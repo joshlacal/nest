@@ -1,1 +1,0 @@
-RedisSessionStore: Store<atrium_api::types::string::Did, atrium_oauth::store::session::Session>

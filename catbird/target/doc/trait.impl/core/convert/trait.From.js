@@ -1,9 +1,0 @@
-(function() {
-    var implementors = Object.fromEntries([["atrium_oauth",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"enum\" href=\"atrium_oauth/enum.AuthMethod.html\" title=\"enum atrium_oauth::AuthMethod\">AuthMethod</a>&gt; for <a class=\"struct\" href=\"https://doc.rust-lang.org/1.92.0/alloc/string/struct.String.html\" title=\"struct alloc::string::String\">String</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"enum\" href=\"atrium_oauth/enum.AuthorizeOptionPrompt.html\" title=\"enum atrium_oauth::AuthorizeOptionPrompt\">AuthorizeOptionPrompt</a>&gt; for <a class=\"struct\" href=\"https://doc.rust-lang.org/1.92.0/alloc/string/struct.String.html\" title=\"struct alloc::string::String\">String</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"enum\" href=\"atrium_oauth/enum.GrantType.html\" title=\"enum atrium_oauth::GrantType\">GrantType</a>&gt; for <a class=\"struct\" href=\"https://doc.rust-lang.org/1.92.0/alloc/string/struct.String.html\" title=\"struct alloc::string::String\">String</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;Error&gt; for <a class=\"enum\" href=\"atrium_oauth/enum.Error.html\" title=\"enum atrium_oauth::Error\">Error</a>"]]]]);
-    if (window.register_implementors) {
-        window.register_implementors(implementors);
-    } else {
-        window.pending_implementors = implementors;
-    }
-})()
-//{"start":57,"fragment_lengths":[1555]}

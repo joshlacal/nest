@@ -1,8 +1,0 @@
-/Users/joshlacalamito/Developer/Catbird+Petrel/nest/catbird/target/debug/deps/rust_multipart_rfc7578_2-4a5621f926a85187.d: /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/lib.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/boundary.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/client_.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/error.rs
-
-/Users/joshlacalamito/Developer/Catbird+Petrel/nest/catbird/target/debug/deps/librust_multipart_rfc7578_2-4a5621f926a85187.rmeta: /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/lib.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/boundary.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/client_.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/error.rs
-
-/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/lib.rs:
-/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/boundary.rs:
-/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/client_.rs:
-/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-multipart-rfc7578_2-0.6.1/src/error.rs:

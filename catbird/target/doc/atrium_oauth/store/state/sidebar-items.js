@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"struct":["InternalStateData"],"trait":["StateStore"],"type":["MemoryStateStore"]};
