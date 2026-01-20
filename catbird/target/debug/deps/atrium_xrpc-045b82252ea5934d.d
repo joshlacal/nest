@@ -1,0 +1,9 @@
+/Users/joshlacalamito/Developer/Catbird+Petrel/nest/catbird/target/debug/deps/atrium_xrpc-045b82252ea5934d.d: /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/lib.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/error.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/traits.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/types.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/../README.md
+
+/Users/joshlacalamito/Developer/Catbird+Petrel/nest/catbird/target/debug/deps/libatrium_xrpc-045b82252ea5934d.rmeta: /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/lib.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/error.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/traits.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/types.rs /Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/../README.md
+
+/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/lib.rs:
+/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/error.rs:
+/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/traits.rs:
+/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/types.rs:
+/Users/joshlacalamito/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/atrium-xrpc-0.12.4/src/../README.md:

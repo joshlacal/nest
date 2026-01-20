@@ -1,0 +1,1 @@
+atrium_oauth::OAuthSession<DefaultHttpClient, CommonDidResolver<DefaultHttpClient>, AppViewHandleResolver<DefaultHttpClient>, RedisSessionStore>

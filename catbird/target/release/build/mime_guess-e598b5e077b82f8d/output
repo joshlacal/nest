@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/joshlacalamito/Developer/Catbird+Petrel/nest/catbird/target/release/build/mime_guess-e598b5e077b82f8d/out/mime_types_generated.rs

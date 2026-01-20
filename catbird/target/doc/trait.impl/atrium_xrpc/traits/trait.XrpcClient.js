@@ -1,0 +1,9 @@
+(function() {
+    var implementors = Object.fromEntries([["atrium_oauth",[["impl&lt;T, D, H, S&gt; XrpcClient for <a class=\"struct\" href=\"atrium_oauth/struct.OAuthSession.html\" title=\"struct atrium_oauth::OAuthSession\">OAuthSession</a>&lt;T, D, H, S&gt;<div class=\"where\">where\n    T: HttpClient + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Send.html\" title=\"trait core::marker::Send\">Send</a> + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Sync.html\" title=\"trait core::marker::Sync\">Sync</a> + 'static,\n    D: Resolver&lt;Input = Did, Output = DidDocument, Error = Error&gt; + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Send.html\" title=\"trait core::marker::Send\">Send</a> + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Sync.html\" title=\"trait core::marker::Sync\">Sync</a>,\n    H: Resolver&lt;Input = Handle, Output = Did, Error = Error&gt; + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Send.html\" title=\"trait core::marker::Send\">Send</a> + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Sync.html\" title=\"trait core::marker::Sync\">Sync</a>,\n    S: <a class=\"trait\" href=\"atrium_oauth/store/session/trait.SessionStore.html\" title=\"trait atrium_oauth::store::session::SessionStore\">SessionStore</a> + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Send.html\" title=\"trait core::marker::Send\">Send</a> + <a class=\"trait\" href=\"https://doc.rust-lang.org/1.92.0/core/marker/trait.Sync.html\" title=\"trait core::marker::Sync\">Sync</a> + 'static,</div>"]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":57,"fragment_lengths":[1665]}

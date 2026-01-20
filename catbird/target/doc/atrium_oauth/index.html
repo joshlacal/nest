@@ -1,0 +1,135 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="ATrium OAuth: atproto flavoured OAuth client"><title>atrium_oauth - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="atrium_oauth" data-themes="" data-resource-suffix="" data-rustdoc-version="1.92.0 (ded5c06cf 2025-12-08)" data-channel="1.92.0" data-search-js="search-d69d8955.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-ce535bd0.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate atrium_oauth</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../atrium_oauth/index.html">atrium_<wbr>oauth</a><span class="version">0.1.6</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#atrium-oauth-atproto-flavoured-oauth-client" title="ATrium OAuth: atproto flavoured OAuth client">ATrium OAuth: atproto flavoured OAuth client</a><ul><li><a href="#usage" title="Usage">Usage</a></li></ul></li></ul><h3><a href="#modules">Crate Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><h1>Crate <span>atrium_<wbr>oauth</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/atrium_oauth/lib.rs.html#1-136">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="atrium-oauth-atproto-flavoured-oauth-client"><a class="doc-anchor" href="#atrium-oauth-atproto-flavoured-oauth-client">§</a>ATrium OAuth: atproto flavoured OAuth client</h2>
+<p>Core library for implementing <a href="https://atproto.com/" title="AT Protocol">atproto</a> OAuth clients.</p>
+<h3 id="usage"><a class="doc-anchor" href="#usage">§</a>Usage</h3><h4 id="configuration"><a class="doc-anchor" href="#configuration">§</a>Configuration</h4>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>atrium_identity::{
+    did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL},
+    handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
+};
+<span class="kw">use </span>atrium_oauth::{
+    store::{session::MemorySessionStore, state::MemoryStateStore},
+    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClient, OAuthClientConfig,
+    OAuthResolverConfig, Scope,
+};
+<span class="kw">use </span>std::{error::Error, sync::Arc};
+
+<span class="kw">struct </span>SomeDnsTxtResolver;
+
+<span class="kw">impl </span>DnsTxtResolver <span class="kw">for </span>SomeDnsTxtResolver {
+    <span class="kw">async fn </span>resolve(
+        <span class="kw-2">&amp;</span><span class="self">self</span>,
+        <span class="kw">_</span>: <span class="kw-2">&amp;</span>str,
+    ) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;String&gt;, Box&lt;<span class="kw">dyn </span>Error + Send + Sync + <span class="lifetime">'static</span>&gt;&gt; {
+        <span class="macro">todo!</span>()
+    }
+}
+
+<span class="kw">let </span>http_client = Arc::new(DefaultHttpClient::default());
+<span class="kw">let </span>config = OAuthClientConfig {
+    client_metadata: AtprotoLocalhostClientMetadata {
+        redirect_uris: <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[String::from(<span class="string">"http://127.0.0.1/callback"</span>)]),
+        scopes: <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[
+            Scope::Known(KnownScope::Atproto),
+            Scope::Known(KnownScope::TransitionGeneric),
+        ]),
+    },
+    keys: <span class="prelude-val">None</span>,
+    resolver: OAuthResolverConfig {
+        did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+            plc_directory_url: DEFAULT_PLC_DIRECTORY_URL.to_string(),
+            http_client: Arc::clone(<span class="kw-2">&amp;</span>http_client),
+        }),
+        handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+            dns_txt_resolver: SomeDnsTxtResolver,
+            http_client: Arc::clone(<span class="kw-2">&amp;</span>http_client),
+        }),
+        authorization_server_metadata: Default::default(),
+        protected_resource_metadata: Default::default(),
+    },
+    <span class="comment">// A store for saving state data while the user is being redirected to the authorization server.
+    </span>state_store: MemoryStateStore::default(),
+    <span class="comment">// A store for saving session data.
+    </span>session_store: MemorySessionStore::default(),
+};
+<span class="kw">let </span><span class="prelude-val">Ok</span>(client) = OAuthClient::new(config) <span class="kw">else </span>{
+    <span class="macro">panic!</span>(<span class="string">"failed to create oauth client"</span>);
+};</code></pre></div><h4 id="authentication"><a class="doc-anchor" href="#authentication">§</a>Authentication</h4>
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span>atrium_oauth::{AuthorizeOptions, KnownScope, OAuthClient, Scope};
+
+<span class="attr">#[tokio::main]
+</span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;(), Box&lt;<span class="kw">dyn </span>std::error::Error&gt;&gt; {
+    <span class="kw">let </span>client = OAuthClient::new(...)<span class="question-mark">?</span>;
+    <span class="kw">let </span>url = client
+        .authorize(
+            <span class="string">"foo.bsky.team"</span>,
+            AuthorizeOptions {
+                scopes: <span class="macro">vec!</span>[
+                    Scope::Known(KnownScope::Atproto),
+                    Scope::Known(KnownScope::TransitionGeneric),
+                ],
+                ..Default::default()
+            },
+        )
+        .<span class="kw">await</span><span class="question-mark">?</span>;
+
+    ...
+
+    <span class="prelude-val">Ok</span>(())
+}</code></pre></div>
+<p>Make user visit <code>url</code>. Then, once it was redirected to the callback URI, perform the following:</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span>atrium_api::agent::Agent;
+
+<span class="attr">#[tokio::main]
+</span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;(), Box&lt;<span class="kw">dyn </span>std::error::Error&gt;&gt; {
+    <span class="kw">let </span>client = OAuthClient::new(...)<span class="question-mark">?</span>;
+
+    ...
+
+    <span class="kw">let </span>query_params = <span class="string">"code=...&amp;state=..."</span>;
+    <span class="kw">let </span>params = serde_html_form::from_str(query_params)<span class="question-mark">?</span>;
+    <span class="kw">let </span>(oauth_session, <span class="kw">_</span>) = client.callback(params).<span class="kw">await</span><span class="question-mark">?</span>;
+
+    ...
+
+    <span class="prelude-val">Ok</span>(())
+}</code></pre></div>
+<p>The sign-in process results in an <a href="struct.OAuthSession.html" title="struct atrium_oauth::OAuthSession"><code>OAuthSession</code></a> instance that can be used to make
+authenticated requests to the resource server. This instance will automatically
+refresh the credentials when needed.</p>
+<h4 id="making-authenticated-requests"><a class="doc-anchor" href="#making-authenticated-requests">§</a>Making authenticated requests</h4>
+<p>The <a href="index.html" title="mod atrium_oauth"><code>atrium_oauth</code></a> package provides a <a href="struct.OAuthSession.html" title="struct atrium_oauth::OAuthSession"><code>OAuthSession</code></a> class that can be
+used to make authenticated requests to Bluesky’s AppView. This can be achieved
+by constructing an <a href="atrium_api::agent::Agent"><code>Agent</code></a> instance using the
+<a href="struct.OAuthSession.html" title="struct atrium_oauth::OAuthSession"><code>OAuthSession</code></a> instance.</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span>atrium_api::agent::Agent;
+
+<span class="attr">#[tokio::main]
+</span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;(), Box&lt;<span class="kw">dyn </span>std::error::Error&gt;&gt; {
+
+    ...
+
+    <span class="kw">let </span>(oauth_session, <span class="kw">_</span>) = client.callback(params).<span class="kw">await</span><span class="question-mark">?</span>;
+    <span class="kw">let </span>agent = Agent::new(oauth_session);
+    <span class="kw">let </span>output = agent
+        .api
+        .app
+        .bsky
+        .feed
+        .get_timeline(
+            atrium_api::app::bsky::feed::get_timeline::ParametersData {
+                algorithm: <span class="prelude-val">None</span>,
+                cursor: <span class="prelude-val">None</span>,
+                limit: <span class="number">3</span>.try_into().ok(),
+            }
+            .into(),
+        )
+        .<span class="kw">await</span><span class="question-mark">?</span>;
+    <span class="kw">for </span>feed <span class="kw">in </span><span class="kw-2">&amp;</span>output.feed {
+        <span class="macro">println!</span>(<span class="string">"{feed:?}"</span>);
+    }
+
+    ...
+
+    <span class="prelude-val">Ok</span>(())
+}</code></pre></div></div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="store/index.html" title="mod atrium_oauth::store">store</a></dt></dl><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.AtprotoClientMetadata.html" title="struct atrium_oauth::AtprotoClientMetadata">Atproto<wbr>Client<wbr>Metadata</a></dt><dt><a class="struct" href="struct.AtprotoLocalhostClientMetadata.html" title="struct atrium_oauth::AtprotoLocalhostClientMetadata">Atproto<wbr>Localhost<wbr>Client<wbr>Metadata</a></dt><dt><a class="struct" href="struct.AuthorizeOptions.html" title="struct atrium_oauth::AuthorizeOptions">Authorize<wbr>Options</a></dt><dt><a class="struct" href="struct.CallbackParams.html" title="struct atrium_oauth::CallbackParams">Callback<wbr>Params</a></dt><dt><a class="struct" href="struct.DefaultHttpClient.html" title="struct atrium_oauth::DefaultHttpClient">Default<wbr>Http<wbr>Client</a></dt><dt><a class="struct" href="struct.DpopClient.html" title="struct atrium_oauth::DpopClient">Dpop<wbr>Client</a></dt><dt><a class="struct" href="struct.OAuthClient.html" title="struct atrium_oauth::OAuthClient">OAuth<wbr>Client</a></dt><dd>An OAuth client for AT Protocol.</dd><dt><a class="struct" href="struct.OAuthClientConfig.html" title="struct atrium_oauth::OAuthClientConfig">OAuth<wbr>Client<wbr>Config</a></dt><dt><a class="struct" href="struct.OAuthClientMetadata.html" title="struct atrium_oauth::OAuthClientMetadata">OAuth<wbr>Client<wbr>Metadata</a></dt><dt><a class="struct" href="struct.OAuthResolverConfig.html" title="struct atrium_oauth::OAuthResolverConfig">OAuth<wbr>Resolver<wbr>Config</a></dt><dt><a class="struct" href="struct.OAuthSession.html" title="struct atrium_oauth::OAuthSession">OAuth<wbr>Session</a></dt><dt><a class="struct" href="struct.TokenSet.html" title="struct atrium_oauth::TokenSet">Token<wbr>Set</a></dt></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.AuthMethod.html" title="enum atrium_oauth::AuthMethod">Auth<wbr>Method</a></dt><dt><a class="enum" href="enum.AuthorizeOptionPrompt.html" title="enum atrium_oauth::AuthorizeOptionPrompt">Authorize<wbr>Option<wbr>Prompt</a></dt><dt><a class="enum" href="enum.Error.html" title="enum atrium_oauth::Error">Error</a></dt><dt><a class="enum" href="enum.GrantType.html" title="enum atrium_oauth::GrantType">Grant<wbr>Type</a></dt><dt><a class="enum" href="enum.KnownScope.html" title="enum atrium_oauth::KnownScope">Known<wbr>Scope</a></dt><dt><a class="enum" href="enum.Scope.html" title="enum atrium_oauth::Scope">Scope</a></dt></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.Result.html" title="type atrium_oauth::Result">Result</a></dt></dl></section></div></main></body></html>
