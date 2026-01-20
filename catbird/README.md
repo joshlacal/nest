@@ -35,15 +35,13 @@ By moving this complexity to a server-side gateway, the mobile app only needs to
 2. **Session Lookup**: Gateway validates session in Redis
 3. **Token Refresh**: If ATProto token expired, automatically refresh it
 4. **Proxy Request**: Forward to user's PDS with proper DPoP/Bearer auth
-5. **Enrichment**: Parse response, enrich blocked posts with metadata
-6. **Response**: Return modified JSON to iOS app
+5. **Response**: Return modified JSON to iOS app
 
 ## Features
 
 - **Confidential OAuth Client**: Secure server-side OAuth with client assertions
 - **DPoP Support**: Automatic DPoP header generation for all PDS requests
 - **Token Management**: Automatic access token refresh using refresh tokens
-- **Response Enrichment**: Detect and annotate blocked/hidden posts
 - **Session Management**: Redis-backed sessions with configurable TTL
 - **Health Checks**: Kubernetes-ready health, readiness, and liveness probes
 
@@ -123,26 +121,6 @@ Key settings:
 ### OAuth Metadata
 - `GET /.well-known/oauth-client-metadata` - OAuth client metadata
 - `GET /.well-known/jwks.json` - Public keys for client auth
-
-## Response Enrichment
-
-The gateway automatically enriches blocked posts with Catbird metadata:
-
-```json
-{
-  "$type": "app.bsky.feed.defs#blockedPost",
-  "uri": "at://did:plc:xxx/app.bsky.feed.post/abc",
-  "blocked": true,
-  "catbird": {
-    "enriched": true,
-    "originalType": "app.bsky.feed.defs#blockedPost",
-    "reason": "user_blocked",
-    "timestamp": "2024-01-15T10:30:00Z"
-  }
-}
-```
-
-This allows the iOS app to show rich UI for blocked content instead of generic placeholders.
 
 ## Development
 
