@@ -77,10 +77,7 @@ fn default_session_ttl() -> u64 {
 }
 
 fn default_scopes() -> Vec<String> {
-    vec![
-        "atproto".to_string(),
-        "transition:generic".to_string(),
-    ]
+    vec!["atproto".to_string(), "transition:generic".to_string()]
 }
 
 impl AppConfig {
@@ -97,19 +94,13 @@ impl AppConfig {
             .set_default("redis.session_ttl_seconds", default_session_ttl())?
             .set_default("oauth.scopes", default_scopes())?
             // Load from config file if exists
-            .add_source(
-                config::File::with_name("config/default")
-                    .required(false)
-            )
-            .add_source(
-                config::File::with_name("config/local")
-                    .required(false)
-            )
+            .add_source(config::File::with_name("config/default").required(false))
+            .add_source(config::File::with_name("config/local").required(false))
             // Override with environment variables (CATBIRD_ prefix)
             .add_source(
                 config::Environment::with_prefix("CATBIRD")
                     .separator("__")
-                    .try_parsing(true)
+                    .try_parsing(true),
             )
             .build()?;
 
@@ -150,7 +141,10 @@ impl AppState {
                 tracing::info!("OAuthClient initialized successfully");
             }
             Err(e) => {
-                tracing::warn!("Failed to initialize OAuthClient: {}. OAuth will be unavailable.", e);
+                tracing::warn!(
+                    "Failed to initialize OAuthClient: {}. OAuth will be unavailable.",
+                    e
+                );
             }
         }
 

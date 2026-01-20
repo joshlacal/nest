@@ -36,7 +36,10 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting Catbird Nest Gateway v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!(
+        "Starting Catbird Nest Gateway v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Load configuration
     let app_config = config::AppConfig::load().map_err(|e| {
@@ -76,7 +79,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the server
     let addr = SocketAddr::from((
-        app_config.server.host.parse::<std::net::IpAddr>().unwrap_or([127, 0, 0, 1].into()),
+        app_config
+            .server
+            .host
+            .parse::<std::net::IpAddr>()
+            .unwrap_or([127, 0, 0, 1].into()),
         app_config.server.port,
     ));
 

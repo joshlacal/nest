@@ -53,7 +53,7 @@ fn extract_session_id(req: &Request<Body>) -> Option<String> {
 }
 
 /// Authentication middleware
-/// 
+///
 /// This middleware:
 /// 1. Extracts the session ID from cookie or Authorization header
 /// 2. Validates the session exists in Redis
@@ -67,7 +67,7 @@ pub async fn auth_middleware(
     let session_id = extract_session_id(&req).ok_or(StatusCode::UNAUTHORIZED)?;
 
     let session_service = SessionService::new(state.clone());
-    
+
     let session = session_service
         .get_valid_session(&session_id)
         .await
@@ -83,7 +83,7 @@ pub async fn auth_middleware(
 }
 
 /// Optional authentication middleware
-/// 
+///
 /// Like auth_middleware but doesn't fail if no session is present.
 /// Useful for endpoints that work with or without authentication.
 pub async fn optional_auth_middleware(
@@ -93,7 +93,7 @@ pub async fn optional_auth_middleware(
 ) -> Response {
     if let Some(session_id) = extract_session_id(&req) {
         let session_service = SessionService::new(state.clone());
-        
+
         if let Ok(session) = session_service.get_valid_session(&session_id).await {
             req.extensions_mut().insert(session);
         }

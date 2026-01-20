@@ -120,8 +120,6 @@ pub struct LogoutResponse {
     pub message: String,
 }
 
-
-
 /// DPoP key pair for token binding (RFC 9449)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DPoPKeyPair {
@@ -136,7 +134,7 @@ pub struct DPoPKeyPair {
 mod base64_bytes {
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serializer};
-    
+
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -144,7 +142,7 @@ mod base64_bytes {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         serializer.serialize_str(&b64.encode(bytes))
     }
-    
+
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
     where
         D: Deserializer<'de>,
@@ -152,6 +150,8 @@ mod base64_bytes {
         let s = String::deserialize(deserializer)?;
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let bytes = b64.decode(&s).map_err(serde::de::Error::custom)?;
-        bytes.try_into().map_err(|_| serde::de::Error::custom("Invalid key length"))
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("Invalid key length"))
     }
 }

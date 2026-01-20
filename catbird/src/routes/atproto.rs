@@ -20,7 +20,7 @@ use crate::middleware::auth_middleware;
 use crate::services::CryptoService;
 
 /// Create the ATProto router
-/// 
+///
 /// This creates all routes for:
 /// - /auth/* - Authentication endpoints
 /// - /xrpc/* - AT Protocol XRPC proxy
@@ -28,16 +28,34 @@ use crate::services::CryptoService;
 pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // Auth routes (some protected, some public)
     let auth_routes = Router::new()
-        .route("/login", post(atproto::login))
+        .route("/login", get(atproto::login).post(atproto::login))
         .route("/callback", get(atproto::oauth_callback))
         // Protected auth routes
-        .route("/logout", post(atproto::logout).layer(middleware::from_fn_with_state(state.clone(), auth_middleware)))
-        .route("/session", get(atproto::get_session).layer(middleware::from_fn_with_state(state.clone(), auth_middleware)));
+        .route(
+            "/logout",
+            post(atproto::logout).layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            )),
+        )
+        .route(
+            "/session",
+            get(atproto::get_session).layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            )),
+        );
 
     // XRPC proxy routes - protected and enriched
     let xrpc_routes = Router::new()
-        .route("/*lexicon", get(atproto::proxy_xrpc).post(atproto::proxy_xrpc))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/*lexicon",
+            get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Well-known routes for OAuth metadata
     let wellknown_routes = Router::new()
@@ -51,9 +69,9 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 }
 
 /// OAuth Client Metadata endpoint
-/// 
+///
 /// GET /.well-known/oauth-client-metadata
-/// 
+///
 /// Returns the OAuth client metadata required for ATProto OAuth.
 async fn oauth_client_metadata(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -78,9 +96,9 @@ async fn oauth_client_metadata(
 }
 
 /// JWKS endpoint
-/// 
+///
 /// GET /.well-known/jwks.json
-/// 
+///
 /// Returns the public keys for client authentication.
 async fn jwks(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,

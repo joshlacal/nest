@@ -32,14 +32,16 @@ impl AtProtoClient {
         query_params: Option<&[(String, String)]>,
     ) -> AppResult<Value> {
         let url = format!("{}{}", session.pds_url, path);
-        
+
         let mut request = self.state.http_client.get(&url);
-        
+
         if let Some(params) = query_params {
             request = request.query(params);
         }
 
-        let headers = self.build_auth_headers(session).await?;
+        let headers = self
+            .build_auth_headers_for_request(session, "GET", &url)
+            .await?;
         request = request.headers(headers);
 
         let response = request.send().await?;
@@ -55,8 +57,10 @@ impl AtProtoClient {
     ) -> AppResult<Value> {
         let url = format!("{}{}", session.pds_url, path);
 
-        let headers = self.build_auth_headers(session).await?;
-        
+        let headers = self
+            .build_auth_headers_for_request(session, "POST", &url)
+            .await?;
+
         let response = self
             .state
             .http_client
@@ -85,20 +89,26 @@ impl AtProtoClient {
             format!("{}{}", session.pds_url, path)
         };
 
-        let mut headers = self.build_auth_headers(session).await?;
-        
+        let mut headers = self
+            .build_auth_headers_for_request(session, method.as_str(), &url)
+            .await?;
+
         if let Some(ct) = content_type {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
         }
 
-        let mut request = self.state.http_client.request(method, &url).headers(headers);
+        let mut request = self
+            .state
+            .http_client
+            .request(method, &url)
+            .headers(headers);
 
         if let Some(b) = body {
             request = request.body(b);
         }
 
         let response = request.send().await?;
-        
+
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
         let body = response.bytes().await?;
@@ -108,7 +118,8 @@ impl AtProtoClient {
 
     /// Build authentication headers including DPoP if needed
     async fn build_auth_headers(&self, session: &CatbirdSession) -> AppResult<HeaderMap> {
-        self.build_auth_headers_for_request(session, "GET", &session.pds_url).await
+        self.build_auth_headers_for_request(session, "GET", &session.pds_url)
+            .await
     }
 
     /// Build authentication headers with DPoP for a specific request
@@ -123,30 +134,29 @@ impl AtProtoClient {
         // If we have a DPoP key, generate a DPoP proof
         if let Some(ref dpop_jkt) = session.dpop_jkt {
             // Generate DPoP proof JWT
-            let dpop_proof = self.generate_dpop_proof(
-                session,
-                method,
-                url,
-            ).await?;
+            let dpop_proof = self.generate_dpop_proof(session, method, url).await?;
 
             // Use DPoP token scheme (not Bearer)
             let auth_value = format!("DPoP {}", session.access_token);
             headers.insert(
                 AUTHORIZATION,
-                HeaderValue::from_str(&auth_value).map_err(|e| AppError::Internal(e.to_string()))?,
+                HeaderValue::from_str(&auth_value)
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
             );
 
             // Add DPoP proof header
             headers.insert(
                 "DPoP",
-                HeaderValue::from_str(&dpop_proof).map_err(|e| AppError::Internal(e.to_string()))?,
+                HeaderValue::from_str(&dpop_proof)
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
             );
         } else {
             // Fall back to Bearer token
             let auth_value = format!("Bearer {}", session.access_token);
             headers.insert(
                 AUTHORIZATION,
-                HeaderValue::from_str(&auth_value).map_err(|e| AppError::Internal(e.to_string()))?,
+                HeaderValue::from_str(&auth_value)
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
             );
         }
 
@@ -161,8 +171,8 @@ impl AtProtoClient {
         http_url: &str,
     ) -> AppResult<String> {
         use base64::Engine;
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         // Create access token hash (ath claim)
@@ -176,7 +186,12 @@ impl AtProtoClient {
         let htu = {
             let parsed = url::Url::parse(http_url)
                 .map_err(|e| AppError::Internal(format!("Invalid URL: {}", e)))?;
-            format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path())
+            format!(
+                "{}://{}{}",
+                parsed.scheme(),
+                parsed.host_str().unwrap_or(""),
+                parsed.path()
+            )
         };
 
         // Generate unique token ID
@@ -211,10 +226,10 @@ impl AtProtoClient {
         let signing_input = format!("{}.{}", encoded_header, encoded_payload);
 
         // Sign with ES256
-        use p256::ecdsa::{SigningKey, Signature, signature::Signer};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
         let signing_key = SigningKey::from_bytes(&dpop_key.private_key_bytes.into())
             .map_err(|e| AppError::Crypto(format!("Invalid DPoP key: {}", e)))?;
-        
+
         let signature: Signature = signing_key.sign(signing_input.as_bytes());
         let encoded_signature = b64url.encode(signature.to_bytes());
 
@@ -224,19 +239,20 @@ impl AtProtoClient {
     /// Retrieve the DPoP private key for a session
     async fn get_dpop_private_key(&self, session: &CatbirdSession) -> AppResult<DPoPKeyPair> {
         // The DPoP key should be stored in Redis alongside the session
-        let key = format!("{}dpop_key:{}", self.state.config.redis.key_prefix, session.did);
+        let key = format!(
+            "{}dpop_key:{}",
+            self.state.config.redis.key_prefix, session.did
+        );
         let mut conn = self.state.redis.clone();
-        
+
         let key_data: Option<String> = conn.get(&key).await?;
-        
+
         match key_data {
-            Some(data) => {
-                serde_json::from_str(&data)
-                    .map_err(|e| AppError::Internal(format!("Failed to parse DPoP key: {}", e)))
-            }
-            None => {
-                Err(AppError::Internal("DPoP key not found for session".to_string()))
-            }
+            Some(data) => serde_json::from_str(&data)
+                .map_err(|e| AppError::Internal(format!("Failed to parse DPoP key: {}", e))),
+            None => Err(AppError::Internal(
+                "DPoP key not found for session".to_string(),
+            )),
         }
     }
 
@@ -249,8 +265,11 @@ impl AtProtoClient {
             Ok(json)
         } else {
             let status_code = status.as_u16();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
             Err(AppError::Upstream {
                 status: status_code,
                 message: error_text,
@@ -262,16 +281,23 @@ impl AtProtoClient {
     pub async fn resolve_handle(handle: &str) -> AppResult<String> {
         // Simple DNS resolution for now or HTTP
         // In production, use atrium-identity or specialized resolver
-        let url = format!("https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}", handle);
+        let url = format!(
+            "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}",
+            handle
+        );
         let client = reqwest::Client::new();
         let res = client.get(&url).send().await?;
-        
+
         if !res.status().is_success() {
-             return Err(AppError::Upstream { status: res.status().as_u16(), message: "Failed to resolve handle".into() });
+            return Err(AppError::Upstream {
+                status: res.status().as_u16(),
+                message: "Failed to resolve handle".into(),
+            });
         }
-        
+
         let json: Value = res.json().await?;
-        json["did"].as_str()
+        json["did"]
+            .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| AppError::Internal("Invalid resolution response".into()))
     }
@@ -280,27 +306,31 @@ impl AtProtoClient {
     pub async fn resolve_pds(did: &str) -> AppResult<String> {
         // Handle did:plc
         if did.starts_with("did:plc:") {
-             let url = format!("https://plc.directory/{}", did);
-             let client = reqwest::Client::new();
-             let res = client.get(&url).send().await?;
-             if !res.status().is_success() {
-                 return Err(AppError::Upstream { status: res.status().as_u16(), message: "Failed to resolve DID".into() });
-             }
-             let json: Value = res.json().await?;
-             // Find service with type AtprotoPds or similar? 
-             // Actually, usually we look for "atproto_pds" service
-             if let Some(services) = json["service"].as_array() {
-                 for service in services {
-                     if service["type"] == "AtprotoPersonalDataServer" {
-                         return service["serviceEndpoint"].as_str()
-                             .map(|s| s.to_string())
-                             .ok_or_else(|| AppError::Internal("Invalid service endpoint".into()));
-                     }
-                 }
-             }
-             return Err(AppError::Internal("No PDS service found for DID".into()));
+            let url = format!("https://plc.directory/{}", did);
+            let client = reqwest::Client::new();
+            let res = client.get(&url).send().await?;
+            if !res.status().is_success() {
+                return Err(AppError::Upstream {
+                    status: res.status().as_u16(),
+                    message: "Failed to resolve DID".into(),
+                });
+            }
+            let json: Value = res.json().await?;
+            // Find service with type AtprotoPds or similar?
+            // Actually, usually we look for "atproto_pds" service
+            if let Some(services) = json["service"].as_array() {
+                for service in services {
+                    if service["type"] == "AtprotoPersonalDataServer" {
+                        return service["serviceEndpoint"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| AppError::Internal("Invalid service endpoint".into()));
+                    }
+                }
+            }
+            return Err(AppError::Internal("No PDS service found for DID".into()));
         }
-        
+
         // Fallback or Handle did:web (omitted for brevity, assume main bsky for now if fail)
         // For development, we default to the implementation check
         Err(AppError::Internal("Unsupported DID method".into()))
@@ -322,8 +352,11 @@ impl SessionService {
 
     /// Get a session by ID (without refresh)
     pub async fn get_session(&self, session_id: &str) -> AppResult<Option<CatbirdSession>> {
-        let key = format!("{}catbird_session:{}", self.state.config.redis.key_prefix, session_id);
-        
+        let key = format!(
+            "{}catbird_session:{}",
+            self.state.config.redis.key_prefix, session_id
+        );
+
         let mut conn = self.state.redis.clone();
         let data: Option<String> = conn.get(&key).await?;
 
@@ -338,24 +371,26 @@ impl SessionService {
 
     /// Save a session to Redis
     pub async fn save_session(&self, session: &CatbirdSession) -> AppResult<()> {
-        let key = format!("{}catbird_session:{}", self.state.config.redis.key_prefix, session.id);
+        let key = format!(
+            "{}catbird_session:{}",
+            self.state.config.redis.key_prefix, session.id
+        );
         let json = serde_json::to_string(session)?;
-        
+
         let mut conn = self.state.redis.clone();
-        conn.set_ex::<_, _, ()>(
-            &key,
-            json,
-            self.state.config.redis.session_ttl_seconds,
-        )
-        .await?;
+        conn.set_ex::<_, _, ()>(&key, json, self.state.config.redis.session_ttl_seconds)
+            .await?;
 
         Ok(())
     }
 
     /// Delete a session
     pub async fn delete_session(&self, session_id: &str) -> AppResult<()> {
-        let key = format!("{}catbird_session:{}", self.state.config.redis.key_prefix, session_id);
-        
+        let key = format!(
+            "{}catbird_session:{}",
+            self.state.config.redis.key_prefix, session_id
+        );
+
         let mut conn = self.state.redis.clone();
         conn.del::<_, ()>(&key).await?;
 
@@ -363,7 +398,7 @@ impl SessionService {
     }
 
     /// Get session with automatic token refresh via OAuthClient
-    /// 
+    ///
     /// Uses atrium-oauth's OAuthClient.restore() to get a session that
     /// automatically handles token refresh when the access token is expired.
     pub async fn get_valid_session(&self, session_id: &str) -> AppResult<CatbirdSession> {
@@ -377,32 +412,39 @@ impl SessionService {
 
         // Check if token refresh is needed
         if session.is_access_token_expired() {
-            tracing::info!("Session {} has expired token, refreshing via OAuthClient", session_id);
-            
+            tracing::info!(
+                "Session {} has expired token, refreshing via OAuthClient",
+                session_id
+            );
+
             // Use OAuthClient.restore() to get a refreshed session
             // This automatically handles token refresh via atrium-oauth
             session = self.refresh_session_tokens(&session).await?;
         }
-        
+
         self.save_session(&session).await?;
         Ok(session)
     }
 
     /// Refresh session tokens using OAuthClient.restore()
-    /// 
+    ///
     /// OAuthSession automatically handles token refresh when restored.
     /// After restore(), we read the updated Session from Redis to sync our CatbirdSession.
     async fn refresh_session_tokens(&self, session: &CatbirdSession) -> AppResult<CatbirdSession> {
+        use crate::services::oauth::RedisSessionStore;
         use atrium_api::types::string::Did;
         use atrium_common::store::Store;
-        use crate::services::oauth::RedisSessionStore;
-        
+
         // Parse the DID
-        let did: Did = session.did.parse()
+        let did: Did = session
+            .did
+            .parse()
             .map_err(|_| AppError::Internal(format!("Invalid DID: {}", session.did)))?;
 
         // Get OAuth client (must be configured for token refresh)
-        let oauth_client = self.state.oauth_client
+        let oauth_client = self
+            .state
+            .oauth_client
             .as_ref()
             .ok_or_else(|| AppError::Config("OAuth client not configured".to_string()))?;
 
@@ -418,8 +460,10 @@ impl SessionService {
             self.state.redis.clone(),
             self.state.config.redis.key_prefix.clone(),
         );
-        
-        let atrium_session = session_store.get(&did).await
+
+        let atrium_session = session_store
+            .get(&did)
+            .await
             .map_err(|e| AppError::Internal(format!("Failed to read session from store: {}", e)))?
             .ok_or_else(|| AppError::Internal("Session not found after restore".to_string()))?;
 
@@ -430,9 +474,14 @@ impl SessionService {
             handle: session.handle.clone(),
             pds_url: session.pds_url.clone(),
             access_token: atrium_session.token_set.access_token.clone(),
-            refresh_token: atrium_session.token_set.refresh_token.clone()
+            refresh_token: atrium_session
+                .token_set
+                .refresh_token
+                .clone()
                 .unwrap_or_else(|| session.refresh_token.clone()),
-            access_token_expires_at: atrium_session.token_set.expires_at
+            access_token_expires_at: atrium_session
+                .token_set
+                .expires_at
                 .map(|dt| dt.as_ref().with_timezone(&chrono::Utc))
                 .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::seconds(3600)),
             created_at: session.created_at,
@@ -445,13 +494,15 @@ impl SessionService {
     }
 
     /// Revoke a session (logout)
-    /// 
+    ///
     /// Revokes the OAuth session via OAuthClient and deletes the local session.
     pub async fn revoke_session(&self, session: &CatbirdSession) -> AppResult<()> {
         use atrium_api::types::string::Did;
-        
+
         // Parse the DID
-        let did: Did = session.did.parse()
+        let did: Did = session
+            .did
+            .parse()
             .map_err(|_| AppError::Internal(format!("Invalid DID: {}", session.did)))?;
 
         // Revoke the OAuth session if client is configured

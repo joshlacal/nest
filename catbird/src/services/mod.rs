@@ -4,7 +4,7 @@
 
 mod atproto_client;
 mod crypto;
-mod oauth;
+pub(crate) mod oauth;
 
 pub use atproto_client::{AtProtoClient, SessionService};
 pub use crypto::CryptoService;
