@@ -126,50 +126,48 @@ pub async fn oauth_callback(
         .map_err(|e| AppError::Internal(format!("Failed to read OAuth session: {e}")))?
         .ok_or_else(|| AppError::Internal("OAuth session missing after callback".into()))?;
 
-    // Persist DPoP private key for request signing (if applicable)
-    let dpop_jkt = match atrium_session.token_set.token_type {
-        atrium_oauth::OAuthTokenType::DPoP => {
-            let jwk_value = serde_json::to_value(&atrium_session.dpop_key)
-                .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP key: {e}")))?;
+    // Persist DPoP private key for request signing
+    // ATProto OAuth always uses DPoP, so we extract and store the key
+    let dpop_jkt = {
+        let jwk_value = serde_json::to_value(&atrium_session.dpop_key)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP key: {e}")))?;
 
-            let d_b64 = jwk_value
-                .get("d")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Internal("DPoP key missing private component".into()))?;
+        let d_b64 = jwk_value
+            .get("d")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::Internal("DPoP key missing private component".into()))?;
 
-            let d_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(d_b64)
-                .map_err(|e| AppError::Internal(format!("Invalid DPoP key encoding: {e}")))?;
+        let d_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(d_b64)
+            .map_err(|e| AppError::Internal(format!("Invalid DPoP key encoding: {e}")))?;
 
-            let private_key_bytes: [u8; 32] = d_bytes
-                .try_into()
-                .map_err(|_| AppError::Internal("Invalid DPoP key length".into()))?;
+        let private_key_bytes: [u8; 32] = d_bytes
+            .try_into()
+            .map_err(|_| AppError::Internal("Invalid DPoP key length".into()))?;
 
-            let mut public_jwk = jwk_value;
-            if let Some(obj) = public_jwk.as_object_mut() {
-                obj.remove("d");
-            }
-
-            let dpop_pair = DPoPKeyPair {
-                public_jwk,
-                private_key_bytes,
-            };
-
-            let redis_key = format!(
-                "{}dpop_key:{}",
-                state.config.redis.key_prefix,
-                did_typed.as_str()
-            );
-            let json = serde_json::to_string(&dpop_pair)
-                .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP keypair: {e}")))?;
-
-            let mut conn = state.redis.clone();
-            conn.set_ex::<_, _, ()>(&redis_key, json, state.config.redis.session_ttl_seconds)
-                .await?;
-
-            Some("dpop".to_string())
+        let mut public_jwk = jwk_value;
+        if let Some(obj) = public_jwk.as_object_mut() {
+            obj.remove("d");
         }
-        _ => None,
+
+        let dpop_pair = DPoPKeyPair {
+            public_jwk,
+            private_key_bytes,
+        };
+
+        let redis_key = format!(
+            "{}dpop_key:{}",
+            state.config.redis.key_prefix,
+            did_typed.as_str()
+        );
+        let json = serde_json::to_string(&dpop_pair)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP keypair: {e}")))?;
+
+        let mut conn = state.redis.clone();
+        conn.set_ex::<_, _, ()>(&redis_key, json, state.config.redis.session_ttl_seconds)
+            .await?;
+
+        Some("dpop".to_string())
     };
 
     let session_id = Uuid::new_v4();

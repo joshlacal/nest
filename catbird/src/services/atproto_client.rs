@@ -107,7 +107,21 @@ impl AtProtoClient {
             request = request.body(b);
         }
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "Request failed to {}: {:?} (is_builder: {}, is_request: {}, is_connect: {}, is_body: {})",
+                    url,
+                    e,
+                    e.is_builder(),
+                    e.is_request(),
+                    e.is_connect(),
+                    e.is_body()
+                );
+                return Err(e.into());
+            }
+        };
 
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
@@ -410,12 +424,23 @@ impl SessionService {
         // Update last used time
         session.last_used_at = Utc::now();
 
+        // If pds_url is empty (legacy sessions), sync from oauth_session
+        let needs_pds_sync = session.pds_url.is_empty();
+
         // Check if token refresh is needed
-        if session.is_access_token_expired() {
-            tracing::info!(
-                "Session {} has expired token, refreshing via OAuthClient",
-                session_id
-            );
+        if session.is_access_token_expired() || needs_pds_sync {
+            if session.is_access_token_expired() {
+                tracing::info!(
+                    "Session {} has expired token, refreshing via OAuthClient",
+                    session_id
+                );
+            }
+            if needs_pds_sync {
+                tracing::info!(
+                    "Session {} has empty pds_url, syncing from oauth session",
+                    session_id
+                );
+            }
 
             // Use OAuthClient.restore() to get a refreshed session
             // This automatically handles token refresh via atrium-oauth
@@ -472,7 +497,8 @@ impl SessionService {
             id: session.id,
             did: session.did.clone(),
             handle: session.handle.clone(),
-            pds_url: session.pds_url.clone(),
+            // Use pds_url from atrium session (aud field) as the authoritative source
+            pds_url: atrium_session.token_set.aud.clone(),
             access_token: atrium_session.token_set.access_token.clone(),
             refresh_token: atrium_session
                 .token_set
