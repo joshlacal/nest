@@ -206,6 +206,33 @@ pub async fn oauth_callback(
 
     let session_id = dpop_jkt.1;
     let dpop_jkt = dpop_jkt.0;
+
+    // Resolve handle from DID by calling com.atproto.repo.describeRepo on the PDS
+    let handle = {
+        let pds_url = &atrium_session.token_set.aud;
+        let describe_url = format!(
+            "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
+            pds_url.as_str().trim_end_matches('/'),
+            &did
+        );
+        
+        // Make unauthenticated request to describe repo (public endpoint)
+        match reqwest::get(&describe_url).await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => json
+                        .get("handle")
+                        .and_then(|h| h.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| did.clone()),
+                    Err(_) => did.clone(),
+                }
+            }
+            _ => did.clone(),
+        }
+    };
+    tracing::info!("Resolved handle for DID {}: {}", &did, &handle);
+
     let now = Utc::now();
 
     let access_token_expires_at = atrium_session
@@ -218,7 +245,7 @@ pub async fn oauth_callback(
     let session = CatbirdSession {
         id: session_id,
         did: did.clone(),
-        handle: did.clone(),
+        handle: handle.clone(),
         pds_url: atrium_session.token_set.aud.clone(),
         access_token: atrium_session.token_set.access_token.clone(),
         refresh_token: atrium_session
