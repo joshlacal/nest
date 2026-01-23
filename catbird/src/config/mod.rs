@@ -14,6 +14,27 @@ pub struct AppConfig {
     pub redis: RedisConfig,
     /// OAuth/ATProto configuration
     pub oauth: OAuthConfig,
+    /// MLS service configuration (optional, for direct routing)
+    #[serde(default)]
+    pub mls: MlsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MlsConfig {
+    /// URL of the MLS service (e.g., http://127.0.0.1:3000)
+    /// If set, MLS requests are routed directly instead of through PDS
+    #[serde(default)]
+    pub service_url: Option<String>,
+    /// DID of this gateway for service auth (e.g., did:web:api.catbird.blue)
+    #[serde(default)]
+    pub gateway_did: Option<String>,
+    /// DID of the MLS service (e.g., did:web:mls.catbird.blue)
+    #[serde(default = "default_mls_service_did")]
+    pub service_did: String,
+}
+
+fn default_mls_service_did() -> String {
+    "did:web:mls.catbird.blue".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,7 +98,7 @@ fn default_session_ttl() -> u64 {
 }
 
 fn default_scopes() -> Vec<String> {
-    vec!["atproto".to_string(), "transition:generic".to_string()]
+    vec!["atproto".to_string(), "transition:generic".to_string(), "transition:chat.bsky".to_string()]
 }
 
 impl AppConfig {
@@ -100,6 +121,8 @@ impl AppConfig {
             .add_source(
                 config::Environment::with_prefix("CATBIRD")
                     .separator("__")
+                    .with_list_parse_key("CATBIRD__OAUTH__SCOPES")
+                    .list_separator(",")
                     .try_parsing(true),
             )
             .build()?;

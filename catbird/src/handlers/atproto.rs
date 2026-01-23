@@ -157,10 +157,15 @@ pub async fn oauth_callback(
             private_key_bytes,
         };
 
+        // Generate session_id first so we can key the DPoP by session, not DID
+        // This allows multiple devices per account
+        let session_id = Uuid::new_v4();
+
+        // Store DPoP key by session_id (not DID) to support multiple devices
         let redis_key = format!(
             "{}dpop_key:{}",
             state.config.redis.key_prefix,
-            did_typed.as_str()
+            session_id
         );
         let json = serde_json::to_string(&dpop_pair)
             .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP keypair: {e}")))?;
@@ -169,10 +174,22 @@ pub async fn oauth_callback(
         conn.set_ex::<_, _, ()>(&redis_key, json, state.config.redis.session_ttl_seconds)
             .await?;
 
-        Some("dpop".to_string())
+        // Also store OAuth session by session_id for per-device token refresh
+        let oauth_session_key = format!(
+            "{}oauth_session:{}",
+            state.config.redis.key_prefix,
+            session_id
+        );
+        let oauth_session_json = serde_json::to_string(&atrium_session)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize OAuth session: {e}")))?;
+        conn.set_ex::<_, _, ()>(&oauth_session_key, oauth_session_json, state.config.redis.session_ttl_seconds)
+            .await?;
+
+        (Some("dpop".to_string()), session_id)
     };
 
-    let session_id = Uuid::new_v4();
+    let session_id = dpop_jkt.1;
+    let dpop_jkt = dpop_jkt.0;
     let now = Utc::now();
 
     let access_token_expires_at = atrium_session
@@ -242,13 +259,18 @@ pub async fn logout(
         // Continue with logout even if revocation fails
     }
 
-    // Also clean up the DPoP key from Redis
+    // Also clean up the DPoP key and session-scoped OAuth session from Redis
     let dpop_key = format!(
         "{}dpop_key:{}",
-        state.config.redis.key_prefix, session.did
+        state.config.redis.key_prefix, session.id
+    );
+    let oauth_session_key = format!(
+        "{}oauth_session:{}",
+        state.config.redis.key_prefix, session.id
     );
     let mut conn = state.redis.clone();
     let _: Result<(), _> = conn.del(&dpop_key).await;
+    let _: Result<(), _> = conn.del(&oauth_session_key).await;
 
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")

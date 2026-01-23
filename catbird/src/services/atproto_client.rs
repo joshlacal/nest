@@ -378,10 +378,10 @@ impl AtProtoClient {
 
     /// Retrieve the DPoP private key for a session
     pub async fn get_dpop_private_key(&self, session: &CatbirdSession) -> AppResult<DPoPKeyPair> {
-        // The DPoP key should be stored in Redis alongside the session
+        // The DPoP key is stored by session ID (not DID) to support multiple devices
         let key = format!(
             "{}dpop_key:{}",
-            self.state.config.redis.key_prefix, session.did
+            self.state.config.redis.key_prefix, session.id
         );
         let mut conn = self.state.redis.clone();
 

@@ -59,7 +59,7 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
     // Well-known routes for OAuth metadata
     let wellknown_routes = Router::new()
-        .route("/oauth-client-metadata", get(oauth_client_metadata))
+        .route("/did.json", get(did_document))
         .route("/jwks.json", get(jwks));
 
     Router::new()
@@ -132,6 +132,78 @@ async fn jwks(
                 "x": x,
                 "y": y,
             }
+        ]
+    }))
+}
+
+/// DID Document endpoint
+///
+/// GET /.well-known/did.json
+///
+/// Returns the DID document for this gateway (did:web resolution).
+/// This allows the MLS server to verify JWTs signed by this gateway.
+async fn did_document(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    // Get the gateway DID from config, or derive from base_url
+    let gateway_did = state.config.mls.gateway_did.clone().unwrap_or_else(|| {
+        // Derive did:web from base_url (e.g., https://api.catbird.blue -> did:web:api.catbird.blue)
+        let base = &state.config.server.base_url;
+        let host = base
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("localhost");
+        format!("did:web:{}", host)
+    });
+
+    let crypto_service = CryptoService::new(state.clone());
+    let private_key = match crypto_service.load_private_key() {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::error!("Failed to load private key for DID document: {}", error);
+            return axum::Json(serde_json::json!({
+                "error": "Failed to load signing key"
+            }));
+        }
+    };
+    
+    let verifying_key = private_key.public_key();
+    let encoded = verifying_key.to_encoded_point(false);
+    let x = encoded
+        .x()
+        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        .unwrap_or_default();
+    let y = encoded
+        .y()
+        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        .unwrap_or_default();
+
+    axum::Json(serde_json::json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/suites/jws-2020/v1"
+        ],
+        "id": gateway_did,
+        "verificationMethod": [
+            {
+                "id": format!("{}#key-1", gateway_did),
+                "type": "JsonWebKey2020",
+                "controller": gateway_did,
+                "publicKeyJwk": {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": x,
+                    "y": y,
+                }
+            }
+        ],
+        "authentication": [
+            format!("{}#key-1", gateway_did)
+        ],
+        "assertionMethod": [
+            format!("{}#key-1", gateway_did)
         ]
     }))
 }
