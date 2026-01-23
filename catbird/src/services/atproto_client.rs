@@ -5,6 +5,7 @@
 //! - Request proxying with DPoP nonce retry
 //! - Token refresh logic
 
+use super::ssrf::validate_pds_url;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{CatbirdSession, DPoPKeyPair};
@@ -86,6 +87,9 @@ impl AtProtoClient {
         client_headers: Option<&HeaderMap>,
         request_id: &str,
     ) -> AppResult<(u16, HeaderMap, bytes::Bytes)> {
+        // SSRF protection: validate the PDS URL before making any requests
+        validate_pds_url(&session.pds_url)?;
+
         let url = if let Some(qs) = query_string {
             format!("{}{}?{}", session.pds_url, path, qs)
         } else {
@@ -461,10 +465,15 @@ impl AtProtoClient {
             if let Some(services) = json["service"].as_array() {
                 for service in services {
                     if service["type"] == "AtprotoPersonalDataServer" {
-                        return service["serviceEndpoint"]
+                        let endpoint = service["serviceEndpoint"]
                             .as_str()
                             .map(|s| s.to_string())
-                            .ok_or_else(|| AppError::Internal("Invalid service endpoint".into()));
+                            .ok_or_else(|| AppError::Internal("Invalid service endpoint".into()))?;
+
+                        // SSRF protection: validate the resolved PDS URL
+                        validate_pds_url(&endpoint)?;
+
+                        return Ok(endpoint);
                     }
                 }
             }
@@ -537,6 +546,27 @@ impl SessionService {
         Ok(())
     }
 
+    /// Clear all session-related data from Redis
+    ///
+    /// Removes the catbird session, DPoP key, and OAuth session.
+    /// Used when a refresh token is rejected and the session is no longer valid.
+    pub async fn clear_session_data(&self, session_id: &str) -> AppResult<()> {
+        let prefix = &self.state.config.redis.key_prefix;
+        let catbird_session_key = format!("{}catbird_session:{}", prefix, session_id);
+        let dpop_key = format!("{}dpop_key:{}", prefix, session_id);
+        let oauth_session_key = format!("{}oauth_session:{}", prefix, session_id);
+
+        let mut conn = self.state.redis.clone();
+        
+        // Delete all session-related keys (ignore individual failures)
+        let _: Result<(), _> = conn.del(&catbird_session_key).await;
+        let _: Result<(), _> = conn.del(&dpop_key).await;
+        let _: Result<(), _> = conn.del(&oauth_session_key).await;
+
+        tracing::info!("Cleared all session data for session {}", session_id);
+        Ok(())
+    }
+
     /// Get session with automatic token refresh via OAuthClient
     ///
     /// Uses atrium-oauth's OAuthClient.restore() to get a session that
@@ -577,65 +607,200 @@ impl SessionService {
         Ok(session)
     }
 
-    /// Refresh session tokens using OAuthClient.restore()
+    /// Refresh session tokens using per-session OAuth data
     ///
-    /// OAuthSession automatically handles token refresh when restored.
-    /// After restore(), we read the updated Session from Redis to sync our CatbirdSession.
+    /// This performs a manual token refresh using the refresh_token stored in
+    /// `oauth_session:{session_id}` rather than the DID-keyed session store.
+    /// This is critical for multi-device support where each device has its own
+    /// refresh token that must not be overwritten by other devices.
     async fn refresh_session_tokens(&self, session: &CatbirdSession) -> AppResult<CatbirdSession> {
-        use crate::services::oauth::RedisSessionStore;
-        use atrium_api::types::string::Did;
-        use atrium_common::store::Store;
+        use atrium_oauth::store::session::Session;
 
-        // Parse the DID
-        let did: Did = session
-            .did
-            .parse()
-            .map_err(|_| AppError::Internal(format!("Invalid DID: {}", session.did)))?;
+        // Load the per-session OAuth data from Redis (not the DID-keyed store)
+        let oauth_session_key = format!(
+            "{}oauth_session:{}",
+            self.state.config.redis.key_prefix,
+            session.id
+        );
+        let mut conn = self.state.redis.clone();
+        let oauth_session_json: Option<String> = conn.get(&oauth_session_key).await?;
+        
+        let oauth_session: Session = match oauth_session_json {
+            Some(json) => serde_json::from_str(&json)
+                .map_err(|e| AppError::Internal(format!("Failed to parse OAuth session: {}", e)))?,
+            None => {
+                return Err(AppError::Internal(format!(
+                    "No per-session OAuth data found for session {}",
+                    session.id
+                )));
+            }
+        };
 
-        // Get OAuth client (must be configured for token refresh)
-        let oauth_client = self
-            .state
-            .oauth_client
-            .as_ref()
-            .ok_or_else(|| AppError::Config("OAuth client not configured".to_string()))?;
+        // Get the refresh token from the per-session data
+        let refresh_token = oauth_session
+            .token_set
+            .refresh_token
+            .clone()
+            .ok_or_else(|| AppError::OAuth("No refresh token in session".to_string()))?;
 
-        // Restore the OAuth session - this triggers automatic token refresh
-        // The OAuthSession will update the Session in our RedisSessionStore
-        let _oauth_session = oauth_client
-            .restore(&did)
-            .await
-            .map_err(|e| AppError::OAuth(format!("Failed to restore OAuth session: {}", e)))?;
-
-        // Read the updated Session from our RedisSessionStore
-        let session_store = RedisSessionStore::new(
-            self.state.redis.clone(),
-            self.state.config.redis.key_prefix.clone(),
+        // Get the token endpoint from the authorization server
+        let token_endpoint = self.get_token_endpoint(&session.pds_url).await?;
+        
+        tracing::info!(
+            "Refreshing tokens for session {} via {}",
+            session.id,
+            token_endpoint
         );
 
-        let atrium_session = session_store
-            .get(&did)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to read session from store: {}", e)))?
-            .ok_or_else(|| AppError::Internal("Session not found after restore".to_string()))?;
+        // Generate client assertion JWT for confidential client auth
+        let client_assertion = self.generate_client_assertion(&token_endpoint).await?;
+        
+        // Build the refresh token request body
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}&client_id={}&client_assertion_type={}&client_assertion={}",
+            urlencoding::encode(&refresh_token),
+            urlencoding::encode(&self.state.config.oauth.client_id),
+            urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            urlencoding::encode(&client_assertion)
+        );
 
-        // Extract tokens from atrium-oauth's Session and update CatbirdSession
+        // First attempt without DPoP nonce
+        let dpop_proof = self.generate_dpop_proof_for_auth_server(
+            session,
+            "POST",
+            &token_endpoint,
+            None,
+        ).await?;
+
+        let response = self
+            .state
+            .http_client
+            .post(&token_endpoint)
+            .header("DPoP", dpop_proof)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body.clone())
+            .send()
+            .await?;
+
+        // Check if we need to retry with DPoP nonce
+        let response = if response.status() == reqwest::StatusCode::BAD_REQUEST 
+            || response.status() == reqwest::StatusCode::UNAUTHORIZED 
+        {
+            let nonce = response.headers()
+                .get("DPoP-Nonce")
+                .or_else(|| response.headers().get("dpop-nonce"))
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            
+            if let Some(nonce) = nonce {
+                tracing::info!("Received DPoP nonce challenge for token refresh, retrying with nonce");
+                
+                // Regenerate DPoP proof with nonce
+                let dpop_proof_with_nonce = self.generate_dpop_proof_for_auth_server(
+                    session,
+                    "POST",
+                    &token_endpoint,
+                    Some(nonce),
+                ).await?;
+                
+                // Regenerate client assertion (needs fresh jti)
+                let client_assertion = self.generate_client_assertion(&token_endpoint).await?;
+                let body = format!(
+                    "grant_type=refresh_token&refresh_token={}&client_id={}&client_assertion_type={}&client_assertion={}",
+                    urlencoding::encode(&refresh_token),
+                    urlencoding::encode(&self.state.config.oauth.client_id),
+                    urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                    urlencoding::encode(&client_assertion)
+                );
+                
+                self.state
+                    .http_client
+                    .post(&token_endpoint)
+                    .header("DPoP", dpop_proof_with_nonce)
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(body)
+                    .send()
+                    .await?
+            } else {
+                response
+            }
+        } else {
+            response
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            
+            // Check for invalid_grant - this means the refresh token was rejected
+            // This can happen when: user revoked access, token was already used,
+            // or PDS invalidated the session
+            if body.contains("invalid_grant") || body.contains("InvalidGrant") {
+                tracing::warn!(
+                    "Refresh token rejected for session {} (invalid_grant), clearing session data. Response: {}",
+                    session.id,
+                    body
+                );
+                
+                // Clear all session data from Redis since the refresh token is no longer valid
+                if let Err(cleanup_err) = self.clear_session_data(&session.id.to_string()).await {
+                    tracing::error!("Failed to clear session data after invalid_grant: {}", cleanup_err);
+                }
+                
+                // Return TokenRefresh error which maps to 401, prompting re-authentication
+                return Err(AppError::TokenRefresh(
+                    "Session expired. Please log in again.".to_string()
+                ));
+            }
+            
+            return Err(AppError::OAuth(format!(
+                "Token refresh failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        // Parse the token response
+        let token_response: serde_json::Value = response.json().await?;
+        
+        let new_access_token = token_response["access_token"]
+            .as_str()
+            .ok_or_else(|| AppError::OAuth("No access_token in refresh response".to_string()))?
+            .to_string();
+        
+        let new_refresh_token = token_response["refresh_token"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| refresh_token.clone());
+        
+        let expires_in = token_response["expires_in"]
+            .as_i64()
+            .unwrap_or(3600);
+        
+        let new_expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
+
+        // Update the per-session OAuth data with new tokens
+        let mut updated_oauth_session = oauth_session.clone();
+        updated_oauth_session.token_set.access_token = new_access_token.clone();
+        updated_oauth_session.token_set.refresh_token = Some(new_refresh_token.clone());
+        updated_oauth_session.token_set.expires_at = Some(atrium_api::types::string::Datetime::new(new_expires_at.fixed_offset()));
+        
+        let updated_oauth_json = serde_json::to_string(&updated_oauth_session)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize OAuth session: {}", e)))?;
+        conn.set_ex::<_, _, ()>(
+            &oauth_session_key,
+            updated_oauth_json,
+            self.state.config.redis.session_ttl_seconds,
+        ).await?;
+
+        // Build the updated CatbirdSession
         let refreshed_session = CatbirdSession {
             id: session.id,
             did: session.did.clone(),
             handle: session.handle.clone(),
-            // Use pds_url from atrium session (aud field) as the authoritative source
-            pds_url: atrium_session.token_set.aud.clone(),
-            access_token: atrium_session.token_set.access_token.clone(),
-            refresh_token: atrium_session
-                .token_set
-                .refresh_token
-                .clone()
-                .unwrap_or_else(|| session.refresh_token.clone()),
-            access_token_expires_at: atrium_session
-                .token_set
-                .expires_at
-                .map(|dt| dt.as_ref().with_timezone(&chrono::Utc))
-                .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::seconds(3600)),
+            pds_url: session.pds_url.clone(),
+            access_token: new_access_token,
+            refresh_token: new_refresh_token,
+            access_token_expires_at: new_expires_at,
             created_at: session.created_at,
             last_used_at: chrono::Utc::now(),
             dpop_jkt: session.dpop_jkt.clone(),
@@ -643,6 +808,66 @@ impl SessionService {
 
         tracing::info!("Successfully refreshed tokens for session {}", session.id);
         Ok(refreshed_session)
+    }
+    
+    /// Get the token endpoint by resolving the authorization server per ATProto OAuth spec
+    async fn get_token_endpoint(&self, pds_url: &str) -> AppResult<String> {
+        // Step 1: Fetch Resource Server metadata from the PDS
+        let resource_metadata_url = format!("{}/.well-known/oauth-protected-resource", pds_url);
+        
+        let response = self
+            .state
+            .http_client
+            .get(&resource_metadata_url)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            return Err(AppError::Internal(format!(
+                "Failed to fetch resource server metadata from {}: {}",
+                pds_url,
+                response.status()
+            )));
+        }
+        
+        let resource_metadata: serde_json::Value = response.json().await?;
+        
+        // Step 2: Extract the authorization server URL
+        let auth_server_url = resource_metadata["authorization_servers"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::Internal("No authorization_servers in resource metadata".into())
+            })?;
+        
+        // Step 3: Fetch Authorization Server metadata
+        let auth_metadata_url = format!("{}/.well-known/oauth-authorization-server", auth_server_url);
+        
+        let response = self
+            .state
+            .http_client
+            .get(&auth_metadata_url)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            return Err(AppError::Internal(format!(
+                "Failed to fetch auth server metadata from {}: {}",
+                auth_server_url,
+                response.status()
+            )));
+        }
+        
+        let auth_metadata: serde_json::Value = response.json().await?;
+        
+        // Step 4: Extract the token endpoint
+        auth_metadata["token_endpoint"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| {
+                AppError::Internal("No token_endpoint in auth server metadata".into())
+            })
     }
 
     /// Revoke a session (logout)
@@ -654,6 +879,9 @@ impl SessionService {
     /// Revokes the OAuth session via direct HTTP call to the Authorization Server revocation endpoint,
     /// then deletes the local session.
     pub async fn revoke_session(&self, session: &CatbirdSession) -> AppResult<()> {
+        // SSRF protection: validate the PDS URL before making any requests
+        validate_pds_url(&session.pds_url)?;
+
         // Resolve the authorization server and revocation endpoint per ATProto OAuth spec
         let revocation_url = self.get_revocation_endpoint(&session.pds_url).await?;
         
@@ -662,10 +890,20 @@ impl SessionService {
         // Generate client assertion for confidential client authentication
         let client_assertion = self.generate_client_assertion(&revocation_url).await?;
         
+        // Per RFC 7009, prefer revoking refresh_token over access_token:
+        // - Refresh tokens are long-lived credentials
+        // - Revoking refresh token prevents future access token issuance
+        // - Access tokens expire soon anyway
+        let token_to_revoke = if !session.refresh_token.is_empty() {
+            &session.refresh_token
+        } else {
+            &session.access_token
+        };
+        
         // Build form body with client authentication
         let body = format!(
             "token={}&client_id={}&client_assertion_type={}&client_assertion={}",
-            urlencoding::encode(&session.access_token),
+            urlencoding::encode(token_to_revoke),
             urlencoding::encode(&self.state.config.oauth.client_id),
             urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
             urlencoding::encode(&client_assertion)
@@ -712,7 +950,7 @@ impl SessionService {
                 let client_assertion = self.generate_client_assertion(&revocation_url).await?;
                 let body = format!(
                     "token={}&client_id={}&client_assertion_type={}&client_assertion={}",
-                    urlencoding::encode(&session.access_token),
+                    urlencoding::encode(token_to_revoke),
                     urlencoding::encode(&self.state.config.oauth.client_id),
                     urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
                     urlencoding::encode(&client_assertion)

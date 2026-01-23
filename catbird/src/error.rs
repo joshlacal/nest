@@ -49,6 +49,9 @@ pub enum AppError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Rate limit exceeded")]
+    RateLimitExceeded { retry_after: u64 },
+
     #[error("Crypto error: {0}")]
     Crypto(String),
 
@@ -112,6 +115,14 @@ impl IntoResponse for AppError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     "Server configuration error".to_string(),
+                )
+            }
+            AppError::RateLimitExceeded { retry_after } => {
+                tracing::warn!("Rate limit exceeded, retry after {} seconds", retry_after);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_exceeded",
+                    format!("Too many requests. Please retry after {} seconds.", retry_after),
                 )
             }
             AppError::Crypto(msg) => {

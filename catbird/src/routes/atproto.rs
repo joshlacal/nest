@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::config::AppState;
 use crate::handlers::atproto;
-use crate::middleware::auth_middleware;
+use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, RateLimitState};
 use crate::services::CryptoService;
 
 /// Create the ATProto router
@@ -26,9 +26,24 @@ use crate::services::CryptoService;
 /// - /xrpc/* - AT Protocol XRPC proxy
 /// - /.well-known/* - OAuth metadata
 pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    // Create rate limit state with default configuration
+    let rate_limit_state = Arc::new(RateLimitState::default());
+
+    // Start background cleanup task for rate limiter
+    rate_limit_state.clone().start_cleanup_task();
+
     // Auth routes (some protected, some public)
+    // Login has stricter IP-based rate limiting
     let auth_routes = Router::new()
-        .route("/login", get(atproto::login).post(atproto::login))
+        .route(
+            "/login",
+            get(atproto::login)
+                .post(atproto::login)
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
+        )
         .route("/callback", get(atproto::oauth_callback))
         // Protected auth routes
         .route(
@@ -46,12 +61,16 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             )),
         );
 
-    // XRPC proxy routes - protected and enriched
+    // XRPC proxy routes - protected with auth and session-based rate limiting
     let xrpc_routes = Router::new()
         .route(
             "/*lexicon",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),
         )
+        .layer(middleware::from_fn_with_state(
+            rate_limit_state.clone(),
+            session_rate_limit,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
