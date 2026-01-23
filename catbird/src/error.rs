@@ -57,6 +57,9 @@ pub enum AppError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Response too large: {0}")]
+    ResponseTooLarge(String),
 }
 
 impl IntoResponse for AppError {
@@ -141,6 +144,11 @@ impl IntoResponse for AppError {
                     msg.clone(),
                 )
             }
+            AppError::ResponseTooLarge(msg) => (
+                StatusCode::BAD_GATEWAY,
+                "response_too_large",
+                msg.clone(),
+            ),
         };
 
         let body = Json(json!({

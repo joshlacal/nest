@@ -66,15 +66,27 @@ pub struct RedisConfig {
 pub struct OAuthConfig {
     /// Client ID (your domain, e.g., https://api.catbird.app)
     pub client_id: String,
-    /// Path to the ES256 private key (PEM format)
+    /// Path to the ES256 private key (PEM format) - for single-key backward compatibility
     pub private_key_path: Option<String>,
     /// ES256 private key as base64-encoded string (alternative to file path)
     pub private_key_base64: Option<String>,
+    /// Multiple private key paths for key rotation support
+    /// Each key gets a kid derived from filename (e.g., "key1.pem" -> "catbird-key1")
+    #[serde(default)]
+    pub private_key_paths: Vec<String>,
+    /// Which key ID to use for signing new JWTs (must match a loaded key's kid)
+    /// Defaults to "catbird-key-1" for backward compatibility
+    #[serde(default = "default_active_key_id")]
+    pub active_key_id: String,
     /// Redirect URI for OAuth callback
     pub redirect_uri: String,
     /// Scopes to request
     #[serde(default = "default_scopes")]
     pub scopes: Vec<String>,
+}
+
+fn default_active_key_id() -> String {
+    "catbird-key-1".to_string()
 }
 
 fn default_host() -> String {
@@ -138,6 +150,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub redis: redis::aio::ConnectionManager,
     pub oauth_client: Option<Arc<crate::services::CatbirdOAuthClient>>,
+    pub key_store: Option<Arc<crate::services::KeyStore>>,
 }
 
 impl AppState {
@@ -155,7 +168,22 @@ impl AppState {
             http_client,
             redis,
             oauth_client: None,
+            key_store: None,
         };
+
+        // Initialize KeyStore first (needed by OAuth client)
+        match crate::services::KeyStore::from_config(&state) {
+            Ok(store) => {
+                state.key_store = Some(Arc::new(store));
+                tracing::info!("KeyStore initialized successfully");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize KeyStore: {}. OAuth will be unavailable.",
+                    e
+                );
+            }
+        }
 
         // Initialize OAuth client after state is created
         match crate::services::create_oauth_client(&state) {

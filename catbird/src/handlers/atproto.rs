@@ -23,12 +23,13 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
+use crate::metrics;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{
     CatbirdSession, DPoPKeyPair, LoginRequest, LoginResponse, LogoutResponse, OAuthCallback,
     SessionInfo,
 };
-use crate::services::{oauth::RedisSessionStore, AtProtoClient, MlsAuthService, SessionService};
+use crate::services::{oauth::RedisSessionStore, AtProtoClient, MlsAuthService, ProxyResponse, SessionService};
 
 /// Handle login initiation (Redirect flow)
 ///
@@ -152,6 +153,21 @@ pub async fn oauth_callback(
             obj.remove("d");
         }
 
+        // Compute JWK thumbprint (RFC 7638) for dpop_jkt
+        // Canonical form requires lexicographic key order: crv, kty, x, y
+        let canonical_jwk = serde_json::json!({
+            "crv": public_jwk["crv"],
+            "kty": public_jwk["kty"],
+            "x": public_jwk["x"],
+            "y": public_jwk["y"],
+        });
+        let canonical_bytes = serde_json::to_vec(&canonical_jwk)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize canonical JWK: {e}")))?;
+
+        use sha2::{Sha256, Digest};
+        let hash = Sha256::digest(&canonical_bytes);
+        let thumbprint = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+
         let dpop_pair = DPoPKeyPair {
             public_jwk,
             private_key_bytes,
@@ -185,7 +201,7 @@ pub async fn oauth_callback(
         conn.set_ex::<_, _, ()>(&oauth_session_key, oauth_session_json, state.config.redis.session_ttl_seconds)
             .await?;
 
-        (Some("dpop".to_string()), session_id)
+        (Some(thumbprint), session_id)
     };
 
     let session_id = dpop_jkt.1;
@@ -218,6 +234,9 @@ pub async fn oauth_callback(
 
     let session_service = SessionService::new(state.clone());
     session_service.save_session(&session).await?;
+
+    // Record successful OAuth login
+    metrics::record_oauth_login(true);
 
     // Set cookie
     let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
@@ -308,6 +327,8 @@ pub async fn proxy_xrpc(
     headers: HeaderMap,
     body: Body,
 ) -> AppResult<Response> {
+    let start = std::time::Instant::now();
+    
     // Extract request ID from client for end-to-end correlation
     let request_id = headers
         .get("x-catbird-request-id")
@@ -374,6 +395,10 @@ pub async fn proxy_xrpc(
             "[BFF-RESP] MLS response"
         );
 
+        // Record proxy metrics
+        let duration = start.elapsed().as_secs_f64();
+        metrics::record_proxy_request(&lexicon, status, duration);
+
         let mut response = Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
         for (name, value) in response_headers.iter() {
@@ -402,7 +427,7 @@ pub async fn proxy_xrpc(
     );
 
     let client = AtProtoClient::new(state.clone());
-    let (status, response_headers, response_body) = client
+    let proxy_response = client
         .proxy_request(
             &session,
             method,
@@ -415,28 +440,59 @@ pub async fn proxy_xrpc(
         )
         .await?;
 
-    let response_shape = json_shape(&response_body);
-    tracing::info!(
-        request_id = %request_id,
-        status = status,
-        body_bytes = response_body.len(),
-        body_shape = ?response_shape,
-        "[BFF-RESP] PDS response"
-    );
+    // Record proxy metrics
+    let duration = start.elapsed().as_secs_f64();
+    metrics::record_proxy_request(&lexicon, proxy_response.status(), duration);
 
-    let mut response =
-        Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
-    for (name, value) in response_headers.iter() {
-        let name_str = name.as_str();
-        if matches!(
-            name_str,
-            "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
-        ) {
-            response = response.header(name, value);
+    match proxy_response {
+        ProxyResponse::Buffered { status, headers: resp_headers, body: response_body } => {
+            let response_shape = json_shape(&response_body);
+            tracing::info!(
+                request_id = %request_id,
+                status = status,
+                body_bytes = response_body.len(),
+                body_shape = ?response_shape,
+                "[BFF-RESP] PDS response (buffered)"
+            );
+
+            let mut response =
+                Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+            for (name, value) in resp_headers.iter() {
+                let name_str = name.as_str();
+                if matches!(
+                    name_str,
+                    "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+                ) {
+                    response = response.header(name, value);
+                }
+            }
+
+            Ok(response.body(Body::from(response_body)).unwrap())
+        }
+        ProxyResponse::Streaming { status, headers: resp_headers, body: upstream_response } => {
+            tracing::info!(
+                request_id = %request_id,
+                status = status,
+                "[BFF-RESP] PDS response (streaming)"
+            );
+
+            let mut response =
+                Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+            for (name, value) in resp_headers.iter() {
+                let name_str = name.as_str();
+                if matches!(
+                    name_str,
+                    "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+                ) {
+                    response = response.header(name, value);
+                }
+            }
+
+            // Stream the response body directly from upstream
+            let stream = upstream_response.bytes_stream();
+            Ok(response.body(Body::from_stream(stream)).unwrap())
         }
     }
-
-    Ok(response.body(Body::from(response_body)).unwrap())
 }
 
 /// Extract JSON shape information for logging (top-level keys and array lengths)

@@ -20,6 +20,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod error;
 mod handlers;
+mod metrics;
 mod middleware;
 mod models;
 mod routes;
@@ -58,6 +59,23 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Connected to Redis at {}", app_config.redis.url);
 
+    // Register Prometheus metrics
+    metrics::register_metrics();
+    tracing::info!("Prometheus metrics registered");
+
+    // Start background task to update active sessions gauge
+    let metrics_state = state.clone();
+    let key_prefix = app_config.redis.key_prefix.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Ok(count) = count_active_sessions(&metrics_state.redis, &key_prefix).await {
+                metrics::set_active_sessions(count as f64);
+            }
+        }
+    });
+
     // Build CORS layer
     let cors = CorsLayer::new()
         .allow_origin(Any) // TODO: Restrict in production
@@ -70,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health::health_check))
         .route("/ready", get(routes::health::readiness_check))
         .route("/live", get(routes::health::liveness_check))
+        // Metrics endpoint
+        .route("/metrics", get(metrics::metrics_handler))
         // ATProto routes (auth + xrpc proxy)
         .merge(routes::atproto::create_router(state.clone()))
         // Global middleware
@@ -93,4 +113,18 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Count active sessions in Redis by scanning session keys
+async fn count_active_sessions(
+    redis: &redis::aio::ConnectionManager,
+    key_prefix: &str,
+) -> Result<usize, redis::RedisError> {
+    let pattern = format!("{}session:*", key_prefix);
+    let mut conn = redis.clone();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(&mut conn)
+        .await?;
+    Ok(keys.len())
 }

@@ -8,12 +8,54 @@
 use super::ssrf::validate_pds_url;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
+use crate::metrics;
 use crate::models::{CatbirdSession, DPoPKeyPair};
-use chrono::{Duration, Utc};
+use chrono::Utc;
+use futures_util::StreamExt;
 use redis::AsyncCommands;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Maximum response size allowed (50MB)
+pub const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024;
+
+/// Threshold above which responses are streamed instead of buffered (1MB)
+pub const STREAM_THRESHOLD: usize = 1 * 1024 * 1024;
+
+/// Response from proxy request - either buffered bytes or a streaming body
+pub enum ProxyResponse {
+    /// Buffered response for smaller payloads (can be inspected/modified)
+    Buffered {
+        status: u16,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+    },
+    /// Streaming response for larger payloads (passed through directly)
+    Streaming {
+        status: u16,
+        headers: HeaderMap,
+        body: reqwest::Response,
+    },
+}
+
+impl ProxyResponse {
+    /// Get the status code
+    pub fn status(&self) -> u16 {
+        match self {
+            ProxyResponse::Buffered { status, .. } => *status,
+            ProxyResponse::Streaming { status, .. } => *status,
+        }
+    }
+
+    /// Get the response headers
+    pub fn headers(&self) -> &HeaderMap {
+        match self {
+            ProxyResponse::Buffered { headers, .. } => headers,
+            ProxyResponse::Streaming { headers, .. } => headers,
+        }
+    }
+}
 
 /// ATProto client for making authenticated requests to PDS
 pub struct AtProtoClient {
@@ -76,6 +118,9 @@ impl AtProtoClient {
 
     /// Proxy a raw request to the PDS, preserving method and body
     /// Handles DPoP nonce retry automatically
+    /// 
+    /// Returns a ProxyResponse which can be either buffered (for small JSON responses
+    /// that may need processing) or streaming (for large responses like blobs).
     pub async fn proxy_request(
         &self,
         session: &CatbirdSession,
@@ -86,7 +131,7 @@ impl AtProtoClient {
         content_type: Option<&str>,
         client_headers: Option<&HeaderMap>,
         request_id: &str,
-    ) -> AppResult<(u16, HeaderMap, bytes::Bytes)> {
+    ) -> AppResult<ProxyResponse> {
         // SSRF protection: validate the PDS URL before making any requests
         validate_pds_url(&session.pds_url)?;
 
@@ -105,17 +150,17 @@ impl AtProtoClient {
             "[BFF-UPSTREAM] First attempt (no nonce)"
         );
 
-        // First attempt without nonce
-        let (status, response_headers, response_body) = self
-            .do_proxy_request(session, method.clone(), &url, body.clone(), content_type, None, client_headers, request_id, 1)
+        // First attempt without nonce - always buffer since we may need to inspect for DPoP nonce
+        let first_response = self
+            .do_proxy_request_buffered(session, method.clone(), &url, body.clone(), content_type, None, client_headers, request_id, 1)
             .await?;
 
         // Check if we got a DPoP nonce error (401 with use_dpop_nonce)
-        if status == 401 {
-            if let Ok(error_json) = serde_json::from_slice::<Value>(&response_body) {
+        if first_response.0 == 401 {
+            if let Ok(error_json) = serde_json::from_slice::<Value>(&first_response.2) {
                 if error_json.get("error").and_then(|e| e.as_str()) == Some("use_dpop_nonce") {
                     // Extract nonce from DPoP-Nonce header
-                    if let Some(nonce_value) = response_headers.get("dpop-nonce") {
+                    if let Some(nonce_value) = first_response.1.get("dpop-nonce") {
                         if let Ok(nonce) = nonce_value.to_str() {
                             let retry_body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
                             tracing::info!(
@@ -126,7 +171,7 @@ impl AtProtoClient {
                                 "[BFF-DPOP-RETRY] Received nonce challenge, retrying"
                             );
                             
-                            // Retry with the nonce
+                            // Retry with the nonce - use streaming-aware version
                             return self
                                 .do_proxy_request(
                                     session,
@@ -150,11 +195,176 @@ impl AtProtoClient {
             }
         }
 
-        Ok((status, response_headers, response_body))
+        Ok(ProxyResponse::Buffered {
+            status: first_response.0,
+            headers: first_response.1,
+            body: first_response.2,
+        })
     }
 
-    /// Internal helper to perform the actual proxy request
+    /// Internal helper to perform the actual proxy request with streaming support
+    /// 
+    /// Decides whether to buffer or stream based on content-length and content-type:
+    /// - Responses > MAX_RESPONSE_SIZE (50MB): Rejected with error
+    /// - Responses > STREAM_THRESHOLD (1MB) or non-JSON: Streamed directly
+    /// - Small JSON responses: Buffered for potential processing
     async fn do_proxy_request(
+        &self,
+        session: &CatbirdSession,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<bytes::Bytes>,
+        content_type: Option<&str>,
+        nonce: Option<String>,
+        client_headers: Option<&HeaderMap>,
+        request_id: &str,
+        attempt: u8,
+    ) -> AppResult<ProxyResponse> {
+        let has_nonce = nonce.is_some();
+        let mut headers = self
+            .build_auth_headers_for_request(session, method.as_str(), url, nonce)
+            .await?;
+
+        if let Some(ct) = content_type {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+        }
+
+        // Forward all client headers except hop-by-hop and headers we set ourselves
+        if let Some(ch) = client_headers {
+            for (name, value) in ch.iter() {
+                let name_lower = name.as_str().to_lowercase();
+                // Skip hop-by-hop headers and headers we manage
+                if matches!(
+                    name_lower.as_str(),
+                    "host" | "connection" | "keep-alive" | "transfer-encoding" 
+                    | "te" | "trailer" | "upgrade" | "proxy-authorization"
+                    | "proxy-connection" | "authorization" | "dpop" | "content-length"
+                ) {
+                    continue;
+                }
+                // Don't overwrite content-type if we already set it
+                if name_lower == "content-type" && headers.contains_key(CONTENT_TYPE) {
+                    continue;
+                }
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+
+        let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        tracing::debug!(
+            request_id = %request_id,
+            attempt = attempt,
+            url = %url,
+            method = %method,
+            body_size = body_size,
+            has_nonce = has_nonce,
+            "[BFF-UPSTREAM-SEND] Sending to PDS"
+        );
+
+        let mut request = self
+            .state
+            .http_client
+            .request(method, url)
+            .headers(headers);
+
+        if let Some(b) = body {
+            request = request.body(b);
+        }
+
+        let start = std::time::Instant::now();
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    request_id = %request_id,
+                    attempt = attempt,
+                    url = %url,
+                    error = %e,
+                    is_builder = e.is_builder(),
+                    is_request = e.is_request(),
+                    is_connect = e.is_connect(),
+                    is_body = e.is_body(),
+                    "[BFF-UPSTREAM-ERR] Request failed"
+                );
+                return Err(e.into());
+            }
+        };
+
+        let status = response.status().as_u16();
+        let response_headers = response.headers().clone();
+
+        // Check Content-Length for size limits
+        let content_length = response_headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
+
+        // Reject responses that are too large
+        if let Some(len) = content_length {
+            if len > MAX_RESPONSE_SIZE {
+                tracing::warn!(
+                    request_id = %request_id,
+                    content_length = len,
+                    max_size = MAX_RESPONSE_SIZE,
+                    "[BFF-UPSTREAM-ERR] Response too large"
+                );
+                return Err(AppError::ResponseTooLarge(format!(
+                    "Response size {} bytes exceeds maximum allowed {} bytes",
+                    len, MAX_RESPONSE_SIZE
+                )));
+            }
+        }
+
+        // Determine if we should stream or buffer
+        let response_content_type = response_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        
+        let is_json = response_content_type.contains("application/json");
+        let should_stream = content_length.map(|l| l > STREAM_THRESHOLD).unwrap_or(false) || !is_json;
+
+        if should_stream {
+            let elapsed_ms = start.elapsed().as_millis();
+            tracing::debug!(
+                request_id = %request_id,
+                attempt = attempt,
+                status = status,
+                elapsed_ms = elapsed_ms,
+                content_length = ?content_length,
+                streaming = true,
+                "[BFF-UPSTREAM-RECV] Response from PDS (streaming)"
+            );
+
+            Ok(ProxyResponse::Streaming {
+                status,
+                headers: response_headers,
+                body: response,
+            })
+        } else {
+            // Buffer small JSON responses
+            let body = self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id).await?;
+            let elapsed_ms = start.elapsed().as_millis();
+
+            tracing::debug!(
+                request_id = %request_id,
+                attempt = attempt,
+                status = status,
+                elapsed_ms = elapsed_ms,
+                body_size = body.len(),
+                "[BFF-UPSTREAM-RECV] Response from PDS (buffered)"
+            );
+
+            Ok(ProxyResponse::Buffered {
+                status,
+                headers: response_headers,
+                body,
+            })
+        }
+    }
+
+    /// Internal helper for first request that always buffers (needed for DPoP nonce inspection)
+    async fn do_proxy_request_buffered(
         &self,
         session: &CatbirdSession,
         method: reqwest::Method,
@@ -238,7 +448,30 @@ impl AtProtoClient {
 
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
-        let body = response.bytes().await?;
+        
+        // Check Content-Length for size limits on initial request
+        let content_length = response_headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
+
+        if let Some(len) = content_length {
+            if len > MAX_RESPONSE_SIZE {
+                tracing::warn!(
+                    request_id = %request_id,
+                    content_length = len,
+                    max_size = MAX_RESPONSE_SIZE,
+                    "[BFF-UPSTREAM-ERR] Response too large"
+                );
+                return Err(AppError::ResponseTooLarge(format!(
+                    "Response size {} bytes exceeds maximum allowed {} bytes",
+                    len, MAX_RESPONSE_SIZE
+                )));
+            }
+        }
+
+        // Read response with size limit protection
+        let body = self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id).await?;
         let elapsed_ms = start.elapsed().as_millis();
 
         tracing::debug!(
@@ -251,6 +484,40 @@ impl AtProtoClient {
         );
 
         Ok((status, response_headers, body))
+    }
+
+    /// Read response body with size limit protection
+    /// 
+    /// Reads the response body in chunks and enforces a maximum size limit
+    /// to prevent memory exhaustion from untrusted responses.
+    async fn read_response_with_limit(
+        &self,
+        response: reqwest::Response,
+        max_size: usize,
+        request_id: &str,
+    ) -> AppResult<bytes::Bytes> {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+            if body.len() + chunk.len() > max_size {
+                tracing::warn!(
+                    request_id = %request_id,
+                    current_size = body.len(),
+                    chunk_size = chunk.len(),
+                    max_size = max_size,
+                    "[BFF-UPSTREAM-ERR] Response exceeded size limit while reading"
+                );
+                return Err(AppError::ResponseTooLarge(format!(
+                    "Response exceeded maximum size of {} bytes while reading",
+                    max_size
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(bytes::Bytes::from(body))
     }
 
     /// Build authentication headers including DPoP if needed
@@ -732,6 +999,9 @@ impl SessionService {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             
+            // Record token refresh failure
+            metrics::record_token_refresh(false);
+            
             // Check for invalid_grant - this means the refresh token was rejected
             // This can happen when: user revoked access, token was already used,
             // or PDS invalidated the session
@@ -807,6 +1077,7 @@ impl SessionService {
         };
 
         tracing::info!("Successfully refreshed tokens for session {}", session.id);
+        metrics::record_token_refresh(true);
         Ok(refreshed_session)
     }
     

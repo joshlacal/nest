@@ -239,6 +239,41 @@ pub fn create_oauth_client(state: &AppState) -> AppResult<CatbirdOAuthClient> {
 
 /// Load ES256 keys from configuration and convert to JWK keyset
 fn load_oauth_keys(state: &AppState) -> AppResult<Option<Vec<Jwk>>> {
+    // Use KeyStore if available
+    if let Some(key_store) = &state.key_store {
+        let jwks = key_store
+            .all_keys()
+            .iter()
+            .map(|key| {
+                let public_key = key.secret_key.public_key();
+                let ec_point = public_key.to_encoded_point(false);
+
+                let x_bytes = ec_point.x().expect("Missing x coordinate");
+                let y_bytes = ec_point.y().expect("Missing y coordinate");
+                let d_bytes = key.secret_key.to_bytes();
+
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+                let jwk = serde_json::json!({
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": b64.encode(x_bytes.as_slice()),
+                    "y": b64.encode(y_bytes.as_slice()),
+                    "d": b64.encode(d_bytes.as_slice()),
+                    "alg": "ES256",
+                    "use": "sig",
+                    "kid": key.kid
+                });
+
+                serde_json::from_value(jwk).expect("Failed to create JWK")
+            })
+            .collect();
+
+        return Ok(Some(jwks));
+    }
+
+    // Fallback to legacy single-key loading
     let crypto = CryptoService::new(std::sync::Arc::new(state.clone()));
 
     // Try to load the private key

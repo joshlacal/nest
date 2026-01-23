@@ -14,6 +14,15 @@ session_ttl_seconds = 2592000  # 30 days
 [oauth]
 client_id = "http://localhost:3000"
 redirect_uri = "http://localhost:3000/auth/callback"
+# Single key (backward compatible):
 # private_key_path = "config/private_key.pem"
 # private_key_base64 = ""  # Alternative: base64-encoded PEM key
+
+# Multi-key mode for key rotation:
+# private_key_paths = [
+#   "config/catbird-key-1.pem",
+#   "config/catbird-key-2.pem",
+# ]
+# active_key_id = "catbird-key-2"  # Which key to use for signing
+
 scopes = ["atproto", "transition:generic"]

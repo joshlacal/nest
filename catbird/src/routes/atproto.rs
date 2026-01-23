@@ -87,41 +87,26 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/.well-known", wellknown_routes)
 }
 
-/// OAuth Client Metadata endpoint
-///
-/// GET /.well-known/oauth-client-metadata
-///
-/// Returns the OAuth client metadata required for ATProto OAuth.
-async fn oauth_client_metadata(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "client_id": state.config.oauth.client_id,
-        "client_name": "Catbird",
-        "client_uri": state.config.server.base_url,
-        "logo_uri": format!("{}/logo.png", state.config.server.base_url),
-        "tos_uri": format!("{}/terms", state.config.server.base_url),
-        "policy_uri": format!("{}/privacy", state.config.server.base_url),
-        "redirect_uris": [&state.config.oauth.redirect_uri],
-        "scope": state.config.oauth.scopes.join(" "),
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "private_key_jwt",
-        "token_endpoint_auth_signing_alg": "ES256",
-        "jwks_uri": format!("{}/.well-known/jwks.json", state.config.server.base_url),
-        "application_type": "web",
-        "dpop_bound_access_tokens": true,
-    }))
-}
+// NOTE: OAuth client metadata is served statically by nginx at
+// https://catbird.blue/oauth-client-metadata.json
+// No dynamic endpoint needed here.
 
 /// JWKS endpoint
 ///
 /// GET /.well-known/jwks.json
 ///
 /// Returns the public keys for client authentication.
+/// Supports multiple keys for key rotation.
 async fn jwks(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
+    // Use KeyStore if available (multi-key mode)
+    if let Some(key_store) = &state.key_store {
+        let keys = key_store.to_jwks();
+        return axum::Json(serde_json::json!({ "keys": keys }));
+    }
+
+    // Fallback to legacy single-key mode
     let crypto_service = CryptoService::new(state.clone());
     let private_key = match crypto_service.load_private_key() {
         Ok(key) => key,
@@ -161,6 +146,7 @@ async fn jwks(
 ///
 /// Returns the DID document for this gateway (did:web resolution).
 /// This allows the MLS server to verify JWTs signed by this gateway.
+/// Includes all configured keys for key rotation support.
 async fn did_document(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
@@ -177,6 +163,56 @@ async fn did_document(
         format!("did:web:{}", host)
     });
 
+    // Use KeyStore if available (multi-key mode)
+    if let Some(key_store) = &state.key_store {
+        let keys = key_store.all_keys();
+        let verification_methods: Vec<serde_json::Value> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let public_key = key.secret_key.public_key();
+                let encoded = public_key.to_encoded_point(false);
+                let x = encoded
+                    .x()
+                    .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+                    .unwrap_or_default();
+                let y = encoded
+                    .y()
+                    .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+                    .unwrap_or_default();
+
+                serde_json::json!({
+                    "id": format!("{}#key-{}", gateway_did, i + 1),
+                    "type": "JsonWebKey2020",
+                    "controller": gateway_did,
+                    "publicKeyJwk": {
+                        "kty": "EC",
+                        "crv": "P-256",
+                        "kid": key.kid,
+                        "x": x,
+                        "y": y,
+                    }
+                })
+            })
+            .collect();
+
+        let key_refs: Vec<String> = (1..=keys.len())
+            .map(|i| format!("{}#key-{}", gateway_did, i))
+            .collect();
+
+        return axum::Json(serde_json::json!({
+            "@context": [
+                "https://www.w3.org/ns/did/v1",
+                "https://w3id.org/security/suites/jws-2020/v1"
+            ],
+            "id": gateway_did,
+            "verificationMethod": verification_methods,
+            "authentication": key_refs,
+            "assertionMethod": key_refs
+        }));
+    }
+
+    // Fallback to legacy single-key mode
     let crypto_service = CryptoService::new(state.clone());
     let private_key = match crypto_service.load_private_key() {
         Ok(key) => key,

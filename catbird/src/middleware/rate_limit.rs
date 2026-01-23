@@ -21,6 +21,8 @@ use std::{
 };
 use tokio::sync::RwLock;
 
+use crate::metrics;
+
 /// Rate limit configuration
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
@@ -250,6 +252,7 @@ pub async fn session_rate_limit(
         }
         Err(retry_after) => {
             tracing::warn!(key = %key, retry_after = retry_after, "Session rate limit exceeded");
+            metrics::record_rate_limit_exceeded("xrpc");
             rate_limit_response(retry_after)
         }
     }
@@ -274,6 +277,7 @@ pub async fn ip_rate_limit(
         }
         Err(retry_after) => {
             tracing::warn!(key = %key, retry_after = retry_after, "Auth rate limit exceeded");
+            metrics::record_rate_limit_exceeded("auth");
             rate_limit_response(retry_after)
         }
     }
