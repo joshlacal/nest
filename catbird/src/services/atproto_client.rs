@@ -2,7 +2,7 @@
 //!
 //! Handles communication with ATProto PDS servers, including:
 //! - OAuth token management (refresh, DPoP)
-//! - Request proxying
+//! - Request proxying with DPoP nonce retry
 //! - Token refresh logic
 
 use crate::config::AppState;
@@ -40,7 +40,7 @@ impl AtProtoClient {
         }
 
         let headers = self
-            .build_auth_headers_for_request(session, "GET", &url)
+            .build_auth_headers_for_request(session, "GET", &url, None)
             .await?;
         request = request.headers(headers);
 
@@ -58,7 +58,7 @@ impl AtProtoClient {
         let url = format!("{}{}", session.pds_url, path);
 
         let headers = self
-            .build_auth_headers_for_request(session, "POST", &url)
+            .build_auth_headers_for_request(session, "POST", &url, None)
             .await?;
 
         let response = self
@@ -74,6 +74,7 @@ impl AtProtoClient {
     }
 
     /// Proxy a raw request to the PDS, preserving method and body
+    /// Handles DPoP nonce retry automatically
     pub async fn proxy_request(
         &self,
         session: &CatbirdSession,
@@ -82,6 +83,8 @@ impl AtProtoClient {
         query_string: Option<&str>,
         body: Option<bytes::Bytes>,
         content_type: Option<&str>,
+        client_headers: Option<&HeaderMap>,
+        request_id: &str,
     ) -> AppResult<(u16, HeaderMap, bytes::Bytes)> {
         let url = if let Some(qs) = query_string {
             format!("{}{}?{}", session.pds_url, path, qs)
@@ -89,35 +92,141 @@ impl AtProtoClient {
             format!("{}{}", session.pds_url, path)
         };
 
+        let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        tracing::debug!(
+            request_id = %request_id,
+            url = %url,
+            method = %method,
+            body_size = body_size,
+            "[BFF-UPSTREAM] First attempt (no nonce)"
+        );
+
+        // First attempt without nonce
+        let (status, response_headers, response_body) = self
+            .do_proxy_request(session, method.clone(), &url, body.clone(), content_type, None, client_headers, request_id, 1)
+            .await?;
+
+        // Check if we got a DPoP nonce error (401 with use_dpop_nonce)
+        if status == 401 {
+            if let Ok(error_json) = serde_json::from_slice::<Value>(&response_body) {
+                if error_json.get("error").and_then(|e| e.as_str()) == Some("use_dpop_nonce") {
+                    // Extract nonce from DPoP-Nonce header
+                    if let Some(nonce_value) = response_headers.get("dpop-nonce") {
+                        if let Ok(nonce) = nonce_value.to_str() {
+                            let retry_body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+                            tracing::info!(
+                                request_id = %request_id,
+                                retry_body_size = retry_body_size,
+                                original_body_size = body_size,
+                                body_preserved = (retry_body_size == body_size),
+                                "[BFF-DPOP-RETRY] Received nonce challenge, retrying"
+                            );
+                            
+                            // Retry with the nonce
+                            return self
+                                .do_proxy_request(
+                                    session,
+                                    method,
+                                    &url,
+                                    body,
+                                    content_type,
+                                    Some(nonce.to_string()),
+                                    client_headers,
+                                    request_id,
+                                    2,
+                                )
+                                .await;
+                        }
+                    }
+                    tracing::warn!(
+                        request_id = %request_id,
+                        "[BFF-DPOP-RETRY] Got use_dpop_nonce error but no DPoP-Nonce header in response"
+                    );
+                }
+            }
+        }
+
+        Ok((status, response_headers, response_body))
+    }
+
+    /// Internal helper to perform the actual proxy request
+    async fn do_proxy_request(
+        &self,
+        session: &CatbirdSession,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<bytes::Bytes>,
+        content_type: Option<&str>,
+        nonce: Option<String>,
+        client_headers: Option<&HeaderMap>,
+        request_id: &str,
+        attempt: u8,
+    ) -> AppResult<(u16, HeaderMap, bytes::Bytes)> {
+        let has_nonce = nonce.is_some();
         let mut headers = self
-            .build_auth_headers_for_request(session, method.as_str(), &url)
+            .build_auth_headers_for_request(session, method.as_str(), url, nonce)
             .await?;
 
         if let Some(ct) = content_type {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
         }
 
+        // Forward all client headers except hop-by-hop and headers we set ourselves
+        if let Some(ch) = client_headers {
+            for (name, value) in ch.iter() {
+                let name_lower = name.as_str().to_lowercase();
+                // Skip hop-by-hop headers and headers we manage
+                if matches!(
+                    name_lower.as_str(),
+                    "host" | "connection" | "keep-alive" | "transfer-encoding" 
+                    | "te" | "trailer" | "upgrade" | "proxy-authorization"
+                    | "proxy-connection" | "authorization" | "dpop" | "content-length"
+                ) {
+                    continue;
+                }
+                // Don't overwrite content-type if we already set it
+                if name_lower == "content-type" && headers.contains_key(CONTENT_TYPE) {
+                    continue;
+                }
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+
+        let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        tracing::debug!(
+            request_id = %request_id,
+            attempt = attempt,
+            url = %url,
+            method = %method,
+            body_size = body_size,
+            has_nonce = has_nonce,
+            "[BFF-UPSTREAM-SEND] Sending to PDS"
+        );
+
         let mut request = self
             .state
             .http_client
-            .request(method, &url)
+            .request(method, url)
             .headers(headers);
 
         if let Some(b) = body {
             request = request.body(b);
         }
 
+        let start = std::time::Instant::now();
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
-                    "Request failed to {}: {:?} (is_builder: {}, is_request: {}, is_connect: {}, is_body: {})",
-                    url,
-                    e,
-                    e.is_builder(),
-                    e.is_request(),
-                    e.is_connect(),
-                    e.is_body()
+                    request_id = %request_id,
+                    attempt = attempt,
+                    url = %url,
+                    error = %e,
+                    is_builder = e.is_builder(),
+                    is_request = e.is_request(),
+                    is_connect = e.is_connect(),
+                    is_body = e.is_body(),
+                    "[BFF-UPSTREAM-ERR] Request failed"
                 );
                 return Err(e.into());
             }
@@ -126,13 +235,23 @@ impl AtProtoClient {
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
         let body = response.bytes().await?;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        tracing::debug!(
+            request_id = %request_id,
+            attempt = attempt,
+            status = status,
+            elapsed_ms = elapsed_ms,
+            body_size = body.len(),
+            "[BFF-UPSTREAM-RECV] Response from PDS"
+        );
 
         Ok((status, response_headers, body))
     }
 
     /// Build authentication headers including DPoP if needed
     async fn build_auth_headers(&self, session: &CatbirdSession) -> AppResult<HeaderMap> {
-        self.build_auth_headers_for_request(session, "GET", &session.pds_url)
+        self.build_auth_headers_for_request(session, "GET", &session.pds_url, None)
             .await
     }
 
@@ -142,13 +261,14 @@ impl AtProtoClient {
         session: &CatbirdSession,
         method: &str,
         url: &str,
+        nonce: Option<String>,
     ) -> AppResult<HeaderMap> {
         let mut headers = HeaderMap::new();
 
         // If we have a DPoP key, generate a DPoP proof
-        if let Some(ref dpop_jkt) = session.dpop_jkt {
+        if let Some(ref _dpop_jkt) = session.dpop_jkt {
             // Generate DPoP proof JWT
-            let dpop_proof = self.generate_dpop_proof(session, method, url).await?;
+            let dpop_proof = self.generate_dpop_proof(session, method, url, nonce).await?;
 
             // Use DPoP token scheme (not Bearer)
             let auth_value = format!("DPoP {}", session.access_token);
@@ -178,11 +298,12 @@ impl AtProtoClient {
     }
 
     /// Generate a DPoP proof JWT per RFC 9449
-    async fn generate_dpop_proof(
+    pub async fn generate_dpop_proof(
         &self,
         session: &CatbirdSession,
         http_method: &str,
         http_url: &str,
+        nonce: Option<String>,
     ) -> AppResult<String> {
         use base64::Engine;
         use sha2::{Digest, Sha256};
@@ -225,14 +346,19 @@ impl AtProtoClient {
             "jwk": dpop_key.public_jwk
         });
 
-        // Build the DPoP JWT payload
-        let payload = serde_json::json!({
+        // Build the DPoP JWT payload - include nonce if provided
+        let mut payload = serde_json::json!({
             "jti": jti,
             "htm": http_method.to_uppercase(),
             "htu": htu,
             "iat": iat,
             "ath": ath
         });
+
+        // Add nonce claim if provided (required for DPoP nonce retry)
+        if let Some(nonce_value) = nonce {
+            payload["nonce"] = serde_json::Value::String(nonce_value);
+        }
 
         // Encode header and payload
         let encoded_header = b64url.encode(serde_json::to_string(&header)?.as_bytes());
@@ -251,7 +377,7 @@ impl AtProtoClient {
     }
 
     /// Retrieve the DPoP private key for a session
-    async fn get_dpop_private_key(&self, session: &CatbirdSession) -> AppResult<DPoPKeyPair> {
+    pub async fn get_dpop_private_key(&self, session: &CatbirdSession) -> AppResult<DPoPKeyPair> {
         // The DPoP key should be stored in Redis alongside the session
         let key = format!(
             "{}dpop_key:{}",
@@ -521,27 +647,287 @@ impl SessionService {
 
     /// Revoke a session (logout)
     ///
-    /// Revokes the OAuth session via OAuthClient and deletes the local session.
+    /// Revokes the OAuth session via direct HTTP call to the PDS revocation endpoint,
+    /// then deletes the local session.
+    /// Revoke a session (logout)
+    ///
+    /// Revokes the OAuth session via direct HTTP call to the Authorization Server revocation endpoint,
+    /// then deletes the local session.
     pub async fn revoke_session(&self, session: &CatbirdSession) -> AppResult<()> {
-        use atrium_api::types::string::Did;
-
-        // Parse the DID
-        let did: Did = session
-            .did
-            .parse()
-            .map_err(|_| AppError::Internal(format!("Invalid DID: {}", session.did)))?;
-
-        // Revoke the OAuth session if client is configured
-        if let Some(oauth_client) = self.state.oauth_client.as_ref() {
-            if let Err(e) = oauth_client.revoke(&did).await {
-                tracing::warn!("Failed to revoke OAuth session: {}", e);
-                // Continue with local cleanup even if revoke fails
+        // Resolve the authorization server and revocation endpoint per ATProto OAuth spec
+        let revocation_url = self.get_revocation_endpoint(&session.pds_url).await?;
+        
+        tracing::info!("Revoking OAuth token at {}", revocation_url);
+        
+        // Generate client assertion for confidential client authentication
+        let client_assertion = self.generate_client_assertion(&revocation_url).await?;
+        
+        // Build form body with client authentication
+        let body = format!(
+            "token={}&client_id={}&client_assertion_type={}&client_assertion={}",
+            urlencoding::encode(&session.access_token),
+            urlencoding::encode(&self.state.config.oauth.client_id),
+            urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            urlencoding::encode(&client_assertion)
+        );
+        
+        // First attempt - no nonce, no ath (auth server requests don't use ath)
+        let dpop_proof = self.generate_dpop_proof_for_auth_server(
+            session,
+            "POST",
+            &revocation_url,
+            None,
+        ).await?;
+        
+        let response = self
+            .state
+            .http_client
+            .post(&revocation_url)
+            .header("DPoP", dpop_proof)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body.clone())
+            .send()
+            .await?;
+        
+        // Check if we need to retry with DPoP nonce
+        let response = if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let nonce = response.headers()
+                .get("DPoP-Nonce")
+                .or_else(|| response.headers().get("dpop-nonce"))
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            
+            if let Some(nonce) = nonce {
+                tracing::info!("Received DPoP nonce challenge for revoke, retrying with nonce");
+                
+                // Regenerate DPoP proof with nonce (no ath for auth server)
+                let dpop_proof_with_nonce = self.generate_dpop_proof_for_auth_server(
+                    session,
+                    "POST",
+                    &revocation_url,
+                    Some(nonce),
+                ).await?;
+                
+                // Regenerate client assertion (needs fresh jti)
+                let client_assertion = self.generate_client_assertion(&revocation_url).await?;
+                let body = format!(
+                    "token={}&client_id={}&client_assertion_type={}&client_assertion={}",
+                    urlencoding::encode(&session.access_token),
+                    urlencoding::encode(&self.state.config.oauth.client_id),
+                    urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                    urlencoding::encode(&client_assertion)
+                );
+                
+                self.state
+                    .http_client
+                    .post(&revocation_url)
+                    .header("DPoP", dpop_proof_with_nonce)
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(body)
+                    .send()
+                    .await?
+            } else {
+                response
             }
+        } else {
+            response
+        };
+        
+        // Per RFC 7009, revocation should return 200, but some implementations return 204
+        // Accept either as success
+        if response.status().is_success() {
+            tracing::info!("Successfully revoked OAuth token for {}", session.did);
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!("OAuth revocation returned {}: {}", status, body);
+            // Continue with local cleanup even if revoke fails
         }
 
         // Delete local session
         self.delete_session(&session.id.to_string()).await?;
 
         Ok(())
+    }
+    
+    /// Generate a DPoP proof for auth server requests (without ath claim)
+    /// 
+    /// Auth server endpoints (token, revoke) should NOT include the ath claim.
+    /// Only resource server requests include ath.
+    async fn generate_dpop_proof_for_auth_server(
+        &self,
+        session: &CatbirdSession,
+        http_method: &str,
+        http_url: &str,
+        nonce: Option<String>,
+    ) -> AppResult<String> {
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        
+        let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        // Parse the URL to get just the origin and path (excluding query params for htu)
+        let htu = {
+            let parsed = url::Url::parse(http_url)
+                .map_err(|e| AppError::Internal(format!("Invalid URL: {}", e)))?;
+            format!(
+                "{}://{}{}",
+                parsed.scheme(),
+                parsed.host_str().unwrap_or(""),
+                parsed.path()
+            )
+        };
+
+        // Generate unique token ID
+        let jti = uuid::Uuid::new_v4().to_string();
+
+        // Current timestamp
+        let iat = chrono::Utc::now().timestamp();
+
+        // Load the DPoP private key from Redis
+        let atproto_client = AtProtoClient::new(Arc::clone(&self.state));
+        let dpop_key = atproto_client.get_dpop_private_key(session).await?;
+
+        // Build the DPoP JWT header
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": dpop_key.public_jwk
+        });
+
+        // Build the DPoP JWT payload - NO ath claim for auth server requests
+        let mut payload = serde_json::json!({
+            "jti": jti,
+            "htm": http_method.to_uppercase(),
+            "htu": htu,
+            "iat": iat
+        });
+
+        // Add nonce claim if provided
+        if let Some(nonce_value) = nonce {
+            payload["nonce"] = serde_json::Value::String(nonce_value);
+        }
+
+        // Encode header and payload
+        let header_b64 = b64url.encode(serde_json::to_string(&header)?.as_bytes());
+        let payload_b64 = b64url.encode(serde_json::to_string(&payload)?.as_bytes());
+        let message = format!("{}.{}", header_b64, payload_b64);
+
+        // Sign with the DPoP private key
+        let signing_key = SigningKey::from_bytes(&dpop_key.private_key_bytes.into())
+            .map_err(|e| AppError::Internal(format!("Failed to create signing key: {}", e)))?;
+        let signature: Signature = signing_key.sign(message.as_bytes());
+        let sig_b64 = b64url.encode(signature.to_bytes());
+
+        Ok(format!("{}.{}", message, sig_b64))
+    }
+    
+    /// Generate a client assertion JWT for confidential client authentication
+    async fn generate_client_assertion(&self, audience: &str) -> AppResult<String> {
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        
+        let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        
+        // Load the client's private key
+        let crypto = super::CryptoService::new(Arc::clone(&self.state));
+        let secret_key = crypto.load_private_key()?;
+        let signing_key = SigningKey::from(&secret_key);
+        
+        // Extract the issuer (authorization server base URL) from the revocation URL
+        let issuer = url::Url::parse(audience)
+            .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
+            .unwrap_or_else(|_| audience.to_string());
+        
+        // Generate unique JWT ID
+        let jti = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        
+        // Build JWT header
+        let header = serde_json::json!({
+            "alg": "ES256",
+            "typ": "JWT"
+        });
+        
+        // Build JWT claims per RFC 7523
+        let claims = serde_json::json!({
+            "iss": self.state.config.oauth.client_id,
+            "sub": self.state.config.oauth.client_id,
+            "aud": issuer,
+            "iat": now,
+            "exp": now + 300, // 5 minutes
+            "jti": jti
+        });
+        
+        // Encode header and claims
+        let header_b64 = b64url.encode(serde_json::to_string(&header)?.as_bytes());
+        let claims_b64 = b64url.encode(serde_json::to_string(&claims)?.as_bytes());
+        let message = format!("{}.{}", header_b64, claims_b64);
+        
+        // Sign the JWT
+        let signature: Signature = signing_key.sign(message.as_bytes());
+        let sig_b64 = b64url.encode(signature.to_bytes());
+        
+        Ok(format!("{}.{}", message, sig_b64))
+    }
+    
+    /// Get the revocation endpoint by resolving the authorization server per ATProto OAuth spec
+    async fn get_revocation_endpoint(&self, pds_url: &str) -> AppResult<String> {
+        // Step 1: Fetch Resource Server metadata from the PDS
+        let resource_metadata_url = format!("{}/.well-known/oauth-protected-resource", pds_url);
+        
+        let response = self
+            .state
+            .http_client
+            .get(&resource_metadata_url)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            return Err(AppError::Internal(format!(
+                "Failed to fetch resource server metadata from {}: {}",
+                pds_url,
+                response.status()
+            )));
+        }
+        
+        let resource_metadata: serde_json::Value = response.json().await?;
+        
+        // Step 2: Extract the authorization server URL
+        let auth_server_url = resource_metadata["authorization_servers"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::Internal("No authorization_servers in resource metadata".into())
+            })?;
+        
+        // Step 3: Fetch Authorization Server metadata
+        let auth_metadata_url = format!("{}/.well-known/oauth-authorization-server", auth_server_url);
+        
+        let response = self
+            .state
+            .http_client
+            .get(&auth_metadata_url)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            return Err(AppError::Internal(format!(
+                "Failed to fetch auth server metadata from {}: {}",
+                auth_server_url,
+                response.status()
+            )));
+        }
+        
+        let auth_metadata: serde_json::Value = response.json().await?;
+        
+        // Step 4: Extract the revocation endpoint
+        auth_metadata["revocation_endpoint"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| {
+                AppError::Internal("No revocation_endpoint in auth server metadata".into())
+            })
     }
 }

@@ -6,7 +6,7 @@
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, Method, StatusCode},
     response::Response,
     Extension, Json,
@@ -16,6 +16,7 @@ use axum_extra::extract::CookieJar;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use redis::AsyncCommands;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use crate::models::{
     CatbirdSession, DPoPKeyPair, LoginRequest, LoginResponse, LogoutResponse, OAuthCallback,
     SessionInfo,
 };
-use crate::services::{oauth::RedisSessionStore, AtProtoClient, SessionService};
+use crate::services::{oauth::RedisSessionStore, AtProtoClient, MlsAuthService, SessionService};
 
 /// Handle login initiation (Redirect flow)
 ///
@@ -54,6 +55,7 @@ pub async fn login(
         scopes: vec![
             Scope::Known(KnownScope::Atproto),
             Scope::Known(KnownScope::TransitionGeneric),
+            Scope::Known(KnownScope::TransitionChatBsky),
         ],
         ..Default::default()
     };
@@ -233,17 +235,28 @@ pub async fn logout(
     jar: CookieJar,
 ) -> AppResult<(CookieJar, Json<LogoutResponse>)> {
     let session_service = SessionService::new(state.clone());
-    session_service
-        .delete_session(&session.id.to_string())
-        .await?;
+    
+    // Revoke the OAuth session at the authorization server and clean up locally
+    if let Err(e) = session_service.revoke_session(&session).await {
+        tracing::warn!("Failed to revoke OAuth session: {}", e);
+        // Continue with logout even if revocation fails
+    }
 
-    // TODO: Also revoke via OAuthClient.revoke()
+    // Also clean up the DPoP key from Redis
+    let dpop_key = format!(
+        "{}dpop_key:{}",
+        state.config.redis.key_prefix, session.did
+    );
+    let mut conn = state.redis.clone();
+    let _: Result<(), _> = conn.del(&dpop_key).await;
 
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
         .http_only(true)
         .max_age(time::Duration::ZERO)
         .build();
+
+    tracing::info!("User {} logged out successfully", session.did);
 
     Ok((
         jar.remove(cookie),
@@ -263,30 +276,26 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
     })
 }
 
-/// Proxy XRPC requests to the user's PDS
+/// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
 pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     method: Method,
     Path(lexicon): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Body,
 ) -> AppResult<Response> {
-    let path = format!("/xrpc/{}", lexicon);
-    tracing::debug!("Proxying {} {} to {}", method, path, session.pds_url);
+    // Extract request ID from client for end-to-end correlation
+    let request_id = headers
+        .get("x-catbird-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
 
-    let query_string = if params.is_empty() {
-        None
-    } else {
-        Some(
-            params
-                .iter()
-                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-                .collect::<Vec<_>>()
-                .join("&"),
-        )
-    };
+    // Use raw query string directly to preserve repeated params (e.g., feeds=a&feeds=b)
+    // HashMap would lose duplicates, keeping only the last value
+    let query_string = raw_query;
 
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
 
@@ -294,11 +303,81 @@ pub async fn proxy_xrpc(
         .await
         .map_err(|e| AppError::BadRequest(format!("Failed to read body: {}", e)))?;
 
+    // Log request receipt with body shape
+    let body_shape = json_shape(&body_bytes);
+    tracing::info!(
+        request_id = %request_id,
+        lexicon = %lexicon,
+        method = %method,
+        query = ?query_string,
+        content_type = ?content_type,
+        body_bytes = body_bytes.len(),
+        body_shape = ?body_shape,
+        "[BFF-RECV] Received XRPC request"
+    );
+
     let body_option = if body_bytes.is_empty() {
         None
     } else {
         Some(body_bytes)
     };
+
+    // Check if this is an MLS lexicon and direct routing is enabled
+    let mls_service = MlsAuthService::new(state.clone());
+    if MlsAuthService::is_mls_lexicon(&lexicon) && mls_service.is_enabled() {
+        tracing::debug!(
+            request_id = %request_id,
+            lexicon = %lexicon,
+            user = %session.did,
+            "Routing MLS request directly to MLS service"
+        );
+
+        let (status, response_headers, response_body) = mls_service
+            .proxy_request(
+                &session,
+                method.try_into().unwrap_or(reqwest::Method::GET),
+                &lexicon,
+                query_string.as_deref(),
+                body_option,
+                content_type,
+            )
+            .await?;
+
+        let response_shape = json_shape(&response_body);
+        tracing::info!(
+            request_id = %request_id,
+            status = status,
+            body_bytes = response_body.len(),
+            body_shape = ?response_shape,
+            "[BFF-RESP] MLS response"
+        );
+
+        let mut response = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+        for (name, value) in response_headers.iter() {
+            let name_str = name.as_str();
+            if matches!(
+                name_str,
+                "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+            ) {
+                if let Ok(v) = reqwest::header::HeaderValue::to_str(value) {
+                    response = response.header(name_str, v);
+                }
+            }
+        }
+
+        return Ok(response.body(Body::from(response_body)).unwrap());
+    }
+
+    // Default: proxy through PDS
+    let path = format!("/xrpc/{}", lexicon);
+    tracing::info!(
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        pds = %session.pds_url,
+        "[BFF-FWD] Forwarding to PDS"
+    );
 
     let client = AtProtoClient::new(state.clone());
     let (status, response_headers, response_body) = client
@@ -309,8 +388,19 @@ pub async fn proxy_xrpc(
             query_string.as_deref(),
             body_option,
             content_type,
+            Some(&headers),
+            &request_id,
         )
         .await?;
+
+    let response_shape = json_shape(&response_body);
+    tracing::info!(
+        request_id = %request_id,
+        status = status,
+        body_bytes = response_body.len(),
+        body_shape = ?response_shape,
+        "[BFF-RESP] PDS response"
+    );
 
     let mut response =
         Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
@@ -325,4 +415,40 @@ pub async fn proxy_xrpc(
     }
 
     Ok(response.body(Body::from(response_body)).unwrap())
+}
+
+/// Extract JSON shape information for logging (top-level keys and array lengths)
+fn json_shape(data: &[u8]) -> Option<String> {
+    let json: Value = serde_json::from_slice(data).ok()?;
+    Some(describe_json_shape(&json, 0))
+}
+
+fn describe_json_shape(value: &Value, depth: usize) -> String {
+    if depth > 2 {
+        return "...".to_string();
+    }
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map
+                .keys()
+                .map(|k| {
+                    let child = describe_json_shape(&map[k], depth + 1);
+                    format!("{}:{}", k, child)
+                })
+                .collect();
+            format!("{{{}}}", keys.join(","))
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                "[]".to_string()
+            } else {
+                let first = describe_json_shape(&arr[0], depth + 1);
+                format!("[{}x{}]", arr.len(), first)
+            }
+        }
+        Value::String(_) => "str".to_string(),
+        Value::Number(_) => "num".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Null => "null".to_string(),
+    }
 }
