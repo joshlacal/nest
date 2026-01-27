@@ -1352,10 +1352,18 @@ impl SessionService {
         let jti = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         
+        // Get the active key ID for the JWT header
+        // ATProto OAuth requires kid in client_assertion JWT to match JWKS
+        let kid = self.state.key_store
+            .as_ref()
+            .map(|ks| ks.active_key().kid)
+            .unwrap_or_else(|| "catbird-key-1".to_string());
+        
         // Build JWT header
         let header = serde_json::json!({
             "alg": "ES256",
-            "typ": "JWT"
+            "typ": "JWT",
+            "kid": kid
         });
         
         // Build JWT claims per RFC 7523
