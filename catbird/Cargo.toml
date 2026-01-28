@@ -17,13 +17,13 @@ tower_governor = "0.4"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP Client
-reqwest = { version = "0.12", features = ["json", "cookies", "multipart", "stream"] }
+reqwest = { version = "0.12", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
 
 # Atrium (AT Protocol)
-atrium-api = { version = "0.25", features = ["default"] }
-atrium-oauth = { version = "0.1.6", features = ["default"] }
-atrium-common = "0.1"
-atrium-identity = { version = "0.1", features = ["default", "doh-handle-resolver"] }
+atrium-api = { git = "https://github.com/atrium-rs/atrium", branch = "main", features = ["default"] }
+atrium-oauth = { git = "https://github.com/atrium-rs/atrium", branch = "main", features = ["default"] }
+atrium-common = { git = "https://github.com/atrium-rs/atrium", branch = "main" }
+atrium-identity = { git = "https://github.com/atrium-rs/atrium", branch = "main", features = ["default", "doh-handle-resolver"] }
 jose-jwk = "0.1"
 
 # Serialization
