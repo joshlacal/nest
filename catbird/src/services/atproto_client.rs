@@ -838,6 +838,11 @@ impl SessionService {
     ///
     /// Uses atrium-oauth's OAuthClient.restore() to get a session that
     /// automatically handles token refresh when the access token is expired.
+    ///
+    /// IMPORTANT: Uses distributed locking to prevent race conditions during
+    /// concurrent token refresh attempts. Without locking, multiple simultaneous
+    /// requests with an expired token could all attempt refresh, causing token
+    /// rotation conflicts that invalidate sessions prematurely.
     pub async fn get_valid_session(&self, session_id: &str) -> AppResult<CatbirdSession> {
         let mut session = self
             .get_session(session_id)
@@ -854,7 +859,7 @@ impl SessionService {
         if session.is_access_token_expired() || needs_pds_sync {
             if session.is_access_token_expired() {
                 tracing::info!(
-                    "Session {} has expired token, refreshing via OAuthClient",
+                    "Session {} has expired token, attempting refresh",
                     session_id
                 );
             }
@@ -865,13 +870,114 @@ impl SessionService {
                 );
             }
 
-            // Use OAuthClient.restore() to get a refreshed session
-            // This automatically handles token refresh via atrium-oauth
-            session = self.refresh_session_tokens(&session).await?;
+            // Use distributed lock to prevent concurrent refresh attempts
+            // This prevents race conditions where multiple requests try to refresh
+            // simultaneously, causing token rotation conflicts
+            session = self.refresh_with_lock(&session).await?;
         }
 
         self.save_session(&session).await?;
         Ok(session)
+    }
+
+    /// Refresh session tokens with distributed locking
+    ///
+    /// Uses Redis SETNX to acquire a lock before refreshing. If another request
+    /// is already refreshing, waits and re-reads the session to get the new tokens.
+    async fn refresh_with_lock(&self, session: &CatbirdSession) -> AppResult<CatbirdSession> {
+        let lock_key = format!(
+            "{}refresh_lock:{}",
+            self.state.config.redis.key_prefix, session.id
+        );
+        let lock_ttl_seconds: u64 = 30; // Lock expires after 30s to prevent deadlocks
+        let max_wait_attempts = 10;
+        let wait_interval_ms = 500;
+
+        let mut conn = self.state.redis.clone();
+
+        // Try to acquire lock using SETNX (SET if Not eXists)
+        let lock_acquired: bool = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg("1")
+            .arg("NX") // Only set if not exists
+            .arg("EX") // Set expiration
+            .arg(lock_ttl_seconds)
+            .query_async(&mut conn)
+            .await
+            .map(|v: Option<String>| v.is_some())
+            .unwrap_or(false);
+
+        if lock_acquired {
+            tracing::debug!("Acquired refresh lock for session {}", session.id);
+
+            // We have the lock - perform the refresh
+            let result = self.refresh_session_tokens(session).await;
+
+            // Release lock (best effort - TTL will handle it if this fails)
+            let _: Result<(), _> = conn.del(&lock_key).await;
+
+            result
+        } else {
+            tracing::debug!(
+                "Refresh lock held by another request for session {}, waiting",
+                session.id
+            );
+
+            // Another request is refreshing - wait and re-read session
+            for attempt in 1..=max_wait_attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_interval_ms)).await;
+
+                // Re-read the session to check if refresh completed
+                if let Some(refreshed_session) = self.get_session(&session.id.to_string()).await? {
+                    if !refreshed_session.is_access_token_expired() {
+                        tracing::debug!(
+                            "Session {} refreshed by another request (attempt {})",
+                            session.id, attempt
+                        );
+                        return Ok(refreshed_session);
+                    }
+                }
+
+                // Check if lock was released (maybe we should try to acquire)
+                let lock_exists: bool = conn.exists(&lock_key).await.unwrap_or(true);
+                if !lock_exists {
+                    // Lock released but token still expired - try to acquire and refresh
+                    let retry_acquired: bool = redis::cmd("SET")
+                        .arg(&lock_key)
+                        .arg("1")
+                        .arg("NX")
+                        .arg("EX")
+                        .arg(lock_ttl_seconds)
+                        .query_async(&mut conn)
+                        .await
+                        .map(|v: Option<String>| v.is_some())
+                        .unwrap_or(false);
+
+                    if retry_acquired {
+                        tracing::debug!(
+                            "Acquired refresh lock on retry for session {}",
+                            session.id
+                        );
+                        let result = self.refresh_session_tokens(session).await;
+                        let _: Result<(), _> = conn.del(&lock_key).await;
+                        return result;
+                    }
+                }
+            }
+
+            // Timeout waiting for refresh - try one more time to get refreshed session
+            if let Some(refreshed_session) = self.get_session(&session.id.to_string()).await? {
+                if !refreshed_session.is_access_token_expired() {
+                    return Ok(refreshed_session);
+                }
+            }
+
+            // Still expired after waiting - the other refresh must have failed
+            // Return error to trigger re-authentication
+            Err(AppError::TokenRefresh(
+                "Token refresh timed out. Please try again.".to_string()
+            ))
+        }
     }
 
     /// Refresh session tokens using per-session OAuth data

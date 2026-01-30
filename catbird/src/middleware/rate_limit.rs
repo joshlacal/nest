@@ -114,11 +114,13 @@ impl Default for RateLimitState {
             session_limiter: Arc::new(RateLimiter::new()),
             ip_limiter: Arc::new(RateLimiter::new()),
             session_config: RateLimitConfig {
-                max_requests: 100,
+                // 600 req/min for XRPC proxy (app makes frequent getConvos/getMessages calls)
+                max_requests: 600,
                 window: Duration::from_secs(60),
             },
             ip_config: RateLimitConfig {
-                max_requests: 10,
+                // 20 req/min for auth endpoints (login/refresh)
+                max_requests: 20,
                 window: Duration::from_secs(60),
             },
         }
