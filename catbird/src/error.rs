@@ -37,6 +37,16 @@ pub enum AppError {
     #[error("Token refresh failed: {0}")]
     TokenRefresh(String),
 
+    #[error("Authentication temporarily unavailable: {0}")]
+    AuthTemporarilyUnavailable(String),
+
+    #[error("ATProto error: {error} - {message}")]
+    AtprotoResponse {
+        status: StatusCode,
+        error: String,
+        message: String,
+    },
+
     #[error("Redis error: {0}")]
     Redis(#[from] redis::RedisError),
 
@@ -88,6 +98,16 @@ impl IntoResponse for AppError {
                 "token_refresh_failed",
                 msg.clone(),
             ),
+            AppError::AuthTemporarilyUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "TemporarilyUnavailable",
+                msg.clone(),
+            ),
+            AppError::AtprotoResponse {
+                status,
+                error,
+                message,
+            } => (*status, error.as_str(), message.clone()),
             AppError::Redis(e) => {
                 tracing::error!("Redis error: {}", e);
                 (
@@ -125,7 +145,10 @@ impl IntoResponse for AppError {
                 (
                     StatusCode::TOO_MANY_REQUESTS,
                     "rate_limit_exceeded",
-                    format!("Too many requests. Please retry after {} seconds.", retry_after),
+                    format!(
+                        "Too many requests. Please retry after {} seconds.",
+                        retry_after
+                    ),
                 )
             }
             AppError::Crypto(msg) => {
@@ -144,11 +167,9 @@ impl IntoResponse for AppError {
                     msg.clone(),
                 )
             }
-            AppError::ResponseTooLarge(msg) => (
-                StatusCode::BAD_GATEWAY,
-                "response_too_large",
-                msg.clone(),
-            ),
+            AppError::ResponseTooLarge(msg) => {
+                (StatusCode::BAD_GATEWAY, "response_too_large", msg.clone())
+            }
         };
 
         let body = Json(json!({

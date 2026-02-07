@@ -118,7 +118,7 @@ impl AtProtoClient {
 
     /// Proxy a raw request to the PDS, preserving method and body
     /// Handles DPoP nonce retry automatically
-    /// 
+    ///
     /// Returns a ProxyResponse which can be either buffered (for small JSON responses
     /// that may need processing) or streaming (for large responses like blobs).
     pub async fn proxy_request(
@@ -152,7 +152,17 @@ impl AtProtoClient {
 
         // First attempt without nonce - always buffer since we may need to inspect for DPoP nonce
         let first_response = self
-            .do_proxy_request_buffered(session, method.clone(), &url, body.clone(), content_type, None, client_headers, request_id, 1)
+            .do_proxy_request_buffered(
+                session,
+                method.clone(),
+                &url,
+                body.clone(),
+                content_type,
+                None,
+                client_headers,
+                request_id,
+                1,
+            )
             .await?;
 
         // Check if we got a DPoP nonce error (401 with use_dpop_nonce)
@@ -170,7 +180,7 @@ impl AtProtoClient {
                                 body_preserved = (retry_body_size == body_size),
                                 "[BFF-DPOP-RETRY] Received nonce challenge, retrying"
                             );
-                            
+
                             // Retry with the nonce - use streaming-aware version
                             return self
                                 .do_proxy_request(
@@ -203,7 +213,7 @@ impl AtProtoClient {
     }
 
     /// Internal helper to perform the actual proxy request with streaming support
-    /// 
+    ///
     /// Decides whether to buffer or stream based on content-length and content-type:
     /// - Responses > MAX_RESPONSE_SIZE (50MB): Rejected with error
     /// - Responses > STREAM_THRESHOLD (1MB) or non-JSON: Streamed directly
@@ -236,9 +246,18 @@ impl AtProtoClient {
                 // Skip hop-by-hop headers and headers we manage
                 if matches!(
                     name_lower.as_str(),
-                    "host" | "connection" | "keep-alive" | "transfer-encoding" 
-                    | "te" | "trailer" | "upgrade" | "proxy-authorization"
-                    | "proxy-connection" | "authorization" | "dpop" | "content-length"
+                    "host"
+                        | "connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                        | "proxy-authorization"
+                        | "proxy-connection"
+                        | "authorization"
+                        | "dpop"
+                        | "content-length"
                 ) {
                     continue;
                 }
@@ -261,11 +280,7 @@ impl AtProtoClient {
             "[BFF-UPSTREAM-SEND] Sending to PDS"
         );
 
-        let mut request = self
-            .state
-            .http_client
-            .request(method, url)
-            .headers(headers);
+        let mut request = self.state.http_client.request(method, url).headers(headers);
 
         if let Some(b) = body {
             request = request.body(b);
@@ -320,9 +335,12 @@ impl AtProtoClient {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        
+
         let is_json = response_content_type.contains("application/json");
-        let should_stream = content_length.map(|l| l > STREAM_THRESHOLD).unwrap_or(false) || !is_json;
+        let should_stream = content_length
+            .map(|l| l > STREAM_THRESHOLD)
+            .unwrap_or(false)
+            || !is_json;
 
         if should_stream {
             let elapsed_ms = start.elapsed().as_millis();
@@ -343,7 +361,9 @@ impl AtProtoClient {
             })
         } else {
             // Buffer small JSON responses
-            let body = self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id).await?;
+            let body = self
+                .read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id)
+                .await?;
             let elapsed_ms = start.elapsed().as_millis();
 
             tracing::debug!(
@@ -392,9 +412,18 @@ impl AtProtoClient {
                 // Skip hop-by-hop headers and headers we manage
                 if matches!(
                     name_lower.as_str(),
-                    "host" | "connection" | "keep-alive" | "transfer-encoding" 
-                    | "te" | "trailer" | "upgrade" | "proxy-authorization"
-                    | "proxy-connection" | "authorization" | "dpop" | "content-length"
+                    "host"
+                        | "connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                        | "proxy-authorization"
+                        | "proxy-connection"
+                        | "authorization"
+                        | "dpop"
+                        | "content-length"
                 ) {
                     continue;
                 }
@@ -417,11 +446,7 @@ impl AtProtoClient {
             "[BFF-UPSTREAM-SEND] Sending to PDS"
         );
 
-        let mut request = self
-            .state
-            .http_client
-            .request(method, url)
-            .headers(headers);
+        let mut request = self.state.http_client.request(method, url).headers(headers);
 
         if let Some(b) = body {
             request = request.body(b);
@@ -448,7 +473,7 @@ impl AtProtoClient {
 
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
-        
+
         // Check Content-Length for size limits on initial request
         let content_length = response_headers
             .get("content-length")
@@ -471,7 +496,9 @@ impl AtProtoClient {
         }
 
         // Read response with size limit protection
-        let body = self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id).await?;
+        let body = self
+            .read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id)
+            .await?;
         let elapsed_ms = start.elapsed().as_millis();
 
         tracing::debug!(
@@ -487,7 +514,7 @@ impl AtProtoClient {
     }
 
     /// Read response body with size limit protection
-    /// 
+    ///
     /// Reads the response body in chunks and enforces a maximum size limit
     /// to prevent memory exhaustion from untrusted responses.
     async fn read_response_with_limit(
@@ -539,7 +566,9 @@ impl AtProtoClient {
         // If we have a DPoP key, generate a DPoP proof
         if let Some(ref _dpop_jkt) = session.dpop_jkt {
             // Generate DPoP proof JWT
-            let dpop_proof = self.generate_dpop_proof(session, method, url, nonce).await?;
+            let dpop_proof = self
+                .generate_dpop_proof(session, method, url, nonce)
+                .await?;
 
             // Use DPoP token scheme (not Bearer)
             let auth_value = format!("DPoP {}", session.access_token);
@@ -735,7 +764,9 @@ impl AtProtoClient {
                         let endpoint = service["serviceEndpoint"]
                             .as_str()
                             .map(|s| s.to_string())
-                            .ok_or_else(|| AppError::Internal("Invalid service endpoint".into()))?;
+                            .ok_or_else(|| {
+                            AppError::Internal("Invalid service endpoint".into())
+                        })?;
 
                         // SSRF protection: validate the resolved PDS URL
                         validate_pds_url(&endpoint)?;
@@ -824,7 +855,7 @@ impl SessionService {
         let oauth_session_key = format!("{}oauth_session:{}", prefix, session_id);
 
         let mut conn = self.state.redis.clone();
-        
+
         // Delete all session-related keys (ignore individual failures)
         let _: Result<(), _> = conn.del(&catbird_session_key).await;
         let _: Result<(), _> = conn.del(&dpop_key).await;
@@ -911,7 +942,7 @@ impl SessionService {
             tracing::debug!("Acquired refresh lock for session {}", session.id);
 
             // We have the lock - perform the refresh
-            let result = self.refresh_session_tokens(session).await;
+            let result = self.refresh_session_tokens_with_retry(session).await;
 
             // Release lock (best effort - TTL will handle it if this fails)
             let _: Result<(), _> = conn.del(&lock_key).await;
@@ -932,7 +963,8 @@ impl SessionService {
                     if !refreshed_session.is_access_token_expired() {
                         tracing::debug!(
                             "Session {} refreshed by another request (attempt {})",
-                            session.id, attempt
+                            session.id,
+                            attempt
                         );
                         return Ok(refreshed_session);
                     }
@@ -958,7 +990,7 @@ impl SessionService {
                             "Acquired refresh lock on retry for session {}",
                             session.id
                         );
-                        let result = self.refresh_session_tokens(session).await;
+                        let result = self.refresh_session_tokens_with_retry(session).await;
                         let _: Result<(), _> = conn.del(&lock_key).await;
                         return result;
                     }
@@ -972,11 +1004,60 @@ impl SessionService {
                 }
             }
 
-            // Still expired after waiting - the other refresh must have failed
-            // Return error to trigger re-authentication
-            Err(AppError::TokenRefresh(
-                "Token refresh timed out. Please try again.".to_string()
+            // Still expired after waiting. This is typically transient lock contention or
+            // upstream slowness; avoid forcing logout on this path.
+            Err(AppError::AuthTemporarilyUnavailable(
+                "Token refresh is still in progress. Please retry.".to_string(),
             ))
+        }
+    }
+
+    /// Refresh session tokens with up to 3 attempts and exponential backoff.
+    ///
+    /// Retries only transient failures: network/transport issues, upstream 5xx/429,
+    /// and metadata lookup outages. Fatal auth failures (e.g., invalid_grant) fail fast.
+    async fn refresh_session_tokens_with_retry(
+        &self,
+        session: &CatbirdSession,
+    ) -> AppResult<CatbirdSession> {
+        const BACKOFF_SECONDS: [u64; 3] = [1, 2, 4];
+        let max_attempts = BACKOFF_SECONDS.len() + 1;
+
+        for attempt in 1..=max_attempts {
+            match self.refresh_session_tokens(session).await {
+                Ok(refreshed) => return Ok(refreshed),
+                Err(error) => {
+                    let should_retry = Self::is_retryable_refresh_error(&error);
+                    if should_retry && attempt < max_attempts {
+                        let delay_seconds = BACKOFF_SECONDS[attempt - 1];
+                        tracing::warn!(
+                            session_id = %session.id,
+                            attempt = attempt,
+                            delay_seconds = delay_seconds,
+                            error = %error,
+                            "Transient token refresh failure, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(AppError::AuthTemporarilyUnavailable(
+            "Token refresh failed after retry attempts.".to_string(),
+        ))
+    }
+
+    fn is_retryable_refresh_error(error: &AppError) -> bool {
+        match error {
+            AppError::AuthTemporarilyUnavailable(_) | AppError::HttpClient(_) => true,
+            AppError::Internal(message) => {
+                message.contains("Failed to fetch resource server metadata")
+                    || message.contains("Failed to fetch auth server metadata")
+            }
+            _ => false,
         }
     }
 
@@ -992,12 +1073,11 @@ impl SessionService {
         // Load the per-session OAuth data from Redis (not the DID-keyed store)
         let oauth_session_key = format!(
             "{}oauth_session:{}",
-            self.state.config.redis.key_prefix,
-            session.id
+            self.state.config.redis.key_prefix, session.id
         );
         let mut conn = self.state.redis.clone();
         let oauth_session_json: Option<String> = conn.get(&oauth_session_key).await?;
-        
+
         let oauth_session: Session = match oauth_session_json {
             Some(json) => serde_json::from_str(&json)
                 .map_err(|e| AppError::Internal(format!("Failed to parse OAuth session: {}", e)))?,
@@ -1018,7 +1098,7 @@ impl SessionService {
 
         // Get the token endpoint from the authorization server
         let token_endpoint = self.get_token_endpoint(&session.pds_url).await?;
-        
+
         tracing::info!(
             "Refreshing tokens for session {} via {}",
             session.id,
@@ -1027,7 +1107,7 @@ impl SessionService {
 
         // Generate client assertion JWT for confidential client auth
         let client_assertion = self.generate_client_assertion(&token_endpoint).await?;
-        
+
         // Build the refresh token request body
         let body = format!(
             "grant_type=refresh_token&refresh_token={}&client_id={}&client_assertion_type={}&client_assertion={}",
@@ -1038,12 +1118,9 @@ impl SessionService {
         );
 
         // First attempt without DPoP nonce
-        let dpop_proof = self.generate_dpop_proof_for_auth_server(
-            session,
-            "POST",
-            &token_endpoint,
-            None,
-        ).await?;
+        let dpop_proof = self
+            .generate_dpop_proof_for_auth_server(session, "POST", &token_endpoint, None)
+            .await?;
 
         let response = self
             .state
@@ -1056,26 +1133,31 @@ impl SessionService {
             .await?;
 
         // Check if we need to retry with DPoP nonce
-        let response = if response.status() == reqwest::StatusCode::BAD_REQUEST 
-            || response.status() == reqwest::StatusCode::UNAUTHORIZED 
+        let response = if response.status() == reqwest::StatusCode::BAD_REQUEST
+            || response.status() == reqwest::StatusCode::UNAUTHORIZED
         {
-            let nonce = response.headers()
+            let nonce = response
+                .headers()
                 .get("DPoP-Nonce")
                 .or_else(|| response.headers().get("dpop-nonce"))
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            
+
             if let Some(nonce) = nonce {
-                tracing::info!("Received DPoP nonce challenge for token refresh, retrying with nonce");
-                
+                tracing::info!(
+                    "Received DPoP nonce challenge for token refresh, retrying with nonce"
+                );
+
                 // Regenerate DPoP proof with nonce
-                let dpop_proof_with_nonce = self.generate_dpop_proof_for_auth_server(
-                    session,
-                    "POST",
-                    &token_endpoint,
-                    Some(nonce),
-                ).await?;
-                
+                let dpop_proof_with_nonce = self
+                    .generate_dpop_proof_for_auth_server(
+                        session,
+                        "POST",
+                        &token_endpoint,
+                        Some(nonce),
+                    )
+                    .await?;
+
                 // Regenerate client assertion (needs fresh jti)
                 let client_assertion = self.generate_client_assertion(&token_endpoint).await?;
                 let body = format!(
@@ -1085,7 +1167,7 @@ impl SessionService {
                     urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
                     urlencoding::encode(&client_assertion)
                 );
-                
+
                 self.state
                     .http_client
                     .post(&token_endpoint)
@@ -1102,71 +1184,113 @@ impl SessionService {
         };
 
         if !response.status().is_success() {
+            #[derive(Debug, serde::Deserialize)]
+            struct OAuthErrorPayload {
+                #[serde(default)]
+                error: String,
+                #[serde(default, rename = "error_description")]
+                error_description: Option<String>,
+                #[serde(default)]
+                message: Option<String>,
+            }
+
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            
+
             // Record token refresh failure
             metrics::record_token_refresh(false);
-            
-            // Check for invalid_grant - this means the refresh token was rejected
-            // This can happen when: user revoked access, token was already used,
-            // or PDS invalidated the session
-            if body.contains("invalid_grant") || body.contains("InvalidGrant") {
+
+            let parsed_error = serde_json::from_str::<OAuthErrorPayload>(&body).ok();
+            let error_code = parsed_error
+                .as_ref()
+                .map(|e| e.error.clone())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let error_message = parsed_error
+                .as_ref()
+                .and_then(|e| e.error_description.clone().or_else(|| e.message.clone()))
+                .unwrap_or_default();
+            let lower_body = body.to_ascii_lowercase();
+
+            // invalid_grant/invalid_token indicates the refresh token is no longer usable.
+            if error_code == "invalid_grant"
+                || error_code == "invalid_token"
+                || lower_body.contains("invalid_grant")
+                || lower_body.contains("invalid_token")
+            {
+                let body_preview: String = body.chars().take(300).collect();
                 tracing::warn!(
-                    "Refresh token rejected for session {} (invalid_grant), clearing session data. Response: {}",
+                    "Refresh token rejected for session {} (invalid_grant/invalid_token), clearing session data. Response: {}",
                     session.id,
-                    body
+                    body_preview
                 );
-                
+
                 // Clear all session data from Redis since the refresh token is no longer valid
                 if let Err(cleanup_err) = self.clear_session_data(&session.id.to_string()).await {
-                    tracing::error!("Failed to clear session data after invalid_grant: {}", cleanup_err);
+                    tracing::error!(
+                        "Failed to clear session data after invalid_grant/invalid_token: {}",
+                        cleanup_err
+                    );
                 }
-                
+
                 // Return TokenRefresh error which maps to 401, prompting re-authentication
                 return Err(AppError::TokenRefresh(
-                    "Session expired. Please log in again.".to_string()
+                    "Session expired. Please log in again.".to_string(),
                 ));
             }
-            
-            return Err(AppError::OAuth(format!(
-                "Token refresh failed with status {}: {}",
-                status, body
+
+            // Treat overloaded/outage cases as transient and do not force logout.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+                || error_code == "temporarily_unavailable"
+                || error_code == "server_error"
+            {
+                return Err(AppError::AuthTemporarilyUnavailable(format!(
+                    "Authorization server temporarily unavailable (status {}). {}",
+                    status, error_message
+                )));
+            }
+
+            // Remaining auth rejections are treated as fatal for this session.
+            return Err(AppError::TokenRefresh(format!(
+                "Token refresh rejected by authorization server (status {}). Please log in again.",
+                status
             )));
         }
 
         // Parse the token response
         let token_response: serde_json::Value = response.json().await?;
-        
+
         let new_access_token = token_response["access_token"]
             .as_str()
             .ok_or_else(|| AppError::OAuth("No access_token in refresh response".to_string()))?
             .to_string();
-        
+
         let new_refresh_token = token_response["refresh_token"]
             .as_str()
             .map(String::from)
             .unwrap_or_else(|| refresh_token.clone());
-        
-        let expires_in = token_response["expires_in"]
-            .as_i64()
-            .unwrap_or(3600);
-        
+
+        let expires_in = token_response["expires_in"].as_i64().unwrap_or(3600);
+
         let new_expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
 
         // Update the per-session OAuth data with new tokens
         let mut updated_oauth_session = oauth_session.clone();
         updated_oauth_session.token_set.access_token = new_access_token.clone();
         updated_oauth_session.token_set.refresh_token = Some(new_refresh_token.clone());
-        updated_oauth_session.token_set.expires_at = Some(atrium_api::types::string::Datetime::new(new_expires_at.fixed_offset()));
-        
+        updated_oauth_session.token_set.expires_at = Some(
+            atrium_api::types::string::Datetime::new(new_expires_at.fixed_offset()),
+        );
+
         let updated_oauth_json = serde_json::to_string(&updated_oauth_session)
             .map_err(|e| AppError::Internal(format!("Failed to serialize OAuth session: {}", e)))?;
         conn.set_ex::<_, _, ()>(
             &oauth_session_key,
             updated_oauth_json,
             self.state.config.redis.session_ttl_seconds,
-        ).await?;
+        )
+        .await?;
 
         // Build the updated CatbirdSession
         let refreshed_session = CatbirdSession {
@@ -1186,19 +1310,19 @@ impl SessionService {
         metrics::record_token_refresh(true);
         Ok(refreshed_session)
     }
-    
+
     /// Get the token endpoint by resolving the authorization server per ATProto OAuth spec
     async fn get_token_endpoint(&self, pds_url: &str) -> AppResult<String> {
         // Step 1: Fetch Resource Server metadata from the PDS
         let resource_metadata_url = format!("{}/.well-known/oauth-protected-resource", pds_url);
-        
+
         let response = self
             .state
             .http_client
             .get(&resource_metadata_url)
             .send()
             .await?;
-        
+
         if !response.status().is_success() {
             return Err(AppError::Internal(format!(
                 "Failed to fetch resource server metadata from {}: {}",
@@ -1206,9 +1330,9 @@ impl SessionService {
                 response.status()
             )));
         }
-        
+
         let resource_metadata: serde_json::Value = response.json().await?;
-        
+
         // Step 2: Extract the authorization server URL
         let auth_server_url = resource_metadata["authorization_servers"]
             .as_array()
@@ -1217,17 +1341,18 @@ impl SessionService {
             .ok_or_else(|| {
                 AppError::Internal("No authorization_servers in resource metadata".into())
             })?;
-        
+
         // Step 3: Fetch Authorization Server metadata
-        let auth_metadata_url = format!("{}/.well-known/oauth-authorization-server", auth_server_url);
-        
+        let auth_metadata_url =
+            format!("{}/.well-known/oauth-authorization-server", auth_server_url);
+
         let response = self
             .state
             .http_client
             .get(&auth_metadata_url)
             .send()
             .await?;
-        
+
         if !response.status().is_success() {
             return Err(AppError::Internal(format!(
                 "Failed to fetch auth server metadata from {}: {}",
@@ -1235,16 +1360,14 @@ impl SessionService {
                 response.status()
             )));
         }
-        
+
         let auth_metadata: serde_json::Value = response.json().await?;
-        
+
         // Step 4: Extract the token endpoint
         auth_metadata["token_endpoint"]
             .as_str()
             .map(String::from)
-            .ok_or_else(|| {
-                AppError::Internal("No token_endpoint in auth server metadata".into())
-            })
+            .ok_or_else(|| AppError::Internal("No token_endpoint in auth server metadata".into()))
     }
 
     /// Revoke a session (logout)
@@ -1261,12 +1384,12 @@ impl SessionService {
 
         // Resolve the authorization server and revocation endpoint per ATProto OAuth spec
         let revocation_url = self.get_revocation_endpoint(&session.pds_url).await?;
-        
+
         tracing::info!("Revoking OAuth token at {}", revocation_url);
-        
+
         // Generate client assertion for confidential client authentication
         let client_assertion = self.generate_client_assertion(&revocation_url).await?;
-        
+
         // Per RFC 7009, prefer revoking refresh_token over access_token:
         // - Refresh tokens are long-lived credentials
         // - Revoking refresh token prevents future access token issuance
@@ -1276,7 +1399,7 @@ impl SessionService {
         } else {
             &session.access_token
         };
-        
+
         // Build form body with client authentication
         let body = format!(
             "token={}&client_id={}&client_assertion_type={}&client_assertion={}",
@@ -1285,15 +1408,12 @@ impl SessionService {
             urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
             urlencoding::encode(&client_assertion)
         );
-        
+
         // First attempt - no nonce, no ath (auth server requests don't use ath)
-        let dpop_proof = self.generate_dpop_proof_for_auth_server(
-            session,
-            "POST",
-            &revocation_url,
-            None,
-        ).await?;
-        
+        let dpop_proof = self
+            .generate_dpop_proof_for_auth_server(session, "POST", &revocation_url, None)
+            .await?;
+
         let response = self
             .state
             .http_client
@@ -1303,26 +1423,29 @@ impl SessionService {
             .body(body.clone())
             .send()
             .await?;
-        
+
         // Check if we need to retry with DPoP nonce
         let response = if response.status() == reqwest::StatusCode::BAD_REQUEST {
-            let nonce = response.headers()
+            let nonce = response
+                .headers()
                 .get("DPoP-Nonce")
                 .or_else(|| response.headers().get("dpop-nonce"))
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            
+
             if let Some(nonce) = nonce {
                 tracing::info!("Received DPoP nonce challenge for revoke, retrying with nonce");
-                
+
                 // Regenerate DPoP proof with nonce (no ath for auth server)
-                let dpop_proof_with_nonce = self.generate_dpop_proof_for_auth_server(
-                    session,
-                    "POST",
-                    &revocation_url,
-                    Some(nonce),
-                ).await?;
-                
+                let dpop_proof_with_nonce = self
+                    .generate_dpop_proof_for_auth_server(
+                        session,
+                        "POST",
+                        &revocation_url,
+                        Some(nonce),
+                    )
+                    .await?;
+
                 // Regenerate client assertion (needs fresh jti)
                 let client_assertion = self.generate_client_assertion(&revocation_url).await?;
                 let body = format!(
@@ -1332,7 +1455,7 @@ impl SessionService {
                     urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
                     urlencoding::encode(&client_assertion)
                 );
-                
+
                 self.state
                     .http_client
                     .post(&revocation_url)
@@ -1347,7 +1470,7 @@ impl SessionService {
         } else {
             response
         };
-        
+
         // Per RFC 7009, revocation should return 200, but some implementations return 204
         // Accept either as success
         if response.status().is_success() {
@@ -1364,9 +1487,9 @@ impl SessionService {
 
         Ok(())
     }
-    
+
     /// Generate a DPoP proof for auth server requests (without ath claim)
-    /// 
+    ///
     /// Auth server endpoints (token, revoke) should NOT include the ath claim.
     /// Only resource server requests include ath.
     async fn generate_dpop_proof_for_auth_server(
@@ -1378,7 +1501,7 @@ impl SessionService {
     ) -> AppResult<String> {
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-        
+
         let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         // Parse the URL to get just the origin and path (excluding query params for htu)
@@ -1436,42 +1559,44 @@ impl SessionService {
 
         Ok(format!("{}.{}", message, sig_b64))
     }
-    
+
     /// Generate a client assertion JWT for confidential client authentication
     async fn generate_client_assertion(&self, audience: &str) -> AppResult<String> {
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-        
+
         let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        
+
         // Load the client's private key
         let crypto = super::CryptoService::new(Arc::clone(&self.state));
         let secret_key = crypto.load_private_key()?;
         let signing_key = SigningKey::from(&secret_key);
-        
+
         // Extract the issuer (authorization server base URL) from the revocation URL
         let issuer = url::Url::parse(audience)
             .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
             .unwrap_or_else(|_| audience.to_string());
-        
+
         // Generate unique JWT ID
         let jti = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
-        
+
         // Get the active key ID for the JWT header
         // ATProto OAuth requires kid in client_assertion JWT to match JWKS
-        let kid = self.state.key_store
+        let kid = self
+            .state
+            .key_store
             .as_ref()
             .map(|ks| ks.active_key().kid)
             .unwrap_or_else(|| "catbird-key-1".to_string());
-        
+
         // Build JWT header
         let header = serde_json::json!({
             "alg": "ES256",
             "typ": "JWT",
             "kid": kid
         });
-        
+
         // Build JWT claims per RFC 7523
         let claims = serde_json::json!({
             "iss": self.state.config.oauth.client_id,
@@ -1481,31 +1606,31 @@ impl SessionService {
             "exp": now + 300, // 5 minutes
             "jti": jti
         });
-        
+
         // Encode header and claims
         let header_b64 = b64url.encode(serde_json::to_string(&header)?.as_bytes());
         let claims_b64 = b64url.encode(serde_json::to_string(&claims)?.as_bytes());
         let message = format!("{}.{}", header_b64, claims_b64);
-        
+
         // Sign the JWT
         let signature: Signature = signing_key.sign(message.as_bytes());
         let sig_b64 = b64url.encode(signature.to_bytes());
-        
+
         Ok(format!("{}.{}", message, sig_b64))
     }
-    
+
     /// Get the revocation endpoint by resolving the authorization server per ATProto OAuth spec
     async fn get_revocation_endpoint(&self, pds_url: &str) -> AppResult<String> {
         // Step 1: Fetch Resource Server metadata from the PDS
         let resource_metadata_url = format!("{}/.well-known/oauth-protected-resource", pds_url);
-        
+
         let response = self
             .state
             .http_client
             .get(&resource_metadata_url)
             .send()
             .await?;
-        
+
         if !response.status().is_success() {
             return Err(AppError::Internal(format!(
                 "Failed to fetch resource server metadata from {}: {}",
@@ -1513,9 +1638,9 @@ impl SessionService {
                 response.status()
             )));
         }
-        
+
         let resource_metadata: serde_json::Value = response.json().await?;
-        
+
         // Step 2: Extract the authorization server URL
         let auth_server_url = resource_metadata["authorization_servers"]
             .as_array()
@@ -1524,17 +1649,18 @@ impl SessionService {
             .ok_or_else(|| {
                 AppError::Internal("No authorization_servers in resource metadata".into())
             })?;
-        
+
         // Step 3: Fetch Authorization Server metadata
-        let auth_metadata_url = format!("{}/.well-known/oauth-authorization-server", auth_server_url);
-        
+        let auth_metadata_url =
+            format!("{}/.well-known/oauth-authorization-server", auth_server_url);
+
         let response = self
             .state
             .http_client
             .get(&auth_metadata_url)
             .send()
             .await?;
-        
+
         if !response.status().is_success() {
             return Err(AppError::Internal(format!(
                 "Failed to fetch auth server metadata from {}: {}",
@@ -1542,9 +1668,9 @@ impl SessionService {
                 response.status()
             )));
         }
-        
+
         let auth_metadata: serde_json::Value = response.json().await?;
-        
+
         // Step 4: Extract the revocation endpoint
         auth_metadata["revocation_endpoint"]
             .as_str()
