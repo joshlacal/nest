@@ -33,7 +33,7 @@ use crate::services::{oauth::RedisSessionStore, AtProtoClient, MlsAuthService, P
 
 /// Handle login initiation (Redirect flow)
 ///
-/// GET /auth/login?identifier=user.bsky.social
+/// GET /auth/login?identifier=user.bsky.social&client=catmos
 pub async fn login(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -43,7 +43,9 @@ pub async fn login(
         .or_else(|| params.get("pds"))
         .or_else(|| params.get("issuer"))
         .ok_or_else(|| AppError::BadRequest("Missing identifier".into()))?;
-    tracing::info!("Login request for identifier: {}", identifier);
+    let client = params.get("client").cloned();
+    let redirect_to = params.get("redirect_to").cloned();
+    tracing::info!("Login request for identifier: {}, client: {:?}, redirect_to: {:?}", identifier, client, redirect_to);
 
     let oauth_client = state
         .oauth_client
@@ -52,12 +54,20 @@ pub async fn login(
 
     use atrium_oauth::{AuthorizeOptions, KnownScope, Scope};
 
+    let state_value = match (&client, &redirect_to) {
+        (Some(c), Some(r)) => Some(format!("{{\"client\":\"{}\",\"redirect_to\":\"{}\"}}", c, r)),
+        (Some(c), None) => Some(c.clone()),
+        _ => None,
+    };
+
     let options = AuthorizeOptions {
         scopes: vec![
             Scope::Known(KnownScope::Atproto),
             Scope::Known(KnownScope::TransitionGeneric),
             Scope::Known(KnownScope::TransitionChatBsky),
         ],
+        // Pass the client identifier and optional redirect_to through OAuth state
+        state: state_value,
         ..Default::default()
     };
 
@@ -97,7 +107,7 @@ pub async fn oauth_callback(
         iss: callback.iss,
     };
 
-    let (oauth_session, _app_state) = oauth_client
+    let (oauth_session, app_state) = oauth_client
         .callback(params)
         .await
         .map_err(|e| AppError::OAuth(format!("Callback failed: {}", e)))?;
@@ -277,7 +287,31 @@ pub async fn oauth_callback(
     // Redirect back to the app via Universal Link (iOS Associated Domains)
     // Note: the cookie is still set for browser-based clients; mobile should use the session_id.
     // Use a URL fragment so the session token isn't sent to catbird.blue (avoids access logs/referrers).
-    let app_redirect = format!("https://catbird.blue/oauth/callback#session_id={}", session_id);
+    // For catmos (desktop app), check for localhost redirect_to in JSON state.
+    let app_redirect = match app_state.as_deref() {
+        Some(state_str) if state_str.starts_with('{') => {
+            // JSON-encoded state with redirect_to
+            if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
+                if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
+                    // SECURITY: Only allow localhost redirects
+                    if redirect_to.starts_with("http://127.0.0.1:") || redirect_to.starts_with("http://[::1]:") {
+                        format!("{}?session_id={}", redirect_to, session_id)
+                    } else {
+                        tracing::warn!("Rejected non-localhost redirect_to: {}", redirect_to);
+                        format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+                    }
+                } else {
+                    format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+                }
+            } else {
+                format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+            }
+        }
+        _ => {
+            // Default: Catbird iOS/macOS universal link
+            format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+        }
+    };
 
     Ok((
         jar.add(cookie),
