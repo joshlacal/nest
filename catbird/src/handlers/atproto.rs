@@ -516,6 +516,19 @@ pub async fn proxy_xrpc(
                 "[BFF-RESP] PDS response (buffered)"
             );
 
+            // Log error response bodies for debugging (truncated, no PII)
+            if status >= 400 {
+                if let Ok(error_text) = std::str::from_utf8(&response_body) {
+                    let truncated = if error_text.len() > 200 { &error_text[..200] } else { error_text };
+                    tracing::warn!(
+                        request_id = %request_id,
+                        status = status,
+                        error_body = %truncated,
+                        "[BFF-RESP-ERR] PDS error response body"
+                    );
+                }
+            }
+
             let mut response =
                 Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {

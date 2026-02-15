@@ -375,6 +375,20 @@ impl AtProtoClient {
                 "[BFF-UPSTREAM-RECV] Response from PDS (buffered)"
             );
 
+            // Log error response bodies for debugging
+            if status >= 400 && status != 401 {
+                if let Ok(error_text) = std::str::from_utf8(&body) {
+                    let truncated = if error_text.len() > 200 { &error_text[..200] } else { error_text };
+                    tracing::warn!(
+                        request_id = %request_id,
+                        attempt = attempt,
+                        status = status,
+                        error_body = %truncated,
+                        "[BFF-UPSTREAM-ERR] PDS error response"
+                    );
+                }
+            }
+
             Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
