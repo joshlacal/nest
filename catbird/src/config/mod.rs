@@ -274,8 +274,17 @@ impl AppState {
             .oauth
             .scopes
             .iter()
-            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
+            .filter_map(|s| {
+                match Scope::parse(s) {
+                    Ok(scope) => Some(scope.into_static()),
+                    Err(e) => {
+                        tracing::warn!(scope = %s, error = %e, "Failed to parse OAuth scope — it will be excluded from authorization requests");
+                        None
+                    }
+                }
+            })
             .collect();
+        tracing::info!(scopes = ?state.config.oauth.scopes, parsed_count = scopes.len(), "OAuth scopes configured");
 
         let metadata = AtprotoClientMetadata::new(
             client_id,

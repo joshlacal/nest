@@ -74,3 +74,7 @@ tokio-test = "0.4"
 wiremock = "0.6"
 testcontainers = "0.18"
 testcontainers-modules = { version = "0.6", features = ["redis"] }
+
+[patch.crates-io]
+# Patch jacquard-oauth to add transition:chat.bsky scope support
+jacquard-oauth = { path = "../patches/jacquard-oauth" }
