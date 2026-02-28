@@ -2,6 +2,7 @@
 //!
 //! Handles loading configuration from environment variables and config files.
 
+use jacquard_common::IntoStatic;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -45,8 +46,14 @@ pub struct ServerConfig {
     /// Port to listen on
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Port for internal admin endpoints (metrics)
+    #[serde(default = "default_admin_port")]
+    pub admin_port: u16,
     /// Base URL for this server (used in OAuth metadata)
     pub base_url: String,
+    /// Allowed CORS origins (empty = permissive in dev)
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +104,10 @@ fn default_port() -> u16 {
     3000
 }
 
+fn default_admin_port() -> u16 {
+    9090
+}
+
 fn default_redis_url() -> String {
     "redis://127.0.0.1:6379".to_string()
 }
@@ -143,14 +154,21 @@ impl AppConfig {
     }
 }
 
+/// Concrete Jacquard OAuth client type used throughout nest.
+pub type JacquardOAuthClient =
+    jacquard_oauth::client::OAuthClient<jacquard_identity::JacquardResolver, crate::services::RedisAuthStore>;
+
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
     pub redis: redis::aio::ConnectionManager,
-    pub oauth_client: Option<Arc<crate::services::CatbirdOAuthClient>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
+    /// Jacquard OAuth client
+    pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
+    /// Redis-backed auth store for Jacquard sessions
+    pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
 }
 
 impl AppState {
@@ -158,6 +176,9 @@ impl AppState {
         let http_client = reqwest::Client::builder()
             .user_agent("Catbird/0.1.0")
             .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
             .build()?;
 
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
@@ -167,8 +188,9 @@ impl AppState {
             config: Arc::new(config),
             http_client,
             redis,
-            oauth_client: None,
             key_store: None,
+            jacquard_client: None,
+            auth_store: None,
         };
 
         // Initialize KeyStore first (needed by OAuth client)
@@ -185,20 +207,88 @@ impl AppState {
             }
         }
 
-        // Initialize OAuth client after state is created
-        match crate::services::create_oauth_client(&state) {
-            Ok(client) => {
-                state.oauth_client = Some(Arc::new(client));
-                tracing::info!("OAuthClient initialized successfully");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize OAuthClient: {}. OAuth will be unavailable.",
-                    e
-                );
+        // Initialize Jacquard auth store + OAuth client
+        if let Some(ref key_store) = state.key_store {
+            match Self::init_jacquard(&state, key_store) {
+                Ok((store, client)) => {
+                    state.auth_store = Some(Arc::new(store));
+                    state.jacquard_client = Some(Arc::new(client));
+                    tracing::info!("Jacquard OAuthClient initialized successfully");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to initialize Jacquard OAuthClient: {}",
+                        e
+                    );
+                }
             }
         }
 
         Ok(state)
+    }
+
+    /// Build the Jacquard RedisAuthStore and OAuthClient from current state.
+    fn init_jacquard(
+        state: &AppState,
+        key_store: &crate::services::KeyStore,
+    ) -> Result<(crate::services::RedisAuthStore, JacquardOAuthClient), anyhow::Error> {
+        use jacquard_oauth::atproto::{AtprotoClientMetadata, GrantType};
+        use jacquard_oauth::scopes::Scope;
+        use jacquard_oauth::session::ClientData;
+
+        // Parse encryption key from env (base64-encoded 32-byte key)
+        let encryption_key = std::env::var("SESSION_ENCRYPTION_KEY")
+            .ok()
+            .and_then(|b64| {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(&b64).ok()?;
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                } else {
+                    tracing::warn!("SESSION_ENCRYPTION_KEY must be 32 bytes (44 base64 chars)");
+                    None
+                }
+            });
+
+        let store = crate::services::RedisAuthStore::new(
+            state.redis.clone(),
+            state.config.redis.key_prefix.clone(),
+            state.config.redis.session_ttl_seconds,
+            encryption_key,
+        );
+
+        let keyset = key_store.to_jacquard_keyset()?;
+
+        // Build AtprotoClientMetadata for confidential client
+        let client_id = url::Url::parse(&state.config.oauth.client_id)?;
+        let redirect_uri = url::Url::parse(&state.config.oauth.redirect_uri)?;
+        let jwks_uri = url::Url::parse(&format!(
+            "{}/.well-known/jwks.json",
+            state.config.server.base_url.trim_end_matches('/')
+        ))?;
+
+        let scopes: Vec<Scope<'static>> = state
+            .config
+            .oauth
+            .scopes
+            .iter()
+            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
+            .collect();
+
+        let metadata = AtprotoClientMetadata::new(
+            client_id,
+            None,
+            vec![redirect_uri],
+            vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+            scopes,
+            Some(jwks_uri),
+        );
+
+        let client_data = ClientData::new(Some(keyset), metadata);
+        let client = JacquardOAuthClient::new(store.clone(), client_data);
+
+        Ok((store, client))
     }
 }

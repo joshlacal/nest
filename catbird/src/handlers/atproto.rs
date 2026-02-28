@@ -13,23 +13,19 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
-use base64::Engine;
-use chrono::{Duration, Utc};
-use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::metrics;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{
-    CatbirdSession, DPoPKeyPair, LoginRequest, LoginResponse, LogoutResponse, OAuthCallback,
-    SessionInfo,
+    CatbirdSession, LogoutResponse, OAuthCallback, SessionInfo,
 };
-use crate::services::{oauth::RedisSessionStore, AtProtoClient, MlsAuthService, ProxyResponse, SessionService};
+use crate::middleware::JacquardDpopData;
+use crate::services::{AtProtoClient, MlsAuthService, ProxyResponse};
 
 /// Handle login initiation (Redirect flow)
 ///
@@ -47,12 +43,12 @@ pub async fn login(
     let redirect_to = params.get("redirect_to").cloned();
     tracing::info!("Login request for identifier: {}, client: {:?}, redirect_to: {:?}", identifier, client, redirect_to);
 
-    let oauth_client = state
-        .oauth_client
+    let jacquard_client = state
+        .jacquard_client
         .as_ref()
-        .ok_or_else(|| AppError::Internal("OAuthClient not initialized".into()))?;
+        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
 
-    use atrium_oauth::{AuthorizeOptions, KnownScope, Scope};
+    use jacquard_oauth::types::AuthorizeOptions;
 
     let state_value = match (&client, &redirect_to) {
         (Some(c), Some(r)) => Some(format!("{{\"client\":\"{}\",\"redirect_to\":\"{}\"}}", c, r)),
@@ -61,18 +57,12 @@ pub async fn login(
     };
 
     let options = AuthorizeOptions {
-        scopes: vec![
-            Scope::Known(KnownScope::Atproto),
-            Scope::Known(KnownScope::TransitionGeneric),
-            Scope::Known(KnownScope::TransitionChatBsky),
-        ],
-        // Pass the client identifier and optional redirect_to through OAuth state
-        state: state_value,
+        state: state_value.map(|s| s.into()),
         ..Default::default()
     };
 
-    let auth_url = oauth_client
-        .authorize(identifier, options)
+    let auth_url = jacquard_client
+        .start_auth(identifier, options)
         .await
         .map_err(|e| AppError::OAuth(format!("Authorization failed: {}", e)))?;
 
@@ -94,189 +84,49 @@ pub async fn oauth_callback(
 ) -> AppResult<(CookieJar, Response)> {
     tracing::info!("OAuth callback received");
 
-    let oauth_client = state
-        .oauth_client
+    let jacquard_client = state
+        .jacquard_client
         .as_ref()
-        .ok_or_else(|| AppError::Internal("OAuthClient not initialized".into()))?;
+        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
 
-    use atrium_oauth::CallbackParams;
+    use jacquard_oauth::types::CallbackParams;
 
     let params = CallbackParams {
-        code: callback.code,
-        state: Some(callback.state),
-        iss: callback.iss,
+        code: callback.code.into(),
+        state: Some(callback.state.into()),
+        iss: callback.iss.map(|s| s.into()),
     };
 
-    let (oauth_session, app_state) = oauth_client
+    let oauth_session = jacquard_client
         .callback(params)
         .await
         .map_err(|e| AppError::OAuth(format!("Callback failed: {}", e)))?;
 
-    // Create our own Catbird session
-    use atrium_api::agent::SessionManager;
-    let did = oauth_session
-        .did()
-        .await
-        .ok_or_else(|| AppError::OAuth("Failed to get DID from session".into()))?
-        .to_string();
-
-    // Read the issued token set + DPoP key from atrium's RedisSessionStore
-    use atrium_api::types::string::Did;
-    use atrium_common::store::Store;
-
-    let did_typed: Did = did
-        .parse()
-        .map_err(|_| AppError::OAuth(format!("Invalid DID from session: {did}")))?;
-
-    let session_store = RedisSessionStore::new(
-        state.redis.clone(),
-        state.config.redis.key_prefix.clone(),
-    );
-
-    let atrium_session = session_store
-        .get(&did_typed)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to read OAuth session: {e}")))?
-        .ok_or_else(|| AppError::Internal("OAuth session missing after callback".into()))?;
-
-    // Persist DPoP private key for request signing
-    // ATProto OAuth always uses DPoP, so we extract and store the key
-    let dpop_jkt = {
-        let jwk_value = serde_json::to_value(&atrium_session.dpop_key)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP key: {e}")))?;
-
-        let d_b64 = jwk_value
-            .get("d")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::Internal("DPoP key missing private component".into()))?;
-
-        let d_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(d_b64)
-            .map_err(|e| AppError::Internal(format!("Invalid DPoP key encoding: {e}")))?;
-
-        let private_key_bytes: [u8; 32] = d_bytes
-            .try_into()
-            .map_err(|_| AppError::Internal("Invalid DPoP key length".into()))?;
-
-        let mut public_jwk = jwk_value;
-        if let Some(obj) = public_jwk.as_object_mut() {
-            obj.remove("d");
-        }
-
-        // Compute JWK thumbprint (RFC 7638) for dpop_jkt
-        // Canonical form requires lexicographic key order: crv, kty, x, y
-        let canonical_jwk = serde_json::json!({
-            "crv": public_jwk["crv"],
-            "kty": public_jwk["kty"],
-            "x": public_jwk["x"],
-            "y": public_jwk["y"],
-        });
-        let canonical_bytes = serde_json::to_vec(&canonical_jwk)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize canonical JWK: {e}")))?;
-
-        use sha2::{Sha256, Digest};
-        let hash = Sha256::digest(&canonical_bytes);
-        let thumbprint = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-
-        let dpop_pair = DPoPKeyPair {
-            public_jwk,
-            private_key_bytes,
-        };
-
-        // Generate session_id first so we can key the DPoP by session, not DID
-        // This allows multiple devices per account
-        let session_id = Uuid::new_v4();
-
-        // Store DPoP key by session_id (not DID) to support multiple devices
-        let redis_key = format!(
-            "{}dpop_key:{}",
-            state.config.redis.key_prefix,
-            session_id
-        );
-        let json = serde_json::to_string(&dpop_pair)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize DPoP keypair: {e}")))?;
-
-        let mut conn = state.redis.clone();
-        conn.set_ex::<_, _, ()>(&redis_key, json, state.config.redis.session_ttl_seconds)
-            .await?;
-
-        // Also store OAuth session by session_id for per-device token refresh
-        let oauth_session_key = format!(
-            "{}oauth_session:{}",
-            state.config.redis.key_prefix,
-            session_id
-        );
-        let oauth_session_json = serde_json::to_string(&atrium_session)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize OAuth session: {e}")))?;
-        conn.set_ex::<_, _, ()>(&oauth_session_key, oauth_session_json, state.config.redis.session_ttl_seconds)
-            .await?;
-
-        (Some(thumbprint), session_id)
+    // Jacquard stores the session in RedisAuthStore automatically.
+    // Extract the session_id and DID from the session data.
+    let session_data = oauth_session.data.read().await;
+    let did = session_data.account_did.as_str().to_string();
+    let session_id = session_data.session_id.to_string();
+    let pds_url = session_data.host_url.to_string();
+    // Read the custom state that was passed through (client identifier, redirect_to)
+    let app_state_str = {
+        // session_id IS the state string from start_auth — Jacquard uses it as AuthRequestData.state
+        // Try to parse it as JSON to extract redirect_to
+        // But the actual OAuth state was passed via AuthorizeOptions.state, which becomes session_id.
+        // We need to get it from the session_id field itself.
+        session_id.clone()
     };
+    drop(session_data);
 
-    let session_id = dpop_jkt.1;
-    let dpop_jkt = dpop_jkt.0;
-
-    // Resolve handle from DID by calling com.atproto.repo.describeRepo on the PDS
-    let handle = {
-        let pds_url = &atrium_session.token_set.aud;
-        let describe_url = format!(
-            "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
-            pds_url.as_str().trim_end_matches('/'),
-            &did
-        );
-        
-        // Make unauthenticated request to describe repo (public endpoint)
-        match reqwest::get(&describe_url).await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(json) => json
-                        .get("handle")
-                        .and_then(|h| h.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| did.clone()),
-                    Err(_) => did.clone(),
-                }
-            }
-            _ => did.clone(),
-        }
-    };
+    // Resolve handle from DID
+    let handle = resolve_handle_for_did(&did, &pds_url).await;
     tracing::info!("Resolved handle for DID {}: {}", &did, &handle);
-
-    let now = Utc::now();
-
-    let access_token_expires_at = atrium_session
-        .token_set
-        .expires_at
-        .as_ref()
-        .map(|dt| dt.as_ref().with_timezone(&Utc))
-        .unwrap_or_else(|| now + Duration::seconds(3600));
-
-    let session = CatbirdSession {
-        id: session_id,
-        did: did.clone(),
-        handle: handle.clone(),
-        pds_url: atrium_session.token_set.aud.clone(),
-        access_token: atrium_session.token_set.access_token.clone(),
-        refresh_token: atrium_session
-            .token_set
-            .refresh_token
-            .clone()
-            .unwrap_or_default(),
-        access_token_expires_at,
-        created_at: now,
-        last_used_at: now,
-        dpop_jkt,
-    };
-
-    let session_service = SessionService::new(state.clone());
-    session_service.save_session(&session).await?;
 
     // Record successful OAuth login
     metrics::record_oauth_login(true);
 
-    // Set cookie
-    let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+    // Set cookie — session_id is the Jacquard state/session identifier
+    let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.clone()))
         .path("/")
         .http_only(true)
         .secure(true)
@@ -285,33 +135,7 @@ pub async fn oauth_callback(
         .build();
 
     // Redirect back to the app via Universal Link (iOS Associated Domains)
-    // Note: the cookie is still set for browser-based clients; mobile should use the session_id.
-    // Use a URL fragment so the session token isn't sent to catbird.blue (avoids access logs/referrers).
-    // For catmos (desktop app), check for localhost redirect_to in JSON state.
-    let app_redirect = match app_state.as_deref() {
-        Some(state_str) if state_str.starts_with('{') => {
-            // JSON-encoded state with redirect_to
-            if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
-                if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
-                    // SECURITY: Only allow localhost redirects
-                    if redirect_to.starts_with("http://127.0.0.1:") || redirect_to.starts_with("http://[::1]:") {
-                        format!("{}?session_id={}", redirect_to, session_id)
-                    } else {
-                        tracing::warn!("Rejected non-localhost redirect_to: {}", redirect_to);
-                        format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
-                    }
-                } else {
-                    format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
-                }
-            } else {
-                format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
-            }
-        }
-        _ => {
-            // Default: Catbird iOS/macOS universal link
-            format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
-        }
-    };
+    let app_redirect = build_app_redirect(&app_state_str, &session_id);
 
     Ok((
         jar.add(cookie),
@@ -323,6 +147,45 @@ pub async fn oauth_callback(
     ))
 }
 
+/// Resolve a handle for a DID by calling com.atproto.repo.describeRepo on the PDS.
+async fn resolve_handle_for_did(did: &str, pds_url: &str) -> String {
+    let describe_url = format!(
+        "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
+        pds_url.trim_end_matches('/'),
+        did
+    );
+
+    match reqwest::get(&describe_url).await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => json
+                    .get("handle")
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| did.to_string()),
+                Err(_) => did.to_string(),
+            }
+        }
+        _ => did.to_string(),
+    }
+}
+
+/// Build the redirect URL after OAuth callback.
+fn build_app_redirect(state_str: &str, session_id: &str) -> String {
+    if state_str.starts_with('{') {
+        if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
+            if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
+                // SECURITY: Only allow localhost redirects
+                if redirect_to.starts_with("http://127.0.0.1:") || redirect_to.starts_with("http://[::1]:") {
+                    return format!("{}?session_id={}", redirect_to, session_id);
+                }
+                tracing::warn!("Rejected non-localhost redirect_to: {}", redirect_to);
+            }
+        }
+    }
+    format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+}
+
 /// Handle logout
 ///
 /// POST /auth/logout
@@ -331,26 +194,19 @@ pub async fn logout(
     Extension(session): Extension<CatbirdSession>,
     jar: CookieJar,
 ) -> AppResult<(CookieJar, Json<LogoutResponse>)> {
-    let session_service = SessionService::new(state.clone());
-    
-    // Revoke the OAuth session at the authorization server and clean up locally
-    if let Err(e) = session_service.revoke_session(&session).await {
-        tracing::warn!("Failed to revoke OAuth session: {}", e);
+    let jacquard_client = state
+        .jacquard_client
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+
+    // Revoke via Jacquard (handles token revocation at auth server + store cleanup)
+    let did = jacquard_common::types::did::Did::new(&session.did)
+        .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
+
+    if let Err(e) = jacquard_client.revoke(&did, &session.id.to_string()).await {
+        tracing::warn!("Failed to revoke Jacquard session: {}", e);
         // Continue with logout even if revocation fails
     }
-
-    // Also clean up the DPoP key and session-scoped OAuth session from Redis
-    let dpop_key = format!(
-        "{}dpop_key:{}",
-        state.config.redis.key_prefix, session.id
-    );
-    let oauth_session_key = format!(
-        "{}oauth_session:{}",
-        state.config.redis.key_prefix, session.id
-    );
-    let mut conn = state.redis.clone();
-    let _: Result<(), _> = conn.del(&dpop_key).await;
-    let _: Result<(), _> = conn.del(&oauth_session_key).await;
 
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
@@ -382,6 +238,8 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
 pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
+    req_extensions: Option<Extension<crate::middleware::RequestId>>,
+    dpop_data: Option<Extension<JacquardDpopData>>,
     method: Method,
     Path(lexicon): Path<String>,
     RawQuery(raw_query): RawQuery,
@@ -389,13 +247,17 @@ pub async fn proxy_xrpc(
     body: Body,
 ) -> AppResult<Response> {
     let start = std::time::Instant::now();
-    
-    // Extract request ID from client for end-to-end correlation
-    let request_id = headers
-        .get("x-catbird-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+
+    // Extract request ID: prefer middleware-set value, fall back to client header
+    let request_id = req_extensions
+        .map(|ext| ext.0 .0.clone())
+        .or_else(|| {
+            headers
+                .get("x-catbird-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Use raw query string directly to preserve repeated params (e.g., feeds=a&feeds=b)
     // HashMap would lose duplicates, keeping only the last value
@@ -488,6 +350,7 @@ pub async fn proxy_xrpc(
     );
 
     let client = AtProtoClient::new(state.clone());
+    let jacquard_dpop = dpop_data.map(|ext| ext.0);
     let proxy_response = client
         .proxy_request(
             &session,
@@ -498,6 +361,7 @@ pub async fn proxy_xrpc(
             content_type,
             Some(&headers),
             &request_id,
+            jacquard_dpop.as_ref(),
         )
         .await?;
 

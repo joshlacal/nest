@@ -17,7 +17,6 @@ use std::sync::Arc;
 use crate::config::AppState;
 use crate::handlers::atproto;
 use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, RateLimitState};
-use crate::services::CryptoService;
 
 /// Create the ATProto router
 ///
@@ -100,44 +99,12 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 async fn jwks(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
-    // Use KeyStore if available (multi-key mode)
     if let Some(key_store) = &state.key_store {
         let keys = key_store.to_jwks();
         return axum::Json(serde_json::json!({ "keys": keys }));
     }
 
-    // Fallback to legacy single-key mode
-    let crypto_service = CryptoService::new(state.clone());
-    let private_key = match crypto_service.load_private_key() {
-        Ok(key) => key,
-        Err(error) => {
-            tracing::error!("Failed to load private key for JWKS: {}", error);
-            return axum::Json(serde_json::json!({ "keys": [] }));
-        }
-    };
-    let verifying_key = private_key.public_key();
-    let encoded = verifying_key.to_encoded_point(false);
-    let x = encoded
-        .x()
-        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-        .unwrap_or_default();
-    let y = encoded
-        .y()
-        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-        .unwrap_or_default();
-
-    axum::Json(serde_json::json!({
-        "keys": [
-            {
-                "kty": "EC",
-                "crv": "P-256",
-                "use": "sig",
-                "kid": "catbird-key-1",
-                "x": x,
-                "y": y,
-            }
-        ]
-    }))
+    axum::Json(serde_json::json!({ "keys": [] }))
 }
 
 /// DID Document endpoint
@@ -163,7 +130,6 @@ async fn did_document(
         format!("did:web:{}", host)
     });
 
-    // Use KeyStore if available (multi-key mode)
     if let Some(key_store) = &state.key_store {
         let keys = key_store.all_keys();
         let verification_methods: Vec<serde_json::Value> = keys
@@ -212,53 +178,15 @@ async fn did_document(
         }));
     }
 
-    // Fallback to legacy single-key mode
-    let crypto_service = CryptoService::new(state.clone());
-    let private_key = match crypto_service.load_private_key() {
-        Ok(key) => key,
-        Err(error) => {
-            tracing::error!("Failed to load private key for DID document: {}", error);
-            return axum::Json(serde_json::json!({
-                "error": "Failed to load signing key"
-            }));
-        }
-    };
-    
-    let verifying_key = private_key.public_key();
-    let encoded = verifying_key.to_encoded_point(false);
-    let x = encoded
-        .x()
-        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-        .unwrap_or_default();
-    let y = encoded
-        .y()
-        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-        .unwrap_or_default();
-
+    // No key_store configured — return empty document
     axum::Json(serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/did/v1",
             "https://w3id.org/security/suites/jws-2020/v1"
         ],
         "id": gateway_did,
-        "verificationMethod": [
-            {
-                "id": format!("{}#key-1", gateway_did),
-                "type": "JsonWebKey2020",
-                "controller": gateway_did,
-                "publicKeyJwk": {
-                    "kty": "EC",
-                    "crv": "P-256",
-                    "x": x,
-                    "y": y,
-                }
-            }
-        ],
-        "authentication": [
-            format!("{}#key-1", gateway_did)
-        ],
-        "assertionMethod": [
-            format!("{}#key-1", gateway_did)
-        ]
+        "verificationMethod": [],
+        "authentication": [],
+        "assertionMethod": []
     }))
 }

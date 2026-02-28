@@ -49,6 +49,10 @@ struct RateLimitEntry {
 }
 
 /// In-memory rate limiter state
+///
+/// NOTE: This is per-instance only. For horizontal scaling behind a load balancer,
+/// migrate to a Redis-backed sliding window or GCRA algorithm so rate limits
+/// are shared across all Nest instances.
 #[derive(Debug, Default)]
 pub struct RateLimiter {
     entries: RwLock<HashMap<String, RateLimitEntry>>,

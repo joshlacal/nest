@@ -9,7 +9,6 @@ use p256::SecretKey;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 
 /// A loaded signing key with its key ID
 #[derive(Clone)]
@@ -104,6 +103,27 @@ impl KeyStore {
         })
     }
 
+    /// Convert loaded keys into a Jacquard `Keyset` for OAuth client authentication.
+    pub fn to_jacquard_keyset(&self) -> AppResult<jacquard_oauth::keyset::Keyset> {
+        let jwks: Vec<jose_jwk::Jwk> = self
+            .keys
+            .iter()
+            .map(|(kid, secret_key)| jose_jwk::Jwk {
+                key: {
+                    let crypto_key = jose_jwk::crypto::Key::from(secret_key.clone());
+                    jose_jwk::Key::from(&crypto_key)
+                },
+                prm: jose_jwk::Parameters {
+                    kid: Some(kid.clone()),
+                    ..Default::default()
+                },
+            })
+            .collect();
+
+        jacquard_oauth::keyset::Keyset::try_from(jwks)
+            .map_err(|e| AppError::Crypto(format!("Failed to create Jacquard keyset: {}", e)))
+    }
+
     /// Convert all public keys to JWK format for JWKS endpoint
     pub fn to_jwks(&self) -> Vec<serde_json::Value> {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -177,37 +197,3 @@ fn load_legacy_key(oauth_config: &crate::config::OAuthConfig) -> AppResult<Optio
     Ok(None)
 }
 
-pub struct CryptoService {
-    state: Arc<AppState>,
-}
-
-impl CryptoService {
-    pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
-    }
-
-    pub fn load_private_key_pem(&self) -> AppResult<String> {
-        if let Some(base64_pem) = &self.state.config.oauth.private_key_base64 {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(base64_pem)
-                .map_err(|e| AppError::Config(format!("Invalid base64 private key: {}", e)))?;
-            return String::from_utf8(decoded)
-                .map_err(|e| AppError::Config(format!("Invalid PEM encoding: {}", e)));
-        }
-
-        if let Some(path) = &self.state.config.oauth.private_key_path {
-            return fs::read_to_string(path)
-                .map_err(|e| AppError::Config(format!("Failed to read private key: {}", e)));
-        }
-
-        Err(AppError::Config(
-            "OAuth private key not configured".to_string(),
-        ))
-    }
-
-    pub fn load_private_key(&self) -> AppResult<SecretKey> {
-        let pem = self.load_private_key_pem()?;
-        SecretKey::from_pkcs8_pem(&pem)
-            .map_err(|e| AppError::Crypto(format!("Failed to parse private key: {}", e)))
-    }
-}

@@ -6,7 +6,6 @@
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::CatbirdSession;
-use crate::services::CryptoService;
 use super::atproto_client::MAX_RESPONSE_SIZE;
 use base64::Engine;
 use chrono::Utc;
@@ -70,28 +69,12 @@ impl MlsAuthService {
             "jti": Uuid::new_v4().to_string(),
         });
 
-        // Use KeyStore for signing if available
-        if let Some(key_store) = &self.state.key_store {
-            let active_key = key_store.active_key();
-            let signing_key = SigningKey::from(&active_key.secret_key);
-            return self.sign_jwt_with_kid(&claims, &signing_key, &active_key.kid);
-        }
+        let key_store = self.state.key_store.as_ref()
+            .ok_or_else(|| AppError::Config("KeyStore not configured".into()))?;
+        let active_key = key_store.active_key();
+        let signing_key = SigningKey::from(&active_key.secret_key);
 
-        // Fallback to legacy single key
-        let crypto = CryptoService::new(self.state.clone());
-        let secret_key = crypto.load_private_key()?;
-        let signing_key = SigningKey::from(&secret_key);
-
-        self.sign_jwt(&claims, &signing_key)
-    }
-
-    /// Sign a JWT with ES256 (legacy, no kid)
-    fn sign_jwt(
-        &self,
-        claims: &serde_json::Value,
-        signing_key: &SigningKey,
-    ) -> AppResult<String> {
-        self.sign_jwt_with_kid(claims, signing_key, "catbird-key-1")
+        self.sign_jwt_with_kid(&claims, &signing_key, &active_key.kid)
     }
 
     /// Sign a JWT with ES256 and include kid in header

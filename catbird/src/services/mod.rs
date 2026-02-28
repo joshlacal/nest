@@ -5,11 +5,11 @@
 mod atproto_client;
 mod crypto;
 mod mls_auth;
-pub(crate) mod oauth;
+pub(crate) mod redis_auth_store;
+pub(crate) mod redis_crypto;
 mod ssrf;
 
-pub use atproto_client::{AtProtoClient, ProxyResponse, SessionService, MAX_RESPONSE_SIZE, STREAM_THRESHOLD};
-pub use crypto::{CryptoService, KeyStore, SigningKey};
+pub use atproto_client::{AtProtoClient, ProxyResponse};
+pub use crypto::KeyStore;
 pub use mls_auth::MlsAuthService;
-pub use oauth::{create_oauth_client, CatbirdOAuthClient};
-pub use ssrf::validate_pds_url;
+pub use redis_auth_store::RedisAuthStore;

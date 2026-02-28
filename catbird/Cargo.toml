@@ -19,12 +19,15 @@ tokio = { version = "1", features = ["full"] }
 # HTTP Client
 reqwest = { version = "0.12", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
 
-# Atrium (AT Protocol)
-atrium-api = { git = "https://github.com/atrium-rs/atrium", branch = "main", features = ["default"] }
-atrium-oauth = { git = "https://github.com/atrium-rs/atrium", branch = "main", features = ["default"] }
-atrium-common = { git = "https://github.com/atrium-rs/atrium", branch = "main" }
-atrium-identity = { git = "https://github.com/atrium-rs/atrium", branch = "main", features = ["default", "doh-handle-resolver"] }
-jose-jwk = "0.1"
+# Jacquard (AT Protocol)
+jacquard-oauth = { version = "0.9", features = ["default"] }
+jacquard-common = "0.9"
+jacquard-identity = { version = "0.9", features = ["dns", "cache"] }
+jose-jwk = { version = "0.1", features = ["p256"] }
+
+# Encryption
+aes-gcm = "0.10"
+dashmap = "6"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,7 +35,6 @@ serde_json = "1.0"
 
 # Crypto for DPoP and Client Assertions
 p256 = { version = "0.13", features = ["jwk", "ecdsa", "pkcs8"] }
-jsonwebtoken = "9"
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.8"

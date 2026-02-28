@@ -14,7 +14,14 @@ use std::sync::Arc;
 use crate::config::AppState;
 use crate::error::AppError;
 use crate::models::CatbirdSession;
-use crate::services::SessionService;
+use chrono::Utc;
+
+/// DPoP key data from Jacquard session, inserted into request extensions for the proxy.
+#[derive(Clone)]
+pub struct JacquardDpopData {
+    pub dpop_key: jose_jwk::Key,
+    pub dpop_host_nonce: String,
+}
 
 /// Cookie name for the Catbird session
 pub const SESSION_COOKIE_NAME: &str = "catbird_session";
@@ -119,8 +126,8 @@ fn extract_session_id(req: &Request<Body>) -> Option<String> {
 ///
 /// This middleware:
 /// 1. Extracts the session ID from cookie or Authorization header
-/// 2. Validates the session exists in Redis
-/// 3. Refreshes the access token if expired
+/// 2. Validates the session via Jacquard SessionRegistry (with automatic token refresh)
+/// 3. Attempts legacy session migration if Jacquard lookup fails
 /// 4. Injects the session into request extensions
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -135,51 +142,123 @@ pub async fn auth_middleware(
         )
     })?;
 
-    let session_service = SessionService::new(state.clone());
+    let auth_store = state.auth_store.as_ref().ok_or_else(|| {
+        classify_auth_error(AppError::Internal("Auth store not configured".into()))
+    })?;
+    let jacquard_client = state.jacquard_client.as_ref().ok_or_else(|| {
+        classify_auth_error(AppError::Internal("Jacquard client not configured".into()))
+    })?;
 
-    let session = session_service
-        .get_valid_session(&session_id)
-        .await
-        .map_err(|e| {
-            tracing::warn!("Session validation failed: {}", e);
-            classify_auth_error(e)
-        })?;
-
-    // Insert session into request extensions for handlers to use
-    req.extensions_mut().insert(session);
-
-    Ok(next.run(req).await)
-}
-
-/// Optional authentication middleware
-///
-/// Like auth_middleware but doesn't fail if no session is present.
-/// Useful for endpoints that work with or without authentication.
-pub async fn optional_auth_middleware(
-    State(state): State<Arc<AppState>>,
-    mut req: Request<Body>,
-    next: Next,
-) -> Response {
-    if let Some(session_id) = extract_session_id(&req) {
-        let session_service = SessionService::new(state.clone());
-
-        if let Ok(session) = session_service.get_valid_session(&session_id).await {
+    // Try Jacquard path (new sessions + already-migrated sessions)
+    match resolve_session_via_jacquard(auth_store, jacquard_client, &session_id).await {
+        Ok((session, dpop_data)) => {
             req.extensions_mut().insert(session);
+            req.extensions_mut().insert(dpop_data);
+            return Ok(next.run(req).await);
+        }
+        Err(AppError::InvalidSession) => {
+            // Session not found — attempt legacy migration
+            tracing::debug!(session_id = %session_id, "Jacquard session not found, attempting legacy migration");
+        }
+        Err(e) => {
+            return Err(classify_auth_error(e));
         }
     }
 
-    next.run(req).await
-}
-
-/// Extension trait to get session from request
-pub trait SessionExt {
-    fn session(&self) -> Option<&CatbirdSession>;
-}
-
-impl<B> SessionExt for Request<B> {
-    fn session(&self) -> Option<&CatbirdSession> {
-        self.extensions().get::<CatbirdSession>()
+    // Attempt to migrate a legacy (pre-Jacquard) session
+    match auth_store.try_migrate_legacy_session(&session_id).await {
+        Ok(Some(_)) => {
+            tracing::info!(session_id = %session_id, "Legacy session migrated, retrying Jacquard lookup");
+            // Migration succeeded — retry Jacquard lookup
+            let (session, dpop_data) =
+                resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
+                    .await
+                    .map_err(classify_auth_error)?;
+            req.extensions_mut().insert(session);
+            req.extensions_mut().insert(dpop_data);
+            Ok(next.run(req).await)
+        }
+        Ok(None) => {
+            // No legacy session either
+            Err(classify_auth_error(AppError::InvalidSession))
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
+            Err(classify_auth_error(AppError::InvalidSession))
+        }
     }
+}
+
+/// Resolve a session via Jacquard's SessionRegistry with automatic token refresh.
+///
+/// iOS sends only session_id. We use the session_index to look up the DID,
+/// then call SessionRegistry.get() which handles token refresh atomically
+/// using in-process DashMap mutex (no Redis distributed locks needed).
+async fn resolve_session_via_jacquard(
+    auth_store: &crate::services::RedisAuthStore,
+    jacquard_client: &crate::config::JacquardOAuthClient,
+    session_id: &str,
+) -> Result<(CatbirdSession, JacquardDpopData), AppError> {
+    use jacquard_common::types::did::Did;
+
+    // Step 1: Look up DID from session index
+    let did_str = auth_store
+        .lookup_did_for_session(session_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Session index lookup failed: {e}")))?
+        .ok_or(AppError::InvalidSession)?;
+
+    let did = Did::new(&did_str)
+        .map_err(|e| AppError::Internal(format!("Invalid DID in session index: {e}")))?;
+
+    // Step 2: Get session from registry (auto_refresh=true triggers token refresh if needed)
+    let session_data = jacquard_client
+        .registry
+        .get(&did, session_id, true)
+        .await
+        .map_err(|e| AppError::OAuth(format!("Jacquard session get failed: {e}")))?;
+
+    // Step 3: Convert ClientSessionData → CatbirdSession for backward compatibility
+    let expires_at = session_data
+        .token_set
+        .expires_at
+        .as_ref()
+        .and_then(|dt| {
+            // Parse jacquard Datetime to chrono
+            let s = dt.as_str();
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        })
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(3600));
+
+    // Extract DPoP data for the proxy
+    let dpop_data = JacquardDpopData {
+        dpop_key: session_data.dpop_data.dpop_key.clone(),
+        dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
+    };
+
+    // Try to resolve handle (best effort)
+    let handle = did_str.clone(); // Will be enriched by handler if needed
+
+    let session = CatbirdSession {
+        id: uuid::Uuid::parse_str(session_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+        did: did_str,
+        handle,
+        pds_url: session_data.host_url.to_string(),
+        access_token: session_data.token_set.access_token.to_string(),
+        refresh_token: session_data
+            .token_set
+            .refresh_token
+            .as_ref()
+            .map(|t| t.to_string())
+            .unwrap_or_default(),
+        access_token_expires_at: expires_at,
+        created_at: Utc::now(), // Not tracked in Jacquard session
+        last_used_at: Utc::now(),
+    };
+
+    Ok((session, dpop_data))
 }
 
 #[cfg(test)]

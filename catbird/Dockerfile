@@ -53,8 +53,8 @@ COPY --from=builder /app/target/release/catbird /app/catbird
 RUN useradd -r -s /bin/false catbird
 USER catbird
 
-# Expose port
-EXPOSE 3000
+# Expose ports (3000 = app, 9090 = admin/metrics)
+EXPOSE 3000 9090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
