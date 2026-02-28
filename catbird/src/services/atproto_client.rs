@@ -374,6 +374,13 @@ impl AtProtoClient {
 
         // Forward all client headers except hop-by-hop and headers we set ourselves
         if let Some(ch) = client_headers {
+            let client_proxy = ch.get("atproto-proxy").map(|v| v.to_str().unwrap_or("?"));
+            tracing::info!(
+                request_id = %request_id,
+                client_atproto_proxy = ?client_proxy,
+                client_header_count = ch.len(),
+                "[BFF-HDR] Client headers received (buffered)"
+            );
             for (name, value) in ch.iter() {
                 let name_lower = name.as_str().to_lowercase();
                 // Skip hop-by-hop headers and headers we manage

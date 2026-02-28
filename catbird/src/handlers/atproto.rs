@@ -341,11 +341,15 @@ pub async fn proxy_xrpc(
 
     // Default: proxy through PDS
     let path = format!("/xrpc/{}", lexicon);
+
+    // Debug: log whether atproto-proxy header is present from client
+    let has_proxy_header = headers.get("atproto-proxy");
     tracing::info!(
         request_id = %request_id,
         method = %method,
         path = %path,
         pds = %session.pds_url,
+        atproto_proxy = ?has_proxy_header,
         "[BFF-FWD] Forwarding to PDS"
     );
 
