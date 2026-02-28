@@ -134,8 +134,7 @@ async fn did_document(
         let keys = key_store.all_keys();
         let verification_methods: Vec<serde_json::Value> = keys
             .iter()
-            .enumerate()
-            .map(|(i, key)| {
+            .map(|key| {
                 let public_key = key.secret_key.public_key();
                 let encoded = public_key.to_encoded_point(false);
                 let x = encoded
@@ -148,7 +147,7 @@ async fn did_document(
                     .unwrap_or_default();
 
                 serde_json::json!({
-                    "id": format!("{}#key-{}", gateway_did, i + 1),
+                    "id": format!("{}#{}", gateway_did, key.kid),
                     "type": "JsonWebKey2020",
                     "controller": gateway_did,
                     "publicKeyJwk": {
@@ -162,8 +161,9 @@ async fn did_document(
             })
             .collect();
 
-        let key_refs: Vec<String> = (1..=keys.len())
-            .map(|i| format!("{}#key-{}", gateway_did, i))
+        let key_refs: Vec<String> = keys
+            .iter()
+            .map(|key| format!("{}#{}", gateway_did, key.kid))
             .collect();
 
         return axum::Json(serde_json::json!({
