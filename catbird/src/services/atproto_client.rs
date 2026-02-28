@@ -83,10 +83,11 @@ impl AtProtoClient {
         // SSRF protection: validate the PDS URL before making any requests
         validate_pds_url(&session.pds_url)?;
 
+        let base = session.pds_url.trim_end_matches('/');
         let url = if let Some(qs) = query_string {
-            format!("{}{}?{}", session.pds_url, path, qs)
+            format!("{}{}?{}", base, path, qs)
         } else {
-            format!("{}{}", session.pds_url, path)
+            format!("{}{}", base, path)
         };
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);

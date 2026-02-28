@@ -27,7 +27,7 @@ impl MlsAuthService {
 
     /// Check if a lexicon is an MLS endpoint that should be routed directly
     pub fn is_mls_lexicon(lexicon: &str) -> bool {
-        lexicon.starts_with("blue.catbird.mls.")
+        lexicon.starts_with("blue.catbird.mlsChat.")
     }
 
     /// Check if direct MLS routing is enabled
@@ -207,8 +207,9 @@ mod tests {
 
     #[test]
     fn test_is_mls_lexicon() {
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mls.getConvos"));
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mls.sendMessage"));
+        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.getConvos"));
+        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.sendMessage"));
+        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.publishKeyPackages"));
         assert!(!MlsAuthService::is_mls_lexicon("app.bsky.feed.getTimeline"));
         assert!(!MlsAuthService::is_mls_lexicon("chat.bsky.convo.listConvos"));
     }
