@@ -24,6 +24,7 @@ jacquard-oauth = { version = "0.9", features = ["default"] }
 jacquard-common = "0.9"
 jacquard-identity = { version = "0.9", features = ["dns", "cache"] }
 jose-jwk = { version = "0.1", features = ["p256"] }
+catbird-atproto = { path = "../../catbird-atproto" }
 
 # Encryption
 aes-gcm = "0.10"
@@ -53,6 +54,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Error Handling
 thiserror = "1.0"
 anyhow = "1.0"
+
+# CLI (for session_migrate binary)
+clap = { version = "4", features = ["derive"] }
 
 # Utilities
 uuid = { version = "1.0", features = ["v4", "serde"] }

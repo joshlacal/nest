@@ -27,7 +27,17 @@ impl MlsAuthService {
 
     /// Check if a lexicon is an MLS endpoint that should be routed directly
     pub fn is_mls_lexicon(lexicon: &str) -> bool {
-        lexicon.starts_with("blue.catbird.mlsChat.")
+        let prefix = Self::mls_lexicon_prefix();
+        lexicon.len() > prefix.len()
+            && lexicon.starts_with(prefix)
+            && lexicon.as_bytes().get(prefix.len()) == Some(&b'.')
+    }
+
+    fn mls_lexicon_prefix() -> &'static str {
+        catbird_atproto::catbird::mls::get_convos::NSID
+            .rsplit_once('.')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(catbird_atproto::catbird::mls::get_convos::NSID)
     }
 
     /// Check if direct MLS routing is enabled
