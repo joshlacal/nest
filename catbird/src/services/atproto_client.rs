@@ -330,7 +330,11 @@ impl AtProtoClient {
             // Log error response bodies for debugging
             if status >= 400 && status != 401 {
                 if let Ok(error_text) = std::str::from_utf8(&body) {
-                    let truncated = if error_text.len() > 200 { &error_text[..200] } else { error_text };
+                    let truncated = if error_text.len() > 200 {
+                        &error_text[..200]
+                    } else {
+                        error_text
+                    };
                     tracing::warn!(
                         request_id = %request_id,
                         attempt = attempt,
@@ -532,9 +536,8 @@ impl AtProtoClient {
     ) -> AppResult<HeaderMap> {
         let mut headers = HeaderMap::new();
 
-        let dpop_data = jacquard_dpop.ok_or_else(|| {
-            AppError::Internal("Missing Jacquard DPoP data for request".into())
-        })?;
+        let dpop_data = jacquard_dpop
+            .ok_or_else(|| AppError::Internal("Missing Jacquard DPoP data for request".into()))?;
 
         use base64::Engine;
         use sha2::{Digest, Sha256};
@@ -557,8 +560,7 @@ impl AtProtoClient {
         let auth_value = format!("DPoP {}", session.access_token);
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&auth_value)
-                .map_err(|e| AppError::Internal(e.to_string()))?,
+            HeaderValue::from_str(&auth_value).map_err(|e| AppError::Internal(e.to_string()))?,
         );
         headers.insert(
             "DPoP",

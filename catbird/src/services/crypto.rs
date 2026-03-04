@@ -73,7 +73,10 @@ impl KeyStore {
             "KeyStore initialized"
         );
 
-        Ok(Self { keys, active_key_id })
+        Ok(Self {
+            keys,
+            active_key_id,
+        })
     }
 
     /// Get the active signing key (used for signing new JWTs)
@@ -127,7 +130,7 @@ impl KeyStore {
     /// Convert all public keys to JWK format for JWKS endpoint
     pub fn to_jwks(&self) -> Vec<serde_json::Value> {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        
+
         self.all_keys()
             .iter()
             .map(|key| {
@@ -162,7 +165,7 @@ fn derive_kid_from_path(path: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("key");
-    
+
     // If filename already starts with "catbird-", use as-is
     if filename.starts_with("catbird-") {
         filename.to_string()
@@ -196,4 +199,3 @@ fn load_legacy_key(oauth_config: &crate::config::OAuthConfig) -> AppResult<Optio
 
     Ok(None)
 }
-

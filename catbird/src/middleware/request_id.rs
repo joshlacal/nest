@@ -16,10 +16,7 @@ use axum::{
 #[derive(Debug, Clone)]
 pub struct RequestId(pub String);
 
-pub async fn request_id_middleware(
-    mut req: Request<Body>,
-    next: Next,
-) -> Response<Body> {
+pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response<Body> {
     let id = req
         .headers()
         .get("x-request-id")

@@ -4,8 +4,7 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    self, CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry,
-    TextEncoder,
+    self, CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
 
 lazy_static! {
@@ -73,9 +72,7 @@ pub fn register_metrics() {
     REGISTRY
         .register(Box::new(PROXY_REQUESTS_TOTAL.clone()))
         .unwrap();
-    REGISTRY
-        .register(Box::new(PROXY_DURATION.clone()))
-        .unwrap();
+    REGISTRY.register(Box::new(PROXY_DURATION.clone())).unwrap();
     REGISTRY
         .register(Box::new(OAUTH_LOGINS_TOTAL.clone()))
         .unwrap();
@@ -94,7 +91,9 @@ pub fn register_metrics() {
 pub async fn metrics_handler() -> String {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
-    encoder.encode_to_string(&metric_families).unwrap_or_default()
+    encoder
+        .encode_to_string(&metric_families)
+        .unwrap_or_default()
 }
 
 /// Record an HTTP request metric
@@ -136,5 +135,7 @@ pub fn set_active_sessions(count: f64) {
 
 /// Record rate limit exceeded event
 pub fn record_rate_limit_exceeded(endpoint: &str) {
-    RATE_LIMIT_EXCEEDED_TOTAL.with_label_values(&[endpoint]).inc();
+    RATE_LIMIT_EXCEEDED_TOTAL
+        .with_label_values(&[endpoint])
+        .inc();
 }

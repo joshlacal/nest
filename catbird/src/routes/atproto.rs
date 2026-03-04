@@ -78,7 +78,8 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // Well-known routes for OAuth metadata
     let wellknown_routes = Router::new()
         .route("/did.json", get(did_document))
-        .route("/jwks.json", get(jwks));
+        .route("/jwks.json", get(jwks))
+        .route("/oauth-client-metadata", get(oauth_client_metadata));
 
     Router::new()
         .nest("/auth", auth_routes)
@@ -86,9 +87,34 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/.well-known", wellknown_routes)
 }
 
-// NOTE: OAuth client metadata is served statically by nginx at
-// https://catbird.blue/oauth-client-metadata.json
-// No dynamic endpoint needed here.
+/// OAuth client metadata endpoint
+///
+/// GET /.well-known/oauth-client-metadata
+///
+/// Returns the OAuth client metadata document for this gateway.
+/// Required by AT Protocol OAuth for client_id validation.
+async fn oauth_client_metadata(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    let base_url = &state.config.server.base_url;
+    axum::Json(serde_json::json!({
+        "client_id": state.config.oauth.client_id,
+        "client_name": "Catbird",
+        "client_uri": base_url,
+        "logo_uri": format!("{}/logo.png", base_url),
+        "tos_uri": format!("{}/terms", base_url),
+        "policy_uri": format!("{}/privacy", base_url),
+        "redirect_uris": [&state.config.oauth.redirect_uri],
+        "scope": state.config.oauth.scopes.join(" "),
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "private_key_jwt",
+        "token_endpoint_auth_signing_alg": "ES256",
+        "jwks_uri": format!("{}/.well-known/jwks.json", base_url),
+        "application_type": "web",
+        "dpop_bound_access_tokens": true,
+    }))
+}
 
 /// JWKS endpoint
 ///

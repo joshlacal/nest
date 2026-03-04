@@ -195,10 +195,7 @@ async fn run_export(
 
     for (i, key) in keys.iter().enumerate() {
         let value: Option<String> = conn.get(key).await?;
-        let ttl: i64 = redis::cmd("TTL")
-            .arg(key)
-            .query_async(&mut conn)
-            .await?;
+        let ttl: i64 = redis::cmd("TTL").arg(key).query_async(&mut conn).await?;
 
         if let Some(v) = value {
             exported.push(ExportedKey {
@@ -322,10 +319,8 @@ async fn run_verify(
     eprintln!("Scanning target keys …");
     let tgt_keys = scan_keys(&mut tgt, prefix, batch_size).await?;
 
-    let src_set: std::collections::HashSet<&str> =
-        src_keys.iter().map(|s| s.as_str()).collect();
-    let tgt_set: std::collections::HashSet<&str> =
-        tgt_keys.iter().map(|s| s.as_str()).collect();
+    let src_set: std::collections::HashSet<&str> = src_keys.iter().map(|s| s.as_str()).collect();
+    let tgt_set: std::collections::HashSet<&str> = tgt_keys.iter().map(|s| s.as_str()).collect();
 
     let missing_from_target: Vec<&&str> = src_set.difference(&tgt_set).collect();
     let extra_in_target: Vec<&&str> = tgt_set.difference(&src_set).collect();

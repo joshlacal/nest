@@ -3,10 +3,10 @@
 //! Generates service auth tokens for direct Gateway → MLS server communication.
 //! Uses the Gateway's signing key to create JWTs that the MLS server can verify.
 
+use super::atproto_client::MAX_RESPONSE_SIZE;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::CatbirdSession;
-use super::atproto_client::MAX_RESPONSE_SIZE;
 use base64::Engine;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -34,16 +34,15 @@ impl MlsAuthService {
     }
 
     fn mls_lexicon_prefix() -> &'static str {
-        catbird_atproto::catbird::mls::get_convos::NSID
+        catbird_atproto::catbird::mls_chat::get_convos::NSID
             .rsplit_once('.')
             .map(|(prefix, _)| prefix)
-            .unwrap_or(catbird_atproto::catbird::mls::get_convos::NSID)
+            .unwrap_or(catbird_atproto::catbird::mls_chat::get_convos::NSID)
     }
 
     /// Check if direct MLS routing is enabled
     pub fn is_enabled(&self) -> bool {
-        self.state.config.mls.service_url.is_some() 
-            && self.state.config.mls.gateway_did.is_some()
+        self.state.config.mls.service_url.is_some() && self.state.config.mls.gateway_did.is_some()
     }
 
     /// Get the MLS service URL
@@ -64,7 +63,12 @@ impl MlsAuthService {
         session: &CatbirdSession,
         lexicon: &str,
     ) -> AppResult<String> {
-        let gateway_did = self.state.config.mls.gateway_did.as_ref()
+        let gateway_did = self
+            .state
+            .config
+            .mls
+            .gateway_did
+            .as_ref()
             .ok_or_else(|| AppError::Config("MLS gateway_did not configured".into()))?;
 
         let now = Utc::now().timestamp();
@@ -79,7 +83,10 @@ impl MlsAuthService {
             "jti": Uuid::new_v4().to_string(),
         });
 
-        let key_store = self.state.key_store.as_ref()
+        let key_store = self
+            .state
+            .key_store
+            .as_ref()
             .ok_or_else(|| AppError::Config("KeyStore not configured".into()))?;
         let active_key = key_store.active_key();
         let signing_key = SigningKey::from(&active_key.secret_key);
@@ -107,12 +114,12 @@ impl MlsAuthService {
         let encoded_header = b64url.encode(
             serde_json::to_string(&header)
                 .map_err(|e| AppError::Internal(e.to_string()))?
-                .as_bytes()
+                .as_bytes(),
         );
         let encoded_payload = b64url.encode(
             serde_json::to_string(claims)
                 .map_err(|e| AppError::Internal(e.to_string()))?
-                .as_bytes()
+                .as_bytes(),
         );
 
         let signing_input = format!("{}.{}", encoded_header, encoded_payload);
@@ -134,7 +141,8 @@ impl MlsAuthService {
         body: Option<bytes::Bytes>,
         content_type: Option<&str>,
     ) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
-        let service_url = self.service_url()
+        let service_url = self
+            .service_url()
             .ok_or_else(|| AppError::Config("MLS service_url not configured".into()))?;
 
         // Build the URL
@@ -148,7 +156,9 @@ impl MlsAuthService {
         let token = self.generate_service_token(session, lexicon)?;
 
         // Build request
-        let mut request = self.state.http_client
+        let mut request = self
+            .state
+            .http_client
             .request(method, &url)
             .header("Authorization", format!("Bearer {}", token));
 
@@ -161,7 +171,9 @@ impl MlsAuthService {
         }
 
         // Send request
-        let response = request.send().await
+        let response = request
+            .send()
+            .await
             .map_err(|e| AppError::Internal(format!("MLS request failed: {}", e)))?;
 
         let status = response.status().as_u16();
@@ -217,10 +229,18 @@ mod tests {
 
     #[test]
     fn test_is_mls_lexicon() {
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.getConvos"));
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.sendMessage"));
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.publishKeyPackages"));
+        assert!(MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
+        assert!(MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.sendMessage"
+        ));
+        assert!(MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.publishKeyPackages"
+        ));
         assert!(!MlsAuthService::is_mls_lexicon("app.bsky.feed.getTimeline"));
-        assert!(!MlsAuthService::is_mls_lexicon("chat.bsky.convo.listConvos"));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "chat.bsky.convo.listConvos"
+        ));
     }
 }

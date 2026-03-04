@@ -121,7 +121,11 @@ fn default_session_ttl() -> u64 {
 }
 
 fn default_scopes() -> Vec<String> {
-    vec!["atproto".to_string(), "transition:generic".to_string(), "transition:chat.bsky".to_string()]
+    vec![
+        "atproto".to_string(),
+        "transition:generic".to_string(),
+        "transition:chat.bsky".to_string(),
+    ]
 }
 
 impl AppConfig {
@@ -155,8 +159,10 @@ impl AppConfig {
 }
 
 /// Concrete Jacquard OAuth client type used throughout nest.
-pub type JacquardOAuthClient =
-    jacquard_oauth::client::OAuthClient<jacquard_identity::JacquardResolver, crate::services::RedisAuthStore>;
+pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
+    jacquard_identity::JacquardResolver,
+    crate::services::RedisAuthStore,
+>;
 
 /// Shared application state
 #[derive(Clone)]
@@ -165,8 +171,10 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub redis: redis::aio::ConnectionManager,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
-    /// Jacquard OAuth client
+    /// Jacquard OAuth client (primary — Catbird iOS)
     pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
+    /// Jacquard OAuth client for catmos-web
+    pub catmos_jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Redis-backed auth store for Jacquard sessions
     pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
 }
@@ -190,6 +198,7 @@ impl AppState {
             redis,
             key_store: None,
             jacquard_client: None,
+            catmos_jacquard_client: None,
             auth_store: None,
         };
 
@@ -216,10 +225,33 @@ impl AppState {
                     tracing::info!("Jacquard OAuthClient initialized successfully");
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to initialize Jacquard OAuthClient: {}",
-                        e
-                    );
+                    tracing::warn!("Failed to initialize Jacquard OAuthClient: {}", e);
+                }
+            }
+        }
+
+        // Initialize catmos-web OAuth client if CATMOS_OAUTH_CLIENT_ID is set
+        if let (Some(ref key_store), Some(ref auth_store)) = (&state.key_store, &state.auth_store) {
+            if let Ok(catmos_client_id) = std::env::var("CATMOS_OAUTH_CLIENT_ID") {
+                let catmos_redirect = std::env::var("CATMOS_OAUTH_REDIRECT_URI")
+                    .unwrap_or_else(|_| format!("{}/auth/callback", state.config.server.base_url));
+                match Self::build_jacquard_client(
+                    &state,
+                    key_store,
+                    auth_store,
+                    &catmos_client_id,
+                    &catmos_redirect,
+                ) {
+                    Ok(client) => {
+                        state.catmos_jacquard_client = Some(Arc::new(client));
+                        tracing::info!(
+                            "Catmos Jacquard OAuthClient initialized (client_id={})",
+                            catmos_client_id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize catmos OAuthClient: {}", e);
+                    }
                 }
             }
         }
@@ -241,7 +273,9 @@ impl AppState {
             .ok()
             .and_then(|b64| {
                 use base64::Engine;
-                let bytes = base64::engine::general_purpose::STANDARD.decode(&b64).ok()?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .ok()?;
                 if bytes.len() == 32 {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
@@ -290,5 +324,50 @@ impl AppState {
         let client = JacquardOAuthClient::new(store.clone(), client_data);
 
         Ok((store, client))
+    }
+
+    /// Build a JacquardOAuthClient with a custom client_id and redirect_uri,
+    /// reusing an existing RedisAuthStore. Used for catmos-web's separate OAuth identity.
+    fn build_jacquard_client(
+        state: &AppState,
+        key_store: &crate::services::KeyStore,
+        existing_store: &crate::services::RedisAuthStore,
+        client_id_str: &str,
+        redirect_uri_str: &str,
+    ) -> Result<JacquardOAuthClient, anyhow::Error> {
+        use jacquard_oauth::atproto::{AtprotoClientMetadata, GrantType};
+        use jacquard_oauth::scopes::Scope;
+        use jacquard_oauth::session::ClientData;
+
+        let keyset = key_store.to_jacquard_keyset()?;
+
+        let client_id = url::Url::parse(client_id_str)?;
+        let redirect_uri = url::Url::parse(redirect_uri_str)?;
+        let jwks_uri = url::Url::parse(&format!(
+            "{}/.well-known/jwks.json",
+            state.config.server.base_url.trim_end_matches('/')
+        ))?;
+
+        let scopes: Vec<Scope<'static>> = state
+            .config
+            .oauth
+            .scopes
+            .iter()
+            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
+            .collect();
+
+        let metadata = AtprotoClientMetadata::new(
+            client_id,
+            None,
+            vec![redirect_uri],
+            vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+            scopes,
+            Some(jwks_uri),
+        );
+
+        let client_data = ClientData::new(Some(keyset), metadata);
+        let client = JacquardOAuthClient::new(existing_store.clone(), client_data);
+
+        Ok(client)
     }
 }

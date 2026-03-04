@@ -180,7 +180,9 @@ impl RedisAuthStore {
             authserver_revocation_endpoint: None,
             scopes: vec![
                 jacquard_oauth::scopes::Scope::Atproto,
-                jacquard_oauth::scopes::Scope::Transition(jacquard_oauth::scopes::TransitionScope::Generic),
+                jacquard_oauth::scopes::Scope::Transition(
+                    jacquard_oauth::scopes::TransitionScope::Generic,
+                ),
             ],
             dpop_data: DpopClientData {
                 dpop_key,

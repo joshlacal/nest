@@ -20,11 +20,9 @@ use std::sync::Arc;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::metrics;
-use crate::middleware::SESSION_COOKIE_NAME;
-use crate::models::{
-    CatbirdSession, LogoutResponse, OAuthCallback, SessionInfo,
-};
 use crate::middleware::JacquardDpopData;
+use crate::middleware::SESSION_COOKIE_NAME;
+use crate::models::{CatbirdSession, LogoutResponse, OAuthCallback, SessionInfo};
 use crate::services::{AtProtoClient, MlsAuthService, ProxyResponse};
 
 /// Handle login initiation (Redirect flow)
@@ -41,23 +39,47 @@ pub async fn login(
         .ok_or_else(|| AppError::BadRequest("Missing identifier".into()))?;
     let client = params.get("client").cloned();
     let redirect_to = params.get("redirect_to").cloned();
-    tracing::info!("Login request for identifier: {}, client: {:?}, redirect_to: {:?}", identifier, client, redirect_to);
+    tracing::info!(
+        "Login request for identifier: {}, client: {:?}, redirect_to: {:?}",
+        identifier,
+        client,
+        redirect_to
+    );
 
-    let jacquard_client = state
-        .jacquard_client
-        .as_ref()
-        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+    // Select the appropriate OAuth client based on the client parameter
+    let is_catmos = client.as_deref() == Some("catmos-web");
+    let jacquard_client = if is_catmos {
+        state
+            .catmos_jacquard_client
+            .as_ref()
+            .or(state.jacquard_client.as_ref())
+            .ok_or_else(|| AppError::Internal("No OAuthClient available for catmos-web".into()))?
+    } else {
+        state
+            .jacquard_client
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
+    };
 
     use jacquard_oauth::types::AuthorizeOptions;
 
-    let state_value = match (&client, &redirect_to) {
-        (Some(c), Some(r)) => Some(format!("{{\"client\":\"{}\",\"redirect_to\":\"{}\"}}", c, r)),
-        (Some(c), None) => Some(c.clone()),
-        _ => None,
-    };
+    // Generate a clean UUID for the OAuth state (= Jacquard session_id).
+    // Store redirect_to in Redis so the callback can look it up.
+    let session_nonce = uuid::Uuid::new_v4().to_string();
+    if let Some(ref r) = redirect_to {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_redirect:{}", session_nonce);
+        let _: Result<(), _> = redis::cmd("SET")
+            .arg(&key)
+            .arg(r.as_str())
+            .arg("EX")
+            .arg(600) // 10 minute TTL
+            .query_async(&mut conn)
+            .await;
+    }
 
     let options = AuthorizeOptions {
-        state: state_value.map(|s| s.into()),
+        state: Some(session_nonce.into()),
         ..Default::default()
     };
 
@@ -84,10 +106,52 @@ pub async fn oauth_callback(
 ) -> AppResult<(CookieJar, Response)> {
     tracing::info!("OAuth callback received");
 
-    let jacquard_client = state
-        .jacquard_client
-        .as_ref()
-        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+    // Check if this session has a stored redirect_to (catmos-web flow).
+    // Legacy sessions with JSON state won't have this key.
+    let redirect_to: Option<String> = {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_redirect:{}", &callback.state);
+        redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .ok()
+    };
+    // Clean up the redirect key (one-time use)
+    if redirect_to.is_some() {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_redirect:{}", &callback.state);
+        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+    }
+
+    // Determine which Jacquard client to use.
+    // New flow: redirect_to presence means catmos-web.
+    // Legacy flow: JSON state with {"client":"catmos-web",...}.
+    let is_catmos = redirect_to.is_some()
+        || (callback.state.starts_with('{')
+            && serde_json::from_str::<serde_json::Value>(&callback.state)
+                .ok()
+                .and_then(|v| {
+                    v.get("client")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c == "catmos-web")
+                })
+                .unwrap_or(false));
+
+    let jacquard_client = if is_catmos {
+        state
+            .catmos_jacquard_client
+            .as_ref()
+            .or(state.jacquard_client.as_ref())
+            .ok_or_else(|| {
+                AppError::Internal("No OAuthClient available for catmos-web callback".into())
+            })?
+    } else {
+        state
+            .jacquard_client
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
+    };
 
     use jacquard_oauth::types::CallbackParams;
 
@@ -103,19 +167,11 @@ pub async fn oauth_callback(
         .map_err(|e| AppError::OAuth(format!("Callback failed: {}", e)))?;
 
     // Jacquard stores the session in RedisAuthStore automatically.
-    // Extract the session_id and DID from the session data.
+    // Extract the session_id (now a clean UUID) and DID from the session data.
     let session_data = oauth_session.data.read().await;
     let did = session_data.account_did.as_str().to_string();
     let session_id = session_data.session_id.to_string();
     let pds_url = session_data.host_url.to_string();
-    // Read the custom state that was passed through (client identifier, redirect_to)
-    let app_state_str = {
-        // session_id IS the state string from start_auth — Jacquard uses it as AuthRequestData.state
-        // Try to parse it as JSON to extract redirect_to
-        // But the actual OAuth state was passed via AuthorizeOptions.state, which becomes session_id.
-        // We need to get it from the session_id field itself.
-        session_id.clone()
-    };
     drop(session_data);
 
     // Resolve handle from DID
@@ -125,7 +181,7 @@ pub async fn oauth_callback(
     // Record successful OAuth login
     metrics::record_oauth_login(true);
 
-    // Set cookie — session_id is the Jacquard state/session identifier
+    // Set cookie — session_id is the Jacquard state/session identifier (clean UUID)
     let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.clone()))
         .path("/")
         .http_only(true)
@@ -134,8 +190,27 @@ pub async fn oauth_callback(
         .max_age(time::Duration::days(30))
         .build();
 
-    // Redirect back to the app via Universal Link (iOS Associated Domains)
-    let app_redirect = build_app_redirect(&app_state_str, &session_id);
+    // Redirect back to the app
+    let app_redirect = if let Some(ref r) = redirect_to {
+        // catmos-web: redirect_to was stored in Redis during login
+        let is_allowed = r.starts_with("http://127.0.0.1:")
+            || r.starts_with("http://[::1]:")
+            || ALLOWED_REDIRECT_ORIGINS
+                .iter()
+                .any(|origin| r.starts_with(origin));
+        if is_allowed {
+            format!("{}?session_id={}", r, session_id)
+        } else {
+            tracing::warn!("Rejected redirect_to from Redis: {}", r);
+            format!(
+                "https://catbird.blue/oauth/callback#session_id={}",
+                session_id
+            )
+        }
+    } else {
+        // Legacy: try parsing session_id as JSON state (for in-flight sessions)
+        build_app_redirect(&session_id, &session_id)
+    };
 
     Ok((
         jar.add(cookie),
@@ -156,34 +231,48 @@ async fn resolve_handle_for_did(did: &str, pds_url: &str) -> String {
     );
 
     match reqwest::get(&describe_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => json
-                    .get("handle")
-                    .and_then(|h| h.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| did.to_string()),
-                Err(_) => did.to_string(),
-            }
-        }
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) => json
+                .get("handle")
+                .and_then(|h| h.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| did.to_string()),
+            Err(_) => did.to_string(),
+        },
         _ => did.to_string(),
     }
 }
+
+/// Allowed redirect origins for OAuth callback (beyond localhost).
+const ALLOWED_REDIRECT_ORIGINS: &[&str] =
+    &["https://catmos.catbird.blue", "https://catmos.pages.dev"];
 
 /// Build the redirect URL after OAuth callback.
 fn build_app_redirect(state_str: &str, session_id: &str) -> String {
     if state_str.starts_with('{') {
         if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
             if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
-                // SECURITY: Only allow localhost redirects
-                if redirect_to.starts_with("http://127.0.0.1:") || redirect_to.starts_with("http://[::1]:") {
+                // Allow localhost redirects (dev)
+                if redirect_to.starts_with("http://127.0.0.1:")
+                    || redirect_to.starts_with("http://[::1]:")
+                {
                     return format!("{}?session_id={}", redirect_to, session_id);
                 }
-                tracing::warn!("Rejected non-localhost redirect_to: {}", redirect_to);
+                // Allow known production origins
+                if ALLOWED_REDIRECT_ORIGINS
+                    .iter()
+                    .any(|origin| redirect_to.starts_with(origin))
+                {
+                    return format!("{}?session_id={}", redirect_to, session_id);
+                }
+                tracing::warn!("Rejected redirect_to: {}", redirect_to);
             }
         }
     }
-    format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+    format!(
+        "https://catbird.blue/oauth/callback#session_id={}",
+        session_id
+    )
 }
 
 /// Handle logout
@@ -370,7 +459,11 @@ pub async fn proxy_xrpc(
     metrics::record_proxy_request(&lexicon, proxy_response.status(), duration);
 
     match proxy_response {
-        ProxyResponse::Buffered { status, headers: resp_headers, body: response_body } => {
+        ProxyResponse::Buffered {
+            status,
+            headers: resp_headers,
+            body: response_body,
+        } => {
             let response_shape = json_shape(&response_body);
             tracing::info!(
                 request_id = %request_id,
@@ -383,7 +476,11 @@ pub async fn proxy_xrpc(
             // Log error response bodies for debugging (truncated, no PII)
             if status >= 400 {
                 if let Ok(error_text) = std::str::from_utf8(&response_body) {
-                    let truncated = if error_text.len() > 200 { &error_text[..200] } else { error_text };
+                    let truncated = if error_text.len() > 200 {
+                        &error_text[..200]
+                    } else {
+                        error_text
+                    };
                     tracing::warn!(
                         request_id = %request_id,
                         status = status,
@@ -393,8 +490,8 @@ pub async fn proxy_xrpc(
                 }
             }
 
-            let mut response =
-                Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+            let mut response = Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {
                 let name_str = name.as_str();
                 if matches!(
@@ -407,15 +504,19 @@ pub async fn proxy_xrpc(
 
             Ok(response.body(Body::from(response_body)).unwrap())
         }
-        ProxyResponse::Streaming { status, headers: resp_headers, body: upstream_response } => {
+        ProxyResponse::Streaming {
+            status,
+            headers: resp_headers,
+            body: upstream_response,
+        } => {
             tracing::info!(
                 request_id = %request_id,
                 status = status,
                 "[BFF-RESP] PDS response (streaming)"
             );
 
-            let mut response =
-                Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+            let mut response = Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {
                 let name_str = name.as_str();
                 if matches!(

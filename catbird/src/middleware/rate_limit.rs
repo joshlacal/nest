@@ -82,8 +82,8 @@ impl RateLimiter {
 
         // Check limit
         if entry.count >= config.max_requests {
-            let retry_after = config.window.as_secs()
-                - now.duration_since(entry.window_start).as_secs();
+            let retry_after =
+                config.window.as_secs() - now.duration_since(entry.window_start).as_secs();
             return Err(retry_after.max(1));
         }
 
@@ -251,7 +251,11 @@ pub async fn session_rate_limit(
         }
     };
 
-    match rate_limit.session_limiter.check(&key, &rate_limit.session_config).await {
+    match rate_limit
+        .session_limiter
+        .check(&key, &rate_limit.session_config)
+        .await
+    {
         Ok(remaining) => {
             tracing::trace!(key = %key, remaining = remaining, "Session rate limit check passed");
             next.run(req).await
@@ -276,7 +280,11 @@ pub async fn ip_rate_limit(
         None => "auth:unknown".to_string(),
     };
 
-    match rate_limit.ip_limiter.check(&key, &rate_limit.ip_config).await {
+    match rate_limit
+        .ip_limiter
+        .check(&key, &rate_limit.ip_config)
+        .await
+    {
         Ok(remaining) => {
             tracing::trace!(key = %key, remaining = remaining, "IP rate limit check passed");
             next.run(req).await
