@@ -55,13 +55,24 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize application state
-    let state = Arc::new(config::AppState::new(app_config.clone()).await?);
+    let mut state = config::AppState::new(app_config.clone()).await?;
+
+    if let Some(push_db) = state.push_db.as_ref() {
+        sqlx::migrate!("./migrations").run(push_db).await?;
+        state.init_push_services().await?;
+    }
+
+    let state = Arc::new(state);
 
     tracing::info!("Connected to Redis at {}", app_config.redis.url);
 
     // Register Prometheus metrics
     metrics::register_metrics();
     tracing::info!("Prometheus metrics registered");
+
+    if let Some(push) = state.push.clone() {
+        push.spawn_worker(state.clone());
+    }
 
     // Start background task to update active sessions gauge
     let metrics_state = state.clone();

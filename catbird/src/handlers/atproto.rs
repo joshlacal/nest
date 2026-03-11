@@ -374,7 +374,7 @@ pub async fn proxy_xrpc(
     let body_option = if body_bytes.is_empty() {
         None
     } else {
-        Some(body_bytes)
+        Some(body_bytes.clone())
     };
 
     // Check if this is an MLS lexicon and direct routing is enabled
@@ -490,6 +490,25 @@ pub async fn proxy_xrpc(
                 }
             }
 
+            if (200..300).contains(&status) {
+                if let Err(err) = mirror_push_mutation_if_needed(
+                    &state,
+                    &session,
+                    jacquard_dpop.as_ref(),
+                    &lexicon,
+                    &body_bytes,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        lexicon = %lexicon,
+                        user = %session.did,
+                        error = %err,
+                        "Failed to mirror push moderation mutation"
+                    );
+                }
+            }
+
             let mut response = Response::builder()
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {
@@ -568,4 +587,120 @@ fn describe_json_shape(value: &Value, depth: usize) -> String {
         Value::Bool(_) => "bool".to_string(),
         Value::Null => "null".to_string(),
     }
+}
+
+async fn mirror_push_mutation_if_needed(
+    state: &Arc<AppState>,
+    session: &CatbirdSession,
+    jacquard_dpop: Option<&JacquardDpopData>,
+    lexicon: &str,
+    request_body: &[u8],
+) -> anyhow::Result<()> {
+    let Some(push) = state.push.as_ref() else {
+        return Ok(());
+    };
+
+    let body: Value = if request_body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(request_body)?
+    };
+
+    match lexicon {
+        "app.bsky.graph.muteActor" => {
+            if let Some(actor) = body.get("actor").and_then(|value| value.as_str()) {
+                push.moderation_cache
+                    .upsert_actor_mute(&session.did, actor)
+                    .await?;
+            }
+        }
+        "app.bsky.graph.unmuteActor" => {
+            if let Some(actor) = body.get("actor").and_then(|value| value.as_str()) {
+                push.moderation_cache
+                    .remove_actor_mute(&session.did, actor)
+                    .await?;
+            }
+        }
+        "app.bsky.graph.muteActorList" => {
+            if let (Some(list), Some(dpop)) = (
+                body.get("list").and_then(|value| value.as_str()),
+                jacquard_dpop,
+            ) {
+                push.moderation_cache
+                    .sync_list_subscription(state, session, dpop, list, "curatelist")
+                    .await?;
+            }
+        }
+        "app.bsky.graph.unmuteActorList" => {
+            if let Some(list) = body.get("list").and_then(|value| value.as_str()) {
+                push.moderation_cache
+                    .remove_list_subscription(&session.did, list)
+                    .await?;
+            }
+        }
+        "app.bsky.graph.muteThread" => {
+            if let Some(root) = body.get("root").and_then(|value| value.as_str()) {
+                push.moderation_cache.mute_thread(&session.did, root).await?;
+            }
+        }
+        "app.bsky.graph.unmuteThread" => {
+            if let Some(root) = body.get("root").and_then(|value| value.as_str()) {
+                push.moderation_cache
+                    .unmute_thread(&session.did, root)
+                    .await?;
+            }
+        }
+        "com.atproto.repo.createRecord" => {
+            if let Some(collection) = body.get("collection").and_then(|value| value.as_str()) {
+                match collection {
+                    "app.bsky.graph.block" => {
+                        if let Some(subject) = body
+                            .get("record")
+                            .and_then(|value| value.get("subject"))
+                            .and_then(|value| value.as_str())
+                        {
+                            push.moderation_cache
+                                .upsert_actor_block(&session.did, subject)
+                                .await?;
+                        }
+                    }
+                    "app.bsky.graph.listblock" => {
+                        if let (Some(subject), Some(dpop)) = (
+                            body.get("record")
+                                .and_then(|value| value.get("subject"))
+                                .and_then(|value| value.as_str()),
+                            jacquard_dpop,
+                        ) {
+                            push.moderation_cache
+                                .sync_list_subscription(state, session, dpop, subject, "modlist")
+                                .await?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "com.atproto.repo.deleteRecord" => {
+            if let (Some(collection), Some(dpop)) =
+                (body.get("collection").and_then(|value| value.as_str()), jacquard_dpop)
+            {
+                match collection {
+                    "app.bsky.graph.block" => {
+                        push.moderation_cache
+                            .refresh_actor_relationships_for_session(state, session, dpop)
+                            .await?;
+                    }
+                    "app.bsky.graph.listblock" => {
+                        push.moderation_cache
+                            .refresh_list_relationships_for_session(state, session, dpop)
+                            .await?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }

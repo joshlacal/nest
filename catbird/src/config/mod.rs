@@ -5,6 +5,7 @@
 use jacquard_common::IntoStatic;
 use serde::Deserialize;
 use std::sync::Arc;
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 
 /// Application configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -18,6 +19,9 @@ pub struct AppConfig {
     /// MLS service configuration (optional, for direct routing)
     #[serde(default)]
     pub mls: MlsConfig,
+    /// Push control-plane configuration (optional)
+    #[serde(default)]
+    pub push: PushConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -35,7 +39,61 @@ pub struct MlsConfig {
 }
 
 fn default_mls_service_did() -> String {
-    "did:web:mls.catbird.blue".to_string()
+    "did:web:mlschat.catbird.blue".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PushConfig {
+    /// Shared Postgres URL used by Nest and catbird-firehose
+    #[serde(default)]
+    pub database_url: Option<String>,
+    /// DID that clients should send in registerPush/unregisterPush
+    #[serde(default)]
+    pub service_did: Option<String>,
+    /// How often Nest should opportunistically refresh cached moderation state
+    #[serde(default = "default_push_sync_interval_seconds")]
+    pub sync_interval_seconds: u64,
+    /// Background queue poll interval in milliseconds
+    #[serde(default = "default_push_queue_poll_interval_ms")]
+    pub queue_poll_interval_ms: u64,
+    /// Max queue rows to lease per poll
+    #[serde(default = "default_push_queue_batch_size")]
+    pub queue_batch_size: u32,
+    /// APNs delivery configuration
+    #[serde(default)]
+    pub apns: ApnsConfig,
+}
+
+impl PushConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.database_url.is_some() && self.service_did.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ApnsConfig {
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub production: bool,
+}
+
+fn default_push_sync_interval_seconds() -> u64 {
+    300
+}
+
+fn default_push_queue_poll_interval_ms() -> u64 {
+    500
+}
+
+fn default_push_queue_batch_size() -> u32 {
+    32
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +228,7 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
     pub redis: redis::aio::ConnectionManager,
+    pub push_db: Option<Pool<Postgres>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
     /// Jacquard OAuth client (primary — Catbird iOS)
     pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
@@ -177,10 +236,24 @@ pub struct AppState {
     pub catmos_jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Redis-backed auth store for Jacquard sessions
     pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
+    /// Push subsystem managers (only present when push is configured)
+    pub push: Option<Arc<crate::services::push::PushServices>>,
 }
 
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
+        let push_db = match config.push.database_url.as_deref() {
+            Some(database_url) => {
+                let pool = PgPoolOptions::new()
+                    .max_connections(16)
+                    .connect(database_url)
+                    .await?;
+                tracing::info!("Connected to Postgres push database");
+                Some(pool)
+            }
+            None => None,
+        };
+
         let http_client = reqwest::Client::builder()
             .user_agent("Catbird/0.1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -196,10 +269,12 @@ impl AppState {
             config: Arc::new(config),
             http_client,
             redis,
+            push_db,
             key_store: None,
             jacquard_client: None,
             catmos_jacquard_client: None,
             auth_store: None,
+            push: None,
         };
 
         // Initialize KeyStore first (needed by OAuth client)
@@ -257,6 +332,22 @@ impl AppState {
         }
 
         Ok(state)
+    }
+
+    pub async fn init_push_services(&mut self) -> Result<(), anyhow::Error> {
+        let Some(pool) = self.push_db.clone() else {
+            return Ok(());
+        };
+
+        if !self.config.push.is_enabled() {
+            tracing::warn!("Push database is configured but push service DID is missing");
+            return Ok(());
+        }
+
+        let services = crate::services::push::PushServices::new(pool, self.config.push.clone())?;
+        self.push = Some(Arc::new(services));
+        tracing::info!("Push services initialized successfully");
+        Ok(())
     }
 
     /// Build the Jacquard RedisAuthStore and OAuthClient from current state.

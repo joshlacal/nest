@@ -50,6 +50,9 @@ pub enum AppError {
     #[error("Redis error: {0}")]
     Redis(#[from] redis::RedisError),
 
+    #[error("Database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+
     #[error("HTTP client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
@@ -114,6 +117,14 @@ impl IntoResponse for AppError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     "An internal error occurred".to_string(),
+                )
+            }
+            AppError::Sqlx(e) => {
+                tracing::error!("Database error: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "A database error occurred".to_string(),
                 )
             }
             AppError::HttpClient(e) => {

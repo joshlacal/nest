@@ -15,7 +15,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use std::sync::Arc;
 
 use crate::config::AppState;
-use crate::handlers::atproto;
+use crate::handlers::{atproto, push};
 use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, RateLimitState};
 
 /// Create the ATProto router
@@ -62,6 +62,30 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
     // XRPC proxy routes - protected with auth and session-based rate limiting
     let xrpc_routes = Router::new()
+        .route(
+            "/app.bsky.notification.registerPush",
+            post(push::register_push),
+        )
+        .route(
+            "/app.bsky.notification.unregisterPush",
+            post(push::unregister_push),
+        )
+        .route(
+            "/app.bsky.notification.getPreferences",
+            get(push::get_preferences),
+        )
+        .route(
+            "/app.bsky.notification.putPreferencesV2",
+            post(push::put_preferences_v2),
+        )
+        .route(
+            "/app.bsky.notification.listActivitySubscriptions",
+            get(push::list_activity_subscriptions),
+        )
+        .route(
+            "/app.bsky.notification.putActivitySubscription",
+            post(push::put_activity_subscription),
+        )
         .route(
             "/*lexicon",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),

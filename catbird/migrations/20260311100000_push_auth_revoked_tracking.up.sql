@@ -1,0 +1,1 @@
+ALTER TABLE push_accounts ADD COLUMN IF NOT EXISTS auth_revoked_at TIMESTAMPTZ;
