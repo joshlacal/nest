@@ -6,6 +6,7 @@
 //! - OAuth metadata endpoints (/.well-known/*)
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
     Router,
@@ -90,6 +91,7 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/*lexicon",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),
         )
+        .layer(DefaultBodyLimit::max(11 * 1024 * 1024)) // 11 MB for blob uploads (10 MB + overhead)
         .layer(middleware::from_fn_with_state(
             rate_limit_state.clone(),
             session_rate_limit,
