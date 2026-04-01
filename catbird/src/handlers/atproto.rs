@@ -197,7 +197,11 @@ pub async fn oauth_callback(
             || r.starts_with("http://[::1]:")
             || ALLOWED_REDIRECT_ORIGINS
                 .iter()
-                .any(|origin| r.starts_with(origin));
+                .any(|origin| r.starts_with(origin))
+            || url::Url::parse(r)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.ends_with(".catmos.pages.dev")))
+                .unwrap_or(false);
         if is_allowed {
             format!("{}?session_id={}", r, session_id)
         } else {

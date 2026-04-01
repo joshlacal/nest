@@ -412,7 +412,9 @@ impl AppState {
         );
 
         let client_data = ClientData::new(Some(keyset), metadata);
-        let client = JacquardOAuthClient::new(store.clone(), client_data);
+        let resolver = Self::build_resolver();
+        let client =
+            JacquardOAuthClient::new_from_resolver(store.clone(), resolver, client_data);
 
         Ok((store, client))
     }
@@ -457,8 +459,23 @@ impl AppState {
         );
 
         let client_data = ClientData::new(Some(keyset), metadata);
-        let client = JacquardOAuthClient::new(existing_store.clone(), client_data);
+        let resolver = Self::build_resolver();
+        let client =
+            JacquardOAuthClient::new_from_resolver(existing_store.clone(), resolver, client_data);
 
         Ok(client)
+    }
+
+    /// Build a JacquardResolver with DNS enabled but no in-memory cache.
+    ///
+    /// Nest handles low-volume OAuth login flows where correctness matters more
+    /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
+    /// stale identity data to persist indefinitely when users retried login.
+    fn build_resolver() -> jacquard_identity::JacquardResolver {
+        let resolver = jacquard_identity::JacquardResolver::new(
+            reqwest::Client::new(),
+            jacquard_identity::resolver::ResolverOptions::default(),
+        );
+        resolver.with_system_dns()
     }
 }

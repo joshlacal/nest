@@ -118,8 +118,10 @@ impl Default for RateLimitState {
             session_limiter: Arc::new(RateLimiter::new()),
             ip_limiter: Arc::new(RateLimiter::new()),
             session_config: RateLimitConfig {
-                // 600 req/min for XRPC proxy (app makes frequent getConvos/getMessages calls)
-                max_requests: 600,
+                // 1200 req/min for XRPC proxy — generous to handle app startup burst
+                // (initial sync fetches conversations + messages for all groups)
+                // With WebSocket for live events, sustained rate is much lower
+                max_requests: 1200,
                 window: Duration::from_secs(60),
             },
             ip_config: RateLimitConfig {
