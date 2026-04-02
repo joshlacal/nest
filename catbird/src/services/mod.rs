@@ -3,6 +3,7 @@
 //! Business logic and external service integrations.
 
 mod atproto_client;
+pub mod chat_poll;
 mod crypto;
 mod mls_auth;
 pub mod push;
