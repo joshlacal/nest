@@ -13,6 +13,8 @@ pub struct ApnsNotification {
     pub body: String,
     pub user_did: String,
     pub custom_data: HashMap<String, String>,
+    pub mutable_content: bool,
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,10 +64,14 @@ impl ApnsDelivery {
         registration: &RegistrationRow,
         notification: &ApnsNotification,
     ) -> Result<()> {
-        let builder = DefaultNotificationBuilder::new()
+        let mut builder = DefaultNotificationBuilder::new()
             .set_title(&notification.title)
             .set_body(&notification.body)
             .set_sound("default");
+
+        if notification.mutable_content {
+            builder = builder.set_mutable_content();
+        }
 
         let mut payload = builder.build(
             &registration.device_token,
@@ -81,6 +87,10 @@ impl ApnsDelivery {
 
         for (key, value) in &notification.custom_data {
             payload.add_custom_data(key, value)?;
+        }
+
+        if let Some(ref thread_id) = notification.thread_id {
+            payload.add_custom_data("thread-id", thread_id)?;
         }
 
         self.client.send(payload).await?;

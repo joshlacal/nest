@@ -126,6 +126,7 @@ impl PushPreferencesDocument {
             "via_like" => self.like_via_repost.push,
             "via_repost" => self.repost_via_repost.push,
             "activity_post" | "activity_reply" => self.subscribed_post.push,
+            "chat_message" => self.chat.push,
             _ => true,
         }
     }

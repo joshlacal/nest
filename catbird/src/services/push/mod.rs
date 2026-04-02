@@ -68,8 +68,16 @@ impl PushServices {
             return;
         }
 
+        let self_clone = self.clone();
+        let state_clone = state.clone();
         tokio::spawn(async move {
-            self.run_worker_loop(state).await;
+            self_clone.run_worker_loop(state_clone).await;
+        });
+
+        let self_clone = self.clone();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            self_clone.run_chat_push_subscriber(state_clone).await;
         });
     }
 
@@ -229,6 +237,128 @@ impl PushServices {
                     tokio::time::sleep(poll_interval).await;
                 }
             }
+        }
+    }
+
+    async fn run_chat_push_subscriber(self: Arc<Self>, state: Arc<AppState>) {
+        use futures_util::StreamExt;
+
+        let Some(apns) = self.apns.clone() else {
+            return;
+        };
+
+        tracing::info!("Chat push Redis subscriber starting");
+
+        loop {
+            let client = match redis::Client::open(state.config.redis.url.as_str()) {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed to create Redis client for chat push subscriber");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let mut pubsub = match client.get_async_pubsub().await {
+                Ok(ps) => ps,
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed to get Redis pubsub connection for chat push subscriber");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            if let Err(err) = pubsub.subscribe("chat_push").await {
+                tracing::error!(error = %err, "Failed to subscribe to chat_push channel");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+
+            tracing::info!("Subscribed to chat_push Redis channel");
+
+            let mut stream = pubsub.on_message();
+
+            while let Some(msg) = stream.next().await {
+                let payload: String = match msg.get_payload() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to get chat_push message payload");
+                        continue;
+                    }
+                };
+
+                let event: crate::services::chat_poll::types::ChatPushEvent =
+                    match serde_json::from_str(&payload) {
+                        Ok(e) => e,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "Failed to deserialize ChatPushEvent");
+                            continue;
+                        }
+                    };
+
+                // Look up active registrations for recipient
+                let registrations = match self
+                    .registry
+                    .list_active_registrations(&event.recipient_did)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to look up registrations for chat push");
+                        continue;
+                    }
+                };
+
+                if registrations.is_empty() {
+                    continue;
+                }
+
+                // Build notification
+                let mut custom_data = std::collections::HashMap::new();
+                custom_data.insert("type".to_string(), "chat_message".to_string());
+                custom_data.insert("convoId".to_string(), event.convo_id.clone());
+                custom_data.insert("messageId".to_string(), event.message_id.clone());
+                custom_data.insert("senderDid".to_string(), event.sender_did.clone());
+                let truncated_text: String = event.message_text.chars().take(200).collect();
+                custom_data.insert("messageText".to_string(), truncated_text);
+
+                let notification = apns::ApnsNotification {
+                    title: "New Message".to_string(),
+                    body: "You have a new message".to_string(),
+                    user_did: event.recipient_did.clone(),
+                    custom_data,
+                    mutable_content: true,
+                    thread_id: Some(format!("chat:{}", event.convo_id)),
+                };
+
+                // Fan out to all devices
+                for registration in &registrations {
+                    if let Err(err) = apns.send(registration, &notification).await {
+                        tracing::warn!(
+                            error = %err,
+                            did = %event.recipient_did,
+                            token = %registration.device_token,
+                            "Chat push fast-path delivery failed"
+                        );
+                    }
+                }
+
+                // Delete matching queue row so durable path doesn't double-send
+                let dedupe_key = format!(
+                    "{}:chat_message:{}:{}",
+                    event.recipient_did, event.convo_id, event.message_id
+                );
+                if let Err(err) = self.queue.delete_by_dedupe_key(&dedupe_key).await {
+                    tracing::debug!(
+                        error = %err,
+                        "Failed to delete queue row by dedupe_key (may not exist yet)"
+                    );
+                }
+            }
+
+            // Stream ended — reconnect
+            tracing::warn!("Chat push Redis subscription stream ended; reconnecting...");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
 }

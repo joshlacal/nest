@@ -101,6 +101,14 @@ impl PushQueue {
         Ok(())
     }
 
+    pub async fn delete_by_dedupe_key(&self, dedupe_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM push_event_queue WHERE dedupe_key = $1")
+            .bind(dedupe_key)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn push_snapshot(&self, id: i64) -> Result<Option<Value>> {
         let row = sqlx::query_scalar::<_, Value>(
             "SELECT event_record_json FROM push_event_queue WHERE id = $1",

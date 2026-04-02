@@ -74,6 +74,14 @@ async fn main() -> anyhow::Result<()> {
         push.spawn_worker(state.clone());
     }
 
+    if state.config.push.chat_poll_enabled {
+        if let Some(push_db) = state.push_db.clone() {
+            let chat_poll = crate::services::chat_poll::ChatPollService::new(push_db);
+            chat_poll.spawn(state.clone());
+            tracing::info!("Chat poll service started");
+        }
+    }
+
     // Start background task to update active sessions gauge
     let metrics_state = state.clone();
     let key_prefix = app_config.redis.key_prefix.clone();

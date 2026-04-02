@@ -86,7 +86,47 @@ impl PushDecisionEngine {
     }
 }
 
+fn build_chat_notification(row: &QueueRow) -> ApnsNotification {
+    let convo_id = row
+        .event_record_json
+        .get("convoId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let message_id = row
+        .event_record_json
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let message_text = row
+        .event_record_json
+        .get("messageText")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let truncated_text: String = message_text.chars().take(200).collect();
+
+    let mut custom_data = HashMap::new();
+    custom_data.insert("type".to_string(), "chat_message".to_string());
+    custom_data.insert("convoId".to_string(), convo_id.to_string());
+    custom_data.insert("messageId".to_string(), message_id.to_string());
+    custom_data.insert("senderDid".to_string(), row.actor_did.clone());
+    custom_data.insert("messageText".to_string(), truncated_text);
+
+    ApnsNotification {
+        title: "New Message".to_string(),
+        body: "You have a new message".to_string(),
+        user_did: row.recipient_did.clone(),
+        custom_data,
+        mutable_content: true,
+        thread_id: Some(format!("chat:{}", convo_id)),
+    }
+}
+
 fn build_notification(row: &QueueRow, _prefs: &PushPreferencesDocument) -> ApnsNotification {
+    if row.notification_type == "chat_message" {
+        return build_chat_notification(row);
+    }
+
     let title = match row.notification_type.as_str() {
         "mention" => "New mention",
         "reply" => "New reply",
@@ -146,6 +186,8 @@ fn build_notification(row: &QueueRow, _prefs: &PushPreferencesDocument) -> ApnsN
         body,
         user_did: row.recipient_did.clone(),
         custom_data,
+        mutable_content: false,
+        thread_id: None,
     }
 }
 

@@ -88,6 +88,14 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(push::put_activity_subscription),
         )
         .route(
+            "/blue.catbird.bskychat.pushHeartbeat",
+            post(crate::handlers::chat_poll::push_heartbeat),
+        )
+        .route(
+            "/blue.catbird.bskychat.updateMuteStatus",
+            post(crate::handlers::chat_poll::update_mute_status),
+        )
+        .route(
             "/*lexicon",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),
         )

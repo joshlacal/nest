@@ -62,6 +62,9 @@ pub struct PushConfig {
     /// APNs delivery configuration
     #[serde(default)]
     pub apns: ApnsConfig,
+    /// Enable the chat poll background service
+    #[serde(default)]
+    pub chat_poll_enabled: bool,
 }
 
 impl PushConfig {
