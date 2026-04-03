@@ -15,7 +15,7 @@ CREATE TABLE chat_poll_state (
 
 CREATE INDEX idx_chat_poll_due
     ON chat_poll_state (next_poll_at)
-    WHERE foreground_lease_until IS NULL OR foreground_lease_until < now();
+    WHERE foreground_lease_until IS NULL;
 
 CREATE TABLE chat_muted_convos (
     account_did TEXT NOT NULL,
