@@ -444,11 +444,11 @@ impl AppState {
             state.config.server.base_url.trim_end_matches('/')
         ))?;
 
-        let scopes: Vec<Scope<'static>> = state
-            .config
-            .oauth
-            .scopes
-            .iter()
+        // Use CATMOS_OAUTH_SCOPES if set, otherwise fall back to "atproto transition:generic"
+        let scope_str = std::env::var("CATMOS_OAUTH_SCOPES")
+            .unwrap_or_else(|_| "atproto transition:generic".to_string());
+        let scopes: Vec<Scope<'static>> = scope_str
+            .split_whitespace()
             .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
             .collect();
 
