@@ -47,7 +47,7 @@ pub async fn login(
     );
 
     // Select the appropriate OAuth client based on the client parameter
-    let is_catmos = client.as_deref() == Some("catmos-web");
+    let is_catmos = matches!(client.as_deref(), Some("catmos-web") | Some("catmos"));
     let jacquard_client = if is_catmos {
         state
             .catmos_jacquard_client
@@ -134,7 +134,7 @@ pub async fn oauth_callback(
                 .and_then(|v| {
                     v.get("client")
                         .and_then(|c| c.as_str())
-                        .map(|c| c == "catmos-web")
+                        .map(|c| c == "catmos-web" || c == "catmos")
                 })
                 .unwrap_or(false));
 
