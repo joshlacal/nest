@@ -39,15 +39,22 @@ pub async fn login(
         .ok_or_else(|| AppError::BadRequest("Missing identifier".into()))?;
     let client = params.get("client").cloned();
     let redirect_to = params.get("redirect_to").cloned();
+
+    // Select the appropriate OAuth client based on the client parameter.
+    // The chosen selector is persisted to Redis so the callback handler can
+    // redeem the authorization code with the EXACT same client_id that
+    // initiated the PAR request (PDS binds codes to client_id).
+    let is_catmos = matches!(client.as_deref(), Some("catmos-web") | Some("catmos"));
+    let client_selector = if is_catmos { "catmos" } else { "default" };
+
     tracing::info!(
-        "Login request for identifier: {}, client: {:?}, redirect_to: {:?}",
+        "Login request for identifier: {}, client: {:?}, redirect_to: {:?}, selector: {}",
         identifier,
         client,
-        redirect_to
+        redirect_to,
+        client_selector
     );
 
-    // Select the appropriate OAuth client based on the client parameter
-    let is_catmos = matches!(client.as_deref(), Some("catmos-web") | Some("catmos"));
     let jacquard_client = if is_catmos {
         state
             .catmos_jacquard_client
@@ -64,8 +71,33 @@ pub async fn login(
     use jacquard_oauth::types::AuthorizeOptions;
 
     // Generate a clean UUID for the OAuth state (= Jacquard session_id).
-    // Store redirect_to in Redis so the callback can look it up.
     let session_nonce = uuid::Uuid::new_v4().to_string();
+
+    // Persist the chosen OAuth client selector so the callback handler can
+    // pick the same jacquard client. Stored unconditionally (including
+    // "default") so callback has a single source of truth. 600s TTL matches
+    // the redirect_to key.
+    {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_client:{}", session_nonce);
+        if let Err(e) = redis::cmd("SET")
+            .arg(&key)
+            .arg(client_selector)
+            .arg("EX")
+            .arg(600)
+            .query_async::<_, ()>(&mut conn)
+            .await
+        {
+            // Don't fail login — callback will fall back to legacy inference.
+            tracing::warn!(
+                "Failed to persist oauth_client selector to Redis for session {}: {}",
+                session_nonce,
+                e
+            );
+        }
+    }
+
+    // Store redirect_to in Redis so the callback can look it up.
     if let Some(ref r) = redirect_to {
         let mut conn = state.redis.clone();
         let key = format!("oauth_redirect:{}", session_nonce);
@@ -124,19 +156,50 @@ pub async fn oauth_callback(
         let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
     }
 
+    // Read back the client selector persisted by the login handler. This is
+    // the authoritative source for which jacquard_client to use — the PDS
+    // binds the authorization code to the client_id that issued the PAR
+    // request, so login and callback MUST use the same client.
+    let stored_selector: Option<String> = {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_client:{}", &callback.state);
+        redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .ok()
+    };
+    // Clean up the selector key (one-time use)
+    if stored_selector.is_some() {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_client:{}", &callback.state);
+        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+    }
+
     // Determine which Jacquard client to use.
-    // New flow: redirect_to presence means catmos-web.
-    // Legacy flow: JSON state with {"client":"catmos-web",...}.
-    let is_catmos = redirect_to.is_some()
-        || (callback.state.starts_with('{')
-            && serde_json::from_str::<serde_json::Value>(&callback.state)
-                .ok()
-                .and_then(|v| {
-                    v.get("client")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c == "catmos-web" || c == "catmos")
-                })
-                .unwrap_or(false));
+    // Preferred: the selector persisted at login time.
+    // Legacy fallback (for sessions started before this deploy OR the old
+    // JSON-state format): infer from redirect_to presence or JSON-state
+    // payload. Remove once in-flight legacy sessions have drained from
+    // prod logs.
+    let is_catmos = match stored_selector.as_deref() {
+        Some("catmos") => true,
+        Some("default") => false,
+        Some(other) => {
+            tracing::warn!(
+                "Unrecognized oauth_client selector {:?} in Redis; falling back to legacy inference",
+                other
+            );
+            legacy_infer_catmos(&redirect_to, &callback.state)
+        }
+        None => {
+            tracing::info!(
+                "No oauth_client selector in Redis for state {}; using legacy inference (pre-deploy in-flight session or JSON-state legacy)",
+                &callback.state
+            );
+            legacy_infer_catmos(&redirect_to, &callback.state)
+        }
+    };
 
     let jacquard_client = if is_catmos {
         state
@@ -245,6 +308,25 @@ async fn resolve_handle_for_did(did: &str, pds_url: &str) -> String {
         },
         _ => did.to_string(),
     }
+}
+
+/// Legacy inference of the catmos client from callback signals.
+///
+/// Used only when `oauth_client:{state}` is absent from Redis (in-flight
+/// sessions started before the selector-persistence fix deployed, or the old
+/// JSON-state callback format). Should be removed after enough time has
+/// passed for any in-flight sessions to drain (600s TTL + safety margin).
+fn legacy_infer_catmos(redirect_to: &Option<String>, state_str: &str) -> bool {
+    redirect_to.is_some()
+        || (state_str.starts_with('{')
+            && serde_json::from_str::<serde_json::Value>(state_str)
+                .ok()
+                .and_then(|v| {
+                    v.get("client")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c == "catmos-web" || c == "catmos")
+                })
+                .unwrap_or(false))
 }
 
 /// Allowed redirect origins for OAuth callback (beyond localhost).
@@ -644,7 +726,9 @@ async fn mirror_push_mutation_if_needed(
         }
         "app.bsky.graph.muteThread" => {
             if let Some(root) = body.get("root").and_then(|value| value.as_str()) {
-                push.moderation_cache.mute_thread(&session.did, root).await?;
+                push.moderation_cache
+                    .mute_thread(&session.did, root)
+                    .await?;
             }
         }
         "app.bsky.graph.unmuteThread" => {
@@ -685,9 +769,10 @@ async fn mirror_push_mutation_if_needed(
             }
         }
         "com.atproto.repo.deleteRecord" => {
-            if let (Some(collection), Some(dpop)) =
-                (body.get("collection").and_then(|value| value.as_str()), jacquard_dpop)
-            {
+            if let (Some(collection), Some(dpop)) = (
+                body.get("collection").and_then(|value| value.as_str()),
+                jacquard_dpop,
+            ) {
                 match collection {
                     "app.bsky.graph.block" => {
                         push.moderation_cache
