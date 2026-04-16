@@ -88,6 +88,23 @@ nest/catbird/src/
 2. **Callback**: PDS redirects to Nest -> token exchange (Private Key JWT) -> creates Redis session -> redirects to iOS with session cookie
 3. **Requests**: Cookie validated -> access token retrieved from Redis -> refreshed if expired -> DPoP-signed request to PDS
 
+## Deployment
+
+Nest runs as a systemd service (`catbird-nest-dev.service`) on port 3000.
+
+```bash
+# Restart after deploy
+sudo systemctl restart catbird-nest-dev
+
+# Check status
+sudo systemctl status catbird-nest-dev
+
+# View logs
+sudo journalctl -u catbird-nest-dev -f
+```
+
+Secrets are managed via Doppler — never hardcode credentials. The server is Linux x86_64; build release binaries on the server or cross-compile.
+
 ## Security Notes
 
 - iOS client never holds refresh tokens - only session cookies
@@ -95,3 +112,4 @@ nest/catbird/src/
 - SSRF prevention on upstream requests (`services/ssrf.rs`)
 - Rate limiting on all endpoints
 - Redis for session storage (not in-process memory)
+- Never commit secrets, tokens, or credentials to this repo

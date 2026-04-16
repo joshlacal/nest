@@ -1,1 +1,3 @@
 catbird/target/
+.claude/
+.DS_Store
