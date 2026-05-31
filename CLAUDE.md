@@ -47,6 +47,10 @@ Catbird iOS --[Session Cookie]--> Nest Gateway --[DPoP + Access Token]--> User P
 5. Nest optionally enriches response (content injection)
 6. Returns modified JSON to iOS
 
+### MLS proxy path (nest is NOT MLS-free)
+
+MLS implementation and storage live in **mls-ds**, but nest retains an **active MLS proxy**. MLS lexicons (`blue.catbird.mlsChat.*`) are intercepted in `handlers/atproto.rs` and routed through `MlsAuthService` (`services/mls_auth.rs`) to local mls-ds at `http://127.0.0.1:3001`, with a minted service-auth JWT (`aud=did:web:mlschat.catbird.blue`, `gateway_did=did:web:api.catbird.blue`). Do not assume "MLS moved to mls-ds" means nest no longer touches MLS — it is on the hot request path.
+
 ### Source Structure
 
 ```
@@ -68,7 +72,7 @@ nest/catbird/src/
 └── services/
     ├── atproto_client.rs  # Upstream PDS client
     ├── crypto.rs          # DPoP key management
-    ├── mls_auth.rs        # MLS authentication helpers
+    ├── mls_auth.rs        # MLS proxy: mints service-auth JWT, forwards MLS lexicons to mls-ds (live hot path)
     ├── oauth.rs           # OAuth flow (PAR, token exchange)
     └── ssrf.rs            # SSRF prevention
 ```
@@ -90,17 +94,19 @@ nest/catbird/src/
 
 ## Deployment
 
-Nest runs as a systemd service (`catbird-nest-dev.service`) on port 3000.
+Nest runs as a systemd service (`catbird-nest-prod.service`) on port 3000, launched via `doppler run --project catbird-nest --config prd -- .../target/release/catbird`.
+
+> **Note:** `catbird-nest-dev.service` is the **disabled legacy unit** (inactive/dead) — `dev-api.catbird.blue` was retired ~Apr 2026. `catbird-nest-prod` is the live deployment.
 
 ```bash
 # Restart after deploy
-sudo systemctl restart catbird-nest-dev
+sudo systemctl restart catbird-nest-prod
 
 # Check status
-sudo systemctl status catbird-nest-dev
+sudo systemctl status catbird-nest-prod
 
 # View logs
-sudo journalctl -u catbird-nest-dev -f
+sudo journalctl -u catbird-nest-prod -f
 ```
 
 Secrets are managed via Doppler — never hardcode credentials. The server is Linux x86_64; build release binaries on the server or cross-compile.
