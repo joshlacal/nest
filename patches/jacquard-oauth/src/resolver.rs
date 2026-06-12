@@ -507,9 +507,12 @@ async fn get_authorization_server_metadata_impl<T: HttpClient + Sync + ?Sized>(
     client: &T,
     issuer: &CowStr<'_>,
 ) -> Result<OAuthAuthorizationServerMetadata<'static>> {
-    let mut md = resolve_authorization_server(client, issuer).await?;
-    md.issuer = issuer.clone().into_static();
-    Ok(md)
+    // Keep the canonical issuer from the server's metadata document: the AS
+    // validates the client assertion "aud" by exact string match against its
+    // issuer, so the caller-supplied form (e.g. with a trailing slash added by
+    // Url normalization) must not replace it. Equivalence with the requested
+    // URL is already enforced in resolve_authorization_server.
+    resolve_authorization_server(client, issuer).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -517,9 +520,12 @@ async fn get_authorization_server_metadata_impl<T: HttpClient + ?Sized>(
     client: &T,
     issuer: &CowStr<'_>,
 ) -> Result<OAuthAuthorizationServerMetadata<'static>> {
-    let mut md = resolve_authorization_server(client, issuer).await?;
-    md.issuer = issuer.clone().into_static();
-    Ok(md)
+    // Keep the canonical issuer from the server's metadata document: the AS
+    // validates the client assertion "aud" by exact string match against its
+    // issuer, so the caller-supplied form (e.g. with a trailing slash added by
+    // Url normalization) must not replace it. Equivalence with the requested
+    // URL is already enforced in resolve_authorization_server.
+    resolve_authorization_server(client, issuer).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -907,6 +913,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err.kind(), ResolverErrorKind::SerdeJson));
+    }
+
+    #[tokio::test]
+    async fn authorization_server_keeps_canonical_issuer() {
+        // Regression: a trailing slash on the requested issuer URL (added by
+        // Url normalization of entryway/PDS login input) must not replace the
+        // canonical issuer from the metadata document — it becomes the client
+        // assertion "aud", which the AS matches by exact string comparison.
+        let client = MockHttp::default();
+        *client.next.lock().await = Some(
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .body(
+                    br#"{
+                        "issuer": "https://bsky.social",
+                        "authorization_endpoint": "https://bsky.social/oauth/authorize",
+                        "token_endpoint": "https://bsky.social/oauth/token",
+                        "scopes_supported": [],
+                        "response_types_supported": ["code"]
+                    }"#
+                    .to_vec(),
+                )
+                .unwrap(),
+        );
+        let requested = CowStr::new_static("https://bsky.social/");
+        let md = super::get_authorization_server_metadata_impl(&client, &requested)
+            .await
+            .unwrap();
+        assert_eq!(md.issuer.as_str(), "https://bsky.social");
     }
 
     #[test]
