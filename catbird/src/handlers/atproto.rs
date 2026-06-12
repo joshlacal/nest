@@ -156,6 +156,36 @@ pub async fn oauth_callback(
         let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
     }
 
+    // Deny/cancel path: the provider redirects back without a code
+    // (RFC 6749 §4.1.2.1 — `error` + optional `error_description` instead).
+    let Some(code) = callback.code else {
+        let err = callback.error.as_deref().unwrap_or("access_denied");
+        tracing::info!(
+            error = err,
+            description = callback.error_description.as_deref().unwrap_or(""),
+            "OAuth callback without authorization code; aborting login"
+        );
+        metrics::record_oauth_login(false);
+        // The selector key is one-time; the flow is dead, so drop it.
+        let mut conn = state.redis.clone();
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg(format!("oauth_client:{}", &callback.state))
+            .query_async(&mut conn)
+            .await;
+        let target = match redirect_to.as_deref() {
+            Some(r) if is_allowed_redirect(r) => format!("{}?error={}", r, err),
+            _ => format!("https://catbird.blue/oauth/callback#error={}", err),
+        };
+        return Ok((
+            jar,
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("Location", target)
+                .body(Body::empty())
+                .unwrap(),
+        ));
+    };
+
     // Read back the client selector persisted by the login handler. This is
     // the authoritative source for which jacquard_client to use — the PDS
     // binds the authorization code to the client_id that issued the PAR
@@ -219,7 +249,7 @@ pub async fn oauth_callback(
     use jacquard_oauth::types::CallbackParams;
 
     let params = CallbackParams {
-        code: callback.code.into(),
+        code: code.into(),
         state: Some(callback.state.into()),
         iss: callback.iss.map(|s| s.into()),
     };
@@ -256,16 +286,7 @@ pub async fn oauth_callback(
     // Redirect back to the app
     let app_redirect = if let Some(ref r) = redirect_to {
         // catmos-web: redirect_to was stored in Redis during login
-        let is_allowed = r.starts_with("http://127.0.0.1:")
-            || r.starts_with("http://[::1]:")
-            || ALLOWED_REDIRECT_ORIGINS
-                .iter()
-                .any(|origin| r.starts_with(origin))
-            || url::Url::parse(r)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.ends_with(".catmos.pages.dev")))
-                .unwrap_or(false);
-        if is_allowed {
+        if is_allowed_redirect(r) {
             format!("{}?session_id={}", r, session_id)
         } else {
             tracing::warn!("Rejected redirect_to from Redis: {}", r);
@@ -334,6 +355,20 @@ const ALLOWED_REDIRECT_ORIGINS: &[&str] =
     &["https://catmos.catbird.blue", "https://catmos.pages.dev"];
 
 /// Build the redirect URL after OAuth callback.
+/// Redirect-target allowlist shared by the success and deny/cancel paths:
+/// local dev loopback, known production origins, and catmos.pages.dev previews.
+fn is_allowed_redirect(r: &str) -> bool {
+    r.starts_with("http://127.0.0.1:")
+        || r.starts_with("http://[::1]:")
+        || ALLOWED_REDIRECT_ORIGINS
+            .iter()
+            .any(|origin| r.starts_with(origin))
+        || url::Url::parse(r)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.ends_with(".catmos.pages.dev")))
+            .unwrap_or(false)
+}
+
 fn build_app_redirect(state_str: &str, session_id: &str) -> String {
     if state_str.starts_with('{') {
         if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {

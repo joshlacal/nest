@@ -49,9 +49,13 @@ pub struct HealthResponse {
 /// OAuth callback parameters
 #[derive(Debug, Deserialize)]
 pub struct OAuthCallback {
-    pub code: String,
+    /// Absent when the user cancels or the provider returns an error
+    /// (RFC 6749 §4.1.2.1: `error` + optional `error_description` instead).
+    pub code: Option<String>,
     pub state: String,
     pub iss: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
 }
 
 /// Session info response (returned to iOS app)
