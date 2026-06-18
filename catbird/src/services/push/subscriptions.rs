@@ -128,15 +128,11 @@ impl PushSubscriptions {
                     let mut profile = item.clone();
                     if let Some(did) = profile.get("did").and_then(|value| value.as_str()) {
                         if let Some(subscription) = lookup.get(did) {
-                            let viewer = profile
-                                .get("viewer")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
+                            let viewer =
+                                profile.get("viewer").cloned().unwrap_or_else(|| json!({}));
                             let mut viewer_obj = viewer.as_object().cloned().unwrap_or_default();
-                            viewer_obj.insert(
-                                "activitySubscription".to_string(),
-                                subscription.clone(),
-                            );
+                            viewer_obj
+                                .insert("activitySubscription".to_string(), subscription.clone());
 
                             if let Some(profile_obj) = profile.as_object_mut() {
                                 profile_obj.insert("viewer".to_string(), Value::Object(viewer_obj));

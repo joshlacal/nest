@@ -25,10 +25,11 @@ impl PushPreferences {
     }
 
     pub async fn get(&self, did: &str) -> Result<Option<PushPreferencesDocument>> {
-        let row = sqlx::query("SELECT preferences_json FROM push_preferences WHERE account_did = $1")
-            .bind(did)
-            .fetch_optional(&self.db_pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT preferences_json FROM push_preferences WHERE account_did = $1")
+                .bind(did)
+                .fetch_optional(&self.db_pool)
+                .await?;
 
         let prefs = row
             .map(|row| row.try_get::<Value, _>("preferences_json"))

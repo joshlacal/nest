@@ -79,7 +79,10 @@ impl ModerationCache {
         let session_id = account.try_get::<String, _>("session_id")?;
         let pds_url = account.try_get::<String, _>("pds_url")?;
         let (session, dpop) = match super::resolve_background_session(
-            state, user_did, &session_id, &pds_url,
+            state,
+            user_did,
+            &session_id,
+            &pds_url,
         )
         .await
         {
@@ -102,7 +105,8 @@ impl ModerationCache {
         };
 
         if actor_stale {
-            self.sync_actor_relationships(state, &session, &dpop).await?;
+            self.sync_actor_relationships(state, &session, &dpop)
+                .await?;
             sqlx::query(
                 "UPDATE push_accounts SET last_actor_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
             )
@@ -241,7 +245,9 @@ impl ModerationCache {
             .await
             .ok()
             .flatten();
-        let members = self.fetch_list_members(state, session, dpop, list_uri).await?;
+        let members = self
+            .fetch_list_members(state, session, dpop, list_uri)
+            .await?;
 
         let mut tx = self.db_pool.begin().await?;
         sqlx::query(
@@ -386,7 +392,13 @@ impl ModerationCache {
             .fetch_paginated_profile_dids(state, session, dpop, "app.bsky.graph.getMutes", "mutes")
             .await?;
         let blocked_dids = self
-            .fetch_paginated_profile_dids(state, session, dpop, "app.bsky.graph.getBlocks", "blocks")
+            .fetch_paginated_profile_dids(
+                state,
+                session,
+                dpop,
+                "app.bsky.graph.getBlocks",
+                "blocks",
+            )
             .await?;
 
         let mut tx = self.db_pool.begin().await?;
@@ -451,7 +463,9 @@ impl ModerationCache {
 
         let mut member_map = Vec::with_capacity(lists.len());
         for list in &lists {
-            let members = self.fetch_list_members(state, session, dpop, &list.uri).await?;
+            let members = self
+                .fetch_list_members(state, session, dpop, &list.uri)
+                .await?;
             member_map.push((list.clone(), members));
         }
 
@@ -536,7 +550,9 @@ impl ModerationCache {
                 Some(cursor) => format!("limit=100&cursor={}", urlencoding::encode(cursor)),
                 None => "limit=100".to_string(),
             };
-            let payload = self.fetch_xrpc_json(state, session, dpop, lexicon, Some(&query)).await?;
+            let payload = self
+                .fetch_xrpc_json(state, session, dpop, lexicon, Some(&query))
+                .await?;
 
             if let Some(items) = payload.get(array_key).and_then(|value| value.as_array()) {
                 dids.extend(items.iter().filter_map(|item| {
@@ -574,7 +590,9 @@ impl ModerationCache {
                 Some(cursor) => format!("limit=100&cursor={}", urlencoding::encode(cursor)),
                 None => "limit=100".to_string(),
             };
-            let payload = self.fetch_xrpc_json(state, session, dpop, lexicon, Some(&query)).await?;
+            let payload = self
+                .fetch_xrpc_json(state, session, dpop, lexicon, Some(&query))
+                .await?;
 
             if let Some(items) = payload.get("lists").and_then(|value| value.as_array()) {
                 lists.extend(items.iter().filter_map(|item| {

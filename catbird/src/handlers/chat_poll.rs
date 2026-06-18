@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{Extension, Json, extract::State};
+use axum::{extract::State, Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -44,8 +44,7 @@ pub async fn push_heartbeat(
         .as_ref()
         .ok_or_else(|| AppError::Config("Push database not configured".into()))?;
 
-    let scheduler =
-        crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
+    let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
 
     let lease_secs: i64 = 90;
     scheduler
@@ -69,8 +68,7 @@ pub async fn update_mute_status(
         .as_ref()
         .ok_or_else(|| AppError::Config("Push database not configured".into()))?;
 
-    let scheduler =
-        crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
+    let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
 
     scheduler
         .set_convo_muted(&session.did, &input.convo_id, input.muted)

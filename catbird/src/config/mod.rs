@@ -4,8 +4,8 @@
 
 use jacquard_common::IntoStatic;
 use serde::Deserialize;
-use std::sync::Arc;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use std::sync::Arc;
 
 /// Application configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -416,8 +416,7 @@ impl AppState {
 
         let client_data = ClientData::new(Some(keyset), metadata);
         let resolver = Self::build_resolver();
-        let client =
-            JacquardOAuthClient::new_from_resolver(store.clone(), resolver, client_data);
+        let client = JacquardOAuthClient::new_from_resolver(store.clone(), resolver, client_data);
 
         Ok((store, client))
     }

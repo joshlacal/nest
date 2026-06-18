@@ -100,8 +100,12 @@ impl PushServices {
                 last_purge = tokio::time::Instant::now();
                 match self.queue.purge_revoked_accounts().await {
                     Ok(0) => {}
-                    Ok(n) => tracing::info!(count = n, "Purged push queue rows for revoked accounts"),
-                    Err(err) => tracing::warn!(error = %err, "Failed to purge revoked account queue rows"),
+                    Ok(n) => {
+                        tracing::info!(count = n, "Purged push queue rows for revoked accounts")
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to purge revoked account queue rows")
+                    }
                 }
             }
 

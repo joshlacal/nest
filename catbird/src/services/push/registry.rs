@@ -6,7 +6,7 @@ use crate::{
     models::CatbirdSession,
 };
 
-use super::types::{PushAccountRow, RegistrationRow, RegisterPushInput, UnregisterPushInput};
+use super::types::{PushAccountRow, RegisterPushInput, RegistrationRow, UnregisterPushInput};
 
 #[derive(Clone)]
 pub struct PushRegistry {
@@ -142,7 +142,12 @@ impl PushRegistry {
         Ok(())
     }
 
-    pub async fn deactivate_invalid_token(&self, did: &str, device_token: &str, error: &str) -> Result<()> {
+    pub async fn deactivate_invalid_token(
+        &self,
+        did: &str,
+        device_token: &str,
+        error: &str,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE user_devices

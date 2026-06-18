@@ -77,12 +77,7 @@ pub async fn poll_account(
     );
 
     // Make the request
-    let response = state
-        .http_client
-        .get(&url)
-        .headers(headers)
-        .send()
-        .await?;
+    let response = state.http_client.get(&url).headers(headers).send().await?;
 
     let status = response.status().as_u16();
 
@@ -102,7 +97,10 @@ pub async fn poll_account(
             "Chat poll got 429 from PDS"
         );
 
-        rate_budget.backoff_host(&row.pds_host, Duration::from_secs(retry_after.max(60) as u64));
+        rate_budget.backoff_host(
+            &row.pds_host,
+            Duration::from_secs(retry_after.max(60) as u64),
+        );
         scheduler
             .backoff_pds_host(&row.pds_host, retry_after)
             .await?;
@@ -283,11 +281,7 @@ async fn publish_to_redis(state: &Arc<AppState>, event: &ChatPushEvent) -> Resul
 }
 
 /// Update the last_notified_message_id for a polled account.
-async fn update_last_notified(
-    db_pool: &Pool<Postgres>,
-    did: &str,
-    message_id: &str,
-) -> Result<()> {
+async fn update_last_notified(db_pool: &Pool<Postgres>, did: &str, message_id: &str) -> Result<()> {
     sqlx::query("UPDATE chat_poll_state SET last_notified_message_id = $2 WHERE account_did = $1")
         .bind(did)
         .bind(message_id)

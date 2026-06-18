@@ -9,7 +9,7 @@ use jacquard_common::IntoStatic;
 use jacquard_oauth::authstore::ClientAuthStore;
 use jacquard_oauth::session::{AuthRequestData, ClientSessionData, DpopClientData};
 use jacquard_oauth::types::{OAuthTokenType, TokenSet};
-use redis::AsyncCommands;
+use redis::{AsyncCommands, Expiry};
 
 use super::redis_crypto::{decrypt_from_redis, encrypt_for_redis};
 
@@ -73,13 +73,23 @@ impl RedisAuthStore {
     ///
     /// iOS sends only `session_id` (not DID), but `ClientAuthStore` needs
     /// `(did, session_id)`. This index bridges that gap.
+    ///
+    /// Sliding expiration: every successful lookup resets the index entry's
+    /// TTL back to `SESSION_INDEX_TTL_SECONDS` via a single atomic `GETEX`.
+    /// Previously this was a plain `GET`, so the TTL only slid on token
+    /// refresh (`upsert_session` / `write_session_index`). A device idle for
+    /// longer than the TTL (no refresh) would lose its index entry and get
+    /// force-logged-out on the next request even though the session was
+    /// otherwise recoverable. Reading on a rolling window now keeps any
+    /// actively-used session alive.
     pub async fn lookup_did_for_session(
         &self,
         session_id: &str,
     ) -> Result<Option<String>, redis::RedisError> {
         let key = self.session_index_key(session_id);
         let mut conn = self.redis.clone();
-        conn.get(&key).await
+        conn.get_ex(&key, Expiry::EX(SESSION_INDEX_TTL_SECONDS as usize))
+            .await
     }
 
     /// Write the session_id→DID index entry.
@@ -230,6 +240,11 @@ impl RedisAuthStore {
 }
 
 impl ClientAuthStore for RedisAuthStore {
+    /// Sliding expiration: fetch the session blob with `GETEX`, resetting its
+    /// TTL to `self.session_ttl` on every successful read so the blob slides
+    /// in lockstep with the `session_index` entry (see
+    /// `lookup_did_for_session`). Keeps an actively-used session from expiring
+    /// on the 30-day idle window even when no token refresh occurs.
     async fn get_session(
         &self,
         did: &Did<'_>,
@@ -238,7 +253,10 @@ impl ClientAuthStore for RedisAuthStore {
         let key = self.session_key(did.as_str(), session_id);
         let mut conn = self.redis.clone();
 
-        let data: Option<String> = conn.get(&key).await.map_err(redis_err)?;
+        let data: Option<String> = conn
+            .get_ex(&key, Expiry::EX(self.session_ttl as usize))
+            .await
+            .map_err(redis_err)?;
 
         match data {
             Some(encrypted) => {
