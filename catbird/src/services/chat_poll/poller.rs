@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde_json::Value;
 use sqlx::{Pool, Postgres};
 
 use crate::config::AppState;
@@ -52,6 +53,16 @@ pub async fn poll_account(
             Err(err) => return Err(err),
         };
 
+    // Host DPoP nonce to try first. Seeded from the registry snapshot above;
+    // `fetch_log_page` updates it in place whenever a `use_dpop_nonce` 401
+    // forces a retry with a fresh one, so later pages in this same poll (and
+    // the persist call below) reuse it instead of eating the round trip again.
+    let mut dpop_nonce: Option<String> = if dpop.dpop_host_nonce.is_empty() {
+        None
+    } else {
+        Some(dpop.dpop_host_nonce.clone())
+    };
+
     // PRIME PASS: first poll for this account. Fast-forward the cursor to
     // "now" WITHOUT notifying — enrolling must never replay backlog.
     //
@@ -65,7 +76,20 @@ pub async fn poll_account(
         let mut done = false;
 
         for _page in 0..100 {
-            let (status, body) = fetch_log_page(state, &session, &dpop, cursor.as_deref()).await?;
+            let (status, body, next_nonce) = fetch_log_page(
+                state,
+                &session,
+                &dpop,
+                cursor.as_deref(),
+                dpop_nonce.as_deref(),
+            )
+            .await?;
+            if next_nonce != dpop_nonce {
+                if let Some(n) = &next_nonce {
+                    persist_host_nonce(state, &row.account_did, &session_id, n).await;
+                }
+                dpop_nonce = next_nonce;
+            }
 
             // Handle rate limiting (429) identically to the main path —
             // retry-after was packed into the body by fetch_log_page.
@@ -156,7 +180,19 @@ pub async fn poll_account(
         return Ok(());
     }
 
-    let (status, body) = fetch_log_page(state, &session, &dpop, row.chat_cursor.as_deref()).await?;
+    let (status, body, next_nonce) = fetch_log_page(
+        state,
+        &session,
+        &dpop,
+        row.chat_cursor.as_deref(),
+        dpop_nonce.as_deref(),
+    )
+    .await?;
+    if next_nonce != dpop_nonce {
+        if let Some(n) = &next_nonce {
+            persist_host_nonce(state, &row.account_did, &session_id, n).await;
+        }
+    }
 
     // Handle rate limiting (429) — retry-after was packed into the body by fetch_log_page.
     if status == 429 {
@@ -283,14 +319,60 @@ pub async fn poll_account(
     Ok(())
 }
 
-/// One getLog page. Returns (status, body_bytes). Auth headers + chat proxy
-/// header are rebuilt per call (DPoP nonces are single-use).
+/// Single HTTP attempt against `chat.bsky.convo.getLog` with the given DPoP
+/// nonce (or none, for a cycle's very first attempt). Returns the raw
+/// status, response headers (needed to read `retry-after` / `DPoP-Nonce`),
+/// and buffered body.
+async fn send_get_log_request(
+    client: &crate::services::AtProtoClient,
+    state: &Arc<AppState>,
+    session: &crate::models::CatbirdSession,
+    dpop: &crate::middleware::JacquardDpopData,
+    url: &str,
+    nonce: Option<String>,
+) -> Result<(u16, HeaderMap, bytes::Bytes)> {
+    let mut headers = client
+        .build_auth_headers_for_request(session, "GET", url, nonce, Some(dpop))
+        .await
+        .map_err(|e| anyhow!("Failed to build auth headers: {}", e))?;
+    headers.insert(
+        "atproto-proxy",
+        HeaderValue::from_static("did:web:api.bsky.chat#bsky_chat"),
+    );
+
+    let response = state.http_client.get(url).headers(headers).send().await?;
+    let status = response.status().as_u16();
+    let response_headers = response.headers().clone();
+    let body = response.bytes().await?;
+    Ok((status, response_headers, body))
+}
+
+fn retry_after_body(headers: &HeaderMap) -> Vec<u8> {
+    let retry_after = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(60);
+    retry_after.to_string().into_bytes()
+}
+
+/// One getLog page. Returns (status, body_bytes, dpop_nonce_for_next_call).
+///
+/// Auth headers + chat proxy header are rebuilt per call (DPoP nonces are
+/// single-use). On a `use_dpop_nonce` 401 the fresh nonce advertised in the
+/// `DPoP-Nonce` response header is captured and the request retried once —
+/// this mirrors `AtProtoClient::proxy_request`'s nonce-retry pattern, which
+/// the live XRPC proxy path already relies on. The returned nonce should be
+/// fed into the next `fetch_log_page` call (the prime-pass loop does this
+/// across pages) and persisted by the caller so later poll cycles don't pay
+/// the extra round trip again.
 async fn fetch_log_page(
     state: &Arc<AppState>,
     session: &crate::models::CatbirdSession,
     dpop: &crate::middleware::JacquardDpopData,
     cursor: Option<&str>,
-) -> Result<(u16, Vec<u8>)> {
+    nonce_hint: Option<&str>,
+) -> Result<(u16, Vec<u8>, Option<String>)> {
     let base = session.pds_url.trim_end_matches('/');
     let url = match cursor {
         Some(c) => format!(
@@ -302,30 +384,116 @@ async fn fetch_log_page(
     };
 
     let client = crate::services::AtProtoClient::new(state.clone());
-    let mut headers = client
-        .build_auth_headers_for_request(session, "GET", &url, None, Some(dpop))
-        .await
-        .map_err(|e| anyhow!("Failed to build auth headers: {}", e))?;
-    headers.insert(
-        "atproto-proxy",
-        HeaderValue::from_static("did:web:api.bsky.chat#bsky_chat"),
-    );
 
-    let response = state.http_client.get(&url).headers(headers).send().await?;
-    let status = response.status().as_u16();
+    let (status, headers, body) = send_get_log_request(
+        &client,
+        state,
+        session,
+        dpop,
+        &url,
+        nonce_hint.map(str::to_string),
+    )
+    .await?;
 
-    if status == 429 {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(60);
-        return Ok((429, retry_after.to_string().into_bytes()));
+    if status == 401 {
+        let is_use_dpop_nonce = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("use_dpop_nonce");
+
+        if is_use_dpop_nonce {
+            if let Some(fresh_nonce) = headers
+                .get("dpop-nonce")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+            {
+                tracing::info!(
+                    did = %session.did,
+                    "Chat poll getLog got use_dpop_nonce challenge; retrying with fresh nonce"
+                );
+                let (status, headers, body) = send_get_log_request(
+                    &client,
+                    state,
+                    session,
+                    dpop,
+                    &url,
+                    Some(fresh_nonce.clone()),
+                )
+                .await?;
+
+                if status == 429 {
+                    return Ok((429, retry_after_body(&headers), Some(fresh_nonce)));
+                }
+                return Ok((status, body.to_vec(), Some(fresh_nonce)));
+            }
+            tracing::warn!(
+                did = %session.did,
+                "Chat poll getLog got use_dpop_nonce error but no DPoP-Nonce header in response"
+            );
+        }
     }
 
-    let body = response.bytes().await?;
-    Ok((status, body.to_vec()))
+    if status == 429 {
+        return Ok((
+            429,
+            retry_after_body(&headers),
+            nonce_hint.map(str::to_string),
+        ));
+    }
+
+    Ok((status, body.to_vec(), nonce_hint.map(str::to_string)))
+}
+
+/// Persist a freshly-issued DPoP host nonce back to the Jacquard session
+/// registry so the next poll cycle for this account starts with a valid
+/// nonce instead of paying the `use_dpop_nonce` round trip again. Best
+/// effort: on failure the next cycle just repeats the retry-once dance in
+/// `fetch_log_page`.
+async fn persist_host_nonce(
+    state: &Arc<AppState>,
+    account_did: &str,
+    session_id: &str,
+    nonce: &str,
+) {
+    use jacquard_common::types::did::Did;
+
+    let Some(jacquard_client) = state.jacquard_client.as_ref() else {
+        return;
+    };
+
+    let did = match Did::new(account_did) {
+        Ok(did) => did,
+        Err(err) => {
+            tracing::debug!(
+                did = %account_did,
+                error = %err,
+                "Chat poll: invalid DID, skipping DPoP nonce persist"
+            );
+            return;
+        }
+    };
+
+    let mut session_data = match jacquard_client.registry.get(&did, session_id, false).await {
+        Ok(data) => data,
+        Err(err) => {
+            tracing::debug!(
+                did = %account_did,
+                error = %err,
+                "Chat poll: failed to load session for DPoP nonce persist"
+            );
+            return;
+        }
+    };
+
+    session_data.dpop_data.dpop_host_nonce = nonce.to_string().into();
+    if let Err(err) = jacquard_client.registry.set(session_data).await {
+        tracing::debug!(
+            did = %account_did,
+            error = %err,
+            "Chat poll: failed to persist DPoP host nonce"
+        );
+    }
 }
 
 /// Whether a CreateMessage at `rev` should trigger a push, given the
