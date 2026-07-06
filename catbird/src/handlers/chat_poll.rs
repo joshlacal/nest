@@ -34,11 +34,33 @@ pub struct UpdateMuteStatusOutput {
     pub success: bool,
 }
 
+/// Enroll `session.did` for chat polling using the session's PDS host.
+/// Safe to call repeatedly (UPSERT preserves cursor/tier). No-op when the
+/// push DB isn't configured.
+pub async fn enroll_session_for_chat_poll(state: &Arc<AppState>, session: &CatbirdSession) {
+    let Some(push_db) = state.push_db.as_ref() else {
+        return;
+    };
+    let Some(host) = url::Url::parse(&session.pds_url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+    else {
+        tracing::warn!(did = %session.did, pds_url = %session.pds_url, "Cannot enroll chat poll: unparseable PDS URL");
+        return;
+    };
+    let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
+    if let Err(err) = scheduler.enroll_account(&session.did, &host).await {
+        tracing::warn!(did = %session.did, error = %err, "Chat poll enrollment failed");
+    }
+}
+
 pub async fn push_heartbeat(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     Json(_input): Json<HeartbeatInput>,
 ) -> AppResult<Json<HeartbeatOutput>> {
+    enroll_session_for_chat_poll(&state, &session).await;
+
     let push_db = state
         .push_db
         .as_ref()

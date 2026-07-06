@@ -38,6 +38,7 @@ pub async fn register_push(
         .upsert_registration(&session, &input)
         .await
         .map_err(internal_error)?;
+    crate::handlers::chat_poll::enroll_session_for_chat_poll(&state, &session).await;
     Ok(StatusCode::OK)
 }
 
@@ -52,6 +53,19 @@ pub async fn unregister_push(
         .deactivate_registration(&session, &input)
         .await
         .map_err(internal_error)?;
+
+    if let Ok(remaining) = push.registry.list_active_registrations(&session.did).await {
+        if remaining.is_empty() {
+            if let Some(push_db) = state.push_db.as_ref() {
+                let scheduler =
+                    crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
+                if let Err(err) = scheduler.unenroll_account(&session.did).await {
+                    tracing::warn!(did = %session.did, error = %err, "Chat poll unenroll failed");
+                }
+            }
+        }
+    }
+
     Ok(StatusCode::OK)
 }
 
