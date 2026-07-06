@@ -90,7 +90,14 @@ pub async fn poll_account(
             }
 
             if status != 200 {
-                tracing::warn!(did = %row.account_did, status, "Prime pass got non-200; will resume next cycle");
+                let body_snippet: String =
+                    String::from_utf8_lossy(&body).chars().take(300).collect();
+                tracing::warn!(
+                    did = %row.account_did,
+                    status,
+                    body = %body_snippet,
+                    "Prime pass got non-200; will resume next cycle"
+                );
                 scheduler.reschedule(&row.account_did, 120).await?;
                 return Ok(());
             }
