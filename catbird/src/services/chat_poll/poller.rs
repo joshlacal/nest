@@ -394,10 +394,7 @@ pub(crate) async fn enqueue_push(
     event: &ChatPushEvent,
     delay_secs: i64,
 ) -> Result<()> {
-    let dedupe_key = format!(
-        "{}:chat_message:{}:{}",
-        event.recipient_did, event.convo_id, event.message_id
-    );
+    let dedupe_key = event.dedupe_key();
     let event_json = serde_json::to_value(event)?;
     let now_epoch = chrono::Utc::now().timestamp();
 

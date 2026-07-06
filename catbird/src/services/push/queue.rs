@@ -101,14 +101,6 @@ impl PushQueue {
         Ok(())
     }
 
-    pub async fn delete_by_dedupe_key(&self, dedupe_key: &str) -> Result<()> {
-        sqlx::query("DELETE FROM push_event_queue WHERE dedupe_key = $1")
-            .bind(dedupe_key)
-            .execute(&self.db_pool)
-            .await?;
-        Ok(())
-    }
-
     /// Atomically claim a queued event by dedupe key. Returns true only if an
     /// UNLEASED row was deleted — the caller then owns delivery. Returns false
     /// if the row is absent or the durable worker already leased it.

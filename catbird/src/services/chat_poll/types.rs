@@ -88,6 +88,17 @@ pub struct ChatPushEvent {
     pub sent_at: String,
 }
 
+impl ChatPushEvent {
+    /// Queue dedupe key — MUST stay identical between enqueue (poller) and
+    /// fast-path claim (push subscriber), or dedup silently breaks.
+    pub fn dedupe_key(&self) -> String {
+        format!(
+            "{}:chat_message:{}:{}",
+            self.recipient_did, self.convo_id, self.message_id
+        )
+    }
+}
+
 pub const TIER_HOT: i16 = 1;
 pub const TIER_WARM: i16 = 2;
 pub const TIER_COLD: i16 = 3;

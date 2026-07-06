@@ -313,10 +313,7 @@ impl PushServices {
                 // Claim the queue row before doing anything else: only an
                 // UNLEASED row (one the durable worker hasn't picked up) is
                 // deleted here, so at most one path ever delivers this event.
-                let dedupe_key = format!(
-                    "{}:chat_message:{}:{}",
-                    event.recipient_did, event.convo_id, event.message_id
-                );
+                let dedupe_key = event.dedupe_key();
                 match self.queue.claim_by_dedupe_key(&dedupe_key).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -325,6 +322,73 @@ impl PushServices {
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "Chat push claim failed; leaving to durable path");
+                        continue;
+                    }
+                }
+
+                // Mirror decision.rs's preferences + moderation checks: the
+                // claim already consumed the row, so on either "drop" or
+                // check-error we must not silently swallow the event —
+                // check-errors requeue (delay 0) so the durable path can
+                // decide fail-closed, matching the durable worker's own
+                // error handling.
+                let prefs = match self.preferences.get_or_create(&event.recipient_did).await {
+                    Ok(prefs) => prefs,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            did = %event.recipient_did,
+                            "Chat push fast-path preferences lookup failed; requeuing"
+                        );
+                        if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
+                            self.queue.pool(),
+                            &event,
+                            0,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %err, "Failed to requeue chat push after preferences lookup failure");
+                        }
+                        continue;
+                    }
+                };
+                if !prefs.is_push_enabled_for("chat_message") {
+                    tracing::debug!(
+                        did = %event.recipient_did,
+                        "Chat push fast-path dropped: preferences_disabled"
+                    );
+                    continue;
+                }
+
+                match self
+                    .moderation_cache
+                    .is_actor_muted_or_blocked(&event.recipient_did, &event.sender_did)
+                    .await
+                {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        tracing::debug!(
+                            did = %event.recipient_did,
+                            actor = %event.sender_did,
+                            "Chat push fast-path dropped: actor_muted_or_blocked"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            did = %event.recipient_did,
+                            "Chat push fast-path moderation lookup failed; requeuing"
+                        );
+                        if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
+                            self.queue.pool(),
+                            &event,
+                            0,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %err, "Failed to requeue chat push after moderation lookup failure");
+                        }
                         continue;
                     }
                 }
@@ -373,6 +437,35 @@ impl PushServices {
                         Ok(()) => {
                             delivered_count += 1;
                         }
+                        Err(err) if is_invalid_token(&err) => {
+                            tracing::info!(
+                                did = %registration.did,
+                                token = %registration.device_token,
+                                "Deactivating invalid APNs token (chat push fast-path)"
+                            );
+                            if let Err(update_err) = self
+                                .registry
+                                .deactivate_invalid_token(
+                                    &registration.did,
+                                    &registration.device_token,
+                                    "apns_unregistered",
+                                )
+                                .await
+                            {
+                                tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
+                            } else if let Some(push_db) = state.push_db.as_ref() {
+                                let scheduler =
+                                    crate::services::chat_poll::scheduler::ChatPollScheduler::new(
+                                        push_db.clone(),
+                                    );
+                                if let Err(err) = scheduler
+                                    .unenroll_account_if_no_active_devices(&registration.did)
+                                    .await
+                                {
+                                    tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
+                                }
+                            }
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
@@ -386,7 +479,7 @@ impl PushServices {
 
                 // We claimed the row; if NOTHING was delivered, hand it back
                 // to the durable path so the notification isn't lost.
-                if !registrations.is_empty() && delivered_count == 0 {
+                if delivered_count == 0 {
                     if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
                         self.queue.pool(),
                         &event,
