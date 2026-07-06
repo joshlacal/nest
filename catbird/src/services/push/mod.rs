@@ -300,6 +300,25 @@ impl PushServices {
                         }
                     };
 
+                // Claim the queue row before doing anything else: only an
+                // UNLEASED row (one the durable worker hasn't picked up) is
+                // deleted here, so at most one path ever delivers this event.
+                let dedupe_key = format!(
+                    "{}:chat_message:{}:{}",
+                    event.recipient_did, event.convo_id, event.message_id
+                );
+                match self.queue.claim_by_dedupe_key(&dedupe_key).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Durable worker owns it (or it was already delivered).
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Chat push claim failed; leaving to durable path");
+                        continue;
+                    }
+                }
+
                 // Look up active registrations for recipient
                 let registrations = match self
                     .registry
@@ -314,6 +333,8 @@ impl PushServices {
                 };
 
                 if registrations.is_empty() {
+                    // No device to deliver to — the claim already consumed
+                    // the event, matching the durable path's Drop disposition.
                     continue;
                 }
 
@@ -336,27 +357,35 @@ impl PushServices {
                 };
 
                 // Fan out to all devices
+                let mut delivered_count = 0usize;
                 for registration in &registrations {
-                    if let Err(err) = apns.send(registration, &notification).await {
-                        tracing::warn!(
-                            error = %err,
-                            did = %event.recipient_did,
-                            token = %registration.device_token,
-                            "Chat push fast-path delivery failed"
-                        );
+                    match apns.send(registration, &notification).await {
+                        Ok(()) => {
+                            delivered_count += 1;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                did = %event.recipient_did,
+                                token = %registration.device_token,
+                                "Chat push fast-path delivery failed"
+                            );
+                        }
                     }
                 }
 
-                // Delete matching queue row so durable path doesn't double-send
-                let dedupe_key = format!(
-                    "{}:chat_message:{}:{}",
-                    event.recipient_did, event.convo_id, event.message_id
-                );
-                if let Err(err) = self.queue.delete_by_dedupe_key(&dedupe_key).await {
-                    tracing::debug!(
-                        error = %err,
-                        "Failed to delete queue row by dedupe_key (may not exist yet)"
-                    );
+                // We claimed the row; if NOTHING was delivered, hand it back
+                // to the durable path so the notification isn't lost.
+                if !registrations.is_empty() && delivered_count == 0 {
+                    if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
+                        self.queue.pool(),
+                        &event,
+                        0,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %err, "Failed to requeue chat push after fast-path failure");
+                    }
                 }
             }
 

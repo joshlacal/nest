@@ -243,7 +243,7 @@ pub async fn poll_account(
                         .collect(),
                     sent_at: event.message.sent_at.clone(),
                 };
-                if let Err(err) = enqueue_push(db_pool, &push_event).await {
+                if let Err(err) = enqueue_push(db_pool, &push_event, 15).await {
                     tracing::warn!(did = %row.account_did, error = %err, "Failed to enqueue chat push");
                 }
                 if let Err(err) = publish_to_redis(state, &push_event).await {
@@ -384,8 +384,16 @@ async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(Str
     Ok(row)
 }
 
-/// Insert a chat push event into the push_event_queue.
-async fn enqueue_push(db_pool: &Pool<Postgres>, event: &ChatPushEvent) -> Result<()> {
+/// Insert a chat push event into the push_event_queue. `delay_secs` sets how
+/// long the row is invisible to the durable worker (`available_at`): new chat
+/// enqueues pass the durable grace window (15s) so the fast-path subscriber
+/// gets first crack at claiming and delivering; requeues after a fast-path
+/// delivery failure pass 0 so the durable worker can pick it up immediately.
+pub(crate) async fn enqueue_push(
+    db_pool: &Pool<Postgres>,
+    event: &ChatPushEvent,
+    delay_secs: i64,
+) -> Result<()> {
     let dedupe_key = format!(
         "{}:chat_message:{}:{}",
         event.recipient_did, event.convo_id, event.message_id
@@ -398,9 +406,10 @@ async fn enqueue_push(db_pool: &Pool<Postgres>, event: &ChatPushEvent) -> Result
         INSERT INTO push_event_queue (
             recipient_did, actor_did, notification_type,
             event_cid, event_path, event_record_json,
-            event_timestamp, dedupe_key
+            event_timestamp, dedupe_key, available_at
         )
-        VALUES ($1, $2, 'chat_message', $3, 'chat.bsky.convo.getLog', $4, $5, $6)
+        VALUES ($1, $2, 'chat_message', $3, 'chat.bsky.convo.getLog', $4, $5, $6,
+                NOW() + make_interval(secs => $7))
         ON CONFLICT (dedupe_key) DO NOTHING
         "#,
     )
@@ -410,6 +419,7 @@ async fn enqueue_push(db_pool: &Pool<Postgres>, event: &ChatPushEvent) -> Result
     .bind(&event_json)
     .bind(now_epoch)
     .bind(&dedupe_key)
+    .bind(delay_secs)
     .execute(db_pool)
     .await?;
 

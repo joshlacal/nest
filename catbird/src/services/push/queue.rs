@@ -109,6 +109,24 @@ impl PushQueue {
         Ok(())
     }
 
+    /// Atomically claim a queued event by dedupe key. Returns true only if an
+    /// UNLEASED row was deleted — the caller then owns delivery. Returns false
+    /// if the row is absent or the durable worker already leased it.
+    pub async fn claim_by_dedupe_key(&self, dedupe_key: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM push_event_queue
+            WHERE dedupe_key = $1
+              AND (leased_until IS NULL OR leased_until < NOW())
+            "#,
+        )
+        .bind(dedupe_key)
+        .execute(&self.db_pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn push_snapshot(&self, id: i64) -> Result<Option<Value>> {
         let row = sqlx::query_scalar::<_, Value>(
             "SELECT event_record_json FROM push_event_queue WHERE id = $1",
@@ -118,5 +136,9 @@ impl PushQueue {
         .await?;
 
         Ok(row)
+    }
+
+    pub fn pool(&self) -> &Pool<Postgres> {
+        &self.db_pool
     }
 }
