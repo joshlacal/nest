@@ -15,6 +15,7 @@ pub struct ChatPollRow {
     pub last_429_at: Option<OffsetDateTime>,
     pub last_retry_after_secs: Option<i32>,
     pub last_notified_message_id: Option<String>,
+    pub primed_at: Option<OffsetDateTime>,
 }
 
 /// Deserialized response from chat.bsky.convo.getLog

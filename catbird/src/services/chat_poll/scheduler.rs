@@ -45,7 +45,8 @@ impl ChatPollScheduler {
                 s.pds_host,
                 s.last_429_at,
                 s.last_retry_after_secs,
-                s.last_notified_message_id
+                s.last_notified_message_id,
+                s.primed_at
             "#,
         )
         .bind(batch_size)
@@ -93,6 +94,41 @@ impl ChatPollScheduler {
         .bind(cursor)
         .bind(new_tier)
         .bind(interval_secs)
+        .execute(&self.db_pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // MARK: - Prime Pass
+
+    /// Mark an account as fully primed: the prime pass has fast-forwarded
+    /// through all backlog and seeded watermarks, so the normal poll loop is
+    /// now safe to run (and safe to notify) for this account.
+    pub async fn mark_primed(&self, did: &str) -> Result<()> {
+        sqlx::query("UPDATE chat_poll_state SET primed_at = NOW() WHERE account_did = $1")
+            .bind(did)
+            .execute(&self.db_pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Persist the prime pass's cursor progress for a single page, without
+    /// touching `poll_tier` / `next_poll_at`. Called after each page during
+    /// priming so a crash or page-cap exhaustion mid-prime resumes from where
+    /// it left off instead of restarting from `cursor=None`.
+    pub async fn update_prime_cursor(&self, did: &str, cursor: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE chat_poll_state
+            SET chat_cursor = $2,
+                last_poll_at = NOW()
+            WHERE account_did = $1
+            "#,
+        )
+        .bind(did)
+        .bind(cursor)
         .execute(&self.db_pool)
         .await?;
 

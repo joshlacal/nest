@@ -1,6 +1,7 @@
 //! Chat poller — polls `chat.bsky.convo.getLog` for each claimed account,
 //! processes new-message events, and enqueues push notifications.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,28 +54,98 @@ pub async fn poll_account(
 
     // PRIME PASS: first poll for this account. Fast-forward the cursor to
     // "now" WITHOUT notifying — enrolling must never replay backlog.
-    if row.chat_cursor.is_none() {
-        let mut cursor: Option<String> = None;
+    //
+    // Gated on `primed_at` (not `chat_cursor`): a partial run — page-cap
+    // exhausted, or aborted on backoff/non-200 — persists its progress and
+    // returns, but `primed_at` stays NULL, so the next claim resumes the
+    // prime pass instead of falling through to the normal loop and
+    // notifying for backlog it never finished skipping.
+    if row.primed_at.is_none() {
+        let mut cursor: Option<String> = row.chat_cursor.clone();
+        let mut done = false;
+
         for _page in 0..100 {
             let (status, body) = fetch_log_page(state, &session, &dpop, cursor.as_deref()).await?;
+
+            // Handle rate limiting (429) identically to the main path —
+            // retry-after was packed into the body by fetch_log_page.
+            if status == 429 {
+                let retry_after: i64 = String::from_utf8_lossy(&body).parse().unwrap_or(60);
+
+                tracing::warn!(
+                    did = %row.account_did,
+                    pds = %row.pds_host,
+                    retry_after = retry_after,
+                    "Prime pass got 429 from PDS"
+                );
+
+                rate_budget.backoff_host(
+                    &row.pds_host,
+                    Duration::from_secs(retry_after.max(60) as u64),
+                );
+                scheduler
+                    .backoff_pds_host(&row.pds_host, retry_after)
+                    .await?;
+                return Ok(());
+            }
+
             if status != 200 {
-                tracing::warn!(did = %row.account_did, status, "Prime pass aborted");
+                tracing::warn!(did = %row.account_did, status, "Prime pass got non-200; will resume next cycle");
                 scheduler.reschedule(&row.account_did, 120).await?;
                 return Ok(());
             }
+
             let page: GetLogResponse = serde_json::from_slice(&body)?;
-            let done = page.logs.is_empty() || Some(&page.cursor) == cursor.as_ref();
+
+            // Seed watermarks from every entry seen while priming, so the
+            // first normal-loop poll after `mark_primed` doesn't re-notify
+            // for messages that already existed (and may already be read)
+            // by the time priming finished.
+            let mut dirty: HashMap<String, String> = HashMap::new();
+            for entry in &page.logs {
+                match entry {
+                    LogEntry::CreateMessage(event) | LogEntry::ReadMessage(event) => {
+                        raise_watermark(&mut dirty, &event.convo_id, &event.rev);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Flush watermarks BEFORE the cursor: same crash-safety
+            // rationale as the normal loop below — if we crash between the
+            // two, the next resumed page re-raises the same (idempotent)
+            // watermarks instead of losing them.
+            for (convo_id, rev) in &dirty {
+                scheduler
+                    .bump_watermark(&row.account_did, convo_id, rev)
+                    .await?;
+            }
+
+            let page_done = page.logs.is_empty() || Some(&page.cursor) == cursor.as_ref();
             cursor = Some(page.cursor);
-            if done {
+            if let Some(c) = &cursor {
+                scheduler.update_prime_cursor(&row.account_did, c).await?;
+            }
+
+            if page_done {
+                done = true;
                 break;
             }
         }
-        if let Some(c) = cursor {
-            scheduler
-                .update_after_poll(&row.account_did, &c, false, row.poll_tier)
-                .await?;
-            tracing::info!(did = %row.account_did, "Chat poll primed (cursor fast-forwarded, no notifications)");
+
+        if done {
+            scheduler.mark_primed(&row.account_did).await?;
+            if let Some(c) = &cursor {
+                scheduler
+                    .update_after_poll(&row.account_did, c, false, row.poll_tier)
+                    .await?;
+            }
+            tracing::info!(did = %row.account_did, "Chat poll primed (cursor fast-forwarded, watermarks seeded, no notifications)");
         }
+        // If the page cap was exhausted without finishing, progress (cursor
+        // + watermarks) is already persisted per-page above; the next claim
+        // resumes from `row.chat_cursor` since `primed_at` is still NULL.
+
         return Ok(());
     }
 
@@ -127,78 +198,60 @@ pub async fn poll_account(
     let log_response: GetLogResponse = serde_json::from_slice(&body)?;
 
     let watermarks = scheduler.get_watermarks(&row.account_did).await?;
-    let mut dirty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut had_incoming_message = false;
 
-    // Effective watermark = max(persisted, raised-this-poll).
-    let effective = |dirty: &std::collections::HashMap<String, String>, convo: &str| match (
-        watermarks.get(convo),
-        dirty.get(convo),
-    ) {
-        (Some(a), Some(b)) => Some(std::cmp::max(a.as_str(), b.as_str()).to_string()),
-        (Some(a), None) => Some(a.clone()),
-        (None, Some(b)) => Some(b.clone()),
-        (None, None) => None,
-    };
-    let raise = |dirty: &mut std::collections::HashMap<String, String>, convo: &str, rev: &str| {
-        let entry = dirty.entry(convo.to_string()).or_default();
-        if rev > entry.as_str() {
-            *entry = rev.to_string();
-        }
-    };
+    // Pass 1: seed the in-memory watermark from every ReadMessage in this
+    // batch BEFORE evaluating any CreateMessage. Without this, a page
+    // ordered [Create(convo, rev=3), Read(convo, rev=5)] would evaluate the
+    // create first and push a notification for a message the same batch
+    // shows was already read.
+    let mut dirty: HashMap<String, String> = batch_read_maxima(&log_response.logs);
 
+    // Pass 2: evaluate + notify CreateMessage entries against the
+    // read-seeded watermark.
     for entry in &log_response.logs {
-        match entry {
-            LogEntry::CreateMessage(event) => {
-                let wm = effective(&dirty, &event.convo_id);
-                if !should_notify(&event.rev, wm.as_deref()) {
-                    continue;
-                }
-                // Own messages and muted convos advance the watermark
-                // without notifying (unmuting must not replay history).
-                let own = event.message.sender.did == row.account_did;
-                let muted = !own
-                    && scheduler
-                        .is_convo_muted(&row.account_did, &event.convo_id)
-                        .await?;
-
-                if !own {
-                    had_incoming_message = true;
-                }
-
-                if !own && !muted {
-                    let push_event = ChatPushEvent {
-                        recipient_did: row.account_did.clone(),
-                        sender_did: event.message.sender.did.clone(),
-                        convo_id: event.convo_id.clone(),
-                        message_id: event.message.id.clone(),
-                        message_text: event
-                            .message
-                            .text
-                            .clone()
-                            .unwrap_or_default()
-                            .chars()
-                            .take(300)
-                            .collect(),
-                        sent_at: event.message.sent_at.clone(),
-                    };
-                    if let Err(err) = enqueue_push(db_pool, &push_event).await {
-                        tracing::warn!(did = %row.account_did, error = %err, "Failed to enqueue chat push");
-                    }
-                    if let Err(err) = publish_to_redis(state, &push_event).await {
-                        tracing::debug!(did = %row.account_did, error = %err, "Redis publish failed (durable path covers it)");
-                    }
-                }
-
-                raise(&mut dirty, &event.convo_id, &event.rev);
+        if let LogEntry::CreateMessage(event) = entry {
+            let wm = effective_watermark(&watermarks, &dirty, &event.convo_id);
+            if !should_notify(&event.rev, wm.as_deref()) {
+                continue;
             }
-            LogEntry::ReadMessage(event) => {
-                // A read on ANY device advances the watermark — messages the
-                // user has already seen never push, and everything below the
-                // read-point is implicitly handled.
-                raise(&mut dirty, &event.convo_id, &event.rev);
+            // Own messages and muted convos advance the watermark
+            // without notifying (unmuting must not replay history).
+            let own = event.message.sender.did == row.account_did;
+            let muted = !own
+                && scheduler
+                    .is_convo_muted(&row.account_did, &event.convo_id)
+                    .await?;
+
+            if !own {
+                had_incoming_message = true;
             }
-            _ => {}
+
+            if !own && !muted {
+                let push_event = ChatPushEvent {
+                    recipient_did: row.account_did.clone(),
+                    sender_did: event.message.sender.did.clone(),
+                    convo_id: event.convo_id.clone(),
+                    message_id: event.message.id.clone(),
+                    message_text: event
+                        .message
+                        .text
+                        .clone()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect(),
+                    sent_at: event.message.sent_at.clone(),
+                };
+                if let Err(err) = enqueue_push(db_pool, &push_event).await {
+                    tracing::warn!(did = %row.account_did, error = %err, "Failed to enqueue chat push");
+                }
+                if let Err(err) = publish_to_redis(state, &push_event).await {
+                    tracing::debug!(did = %row.account_did, error = %err, "Redis publish failed (durable path covers it)");
+                }
+            }
+
+            raise_watermark(&mut dirty, &event.convo_id, &event.rev);
         }
     }
 
@@ -277,6 +330,47 @@ fn should_notify(rev: &str, watermark: Option<&str>) -> bool {
     }
 }
 
+/// Monotonically raise the watermark for `convo_id` in `dirty` to `rev` (a
+/// lower rev never overwrites). Revs are TIDs — lexicographic order is time
+/// order.
+fn raise_watermark(dirty: &mut HashMap<String, String>, convo_id: &str, rev: &str) {
+    let entry = dirty.entry(convo_id.to_string()).or_default();
+    if rev > entry.as_str() {
+        *entry = rev.to_string();
+    }
+}
+
+/// Effective watermark for `convo_id`: max(persisted, raised-this-poll).
+fn effective_watermark(
+    persisted: &HashMap<String, String>,
+    dirty: &HashMap<String, String>,
+    convo_id: &str,
+) -> Option<String> {
+    match (persisted.get(convo_id), dirty.get(convo_id)) {
+        (Some(a), Some(b)) => Some(std::cmp::max(a.as_str(), b.as_str()).to_string()),
+        (Some(a), None) => Some(a.clone()),
+        (None, Some(b)) => Some(b.clone()),
+        (None, None) => None,
+    }
+}
+
+/// Per-convo maximum rev among ReadMessage entries in a single getLog page.
+///
+/// Used to seed the in-memory watermark BEFORE any CreateMessage in the same
+/// page is evaluated: a page ordered [Create, ..., Read(higher rev)] for the
+/// same convo must suppress the create rather than notify for a message the
+/// same batch shows was already read (a single forward pass gets this wrong
+/// because it would evaluate the create before reaching the later read).
+fn batch_read_maxima(logs: &[LogEntry]) -> HashMap<String, String> {
+    let mut maxima = HashMap::new();
+    for entry in logs {
+        if let LogEntry::ReadMessage(event) = entry {
+            raise_watermark(&mut maxima, &event.convo_id, &event.rev);
+        }
+    }
+    maxima
+}
+
 /// Look up session_id and pds_url from push_accounts for a given DID.
 async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(String, String)> {
     let row = sqlx::query_as::<_, (String, String)>(
@@ -336,7 +430,8 @@ async fn publish_to_redis(state: &Arc<AppState>, event: &ChatPushEvent) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::should_notify;
+    use super::super::types::{LogMessage, LogMessageEvent, LogSender};
+    use super::*;
 
     #[test]
     fn notify_when_no_watermark() {
@@ -352,5 +447,60 @@ mod tests {
     #[test]
     fn notify_above_watermark() {
         assert!(should_notify("3lccc", Some("3lbbb")));
+    }
+
+    fn log_message_event(
+        convo_id: &str,
+        rev: &str,
+        sender_did: &str,
+        message_id: &str,
+    ) -> LogMessageEvent {
+        LogMessageEvent {
+            convo_id: convo_id.to_string(),
+            rev: rev.to_string(),
+            message: LogMessage {
+                id: message_id.to_string(),
+                sender: LogSender {
+                    did: sender_did.to_string(),
+                },
+                text: Some("hello".to_string()),
+                sent_at: "2026-07-06T00:00:00Z".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn batch_read_maxima_tracks_per_convo_max_rev() {
+        let logs = vec![
+            LogEntry::ReadMessage(log_message_event("convo1", "3laaa", "did:plc:self", "r1")),
+            LogEntry::ReadMessage(log_message_event("convo1", "3lccc", "did:plc:self", "r2")),
+            LogEntry::ReadMessage(log_message_event("convo2", "3lbbb", "did:plc:self", "r3")),
+            LogEntry::CreateMessage(log_message_event("convo1", "3lzzz", "did:plc:other", "m1")),
+        ];
+
+        let maxima = batch_read_maxima(&logs);
+
+        assert_eq!(maxima.get("convo1").map(String::as_str), Some("3lccc"));
+        assert_eq!(maxima.get("convo2").map(String::as_str), Some("3lbbb"));
+    }
+
+    #[test]
+    fn same_batch_read_after_create_suppresses_notification() {
+        // A page ordered [Create(rev=3laaa), Read(rev=3lbbb)] for the same
+        // convo — the read arrives later in the page but covers the create.
+        // Finding 3: a naive single forward pass would notify for the
+        // create before ever seeing the read. The fix seeds the watermark
+        // from ALL same-batch reads (batch_read_maxima) before evaluating
+        // any create.
+        let logs = vec![
+            LogEntry::CreateMessage(log_message_event("convo1", "3laaa", "did:plc:other", "m1")),
+            LogEntry::ReadMessage(log_message_event("convo1", "3lbbb", "did:plc:self", "r1")),
+        ];
+
+        let persisted: HashMap<String, String> = HashMap::new();
+        let dirty = batch_read_maxima(&logs);
+
+        let wm = effective_watermark(&persisted, &dirty, "convo1");
+        assert!(!should_notify("3laaa", wm.as_deref()));
     }
 }
