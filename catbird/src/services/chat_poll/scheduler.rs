@@ -272,4 +272,42 @@ impl ChatPollScheduler {
 
         Ok(())
     }
+
+    // MARK: - Notification Watermarks
+
+    /// All (convo_id -> last_rev) watermarks for an account, fetched once per poll.
+    pub async fn get_watermarks(
+        &self,
+        did: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT convo_id, last_rev FROM chat_notified_watermarks WHERE account_did = $1",
+        )
+        .bind(did)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Monotonically raise the watermark for (did, convo). Revs are TIDs, so
+    /// lexicographic comparison is the ordering; a lower rev never overwrites.
+    pub async fn bump_watermark(&self, did: &str, convo_id: &str, rev: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO chat_notified_watermarks (account_did, convo_id, last_rev, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (account_did, convo_id)
+            DO UPDATE SET last_rev = EXCLUDED.last_rev, updated_at = NOW()
+            WHERE chat_notified_watermarks.last_rev < EXCLUDED.last_rev
+            "#,
+        )
+        .bind(did)
+        .bind(convo_id)
+        .bind(rev)
+        .execute(&self.db_pool)
+        .await?;
+
+        Ok(())
+    }
 }
