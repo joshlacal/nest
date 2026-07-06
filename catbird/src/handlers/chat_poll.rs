@@ -69,10 +69,22 @@ pub async fn push_heartbeat(
     let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
 
     let lease_secs: i64 = 90;
-    scheduler
+    let rows_affected = scheduler
         .update_foreground_lease(&session.did, lease_secs)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if rows_affected == 0 {
+        tracing::warn!(did = %session.did, "Heartbeat lease update touched no rows; enrollment must have failed earlier in this request. Retrying enrollment once.");
+        enroll_session_for_chat_poll(&state, &session).await;
+        let retry_rows = scheduler
+            .update_foreground_lease(&session.did, lease_secs)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if retry_rows == 0 {
+            tracing::warn!(did = %session.did, "Heartbeat lease update still touched no rows after re-enrollment retry");
+        }
+    }
 
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(lease_secs);
     Ok(Json(HeartbeatOutput {

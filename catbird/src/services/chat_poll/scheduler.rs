@@ -184,9 +184,10 @@ impl ChatPollScheduler {
     /// Extend (or create) the foreground lease for a DID.
     ///
     /// While the lease is active the poller should run at TIER_HOT frequency
-    /// because the user has the app in the foreground.
-    pub async fn update_foreground_lease(&self, did: &str, secs: i64) -> Result<()> {
-        sqlx::query(
+    /// because the user has the app in the foreground. Returns the number of
+    /// rows updated so callers can detect a missing enrollment (0 rows).
+    pub async fn update_foreground_lease(&self, did: &str, secs: i64) -> Result<u64> {
+        let result = sqlx::query(
             r#"
             UPDATE chat_poll_state
             SET foreground_lease_until = NOW() + make_interval(secs => $2),
@@ -202,7 +203,7 @@ impl ChatPollScheduler {
         .execute(&self.db_pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     // MARK: - Enrollment
@@ -237,6 +238,27 @@ impl ChatPollScheduler {
             .await?;
 
         Ok(())
+    }
+
+    /// Unenroll only if the account has no active devices — atomic, so a
+    /// concurrent re-registration's enrollment can't be wiped between a
+    /// check and a delete.
+    pub async fn unenroll_account_if_no_active_devices(&self, did: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM chat_poll_state
+            WHERE account_did = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_devices
+                  WHERE did = $1 AND is_active
+              )
+            "#,
+        )
+        .bind(did)
+        .execute(&self.db_pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     // MARK: - Mute Management

@@ -166,6 +166,16 @@ impl PushServices {
                                                 .await
                                             {
                                                 tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
+                                            } else if let Some(push_db) = state.push_db.as_ref() {
+                                                let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
+                                                if let Err(err) = scheduler
+                                                    .unenroll_account_if_no_active_devices(
+                                                        &registration.did,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
+                                                }
                                             }
                                         }
                                         Err(err) if is_auth_revocation_error(&err) => {
