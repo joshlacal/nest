@@ -83,6 +83,12 @@ pub struct ApnsConfig {
     pub team_id: Option<String>,
     #[serde(default)]
     pub topic: Option<String>,
+    /// Default first-try APNs environment for registrations with no known
+    /// environment yet (`RegistrationRow.apns_environment` is NULL).
+    /// `true` tries production first, `false` tries sandbox first.
+    /// `ApnsDelivery` always maintains clients for BOTH environments and
+    /// falls back to the other one on a `BadDeviceToken` rejection, so this
+    /// only affects which endpoint is tried first for brand-new tokens.
     #[serde(default)]
     pub production: bool,
 }

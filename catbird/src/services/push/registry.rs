@@ -179,7 +179,8 @@ impl PushRegistry {
                 app_id,
                 service_did,
                 age_restricted,
-                is_active
+                is_active,
+                apns_environment
             FROM user_devices
             WHERE did = $1
               AND is_active = TRUE
@@ -191,6 +192,33 @@ impl PushRegistry {
         .await?;
 
         Ok(rows)
+    }
+
+    /// Records the APNs environment ("production"/"sandbox") that a device
+    /// token was actually delivered on, learned via try-and-learn in
+    /// `ApnsDelivery::send`. Called only when it differs from what's on file.
+    pub async fn set_apns_environment(
+        &self,
+        did: &str,
+        device_token: &str,
+        env: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE user_devices
+            SET apns_environment = $3,
+                updated_at = NOW()
+            WHERE did = $1
+              AND device_token = $2
+            "#,
+        )
+        .bind(did)
+        .bind(device_token)
+        .bind(env)
+        .execute(&self.db_pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn get_push_account(&self, did: &str) -> Result<Option<PushAccountRow>> {

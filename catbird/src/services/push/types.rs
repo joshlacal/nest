@@ -255,6 +255,9 @@ pub struct RegistrationRow {
     pub service_did: Option<String>,
     pub age_restricted: bool,
     pub is_active: bool,
+    /// Which APNs environment ("production"/"sandbox") this token is known to
+    /// belong to. NULL until try-and-learn observes a successful delivery.
+    pub apns_environment: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

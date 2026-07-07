@@ -169,7 +169,29 @@ impl PushServices {
 
                                 for (registration, notification) in deliveries {
                                     match apns.send(&registration, &notification).await {
-                                        Ok(()) => {}
+                                        Ok(delivered_env) => {
+                                            if registration.apns_environment.as_deref()
+                                                != Some(delivered_env)
+                                            {
+                                                tracing::info!(
+                                                    did = %registration.did,
+                                                    token = %registration.device_token,
+                                                    env = delivered_env,
+                                                    "Learned APNs environment"
+                                                );
+                                                if let Err(err) = self
+                                                    .registry
+                                                    .set_apns_environment(
+                                                        &registration.did,
+                                                        &registration.device_token,
+                                                        delivered_env,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(error = %err, "Failed to persist learned APNs environment");
+                                                }
+                                            }
+                                        }
                                         Err(err) if is_invalid_token(&err) => {
                                             tracing::info!(
                                                 did = %registration.did,
@@ -220,6 +242,12 @@ impl PushServices {
                                         tracing::error!(error = %err, "Failed to delete revoked-account push event");
                                     }
                                 } else if let Some(err) = transient_error {
+                                    // Known limitation: retrying the row re-sends to
+                                    // registrations that already succeeded this attempt.
+                                    // Acceptable for rare, genuinely transient errors
+                                    // (network/5xx) — deterministic failures like
+                                    // BadDeviceToken must never reach this arm (they're
+                                    // classified invalid and deactivate the token instead).
                                     tracing::warn!(
                                         recipient = %row.recipient_did,
                                         notification_type = %row.notification_type,
@@ -455,8 +483,27 @@ impl PushServices {
                 let mut delivered_count = 0usize;
                 for registration in &registrations {
                     match apns.send(registration, &notification).await {
-                        Ok(()) => {
+                        Ok(delivered_env) => {
                             delivered_count += 1;
+                            if registration.apns_environment.as_deref() != Some(delivered_env) {
+                                tracing::info!(
+                                    did = %registration.did,
+                                    token = %registration.device_token,
+                                    env = delivered_env,
+                                    "Learned APNs environment (chat push fast-path)"
+                                );
+                                if let Err(err) = self
+                                    .registry
+                                    .set_apns_environment(
+                                        &registration.did,
+                                        &registration.device_token,
+                                        delivered_env,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(error = %err, "Failed to persist learned APNs environment (chat push fast-path)");
+                                }
+                            }
                         }
                         Err(err) if is_invalid_token(&err) => {
                             tracing::info!(
@@ -523,7 +570,18 @@ impl PushServices {
 fn is_invalid_token(err: &anyhow::Error) -> bool {
     if let Some(a2_err) = err.downcast_ref::<a2::Error>() {
         if let a2::Error::ResponseError(response) = a2_err {
-            return response.code == 410;
+            if response.code == 410 {
+                return true;
+            }
+            // ApnsDelivery::send already retries BadDeviceToken once against
+            // the other environment, so a BadDeviceToken reaching here means
+            // both endpoints rejected the token — it's genuinely invalid,
+            // not just aimed at the wrong environment.
+            if let Some(body) = response.error.as_ref() {
+                if body.reason == a2::ErrorReason::BadDeviceToken {
+                    return true;
+                }
+            }
         }
     }
 
