@@ -107,6 +107,7 @@ fn build_chat_notification(row: &QueueRow) -> ApnsNotification {
 
     let mut custom_data = HashMap::new();
     custom_data.insert("type".to_string(), "chat_message".to_string());
+    custom_data.insert("recipientDid".to_string(), row.recipient_did.clone());
     custom_data.insert("convoId".to_string(), convo_id.to_string());
     custom_data.insert("messageId".to_string(), message_id.to_string());
     custom_data.insert("senderDid".to_string(), row.actor_did.clone());

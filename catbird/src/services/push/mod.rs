@@ -107,6 +107,15 @@ impl PushServices {
                         tracing::warn!(error = %err, "Failed to purge revoked account queue rows")
                     }
                 }
+                match self.queue.purge_non_chat().await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(count = n, "Purged non-chat push queue rows")
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to purge non-chat queue rows")
+                    }
+                }
             }
 
             match self.queue.claim_ready(batch_size).await {
@@ -415,6 +424,7 @@ impl PushServices {
                 // Build notification
                 let mut custom_data = std::collections::HashMap::new();
                 custom_data.insert("type".to_string(), "chat_message".to_string());
+                custom_data.insert("recipientDid".to_string(), event.recipient_did.clone());
                 custom_data.insert("convoId".to_string(), event.convo_id.clone());
                 custom_data.insert("messageId".to_string(), event.message_id.clone());
                 custom_data.insert("senderDid".to_string(), event.sender_did.clone());
