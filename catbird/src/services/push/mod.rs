@@ -107,15 +107,6 @@ impl PushServices {
                         tracing::warn!(error = %err, "Failed to purge revoked account queue rows")
                     }
                 }
-                match self.queue.purge_non_chat().await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        tracing::info!(count = n, "Purged non-chat push queue rows")
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Failed to purge non-chat queue rows")
-                    }
-                }
             }
 
             match self.queue.claim_ready(batch_size).await {
@@ -137,6 +128,26 @@ impl PushServices {
                             );
                             if let Err(err) = self.queue.delete(row.id).await {
                                 tracing::error!(error = %err, "Failed to delete revoked-account push event");
+                            }
+                            continue;
+                        }
+
+                        // Staleness guard: drop events that sat in the queue
+                        // past this age instead of delivering a long-dead
+                        // notification. Protects against any future dormant
+                        // producer/pipeline reactivation spraying weeks-old
+                        // backlog (e.g. the 383k-row incident), independent of
+                        // notification_type.
+                        let age = time::OffsetDateTime::now_utc() - row.created_at;
+                        if age > time::Duration::hours(24) {
+                            tracing::debug!(
+                                recipient = %row.recipient_did,
+                                notification_type = %row.notification_type,
+                                age_secs = age.whole_seconds(),
+                                "Dropping stale queued push event"
+                            );
+                            if let Err(err) = self.queue.delete(row.id).await {
+                                tracing::error!(error = %err, "Failed to delete stale push event");
                             }
                             continue;
                         }

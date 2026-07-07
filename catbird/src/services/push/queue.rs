@@ -24,10 +24,6 @@ impl PushQueue {
                 WHERE peq.available_at <= NOW()
                   AND (peq.leased_until IS NULL OR peq.leased_until < NOW())
                   AND (pa.auth_revoked_at IS NULL)
-                  -- nest delivers chat only; social push (like/reply/follow/etc.)
-                  -- is bluesky-push-notifier's job — delivering it here would
-                  -- duplicate that service's notifications.
-                  AND peq.notification_type = 'chat_message'
                 ORDER BY peq.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF peq SKIP LOCKED
@@ -49,6 +45,7 @@ impl PushQueue {
                 q.thread_root_uri,
                 q.event_record_json,
                 q.event_timestamp,
+                q.created_at,
                 q.attempts
             "#,
         )
@@ -69,22 +66,6 @@ impl PushQueue {
                 SELECT account_did FROM push_accounts
                 WHERE auth_revoked_at IS NOT NULL
             )
-            "#,
-        )
-        .execute(&self.db_pool)
-        .await?;
-
-        Ok(result.rows_affected())
-    }
-
-    /// Delete queued events for notification types nest no longer delivers
-    /// (social push belongs to bluesky-push-notifier). Absorbs ongoing
-    /// firehose writes so the queue doesn't re-accumulate a backlog.
-    pub async fn purge_non_chat(&self) -> Result<u64> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM push_event_queue
-            WHERE notification_type != 'chat_message'
             "#,
         )
         .execute(&self.db_pool)

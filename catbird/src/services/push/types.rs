@@ -269,6 +269,7 @@ pub struct QueueRow {
     pub thread_root_uri: Option<String>,
     pub event_record_json: Value,
     pub event_timestamp: i64,
+    pub created_at: sqlx::types::time::OffsetDateTime,
     pub attempts: i32,
 }
 
