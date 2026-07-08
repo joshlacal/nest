@@ -544,6 +544,7 @@ impl ModerationCache {
     ) -> Result<Vec<String>> {
         let mut cursor = None::<String>;
         let mut dids = Vec::new();
+        let mut pages = 0usize;
 
         loop {
             let query = match cursor.as_deref() {
@@ -562,12 +563,14 @@ impl ModerationCache {
                 }));
             }
 
-            cursor = payload
+            pages += 1;
+            let next = payload
                 .get("cursor")
                 .and_then(|value| value.as_str())
                 .map(str::to_owned);
-            if cursor.is_none() {
-                break;
+            match advance_cursor(cursor.as_deref(), next, pages, lexicon)? {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
             }
         }
 
@@ -584,6 +587,7 @@ impl ModerationCache {
     ) -> Result<Vec<ListSubscription>> {
         let mut cursor = None::<String>;
         let mut lists = Vec::new();
+        let mut pages = 0usize;
 
         loop {
             let query = match cursor.as_deref() {
@@ -609,12 +613,14 @@ impl ModerationCache {
                 }));
             }
 
-            cursor = payload
+            pages += 1;
+            let next = payload
                 .get("cursor")
                 .and_then(|value| value.as_str())
                 .map(str::to_owned);
-            if cursor.is_none() {
-                break;
+            match advance_cursor(cursor.as_deref(), next, pages, lexicon)? {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
             }
         }
 
@@ -649,6 +655,7 @@ impl ModerationCache {
     ) -> Result<Vec<String>> {
         let mut cursor = None::<String>;
         let mut members = Vec::new();
+        let mut pages = 0usize;
 
         loop {
             let mut query = format!("list={}&limit=100", urlencoding::encode(list_uri));
@@ -670,12 +677,14 @@ impl ModerationCache {
                 }));
             }
 
-            cursor = payload
+            pages += 1;
+            let next = payload
                 .get("cursor")
                 .and_then(|value| value.as_str())
                 .map(str::to_owned);
-            if cursor.is_none() {
-                break;
+            match advance_cursor(cursor.as_deref(), next, pages, "app.bsky.graph.getList")? {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
             }
         }
 
@@ -724,4 +733,99 @@ impl ModerationCache {
 
 fn parse_json_body(body: &Bytes) -> Result<Value> {
     Ok(serde_json::from_slice(body)?)
+}
+
+/// Upper bound on pages fetched from a single paginated XRPC endpoint.
+/// At 100 items per page this is 50,000 items — far beyond any real
+/// moderation list, while guaranteeing termination.
+const MAX_PAGINATION_PAGES: usize = 500;
+
+/// Decides whether a paginated XRPC fetch may continue, and with which cursor.
+///
+/// The upstream contract is "keep going until `cursor` is absent", but that
+/// alone is not a termination guarantee: an upstream that repeats or pins its
+/// cursor spins forever. Because these loops never return `Err`, such a spin
+/// is invisible — no error is logged, the enclosing sync never records
+/// completion, and since the push worker awaits `ensure_fresh` inline while
+/// processing rows sequentially, one wedged account stalls *all* push
+/// delivery. That is exactly how notifications stopped for over a day.
+///
+/// So termination rests on three conditions, not one: the cursor is absent
+/// (normal end), the cursor did not advance, or the page cap was reached.
+///
+/// The abnormal cases return `Err` rather than truncating. A truncated
+/// moderation list would under-block — delivering notifications from actors
+/// the user muted or blocked — so failing the refresh and requeuing the event
+/// is the privacy-preserving choice.
+fn advance_cursor(
+    previous: Option<&str>,
+    next: Option<String>,
+    pages_fetched: usize,
+    context: &str,
+) -> Result<Option<String>> {
+    let Some(next_cursor) = next else {
+        return Ok(None);
+    };
+    if previous == Some(next_cursor.as_str()) {
+        return Err(anyhow!(
+            "{context}: upstream repeated pagination cursor after {pages_fetched} pages; refusing to loop"
+        ));
+    }
+    if pages_fetched >= MAX_PAGINATION_PAGES {
+        return Err(anyhow!(
+            "{context}: exceeded {MAX_PAGINATION_PAGES} pages of pagination; refusing to loop"
+        ));
+    }
+    Ok(Some(next_cursor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_cursor_ends_pagination() {
+        assert_eq!(advance_cursor(Some("a"), None, 1, "test").unwrap(), None);
+    }
+
+    #[test]
+    fn advancing_cursor_continues_pagination() {
+        assert_eq!(
+            advance_cursor(None, Some("a".into()), 1, "test").unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            advance_cursor(Some("a"), Some("b".into()), 2, "test").unwrap(),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn repeated_cursor_is_refused() {
+        // An upstream that returns the same cursor forever is the exact
+        // shape that stalled the push pipeline: every page looked "normal"
+        // because a cursor was present, so the loop never exited.
+        let err = advance_cursor(Some("a"), Some("a".into()), 2, "test").unwrap_err();
+        assert!(err.to_string().contains("repeated pagination cursor"));
+    }
+
+    #[test]
+    fn page_cap_is_refused() {
+        // Catches an upstream that advances the cursor forever, which the
+        // repeat check alone would not.
+        let err =
+            advance_cursor(Some("a"), Some("b".into()), MAX_PAGINATION_PAGES, "test").unwrap_err();
+        assert!(err.to_string().contains("pages"));
+    }
+
+    #[test]
+    fn page_cap_allows_the_last_permitted_page() {
+        assert!(advance_cursor(
+            Some("a"),
+            Some("b".into()),
+            MAX_PAGINATION_PAGES - 1,
+            "test"
+        )
+        .is_ok());
+    }
 }
