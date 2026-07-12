@@ -88,6 +88,11 @@ impl DidDocResponse {
             if let Ok(doc) = serde_json::from_slice::<DidDocument<'b>>(&self.buffer) {
                 Ok(doc)
             } else if let Ok(mini_doc) = serde_json::from_slice::<MiniDoc<'b>>(&self.buffer) {
+                let pds_url = Url::from_str(&mini_doc.pds).map_err(|error| {
+                    IdentityError::invalid_doc(smol_str::format_smolstr!(
+                        "invalid PDS URL: {error}"
+                    ))
+                })?;
                 Ok(DidDocument {
                     context: default_context(),
                     id: mini_doc.did,
@@ -96,9 +101,7 @@ impl DidDocResponse {
                     service: Some(vec![Service {
                         id: CowStr::new_static("#atproto_pds"),
                         r#type: CowStr::new_static("AtprotoPersonalDataServer"),
-                        service_endpoint: Some(Data::String(AtprotoStr::Uri(Uri::Https(
-                            Url::from_str(&mini_doc.pds).unwrap(),
-                        )))),
+                        service_endpoint: Some(Data::String(AtprotoStr::Uri(Uri::Https(pds_url)))),
                         extra_data: BTreeMap::new(),
                     }]),
                     extra_data: BTreeMap::new(),
@@ -133,6 +136,11 @@ impl DidDocResponse {
             if let Ok(doc) = serde_json::from_slice::<DidDocument<'_>>(&self.buffer) {
                 Ok(doc.into_static())
             } else if let Ok(mini_doc) = serde_json::from_slice::<MiniDoc<'_>>(&self.buffer) {
+                let pds_url = Url::from_str(&mini_doc.pds).map_err(|error| {
+                    IdentityError::invalid_doc(smol_str::format_smolstr!(
+                        "invalid PDS URL: {error}"
+                    ))
+                })?;
                 Ok(DidDocument {
                     context: default_context(),
                     id: mini_doc.did,
@@ -141,9 +149,7 @@ impl DidDocResponse {
                     service: Some(vec![Service {
                         id: CowStr::new_static("#atproto_pds"),
                         r#type: CowStr::new_static("AtprotoPersonalDataServer"),
-                        service_endpoint: Some(Data::String(AtprotoStr::Uri(Uri::Https(
-                            Url::from_str(&mini_doc.pds).unwrap(),
-                        )))),
+                        service_endpoint: Some(Data::String(AtprotoStr::Uri(Uri::Https(pds_url)))),
                         extra_data: BTreeMap::new(),
                     }]),
                     extra_data: BTreeMap::new(),
@@ -806,5 +812,28 @@ mod tests {
             },
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn malformed_mini_doc_pds_is_a_typed_error() {
+        let buffer = Bytes::from_static(
+            br#"{"did":"did:plc:ewvi7nxzyoun6zhxrhs64oiz","handle":"alice.bsky.social","pds":"not a url","signingKey":"did:key:zAlice"}"#,
+        );
+        let response = DidDocResponse {
+            buffer,
+            status: StatusCode::OK,
+            requested: None,
+        };
+
+        assert!(serde_json::from_slice::<MiniDoc<'_>>(&response.buffer).is_ok());
+        let error = response.parse().unwrap_err();
+        assert!(
+            matches!(error.kind(), IdentityErrorKind::InvalidDoc(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(matches!(
+            response.into_owned().unwrap_err().kind(),
+            IdentityErrorKind::InvalidDoc(_)
+        ));
     }
 }

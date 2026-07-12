@@ -167,7 +167,7 @@ impl OutboundPolicy {
                     remaining,
                 )
                 .await?;
-            if !response.status().is_redirection() {
+            if !is_followed_redirect(response.status()) {
                 return Ok((response, deadline));
             }
             if hop == MAX_REDIRECT_HOPS {
@@ -311,8 +311,12 @@ pub fn is_global(ip: IpAddr) -> bool {
     }
 }
 
+fn is_followed_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
 fn is_global_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, _, _] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     !(a == 0
         || a == 10
         || a == 127
@@ -320,8 +324,8 @@ fn is_global_v4(ip: Ipv4Addr) -> bool {
         || (a == 169 && b == 254)
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
-        || (a == 192 && b == 0)
-        || (a == 192 && b == 88)
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
         || (a == 198 && (18..=19).contains(&b))
         || a >= 224
         || ip.is_broadcast()
@@ -356,6 +360,7 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -436,6 +441,24 @@ mod tests {
         }
         assert!(is_global("93.184.216.34".parse().unwrap()));
         assert!(is_global("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn globally_routable_neighbors_of_special_ipv4_ranges_remain_allowed() {
+        assert!(is_global("192.0.1.1".parse().unwrap()));
+        assert!(is_global("192.88.1.1".parse().unwrap()));
+        assert!(!is_global("192.0.0.1".parse().unwrap()));
+        assert!(!is_global("192.88.99.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_true_redirect_statuses_are_followed() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(is_followed_redirect(StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [300, 304, 305, 306] {
+            assert!(!is_followed_redirect(StatusCode::from_u16(status).unwrap()));
+        }
     }
 
     #[test]
