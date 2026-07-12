@@ -172,10 +172,10 @@ pub async fn oauth_callback(
             .arg(format!("oauth_client:{}", &callback.state))
             .query_async(&mut conn)
             .await;
-        let target = match redirect_to.as_deref() {
-            Some(r) if is_allowed_redirect(r) => format!("{}?error={}", r, err),
-            _ => format!("https://catbird.blue/oauth/callback#error={}", err),
-        };
+        let target = redirect_to
+            .as_deref()
+            .and_then(|r| redirect_with_query(r, "error", err))
+            .unwrap_or_else(|| format!("https://catbird.blue/oauth/callback#error={}", err));
         return Ok((
             jar,
             Response::builder()
@@ -286,8 +286,8 @@ pub async fn oauth_callback(
     // Redirect back to the app
     let app_redirect = if let Some(ref r) = redirect_to {
         // catmos-web: redirect_to was stored in Redis during login
-        if is_allowed_redirect(r) {
-            format!("{}?session_id={}", r, session_id)
+        if let Some(target) = redirect_with_query(r, "session_id", &session_id) {
+            target
         } else {
             tracing::warn!("Rejected redirect_to from Redis: {}", r);
             format!(
@@ -358,33 +358,58 @@ const ALLOWED_REDIRECT_ORIGINS: &[&str] =
 /// Redirect-target allowlist shared by the success and deny/cancel paths:
 /// local dev loopback, known production origins, and catmos.pages.dev previews.
 fn is_allowed_redirect(r: &str) -> bool {
-    r.starts_with("http://127.0.0.1:")
-        || r.starts_with("http://[::1]:")
-        || ALLOWED_REDIRECT_ORIGINS
-            .iter()
-            .any(|origin| r.starts_with(origin))
-        || url::Url::parse(r)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.ends_with(".catmos.pages.dev")))
-            .unwrap_or(false)
+    let Ok(url) = url::Url::parse(r) else {
+        return false;
+    };
+
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    match url.scheme() {
+        "https" => {
+            url.port_or_known_default() == Some(443)
+                && (ALLOWED_REDIRECT_ORIGINS.iter().any(|origin| {
+                    url::Url::parse(origin)
+                        .ok()
+                        .and_then(|allowed| allowed.host_str().map(|allowed| allowed == host))
+                        .unwrap_or(false)
+                }) || host.ends_with(".catmos.pages.dev"))
+        }
+        "http" => {
+            let Some(port) = url.port() else {
+                return false;
+            };
+            let authority = r
+                .strip_prefix("http://")
+                .and_then(|rest| rest.split(['/', '?', '#']).next());
+            authority == Some(format!("127.0.0.1:{port}").as_str())
+                || authority == Some(format!("[::1]:{port}").as_str())
+        }
+        _ => false,
+    }
+}
+
+fn redirect_with_query(target: &str, key: &str, value: &str) -> Option<String> {
+    if !is_allowed_redirect(target) {
+        return None;
+    }
+
+    let mut url = url::Url::parse(target).ok()?;
+    url.query_pairs_mut().append_pair(key, value);
+    Some(url.into())
 }
 
 fn build_app_redirect(state_str: &str, session_id: &str) -> String {
     if state_str.starts_with('{') {
         if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
             if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
-                // Allow localhost redirects (dev)
-                if redirect_to.starts_with("http://127.0.0.1:")
-                    || redirect_to.starts_with("http://[::1]:")
-                {
-                    return format!("{}?session_id={}", redirect_to, session_id);
-                }
-                // Allow known production origins
-                if ALLOWED_REDIRECT_ORIGINS
-                    .iter()
-                    .any(|origin| redirect_to.starts_with(origin))
-                {
-                    return format!("{}?session_id={}", redirect_to, session_id);
+                if let Some(target) = redirect_with_query(redirect_to, "session_id", session_id) {
+                    return target;
                 }
                 tracing::warn!("Rejected redirect_to: {}", redirect_to);
             }
@@ -827,4 +852,82 @@ async fn mirror_push_mutation_if_needed(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::{build_app_redirect, is_allowed_redirect, redirect_with_query};
+
+    #[test]
+    fn redirect_allowlist_accepts_supported_catmos_targets() {
+        let accepted = [
+            "https://catmos.catbird.blue/callback",
+            "https://catmos.pages.dev/auth/callback?client=web",
+            "https://pr-42.catmos.pages.dev/callback",
+            "http://127.0.0.1:1420/callback",
+            "http://[::1]:49152/auth/callback",
+        ];
+
+        for target in accepted {
+            assert!(is_allowed_redirect(target), "expected to allow {target}");
+        }
+    }
+
+    #[test]
+    fn redirect_allowlist_rejects_untrusted_authorities_and_schemes() {
+        let rejected = [
+            "https://catmos.catbird.blue.evil.example/callback",
+            "https://catmos.pages.dev@evil.example/callback",
+            "https://user@catmos.catbird.blue/callback",
+            "http://127.0.0.1:1420@evil.example/callback",
+            "http://pr-42.catmos.pages.dev/callback",
+            "https://pr-42.catmos.pages.dev:8443/callback",
+            "http://localhost:1420/callback",
+            "http://192.168.1.10:1420/callback",
+            "http://127.1:1420/callback",
+            "http://2130706433:1420/callback",
+            "https://evilcatmos.pages.dev/callback",
+            "https://catmos.catbird.blue/callback#fragment",
+        ];
+
+        for target in rejected {
+            assert!(!is_allowed_redirect(target), "expected to reject {target}");
+        }
+    }
+
+    #[test]
+    fn callback_parameters_are_encoded_and_preserve_existing_query() {
+        assert_eq!(
+            redirect_with_query(
+                "https://catmos.catbird.blue/auth/callback?client=web",
+                "error",
+                "access denied&retry=false",
+            ),
+            Some(
+                "https://catmos.catbird.blue/auth/callback?client=web&error=access+denied%26retry%3Dfalse"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_redirect_uses_the_same_validation_policy() {
+        let allowed_state = serde_json::json!({
+            "redirect_to": "https://preview.catmos.pages.dev/auth/callback"
+        })
+        .to_string();
+        assert_eq!(
+            build_app_redirect(&allowed_state, "session value"),
+            "https://preview.catmos.pages.dev/auth/callback?session_id=session+value"
+        );
+
+        let rejected_state = serde_json::json!({
+            "redirect_to": "https://catmos.pages.dev@evil.example/callback"
+        })
+        .to_string();
+        assert_eq!(
+            build_app_redirect(&rejected_state, "secret"),
+            "https://catbird.blue/oauth/callback#session_id=secret"
+        );
+    }
 }
