@@ -175,24 +175,6 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn sanitized_redis_endpoint(redis_url: &str) -> String {
-    let Ok(url) = url::Url::parse(redis_url) else {
-        return "<invalid Redis URL>".to_string();
-    };
-    let Some(host) = url.host_str() else {
-        return "<invalid Redis URL>".to_string();
-    };
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
-}
-
 async fn run_legacy_convert(
     redis_url: &str,
     prefix: &str,
@@ -207,7 +189,10 @@ async fn run_legacy_convert(
     if chrono::Utc::now() >= deadline.with_timezone(&chrono::Utc) {
         anyhow::bail!("legacy conversion deadline has passed");
     }
-    eprintln!("Connecting to {} …", sanitized_redis_endpoint(redis_url));
+    eprintln!(
+        "Connecting to {} …",
+        catbird::config::sanitized_redis_endpoint(redis_url)
+    );
     let mut conn = connect(redis_url).await?;
     let store = catbird::services::RedisAuthStore::from_environment(
         conn.clone(),
@@ -252,7 +237,10 @@ async fn run_export(
     batch_size: usize,
     dry_run: bool,
 ) -> Result<(), anyhow::Error> {
-    eprintln!("Connecting to {} …", sanitized_redis_endpoint(redis_url));
+    eprintln!(
+        "Connecting to {} …",
+        catbird::config::sanitized_redis_endpoint(redis_url)
+    );
     let mut conn = connect(redis_url).await?;
 
     eprintln!("Scanning for keys with prefix \"{prefix}\" …");
@@ -339,7 +327,10 @@ async fn run_import(
         return Ok(());
     }
 
-    eprintln!("Connecting to {} …", sanitized_redis_endpoint(redis_url));
+    eprintln!(
+        "Connecting to {} …",
+        catbird::config::sanitized_redis_endpoint(redis_url)
+    );
     let mut conn = connect(redis_url).await?;
 
     let total = export.keys.len();
@@ -393,8 +384,8 @@ async fn run_verify(
 ) -> Result<(), anyhow::Error> {
     eprintln!(
         "Connecting to source ({}) and target ({}) …",
-        sanitized_redis_endpoint(source_url),
-        sanitized_redis_endpoint(target_url)
+        catbird::config::sanitized_redis_endpoint(source_url),
+        catbird::config::sanitized_redis_endpoint(target_url)
     );
     let mut src = connect(source_url).await?;
     let mut tgt = connect(target_url).await?;
@@ -523,14 +514,17 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn redis_url_display_omits_credentials_and_paths() {
         assert_eq!(
-            sanitized_redis_endpoint("rediss://user:password@redis.example:6380/4?token=secret"),
+            catbird::config::sanitized_redis_endpoint(
+                "rediss://user:password@redis.example:6380/4?token=secret"
+            ),
             "rediss://redis.example:6380"
         );
-        assert_eq!(sanitized_redis_endpoint("not a url"), "<invalid Redis URL>");
+        assert_eq!(
+            catbird::config::sanitized_redis_endpoint("not a url"),
+            "<invalid Redis URL>"
+        );
     }
 }

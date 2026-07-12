@@ -60,6 +60,9 @@ impl Keyring {
         {
             return Err(CryptoError::DuplicateKeyId);
         }
+        if identifier_key == active.key || previous.iter().any(|key| identifier_key == key.key) {
+            return Err(CryptoError::IdentifierKeyReuse);
+        }
         Ok(Self {
             active,
             previous,
@@ -104,6 +107,14 @@ impl Keyring {
         context: &RecordContext<'_>,
         envelope: &str,
     ) -> Result<Vec<u8>, CryptoError> {
+        Ok(self.open_with_status(context, envelope)?.plaintext)
+    }
+
+    pub fn open_with_status(
+        &self,
+        context: &RecordContext<'_>,
+        envelope: &str,
+    ) -> Result<OpenedRecord, CryptoError> {
         let mut parts = envelope.splitn(3, ':');
         if parts.next() != Some(ENVELOPE_VERSION) {
             return Err(CryptoError::UnknownVersion);
@@ -131,7 +142,7 @@ impl Keyring {
         let nonce_bytes: [u8; NONCE_LEN] =
             nonce_bytes.try_into().map_err(|_| CryptoError::TooShort)?;
         let nonce = Nonce::from(nonce_bytes);
-        cipher
+        let plaintext = cipher
             .decrypt(
                 &nonce,
                 Payload {
@@ -139,7 +150,12 @@ impl Keyring {
                     aad: &aad,
                 },
             )
-            .map_err(|_| CryptoError::AuthenticationFailed)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        Ok(OpenedRecord {
+            plaintext,
+            key_id: kid.to_string(),
+            needs_rewrap: kid != self.active.kid,
+        })
     }
 
     pub fn opaque_id(&self, domain: &str, logical_id: &str) -> String {
@@ -165,6 +181,13 @@ impl Keyring {
             .decrypt(&nonce, ciphertext)
             .map_err(|_| CryptoError::AuthenticationFailed)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OpenedRecord {
+    pub plaintext: Vec<u8>,
+    pub key_id: String,
+    pub needs_rewrap: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -221,6 +244,8 @@ pub enum CryptoError {
     InvalidKeyId,
     #[error("duplicate key identifier")]
     DuplicateKeyId,
+    #[error("identifier HMAC key must be distinct from encryption keys")]
+    IdentifierKeyReuse,
     #[error("too many previous keys")]
     TooManyPreviousKeys,
     #[error("invalid key length")]
@@ -243,12 +268,14 @@ pub enum CryptoError {
     InvalidUtf8,
 }
 
-pub fn open_utf8(
+pub fn open_utf8_with_status(
     keyring: &Keyring,
     context: &RecordContext<'_>,
     envelope: &str,
-) -> Result<String, CryptoError> {
-    String::from_utf8(keyring.open(context, envelope)?).map_err(|_| CryptoError::InvalidUtf8)
+) -> Result<(String, bool), CryptoError> {
+    let opened = keyring.open_with_status(context, envelope)?;
+    let plaintext = String::from_utf8(opened.plaintext).map_err(|_| CryptoError::InvalidUtf8)?;
+    Ok((plaintext, opened.needs_rewrap))
 }
 
 #[cfg(test)]
@@ -370,5 +397,50 @@ mod tests {
             opaque,
             keyring.opaque_id("auth-request", "live-session-secret")
         );
+    }
+
+    #[test]
+    fn identifier_key_must_be_distinct_from_all_encryption_keys() {
+        let active = KeyMaterial::new("active", [1; 32]).unwrap();
+        assert!(matches!(
+            Keyring::new(active.clone(), vec![], [1; 32]),
+            Err(CryptoError::IdentifierKeyReuse)
+        ));
+        assert!(matches!(
+            Keyring::new(
+                active,
+                vec![KeyMaterial::new("previous", [2; 32]).unwrap()],
+                [2; 32]
+            ),
+            Err(CryptoError::IdentifierKeyReuse)
+        ));
+    }
+
+    #[test]
+    fn previous_key_open_reports_rewrap_and_removed_key_rejects_after_rewrap() {
+        let context = RecordContext::new("session", "opaque-key");
+        let previous = KeyMaterial::new("old", [3; 32]).unwrap();
+        let old = Keyring::new(previous.clone(), vec![], [9; 32]).unwrap();
+        let envelope = old.seal(&context, b"record").unwrap();
+        let rotated = Keyring::new(
+            KeyMaterial::new("new", [4; 32]).unwrap(),
+            vec![previous],
+            [9; 32],
+        )
+        .unwrap();
+
+        let opened = rotated.open_with_status(&context, &envelope).unwrap();
+        assert!(opened.needs_rewrap);
+        assert_eq!(opened.key_id, "old");
+        let rewrapped = rotated.seal(&context, &opened.plaintext).unwrap();
+        assert!(rewrapped.starts_with("v1:new:"));
+
+        let after_removal =
+            Keyring::new(KeyMaterial::new("new", [4; 32]).unwrap(), vec![], [9; 32]).unwrap();
+        assert!(matches!(
+            after_removal.open(&context, &envelope),
+            Err(CryptoError::UnknownKeyId)
+        ));
+        assert_eq!(after_removal.open(&context, &rewrapped).unwrap(), b"record");
     }
 }

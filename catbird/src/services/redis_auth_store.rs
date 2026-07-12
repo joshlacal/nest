@@ -10,7 +10,7 @@ use jacquard_oauth::session::{AuthRequestData, ClientSessionData, DpopClientData
 use jacquard_oauth::types::{OAuthTokenType, TokenSet};
 use redis::{AsyncCommands, Expiry};
 
-use super::redis_crypto::{open_utf8, Keyring, RecordContext};
+use super::redis_crypto::{open_utf8_with_status, Keyring, RecordContext};
 
 const STATE_TTL_SECONDS: u64 = 600; // 10 minutes for OAuth state
 const SESSION_INDEX_TTL_SECONDS: u64 = 86400 * 30; // 30 days
@@ -21,6 +21,125 @@ fn redis_err(e: redis::RedisError) -> SessionStoreError {
 
 fn other_err(msg: &str) -> SessionStoreError {
     SessionStoreError::Other(msg.into())
+}
+
+fn validated_https_url(value: &str) -> Result<url::Url, SessionStoreError> {
+    let parsed = url::Url::parse(value).map_err(|_| other_err("legacy endpoint is invalid"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(other_err("legacy endpoint is not an approved HTTPS URL"));
+    }
+    Ok(parsed)
+}
+
+fn same_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn validate_legacy_records(
+    catbird: &serde_json::Value,
+    dpop_pair: &serde_json::Value,
+    oauth: &serde_json::Value,
+) -> Result<(), SessionStoreError> {
+    use base64::Engine;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let did = catbird["did"]
+        .as_str()
+        .ok_or_else(|| other_err("legacy session missing DID"))?;
+    let pds = validated_https_url(
+        catbird["pds_url"]
+            .as_str()
+            .ok_or_else(|| other_err("legacy session missing PDS URL"))?,
+    )?;
+    let tokens = oauth["token_set"]
+        .as_object()
+        .ok_or_else(|| other_err("legacy OAuth record missing token set"))?;
+    if tokens.get("sub").and_then(|value| value.as_str()) != Some(did) {
+        return Err(other_err("legacy OAuth subject does not match account DID"));
+    }
+    let issuer = validated_https_url(
+        tokens
+            .get("iss")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| other_err("legacy OAuth record missing issuer"))?,
+    )?;
+    let audience = validated_https_url(
+        tokens
+            .get("aud")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| other_err("legacy OAuth record missing audience"))?,
+    )?;
+    if !same_origin(&pds, &audience) {
+        return Err(other_err("legacy OAuth endpoints are inconsistent"));
+    }
+    let _ = issuer;
+    for field in ["access_token", "refresh_token"] {
+        if let Some(catbird_value) = catbird.get(field).and_then(|value| value.as_str()) {
+            if tokens.get(field).and_then(|value| value.as_str()) != Some(catbird_value) {
+                return Err(other_err(
+                    "legacy OAuth token does not match Catbird session",
+                ));
+            }
+        } else if field == "access_token" {
+            return Err(other_err("legacy Catbird session missing access token"));
+        }
+    }
+
+    let public = dpop_pair["public_jwk"]
+        .as_object()
+        .ok_or_else(|| other_err("legacy DPoP public key is invalid"))?;
+    let private = dpop_pair["private_key_bytes"]
+        .as_str()
+        .ok_or_else(|| other_err("legacy DPoP private key is missing"))?;
+    let mut full_jwk = serde_json::Value::Object(public.clone());
+    full_jwk
+        .as_object_mut()
+        .expect("object created above")
+        .insert(
+            "d".to_string(),
+            serde_json::Value::String(private.to_string()),
+        );
+    if oauth.get("dpop_key") != Some(&full_jwk) {
+        return Err(other_err("legacy DPoP records do not match"));
+    }
+
+    let scalar = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(private)
+        .map_err(|_| other_err("legacy DPoP private key encoding is invalid"))?;
+    let secret = p256::SecretKey::from_slice(&scalar)
+        .map_err(|_| other_err("legacy DPoP private key is invalid"))?;
+    let encoded = secret.public_key().to_encoded_point(false);
+    let expected_x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            public
+                .get("x")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| other_err("legacy DPoP x coordinate is missing"))?,
+        )
+        .map_err(|_| other_err("legacy DPoP x coordinate is invalid"))?;
+    let expected_y = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            public
+                .get("y")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| other_err("legacy DPoP y coordinate is missing"))?,
+        )
+        .map_err(|_| other_err("legacy DPoP y coordinate is invalid"))?;
+    if encoded.x().map(|value| &value[..]) != Some(expected_x.as_slice())
+        || encoded.y().map(|value| &value[..]) != Some(expected_y.as_slice())
+    {
+        return Err(other_err(
+            "legacy DPoP private key does not match public key",
+        ));
+    }
+    Ok(())
 }
 
 /// Redis-backed auth store for Jacquard OAuth.
@@ -150,22 +269,37 @@ impl RedisAuthStore {
         let encrypted: Option<String> = conn
             .get_ex(&key, Expiry::EX(SESSION_INDEX_TTL_SECONDS as usize))
             .await?;
-        encrypted
-            .map(|value| {
-                open_utf8(
-                    &self.keyring,
-                    &RecordContext::new("session_index", &key),
-                    &value,
-                )
+        let Some(value) = encrypted else {
+            return Ok(None);
+        };
+        let context = RecordContext::new("session_index", &key);
+        let (did, needs_rewrap) =
+            open_utf8_with_status(&self.keyring, &context, &value).map_err(|error| {
+                redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "invalid encrypted session index",
+                    error.to_string(),
+                ))
+            })?;
+        if needs_rewrap {
+            let rewrapped = self
+                .keyring
+                .seal(&context, did.as_bytes())
                 .map_err(|error| {
                     redis::RedisError::from((
                         redis::ErrorKind::TypeError,
-                        "invalid encrypted session index",
+                        "failed to rewrap session index",
                         error.to_string(),
                     ))
-                })
-            })
-            .transpose()
+                })?;
+            conn.set_ex::<_, _, ()>(&key, rewrapped, SESSION_INDEX_TTL_SECONDS)
+                .await?;
+            tracing::info!(
+                record_kind = "session_index",
+                "Rewrapped Redis record with active key"
+            );
+        }
+        Ok(Some(did))
     }
 
     /// Write the session_id→DID index entry.
@@ -200,7 +334,6 @@ impl RedisAuthStore {
         let mut conn = self.redis.clone();
         let catbird_key = format!("{}catbird_session:{}", self.key_prefix, session_id);
         let dpop_key = format!("{}dpop_key:{}", self.key_prefix, session_id);
-        let oauth_key = format!("{}oauth_session:{}", self.key_prefix, session_id);
         let Some(catbird_json): Option<String> = conn.get(&catbird_key).await.map_err(redis_err)?
         else {
             return Ok(false);
@@ -216,43 +349,47 @@ impl RedisAuthStore {
         let pds_url = catbird["pds_url"]
             .as_str()
             .ok_or_else(|| other_err("legacy session missing PDS URL"))?;
-        let access_token = catbird["access_token"]
-            .as_str()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| other_err("legacy session missing access token"))?;
         let did = Did::new_owned(did_str)
             .map_err(|error| other_err(&format!("invalid legacy DID: {error}")))?;
 
+        // The actual atrium RedisSessionStore keyed OAuth sessions by DID,
+        // not by the Catbird session identifier.
+        let oauth_key = format!("{}oauth_session:{}", self.key_prefix, did_str);
+        let Some(oauth_json): Option<String> = conn.get(&oauth_key).await.map_err(redis_err)?
+        else {
+            return Err(other_err("legacy session missing OAuth record"));
+        };
+        let oauth: serde_json::Value =
+            serde_json::from_str(&oauth_json).map_err(SessionStoreError::Serde)?;
+
         let pair: serde_json::Value =
             serde_json::from_str(&dpop_json).map_err(SessionStoreError::Serde)?;
-        let mut full_jwk = pair["public_jwk"].clone();
-        let private = pair["private_key_bytes"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| other_err("legacy DPoP record missing private key"))?;
-        full_jwk
-            .as_object_mut()
-            .ok_or_else(|| other_err("legacy DPoP public key is invalid"))?
-            .insert(
-                "d".to_string(),
-                serde_json::Value::String(private.to_string()),
-            );
+        validate_legacy_records(&catbird, &pair, &oauth)?;
+        let full_jwk = oauth["dpop_key"].clone();
         let dpop_jwk: jose_jwk::Key =
             serde_json::from_value(full_jwk).map_err(SessionStoreError::Serde)?;
-        let refresh_token = catbird["refresh_token"]
+        let token_set = &oauth["token_set"];
+        let issuer = token_set["iss"]
+            .as_str()
+            .ok_or_else(|| other_err("legacy OAuth issuer missing"))?;
+        let audience = token_set["aud"]
+            .as_str()
+            .ok_or_else(|| other_err("legacy OAuth audience missing"))?;
+        let access_token = token_set["access_token"]
+            .as_str()
+            .ok_or_else(|| other_err("legacy OAuth access token missing"))?;
+        let refresh_token = token_set["refresh_token"]
             .as_str()
             .filter(|token| !token.is_empty())
             .map(|token| token.to_string().into());
-        let expires_at = catbird["access_token_expires_at"]
-            .as_str()
-            .and_then(|value| {
-                jacquard_common::types::string::Datetime::try_from(value.to_string()).ok()
-            });
+        let expires_at = token_set["expires_at"].as_str().and_then(|value| {
+            jacquard_common::types::string::Datetime::try_from(value.to_string()).ok()
+        });
         let session = ClientSessionData {
             account_did: did.clone(),
             session_id: session_id.to_string().into(),
             host_url: pds_url.to_string().into(),
-            authserver_url: pds_url.to_string().into(),
+            authserver_url: issuer.to_string().into(),
             authserver_token_endpoint: "".into(),
             authserver_revocation_endpoint: None,
             scopes: vec![jacquard_oauth::scopes::Scope::Atproto],
@@ -262,10 +399,12 @@ impl RedisAuthStore {
                 dpop_host_nonce: "".into(),
             },
             token_set: TokenSet {
-                iss: pds_url.to_string().into(),
+                iss: issuer.to_string().into(),
                 sub: did.clone(),
-                aud: pds_url.to_string().into(),
-                scope: Some("atproto".into()),
+                aud: audience.to_string().into(),
+                scope: token_set["scope"]
+                    .as_str()
+                    .map(|value| value.to_string().into()),
                 refresh_token,
                 access_token: access_token.to_string().into(),
                 token_type: OAuthTokenType::DPoP,
@@ -355,12 +494,26 @@ impl ClientAuthStore for RedisAuthStore {
 
         match data {
             Some(encrypted) => {
-                let json = open_utf8(
-                    &self.keyring,
-                    &RecordContext::new("session", &key),
-                    &encrypted,
-                )
-                .map_err(|error| other_err(&format!("invalid encrypted session: {error}")))?;
+                let context = RecordContext::new("session", &key);
+                let (json, needs_rewrap) =
+                    open_utf8_with_status(&self.keyring, &context, &encrypted).map_err(
+                        |error| other_err(&format!("invalid encrypted session: {error}")),
+                    )?;
+                if needs_rewrap {
+                    let rewrapped =
+                        self.keyring
+                            .seal(&context, json.as_bytes())
+                            .map_err(|error| {
+                                other_err(&format!("failed to rewrap session: {error}"))
+                            })?;
+                    conn.set_ex::<_, _, ()>(&key, rewrapped, self.session_ttl)
+                        .await
+                        .map_err(redis_err)?;
+                    tracing::info!(
+                        record_kind = "session",
+                        "Rewrapped Redis record with active key"
+                    );
+                }
                 let session: ClientSessionData<'_> =
                     serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
                 Ok(Some(session.into_static()))
@@ -419,12 +572,37 @@ impl ClientAuthStore for RedisAuthStore {
 
         match data {
             Some(encrypted) => {
-                let json = open_utf8(
-                    &self.keyring,
-                    &RecordContext::new("auth_req", &key),
-                    &encrypted,
-                )
-                .map_err(|error| other_err(&format!("invalid encrypted auth request: {error}")))?;
+                let context = RecordContext::new("auth_req", &key);
+                let (json, needs_rewrap) =
+                    open_utf8_with_status(&self.keyring, &context, &encrypted).map_err(
+                        |error| other_err(&format!("invalid encrypted auth request: {error}")),
+                    )?;
+                if needs_rewrap {
+                    let ttl: i64 = redis::cmd("TTL")
+                        .arg(&key)
+                        .query_async(&mut conn)
+                        .await
+                        .map_err(redis_err)?;
+                    let rewrapped =
+                        self.keyring
+                            .seal(&context, json.as_bytes())
+                            .map_err(|error| {
+                                other_err(&format!("failed to rewrap auth request: {error}"))
+                            })?;
+                    if ttl > 0 {
+                        conn.set_ex::<_, _, ()>(&key, rewrapped, ttl as u64)
+                            .await
+                            .map_err(redis_err)?;
+                    } else {
+                        conn.set::<_, _, ()>(&key, rewrapped)
+                            .await
+                            .map_err(redis_err)?;
+                    }
+                    tracing::info!(
+                        record_kind = "auth_req",
+                        "Rewrapped Redis record with active key"
+                    );
+                }
                 let info: AuthRequestData<'_> =
                     serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
                 Ok(Some(info.into_static()))
@@ -457,5 +635,55 @@ impl ClientAuthStore for RedisAuthStore {
         let mut conn = self.redis.clone();
         conn.del::<_, ()>(&key).await.map_err(redis_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_fixtures() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+        let catbird = serde_json::json!({
+            "did": "did:plc:alice",
+            "pds_url": "https://pds.example",
+            "access_token": "access",
+            "refresh_token": "refresh"
+        });
+        let pair = serde_json::json!({
+            "public_jwk": {"kty":"EC", "crv":"P-256", "x":"x", "y":"y"},
+            "private_key_bytes": "d"
+        });
+        let oauth = serde_json::json!({
+            "dpop_key": {"kty":"EC", "crv":"P-256", "x":"x", "y":"y", "d":"d"},
+            "token_set": {
+                "iss": "https://auth.example",
+                "sub": "did:plc:alice",
+                "aud": "https://pds.example",
+                "access_token": "access",
+                "refresh_token": "refresh"
+            }
+        });
+        (catbird, pair, oauth)
+    }
+
+    #[test]
+    fn legacy_validation_rejects_identity_endpoint_token_and_dpop_mismatches() {
+        let (catbird, pair, oauth) = legacy_fixtures();
+
+        let mut wrong_identity = oauth.clone();
+        wrong_identity["token_set"]["sub"] = serde_json::json!("did:plc:mallory");
+        assert!(validate_legacy_records(&catbird, &pair, &wrong_identity).is_err());
+
+        let mut attacker_endpoint = catbird.clone();
+        attacker_endpoint["pds_url"] = serde_json::json!("http://127.0.0.1:6379");
+        assert!(validate_legacy_records(&attacker_endpoint, &pair, &oauth).is_err());
+
+        let mut wrong_token = oauth.clone();
+        wrong_token["token_set"]["access_token"] = serde_json::json!("different");
+        assert!(validate_legacy_records(&catbird, &pair, &wrong_token).is_err());
+
+        let mut wrong_dpop = oauth;
+        wrong_dpop["dpop_key"]["x"] = serde_json::json!("different");
+        assert!(validate_legacy_records(&catbird, &pair, &wrong_dpop).is_err());
     }
 }

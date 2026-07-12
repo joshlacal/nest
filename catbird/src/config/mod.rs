@@ -7,6 +7,24 @@ use serde::Deserialize;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::sync::Arc;
 
+pub fn sanitized_redis_endpoint(redis_url: &str) -> String {
+    let Ok(url) = url::Url::parse(redis_url) else {
+        return "<invalid Redis URL>".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return "<invalid Redis URL>".to_string();
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
