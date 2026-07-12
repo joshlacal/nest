@@ -743,6 +743,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_redis_session_and_index_rewrap_cas_never_overwrites_a_refresh() {
+        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
+            return;
+        };
+        let client = redis::Client::open(redis_url).expect("TEST_REDIS_URL must be valid");
+        let mut conn = client
+            .get_connection_manager()
+            .await
+            .expect("TEST_REDIS_URL must be reachable");
+
+        for record_kind in ["session", "session_index"] {
+            let key = format!("test:rewrap-cas:{record_kind}:{}", uuid::Uuid::new_v4());
+            let stale_previous_key_value = format!("v1:previous:{record_kind}");
+            let refreshed_active_key_value = format!("v1:active:refreshed-{record_kind}");
+            let stale_rewrap_value = format!("v1:active:stale-rewrap-{record_kind}");
+
+            let _: () = redis::cmd("SET")
+                .arg(&key)
+                .arg(&stale_previous_key_value)
+                .arg("PX")
+                .arg(60_000)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            let stale_read: String = conn.get(&key).await.unwrap();
+
+            // Simulate a token refresh winning after the previous-key read but
+            // before lazy rewrap attempts to write its stale plaintext.
+            let _: () = redis::cmd("SET")
+                .arg(&key)
+                .arg(&refreshed_active_key_value)
+                .arg("PX")
+                .arg(45_000)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            let ttl_before: i64 = conn.pttl(&key).await.unwrap();
+
+            let result: i64 = expiry_preserving_cas_script()
+                .key(&key)
+                .arg(&stale_read)
+                .arg(&stale_rewrap_value)
+                .invoke_async(&mut conn)
+                .await
+                .unwrap();
+            let stored: String = conn.get(&key).await.unwrap();
+            let ttl_after: i64 = conn.pttl(&key).await.unwrap();
+
+            assert_eq!(result, 0, "{record_kind} stale CAS must lose");
+            assert_eq!(stored, refreshed_active_key_value);
+            assert!(ttl_before > 0);
+            assert!(ttl_after > 0);
+            assert!(
+                ttl_after <= ttl_before,
+                "CAS must not extend the refresh TTL"
+            );
+
+            conn.del::<_, ()>(&key).await.unwrap();
+        }
+    }
+
     #[test]
     fn legacy_validation_accepts_a_real_matching_p256_fixture() {
         use base64::Engine;
