@@ -103,6 +103,7 @@ impl AtProtoClient {
         request_id: &str,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
     ) -> AppResult<ProxyResponse> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         // SSRF protection: validate the PDS URL before making any requests
         validate_pds_url(&session.pds_url)?;
 
@@ -135,6 +136,7 @@ impl AtProtoClient {
                 request_id,
                 1,
                 jacquard_dpop,
+                deadline,
             )
             .await?;
 
@@ -167,6 +169,7 @@ impl AtProtoClient {
                                     request_id,
                                     2,
                                     jacquard_dpop,
+                                    deadline,
                                 )
                                 .await;
                         }
@@ -204,6 +207,7 @@ impl AtProtoClient {
         request_id: &str,
         attempt: u8,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        deadline: tokio::time::Instant,
     ) -> AppResult<ProxyResponse> {
         let has_nonce = nonce.is_some();
         let mut headers = self
@@ -231,7 +235,7 @@ impl AtProtoClient {
         let response = match self
             .state
             .outbound_policy
-            .send(method, url, headers, body)
+            .send_before(method, url, headers, body, deadline)
             .await
         {
             Ok(r) => r,
@@ -306,9 +310,15 @@ impl AtProtoClient {
             })
         } else {
             // Buffer small JSON responses
-            let body = self
-                .read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id)
-                .await?;
+            let body = tokio::time::timeout_at(
+                deadline,
+                self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id),
+            )
+            .await
+            .map_err(|_| AppError::Upstream {
+                status: 504,
+                message: "outbound request deadline exceeded reading body".to_string(),
+            })??;
             let elapsed_ms = start.elapsed().as_millis();
 
             tracing::debug!(
@@ -359,6 +369,7 @@ impl AtProtoClient {
         request_id: &str,
         attempt: u8,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        deadline: tokio::time::Instant,
     ) -> AppResult<(u16, HeaderMap, bytes::Bytes)> {
         let has_nonce = nonce.is_some();
         let mut headers = self
@@ -395,7 +406,7 @@ impl AtProtoClient {
         let response = match self
             .state
             .outbound_policy
-            .send(method, url, headers, body)
+            .send_before(method, url, headers, body, deadline)
             .await
         {
             Ok(r) => r,
@@ -439,9 +450,15 @@ impl AtProtoClient {
         }
 
         // Read response with size limit protection
-        let body = self
-            .read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id)
-            .await?;
+        let body = tokio::time::timeout_at(
+            deadline,
+            self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id),
+        )
+        .await
+        .map_err(|_| AppError::Upstream {
+            status: 504,
+            message: "outbound request deadline exceeded reading body".to_string(),
+        })??;
         let elapsed_ms = start.elapsed().as_millis();
 
         tracing::debug!(

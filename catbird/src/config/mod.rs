@@ -481,7 +481,7 @@ impl AppState {
     /// stale identity data to persist indefinitely when users retried login.
     fn build_resolver() -> outbound_policy::PolicyOAuthResolver {
         let resolver = jacquard_identity::JacquardResolver::new(
-            reqwest::Client::new(),
+            outbound_policy::OutboundPolicy,
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         outbound_policy::PolicyOAuthResolver::new(resolver.with_system_dns())

@@ -92,33 +92,83 @@ pub struct OutboundPolicy;
 
 impl OutboundPolicy {
     pub async fn validate(&self, input: &str) -> Result<ValidatedUrl, PolicyError> {
+        self.validate_before(input, tokio::time::Instant::now() + REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn validate_before(
+        &self,
+        input: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ValidatedUrl, PolicyError> {
         let parsed = ValidatedUrl::parse(input)?;
         let host = parsed.url.host_str().expect("validated host").to_owned();
         let port = parsed.url.port_or_known_default().expect("https port");
-        let answers = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|e| PolicyError(format!("DNS resolution failed: {e}")))?
-            .map(|address| address.ip())
-            .collect();
+        let answers =
+            tokio::time::timeout_at(deadline, tokio::net::lookup_host((host.as_str(), port)))
+                .await
+                .map_err(|_| PolicyError("outbound request deadline exceeded during DNS".into()))?
+                .map_err(|e| PolicyError(format!("DNS resolution failed: {e}")))?
+                .map(|address| address.ip())
+                .collect();
         parsed.with_addresses(answers)
     }
 
     pub async fn send(
         &self,
+        method: Method,
+        input: &str,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+    ) -> Result<Response, PolicyError> {
+        self.send_bounded(method, input, headers, body, REQUEST_TIMEOUT)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    pub(crate) async fn send_before(
+        &self,
+        method: Method,
+        input: &str,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Response, PolicyError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| PolicyError("outbound request deadline exceeded".into()))?;
+        self.send_bounded(method, input, headers, body, remaining)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn send_bounded(
+        &self,
         mut method: Method,
         input: &str,
         headers: HeaderMap,
         mut body: Option<bytes::Bytes>,
-    ) -> Result<Response, PolicyError> {
+        budget: Duration,
+    ) -> Result<(Response, tokio::time::Instant), PolicyError> {
+        let deadline = tokio::time::Instant::now() + budget;
         let original = ValidatedUrl::parse(input)?;
         let mut current = original.url.clone();
         for hop in 0..=MAX_REDIRECT_HOPS {
-            let target = self.validate(current.as_str()).await?;
+            let target = self.validate_before(current.as_str(), deadline).await?;
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| PolicyError("outbound request deadline exceeded".into()))?;
             let response = self
-                .send_once(method.clone(), &target, headers.clone(), body.clone())
+                .send_once(
+                    method.clone(),
+                    &target,
+                    headers.clone(),
+                    body.clone(),
+                    remaining,
+                )
                 .await?;
             if !response.status().is_redirection() {
-                return Ok(response);
+                return Ok((response, deadline));
             }
             if hop == MAX_REDIRECT_HOPS {
                 return Err(PolicyError("outbound redirect limit exceeded".into()));
@@ -147,6 +197,7 @@ impl OutboundPolicy {
         target: &ValidatedUrl,
         headers: HeaderMap,
         body: Option<bytes::Bytes>,
+        remaining: Duration,
     ) -> Result<Response, PolicyError> {
         let host = target.url.host_str().expect("validated host");
         let port = target.url.port_or_known_default().expect("https port");
@@ -158,8 +209,8 @@ impl OutboundPolicy {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT.min(remaining))
+            .timeout(remaining)
             .resolve_to_addrs(host, &pinned)
             .build()
             .map_err(|e| PolicyError(format!("HTTP client setup failed: {e}")))?;
@@ -184,19 +235,20 @@ impl HttpClient for OutboundPolicy {
         let (parts, body) = request.into_parts();
         let method = Method::from_bytes(parts.method.as_str().as_bytes())
             .map_err(|e| PolicyError(format!("invalid method: {e}")))?;
-        let response = self
-            .send(
+        let (response, deadline) = self
+            .send_bounded(
                 method,
                 &parts.uri.to_string(),
                 parts.headers,
                 Some(body.into()),
+                REQUEST_TIMEOUT,
             )
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response
-            .bytes()
+        let bytes = tokio::time::timeout_at(deadline, response.bytes())
             .await
+            .map_err(|_| PolicyError("outbound request deadline exceeded reading body".into()))?
             .map_err(|e| PolicyError(format!("response read failed: {e}")))?;
         let mut builder = http::Response::builder().status(status);
         *builder.headers_mut().expect("response builder headers") = headers;
@@ -208,12 +260,12 @@ impl HttpClient for OutboundPolicy {
 
 #[derive(Clone)]
 pub struct PolicyOAuthResolver {
-    identity: jacquard_identity::JacquardResolver,
+    identity: jacquard_identity::JacquardResolver<OutboundPolicy>,
     policy: OutboundPolicy,
 }
 
 impl PolicyOAuthResolver {
-    pub fn new(identity: jacquard_identity::JacquardResolver) -> Self {
+    pub fn new(identity: jacquard_identity::JacquardResolver<OutboundPolicy>) -> Self {
         Self {
             identity,
             policy: OutboundPolicy,
@@ -268,6 +320,8 @@ fn is_global_v4(ip: Ipv4Addr) -> bool {
         || (a == 169 && b == 254)
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
+        || (a == 192 && b == 0)
+        || (a == 192 && b == 88)
         || (a == 198 && (18..=19).contains(&b))
         || a >= 224
         || ip.is_broadcast()
@@ -282,6 +336,18 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
+        || (segments[0] == 0
+            && segments[1] == 0
+            && segments[2] == 0
+            && segments[3] == 0
+            && segments[4] == 0
+            && segments[5] == 0)
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        || (segments[0] == 0x0100 && segments[1] == 0)
+        || (segments[0] == 0x2001 && segments[1] <= 0x01ff)
+        || segments[0] == 0x2002
+        || (segments[0] & 0xfff0) == 0x3ff0
+        || segments[0] == 0x5f00
         || (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
@@ -370,5 +436,65 @@ mod tests {
         }
         assert!(is_global("93.184.216.34".parse().unwrap()));
         assert!(is_global("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_all_reviewed_special_use_and_compatible_forms() {
+        for ip in [
+            "192.0.0.1",
+            "192.88.99.1",
+            "::127.0.0.1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:2::1",
+            "2001:20::1",
+            "2002:7f00:1::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            assert!(!is_global(ip.parse().unwrap()), "classified {ip} global");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_remaining_budget_opens_no_socket() {
+        let error = OutboundPolicy
+            .send_bounded(
+                Method::GET,
+                "https://example.com/",
+                HeaderMap::new(),
+                None,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cumulative_deadline_is_not_reset_for_a_retry() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let error = OutboundPolicy
+            .send_before(
+                Method::GET,
+                "https://example.com/",
+                HeaderMap::new(),
+                None,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[tokio::test]
+    async fn did_web_identity_fetch_uses_policy_and_rejects_loopback() {
+        let resolver =
+            jacquard_identity::JacquardResolver::new(OutboundPolicy, ResolverOptions::default());
+        let did = Did::new("did:web:127.0.0.1").unwrap();
+        assert!(resolver.resolve_did_doc(&did).await.is_err());
     }
 }
