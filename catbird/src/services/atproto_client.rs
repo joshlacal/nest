@@ -19,6 +19,29 @@ pub const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024;
 /// Threshold above which responses are streamed instead of buffered (1MB)
 pub const STREAM_THRESHOLD: usize = 1 * 1024 * 1024;
 
+const FORWARDED_CLIENT_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "atproto-proxy",
+    "atproto-accept-labelers",
+    "range",
+    "if-range",
+    "if-none-match",
+    "if-modified-since",
+];
+
+fn merge_allowed_client_headers(headers: &mut HeaderMap, client_headers: Option<&HeaderMap>) {
+    let Some(client_headers) = client_headers else {
+        return;
+    };
+
+    for (name, value) in client_headers {
+        if FORWARDED_CLIENT_HEADERS.contains(&name.as_str()) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+}
+
 /// Response from proxy request - either buffered bytes or a streaming body
 pub enum ProxyResponse {
     /// Buffered response for smaller payloads (can be inspected/modified)
@@ -191,35 +214,7 @@ impl AtProtoClient {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
         }
 
-        // Forward all client headers except hop-by-hop and headers we set ourselves
-        if let Some(ch) = client_headers {
-            for (name, value) in ch.iter() {
-                let name_lower = name.as_str().to_lowercase();
-                // Skip hop-by-hop headers and headers we manage
-                if matches!(
-                    name_lower.as_str(),
-                    "host"
-                        | "connection"
-                        | "keep-alive"
-                        | "transfer-encoding"
-                        | "te"
-                        | "trailer"
-                        | "upgrade"
-                        | "proxy-authorization"
-                        | "proxy-connection"
-                        | "authorization"
-                        | "dpop"
-                        | "content-length"
-                ) {
-                    continue;
-                }
-                // Don't overwrite content-type if we already set it
-                if name_lower == "content-type" && headers.contains_key(CONTENT_TYPE) {
-                    continue;
-                }
-                headers.insert(name.clone(), value.clone());
-            }
-        }
+        merge_allowed_client_headers(&mut headers, client_headers);
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
         tracing::debug!(
@@ -376,7 +371,6 @@ impl AtProtoClient {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
         }
 
-        // Forward all client headers except hop-by-hop and headers we set ourselves
         if let Some(ch) = client_headers {
             let client_proxy = ch.get("atproto-proxy").map(|v| v.to_str().unwrap_or("?"));
             tracing::info!(
@@ -385,33 +379,8 @@ impl AtProtoClient {
                 client_header_count = ch.len(),
                 "[BFF-HDR] Client headers received (buffered)"
             );
-            for (name, value) in ch.iter() {
-                let name_lower = name.as_str().to_lowercase();
-                // Skip hop-by-hop headers and headers we manage
-                if matches!(
-                    name_lower.as_str(),
-                    "host"
-                        | "connection"
-                        | "keep-alive"
-                        | "transfer-encoding"
-                        | "te"
-                        | "trailer"
-                        | "upgrade"
-                        | "proxy-authorization"
-                        | "proxy-connection"
-                        | "authorization"
-                        | "dpop"
-                        | "content-length"
-                ) {
-                    continue;
-                }
-                // Don't overwrite content-type if we already set it
-                if name_lower == "content-type" && headers.contains_key(CONTENT_TYPE) {
-                    continue;
-                }
-                headers.insert(name.clone(), value.clone());
-            }
         }
+        merge_allowed_client_headers(&mut headers, client_headers);
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
         tracing::debug!(
@@ -573,4 +542,90 @@ impl AtProtoClient {
 
     // Token refresh is now handled by Jacquard's SessionRegistry.
     // AtProtoClient is for proxying requests only.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_headers_forward_only_the_explicit_allowlist() {
+        let mut outbound = HeaderMap::new();
+        outbound.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("DPoP upstream-token"),
+        );
+        outbound.insert("dpop", HeaderValue::from_static("upstream-proof"));
+        outbound.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let mut client = HeaderMap::new();
+        for (name, value) in [
+            ("accept", "application/json"),
+            ("accept-language", "en-US"),
+            ("atproto-proxy", "did:web:example.com#atproto_labeler"),
+            ("atproto-accept-labelers", "did:plc:labeler;redact"),
+            ("range", "bytes=0-99"),
+            ("if-range", "etag-a"),
+            ("if-none-match", "etag-b"),
+            ("if-modified-since", "Sat, 12 Jul 2026 00:00:00 GMT"),
+            ("cookie", "sid=browser-secret"),
+            ("cookie2", "sid=legacy-secret"),
+            ("authorization", "Bearer browser-secret"),
+            ("dpop", "browser-proof"),
+            ("host", "attacker.example"),
+            ("content-length", "999"),
+            ("connection", "keep-alive"),
+            ("forwarded", "for=192.0.2.1"),
+            ("x-forwarded-for", "192.0.2.1"),
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://app.example"),
+            ("referer", "https://app.example/private"),
+            ("x-unknown", "must-not-cross"),
+            ("content-type", "text/plain"),
+        ] {
+            client.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+
+        merge_allowed_client_headers(&mut outbound, Some(&client));
+
+        for name in [
+            "accept",
+            "accept-language",
+            "atproto-proxy",
+            "atproto-accept-labelers",
+            "range",
+            "if-range",
+            "if-none-match",
+            "if-modified-since",
+        ] {
+            assert_eq!(
+                outbound.get(name),
+                client.get(name),
+                "allowed header {name}"
+            );
+        }
+
+        assert_eq!(outbound.get(AUTHORIZATION).unwrap(), "DPoP upstream-token");
+        assert_eq!(outbound.get("dpop").unwrap(), "upstream-proof");
+        assert_eq!(outbound.get(CONTENT_TYPE).unwrap(), "application/json");
+
+        for name in [
+            "cookie",
+            "cookie2",
+            "host",
+            "content-length",
+            "connection",
+            "forwarded",
+            "x-forwarded-for",
+            "sec-fetch-site",
+            "origin",
+            "referer",
+            "x-unknown",
+        ] {
+            assert!(!outbound.contains_key(name), "blocked header {name}");
+        }
+    }
 }
