@@ -716,6 +716,8 @@ where
     let Some(url) = endpoint_for_req(&metadata.server_metadata, &request) else {
         return Err(RequestError::no_endpoint(request.name()));
     };
+    require_exact_issuer_origin(&metadata.server_metadata.issuer, url)
+        .map_err(|_| RequestError::no_endpoint(format!("{} endpoint outside issuer origin", request.name())))?;
     let client_assertions = build_auth(
         metadata.keyset.as_ref(),
         &metadata.server_metadata,
@@ -753,6 +755,18 @@ where
     } else {
         Err(RequestError::http_status(res.status()))
     }
+}
+
+fn require_exact_issuer_origin(issuer: &CowStr<'_>, endpoint: &CowStr<'_>) -> core::result::Result<(), ()> {
+    let issuer = url::Url::parse(issuer.as_str()).map_err(|_| ())?;
+    let endpoint = url::Url::parse(endpoint.as_str()).map_err(|_| ())?;
+    let valid = issuer.scheme() == "https"
+        && endpoint.scheme() == "https"
+        && issuer.username().is_empty() && issuer.password().is_none() && issuer.fragment().is_none()
+        && endpoint.username().is_empty() && endpoint.password().is_none() && endpoint.fragment().is_none()
+        && issuer.host_str() == endpoint.host_str()
+        && issuer.port_or_known_default() == endpoint.port_or_known_default();
+    if valid { Ok(()) } else { Err(()) }
 }
 
 #[inline]
@@ -1038,5 +1052,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err.kind(), RequestErrorKind::TokenVerification));
+    }
+
+    #[test]
+    fn credential_endpoints_are_exactly_bound_to_issuer_origin() {
+        let issuer = CowStr::from("https://issuer.example/path");
+        assert!(super::require_exact_issuer_origin(
+            &issuer,
+            &CowStr::from("https://issuer.example/token")
+        )
+        .is_ok());
+        for endpoint in [
+            "https://issuer.example.evil/token",
+            "https://issuer.example:444/token",
+            "http://issuer.example/token",
+            "https://user@issuer.example/token",
+            "https://issuer.example/token#fragment",
+        ] {
+            assert!(
+                super::require_exact_issuer_origin(&issuer, &CowStr::from(endpoint)).is_err(),
+                "accepted {endpoint}"
+            );
+        }
     }
 }

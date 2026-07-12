@@ -268,7 +268,7 @@ pub async fn oauth_callback(
     drop(session_data);
 
     // Resolve handle from DID
-    let handle = resolve_handle_for_did(&did, &pds_url).await;
+    let handle = resolve_handle_for_did(&state, &did, &pds_url).await;
     tracing::info!("Resolved handle for DID {}: {}", &did, &handle);
 
     // Record successful OAuth login
@@ -311,14 +311,23 @@ pub async fn oauth_callback(
 }
 
 /// Resolve a handle for a DID by calling com.atproto.repo.describeRepo on the PDS.
-async fn resolve_handle_for_did(did: &str, pds_url: &str) -> String {
+async fn resolve_handle_for_did(state: &AppState, did: &str, pds_url: &str) -> String {
     let describe_url = format!(
         "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
         pds_url.trim_end_matches('/'),
         did
     );
 
-    match reqwest::get(&describe_url).await {
+    match state
+        .outbound_policy
+        .send(
+            reqwest::Method::GET,
+            &describe_url,
+            reqwest::header::HeaderMap::new(),
+            None,
+        )
+        .await
+    {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(json) => json
                 .get("handle")

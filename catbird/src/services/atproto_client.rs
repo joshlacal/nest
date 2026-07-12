@@ -227,14 +227,13 @@ impl AtProtoClient {
             "[BFF-UPSTREAM-SEND] Sending to PDS"
         );
 
-        let mut request = self.state.http_client.request(method, url).headers(headers);
-
-        if let Some(b) = body {
-            request = request.body(b);
-        }
-
         let start = std::time::Instant::now();
-        let response = match request.send().await {
+        let response = match self
+            .state
+            .outbound_policy
+            .send(method, url, headers, body)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
@@ -242,13 +241,12 @@ impl AtProtoClient {
                     attempt = attempt,
                     url = %url,
                     error = %e,
-                    is_builder = e.is_builder(),
-                    is_request = e.is_request(),
-                    is_connect = e.is_connect(),
-                    is_body = e.is_body(),
                     "[BFF-UPSTREAM-ERR] Request failed"
                 );
-                return Err(e.into());
+                return Err(AppError::Upstream {
+                    status: 502,
+                    message: e.to_string(),
+                });
             }
         };
 
@@ -393,14 +391,13 @@ impl AtProtoClient {
             "[BFF-UPSTREAM-SEND] Sending to PDS"
         );
 
-        let mut request = self.state.http_client.request(method, url).headers(headers);
-
-        if let Some(b) = body {
-            request = request.body(b);
-        }
-
         let start = std::time::Instant::now();
-        let response = match request.send().await {
+        let response = match self
+            .state
+            .outbound_policy
+            .send(method, url, headers, body)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
@@ -408,13 +405,12 @@ impl AtProtoClient {
                     attempt = attempt,
                     url = %url,
                     error = %e,
-                    is_builder = e.is_builder(),
-                    is_request = e.is_request(),
-                    is_connect = e.is_connect(),
-                    is_body = e.is_body(),
                     "[BFF-UPSTREAM-ERR] Request failed"
                 );
-                return Err(e.into());
+                return Err(AppError::Upstream {
+                    status: 502,
+                    message: e.to_string(),
+                });
             }
         };
 
