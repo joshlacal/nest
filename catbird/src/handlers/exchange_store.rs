@@ -5,9 +5,10 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::services::redis_crypto::{KeyMaterial, Keyring, RecordContext, MAX_PREVIOUS_KEYS};
+use crate::services::redis_crypto::{Keyring, RecordContext};
 
 const EXCHANGE_TTL_SECONDS: u64 = 60;
+const MAX_FUTURE_SKEW_SECONDS: i64 = 5;
 const INIT_TTL_SECONDS: u64 = 600;
 const ALLOWED_HTTPS_HOSTS: &[&str] = &["catbird.blue", "catmos.catbird.blue", "catmos.pages.dev"];
 
@@ -22,7 +23,13 @@ pub struct ExchangeStore {
 pub struct ExchangeInit {
     pub nonce_hash: Option<String>,
     pub redirect_origin: String,
-    pub redirect_target: String,
+    pub redirect_target: Option<String>,
+    pub client_selector: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyExchangeInit {
+    pub redirect_target: Option<String>,
     pub client_selector: String,
 }
 
@@ -46,8 +53,8 @@ impl ExchangeRecord {
     }
 
     fn validate(&self, nonce: &str, origin: &str, now: i64) -> Result<(), ExchangeError> {
-        if now < self.created_at
-            || now - self.created_at > EXCHANGE_TTL_SECONDS as i64
+        let age = now - self.created_at;
+        if !(-MAX_FUTURE_SKEW_SECONDS..=EXCHANGE_TTL_SECONDS as i64).contains(&age)
             || !verify_nonce(&self.nonce_hash, nonce)
             || self.redirect_origin != origin
         {
@@ -61,64 +68,19 @@ impl ExchangeRecord {
 pub enum ExchangeError {
     #[error("exchange failed")]
     Unauthorized,
+    #[error("exchange failed")]
+    Missing,
     #[error("exchange service unavailable")]
     Unavailable,
 }
 
 impl ExchangeStore {
-    pub fn from_environment(
-        redis: redis::aio::ConnectionManager,
-        key_prefix: String,
-    ) -> Result<Self, ExchangeError> {
-        fn decode(name: &str, encoded: &str) -> Result<[u8; 32], ExchangeError> {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|_| {
-                    tracing::error!(setting = name, "invalid exchange encryption setting");
-                    ExchangeError::Unavailable
-                })?;
-            bytes.try_into().map_err(|_| ExchangeError::Unavailable)
-        }
-
-        let active = KeyMaterial::new(
-            std::env::var("SESSION_ENCRYPTION_KEY_ID").unwrap_or_else(|_| "active".into()),
-            decode(
-                "SESSION_ENCRYPTION_KEY",
-                &std::env::var("SESSION_ENCRYPTION_KEY").map_err(|_| ExchangeError::Unavailable)?,
-            )?,
-        )
-        .map_err(|_| ExchangeError::Unavailable)?;
-        let mut previous = Vec::new();
-        for entry in std::env::var("SESSION_ENCRYPTION_PREVIOUS_KEYS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-        {
-            let (kid, encoded) = entry.split_once('=').ok_or(ExchangeError::Unavailable)?;
-            previous.push(
-                KeyMaterial::new(kid, decode("SESSION_ENCRYPTION_PREVIOUS_KEYS", encoded)?)
-                    .map_err(|_| ExchangeError::Unavailable)?,
-            );
-        }
-        if previous.len() > MAX_PREVIOUS_KEYS {
-            return Err(ExchangeError::Unavailable);
-        }
-        let keyring = Keyring::new(
-            active,
-            previous,
-            decode(
-                "SESSION_IDENTIFIER_HMAC_KEY",
-                &std::env::var("SESSION_IDENTIFIER_HMAC_KEY")
-                    .map_err(|_| ExchangeError::Unavailable)?,
-            )?,
-        )
-        .map_err(|_| ExchangeError::Unavailable)?;
-        Ok(Self {
+    pub fn new(redis: redis::aio::ConnectionManager, key_prefix: String, keyring: Keyring) -> Self {
+        Self {
             redis,
             key_prefix,
             keyring,
-        })
+        }
     }
 
     pub fn new_code(&self) -> String {
@@ -157,17 +119,18 @@ impl ExchangeStore {
         &self,
         state: &str,
         nonce: Option<&str>,
-        redirect_target: &str,
+        redirect_target: Option<&str>,
         client_selector: &str,
     ) -> Result<(), ExchangeError> {
-        let redirect_origin = normalize_origin(redirect_target)?;
+        let redirect_origin =
+            normalize_origin(redirect_target.unwrap_or("https://catbird.blue/oauth/callback"))?;
         if !matches!(client_selector, "catmos" | "default") {
             return Err(ExchangeError::Unauthorized);
         }
         let record = ExchangeInit {
             nonce_hash: nonce.map(nonce_hash),
             redirect_origin,
-            redirect_target: redirect_target.to_string(),
+            redirect_target: redirect_target.map(str::to_string),
             client_selector: client_selector.to_string(),
         };
         self.store_encrypted(
@@ -182,6 +145,33 @@ impl ExchangeStore {
     pub async fn take_init(&self, state: &str) -> Result<ExchangeInit, ExchangeError> {
         self.take_encrypted(&self.init_key(state), "oauth-exchange-init")
             .await
+    }
+
+    /// Consume pre-migration callback keys as one Redis transaction.
+    ///
+    /// This is called only while the explicit legacy callback window is open.
+    /// Both keys are bound to the provider-returned OAuth state and their values
+    /// are validated before they influence client selection or redirection.
+    pub async fn take_legacy_init(
+        &self,
+        state: &str,
+    ) -> Result<Option<LegacyExchangeInit>, ExchangeError> {
+        if state.len() > 4096 {
+            return Err(ExchangeError::Unauthorized);
+        }
+        let client_key = format!("oauth_client:{state}");
+        let redirect_key = format!("oauth_redirect:{state}");
+        let mut connection = self.redis.clone();
+        let (client_selector, redirect_target): (Option<String>, Option<String>) = redis::pipe()
+            .atomic()
+            .cmd("GETDEL")
+            .arg(client_key)
+            .cmd("GETDEL")
+            .arg(redirect_key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|_| ExchangeError::Unavailable)?;
+        validate_legacy_init(client_selector, redirect_target)
     }
 
     pub async fn issue(
@@ -215,7 +205,11 @@ impl ExchangeStore {
         let origin = normalize_origin(origin)?;
         let record: ExchangeRecord = self
             .take_encrypted(&self.exchange_key(code), "oauth-exchange")
-            .await?;
+            .await
+            .map_err(|error| match error {
+                ExchangeError::Missing => ExchangeError::Unauthorized,
+                other => other,
+            })?;
         record.validate(nonce, &origin, chrono::Utc::now().timestamp())?;
         Ok(record.session_id)
     }
@@ -254,13 +248,36 @@ impl ExchangeStore {
             .query_async(&mut connection)
             .await
             .map_err(|_| ExchangeError::Unavailable)?;
-        let envelope = envelope.ok_or(ExchangeError::Unauthorized)?;
+        let envelope = envelope.ok_or(ExchangeError::Missing)?;
         let plaintext = self
             .keyring
             .open(&RecordContext::new(kind, key), &envelope)
             .map_err(|_| ExchangeError::Unauthorized)?;
         serde_json::from_slice(&plaintext).map_err(|_| ExchangeError::Unauthorized)
     }
+}
+
+fn validate_legacy_init(
+    client_selector: Option<String>,
+    redirect_target: Option<String>,
+) -> Result<Option<LegacyExchangeInit>, ExchangeError> {
+    let Some(client_selector) = client_selector else {
+        return if redirect_target.is_none() {
+            Ok(None)
+        } else {
+            Err(ExchangeError::Unauthorized)
+        };
+    };
+    if !matches!(client_selector.as_str(), "catmos" | "default") {
+        return Err(ExchangeError::Unauthorized);
+    }
+    if let Some(target) = redirect_target.as_deref() {
+        normalize_origin(target)?;
+    }
+    Ok(Some(LegacyExchangeInit {
+        redirect_target,
+        client_selector,
+    }))
 }
 
 pub fn normalize_origin(target: &str) -> Result<String, ExchangeError> {
@@ -326,6 +343,7 @@ fn verify_nonce(expected: &str, nonce: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::redis_crypto::KeyMaterial;
 
     #[test]
     fn exact_origin_normalization_rejects_ambiguous_origins() {
@@ -401,6 +419,35 @@ mod tests {
             record.validate("nonce", "https://evil.example", now),
             Err(ExchangeError::Unauthorized)
         );
+        assert!(record
+            .validate("nonce", "https://catmos.catbird.blue", now - 5)
+            .is_ok());
+        assert_eq!(
+            record.validate("nonce", "https://catmos.catbird.blue", now - 6),
+            Err(ExchangeError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn legacy_init_values_are_validated_before_use() {
+        let init = validate_legacy_init(
+            Some("catmos".to_string()),
+            Some("https://catmos.catbird.blue/callback".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(init.client_selector, "catmos");
+        assert_eq!(
+            init.redirect_target.as_deref(),
+            Some("https://catmos.catbird.blue/callback")
+        );
+        assert!(validate_legacy_init(Some("admin".to_string()), None).is_err());
+        assert!(validate_legacy_init(
+            Some("catmos".to_string()),
+            Some("https://evil.example/callback".to_string())
+        )
+        .is_err());
+        assert!(validate_legacy_init(None, None).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -419,11 +466,45 @@ mod tests {
             )
             .unwrap(),
         };
+        let legacy_state = format!("legacy-{}", uuid::Uuid::new_v4());
+        let mut legacy_connection = store.redis.clone();
+        redis::pipe()
+            .cmd("SET")
+            .arg(format!("oauth_client:{legacy_state}"))
+            .arg("catmos")
+            .arg("EX")
+            .arg(600)
+            .ignore()
+            .cmd("SET")
+            .arg(format!("oauth_redirect:{legacy_state}"))
+            .arg("https://catmos.catbird.blue/callback")
+            .arg("EX")
+            .arg(600)
+            .ignore()
+            .query_async::<_, ()>(&mut legacy_connection)
+            .await
+            .unwrap();
+        let legacy = store
+            .take_legacy_init(&legacy_state)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.client_selector, "catmos");
+        assert_eq!(
+            legacy.redirect_target.as_deref(),
+            Some("https://catmos.catbird.blue/callback")
+        );
+        assert!(store
+            .take_legacy_init(&legacy_state)
+            .await
+            .unwrap()
+            .is_none());
+
         store
             .store_init(
                 "cancelled-state",
                 Some("browser-secret"),
-                "https://catmos.catbird.blue/callback",
+                Some("https://catmos.catbird.blue/callback"),
                 "catmos",
             )
             .await
@@ -432,12 +513,12 @@ mod tests {
         assert_eq!(cancelled.client_selector, "catmos");
         assert!(matches!(
             store.take_init("cancelled-state").await,
-            Err(ExchangeError::Unauthorized)
+            Err(ExchangeError::Missing)
         ));
         let init = ExchangeInit {
             nonce_hash: Some(nonce_hash("browser-secret")),
             redirect_origin: "https://catmos.catbird.blue".into(),
-            redirect_target: "https://catmos.catbird.blue/callback".into(),
+            redirect_target: Some("https://catmos.catbird.blue/callback".into()),
             client_selector: "catmos".into(),
         };
         let code = store.issue("session", init).await.unwrap();
@@ -461,7 +542,7 @@ mod tests {
                 ExchangeInit {
                     nonce_hash: Some(nonce_hash("browser-secret")),
                     redirect_origin: "https://catmos.catbird.blue".into(),
-                    redirect_target: "https://catmos.catbird.blue/callback".into(),
+                    redirect_target: Some("https://catmos.catbird.blue/callback".into()),
                     client_selector: "catmos".into(),
                 },
             )
@@ -487,7 +568,7 @@ mod tests {
                 ExchangeInit {
                     nonce_hash: Some(nonce_hash("browser-secret")),
                     redirect_origin: "https://catmos.catbird.blue".into(),
-                    redirect_target: "https://catmos.catbird.blue/callback".into(),
+                    redirect_target: Some("https://catmos.catbird.blue/callback".into()),
                     client_selector: "catmos".into(),
                 },
             )

@@ -187,6 +187,10 @@ pub struct RedisAuthStore {
 }
 
 impl RedisAuthStore {
+    pub(crate) fn encryption_keyring(&self) -> Keyring {
+        self.keyring.clone()
+    }
+
     pub fn from_environment(
         redis: redis::aio::ConnectionManager,
         key_prefix: String,
