@@ -8,6 +8,7 @@ use aes_gcm::{
 };
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -15,10 +16,20 @@ const ENVELOPE_VERSION: &str = "v1";
 const AAD_DOMAIN: &[u8] = b"catbird-redis-envelope-v1";
 pub const MAX_PREVIOUS_KEYS: usize = 3;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct KeyMaterial {
     kid: String,
     key: [u8; 32],
+}
+
+impl std::fmt::Debug for KeyMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyMaterial")
+            .field("kid", &self.kid)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl KeyMaterial {
@@ -36,11 +47,22 @@ impl KeyMaterial {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Keyring {
     active: KeyMaterial,
     previous: Vec<KeyMaterial>,
     identifier_key: [u8; 32],
+}
+
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Keyring")
+            .field("active", &self.active)
+            .field("previous_key_count", &self.previous.len())
+            .field("identifier_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Keyring {
@@ -442,5 +464,13 @@ mod tests {
             Err(CryptoError::UnknownKeyId)
         ));
         assert_eq!(after_removal.open(&context, &rewrapped).unwrap(), b"record");
+    }
+
+    #[test]
+    fn key_material_debug_output_never_contains_secret_bytes() {
+        let material = KeyMaterial::new("active", [0x5a; 32]).unwrap();
+        let debug = format!("{material:?}");
+        assert!(!debug.contains("90, 90"));
+        assert!(debug.contains("active"));
     }
 }

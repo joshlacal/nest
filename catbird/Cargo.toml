@@ -28,6 +28,7 @@ catbird-atproto = { path = "../../catbird-atproto" }
 
 # Encryption
 aes-gcm = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 dashmap = "6"
 
 # Serialization

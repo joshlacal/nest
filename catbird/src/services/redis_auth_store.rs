@@ -35,6 +35,24 @@ fn interpret_auth_rewrap_result(result: i64) -> Result<(), SessionStoreError> {
     }
 }
 
+fn interpret_session_rewrap_result(result: i64) -> bool {
+    result == 1
+}
+
+fn expiry_preserving_cas_script() -> redis::Script {
+    redis::Script::new(
+        r#"
+        local current = redis.call('GET', KEYS[1])
+        if not current then return -2 end
+        if current ~= ARGV[1] then return 0 end
+        local ttl = redis.call('PTTL', KEYS[1])
+        if ttl <= 0 then return ttl end
+        redis.call('SET', KEYS[1], ARGV[2], 'XX', 'PX', ttl)
+        return 1
+        "#,
+    )
+}
+
 fn validated_https_url(value: &str) -> Result<url::Url, SessionStoreError> {
     let parsed = url::Url::parse(value).map_err(|_| other_err("legacy endpoint is invalid"))?;
     if parsed.scheme() != "https"
@@ -304,12 +322,18 @@ impl RedisAuthStore {
                         error.to_string(),
                     ))
                 })?;
-            conn.set_ex::<_, _, ()>(&key, rewrapped, SESSION_INDEX_TTL_SECONDS)
+            let result: i64 = expiry_preserving_cas_script()
+                .key(&key)
+                .arg(&value)
+                .arg(&rewrapped)
+                .invoke_async(&mut conn)
                 .await?;
-            tracing::info!(
-                record_kind = "session_index",
-                "Rewrapped Redis record with active key"
-            );
+            if interpret_session_rewrap_result(result) {
+                tracing::info!(
+                    record_kind = "session_index",
+                    "Rewrapped Redis record with active key"
+                );
+            }
         }
         Ok(Some(did))
     }
@@ -433,9 +457,9 @@ impl RedisAuthStore {
         if verified.token_set.access_token != access_token {
             return Err(other_err("migrated token readback verification failed"));
         }
-        conn.del::<_, ()>(&catbird_key).await.map_err(redis_err)?;
-        conn.del::<_, ()>(&dpop_key).await.map_err(redis_err)?;
-        conn.del::<_, ()>(&oauth_key).await.map_err(redis_err)?;
+        conn.del::<_, ()>(&[catbird_key.as_str(), dpop_key.as_str(), oauth_key.as_str()])
+            .await
+            .map_err(redis_err)?;
         Ok(true)
     }
 
@@ -457,7 +481,11 @@ impl RedisAuthStore {
         let did = Did::new_owned(did_str.as_str())
             .map_err(|error| other_err(&format!("invalid pre-envelope DID: {error}")))?;
         let old_session_key = format!("{}session:{}_{}", self.key_prefix, did_str, session_id);
-        let encrypted: String = conn.get(&old_session_key).await.map_err(redis_err)?;
+        let Some(encrypted): Option<String> =
+            conn.get(&old_session_key).await.map_err(redis_err)?
+        else {
+            return Ok(false);
+        };
         let json = if encrypted.trim_start().starts_with('{') {
             encrypted
         } else {
@@ -518,13 +546,19 @@ impl ClientAuthStore for RedisAuthStore {
                             .map_err(|error| {
                                 other_err(&format!("failed to rewrap session: {error}"))
                             })?;
-                    conn.set_ex::<_, _, ()>(&key, rewrapped, self.session_ttl)
+                    let result: i64 = expiry_preserving_cas_script()
+                        .key(&key)
+                        .arg(&encrypted)
+                        .arg(&rewrapped)
+                        .invoke_async(&mut conn)
                         .await
                         .map_err(redis_err)?;
-                    tracing::info!(
-                        record_kind = "session",
-                        "Rewrapped Redis record with active key"
-                    );
+                    if interpret_session_rewrap_result(result) {
+                        tracing::info!(
+                            record_kind = "session",
+                            "Rewrapped Redis record with active key"
+                        );
+                    }
                 }
                 let session: ClientSessionData<'_> =
                     serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
@@ -596,18 +630,7 @@ impl ClientAuthStore for RedisAuthStore {
                             .map_err(|error| {
                                 other_err(&format!("failed to rewrap auth request: {error}"))
                             })?;
-                    let script = redis::Script::new(
-                        r#"
-                        local current = redis.call('GET', KEYS[1])
-                        if not current then return -2 end
-                        if current ~= ARGV[1] then return 0 end
-                        local ttl = redis.call('PTTL', KEYS[1])
-                        if ttl <= 0 then return ttl end
-                        redis.call('SET', KEYS[1], ARGV[2], 'XX', 'PX', ttl)
-                        return 1
-                        "#,
-                    );
-                    let result: i64 = script
+                    let result: i64 = expiry_preserving_cas_script()
                         .key(&key)
                         .arg(&encrypted)
                         .arg(&rewrapped)
@@ -710,6 +733,14 @@ mod tests {
             assert!(interpret_auth_rewrap_result(result).is_err());
         }
         assert!(interpret_auth_rewrap_result(1).is_ok());
+    }
+
+    #[test]
+    fn session_rewrap_only_reports_success_for_a_positive_ttl_cas() {
+        assert!(interpret_session_rewrap_result(1));
+        for result in [-2, -1, 0] {
+            assert!(!interpret_session_rewrap_result(result));
+        }
     }
 
     #[test]
