@@ -744,10 +744,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL"]
     async fn live_redis_session_and_index_rewrap_cas_never_overwrites_a_refresh() {
-        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
-            return;
-        };
+        let redis_url =
+            std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL is required for this test");
         let client = redis::Client::open(redis_url).expect("TEST_REDIS_URL must be valid");
         let mut conn = client
             .get_connection_manager()
