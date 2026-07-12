@@ -23,6 +23,18 @@ fn other_err(msg: &str) -> SessionStoreError {
     SessionStoreError::Other(msg.into())
 }
 
+fn interpret_auth_rewrap_result(result: i64) -> Result<(), SessionStoreError> {
+    match result {
+        1 => Ok(()),
+        -2 => Err(other_err("auth request expired during rewrap")),
+        -1 => Err(other_err(
+            "auth request has no expiry and cannot be rewrapped",
+        )),
+        0 => Err(other_err("auth request changed concurrently during rewrap")),
+        _ => Err(other_err("auth request rewrap returned an invalid result")),
+    }
+}
+
 fn validated_https_url(value: &str) -> Result<url::Url, SessionStoreError> {
     let parsed = url::Url::parse(value).map_err(|_| other_err("legacy endpoint is invalid"))?;
     if parsed.scheme() != "https"
@@ -578,26 +590,31 @@ impl ClientAuthStore for RedisAuthStore {
                         |error| other_err(&format!("invalid encrypted auth request: {error}")),
                     )?;
                 if needs_rewrap {
-                    let ttl: i64 = redis::cmd("TTL")
-                        .arg(&key)
-                        .query_async(&mut conn)
-                        .await
-                        .map_err(redis_err)?;
                     let rewrapped =
                         self.keyring
                             .seal(&context, json.as_bytes())
                             .map_err(|error| {
                                 other_err(&format!("failed to rewrap auth request: {error}"))
                             })?;
-                    if ttl > 0 {
-                        conn.set_ex::<_, _, ()>(&key, rewrapped, ttl as u64)
-                            .await
-                            .map_err(redis_err)?;
-                    } else {
-                        conn.set::<_, _, ()>(&key, rewrapped)
-                            .await
-                            .map_err(redis_err)?;
-                    }
+                    let script = redis::Script::new(
+                        r#"
+                        local current = redis.call('GET', KEYS[1])
+                        if not current then return -2 end
+                        if current ~= ARGV[1] then return 0 end
+                        local ttl = redis.call('PTTL', KEYS[1])
+                        if ttl <= 0 then return ttl end
+                        redis.call('SET', KEYS[1], ARGV[2], 'XX', 'PX', ttl)
+                        return 1
+                        "#,
+                    );
+                    let result: i64 = script
+                        .key(&key)
+                        .arg(&encrypted)
+                        .arg(&rewrapped)
+                        .invoke_async(&mut conn)
+                        .await
+                        .map_err(redis_err)?;
+                    interpret_auth_rewrap_result(result)?;
                     tracing::info!(
                         record_kind = "auth_req",
                         "Rewrapped Redis record with active key"
@@ -685,5 +702,48 @@ mod tests {
         let mut wrong_dpop = oauth;
         wrong_dpop["dpop_key"]["x"] = serde_json::json!("different");
         assert!(validate_legacy_records(&catbird, &pair, &wrong_dpop).is_err());
+    }
+
+    #[test]
+    fn auth_request_rewrap_rejects_expired_unbounded_and_raced_records() {
+        for result in [-2, -1, 0] {
+            assert!(interpret_auth_rewrap_result(result).is_err());
+        }
+        assert!(interpret_auth_rewrap_result(1).is_ok());
+    }
+
+    #[test]
+    fn legacy_validation_accepts_a_real_matching_p256_fixture() {
+        use base64::Engine;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let secret = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let point = secret.public_key().to_encoded_point(false);
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let d = b64.encode(secret.to_bytes());
+        let x = b64.encode(point.x().unwrap());
+        let y = b64.encode(point.y().unwrap());
+        let catbird = serde_json::json!({
+            "did": "did:plc:alice",
+            "pds_url": "https://pds.example",
+            "access_token": "access",
+            "refresh_token": "refresh"
+        });
+        let pair = serde_json::json!({
+            "public_jwk": {"kty":"EC", "crv":"P-256", "x":x, "y":y},
+            "private_key_bytes": d
+        });
+        let oauth = serde_json::json!({
+            "dpop_key": {"kty":"EC", "crv":"P-256", "x":x, "y":y, "d":d},
+            "token_set": {
+                "iss": "https://auth.example",
+                "sub": "did:plc:alice",
+                "aud": "https://pds.example",
+                "access_token": "access",
+                "refresh_token": "refresh"
+            }
+        });
+
+        validate_legacy_records(&catbird, &pair, &oauth).unwrap();
     }
 }
