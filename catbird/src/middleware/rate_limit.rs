@@ -242,13 +242,19 @@ pub async fn session_rate_limit(
     next: Next,
 ) -> Response {
     // Extract session ID for rate limiting
-    let key = match extract_session_for_rate_limit(&req) {
-        Some(session_id) => format!("session:{}", session_id),
+    let (key, key_kind) = match extract_session_for_rate_limit(&req) {
+        Some(session_id) => {
+            use sha2::{Digest, Sha256};
+            (
+                format!("session:{:x}", Sha256::digest(session_id)),
+                "session",
+            )
+        }
         None => {
             // No session - use IP as fallback
             match extract_client_ip(&req) {
-                Some(ip) => format!("ip:{}", ip),
-                None => "unknown".to_string(),
+                Some(ip) => (format!("ip:{}", ip), "ip"),
+                None => ("unknown".to_string(), "unknown"),
             }
         }
     };
@@ -259,11 +265,11 @@ pub async fn session_rate_limit(
         .await
     {
         Ok(remaining) => {
-            tracing::trace!(key = %key, remaining = remaining, "Session rate limit check passed");
+            tracing::trace!(key_kind, remaining, "Session rate limit check passed");
             next.run(req).await
         }
         Err(retry_after) => {
-            tracing::warn!(key = %key, retry_after = retry_after, "Session rate limit exceeded");
+            tracing::warn!(key_kind, retry_after, "Session rate limit exceeded");
             metrics::record_rate_limit_exceeded("xrpc");
             rate_limit_response(retry_after)
         }

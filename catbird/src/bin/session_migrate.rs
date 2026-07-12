@@ -32,6 +32,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// One-shot conversion of validated legacy plaintext sessions.
+    LegacyConvert {
+        #[arg(long)]
+        redis_url: String,
+        #[arg(long, default_value = DEFAULT_PREFIX)]
+        prefix: String,
+        #[arg(long)]
+        deadline: String,
+        #[arg(long, default_value_t = 2_592_000)]
+        session_ttl_seconds: u64,
+        #[arg(long)]
+        allow_legacy_plaintext: bool,
+    },
     /// Export sessions from a Redis instance to a JSON file
     Export {
         /// Redis connection URL
@@ -162,6 +175,74 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn sanitized_redis_endpoint(redis_url: &str) -> String {
+    let Ok(url) = url::Url::parse(redis_url) else {
+        return "<invalid Redis URL>".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return "<invalid Redis URL>".to_string();
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
+async fn run_legacy_convert(
+    redis_url: &str,
+    prefix: &str,
+    deadline: &str,
+    session_ttl_seconds: u64,
+    allow_legacy_plaintext: bool,
+) -> Result<(), anyhow::Error> {
+    if !allow_legacy_plaintext {
+        anyhow::bail!("legacy conversion requires --allow-legacy-plaintext");
+    }
+    let deadline = chrono::DateTime::parse_from_rfc3339(deadline)?;
+    if chrono::Utc::now() >= deadline.with_timezone(&chrono::Utc) {
+        anyhow::bail!("legacy conversion deadline has passed");
+    }
+    eprintln!("Connecting to {} …", sanitized_redis_endpoint(redis_url));
+    let mut conn = connect(redis_url).await?;
+    let store = catbird::services::RedisAuthStore::from_environment(
+        conn.clone(),
+        prefix.to_string(),
+        session_ttl_seconds,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let legacy_prefix = format!("{prefix}catbird_session:");
+    let keys = scan_keys(&mut conn, &legacy_prefix, DEFAULT_BATCH_SIZE).await?;
+    let mut migrated = 0usize;
+    for key in &keys {
+        let session_id = key
+            .strip_prefix(&legacy_prefix)
+            .ok_or_else(|| anyhow::anyhow!("legacy key did not match expected namespace"))?;
+        if store.migrate_legacy_session_offline(session_id).await? {
+            migrated += 1;
+        }
+    }
+    let index_prefix = format!("{prefix}session_index:");
+    let index_keys = scan_keys(&mut conn, &index_prefix, DEFAULT_BATCH_SIZE).await?;
+    for key in &index_keys {
+        let session_id = key
+            .strip_prefix(&index_prefix)
+            .ok_or_else(|| anyhow::anyhow!("session index key did not match namespace"))?;
+        if store
+            .migrate_pre_envelope_session_offline(session_id)
+            .await?
+        {
+            migrated += 1;
+        }
+    }
+    eprintln!("Converted {migrated} validated legacy or pre-envelope session records");
+    Ok(())
+}
+
 // ── Subcommands ─────────────────────────────────────────────────────
 
 async fn run_export(
@@ -171,7 +252,7 @@ async fn run_export(
     batch_size: usize,
     dry_run: bool,
 ) -> Result<(), anyhow::Error> {
-    eprintln!("Connecting to {redis_url} …");
+    eprintln!("Connecting to {} …", sanitized_redis_endpoint(redis_url));
     let mut conn = connect(redis_url).await?;
 
     eprintln!("Scanning for keys with prefix \"{prefix}\" …");
@@ -258,7 +339,7 @@ async fn run_import(
         return Ok(());
     }
 
-    eprintln!("Connecting to {redis_url} …");
+    eprintln!("Connecting to {} …", sanitized_redis_endpoint(redis_url));
     let mut conn = connect(redis_url).await?;
 
     let total = export.keys.len();
@@ -287,7 +368,7 @@ async fn run_import(
             match res {
                 Ok(()) => imported += 1,
                 Err(e) => {
-                    eprintln!("  WARN: failed to import {}: {e}", entry.key);
+                    eprintln!("  WARN: failed to import {} record: {e}", entry.key_type);
                     failed += 1;
                 }
             }
@@ -310,7 +391,11 @@ async fn run_verify(
     spot_check: usize,
     batch_size: usize,
 ) -> Result<(), anyhow::Error> {
-    eprintln!("Connecting to source ({source_url}) and target ({target_url}) …");
+    eprintln!(
+        "Connecting to source ({}) and target ({}) …",
+        sanitized_redis_endpoint(source_url),
+        sanitized_redis_endpoint(target_url)
+    );
     let mut src = connect(source_url).await?;
     let mut tgt = connect(target_url).await?;
 
@@ -333,9 +418,6 @@ async fn run_verify(
             "⚠ {} keys in source missing from target:",
             missing_from_target.len()
         );
-        for k in missing_from_target.iter().take(20) {
-            eprintln!("  - {k}");
-        }
         if missing_from_target.len() > 20 {
             eprintln!("  … and {} more", missing_from_target.len() - 20);
         }
@@ -346,9 +428,6 @@ async fn run_verify(
             "ℹ {} keys in target not in source (new sessions?):",
             extra_in_target.len()
         );
-        for k in extra_in_target.iter().take(10) {
-            eprintln!("  - {k}");
-        }
     }
 
     // Spot-check value equality
@@ -371,7 +450,7 @@ async fn run_verify(
             let tgt_val: Option<String> = tgt.get(*key).await?;
 
             if src_val != tgt_val {
-                eprintln!("  ✗ mismatch: {key}");
+                eprintln!("  ✗ encrypted record mismatch");
                 mismatches += 1;
             }
         }
@@ -397,6 +476,22 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Command::LegacyConvert {
+            redis_url,
+            prefix,
+            deadline,
+            session_ttl_seconds,
+            allow_legacy_plaintext,
+        } => {
+            run_legacy_convert(
+                &redis_url,
+                &prefix,
+                &deadline,
+                session_ttl_seconds,
+                allow_legacy_plaintext,
+            )
+            .await
+        }
         Command::Export {
             redis_url,
             output,
@@ -423,5 +518,19 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redis_url_display_omits_credentials_and_paths() {
+        assert_eq!(
+            sanitized_redis_endpoint("rediss://user:password@redis.example:6380/4?token=secret"),
+            "rediss://redis.example:6380"
+        );
+        assert_eq!(sanitized_redis_endpoint("not a url"), "<invalid Redis URL>");
     }
 }

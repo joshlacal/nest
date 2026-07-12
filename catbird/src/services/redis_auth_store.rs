@@ -1,7 +1,6 @@
 //! Redis-backed implementation of Jacquard's `ClientAuthStore`.
 //!
-//! Stores session data in Redis with optional AES-256-GCM encryption.
-//! Includes migration-on-access from the legacy 3-key atrium format.
+//! Stores authenticated, encrypted session data under opaque Redis keys.
 
 use jacquard_common::session::SessionStoreError;
 use jacquard_common::types::did::Did;
@@ -11,7 +10,7 @@ use jacquard_oauth::session::{AuthRequestData, ClientSessionData, DpopClientData
 use jacquard_oauth::types::{OAuthTokenType, TokenSet};
 use redis::{AsyncCommands, Expiry};
 
-use super::redis_crypto::{decrypt_from_redis, encrypt_for_redis};
+use super::redis_crypto::{open_utf8, Keyring, RecordContext};
 
 const STATE_TTL_SECONDS: u64 = 600; // 10 minutes for OAuth state
 const SESSION_INDEX_TTL_SECONDS: u64 = 86400 * 30; // 30 days
@@ -27,46 +26,106 @@ fn other_err(msg: &str) -> SessionStoreError {
 /// Redis-backed auth store for Jacquard OAuth.
 ///
 /// Key schema:
-///   `{prefix}session:{did}_{session_id}`   → encrypted ClientSessionData JSON
-///   `{prefix}auth_req:{state}`             → encrypted AuthRequestData JSON
-///   `{prefix}session_index:{session_id}`   → DID string (for session_id→DID lookup)
+///   `{prefix}session:<opaque-id>`       → encrypted ClientSessionData JSON
+///   `{prefix}auth_req:<opaque-id>`      → encrypted AuthRequestData JSON
+///   `{prefix}session_index:<opaque-id>` → encrypted DID string
 #[derive(Clone)]
 pub struct RedisAuthStore {
     redis: redis::aio::ConnectionManager,
     key_prefix: String,
     session_ttl: u64,
-    encryption_key: Option<[u8; 32]>,
+    keyring: Keyring,
 }
 
 impl RedisAuthStore {
+    pub fn from_environment(
+        redis: redis::aio::ConnectionManager,
+        key_prefix: String,
+        session_ttl: u64,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use super::redis_crypto::{KeyMaterial, MAX_PREVIOUS_KEYS};
+        use base64::Engine;
+
+        fn decode(name: &str, encoded: &str) -> Result<[u8; 32], String> {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| format!("{name} must be valid base64"))?;
+            bytes
+                .try_into()
+                .map_err(|_| format!("{name} must decode to exactly 32 bytes"))
+        }
+
+        let active_encoded = std::env::var("SESSION_ENCRYPTION_KEY")
+            .map_err(|_| "SESSION_ENCRYPTION_KEY is required")?;
+        let active = KeyMaterial::new(
+            std::env::var("SESSION_ENCRYPTION_KEY_ID").unwrap_or_else(|_| "active".to_string()),
+            decode("SESSION_ENCRYPTION_KEY", &active_encoded)?,
+        )?;
+        let mut previous = Vec::new();
+        for entry in std::env::var("SESSION_ENCRYPTION_PREVIOUS_KEYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (kid, encoded) = entry
+                .split_once('=')
+                .ok_or("previous encryption keys must use kid=base64")?;
+            previous.push(KeyMaterial::new(
+                kid,
+                decode("SESSION_ENCRYPTION_PREVIOUS_KEYS", encoded)?,
+            )?);
+        }
+        if previous.len() > MAX_PREVIOUS_KEYS {
+            return Err("too many previous encryption keys".into());
+        }
+        let identifier_encoded = std::env::var("SESSION_IDENTIFIER_HMAC_KEY")
+            .map_err(|_| "SESSION_IDENTIFIER_HMAC_KEY is required")?;
+        let keyring = Keyring::new(
+            active,
+            previous,
+            decode("SESSION_IDENTIFIER_HMAC_KEY", &identifier_encoded)?,
+        )?;
+        Ok(Self::new(redis, key_prefix, session_ttl, keyring))
+    }
+
     pub fn new(
         redis: redis::aio::ConnectionManager,
         key_prefix: String,
         session_ttl: u64,
-        encryption_key: Option<[u8; 32]>,
+        keyring: Keyring,
     ) -> Self {
         Self {
             redis,
             key_prefix,
             session_ttl,
-            encryption_key,
+            keyring,
         }
     }
 
     fn session_key(&self, did: &str, session_id: &str) -> String {
-        format!("{}session:{}_{}", self.key_prefix, did, session_id)
+        let logical = format!("{did}\0{session_id}");
+        format!(
+            "{}session:{}",
+            self.key_prefix,
+            self.keyring.opaque_id("session", &logical)
+        )
     }
 
     fn auth_req_key(&self, state: &str) -> String {
-        format!("{}auth_req:{}", self.key_prefix, state)
+        format!(
+            "{}auth_req:{}",
+            self.key_prefix,
+            self.keyring.opaque_id("auth-request", state)
+        )
     }
 
     fn session_index_key(&self, session_id: &str) -> String {
-        format!("{}session_index:{}", self.key_prefix, session_id)
-    }
-
-    fn enc_key(&self) -> Option<&[u8; 32]> {
-        self.encryption_key.as_ref()
+        format!(
+            "{}session_index:{}",
+            self.key_prefix,
+            self.keyring.opaque_id("session-index", session_id)
+        )
     }
 
     /// Look up the DID associated with a session_id.
@@ -88,8 +147,25 @@ impl RedisAuthStore {
     ) -> Result<Option<String>, redis::RedisError> {
         let key = self.session_index_key(session_id);
         let mut conn = self.redis.clone();
-        conn.get_ex(&key, Expiry::EX(SESSION_INDEX_TTL_SECONDS as usize))
-            .await
+        let encrypted: Option<String> = conn
+            .get_ex(&key, Expiry::EX(SESSION_INDEX_TTL_SECONDS as usize))
+            .await?;
+        encrypted
+            .map(|value| {
+                open_utf8(
+                    &self.keyring,
+                    &RecordContext::new("session_index", &key),
+                    &value,
+                )
+                .map_err(|error| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "invalid encrypted session index",
+                        error.to_string(),
+                    ))
+                })
+            })
+            .transpose()
     }
 
     /// Write the session_id→DID index entry.
@@ -100,102 +176,88 @@ impl RedisAuthStore {
     ) -> Result<(), redis::RedisError> {
         let key = self.session_index_key(session_id);
         let mut conn = self.redis.clone();
-        conn.set_ex::<_, _, ()>(&key, did, SESSION_INDEX_TTL_SECONDS)
+        let encrypted = self
+            .keyring
+            .seal(&RecordContext::new("session_index", &key), did.as_bytes())
+            .map_err(|error| {
+                redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "failed to encrypt session index",
+                    error.to_string(),
+                ))
+            })?;
+        conn.set_ex::<_, _, ()>(&key, encrypted, SESSION_INDEX_TTL_SECONDS)
             .await
     }
 
-    /// Attempt to migrate a legacy (atrium) session to the new format.
-    ///
-    /// Legacy keys:
-    ///   `{prefix}catbird_session:{session_id}` → CatbirdSession JSON
-    ///   `{prefix}oauth_session:{session_id}`   → atrium Session JSON
-    ///   `{prefix}dpop_key:{session_id}`        → DPoPKeyPair JSON
-    ///
-    /// Returns the migrated `ClientSessionData` if migration succeeded.
-    pub async fn try_migrate_legacy_session(
+    /// Convert one legacy plaintext three-key record. This is intentionally
+    /// exposed only for the explicit offline migration binary; runtime auth
+    /// never calls it.
+    pub async fn migrate_legacy_session_offline(
         &self,
         session_id: &str,
-    ) -> Result<Option<ClientSessionData<'static>>, SessionStoreError> {
+    ) -> Result<bool, SessionStoreError> {
         let mut conn = self.redis.clone();
-
-        // Read legacy catbird session
         let catbird_key = format!("{}catbird_session:{}", self.key_prefix, session_id);
-        let catbird_json: Option<String> = conn.get(&catbird_key).await.map_err(redis_err)?;
-
-        let catbird_json = match catbird_json {
-            Some(j) => j,
-            None => return Ok(None),
+        let dpop_key = format!("{}dpop_key:{}", self.key_prefix, session_id);
+        let oauth_key = format!("{}oauth_session:{}", self.key_prefix, session_id);
+        let Some(catbird_json): Option<String> = conn.get(&catbird_key).await.map_err(redis_err)?
+        else {
+            return Ok(false);
         };
-
+        let Some(dpop_json): Option<String> = conn.get(&dpop_key).await.map_err(redis_err)? else {
+            return Err(other_err("legacy session missing DPoP record"));
+        };
         let catbird: serde_json::Value =
             serde_json::from_str(&catbird_json).map_err(SessionStoreError::Serde)?;
-
-        // Read legacy DPoP key
-        let dpop_redis_key = format!("{}dpop_key:{}", self.key_prefix, session_id);
-        let dpop_json: Option<String> = conn.get(&dpop_redis_key).await.map_err(redis_err)?;
-
-        // We need at minimum the catbird session with tokens and DPoP key.
         let did_str = catbird["did"]
             .as_str()
-            .ok_or_else(|| other_err("legacy session missing did"))?;
+            .ok_or_else(|| other_err("legacy session missing DID"))?;
         let pds_url = catbird["pds_url"]
             .as_str()
-            .ok_or_else(|| other_err("legacy session missing pds_url"))?;
+            .ok_or_else(|| other_err("legacy session missing PDS URL"))?;
         let access_token = catbird["access_token"]
             .as_str()
-            .ok_or_else(|| other_err("legacy session missing access_token"))?;
-        let refresh_token = catbird["refresh_token"].as_str().unwrap_or("");
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| other_err("legacy session missing access token"))?;
+        let did = Did::new_owned(did_str)
+            .map_err(|error| other_err(&format!("invalid legacy DID: {error}")))?;
 
-        // Build DPoP key from legacy format
-        let dpop_key: jose_jwk::Key = if let Some(ref dj) = dpop_json {
-            let dpop_pair: serde_json::Value =
-                serde_json::from_str(dj).map_err(SessionStoreError::Serde)?;
-
-            // Legacy DPoPKeyPair has public_jwk (object) and private_key_bytes (base64 string)
-            let pub_jwk = &dpop_pair["public_jwk"];
-            let priv_b64 = dpop_pair["private_key_bytes"]
-                .as_str()
-                .ok_or_else(|| other_err("legacy dpop missing private_key_bytes"))?;
-
-            // Reconstruct a full JWK with private component
-            let mut full_jwk = pub_jwk.clone();
-            if let Some(obj) = full_jwk.as_object_mut() {
-                obj.insert(
-                    "d".to_string(),
-                    serde_json::Value::String(priv_b64.to_string()),
-                );
-            }
-
-            serde_json::from_value(full_jwk).map_err(SessionStoreError::Serde)?
-        } else {
-            return Err(other_err("legacy session missing dpop_key"));
-        };
-
-        // Parse expiry
+        let pair: serde_json::Value =
+            serde_json::from_str(&dpop_json).map_err(SessionStoreError::Serde)?;
+        let mut full_jwk = pair["public_jwk"].clone();
+        let private = pair["private_key_bytes"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| other_err("legacy DPoP record missing private key"))?;
+        full_jwk
+            .as_object_mut()
+            .ok_or_else(|| other_err("legacy DPoP public key is invalid"))?
+            .insert(
+                "d".to_string(),
+                serde_json::Value::String(private.to_string()),
+            );
+        let dpop_jwk: jose_jwk::Key =
+            serde_json::from_value(full_jwk).map_err(SessionStoreError::Serde)?;
+        let refresh_token = catbird["refresh_token"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_string().into());
         let expires_at = catbird["access_token_expires_at"]
             .as_str()
-            .and_then(|s| jacquard_common::types::string::Datetime::try_from(s.to_string()).ok());
-
-        let did = Did::new_owned(did_str.to_string())
-            .map_err(|e| other_err(&format!("invalid DID: {e}")))?;
-
-        let session_data = ClientSessionData {
+            .and_then(|value| {
+                jacquard_common::types::string::Datetime::try_from(value.to_string()).ok()
+            });
+        let session = ClientSessionData {
             account_did: did.clone(),
             session_id: session_id.to_string().into(),
             host_url: pds_url.to_string().into(),
-            // We don't know the auth server URL in legacy format; it will be
-            // resolved by Jacquard on next refresh.
             authserver_url: pds_url.to_string().into(),
             authserver_token_endpoint: "".into(),
             authserver_revocation_endpoint: None,
-            scopes: vec![
-                jacquard_oauth::scopes::Scope::Atproto,
-                jacquard_oauth::scopes::Scope::Transition(
-                    jacquard_oauth::scopes::TransitionScope::Generic,
-                ),
-            ],
+            scopes: vec![jacquard_oauth::scopes::Scope::Atproto],
             dpop_data: DpopClientData {
-                dpop_key,
+                dpop_key: dpop_jwk,
                 dpop_authserver_nonce: "".into(),
                 dpop_host_nonce: "".into(),
             },
@@ -203,39 +265,72 @@ impl RedisAuthStore {
                 iss: pds_url.to_string().into(),
                 sub: did.clone(),
                 aud: pds_url.to_string().into(),
-                scope: Some("atproto transition:generic transition:chat.bsky".into()),
-                refresh_token: if refresh_token.is_empty() {
-                    None
-                } else {
-                    Some(refresh_token.to_string().into())
-                },
+                scope: Some("atproto".into()),
+                refresh_token,
                 access_token: access_token.to_string().into(),
                 token_type: OAuthTokenType::DPoP,
                 expires_at,
             },
         };
 
-        // Write new-format session
-        self.upsert_session(session_data.clone()).await?;
+        self.upsert_session(session).await?;
+        let verified = self
+            .get_session(&did, session_id)
+            .await?
+            .filter(|record| record.account_did == did && record.session_id == session_id)
+            .ok_or_else(|| other_err("migrated session readback verification failed"))?;
+        if verified.token_set.access_token != access_token {
+            return Err(other_err("migrated token readback verification failed"));
+        }
+        conn.del::<_, ()>(&catbird_key).await.map_err(redis_err)?;
+        conn.del::<_, ()>(&dpop_key).await.map_err(redis_err)?;
+        conn.del::<_, ()>(&oauth_key).await.map_err(redis_err)?;
+        Ok(true)
+    }
 
-        // Write session index
-        self.write_session_index(session_id, did_str)
+    /// Convert one pre-envelope Jacquard session and plaintext index. The
+    /// caller must invoke this from the time-bounded offline migration CLI.
+    pub async fn migrate_pre_envelope_session_offline(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let mut conn = self.redis.clone();
+        let old_index_key = format!("{}session_index:{}", self.key_prefix, session_id);
+        let Some(did_str): Option<String> = conn.get(&old_index_key).await.map_err(redis_err)?
+        else {
+            return Ok(false);
+        };
+        if did_str.starts_with("v1:") {
+            return Ok(false);
+        }
+        let did = Did::new_owned(did_str.as_str())
+            .map_err(|error| other_err(&format!("invalid pre-envelope DID: {error}")))?;
+        let old_session_key = format!("{}session:{}_{}", self.key_prefix, did_str, session_id);
+        let encrypted: String = conn.get(&old_session_key).await.map_err(redis_err)?;
+        let json = if encrypted.trim_start().starts_with('{') {
+            encrypted
+        } else {
+            String::from_utf8(
+                self.keyring
+                    .open_legacy_active(&encrypted)
+                    .map_err(|error| other_err(&format!("invalid pre-envelope record: {error}")))?,
+            )
+            .map_err(|_| other_err("pre-envelope record is not UTF-8"))?
+        };
+        let session: ClientSessionData<'_> =
+            serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+        if session.account_did != did || session.session_id != session_id {
+            return Err(other_err("pre-envelope session identity mismatch"));
+        }
+        self.upsert_session(session.into_static()).await?;
+        self.get_session(&did, session_id)
+            .await?
+            .ok_or_else(|| other_err("pre-envelope migration readback failed"))?;
+        conn.del::<_, ()>(&old_session_key)
             .await
             .map_err(redis_err)?;
-
-        // Clean up legacy keys (best effort)
-        let _: Result<(), _> = conn.del(&catbird_key).await;
-        let oauth_key = format!("{}oauth_session:{}", self.key_prefix, session_id);
-        let _: Result<(), _> = conn.del(&oauth_key).await;
-        let _: Result<(), _> = conn.del(&dpop_redis_key).await;
-
-        tracing::info!(
-            did = %did_str,
-            session_id = %session_id,
-            "Migrated legacy session to new format"
-        );
-
-        Ok(Some(session_data))
+        conn.del::<_, ()>(&old_index_key).await.map_err(redis_err)?;
+        Ok(true)
     }
 }
 
@@ -260,7 +355,12 @@ impl ClientAuthStore for RedisAuthStore {
 
         match data {
             Some(encrypted) => {
-                let json = decrypt_from_redis(self.enc_key(), &encrypted);
+                let json = open_utf8(
+                    &self.keyring,
+                    &RecordContext::new("session", &key),
+                    &encrypted,
+                )
+                .map_err(|error| other_err(&format!("invalid encrypted session: {error}")))?;
                 let session: ClientSessionData<'_> =
                     serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
                 Ok(Some(session.into_static()))
@@ -275,7 +375,10 @@ impl ClientAuthStore for RedisAuthStore {
     ) -> Result<(), SessionStoreError> {
         let key = self.session_key(session.account_did.as_str(), &session.session_id);
         let json = serde_json::to_string(&session).map_err(SessionStoreError::Serde)?;
-        let encrypted = encrypt_for_redis(self.enc_key(), &json);
+        let encrypted = self
+            .keyring
+            .seal(&RecordContext::new("session", &key), json.as_bytes())
+            .map_err(|error| other_err(&format!("failed to encrypt session: {error}")))?;
 
         let mut conn = self.redis.clone();
         conn.set_ex::<_, _, ()>(&key, encrypted, self.session_ttl)
@@ -283,13 +386,9 @@ impl ClientAuthStore for RedisAuthStore {
             .map_err(redis_err)?;
 
         // Also update the session index
-        conn.set_ex::<_, _, ()>(
-            &self.session_index_key(&session.session_id),
-            session.account_did.as_str(),
-            SESSION_INDEX_TTL_SECONDS,
-        )
-        .await
-        .map_err(redis_err)?;
+        self.write_session_index(&session.session_id, session.account_did.as_str())
+            .await
+            .map_err(redis_err)?;
 
         Ok(())
     }
@@ -320,7 +419,12 @@ impl ClientAuthStore for RedisAuthStore {
 
         match data {
             Some(encrypted) => {
-                let json = decrypt_from_redis(self.enc_key(), &encrypted);
+                let json = open_utf8(
+                    &self.keyring,
+                    &RecordContext::new("auth_req", &key),
+                    &encrypted,
+                )
+                .map_err(|error| other_err(&format!("invalid encrypted auth request: {error}")))?;
                 let info: AuthRequestData<'_> =
                     serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
                 Ok(Some(info.into_static()))
@@ -335,7 +439,10 @@ impl ClientAuthStore for RedisAuthStore {
     ) -> Result<(), SessionStoreError> {
         let key = self.auth_req_key(&auth_req_info.state);
         let json = serde_json::to_string(auth_req_info).map_err(SessionStoreError::Serde)?;
-        let encrypted = encrypt_for_redis(self.enc_key(), &json);
+        let encrypted = self
+            .keyring
+            .seal(&RecordContext::new("auth_req", &key), json.as_bytes())
+            .map_err(|error| other_err(&format!("failed to encrypt auth request: {error}")))?;
 
         let mut conn = self.redis.clone();
         conn.set_ex::<_, _, ()>(&key, encrypted, STATE_TTL_SECONDS)

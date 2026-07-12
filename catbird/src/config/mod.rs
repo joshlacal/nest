@@ -302,16 +302,10 @@ impl AppState {
 
         // Initialize Jacquard auth store + OAuth client
         if let Some(ref key_store) = state.key_store {
-            match Self::init_jacquard(&state, key_store) {
-                Ok((store, client)) => {
-                    state.auth_store = Some(Arc::new(store));
-                    state.jacquard_client = Some(Arc::new(client));
-                    tracing::info!("Jacquard OAuthClient initialized successfully");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to initialize Jacquard OAuthClient: {}", e);
-                }
-            }
+            let (store, client) = Self::init_jacquard(&state, key_store)?;
+            state.auth_store = Some(Arc::new(store));
+            state.jacquard_client = Some(Arc::new(client));
+            tracing::info!("Jacquard OAuthClient initialized successfully");
         }
 
         // Initialize catmos-web OAuth client if CATMOS_OAUTH_CLIENT_ID is set
@@ -368,30 +362,12 @@ impl AppState {
         use jacquard_oauth::scopes::Scope;
         use jacquard_oauth::session::ClientData;
 
-        // Parse encryption key from env (base64-encoded 32-byte key)
-        let encryption_key = std::env::var("SESSION_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|b64| {
-                use base64::Engine;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&b64)
-                    .ok()?;
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    Some(arr)
-                } else {
-                    tracing::warn!("SESSION_ENCRYPTION_KEY must be 32 bytes (44 base64 chars)");
-                    None
-                }
-            });
-
-        let store = crate::services::RedisAuthStore::new(
+        let store = crate::services::RedisAuthStore::from_environment(
             state.redis.clone(),
             state.config.redis.key_prefix.clone(),
             state.config.redis.session_ttl_seconds,
-            encryption_key,
-        );
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
         let keyset = key_store.to_jacquard_keyset()?;
 

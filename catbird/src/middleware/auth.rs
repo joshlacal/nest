@@ -127,7 +127,7 @@ fn extract_session_id(req: &Request<Body>) -> Option<String> {
 /// This middleware:
 /// 1. Extracts the session ID from cookie or Authorization header
 /// 2. Validates the session via Jacquard SessionRegistry (with automatic token refresh)
-/// 3. Attempts legacy session migration if Jacquard lookup fails
+/// 3. Rejects missing or unauthenticated records without runtime migration
 /// 4. Injects the session into request extensions
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -149,43 +149,13 @@ pub async fn auth_middleware(
         classify_auth_error(AppError::Internal("Jacquard client not configured".into()))
     })?;
 
-    // Try Jacquard path (new sessions + already-migrated sessions)
     match resolve_session_via_jacquard(auth_store, jacquard_client, &session_id).await {
         Ok((session, dpop_data)) => {
             req.extensions_mut().insert(session);
             req.extensions_mut().insert(dpop_data);
-            return Ok(next.run(req).await);
-        }
-        Err(AppError::InvalidSession) => {
-            // Session not found — attempt legacy migration
-            tracing::debug!(session_id = %session_id, "Jacquard session not found, attempting legacy migration");
-        }
-        Err(e) => {
-            return Err(classify_auth_error(e));
-        }
-    }
-
-    // Attempt to migrate a legacy (pre-Jacquard) session
-    match auth_store.try_migrate_legacy_session(&session_id).await {
-        Ok(Some(_)) => {
-            tracing::info!(session_id = %session_id, "Legacy session migrated, retrying Jacquard lookup");
-            // Migration succeeded — retry Jacquard lookup
-            let (session, dpop_data) =
-                resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
-                    .await
-                    .map_err(classify_auth_error)?;
-            req.extensions_mut().insert(session);
-            req.extensions_mut().insert(dpop_data);
             Ok(next.run(req).await)
         }
-        Ok(None) => {
-            // No legacy session either
-            Err(classify_auth_error(AppError::InvalidSession))
-        }
-        Err(e) => {
-            tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
-            Err(classify_auth_error(AppError::InvalidSession))
-        }
+        Err(error) => Err(classify_auth_error(error)),
     }
 }
 
