@@ -20,8 +20,10 @@ pub struct ExchangeStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeInit {
-    nonce_hash: String,
-    redirect_origin: String,
+    pub nonce_hash: Option<String>,
+    pub redirect_origin: String,
+    pub redirect_target: String,
+    pub client_selector: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,16 +136,6 @@ impl ExchangeStore {
             self.keyring.opaque_id("oauth-exchange-init", state)
         )
     }
-
-    pub fn flow_key(&self, kind: &str, state: &str) -> String {
-        format!(
-            "{}oauth_flow_{}:{}",
-            self.key_prefix,
-            kind,
-            self.keyring
-                .opaque_id("oauth-flow", &format!("{kind}\0{state}"))
-        )
-    }
 }
 
 fn new_code_value() -> String {
@@ -164,13 +156,19 @@ impl ExchangeStore {
     pub async fn store_init(
         &self,
         state: &str,
-        nonce: &str,
+        nonce: Option<&str>,
         redirect_target: &str,
+        client_selector: &str,
     ) -> Result<(), ExchangeError> {
         let redirect_origin = normalize_origin(redirect_target)?;
+        if !matches!(client_selector, "catmos" | "default") {
+            return Err(ExchangeError::Unauthorized);
+        }
         let record = ExchangeInit {
-            nonce_hash: nonce_hash(nonce),
+            nonce_hash: nonce.map(nonce_hash),
             redirect_origin,
+            redirect_target: redirect_target.to_string(),
+            client_selector: client_selector.to_string(),
         };
         self.store_encrypted(
             &self.init_key(state),
@@ -194,7 +192,7 @@ impl ExchangeStore {
         let code = self.new_code();
         let record = ExchangeRecord {
             session_id: session_id.to_string(),
-            nonce_hash: init.nonce_hash,
+            nonce_hash: init.nonce_hash.ok_or(ExchangeError::Unauthorized)?,
             redirect_origin: init.redirect_origin,
             created_at: chrono::Utc::now().timestamp(),
         };
@@ -278,17 +276,37 @@ pub fn normalize_origin(target: &str) -> Result<String, ExchangeError> {
         {
             Ok(format!("https://{host}"))
         }
-        "http" if matches!(host, "127.0.0.1" | "::1") && url.port().is_some() => Ok(format!(
-            "http://{}:{}",
-            if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_string()
-            },
-            url.port().unwrap()
-        )),
+        "http" if matches!(host, "127.0.0.1" | "::1" | "[::1]") => {
+            let port = explicit_loopback_port(target).ok_or(ExchangeError::Unauthorized)?;
+            Ok(format!(
+                "http://{}:{}",
+                if host.starts_with('[') {
+                    host.to_string()
+                } else if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.to_string()
+                },
+                port
+            ))
+        }
         _ => Err(ExchangeError::Unauthorized),
     }
+}
+
+fn explicit_loopback_port(target: &str) -> Option<u16> {
+    let authority = target
+        .strip_prefix("http://")?
+        .split(['/', '?', '#'])
+        .next()?;
+    let port = authority
+        .strip_prefix("127.0.0.1:")
+        .or_else(|| authority.strip_prefix("[::1]:"))?;
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let port = port.parse::<u32>().ok()?;
+    (1..=u16::MAX as u32).contains(&port).then_some(port as u16)
 }
 
 fn nonce_hash(nonce: &str) -> String {
@@ -321,12 +339,22 @@ mod tests {
             "https://catmos.catbird.blue:444/callback",
             "https://catmos.catbird.blue.evil/callback",
             "https://catmos.catbird.blue/callback#fragment",
+            "http://127.0.0.1:0/callback",
+            "http://[::1]:0/callback",
         ] {
             assert!(normalize_origin(origin).is_err(), "accepted {origin}");
         }
         assert_eq!(
             normalize_origin("http://127.0.0.1:43123/callback").unwrap(),
             "http://127.0.0.1:43123"
+        );
+        assert_eq!(
+            normalize_origin("http://127.0.0.1:80/callback").unwrap(),
+            "http://127.0.0.1:80"
+        );
+        assert_eq!(
+            normalize_origin("http://[::1]:80/callback").unwrap(),
+            "http://[::1]:80"
         );
     }
 
@@ -349,14 +377,9 @@ mod tests {
         let session = "live-session-credential";
         let code = new_code_value();
         let key = exchange_key_for("test:", &keyring, &code);
-        let flow_key = format!(
-            "test:oauth_flow_client:{}",
-            keyring.opaque_id("oauth-flow", &format!("client\0{session}"))
-        );
         assert!(!code.contains(session));
         assert!(!key.contains(session));
         assert!(!key.contains(&code));
-        assert!(!flow_key.contains(session));
     }
 
     #[test]
@@ -381,16 +404,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Docker"]
-    async fn concurrent_redemption_is_atomic_and_single_use() {
-        use testcontainers_modules::{redis::Redis, testcontainers::runners::AsyncRunner};
-        let container = Redis::default().start().await.unwrap();
-        let port = container.get_host_port_ipv4(6379).await.unwrap();
-        let client = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap();
+    #[ignore = "requires TEST_REDIS_URL"]
+    async fn redis_concurrency_ttl_and_aad_are_enforced() {
+        let redis_url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL is required");
+        let client = redis::Client::open(redis_url).unwrap();
         let manager = redis::aio::ConnectionManager::new(client).await.unwrap();
         let store = ExchangeStore {
             redis: manager,
-            key_prefix: "test:".into(),
+            key_prefix: format!("test:oauth-exchange:{}:", uuid::Uuid::new_v4()),
             keyring: Keyring::new(
                 KeyMaterial::new("active", [1; 32]).unwrap(),
                 vec![],
@@ -398,15 +419,98 @@ mod tests {
             )
             .unwrap(),
         };
+        store
+            .store_init(
+                "cancelled-state",
+                Some("browser-secret"),
+                "https://catmos.catbird.blue/callback",
+                "catmos",
+            )
+            .await
+            .unwrap();
+        let cancelled = store.take_init("cancelled-state").await.unwrap();
+        assert_eq!(cancelled.client_selector, "catmos");
+        assert!(matches!(
+            store.take_init("cancelled-state").await,
+            Err(ExchangeError::Unauthorized)
+        ));
         let init = ExchangeInit {
-            nonce_hash: nonce_hash("browser-secret"),
+            nonce_hash: Some(nonce_hash("browser-secret")),
             redirect_origin: "https://catmos.catbird.blue".into(),
+            redirect_target: "https://catmos.catbird.blue/callback".into(),
+            client_selector: "catmos".into(),
         };
         let code = store.issue("session", init).await.unwrap();
+        let key = store.exchange_key(&code);
+        let mut connection = store.redis.clone();
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!((1..=60).contains(&ttl));
         let (first, second) = tokio::join!(
             store.redeem(&code, "browser-secret", "https://catmos.catbird.blue"),
             store.redeem(&code, "browser-secret", "https://catmos.catbird.blue")
         );
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+
+        let expiring = store
+            .issue(
+                "expired-session",
+                ExchangeInit {
+                    nonce_hash: Some(nonce_hash("browser-secret")),
+                    redirect_origin: "https://catmos.catbird.blue".into(),
+                    redirect_target: "https://catmos.catbird.blue/callback".into(),
+                    client_selector: "catmos".into(),
+                },
+            )
+            .await
+            .unwrap();
+        redis::cmd("PEXPIRE")
+            .arg(store.exchange_key(&expiring))
+            .arg(1)
+            .query_async::<_, ()>(&mut connection)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(
+            store
+                .redeem(&expiring, "browser-secret", "https://catmos.catbird.blue")
+                .await,
+            Err(ExchangeError::Unauthorized)
+        );
+
+        let aad_code = store
+            .issue(
+                "aad-session",
+                ExchangeInit {
+                    nonce_hash: Some(nonce_hash("browser-secret")),
+                    redirect_origin: "https://catmos.catbird.blue".into(),
+                    redirect_target: "https://catmos.catbird.blue/callback".into(),
+                    client_selector: "catmos".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let original_key = store.exchange_key(&aad_code);
+        let envelope: String = redis::cmd("GET")
+            .arg(&original_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let copied_key = format!("{}copied", original_key);
+        redis::cmd("SET")
+            .arg(&copied_key)
+            .arg(envelope)
+            .query_async::<_, ()>(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .take_encrypted::<ExchangeRecord>(&copied_key, "oauth-exchange")
+                .await,
+            Err(ExchangeError::Unauthorized)
+        ));
     }
 }

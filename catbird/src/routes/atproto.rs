@@ -45,7 +45,15 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 )),
         )
         .route("/callback", get(atproto::oauth_callback))
-        .route("/exchange", post(atproto::exchange_oauth_code))
+        .route(
+            "/exchange",
+            post(atproto::exchange_oauth_code)
+                .layer(DefaultBodyLimit::max(1024))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
+        )
         // Protected auth routes
         .route(
             "/logout",
