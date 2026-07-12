@@ -1,0 +1,412 @@
+//! Encrypted, opaque-keyed, single-use OAuth callback exchange records.
+
+use base64::Engine;
+use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::services::redis_crypto::{KeyMaterial, Keyring, RecordContext, MAX_PREVIOUS_KEYS};
+
+const EXCHANGE_TTL_SECONDS: u64 = 60;
+const INIT_TTL_SECONDS: u64 = 600;
+const ALLOWED_HTTPS_HOSTS: &[&str] = &["catbird.blue", "catmos.catbird.blue", "catmos.pages.dev"];
+
+#[derive(Clone)]
+pub struct ExchangeStore {
+    redis: redis::aio::ConnectionManager,
+    key_prefix: String,
+    keyring: Keyring,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeInit {
+    nonce_hash: String,
+    redirect_origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeRecord {
+    pub session_id: String,
+    nonce_hash: String,
+    redirect_origin: String,
+    created_at: i64,
+}
+
+impl ExchangeRecord {
+    #[cfg(test)]
+    fn new(session_id: &str, nonce: &str, redirect_origin: &str, created_at: i64) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            nonce_hash: nonce_hash(nonce),
+            redirect_origin: redirect_origin.to_string(),
+            created_at,
+        }
+    }
+
+    fn validate(&self, nonce: &str, origin: &str, now: i64) -> Result<(), ExchangeError> {
+        if now < self.created_at
+            || now - self.created_at > EXCHANGE_TTL_SECONDS as i64
+            || !verify_nonce(&self.nonce_hash, nonce)
+            || self.redirect_origin != origin
+        {
+            return Err(ExchangeError::Unauthorized);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ExchangeError {
+    #[error("exchange failed")]
+    Unauthorized,
+    #[error("exchange service unavailable")]
+    Unavailable,
+}
+
+impl ExchangeStore {
+    pub fn from_environment(
+        redis: redis::aio::ConnectionManager,
+        key_prefix: String,
+    ) -> Result<Self, ExchangeError> {
+        fn decode(name: &str, encoded: &str) -> Result<[u8; 32], ExchangeError> {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| {
+                    tracing::error!(setting = name, "invalid exchange encryption setting");
+                    ExchangeError::Unavailable
+                })?;
+            bytes.try_into().map_err(|_| ExchangeError::Unavailable)
+        }
+
+        let active = KeyMaterial::new(
+            std::env::var("SESSION_ENCRYPTION_KEY_ID").unwrap_or_else(|_| "active".into()),
+            decode(
+                "SESSION_ENCRYPTION_KEY",
+                &std::env::var("SESSION_ENCRYPTION_KEY").map_err(|_| ExchangeError::Unavailable)?,
+            )?,
+        )
+        .map_err(|_| ExchangeError::Unavailable)?;
+        let mut previous = Vec::new();
+        for entry in std::env::var("SESSION_ENCRYPTION_PREVIOUS_KEYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (kid, encoded) = entry.split_once('=').ok_or(ExchangeError::Unavailable)?;
+            previous.push(
+                KeyMaterial::new(kid, decode("SESSION_ENCRYPTION_PREVIOUS_KEYS", encoded)?)
+                    .map_err(|_| ExchangeError::Unavailable)?,
+            );
+        }
+        if previous.len() > MAX_PREVIOUS_KEYS {
+            return Err(ExchangeError::Unavailable);
+        }
+        let keyring = Keyring::new(
+            active,
+            previous,
+            decode(
+                "SESSION_IDENTIFIER_HMAC_KEY",
+                &std::env::var("SESSION_IDENTIFIER_HMAC_KEY")
+                    .map_err(|_| ExchangeError::Unavailable)?,
+            )?,
+        )
+        .map_err(|_| ExchangeError::Unavailable)?;
+        Ok(Self {
+            redis,
+            key_prefix,
+            keyring,
+        })
+    }
+
+    pub fn new_code(&self) -> String {
+        new_code_value()
+    }
+
+    fn exchange_key(&self, code: &str) -> String {
+        exchange_key_for(&self.key_prefix, &self.keyring, code)
+    }
+
+    fn init_key(&self, state: &str) -> String {
+        format!(
+            "{}oauth_exchange_init:{}",
+            self.key_prefix,
+            self.keyring.opaque_id("oauth-exchange-init", state)
+        )
+    }
+
+    pub fn flow_key(&self, kind: &str, state: &str) -> String {
+        format!(
+            "{}oauth_flow_{}:{}",
+            self.key_prefix,
+            kind,
+            self.keyring
+                .opaque_id("oauth-flow", &format!("{kind}\0{state}"))
+        )
+    }
+}
+
+fn new_code_value() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn exchange_key_for(prefix: &str, keyring: &Keyring, code: &str) -> String {
+    format!(
+        "{}oauth_exchange:{}",
+        prefix,
+        keyring.opaque_id("oauth-exchange", code)
+    )
+}
+
+impl ExchangeStore {
+    pub async fn store_init(
+        &self,
+        state: &str,
+        nonce: &str,
+        redirect_target: &str,
+    ) -> Result<(), ExchangeError> {
+        let redirect_origin = normalize_origin(redirect_target)?;
+        let record = ExchangeInit {
+            nonce_hash: nonce_hash(nonce),
+            redirect_origin,
+        };
+        self.store_encrypted(
+            &self.init_key(state),
+            "oauth-exchange-init",
+            &record,
+            INIT_TTL_SECONDS,
+        )
+        .await
+    }
+
+    pub async fn take_init(&self, state: &str) -> Result<ExchangeInit, ExchangeError> {
+        self.take_encrypted(&self.init_key(state), "oauth-exchange-init")
+            .await
+    }
+
+    pub async fn issue(
+        &self,
+        session_id: &str,
+        init: ExchangeInit,
+    ) -> Result<String, ExchangeError> {
+        let code = self.new_code();
+        let record = ExchangeRecord {
+            session_id: session_id.to_string(),
+            nonce_hash: init.nonce_hash,
+            redirect_origin: init.redirect_origin,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        self.store_encrypted(
+            &self.exchange_key(&code),
+            "oauth-exchange",
+            &record,
+            EXCHANGE_TTL_SECONDS,
+        )
+        .await?;
+        Ok(code)
+    }
+
+    pub async fn redeem(
+        &self,
+        code: &str,
+        nonce: &str,
+        origin: &str,
+    ) -> Result<String, ExchangeError> {
+        let origin = normalize_origin(origin)?;
+        let record: ExchangeRecord = self
+            .take_encrypted(&self.exchange_key(code), "oauth-exchange")
+            .await?;
+        record.validate(nonce, &origin, chrono::Utc::now().timestamp())?;
+        Ok(record.session_id)
+    }
+
+    async fn store_encrypted<T: Serialize>(
+        &self,
+        key: &str,
+        kind: &str,
+        record: &T,
+        ttl: u64,
+    ) -> Result<(), ExchangeError> {
+        let plaintext = serde_json::to_vec(record).map_err(|_| ExchangeError::Unavailable)?;
+        let envelope = self
+            .keyring
+            .seal(&RecordContext::new(kind, key), &plaintext)
+            .map_err(|_| ExchangeError::Unavailable)?;
+        let mut connection = self.redis.clone();
+        redis::cmd("SET")
+            .arg(key)
+            .arg(envelope)
+            .arg("EX")
+            .arg(ttl)
+            .query_async::<_, ()>(&mut connection)
+            .await
+            .map_err(|_| ExchangeError::Unavailable)
+    }
+
+    async fn take_encrypted<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+        kind: &str,
+    ) -> Result<T, ExchangeError> {
+        let mut connection = self.redis.clone();
+        let envelope: Option<String> = redis::cmd("GETDEL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|_| ExchangeError::Unavailable)?;
+        let envelope = envelope.ok_or(ExchangeError::Unauthorized)?;
+        let plaintext = self
+            .keyring
+            .open(&RecordContext::new(kind, key), &envelope)
+            .map_err(|_| ExchangeError::Unauthorized)?;
+        serde_json::from_slice(&plaintext).map_err(|_| ExchangeError::Unauthorized)
+    }
+}
+
+pub fn normalize_origin(target: &str) -> Result<String, ExchangeError> {
+    let url = url::Url::parse(target).map_err(|_| ExchangeError::Unauthorized)?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(ExchangeError::Unauthorized);
+    }
+    let host = url.host_str().ok_or(ExchangeError::Unauthorized)?;
+    match url.scheme() {
+        "https"
+            if url.port_or_known_default() == Some(443)
+                && (ALLOWED_HTTPS_HOSTS.contains(&host) || host.ends_with(".catmos.pages.dev")) =>
+        {
+            Ok(format!("https://{host}"))
+        }
+        "http" if matches!(host, "127.0.0.1" | "::1") && url.port().is_some() => Ok(format!(
+            "http://{}:{}",
+            if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            },
+            url.port().unwrap()
+        )),
+        _ => Err(ExchangeError::Unauthorized),
+    }
+}
+
+fn nonce_hash(nonce: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(nonce.as_bytes()))
+}
+
+fn verify_nonce(expected: &str, nonce: &str) -> bool {
+    let actual = nonce_hash(nonce);
+    expected.len() == actual.len()
+        && expected
+            .bytes()
+            .zip(actual.bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_origin_normalization_rejects_ambiguous_origins() {
+        assert_eq!(
+            normalize_origin("https://catmos.catbird.blue/callback").unwrap(),
+            "https://catmos.catbird.blue"
+        );
+        for origin in [
+            "http://catmos.catbird.blue/callback",
+            "https://user@catmos.catbird.blue/callback",
+            "https://catmos.catbird.blue:444/callback",
+            "https://catmos.catbird.blue.evil/callback",
+            "https://catmos.catbird.blue/callback#fragment",
+        ] {
+            assert!(normalize_origin(origin).is_err(), "accepted {origin}");
+        }
+        assert_eq!(
+            normalize_origin("http://127.0.0.1:43123/callback").unwrap(),
+            "http://127.0.0.1:43123"
+        );
+    }
+
+    #[test]
+    fn nonce_binding_is_constant_shape_and_mismatch_is_generic() {
+        let hash = nonce_hash("browser-secret");
+        assert!(verify_nonce(&hash, "browser-secret"));
+        assert!(!verify_nonce(&hash, "wrong"));
+        assert_eq!(hash.len(), 43);
+    }
+
+    #[test]
+    fn exchange_keys_and_codes_do_not_contain_session_credentials() {
+        let keyring = Keyring::new(
+            KeyMaterial::new("active", [1; 32]).unwrap(),
+            vec![],
+            [2; 32],
+        )
+        .unwrap();
+        let session = "live-session-credential";
+        let code = new_code_value();
+        let key = exchange_key_for("test:", &keyring, &code);
+        let flow_key = format!(
+            "test:oauth_flow_client:{}",
+            keyring.opaque_id("oauth-flow", &format!("client\0{session}"))
+        );
+        assert!(!code.contains(session));
+        assert!(!key.contains(session));
+        assert!(!key.contains(&code));
+        assert!(!flow_key.contains(session));
+    }
+
+    #[test]
+    fn records_expire_after_sixty_seconds_and_fail_generically() {
+        let now = 1_000;
+        let record = ExchangeRecord::new("session", "nonce", "https://catmos.catbird.blue", now);
+        assert!(record
+            .validate("nonce", "https://catmos.catbird.blue", now + 60)
+            .is_ok());
+        assert_eq!(
+            record.validate("nonce", "https://catmos.catbird.blue", now + 61),
+            Err(ExchangeError::Unauthorized)
+        );
+        assert_eq!(
+            record.validate("wrong", "https://catmos.catbird.blue", now),
+            Err(ExchangeError::Unauthorized)
+        );
+        assert_eq!(
+            record.validate("nonce", "https://evil.example", now),
+            Err(ExchangeError::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn concurrent_redemption_is_atomic_and_single_use() {
+        use testcontainers_modules::{redis::Redis, testcontainers::runners::AsyncRunner};
+        let container = Redis::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap();
+        let manager = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let store = ExchangeStore {
+            redis: manager,
+            key_prefix: "test:".into(),
+            keyring: Keyring::new(
+                KeyMaterial::new("active", [1; 32]).unwrap(),
+                vec![],
+                [2; 32],
+            )
+            .unwrap(),
+        };
+        let init = ExchangeInit {
+            nonce_hash: nonce_hash("browser-secret"),
+            redirect_origin: "https://catmos.catbird.blue".into(),
+        };
+        let code = store.issue("session", init).await.unwrap();
+        let (first, second) = tokio::join!(
+            store.redeem(&code, "browser-secret", "https://catmos.catbird.blue"),
+            store.redeem(&code, "browser-secret", "https://catmos.catbird.blue")
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    }
+}

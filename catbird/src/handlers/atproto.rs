@@ -4,6 +4,9 @@
 //! - OAuth flow (login, callback, logout)
 //! - XRPC proxy
 
+#[path = "exchange_store.rs"]
+mod exchange_store;
+
 use axum::{
     body::Body,
     extract::{Path, Query, RawQuery, State},
@@ -13,6 +16,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +28,36 @@ use crate::middleware::JacquardDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{CatbirdSession, LogoutResponse, OAuthCallback, SessionInfo};
 use crate::services::{AtProtoClient, MlsAuthService, ProxyResponse};
+use exchange_store::{ExchangeError, ExchangeStore};
+
+#[derive(Debug, Deserialize)]
+pub struct ExchangeRequest {
+    code: String,
+    browser_nonce: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExchangeResponse {
+    session_id: String,
+}
+
+fn exchange_store(state: &AppState) -> Result<ExchangeStore, AppError> {
+    ExchangeStore::from_environment(state.redis.clone(), state.config.redis.key_prefix.clone())
+        .map_err(|_| AppError::Internal("OAuth exchange unavailable".into()))
+}
+
+fn legacy_callback_allowed() -> bool {
+    let Ok(deadline) = std::env::var("OAUTH_LEGACY_CALLBACK_UNTIL") else {
+        return false;
+    };
+    legacy_callback_allowed_at(&deadline, chrono::Utc::now())
+}
+
+fn legacy_callback_allowed_at(deadline: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(deadline)
+        .map(|deadline| deadline > now)
+        .unwrap_or(false)
+}
 
 /// Handle login initiation (Redirect flow)
 ///
@@ -39,6 +73,7 @@ pub async fn login(
         .ok_or_else(|| AppError::BadRequest("Missing identifier".into()))?;
     let client = params.get("client").cloned();
     let redirect_to = params.get("redirect_to").cloned();
+    let browser_nonce = params.get("browser_nonce").cloned();
 
     // Select the appropriate OAuth client based on the client parameter.
     // The chosen selector is persisted to Redis so the callback handler can
@@ -72,6 +107,22 @@ pub async fn login(
 
     // Generate a clean UUID for the OAuth state (= Jacquard session_id).
     let session_nonce = uuid::Uuid::new_v4().to_string();
+    let store = exchange_store(&state)?;
+
+    if let Some(nonce) = browser_nonce.as_deref() {
+        if nonce.len() < 16 || nonce.len() > 256 {
+            return Err(AppError::BadRequest("Invalid browser nonce".into()));
+        }
+        let redirect_target = redirect_to
+            .as_deref()
+            .unwrap_or("https://catbird.blue/oauth/callback");
+        store
+            .store_init(&session_nonce, nonce, redirect_target)
+            .await
+            .map_err(|_| AppError::BadRequest("Invalid OAuth redirect".into()))?;
+    } else if !legacy_callback_allowed() {
+        return Err(AppError::BadRequest("Browser nonce required".into()));
+    }
 
     // Persist the chosen OAuth client selector so the callback handler can
     // pick the same jacquard client. Stored unconditionally (including
@@ -79,7 +130,7 @@ pub async fn login(
     // the redirect_to key.
     {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_client:{}", session_nonce);
+        let key = store.flow_key("client", &session_nonce);
         if let Err(e) = redis::cmd("SET")
             .arg(&key)
             .arg(client_selector)
@@ -90,9 +141,8 @@ pub async fn login(
         {
             // Don't fail login — callback will fall back to legacy inference.
             tracing::warn!(
-                "Failed to persist oauth_client selector to Redis for session {}: {}",
-                session_nonce,
-                e
+                error = %e,
+                "Failed to persist OAuth client selector"
             );
         }
     }
@@ -100,7 +150,7 @@ pub async fn login(
     // Store redirect_to in Redis so the callback can look it up.
     if let Some(ref r) = redirect_to {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_redirect:{}", session_nonce);
+        let key = store.flow_key("redirect", &session_nonce);
         let _: Result<(), _> = redis::cmd("SET")
             .arg(&key)
             .arg(r.as_str())
@@ -137,12 +187,13 @@ pub async fn oauth_callback(
     jar: CookieJar,
 ) -> AppResult<(CookieJar, Response)> {
     tracing::info!("OAuth callback received");
+    let store = exchange_store(&state)?;
 
     // Check if this session has a stored redirect_to (catmos-web flow).
     // Legacy sessions with JSON state won't have this key.
     let redirect_to: Option<String> = {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_redirect:{}", &callback.state);
+        let key = store.flow_key("redirect", &callback.state);
         redis::cmd("GET")
             .arg(&key)
             .query_async(&mut conn)
@@ -152,7 +203,7 @@ pub async fn oauth_callback(
     // Clean up the redirect key (one-time use)
     if redirect_to.is_some() {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_redirect:{}", &callback.state);
+        let key = store.flow_key("redirect", &callback.state);
         let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
     }
 
@@ -169,7 +220,7 @@ pub async fn oauth_callback(
         // The selector key is one-time; the flow is dead, so drop it.
         let mut conn = state.redis.clone();
         let _: Result<(), _> = redis::cmd("DEL")
-            .arg(format!("oauth_client:{}", &callback.state))
+            .arg(store.flow_key("client", &callback.state))
             .query_async(&mut conn)
             .await;
         let target = redirect_to
@@ -192,7 +243,7 @@ pub async fn oauth_callback(
     // request, so login and callback MUST use the same client.
     let stored_selector: Option<String> = {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_client:{}", &callback.state);
+        let key = store.flow_key("client", &callback.state);
         redis::cmd("GET")
             .arg(&key)
             .query_async(&mut conn)
@@ -202,7 +253,7 @@ pub async fn oauth_callback(
     // Clean up the selector key (one-time use)
     if stored_selector.is_some() {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_client:{}", &callback.state);
+        let key = store.flow_key("client", &callback.state);
         let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
     }
 
@@ -223,10 +274,7 @@ pub async fn oauth_callback(
             legacy_infer_catmos(&redirect_to, &callback.state)
         }
         None => {
-            tracing::info!(
-                "No oauth_client selector in Redis for state {}; using legacy inference (pre-deploy in-flight session or JSON-state legacy)",
-                &callback.state
-            );
+            tracing::info!("No OAuth client selector in Redis; using bounded legacy inference");
             legacy_infer_catmos(&redirect_to, &callback.state)
         }
     };
@@ -250,7 +298,7 @@ pub async fn oauth_callback(
 
     let params = CallbackParams {
         code: code.into(),
-        state: Some(callback.state.into()),
+        state: Some(callback.state.clone().into()),
         iss: callback.iss.map(|s| s.into()),
     };
 
@@ -274,40 +322,89 @@ pub async fn oauth_callback(
     // Record successful OAuth login
     metrics::record_oauth_login(true);
 
-    // Set cookie — session_id is the Jacquard state/session identifier (clean UUID)
-    let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.clone()))
-        .path("/")
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict)
-        .max_age(time::Duration::days(30))
-        .build();
-
-    // Redirect back to the app
-    let app_redirect = if let Some(ref r) = redirect_to {
-        // catmos-web: redirect_to was stored in Redis during login
-        if let Some(target) = redirect_with_query(r, "session_id", &session_id) {
-            target
-        } else {
-            tracing::warn!("Rejected redirect_to from Redis: {}", r);
-            format!(
-                "https://catbird.blue/oauth/callback#session_id={}",
-                session_id
-            )
+    let exchange_init = match store.take_init(&callback.state).await {
+        Ok(init) => Some(init),
+        Err(ExchangeError::Unauthorized) => None,
+        Err(ExchangeError::Unavailable) => {
+            return Err(AppError::Internal("OAuth exchange unavailable".into()))
         }
+    };
+
+    let (app_redirect, jar) = if let Some(init) = exchange_init {
+        let exchange_code = store
+            .issue(&session_id, init)
+            .await
+            .map_err(|_| AppError::Internal("OAuth exchange unavailable".into()))?;
+        let target = redirect_to
+            .as_deref()
+            .unwrap_or("https://catbird.blue/oauth/callback");
+        let redirect = redirect_with_query(target, "code", &exchange_code)
+            .ok_or_else(|| AppError::OAuth("Invalid OAuth redirect".into()))?;
+        (redirect, jar)
+    } else if legacy_callback_allowed() {
+        metrics::record_oauth_exchange("legacy_callback");
+        let cookie = session_cookie(&session_id);
+        let redirect = if let Some(ref target) = redirect_to {
+            redirect_with_query(target, "session_id", &session_id)
+                .ok_or_else(|| AppError::OAuth("Invalid OAuth redirect".into()))?
+        } else {
+            build_app_redirect(&session_id, &session_id)
+        };
+        (redirect, jar.add(cookie))
     } else {
-        // Legacy: try parsing session_id as JSON state (for in-flight sessions)
-        build_app_redirect(&session_id, &session_id)
+        return Err(AppError::OAuth("OAuth exchange failed".into()));
     };
 
     Ok((
-        jar.add(cookie),
+        jar,
         Response::builder()
             .status(StatusCode::FOUND)
             .header("Location", app_redirect)
             .body(Body::empty())
             .unwrap(),
     ))
+}
+
+fn session_cookie(session_id: &str) -> Cookie<'static> {
+    Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Strict)
+        .max_age(time::Duration::days(30))
+        .build()
+}
+
+/// Atomically redeem a short-lived callback exchange code.
+pub async fn exchange_oauth_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(request): Json<ExchangeRequest>,
+) -> AppResult<(CookieJar, Json<ExchangeResponse>)> {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("OAuth exchange failed".into()))?;
+    let redemption = exchange_store(&state)?
+        .redeem(&request.code, &request.browser_nonce, origin)
+        .await;
+    let session_id = match redemption {
+        Ok(session_id) => {
+            metrics::record_oauth_exchange("success");
+            session_id
+        }
+        Err(ExchangeError::Unauthorized) => {
+            metrics::record_oauth_exchange("rejected");
+            return Err(AppError::Unauthorized("OAuth exchange failed".into()));
+        }
+        Err(ExchangeError::Unavailable) => {
+            metrics::record_oauth_exchange("unavailable");
+            return Err(AppError::Internal("OAuth exchange unavailable".into()));
+        }
+    };
+    let cookie = session_cookie(&session_id);
+    Ok((jar.add(cookie), Json(ExchangeResponse { session_id })))
 }
 
 /// Resolve a handle for a DID by calling com.atproto.repo.describeRepo on the PDS.
@@ -362,8 +459,11 @@ fn legacy_infer_catmos(redirect_to: &Option<String>, state_str: &str) -> bool {
 }
 
 /// Allowed redirect origins for OAuth callback (beyond localhost).
-const ALLOWED_REDIRECT_ORIGINS: &[&str] =
-    &["https://catmos.catbird.blue", "https://catmos.pages.dev"];
+const ALLOWED_REDIRECT_ORIGINS: &[&str] = &[
+    "https://catbird.blue",
+    "https://catmos.catbird.blue",
+    "https://catmos.pages.dev",
+];
 
 /// Build the redirect URL after OAuth callback.
 /// Redirect-target allowlist shared by the success and deny/cancel paths:
@@ -875,7 +975,9 @@ async fn mirror_push_mutation_if_needed(
 
 #[cfg(test)]
 mod redirect_tests {
-    use super::{build_app_redirect, is_allowed_redirect, redirect_with_query};
+    use super::{
+        build_app_redirect, is_allowed_redirect, legacy_callback_allowed_at, redirect_with_query,
+    };
 
     #[test]
     fn redirect_allowlist_accepts_supported_catmos_targets() {
@@ -936,6 +1038,19 @@ mod redirect_tests {
     }
 
     #[test]
+    fn exchange_callback_url_contains_code_but_never_session_credential() {
+        let location = redirect_with_query(
+            "https://catmos.catbird.blue/auth/callback",
+            "code",
+            "opaque-exchange-code",
+        )
+        .unwrap();
+        assert!(location.contains("code=opaque-exchange-code"));
+        assert!(!location.contains("session_id"));
+        assert!(!location.contains("live-session-credential"));
+    }
+
+    #[test]
     fn legacy_redirect_uses_the_same_validation_policy() {
         let allowed_state = serde_json::json!({
             "redirect_to": "https://preview.catmos.pages.dev/auth/callback"
@@ -954,5 +1069,15 @@ mod redirect_tests {
             build_app_redirect(&rejected_state, "secret"),
             "https://catbird.blue/oauth/callback#session_id=secret"
         );
+    }
+
+    #[test]
+    fn legacy_callback_window_is_explicit_and_bounded() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(legacy_callback_allowed_at("2026-07-12T12:00:01Z", now));
+        assert!(!legacy_callback_allowed_at("2026-07-12T12:00:00Z", now));
+        assert!(!legacy_callback_allowed_at("not-a-deadline", now));
     }
 }
