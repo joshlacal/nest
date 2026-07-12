@@ -380,18 +380,26 @@ fn is_allowed_redirect(r: &str) -> bool {
                         .unwrap_or(false)
                 }) || host.ends_with(".catmos.pages.dev"))
         }
-        "http" => {
-            let Some(port) = url.port() else {
-                return false;
-            };
-            let authority = r
-                .strip_prefix("http://")
-                .and_then(|rest| rest.split(['/', '?', '#']).next());
-            authority == Some(format!("127.0.0.1:{port}").as_str())
-                || authority == Some(format!("[::1]:{port}").as_str())
-        }
+        "http" => explicit_loopback_port(r).is_some(),
         _ => false,
     }
+}
+
+fn explicit_loopback_port(target: &str) -> Option<u16> {
+    let authority = target
+        .strip_prefix("http://")?
+        .split(['/', '?', '#'])
+        .next()?;
+    let port = authority
+        .strip_prefix("127.0.0.1:")
+        .or_else(|| authority.strip_prefix("[::1]:"))?;
+
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let port = port.parse::<u32>().ok()?;
+    (1..=u16::MAX as u32).contains(&port).then_some(port as u16)
 }
 
 fn redirect_with_query(target: &str, key: &str, value: &str) -> Option<String> {
@@ -865,7 +873,9 @@ mod redirect_tests {
             "https://catmos.pages.dev/auth/callback?client=web",
             "https://pr-42.catmos.pages.dev/callback",
             "http://127.0.0.1:1420/callback",
+            "http://127.0.0.1:80/callback",
             "http://[::1]:49152/auth/callback",
+            "http://[::1]:80/auth/callback",
         ];
 
         for target in accepted {
@@ -884,6 +894,10 @@ mod redirect_tests {
             "https://pr-42.catmos.pages.dev:8443/callback",
             "http://localhost:1420/callback",
             "http://192.168.1.10:1420/callback",
+            "http://127.0.0.1/callback",
+            "http://[::1]/callback",
+            "http://127.0.0.1:0/callback",
+            "http://[::1]:0/callback",
             "http://127.1:1420/callback",
             "http://2130706433:1420/callback",
             "https://evilcatmos.pages.dev/callback",
