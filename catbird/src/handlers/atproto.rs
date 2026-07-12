@@ -71,12 +71,20 @@ fn exchange_store(state: &AppState) -> Result<ExchangeStore, AppError> {
 }
 
 fn legacy_callback_allowed() -> bool {
-    let Ok(deadline) = std::env::var("OAUTH_LEGACY_CALLBACK_UNTIL") else {
-        return false;
-    };
-    legacy_callback_allowed_at(&deadline, chrono::Utc::now())
+    static DEADLINE: std::sync::OnceLock<Option<chrono::DateTime<chrono::FixedOffset>>> =
+        std::sync::OnceLock::new();
+    DEADLINE
+        .get_or_init(|| {
+            std::env::var("OAUTH_LEGACY_CALLBACK_UNTIL")
+                .ok()
+                .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(&deadline).ok())
+        })
+        .as_ref()
+        .map(|deadline| deadline > &chrono::Utc::now())
+        .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn legacy_callback_allowed_at(deadline: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
     chrono::DateTime::parse_from_rfc3339(deadline)
         .map(|deadline| deadline > now)
