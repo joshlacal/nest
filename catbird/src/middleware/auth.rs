@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::config::AppState;
 use crate::error::AppError;
+use crate::handlers::atproto::AuthenticatedSessionId;
 use crate::models::CatbirdSession;
 use chrono::Utc;
 
@@ -151,6 +152,8 @@ pub async fn auth_middleware(
 
     match resolve_session_via_jacquard(auth_store, jacquard_client, &session_id).await {
         Ok((session, dpop_data)) => {
+            req.extensions_mut()
+                .insert(AuthenticatedSessionId::new(session_id));
             req.extensions_mut().insert(session);
             req.extensions_mut().insert(dpop_data);
             Ok(next.run(req).await)
@@ -257,6 +260,13 @@ mod tests {
             extract_session_id(&request),
             Some("cookie-token".to_string())
         );
+    }
+
+    #[test]
+    fn authenticated_session_capability_preserves_non_uuid_bearer_exactly() {
+        let capability = AuthenticatedSessionId::new("opaque.non-uuid/session-token");
+        assert_eq!(capability.as_str(), "opaque.non-uuid/session-token");
+        assert!(!format!("{capability:?}").contains("opaque.non-uuid/session-token"));
     }
 
     #[test]

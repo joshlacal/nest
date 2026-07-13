@@ -26,3 +26,8 @@ redirect_uri = "http://localhost:3000/auth/callback"
 # active_key_id = "catbird-key-2"  # Which key to use for signing
 
 scopes = ["atproto", "transition:generic", "transition:chat.bsky"]
+
+[mls]
+# The externally verified origin used by mls-ds for RFC 9449 DPoP proofs.
+# Internal `service_url` may use loopback HTTP, but this origin must be HTTPS.
+proof_origin = "https://mlschat.catbird.blue"
