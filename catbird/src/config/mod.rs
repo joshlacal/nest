@@ -7,6 +7,9 @@ use serde::Deserialize;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::sync::Arc;
 
+#[path = "../services/outbound_policy.rs"]
+pub mod outbound_policy;
+
 pub fn sanitized_redis_endpoint(redis_url: &str) -> String {
     let Ok(url) = url::Url::parse(redis_url) else {
         return "<invalid Redis URL>".to_string();
@@ -245,7 +248,7 @@ impl AppConfig {
 
 /// Concrete Jacquard OAuth client type used throughout nest.
 pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
-    jacquard_identity::JacquardResolver,
+    outbound_policy::PolicyOAuthResolver,
     crate::services::RedisAuthStore,
 >;
 
@@ -254,6 +257,7 @@ pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
+    pub outbound_policy: outbound_policy::OutboundPolicy,
     pub redis: redis::aio::ConnectionManager,
     pub push_db: Option<Pool<Postgres>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
@@ -287,6 +291,7 @@ impl AppState {
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
@@ -295,6 +300,7 @@ impl AppState {
         let mut state = Self {
             config: Arc::new(config),
             http_client,
+            outbound_policy: outbound_policy::OutboundPolicy,
             redis,
             push_db,
             key_store: None,
@@ -473,11 +479,11 @@ impl AppState {
     /// Nest handles low-volume OAuth login flows where correctness matters more
     /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
     /// stale identity data to persist indefinitely when users retried login.
-    fn build_resolver() -> jacquard_identity::JacquardResolver {
+    fn build_resolver() -> outbound_policy::PolicyOAuthResolver {
         let resolver = jacquard_identity::JacquardResolver::new(
-            reqwest::Client::new(),
+            outbound_policy::OutboundPolicy,
             jacquard_identity::resolver::ResolverOptions::default(),
         );
-        resolver.with_system_dns()
+        outbound_policy::PolicyOAuthResolver::new(resolver.with_system_dns())
     }
 }

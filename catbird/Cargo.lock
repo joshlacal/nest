@@ -2572,8 +2572,6 @@ dependencies = [
 [[package]]
 name = "jacquard-identity"
 version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7aaefa819fa4213cf59f180dba932f018a7cd0599582fd38474ee2a38c16cf2"
 dependencies = [
  "bon",
  "bytes",
