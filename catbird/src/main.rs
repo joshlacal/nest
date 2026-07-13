@@ -64,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(state);
 
-    tracing::info!("Connected to Redis at {}", app_config.redis.url);
+    tracing::info!(
+        endpoint = %config::sanitized_redis_endpoint(&app_config.redis.url),
+        "Connected to Redis"
+    );
 
     // Register Prometheus metrics
     metrics::register_metrics();
