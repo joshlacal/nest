@@ -67,6 +67,31 @@ fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
 }
 
+impl MlsConfig {
+    fn validate_and_normalize(&mut self) -> Result<(), String> {
+        let Some(value) = self.gateway_did.as_deref() else {
+            return Ok(());
+        };
+        if value.trim() != value || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err("MLS gateway DID is not canonical".into());
+        }
+        let canonical = value.split_once('#').map_or(value, |(did, _)| did);
+        let Some((method, identifier)) = canonical
+            .strip_prefix("did:")
+            .and_then(|rest| rest.split_once(':'))
+        else {
+            return Err("MLS gateway DID is invalid".into());
+        };
+        if method.is_empty() || identifier.is_empty() {
+            return Err("MLS gateway DID is invalid".into());
+        }
+        if canonical != value {
+            self.gateway_did = Some(canonical.to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PushConfig {
     /// Shared Postgres URL used by Nest and catbird-firehose
@@ -246,7 +271,12 @@ impl AppConfig {
             )
             .build()?;
 
-        config.try_deserialize()
+        let mut config: Self = config.try_deserialize()?;
+        config
+            .mls
+            .validate_and_normalize()
+            .map_err(config::ConfigError::Message)?;
+        Ok(config)
     }
 }
 
@@ -276,7 +306,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
+    pub async fn new(mut config: AppConfig) -> Result<Self, anyhow::Error> {
+        config
+            .mls
+            .validate_and_normalize()
+            .map_err(anyhow::Error::msg)?;
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
                 let pool = PgPoolOptions::new()
@@ -489,5 +523,36 @@ impl AppState {
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         outbound_policy::PolicyOAuthResolver::new(resolver.with_system_dns())
+    }
+}
+
+#[cfg(test)]
+mod mls_config_tests {
+    use super::MlsConfig;
+
+    #[test]
+    fn gateway_did_is_canonicalized_once_and_invalid_configuration_fails() {
+        let mut configured = MlsConfig {
+            gateway_did: Some("did:web:api.catbird.blue#gateway-key".to_string()),
+            ..MlsConfig::default()
+        };
+        configured.validate_and_normalize().unwrap();
+        assert_eq!(
+            configured.gateway_did.as_deref(),
+            Some("did:web:api.catbird.blue")
+        );
+
+        for invalid in [
+            " did:web:api.catbird.blue",
+            "did:web:api catbird.blue",
+            "not-a-did",
+            "did:web:",
+        ] {
+            let mut configured = MlsConfig {
+                gateway_did: Some(invalid.to_string()),
+                ..MlsConfig::default()
+            };
+            assert!(configured.validate_and_normalize().is_err());
+        }
     }
 }

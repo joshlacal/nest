@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const BEGIN_BINDING_NSID: &str = "blue.catbird.mlsChat.beginDeviceAuthBinding";
 pub(crate) const COMPLETE_BINDING_NSID: &str = "blue.catbird.mlsChat.completeDeviceAuthBinding";
+const MAX_CHALLENGE_LIFETIME: Duration = Duration::minutes(10);
+const CHALLENGE_CLOCK_SKEW: Duration = Duration::seconds(30);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingBinding {
@@ -93,8 +95,9 @@ fn valid_opaque_id(value: &str, max: usize) -> bool {
 }
 
 fn canonical_device_uuid(value: &str) -> bool {
+    let mut encoded = [0_u8; uuid::fmt::Hyphenated::LENGTH];
     uuid::Uuid::parse_str(value)
-        .map(|uuid| uuid.hyphenated().to_string() == value)
+        .map(|uuid| uuid.hyphenated().encode_lower(&mut encoded) == value)
         .unwrap_or(false)
 }
 
@@ -127,7 +130,7 @@ pub(crate) fn parse_begin_response(
         || !valid_opaque_id(&response.challenge_id, 128)
         || !(1..=512).contains(&challenge_len)
         || response.expires_at <= now
-        || response.expires_at > now + Duration::minutes(10)
+        || response.expires_at > now + MAX_CHALLENGE_LIFETIME + CHALLENGE_CLOCK_SKEW
     {
         return Err("invalid begin binding response".to_string());
     }
@@ -222,6 +225,10 @@ pub(crate) fn authoritative_device_id<'a>(
     }
 }
 
+fn cluster_binding_key(prefix: &str, suffix: &str) -> String {
+    format!("{{catbird-mls-binding}}:{prefix}mls_binding:{suffix}")
+}
+
 #[derive(Clone)]
 pub(crate) struct MlsDeviceBindingStore {
     redis: redis::aio::ConnectionManager,
@@ -250,26 +257,30 @@ impl MlsDeviceBindingStore {
     }
 
     fn pending_key(&self, challenge_id: &str) -> String {
-        format!(
-            "{}mls_binding:pending:{}",
-            self.key_prefix,
-            self.keyring.opaque_id("mls-device-pending", challenge_id)
+        cluster_binding_key(
+            &self.key_prefix,
+            &format!(
+                "pending:{}",
+                self.keyring.opaque_id("mls-device-pending", challenge_id)
+            ),
         )
     }
 
     fn bound_key_for_binding(&self, session_binding_id: &str) -> String {
-        format!("{}mls_binding:bound:{session_binding_id}", self.key_prefix)
+        cluster_binding_key(&self.key_prefix, &format!("bound:{session_binding_id}"))
     }
 
     fn index_key_for_binding(&self, session_binding_id: &str) -> String {
-        format!("{}mls_binding:index:{session_binding_id}", self.key_prefix)
+        cluster_binding_key(&self.key_prefix, &format!("index:{session_binding_id}"))
     }
 
     fn device_owner_key(&self, device_id: &str) -> String {
-        format!(
-            "{}mls_binding:device:{}",
-            self.key_prefix,
-            self.keyring.opaque_id("mls-device-id", device_id)
+        cluster_binding_key(
+            &self.key_prefix,
+            &format!(
+                "device:{}",
+                self.keyring.opaque_id("mls-device-id", device_id)
+            ),
         )
     }
 
@@ -295,12 +306,16 @@ impl MlsDeviceBindingStore {
                 "invalid MLS device binding response".into(),
             ));
         }
-        let ttl = (response.expires_at - now).num_seconds();
-        if !(1..=600).contains(&ttl) {
+        let upstream_ttl = (response.expires_at - now).num_seconds();
+        if !(1..=(MAX_CHALLENGE_LIFETIME + CHALLENGE_CLOCK_SKEW).num_seconds())
+            .contains(&upstream_ttl)
+        {
             return Err(crate::error::AppError::BadRequest(
                 "invalid MLS device binding expiry".into(),
             ));
         }
+        let expires_at = response.expires_at.min(now + MAX_CHALLENGE_LIFETIME);
+        let ttl = (expires_at - now).num_seconds();
         let session_binding_id = self.session_binding_id(session_id);
         let pending = PendingBinding {
             session_binding_id: session_binding_id.clone(),
@@ -309,7 +324,7 @@ impl MlsDeviceBindingStore {
             device_id: device_id.to_string(),
             challenge_id: response.challenge_id.clone(),
             challenge,
-            expires_at: response.expires_at,
+            expires_at,
         };
         let pending_key = self.pending_key(&pending.challenge_id);
         let index_key = self.index_key_for_binding(&session_binding_id);
@@ -746,6 +761,23 @@ mod tests {
     }
 
     #[test]
+    fn begin_response_tolerates_bounded_issuer_clock_skew() {
+        let now = Utc::now();
+        let challenge = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        let tolerated = (now + Duration::minutes(10) + Duration::seconds(30)).to_rfc3339();
+        let body = format!(
+            r#"{{"challengeId":"challenge-skew","challenge":{{"$bytes":"{challenge}"}},"expiresAt":"{tolerated}","bindingVersion":1}}"#
+        );
+        assert!(parse_begin_response(body.as_bytes(), now).is_ok());
+
+        let excessive = (now + Duration::minutes(10) + Duration::seconds(31)).to_rfc3339();
+        let body = format!(
+            r#"{{"challengeId":"challenge-skew","challenge":{{"$bytes":"{challenge}"}},"expiresAt":"{excessive}","bindingVersion":1}}"#
+        );
+        assert!(parse_begin_response(body.as_bytes(), now).is_err());
+    }
+
+    #[test]
     fn complete_response_must_name_the_exact_pending_device() {
         let now = Utc::now();
         let body = format!(
@@ -837,6 +869,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_binding_key_uses_the_first_stable_redis_cluster_hash_tag() {
+        fn first_hash_tag(key: &str) -> Option<&str> {
+            let start = key.find('{')? + 1;
+            let end = key[start..].find('}')? + start;
+            (end > start).then_some(&key[start..end])
+        }
+
+        for suffix in [
+            "pending:challenge",
+            "bound:session",
+            "index:session",
+            "device:identifier",
+        ] {
+            let key = cluster_binding_key("tenant:{hostile-prefix}:", suffix);
+            assert_eq!(first_hash_tag(&key), Some("catbird-mls-binding"));
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_REDIS_URL"]
     async fn redis_binding_lifecycle_is_atomic_session_bound_and_restart_safe() {
@@ -854,7 +905,7 @@ mod tests {
             challenge: AtprotoBytes {
                 encoded: base64::engine::general_purpose::STANDARD.encode([3u8; 32]),
             },
-            expires_at: Utc::now() + Duration::minutes(5),
+            expires_at: Utc::now() + MAX_CHALLENGE_LIFETIME + CHALLENGE_CLOCK_SKEW,
             binding_version: 1,
         };
 
@@ -868,9 +919,16 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(pending.expires_at <= Utc::now() + MAX_CHALLENGE_LIFETIME);
         let mut conn = manager.clone();
+        let pending_ttl: i64 = redis::cmd("TTL")
+            .arg(store.pending_key("challenge-redis"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!((1..=MAX_CHALLENGE_LIFETIME.num_seconds()).contains(&pending_ttl));
         let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(format!("{prefix}*"))
+            .arg(format!("{{catbird-mls-binding}}:{prefix}*"))
             .query_async(&mut conn)
             .await
             .unwrap();
@@ -1065,7 +1123,7 @@ mod tests {
         assert!(race_owner.is_none());
 
         let remaining: Vec<String> = redis::cmd("KEYS")
-            .arg(format!("{prefix}*"))
+            .arg(format!("{{catbird-mls-binding}}:{prefix}*"))
             .query_async(&mut conn)
             .await
             .unwrap();

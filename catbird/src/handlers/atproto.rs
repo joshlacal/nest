@@ -11,7 +11,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{FromRequestParts, Path, Query, RawQuery, State},
     http::{request::Parts, HeaderMap, Method, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -653,53 +653,128 @@ fn build_app_redirect(state_str: &str, session_id: &str) -> String {
 /// Handle logout
 ///
 /// POST /auth/logout
-pub(crate) async fn logout(
-    State(state): State<Arc<AppState>>,
-    Extension(session): Extension<CatbirdSession>,
-    Extension(authenticated_session_id): Extension<AuthenticatedSessionId>,
-    jar: CookieJar,
-) -> AppResult<(CookieJar, Json<LogoutResponse>)> {
-    let jacquard_client = state
-        .jacquard_client
-        .as_ref()
-        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+async fn ordered_logout<Revoke, RevokeFuture, Delete, DeleteFuture>(
+    revoke: Revoke,
+    delete_bindings: Delete,
+) -> AppResult<()>
+where
+    Revoke: FnOnce() -> RevokeFuture,
+    RevokeFuture: std::future::Future<Output = AppResult<()>>,
+    Delete: FnOnce() -> DeleteFuture,
+    DeleteFuture: std::future::Future<Output = AppResult<()>>,
+{
+    let revoke_result = revoke().await;
+    let delete_result = delete_bindings().await;
+    match (revoke_result, delete_result) {
+        (Err(revoke_error), _) => Err(revoke_error),
+        (Ok(()), Err(delete_error)) => Err(delete_error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
 
-    // Remove all MLS authority first. If registry revocation then fails, the
-    // browser remains logged in but can no longer reuse the old MLS binding.
-    mls_device_binding_store(&state)?
-        .delete_session(authenticated_session_id.as_str())
-        .await
-        .map_err(record_mls_binding_error)?;
-
-    // Revoke via Jacquard (handles token revocation at auth server + store cleanup).
-    // Logout is not reported as successful unless registry deletion succeeds.
-    let did = jacquard_common::types::did::Did::new(&session.did)
-        .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
-
-    jacquard_client
-        .revoke(&did, authenticated_session_id.as_str())
-        .await
-        .map_err(|_| {
-            AppError::AuthTemporarilyUnavailable(
-                "Logout could not revoke the authenticated session".into(),
-            )
-        })?;
-
+fn finish_logout(jar: CookieJar, result: AppResult<()>) -> Response {
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
         .http_only(true)
         .max_age(time::Duration::ZERO)
         .build();
+    let jar = jar.remove(cookie);
+    match result {
+        Ok(()) => (
+            jar,
+            Json(LogoutResponse {
+                success: true,
+                message: "Logged out".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (jar, error).into_response(),
+    }
+}
 
-    tracing::info!("User {} logged out successfully", session.did);
+pub(crate) async fn logout(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    Extension(authenticated_session_id): Extension<AuthenticatedSessionId>,
+    jar: CookieJar,
+) -> Response {
+    let result = async {
+        let jacquard_client = state
+            .jacquard_client
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+        let binding_store = mls_device_binding_store(&state)?;
+        let did = jacquard_common::types::did::Did::new(&session.did)
+            .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
 
-    Ok((
-        jar.remove(cookie),
-        Json(LogoutResponse {
-            success: true,
-            message: "Logged out".to_string(),
-        }),
-    ))
+        ordered_logout(
+            || async {
+                jacquard_client
+                    .revoke(&did, authenticated_session_id.as_str())
+                    .await
+                    .map_err(|_| {
+                        AppError::AuthTemporarilyUnavailable(
+                            "Logout could not revoke the authenticated session".into(),
+                        )
+                    })
+            },
+            || async {
+                binding_store
+                    .delete_session(authenticated_session_id.as_str())
+                    .await
+                    .map_err(record_mls_binding_error)
+            },
+        )
+        .await
+    }
+    .await;
+
+    if result.is_ok() {
+        tracing::info!("User {} logged out successfully", session.did);
+    }
+    finish_logout(jar, result)
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn upstream_revoke_failure_still_deletes_bindings_and_expires_browser_cookie() {
+        let delete_called = Arc::new(AtomicBool::new(false));
+        let delete_observer = delete_called.clone();
+        let result = ordered_logout(
+            || async {
+                Err(AppError::AuthTemporarilyUnavailable(
+                    "upstream unavailable".into(),
+                ))
+            },
+            move || async move {
+                delete_observer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(delete_called.load(Ordering::SeqCst));
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
+        let jar = CookieJar::from_headers(&request_headers);
+        let response = finish_logout(jar, result);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let set_cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("catbird_session="))
+            .unwrap_or_else(|| panic!("session removal cookie: {:?}", response.headers()));
+        assert!(set_cookie.contains("Max-Age=0"));
+        assert!(!set_cookie.contains("browser-session"));
+    }
 }
 
 /// Get current session info

@@ -92,23 +92,6 @@ struct DelegatedAuthRequest<'a> {
     proof_origin: &'a MlsProofOrigin,
 }
 
-pub(crate) fn canonical_gateway_did(value: &str) -> AppResult<String> {
-    if value.trim() != value || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return Err(AppError::Config("MLS gateway DID is not canonical".into()));
-    }
-    let canonical = value.split_once('#').map_or(value, |(did, _)| did);
-    let Some((method, identifier)) = canonical
-        .strip_prefix("did:")
-        .and_then(|rest| rest.split_once(':'))
-    else {
-        return Err(AppError::Config("MLS gateway DID is invalid".into()));
-    };
-    if method.is_empty() || identifier.is_empty() {
-        return Err(AppError::Config("MLS gateway DID is invalid".into()));
-    }
-    Ok(canonical.to_string())
-}
-
 pub(crate) fn public_p256_jwk(key: &jose_jwk::Key) -> AppResult<serde_json::Value> {
     let jose_jwk::Key::Ec(ec) = key else {
         return Err(AppError::Crypto("session DPoP key must be P-256".into()));
@@ -202,7 +185,6 @@ fn issue_delegated_auth(request: DelegatedAuthRequest<'_>) -> AppResult<Delegate
         method,
         proof_origin,
     } = request;
-    let gateway_did = canonical_gateway_did(gateway_did)?;
     let jkt = session_p256_jkt(session_dpop_key)?;
     let now = Utc::now().timestamp();
     let mut claims = json!({
@@ -502,26 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_did_fragments_are_canonicalized_without_accepting_whitespace() {
-        assert_eq!(
-            canonical_gateway_did("did:web:api.catbird.blue#gateway-key").unwrap(),
-            "did:web:api.catbird.blue"
-        );
-        assert_eq!(
-            canonical_gateway_did("did:plc:gateway").unwrap(),
-            "did:plc:gateway"
-        );
-        for invalid in [
-            " did:web:api.catbird.blue",
-            "did:web:api.catbird.blue ",
-            "did:web:api catbird.blue",
-            "did:web:",
-        ] {
-            assert!(canonical_gateway_did(invalid).is_err());
-        }
-    }
-
-    #[test]
     fn rfc7638_thumbprint_accepts_public_metadata_but_rejects_private_material() {
         let key = session_dpop_key();
         let session_jkt = session_p256_jkt(&key).unwrap();
@@ -548,7 +510,7 @@ mod tests {
         let first = issue_delegated_auth(DelegatedAuthRequest {
             gateway_signing_key: &gateway_signing,
             gateway_kid: "gateway-kid",
-            gateway_did: "did:web:api.catbird.blue#gateway-kid",
+            gateway_did: "did:web:api.catbird.blue",
             service_did: "did:web:mlschat.catbird.blue",
             user_did: "did:plc:alice",
             lexicon: "blue.catbird.mlsChat.commitGroupChange",
@@ -561,7 +523,7 @@ mod tests {
         let second = issue_delegated_auth(DelegatedAuthRequest {
             gateway_signing_key: &gateway_signing,
             gateway_kid: "gateway-kid",
-            gateway_did: "did:web:api.catbird.blue#gateway-kid",
+            gateway_did: "did:web:api.catbird.blue",
             service_did: "did:web:mlschat.catbird.blue",
             user_did: "did:plc:alice",
             lexicon: "blue.catbird.mlsChat.commitGroupChange",
