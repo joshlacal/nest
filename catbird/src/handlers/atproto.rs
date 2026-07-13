@@ -320,7 +320,7 @@ async fn resolve_handle_for_did(state: &AppState, did: &str, pds_url: &str) -> S
 
     match state
         .outbound_policy
-        .send(
+        .send_discovery(
             reqwest::Method::GET,
             &describe_url,
             reqwest::header::HeaderMap::new(),
@@ -328,14 +328,16 @@ async fn resolve_handle_for_did(state: &AppState, did: &str, pds_url: &str) -> S
         )
         .await
     {
-        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-            Ok(json) => json
-                .get("handle")
-                .and_then(|h| h.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| did.to_string()),
-            Err(_) => did.to_string(),
-        },
+        Ok((status, _, body)) if status.is_success() => {
+            match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(json) => json
+                    .get("handle")
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| did.to_string()),
+                Err(_) => did.to_string(),
+            }
+        }
         _ => did.to_string(),
     }
 }

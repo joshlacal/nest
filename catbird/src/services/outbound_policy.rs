@@ -1,5 +1,6 @@
 //! Validated, DNS-pinned transport for requests to attacker-selected hosts.
 
+use futures_util::{pin_mut, Stream, StreamExt};
 use jacquard_common::http_client::HttpClient;
 use jacquard_common::types::{did::Did, string::Handle};
 use jacquard_identity::resolver::{DidDocResponse, IdentityResolver, ResolverOptions};
@@ -13,6 +14,12 @@ use std::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECT_HOPS: usize = 3;
+/// OAuth metadata, identity documents, and post-login profile enrichment are
+/// compact JSON/text documents. One MiB leaves ample room for real DID docs
+/// while preventing discovery endpoints from turning a login into an
+/// unbounded allocation. The authenticated XRPC proxy keeps its separate
+/// 50 MiB response policy.
+const DISCOVERY_RESPONSE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PolicyError(String);
@@ -142,6 +149,24 @@ impl OutboundPolicy {
             .map(|(response, _)| response)
     }
 
+    /// Send a discovery/enrichment request and collect its body under the
+    /// policy's one-MiB byte budget and the same absolute request deadline.
+    pub async fn send_discovery(
+        &self,
+        method: Method,
+        input: &str,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+    ) -> Result<(reqwest::StatusCode, HeaderMap, bytes::Bytes), PolicyError> {
+        let (response, deadline) = self
+            .send_bounded(method, input, headers, body, REQUEST_TIMEOUT)
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = read_response_bounded(response, DISCOVERY_RESPONSE_LIMIT, deadline).await?;
+        Ok((status, headers, body))
+    }
+
     async fn send_bounded(
         &self,
         mut method: Method,
@@ -225,6 +250,60 @@ impl OutboundPolicy {
     }
 }
 
+async fn read_response_bounded(
+    response: Response,
+    max_bytes: usize,
+    deadline: tokio::time::Instant,
+) -> Result<bytes::Bytes, PolicyError> {
+    let content_length = response.content_length();
+    collect_bounded_stream(response.bytes_stream(), content_length, max_bytes, deadline).await
+}
+
+async fn collect_bounded_stream<S, E>(
+    stream: S,
+    content_length: Option<u64>,
+    max_bytes: usize,
+    deadline: tokio::time::Instant,
+) -> Result<bytes::Bytes, PolicyError>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+    E: fmt::Display,
+{
+    if content_length.is_some_and(|length| length > max_bytes as u64) {
+        return Err(PolicyError(format!(
+            "response Content-Length exceeds {max_bytes}-byte limit"
+        )));
+    }
+
+    let collect = async move {
+        pin_mut!(stream);
+        let initial_capacity = content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes);
+        let mut body = Vec::with_capacity(initial_capacity);
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| PolicyError(format!("response read failed: {error}")))?;
+            let next_size = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| PolicyError("response byte limit exceeded".into()))?;
+            if next_size > max_bytes {
+                return Err(PolicyError(format!(
+                    "response byte limit exceeded ({max_bytes} bytes)"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(bytes::Bytes::from(body))
+    };
+
+    tokio::time::timeout_at(deadline, collect)
+        .await
+        .map_err(|_| PolicyError("outbound request deadline exceeded reading body".into()))?
+}
+
 impl HttpClient for OutboundPolicy {
     type Error = PolicyError;
 
@@ -246,10 +325,7 @@ impl HttpClient for OutboundPolicy {
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = tokio::time::timeout_at(deadline, response.bytes())
-            .await
-            .map_err(|_| PolicyError("outbound request deadline exceeded reading body".into()))?
-            .map_err(|e| PolicyError(format!("response read failed: {e}")))?;
+        let bytes = read_response_bounded(response, DISCOVERY_RESPONSE_LIMIT, deadline).await?;
         let mut builder = http::Response::builder().status(status);
         *builder.headers_mut().expect("response builder headers") = headers;
         builder
@@ -360,7 +436,10 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures_util::stream;
     use reqwest::StatusCode;
+    use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -519,5 +598,74 @@ mod tests {
             jacquard_identity::JacquardResolver::new(OutboundPolicy, ResolverOptions::default());
         let did = Did::new("did:web:127.0.0.1").unwrap();
         assert!(resolver.resolve_did_doc(&did).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_body_rejects_declared_oversize_before_polling() {
+        let body = stream::pending::<Result<Bytes, io::Error>>();
+        let error = collect_bounded_stream(
+            body,
+            Some((DISCOVERY_RESPONSE_LIMIT + 1) as u64),
+            DISCOVERY_RESPONSE_LIMIT,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Content-Length"));
+    }
+
+    #[tokio::test]
+    async fn bounded_body_rejects_chunked_oversize_without_content_length() {
+        let body = stream::iter([
+            Ok::<_, io::Error>(Bytes::from(vec![0_u8; DISCOVERY_RESPONSE_LIMIT])),
+            Ok(Bytes::from_static(b"x")),
+        ]);
+        let error = collect_bounded_stream(
+            body,
+            None,
+            DISCOVERY_RESPONSE_LIMIT,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("response byte limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn bounded_body_accepts_exact_limit_without_content_length() {
+        let body = stream::iter([Ok::<_, io::Error>(Bytes::from(vec![
+            0_u8;
+            DISCOVERY_RESPONSE_LIMIT
+        ]))]);
+        let bytes = collect_bounded_stream(
+            body,
+            None,
+            DISCOVERY_RESPONSE_LIMIT,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes.len(), DISCOVERY_RESPONSE_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_body_uses_the_existing_absolute_deadline() {
+        let body = stream::once(async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok::<_, io::Error>(Bytes::from_static(b"late"))
+        });
+        let error = collect_bounded_stream(
+            body,
+            None,
+            DISCOVERY_RESPONSE_LIMIT,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("deadline exceeded reading body"));
     }
 }
