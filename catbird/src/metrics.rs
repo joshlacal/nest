@@ -44,6 +44,11 @@ lazy_static! {
         &["status"]
     ).unwrap();
 
+    pub static ref OAUTH_EXCHANGES_TOTAL: CounterVec = CounterVec::new(
+        Opts::new("catbird_oauth_exchanges_total", "OAuth callback exchange outcomes"),
+        &["outcome"]
+    ).unwrap();
+
     pub static ref TOKEN_REFRESHES_TOTAL: CounterVec = CounterVec::new(
         Opts::new("catbird_token_refreshes_total", "Total token refresh attempts"),
         &["status"]
@@ -75,6 +80,9 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(PROXY_DURATION.clone())).unwrap();
     REGISTRY
         .register(Box::new(OAUTH_LOGINS_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(OAUTH_EXCHANGES_TOTAL.clone()))
         .unwrap();
     REGISTRY
         .register(Box::new(TOKEN_REFRESHES_TOTAL.clone()))
@@ -120,6 +128,10 @@ pub fn record_proxy_request(lexicon: &str, status: u16, duration_secs: f64) {
 pub fn record_oauth_login(success: bool) {
     let status = if success { "success" } else { "failure" };
     OAUTH_LOGINS_TOTAL.with_label_values(&[status]).inc();
+}
+
+pub fn record_oauth_exchange(outcome: &str) {
+    OAUTH_EXCHANGES_TOTAL.with_label_values(&[outcome]).inc();
 }
 
 /// Record a token refresh attempt
