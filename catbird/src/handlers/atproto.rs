@@ -9,8 +9,8 @@ mod exchange_store;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, RawQuery, State},
-    http::{HeaderMap, Method, StatusCode},
+    extract::{FromRequestParts, Path, Query, RawQuery, State},
+    http::{request::Parts, HeaderMap, Method, StatusCode},
     response::Response,
     Extension, Json,
 };
@@ -24,11 +24,79 @@ use std::sync::Arc;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::metrics;
+use crate::metrics::MlsDeviceBindingOutcome;
 use crate::middleware::JacquardDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{CatbirdSession, LogoutResponse, OAuthCallback, SessionInfo};
-use crate::services::{AtProtoClient, MlsAuthService, ProxyResponse};
+use crate::services::{
+    authoritative_device_id, parse_begin_input, parse_begin_response, parse_complete_input,
+    parse_complete_response, session_p256_jkt, AtProtoClient, MlsAuthService,
+    MlsDeviceBindingStore, MlsProxyRequest, ProxyResponse, BEGIN_BINDING_NSID,
+    COMPLETE_BINDING_NSID,
+};
 use exchange_store::{ExchangeError, ExchangeStore};
+
+/// Exact authenticated session capability. This never leaves request
+/// extensions and deliberately redacts its bearer value from Debug output.
+#[derive(Clone)]
+pub(crate) struct AuthenticatedSessionId(String);
+
+impl AuthenticatedSessionId {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthenticatedSessionId([REDACTED])")
+    }
+}
+
+pub(crate) struct AuthenticatedProxyContext {
+    session: CatbirdSession,
+    session_id: AuthenticatedSessionId,
+    request_id: Option<crate::middleware::RequestId>,
+    dpop: Option<JacquardDpopData>,
+}
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for AuthenticatedProxyContext
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let session = parts
+            .extensions
+            .get::<CatbirdSession>()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Unauthorized("Authenticated session context unavailable".into())
+            })?;
+        let session_id = parts
+            .extensions
+            .get::<AuthenticatedSessionId>()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Unauthorized("Authenticated session capability unavailable".into())
+            })?;
+        Ok(Self {
+            session,
+            session_id,
+            request_id: parts
+                .extensions
+                .get::<crate::middleware::RequestId>()
+                .cloned(),
+            dpop: parts.extensions.get::<JacquardDpopData>().cloned(),
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +136,31 @@ fn exchange_store(state: &AppState) -> Result<ExchangeStore, AppError> {
         state.config.redis.key_prefix.clone(),
         keyring,
     ))
+}
+
+fn mls_device_binding_store(state: &AppState) -> Result<MlsDeviceBindingStore, AppError> {
+    let keyring = state
+        .auth_store
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("MLS device binding store unavailable".into()))?
+        .encryption_keyring();
+    Ok(MlsDeviceBindingStore::new(
+        state.redis.clone(),
+        state.config.redis.key_prefix.clone(),
+        state.config.redis.session_ttl_seconds,
+        keyring,
+    ))
+}
+
+fn record_mls_binding_error(error: AppError) -> AppError {
+    let outcome = match &error {
+        AppError::Redis(_) | AppError::Crypto(_) | AppError::Internal(_) => {
+            MlsDeviceBindingOutcome::StoreFailure
+        }
+        _ => MlsDeviceBindingOutcome::Denied,
+    };
+    metrics::record_mls_device_binding(outcome);
+    error
 }
 
 fn legacy_callback_allowed() -> bool {
@@ -560,9 +653,10 @@ fn build_app_redirect(state_str: &str, session_id: &str) -> String {
 /// Handle logout
 ///
 /// POST /auth/logout
-pub async fn logout(
+pub(crate) async fn logout(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
+    Extension(authenticated_session_id): Extension<AuthenticatedSessionId>,
     jar: CookieJar,
 ) -> AppResult<(CookieJar, Json<LogoutResponse>)> {
     let jacquard_client = state
@@ -570,14 +664,26 @@ pub async fn logout(
         .as_ref()
         .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
 
-    // Revoke via Jacquard (handles token revocation at auth server + store cleanup)
+    // Remove all MLS authority first. If registry revocation then fails, the
+    // browser remains logged in but can no longer reuse the old MLS binding.
+    mls_device_binding_store(&state)?
+        .delete_session(authenticated_session_id.as_str())
+        .await
+        .map_err(record_mls_binding_error)?;
+
+    // Revoke via Jacquard (handles token revocation at auth server + store cleanup).
+    // Logout is not reported as successful unless registry deletion succeeds.
     let did = jacquard_common::types::did::Did::new(&session.did)
         .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
 
-    if let Err(e) = jacquard_client.revoke(&did, &session.id.to_string()).await {
-        tracing::warn!("Failed to revoke Jacquard session: {}", e);
-        // Continue with logout even if revocation fails
-    }
+    jacquard_client
+        .revoke(&did, authenticated_session_id.as_str())
+        .await
+        .map_err(|_| {
+            AppError::AuthTemporarilyUnavailable(
+                "Logout could not revoke the authenticated session".into(),
+            )
+        })?;
 
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
@@ -606,11 +712,9 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
 }
 
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
-pub async fn proxy_xrpc(
+pub(crate) async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
-    Extension(session): Extension<CatbirdSession>,
-    req_extensions: Option<Extension<crate::middleware::RequestId>>,
-    dpop_data: Option<Extension<JacquardDpopData>>,
+    auth: AuthenticatedProxyContext,
     method: Method,
     Path(lexicon): Path<String>,
     RawQuery(raw_query): RawQuery,
@@ -618,10 +722,16 @@ pub async fn proxy_xrpc(
     body: Body,
 ) -> AppResult<Response> {
     let start = std::time::Instant::now();
+    let AuthenticatedProxyContext {
+        session,
+        session_id: authenticated_session_id,
+        request_id: authenticated_request_id,
+        dpop: dpop_data,
+    } = auth;
 
     // Extract request ID: prefer middleware-set value, fall back to client header
-    let request_id = req_extensions
-        .map(|ext| ext.0 .0.clone())
+    let request_id = authenticated_request_id
+        .map(|request_id| request_id.0)
         .or_else(|| {
             headers
                 .get("x-catbird-request-id")
@@ -662,6 +772,66 @@ pub async fn proxy_xrpc(
     // Check if this is an MLS lexicon and direct routing is enabled
     let mls_service = MlsAuthService::new(state.clone());
     if MlsAuthService::is_mls_lexicon(&lexicon) && mls_service.is_enabled() {
+        let dpop_data = dpop_data.as_ref().ok_or_else(|| {
+            AppError::Unauthorized("Authenticated MLS requests require session DPoP".into())
+        })?;
+        let jkt = session_p256_jkt(&dpop_data.dpop_key).map_err(record_mls_binding_error)?;
+        let binding_store = mls_device_binding_store(&state)?;
+
+        let begin_input = if lexicon == BEGIN_BINDING_NSID {
+            Some(
+                parse_begin_input(&body_bytes)
+                    .map_err(AppError::BadRequest)
+                    .map_err(record_mls_binding_error)?,
+            )
+        } else {
+            None
+        };
+        let complete_input = if lexicon == COMPLETE_BINDING_NSID {
+            Some(
+                parse_complete_input(&body_bytes)
+                    .map_err(AppError::BadRequest)
+                    .map_err(record_mls_binding_error)?,
+            )
+        } else {
+            None
+        };
+        let pending = if let Some(input) = complete_input.as_ref() {
+            Some(
+                binding_store
+                    .load_pending(
+                        authenticated_session_id.as_str(),
+                        &session.did,
+                        &jkt,
+                        &input.challenge_id,
+                    )
+                    .await
+                    .map_err(record_mls_binding_error)?,
+            )
+        } else {
+            None
+        };
+        let bound = if begin_input.is_none() && pending.is_none() {
+            let bound = binding_store
+                .load_bound(authenticated_session_id.as_str(), &session.did, &jkt)
+                .await
+                .map_err(record_mls_binding_error)?;
+            metrics::record_mls_device_binding(if bound.is_some() {
+                MlsDeviceBindingOutcome::BoundFound
+            } else {
+                MlsDeviceBindingOutcome::BoundMissing
+            });
+            bound
+        } else {
+            None
+        };
+        let device_id = authoritative_device_id(
+            &lexicon,
+            begin_input.as_ref().map(|input| input.device_id.as_str()),
+            pending.as_ref(),
+            bound.as_ref(),
+        );
+
         tracing::debug!(
             request_id = %request_id,
             lexicon = %lexicon,
@@ -670,15 +840,51 @@ pub async fn proxy_xrpc(
         );
 
         let (status, response_headers, response_body) = mls_service
-            .proxy_request(
-                &session,
-                method.try_into().unwrap_or(reqwest::Method::GET),
-                &lexicon,
-                query_string.as_deref(),
-                body_option,
+            .proxy_request(MlsProxyRequest {
+                session: &session,
+                session_dpop_key: &dpop_data.dpop_key,
+                device_id,
+                method,
+                lexicon: &lexicon,
+                query_string: query_string.as_deref(),
+                body: body_option,
                 content_type,
-            )
+            })
             .await?;
+
+        if (200..300).contains(&status) {
+            if let Some(input) = begin_input.as_ref() {
+                let response = parse_begin_response(&response_body, chrono::Utc::now()).map_err(
+                    |message| AppError::Upstream {
+                        status: StatusCode::BAD_GATEWAY.as_u16(),
+                        message,
+                    },
+                )?;
+                binding_store
+                    .persist_pending(
+                        authenticated_session_id.as_str(),
+                        &session.did,
+                        &jkt,
+                        &input.device_id,
+                        &response,
+                    )
+                    .await
+                    .map_err(record_mls_binding_error)?;
+                metrics::record_mls_device_binding(MlsDeviceBindingOutcome::BeginPersisted);
+            } else if let Some(pending) = pending.as_ref() {
+                let response =
+                    parse_complete_response(&response_body, &pending.device_id, chrono::Utc::now())
+                        .map_err(|message| AppError::Upstream {
+                            status: StatusCode::BAD_GATEWAY.as_u16(),
+                            message,
+                        })?;
+                binding_store
+                    .promote(authenticated_session_id.as_str(), pending, &response)
+                    .await
+                    .map_err(record_mls_binding_error)?;
+                metrics::record_mls_device_binding(MlsDeviceBindingOutcome::CompletePromoted);
+            }
+        }
 
         let response_shape = json_shape(&response_body);
         tracing::info!(
@@ -721,7 +927,7 @@ pub async fn proxy_xrpc(
     );
 
     let client = AtProtoClient::new(state.clone());
-    let jacquard_dpop = dpop_data.map(|ext| ext.0);
+    let jacquard_dpop = dpop_data;
     let proxy_response = client
         .proxy_request(
             &session,

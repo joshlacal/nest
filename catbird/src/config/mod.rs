@@ -54,6 +54,10 @@ pub struct MlsConfig {
     /// DID of this gateway for service auth (e.g., did:web:api.catbird.blue)
     #[serde(default)]
     pub gateway_did: Option<String>,
+    /// Public origin used in RFC 9449 DPoP `htu` claims. This is intentionally
+    /// separate from the internal service connection URL.
+    #[serde(default)]
+    pub proof_origin: Option<String>,
     /// DID of the MLS service (e.g., did:web:mls.catbird.blue)
     #[serde(default = "default_mls_service_did")]
     pub service_did: String,

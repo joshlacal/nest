@@ -59,6 +59,14 @@ lazy_static! {
         "Number of active sessions in Redis"
     ).unwrap();
 
+    pub static ref MLS_DEVICE_BINDING_TOTAL: CounterVec = CounterVec::new(
+        Opts::new(
+            "catbird_mls_device_binding_total",
+            "MLS session-to-device binding outcomes"
+        ),
+        &["outcome"]
+    ).unwrap();
+
     // Rate Limit Metrics
     pub static ref RATE_LIMIT_EXCEEDED_TOTAL: CounterVec = CounterVec::new(
         Opts::new("catbird_rate_limit_exceeded_total", "Total rate limit exceeded events"),
@@ -89,6 +97,9 @@ pub fn register_metrics() {
         .unwrap();
     REGISTRY
         .register(Box::new(ACTIVE_SESSIONS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(MLS_DEVICE_BINDING_TOTAL.clone()))
         .unwrap();
     REGISTRY
         .register(Box::new(RATE_LIMIT_EXCEEDED_TOTAL.clone()))
@@ -150,4 +161,70 @@ pub fn record_rate_limit_exceeded(endpoint: &str) {
     RATE_LIMIT_EXCEEDED_TOTAL
         .with_label_values(&[endpoint])
         .inc();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MlsDeviceBindingOutcome {
+    BoundFound,
+    BoundMissing,
+    BeginPersisted,
+    CompletePromoted,
+    Denied,
+    StoreFailure,
+}
+
+impl MlsDeviceBindingOutcome {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::BoundFound => "bound_found",
+            Self::BoundMissing => "bound_missing",
+            Self::BeginPersisted => "begin_persisted",
+            Self::CompletePromoted => "complete_promoted",
+            Self::Denied => "denied",
+            Self::StoreFailure => "store_failure",
+        }
+    }
+}
+
+pub(crate) fn record_mls_device_binding(outcome: MlsDeviceBindingOutcome) {
+    MLS_DEVICE_BINDING_TOTAL
+        .with_label_values(&[outcome.label()])
+        .inc();
+}
+
+#[cfg(test)]
+mod mls_binding_tests {
+    use super::*;
+
+    #[test]
+    fn mls_device_binding_metric_labels_are_closed_and_redacted() {
+        let outcomes = [
+            MlsDeviceBindingOutcome::BoundFound,
+            MlsDeviceBindingOutcome::BoundMissing,
+            MlsDeviceBindingOutcome::BeginPersisted,
+            MlsDeviceBindingOutcome::CompletePromoted,
+            MlsDeviceBindingOutcome::Denied,
+            MlsDeviceBindingOutcome::StoreFailure,
+        ];
+        assert_eq!(
+            outcomes.map(MlsDeviceBindingOutcome::label),
+            [
+                "bound_found",
+                "bound_missing",
+                "begin_persisted",
+                "complete_promoted",
+                "denied",
+                "store_failure",
+            ]
+        );
+        for outcome in outcomes {
+            record_mls_device_binding(outcome);
+        }
+        let encoded = TextEncoder::new()
+            .encode_to_string(&REGISTRY.gather())
+            .unwrap();
+        assert!(!encoded.contains("did:plc"));
+        assert!(!encoded.contains("device_id"));
+        assert!(!encoded.contains("secret-session-bearer"));
+    }
 }
