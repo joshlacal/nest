@@ -72,7 +72,7 @@ impl MlsConfig {
         let Some(value) = self.gateway_did.as_deref() else {
             return Ok(());
         };
-        if value.trim() != value || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        if value.chars().any(char::is_whitespace) {
             return Err("MLS gateway DID is not canonical".into());
         }
         let canonical = value.split_once('#').map_or(value, |(did, _)| did);
@@ -545,6 +545,8 @@ mod mls_config_tests {
         for invalid in [
             " did:web:api.catbird.blue",
             "did:web:api catbird.blue",
+            "did:web:api.\u{00a0}catbird.blue",
+            "did:web:api.\u{2003}catbird.blue",
             "not-a-did",
             "did:web:",
         ] {

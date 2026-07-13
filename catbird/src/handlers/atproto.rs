@@ -653,21 +653,25 @@ fn build_app_redirect(state_str: &str, session_id: &str) -> String {
 /// Handle logout
 ///
 /// POST /auth/logout
-async fn ordered_logout<Revoke, RevokeFuture, Delete, DeleteFuture>(
-    revoke: Revoke,
+async fn ordered_logout<Delete, DeleteFuture, Revoke, RevokeFuture>(
     delete_bindings: Delete,
+    revoke: Revoke,
 ) -> AppResult<()>
 where
-    Revoke: FnOnce() -> RevokeFuture,
-    RevokeFuture: std::future::Future<Output = AppResult<()>>,
     Delete: FnOnce() -> DeleteFuture,
     DeleteFuture: std::future::Future<Output = AppResult<()>>,
+    Revoke: FnOnce() -> RevokeFuture,
+    RevokeFuture: std::future::Future<Output = AppResult<()>>,
 {
-    let revoke_result = revoke().await;
     let delete_result = delete_bindings().await;
-    match (revoke_result, delete_result) {
-        (Err(revoke_error), _) => Err(revoke_error),
-        (Ok(()), Err(delete_error)) => Err(delete_error),
+    let revoke_result = revoke().await;
+    match (delete_result, revoke_result) {
+        (Err(_), Err(_)) => Err(AppError::AuthTemporarilyUnavailable(
+            "Logout could not revoke the authenticated session and clear MLS device bindings"
+                .into(),
+        )),
+        (Err(delete_error), Ok(())) => Err(delete_error),
+        (Ok(()), Err(revoke_error)) => Err(revoke_error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
@@ -709,6 +713,12 @@ pub(crate) async fn logout(
 
         ordered_logout(
             || async {
+                binding_store
+                    .delete_session(authenticated_session_id.as_str())
+                    .await
+                    .map_err(record_mls_binding_error)
+            },
+            || async {
                 jacquard_client
                     .revoke(&did, authenticated_session_id.as_str())
                     .await
@@ -717,12 +727,6 @@ pub(crate) async fn logout(
                             "Logout could not revoke the authenticated session".into(),
                         )
                     })
-            },
-            || async {
-                binding_store
-                    .delete_session(authenticated_session_id.as_str())
-                    .await
-                    .map_err(record_mls_binding_error)
             },
         )
         .await
@@ -738,32 +742,96 @@ pub(crate) async fn logout(
 #[cfg(test)]
 mod logout_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn local_binding_cleanup_finishes_before_upstream_revoke_starts() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let revoke_events = events.clone();
+        let delete_events = events.clone();
+
+        ordered_logout(
+            move || async move {
+                delete_events.lock().unwrap().push("delete");
+                Ok(())
+            },
+            move || async move {
+                revoke_events.lock().unwrap().push("revoke");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*events.lock().unwrap(), ["delete", "revoke"]);
+    }
 
     #[tokio::test]
     async fn upstream_revoke_failure_still_deletes_bindings_and_expires_browser_cookie() {
-        let delete_called = Arc::new(AtomicBool::new(false));
+        let delete_called = Arc::new(Mutex::new(false));
         let delete_observer = delete_called.clone();
         let result = ordered_logout(
+            move || async move {
+                *delete_observer.lock().unwrap() = true;
+                Ok(())
+            },
             || async {
                 Err(AppError::AuthTemporarilyUnavailable(
                     "upstream unavailable".into(),
                 ))
             },
-            move || async move {
-                delete_observer.store(true, Ordering::SeqCst);
-                Ok(())
-            },
         )
         .await;
 
         assert!(result.is_err());
-        assert!(delete_called.load(Ordering::SeqCst));
+        assert!(*delete_called.lock().unwrap());
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
         let jar = CookieJar::from_headers(&request_headers);
         let response = finish_logout(jar, result);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let set_cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("catbird_session="))
+            .unwrap_or_else(|| panic!("session removal cookie: {:?}", response.headers()));
+        assert!(set_cookie.contains("Max-Age=0"));
+        assert!(!set_cookie.contains("browser-session"));
+    }
+
+    #[tokio::test]
+    async fn combined_logout_failure_is_503_and_still_expires_browser_cookie() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let revoke_events = events.clone();
+        let delete_events = events.clone();
+        let result = ordered_logout(
+            move || async move {
+                delete_events.lock().unwrap().push("delete");
+                Err(AppError::Internal("binding cleanup unavailable".into()))
+            },
+            move || async move {
+                revoke_events.lock().unwrap().push("revoke");
+                Err(AppError::AuthTemporarilyUnavailable(
+                    "upstream unavailable".into(),
+                ))
+            },
+        )
+        .await;
+
+        assert_eq!(*events.lock().unwrap(), ["delete", "revoke"]);
+        assert!(matches!(
+            &result,
+            Err(AppError::AuthTemporarilyUnavailable(message))
+                if message.contains("revoke") && message.contains("device bindings")
+        ));
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
+        let response = finish_logout(CookieJar::from_headers(&request_headers), result);
+
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let set_cookie = response
             .headers()
