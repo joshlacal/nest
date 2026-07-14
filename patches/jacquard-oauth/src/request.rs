@@ -318,6 +318,20 @@ impl RequestError {
             _ => false,
         }
     }
+
+    /// Returns true only when the authorization server explicitly reports
+    /// that the submitted grant token is already unusable. This is narrower
+    /// than `is_permanent`: access denial or client-authentication failures do
+    /// not prove that a refresh grant has been revoked.
+    pub fn proves_token_inactive(&self) -> bool {
+        match &self.kind {
+            RequestErrorKind::HttpStatusWithBody { body, .. } => body
+                .get("error")
+                .and_then(|error| error.as_str())
+                .is_some_and(|error| matches!(error, "invalid_grant" | "invalid_token")),
+            _ => false,
+        }
+    }
 }
 
 // From impls for common error types
@@ -1127,6 +1141,25 @@ mod tests {
             super::validate_oauth_token_response(&refresh_without_sub, Some(&expected), false)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn only_invalid_token_or_grant_proves_revocation_is_already_complete() {
+        for code in ["invalid_token", "invalid_grant"] {
+            let error = RequestError::http_status_with_body(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "error": code }),
+            );
+            assert!(error.proves_token_inactive(), "rejected {code}");
+        }
+
+        for code in ["access_denied", "temporarily_unavailable", "invalid_client"] {
+            let error = RequestError::http_status_with_body(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "error": code }),
+            );
+            assert!(!error.proves_token_inactive(), "accepted {code}");
+        }
     }
 
     #[test]

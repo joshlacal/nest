@@ -538,7 +538,11 @@ where
             data.token_set.access_token.as_ref(),
         )?
         .to_owned();
-        revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta).await?;
+        match revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta).await {
+            Ok(()) => {}
+            Err(error) if error.proves_token_inactive() => {}
+            Err(error) => return Err(error.into()),
+        }
         // Remove from store
         self.registry
             .del(&data.account_did, &data.session_id)
