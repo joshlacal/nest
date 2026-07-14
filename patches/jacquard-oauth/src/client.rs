@@ -142,6 +142,22 @@ where
     }
 }
 
+#[cfg(test)]
+mod revocation_security_tests {
+    #[test]
+    fn logout_requires_revocation_endpoint_and_prefers_refresh_grant_token() {
+        assert!(super::required_revocation_token(false, Some("refresh"), "access").is_err());
+        assert_eq!(
+            super::required_revocation_token(true, Some("refresh"), "access").unwrap(),
+            "refresh"
+        );
+        assert_eq!(
+            super::required_revocation_token(true, None, "access").unwrap(),
+            "access"
+        );
+    }
+}
+
 impl<T, S> OAuthClient<T, S>
 where
     S: ClientAuthStore + Send + Sync + 'static,
@@ -171,13 +187,14 @@ where
         } else {
             None
         };
+        let resolved_account_did = identity.as_ref().map(|document| document.id.clone());
         let metadata = OAuthMetadata {
             server_metadata,
             client_metadata,
             keyset: self.registry.client_data.keyset.clone(),
         };
 
-        let auth_req_info = par(
+        let mut auth_req_info = par(
             self.client.as_ref(),
             login_hint,
             options.prompt,
@@ -185,6 +202,7 @@ where
             options.state,
         )
         .await?;
+        auth_req_info.account_did = resolved_account_did;
 
         // Persist state for callback handling
         self.registry
@@ -250,6 +268,7 @@ where
             &params.code,
             &auth_req_info.pkce_verifier,
             &metadata,
+            auth_req_info.account_did.as_ref(),
         )
         .await
         {
@@ -301,7 +320,14 @@ where
     }
 
     pub async fn revoke(&self, did: &Did<'_>, session_id: &str) -> Result<()> {
-        Ok(self.registry.del(did, session_id).await?)
+        let data = self.registry.get(did, session_id, false).await?;
+        OAuthSession::new(
+            self.registry.clone(),
+            self.client.clone(),
+            data.into_static(),
+        )
+        .logout()
+        .await
     }
 }
 
@@ -506,18 +532,30 @@ where
         let mut data = self.data.write().await;
         let meta =
             OAuthMetadata::new(self.client.as_ref(), &self.registry.client_data, &data).await?;
-        if meta.server_metadata.revocation_endpoint.is_some() {
-            let token = data.token_set.access_token.clone();
-            revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta)
-                .await
-                .ok();
-        }
+        let token = required_revocation_token(
+            meta.server_metadata.revocation_endpoint.is_some(),
+            data.token_set.refresh_token.as_deref(),
+            data.token_set.access_token.as_ref(),
+        )?
+        .to_owned();
+        revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta).await?;
         // Remove from store
         self.registry
             .del(&data.account_did, &data.session_id)
             .await?;
         Ok(())
     }
+}
+
+fn required_revocation_token<'a>(
+    has_revocation_endpoint: bool,
+    refresh_token: Option<&'a str>,
+    access_token: &'a str,
+) -> Result<&'a str> {
+    if !has_revocation_endpoint {
+        return Err(crate::request::RequestError::no_endpoint("revocation").into());
+    }
+    Ok(refresh_token.unwrap_or(access_token))
 }
 
 impl<T, S> OAuthClient<T, S>

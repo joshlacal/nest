@@ -599,12 +599,15 @@ where
     )
     .await?;
 
-    let expires_at = response.expires_in.and_then(|expires_in| {
+    let (_, expires_in) =
+        validate_oauth_token_response(&response, Some(&session_data.token_set.sub), false)?;
+
+    let expires_at = {
         let now = Datetime::now();
         now.as_ref()
             .checked_add_signed(TimeDelta::seconds(expires_in))
             .map(Datetime::new)
-    });
+    };
 
     session_data.update_with_tokens(TokenSet {
         iss,
@@ -627,6 +630,7 @@ pub async fn exchange_code<'r, T, D>(
     code: &str,
     verifier: &str,
     metadata: &OAuthMetadata,
+    expected_sub: Option<&Did<'_>>,
 ) -> Result<TokenSet<'r>>
 where
     T: OAuthResolver + DpopExt + Send + Sync + 'static,
@@ -648,10 +652,8 @@ where
         metadata,
     )
     .await?;
-    let Some(sub) = token_response.sub else {
-        return Err(RequestError::token_verification());
-    };
-    let sub = Did::new_owned(sub)?;
+    let (sub, expires_in) = validate_oauth_token_response(&token_response, expected_sub, true)?;
+    let sub = sub.expect("required token subject was validated");
     let iss = metadata.server_metadata.issuer.clone();
     // /!\ IMPORTANT /!\
     //
@@ -661,12 +663,12 @@ where
         .verify_issuer(&metadata.server_metadata, &sub)
         .await?;
 
-    let expires_at = token_response.expires_in.and_then(|expires_in| {
+    let expires_at = {
         Datetime::now()
             .as_ref()
             .checked_add_signed(TimeDelta::seconds(expires_in))
             .map(Datetime::new)
-    });
+    };
     Ok(TokenSet {
         iss,
         sub,
@@ -677,6 +679,33 @@ where
         token_type: token_response.token_type,
         expires_at,
     })
+}
+
+fn validate_oauth_token_response(
+    response: &OAuthTokenResponse,
+    expected_sub: Option<&Did<'_>>,
+    require_sub: bool,
+) -> Result<(Option<Did<'static>>, i64)> {
+    if response.token_type != crate::types::OAuthTokenType::DPoP {
+        return Err(RequestError::token_verification());
+    }
+
+    let expires_in = response
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(RequestError::token_verification)?;
+    let returned_sub = response.sub.clone().map(Did::new_owned).transpose()?;
+
+    if require_sub && returned_sub.is_none() {
+        return Err(RequestError::token_verification());
+    }
+    if let (Some(expected), Some(returned)) = (expected_sub, returned_sub.as_ref()) {
+        if returned != expected {
+            return Err(RequestError::token_verification());
+        }
+    }
+
+    Ok((returned_sub, expires_in))
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
@@ -716,8 +745,9 @@ where
     let Some(url) = endpoint_for_req(&metadata.server_metadata, &request) else {
         return Err(RequestError::no_endpoint(request.name()));
     };
-    require_exact_issuer_origin(&metadata.server_metadata.issuer, url)
-        .map_err(|_| RequestError::no_endpoint(format!("{} endpoint outside issuer origin", request.name())))?;
+    require_exact_issuer_origin(&metadata.server_metadata.issuer, url).map_err(|_| {
+        RequestError::no_endpoint(format!("{} endpoint outside issuer origin", request.name()))
+    })?;
     let client_assertions = build_auth(
         metadata.keyset.as_ref(),
         &metadata.server_metadata,
@@ -757,13 +787,20 @@ where
     }
 }
 
-fn require_exact_issuer_origin(issuer: &CowStr<'_>, endpoint: &CowStr<'_>) -> core::result::Result<(), ()> {
+fn require_exact_issuer_origin(
+    issuer: &CowStr<'_>,
+    endpoint: &CowStr<'_>,
+) -> core::result::Result<(), ()> {
     let issuer = url::Url::parse(issuer.as_str()).map_err(|_| ())?;
     let endpoint = url::Url::parse(endpoint.as_str()).map_err(|_| ())?;
     let valid = issuer.scheme() == "https"
         && endpoint.scheme() == "https"
-        && issuer.username().is_empty() && issuer.password().is_none() && issuer.fragment().is_none()
-        && endpoint.username().is_empty() && endpoint.password().is_none() && endpoint.fragment().is_none()
+        && issuer.username().is_empty()
+        && issuer.password().is_none()
+        && issuer.fragment().is_none()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.fragment().is_none()
         && issuer.host_str() == endpoint.host_str()
         && issuer.port_or_known_default() == endpoint.port_or_known_default();
     if valid { Ok(()) } else { Err(()) }
@@ -1048,20 +1085,60 @@ mod tests {
             dpop_key: crate::utils::generate_key(&[CowStr::from("ES256")]).unwrap(),
             dpop_authserver_nonce: None,
         };
-        let err = super::exchange_code(&client, &mut dpop, "abc", "verifier", &meta)
+        let err = super::exchange_code(&client, &mut dpop, "abc", "verifier", &meta, None)
             .await
             .unwrap_err();
         assert!(matches!(err.kind(), RequestErrorKind::TokenVerification));
     }
 
     #[test]
+    fn token_response_security_rejects_bearer_missing_or_nonpositive_expiry_and_subject_swap() {
+        let expected = Did::new_static("did:plc:alice").unwrap();
+        let valid = OAuthTokenResponse {
+            access_token: "token".into(),
+            token_type: crate::types::OAuthTokenType::DPoP,
+            expires_in: Some(3600),
+            refresh_token: Some("refresh".into()),
+            scope: None,
+            sub: Some("did:plc:alice".into()),
+        };
+
+        assert!(super::validate_oauth_token_response(&valid, Some(&expected), true).is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.token_type = crate::types::OAuthTokenType::Bearer;
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.expires_in = None;
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.expires_in = Some(0);
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.sub = Some("did:plc:mallory".into());
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut refresh_without_sub = valid;
+        refresh_without_sub.sub = None;
+        assert!(
+            super::validate_oauth_token_response(&refresh_without_sub, Some(&expected), false)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn credential_endpoints_are_exactly_bound_to_issuer_origin() {
         let issuer = CowStr::from("https://issuer.example/path");
-        assert!(super::require_exact_issuer_origin(
-            &issuer,
-            &CowStr::from("https://issuer.example/token")
-        )
-        .is_ok());
+        assert!(
+            super::require_exact_issuer_origin(
+                &issuer,
+                &CowStr::from("https://issuer.example/token")
+            )
+            .is_ok()
+        );
         for endpoint in [
             "https://issuer.example.evil/token",
             "https://issuer.example:444/token",

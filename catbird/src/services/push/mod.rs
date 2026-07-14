@@ -606,15 +606,8 @@ pub(crate) async fn resolve_background_session(
         .as_ref()
         .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
 
-    if let Some(mapped_did) = auth_store.lookup_did_for_session(session_id).await? {
-        if mapped_did != account_did {
-            tracing::warn!(
-                mapped_did = %mapped_did,
-                requested_did = %account_did,
-                "Push background session lookup resolved a different DID than expected"
-            );
-        }
-    }
+    let mapped_did = auth_store.lookup_did_for_session(session_id).await?;
+    validate_background_session_mapping(mapped_did.as_deref(), account_did)?;
 
     let did = Did::new(account_did)
         .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
@@ -661,6 +654,15 @@ pub(crate) async fn resolve_background_session(
     Ok((session, dpop))
 }
 
+fn validate_background_session_mapping(mapped_did: Option<&str>, expected_did: &str) -> Result<()> {
+    match mapped_did {
+        Some(mapped_did) if mapped_did == expected_did => Ok(()),
+        _ => Err(anyhow!(
+            "Background OAuth session is not bound to the requested account"
+        )),
+    }
+}
+
 pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
     let message = err.to_string().to_ascii_lowercase();
     message.contains("invalid_grant")
@@ -673,4 +675,21 @@ pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
 
 pub(crate) fn push_unavailable_error() -> AppError {
     AppError::Config("Push control plane is not configured".into())
+}
+
+#[cfg(test)]
+mod session_binding_tests {
+    #[test]
+    fn background_session_mapping_requires_exact_expected_did() {
+        assert!(
+            super::validate_background_session_mapping(Some("did:plc:alice"), "did:plc:alice")
+                .is_ok()
+        );
+        assert!(super::validate_background_session_mapping(
+            Some("did:plc:mallory"),
+            "did:plc:alice"
+        )
+        .is_err());
+        assert!(super::validate_background_session_mapping(None, "did:plc:alice").is_err());
+    }
 }
