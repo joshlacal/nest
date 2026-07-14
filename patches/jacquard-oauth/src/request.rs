@@ -795,6 +795,12 @@ where
         .body(body.into_bytes())?;
     let res = client.dpop_server_call(data_source).send(req).await?;
     if request.accepts_status(res.status()) {
+        if matches!(request, OAuthRequest::Revocation(_)) {
+            // RFC 7009 defines no success payload and requires clients to
+            // ignore any response content. Return unit for both 200 and the
+            // deployed provider's compatible 204 response.
+            return Ok(serde_json::from_slice(b"null")?);
+        }
         let body = res.body();
         if body.is_empty() {
             // since an empty body cannot be deserialized, use “null” temporarily to allow deserialization to `()`.
@@ -1201,6 +1207,31 @@ mod tests {
         assert!(request.accepts_status(StatusCode::OK));
         assert!(request.accepts_status(StatusCode::NO_CONTENT));
         assert!(!request.accepts_status(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn revocation_http_path_ignores_success_response_content() {
+        for (status, body) in [
+            (StatusCode::OK, br#"{"ignored":true}"#.to_vec()),
+            (StatusCode::OK, b" \n ".to_vec()),
+            (StatusCode::NO_CONTENT, Vec::new()),
+        ] {
+            let client = MockClient::default();
+            *client.resp.lock().await =
+                Some(HttpResponse::builder().status(status).body(body).unwrap());
+            let mut metadata = base_metadata();
+            metadata.server_metadata.revocation_endpoint =
+                Some(CowStr::new_static("https://issuer/revoke"));
+            let mut dpop = DpopClientData {
+                dpop_key: crate::utils::generate_key(&[CowStr::new_static("ES256")]).unwrap(),
+                dpop_authserver_nonce: CowStr::new_static(""),
+                dpop_host_nonce: CowStr::new_static(""),
+            };
+
+            super::revoke(&client, &mut dpop, "grant", &metadata)
+                .await
+                .unwrap_or_else(|error| panic!("status {status} failed: {error}"));
+        }
     }
 
     #[test]
