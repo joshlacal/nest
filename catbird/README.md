@@ -58,7 +58,7 @@ By moving this complexity to a server-side gateway, the mobile app only needs to
 ### Prerequisites
 
 - Rust 1.75+
-- Redis 7.0+
+- Standalone Redis or Valkey 7.0+ (Redis Cluster is intentionally unsupported)
 - An ES256 key pair for OAuth client authentication
 
 ### Installation
@@ -100,6 +100,13 @@ Key settings:
 | `CATBIRD__REDIS__URL` | Redis connection URL | redis://127.0.0.1:6379 |
 | `CATBIRD__OAUTH__CLIENT_ID` | OAuth client ID (your domain) | - |
 | `CATBIRD__OAUTH__REDIRECT_URI` | OAuth callback URL | - |
+
+Nest requires a standalone Redis/Valkey server. OAuth lifecycle operations use
+multi-key atomic scripts and migration/audit tooling scans the complete session
+keyspace. Both gateway startup and `session_migrate` query `INFO cluster` and
+fail closed unless the server explicitly reports `cluster_enabled:0`; a cluster
+node or an account that cannot prove its topology is rejected before session
+state is read or changed.
 
 ## API Endpoints
 

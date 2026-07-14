@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use crate::config::AppState;
 use crate::handlers::{atproto, push};
-use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, RateLimitState};
+use crate::middleware::{
+    auth_middleware, ip_rate_limit, logout_auth_middleware, session_rate_limit, RateLimitState,
+};
 
 /// Create the ATProto router
 ///
@@ -59,7 +61,7 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/logout",
             post(atproto::logout).layer(middleware::from_fn_with_state(
                 state.clone(),
-                auth_middleware,
+                logout_auth_middleware,
             )),
         )
         .route(

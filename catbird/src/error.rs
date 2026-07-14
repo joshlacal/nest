@@ -28,6 +28,9 @@ pub enum AppError {
     #[error("Invalid session")]
     InvalidSession,
 
+    #[error("Session requires reauthentication")]
+    ReauthenticationRequired,
+
     #[error("OAuth error: {0}")]
     OAuth(String),
 
@@ -90,6 +93,11 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 "invalid_session",
                 "Invalid session. Please log in again.".to_string(),
+            ),
+            AppError::ReauthenticationRequired => (
+                StatusCode::UNAUTHORIZED,
+                "reauthentication_required",
+                "This session can no longer be used safely. Please log in again.".to_string(),
             ),
             AppError::OAuth(msg) => (StatusCode::BAD_REQUEST, "oauth_error", msg.clone()),
             AppError::Upstream { status, message } => {

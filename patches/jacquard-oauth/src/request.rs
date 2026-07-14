@@ -151,6 +151,13 @@ pub enum RequestErrorKind {
     #[diagnostic(code(jacquard_oauth::request::serde_json))]
     SerdeJson,
 
+    /// An accepted success response could not be safely consumed. For token
+    /// operations this is ambiguous because the server may have rotated the
+    /// refresh grant before returning the unusable response.
+    #[error("successful response could not be accepted")]
+    #[diagnostic(code(jacquard_oauth::request::ambiguous_success_response))]
+    AmbiguousSuccessResponse,
+
     /// Atproto metadata error
     #[error("atproto error")]
     #[diagnostic(code(jacquard_oauth::request::atproto))]
@@ -288,6 +295,13 @@ impl RequestError {
         Self::new(RequestErrorKind::HttpStatusWithBody { status, body }, None)
     }
 
+    fn ambiguous_success_response(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::new(
+            RequestErrorKind::AmbiguousSuccessResponse,
+            Some(Box::new(source)),
+        )
+    }
+
     /// Create an identity error
     pub fn identity(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::new(RequestErrorKind::Identity, Some(Box::new(source)))
@@ -332,6 +346,24 @@ impl RequestError {
                     .and_then(|error| error.as_str())
                     .is_some_and(|error| matches!(error, "invalid_grant" | "invalid_token"))
             }
+            _ => false,
+        }
+    }
+
+    /// Whether a failed refresh may have produced credentials that the caller
+    /// never received. Explicit OAuth error responses are not ambiguous;
+    /// transport loss and invalid successful token responses are.
+    pub(crate) fn refresh_outcome_is_ambiguous(&self) -> bool {
+        match &self.kind {
+            RequestErrorKind::TokenVerification
+            | RequestErrorKind::InvalidDid
+            | RequestErrorKind::AmbiguousSuccessResponse => true,
+            RequestErrorKind::HttpStatus(status) if status.is_server_error() => true,
+            RequestErrorKind::Dpop => self
+                .source
+                .as_deref()
+                .and_then(|source| source.downcast_ref::<crate::dpop::Error>())
+                .is_some_and(crate::dpop::Error::request_may_have_been_dispatched),
             _ => false,
         }
     }
@@ -804,9 +836,10 @@ where
         let body = res.body();
         if body.is_empty() {
             // since an empty body cannot be deserialized, use “null” temporarily to allow deserialization to `()`.
-            Ok(serde_json::from_slice(b"null")?)
+            serde_json::from_slice(b"null").map_err(RequestError::ambiguous_success_response)
         } else {
-            let output: O = serde_json::from_slice(body)?;
+            let output: O =
+                serde_json::from_slice(body).map_err(RequestError::ambiguous_success_response)?;
             Ok(output)
         }
     } else if res.status().is_client_error() {
@@ -959,6 +992,43 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("simulated transport failure")]
+    struct SimulatedTransportFailure;
+
+    #[test]
+    fn refresh_ambiguity_tracks_the_dispatch_boundary() {
+        let predispatch = RequestError::resolver(SimulatedTransportFailure);
+        assert!(!predispatch.refresh_outcome_is_ambiguous());
+
+        let postdispatch = RequestError::from(crate::dpop::Error::Inner(Box::new(
+            SimulatedTransportFailure,
+        )));
+        assert!(postdispatch.refresh_outcome_is_ambiguous());
+
+        let explicit_oauth_error = RequestError::http_status_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "temporarily_unavailable"}),
+        );
+        assert!(!explicit_oauth_error.refresh_outcome_is_ambiguous());
+
+        let unparsed_server_error = RequestError::http_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unparsed_server_error.refresh_outcome_is_ambiguous());
+
+        assert!(RequestError::token_verification().refresh_outcome_is_ambiguous());
+        assert!(
+            RequestError::invalid_did(SimulatedTransportFailure).refresh_outcome_is_ambiguous()
+        );
+        assert!(
+            RequestError::ambiguous_success_response(SimulatedTransportFailure)
+                .refresh_outcome_is_ambiguous()
+        );
+        assert!(
+            !RequestError::from(serde_json::from_slice::<Value>(b"not-json").unwrap_err())
+                .refresh_outcome_is_ambiguous()
+        );
+    }
+
     #[derive(Clone, Default)]
     struct MockClient {
         resp: Arc<Mutex<Option<HttpResponse<Vec<u8>>>>>,
@@ -1068,6 +1138,7 @@ mod tests {
         let client = MockClient::default();
         let meta = base_metadata();
         let session = ClientSessionData {
+            lifecycle_generation: CowStr::default(),
             account_did: Did::new_static("did:plc:alice").unwrap(),
             session_id: CowStr::from("state"),
             host_url: CowStr::new_static("https://pds"),

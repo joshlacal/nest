@@ -114,6 +114,17 @@ fn exchange_key_for(prefix: &str, keyring: &Keyring, code: &str) -> String {
     )
 }
 
+fn take_legacy_init_script() -> redis::Script {
+    redis::Script::new(
+        r#"
+        local client = redis.call('GET', KEYS[1])
+        local redirect = redis.call('GET', KEYS[2])
+        redis.call('DEL', KEYS[1], KEYS[2])
+        return {client or false, redirect or false}
+        "#,
+    )
+}
+
 impl ExchangeStore {
     pub async fn store_init(
         &self,
@@ -162,15 +173,13 @@ impl ExchangeStore {
         let client_key = format!("oauth_client:{state}");
         let redirect_key = format!("oauth_redirect:{state}");
         let mut connection = self.redis.clone();
-        let (client_selector, redirect_target): (Option<String>, Option<String>) = redis::pipe()
-            .atomic()
-            .cmd("GETDEL")
-            .arg(client_key)
-            .cmd("GETDEL")
-            .arg(redirect_key)
-            .query_async(&mut connection)
-            .await
-            .map_err(|_| ExchangeError::Unavailable)?;
+        let (client_selector, redirect_target): (Option<String>, Option<String>) =
+            take_legacy_init_script()
+                .key(client_key)
+                .key(redirect_key)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(|_| ExchangeError::Unavailable)?;
         validate_legacy_init(client_selector, redirect_target)
     }
 
@@ -343,6 +352,18 @@ fn verify_nonce(expected: &str, nonce: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiplexed_exchange_store_contains_no_multi_exec_pipeline() {
+        let forbidden = [".ato", "mic()"].concat();
+        assert!(!include_str!("exchange_store.rs").contains(&forbidden));
+    }
+
+    #[test]
+    fn legacy_init_script_returns_two_explicit_optional_slots() {
+        let expected = ["return {client ", "or false, redirect or false}"].concat();
+        assert!(include_str!("exchange_store.rs").contains(&expected));
+    }
     use crate::services::redis_crypto::KeyMaterial;
 
     #[test]
@@ -593,5 +614,79 @@ mod tests {
                 .await,
             Err(ExchangeError::Unauthorized)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL"]
+    async fn redis_legacy_init_missing_values_keep_fixed_slots_and_delete_atomically() {
+        let redis_url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL is required");
+        let client = redis::Client::open(redis_url).unwrap();
+        let manager = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let store = ExchangeStore {
+            redis: manager,
+            key_prefix: format!("test:oauth-exchange:{}:", uuid::Uuid::new_v4()),
+            keyring: Keyring::new(
+                KeyMaterial::new("active", [1; 32]).unwrap(),
+                vec![],
+                [2; 32],
+            )
+            .unwrap(),
+        };
+        let mut connection = store.redis.clone();
+
+        let client_only_state = format!("client-only-{}", uuid::Uuid::new_v4());
+        let client_only_key = format!("oauth_client:{client_only_state}");
+        let client_only_redirect_key = format!("oauth_redirect:{client_only_state}");
+        redis::cmd("SET")
+            .arg(&client_only_key)
+            .arg("catmos")
+            .query_async::<_, ()>(&mut connection)
+            .await
+            .unwrap();
+        let client_only = store
+            .take_legacy_init(&client_only_state)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client_only.client_selector, "catmos");
+        assert_eq!(client_only.redirect_target, None);
+        let client_only_after: (Option<String>, Option<String>) = redis::pipe()
+            .cmd("GET")
+            .arg(&client_only_key)
+            .cmd("GET")
+            .arg(&client_only_redirect_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(client_only_after, (None, None));
+
+        let redirect_only_state = format!("redirect-only-{}", uuid::Uuid::new_v4());
+        let redirect_only_client_key = format!("oauth_client:{redirect_only_state}");
+        let redirect_only_key = format!("oauth_redirect:{redirect_only_state}");
+        redis::cmd("SET")
+            .arg(&redirect_only_key)
+            .arg("https://catmos.catbird.blue/callback")
+            .query_async::<_, ()>(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.take_legacy_init(&redirect_only_state).await,
+            Err(ExchangeError::Unauthorized)
+        );
+        let redirect_only_after: (Option<String>, Option<String>) = redis::pipe()
+            .cmd("GET")
+            .arg(&redirect_only_client_key)
+            .cmd("GET")
+            .arg(&redirect_only_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(redirect_only_after, (None, None));
+
+        let json_state_fallback = format!("json-state-{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            store.take_legacy_init(&json_state_fallback).await.unwrap(),
+            None
+        );
     }
 }

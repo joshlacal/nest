@@ -145,25 +145,39 @@ where
 #[cfg(test)]
 mod revocation_security_tests {
     use super::complete_logout_after_revocation;
+    use crate::types::OAuthAuthorizationServerMetadata;
     use crate::{
         atproto::AtprotoClientMetadata,
-        authstore::{ClientAuthStore, MemoryAuthStore},
+        authstore::{
+            ClientAuthStore, MemoryAuthStore, SessionOperationAcquire, SessionOperationKind,
+            is_reauthentication_required, is_session_operation_active,
+        },
         dpop::DpopExt,
         request::{RequestError, Result as RequestResult},
         resolver::OAuthResolver,
         session::{ClientData, ClientSessionData, DpopClientData, SessionRegistry},
         types::{OAuthTokenType, TokenSet},
     };
+    use dashmap::DashMap;
     use http::{Request, Response, StatusCode};
     use jacquard_common::{
-        CowStr,
+        CowStr, IntoStatic,
         http_client::HttpClient,
         types::{did::Did, string::Handle},
     };
     use jacquard_identity::resolver::{
         DidDocResponse, IdentityError, IdentityResolver, ResolverOptions,
     };
-    use std::{convert::Infallible, sync::Arc};
+    use std::{
+        convert::Infallible,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::{Barrier, Notify};
+    use url::Url;
 
     #[derive(Clone)]
     struct NoopResolver;
@@ -204,9 +218,464 @@ mod revocation_security_tests {
     impl OAuthResolver for NoopResolver {}
     impl DpopExt for NoopResolver {}
 
+    #[derive(Clone)]
+    struct BlockingRefreshResolver {
+        refresh_entered: Arc<Notify>,
+        release_refresh: Arc<Notify>,
+        revocation_started: Arc<AtomicBool>,
+        revocation_bodies: Arc<Mutex<Vec<String>>>,
+        fail_refresh: Arc<AtomicBool>,
+        fail_issuer: Arc<AtomicBool>,
+        malformed_refresh_sub: Arc<AtomicBool>,
+        malformed_refresh_error: Arc<AtomicBool>,
+        revoke_as_inactive: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("simulated transport timeout")]
+    struct SimulatedTransportTimeout;
+
+    impl HttpClient for BlockingRefreshResolver {
+        type Error = SimulatedTransportTimeout;
+
+        async fn send_http(
+            &self,
+            request: Request<Vec<u8>>,
+        ) -> core::result::Result<Response<Vec<u8>>, Self::Error> {
+            match request.uri().path() {
+                "/token" => {
+                    self.refresh_entered.notify_one();
+                    self.release_refresh.notified().await;
+                    if self.fail_refresh.load(Ordering::SeqCst) {
+                        return Err(SimulatedTransportTimeout);
+                    }
+                    if self.malformed_refresh_error.load(Ordering::SeqCst) {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(b"not-json".to_vec())
+                            .unwrap());
+                    }
+                    let mut body = serde_json::json!({
+                        "access_token": "refreshed-access",
+                        "refresh_token": "refreshed-refresh",
+                        "token_type": "DPoP",
+                        "expires_in": 3600
+                    });
+                    if self.malformed_refresh_sub.load(Ordering::SeqCst) {
+                        body["sub"] = serde_json::Value::String("not-a-did".into());
+                    }
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(serde_json::to_vec(&body).unwrap())
+                        .unwrap())
+                }
+                "/revoke" => {
+                    self.revocation_started.store(true, Ordering::SeqCst);
+                    self.revocation_bodies
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8(request.body().clone()).unwrap());
+                    if self.revoke_as_inactive.load(Ordering::SeqCst) {
+                        Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header("content-type", "application/json")
+                            .body(br#"{"error":"invalid_grant"}"#.to_vec())
+                            .unwrap())
+                    } else {
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Vec::new())
+                            .unwrap())
+                    }
+                }
+                path => panic!("unexpected OAuth endpoint: {path}"),
+            }
+        }
+    }
+
+    impl IdentityResolver for BlockingRefreshResolver {
+        fn options(&self) -> &ResolverOptions {
+            use std::sync::LazyLock;
+            static OPTIONS: LazyLock<ResolverOptions> = LazyLock::new(ResolverOptions::default);
+            &OPTIONS
+        }
+
+        async fn resolve_handle(
+            &self,
+            _handle: &Handle<'_>,
+        ) -> core::result::Result<Did<'static>, IdentityError> {
+            unreachable!("refresh race test does not resolve handles")
+        }
+
+        async fn resolve_did_doc(
+            &self,
+            _did: &Did<'_>,
+        ) -> core::result::Result<DidDocResponse, IdentityError> {
+            unreachable!("refresh race test overrides issuer verification")
+        }
+    }
+
+    impl OAuthResolver for BlockingRefreshResolver {
+        async fn verify_issuer(
+            &self,
+            _server_metadata: &OAuthAuthorizationServerMetadata<'_>,
+            _sub: &Did<'_>,
+        ) -> crate::resolver::Result<Url> {
+            if self.fail_issuer.load(Ordering::SeqCst) {
+                return Err(crate::resolver::ResolverError::transport(
+                    SimulatedTransportTimeout,
+                ));
+            }
+            Ok(Url::parse("https://pds.example").unwrap())
+        }
+
+        async fn get_authorization_server_metadata(
+            &self,
+            _issuer: &CowStr<'_>,
+        ) -> crate::resolver::Result<OAuthAuthorizationServerMetadata<'static>> {
+            let mut metadata = OAuthAuthorizationServerMetadata::default();
+            metadata.issuer = CowStr::new_static("https://issuer.example");
+            metadata.token_endpoint = CowStr::new_static("https://issuer.example/token");
+            metadata.revocation_endpoint =
+                Some(CowStr::new_static("https://issuer.example/revoke"));
+            metadata.token_endpoint_auth_methods_supported = Some(vec![CowStr::new_static("none")]);
+            Ok(metadata)
+        }
+    }
+    impl DpopExt for BlockingRefreshResolver {}
+
+    #[derive(Clone)]
+    struct RefreshResponseResolver {
+        status: StatusCode,
+        refresh_dispatches: Arc<AtomicUsize>,
+        block_next_dispatch: Arc<AtomicBool>,
+        dispatch_entered: Arc<Notify>,
+        release_dispatch: Arc<Notify>,
+    }
+
+    impl RefreshResponseResolver {
+        fn new(status: StatusCode, refresh_dispatches: Arc<AtomicUsize>) -> Self {
+            Self {
+                status,
+                refresh_dispatches,
+                block_next_dispatch: Arc::new(AtomicBool::new(false)),
+                dispatch_entered: Arc::new(Notify::new()),
+                release_dispatch: Arc::new(Notify::new()),
+            }
+        }
+
+        fn block_one_dispatch(&self) {
+            self.block_next_dispatch.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl HttpClient for RefreshResponseResolver {
+        type Error = Infallible;
+
+        async fn send_http(
+            &self,
+            request: Request<Vec<u8>>,
+        ) -> core::result::Result<Response<Vec<u8>>, Self::Error> {
+            assert_eq!(request.uri().path(), "/token");
+            self.refresh_dispatches.fetch_add(1, Ordering::SeqCst);
+            if self.block_next_dispatch.swap(false, Ordering::SeqCst) {
+                self.dispatch_entered.notify_one();
+                self.release_dispatch.notified().await;
+            }
+            let body = if self.status == StatusCode::OK {
+                serde_json::to_vec(&serde_json::json!({
+                    "access_token": "refreshed-access",
+                    "refresh_token": "refreshed-refresh",
+                    "token_type": "DPoP",
+                    "expires_in": 3600
+                }))
+                .unwrap()
+            } else {
+                Vec::new()
+            };
+            Ok(Response::builder()
+                .status(self.status)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap())
+        }
+    }
+
+    impl IdentityResolver for RefreshResponseResolver {
+        fn options(&self) -> &ResolverOptions {
+            use std::sync::LazyLock;
+            static OPTIONS: LazyLock<ResolverOptions> = LazyLock::new(ResolverOptions::default);
+            &OPTIONS
+        }
+
+        async fn resolve_handle(
+            &self,
+            _handle: &Handle<'_>,
+        ) -> core::result::Result<Did<'static>, IdentityError> {
+            unreachable!("refresh tests do not resolve handles")
+        }
+
+        async fn resolve_did_doc(
+            &self,
+            _did: &Did<'_>,
+        ) -> core::result::Result<DidDocResponse, IdentityError> {
+            unreachable!("refresh tests override issuer verification")
+        }
+    }
+
+    impl OAuthResolver for RefreshResponseResolver {
+        async fn verify_issuer(
+            &self,
+            _server_metadata: &OAuthAuthorizationServerMetadata<'_>,
+            _sub: &Did<'_>,
+        ) -> crate::resolver::Result<Url> {
+            Ok(Url::parse("https://pds.example").unwrap())
+        }
+
+        async fn get_authorization_server_metadata(
+            &self,
+            _issuer: &CowStr<'_>,
+        ) -> crate::resolver::Result<OAuthAuthorizationServerMetadata<'static>> {
+            let mut metadata = OAuthAuthorizationServerMetadata::default();
+            metadata.issuer = CowStr::new_static("https://issuer.example");
+            metadata.token_endpoint = CowStr::new_static("https://issuer.example/token");
+            metadata.token_endpoint_auth_methods_supported = Some(vec![CowStr::new_static("none")]);
+            Ok(metadata)
+        }
+    }
+
+    impl DpopExt for RefreshResponseResolver {}
+
+    struct IndexedMemoryAuthStore {
+        inner: MemoryAuthStore,
+        index: DashMap<String, String>,
+        block_next_update: AtomicBool,
+        update_entered: Notify,
+        release_update: Notify,
+        fail_renew_countdown: AtomicUsize,
+        coordinated_initial_reads: AtomicUsize,
+        initial_read_barrier: Barrier,
+        busy_acquisitions: AtomicUsize,
+        busy_acquisition_seen: Notify,
+        fail_next_release: AtomicBool,
+    }
+
+    impl IndexedMemoryAuthStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryAuthStore::new(),
+                index: DashMap::new(),
+                block_next_update: AtomicBool::new(false),
+                update_entered: Notify::new(),
+                release_update: Notify::new(),
+                fail_renew_countdown: AtomicUsize::new(0),
+                coordinated_initial_reads: AtomicUsize::new(0),
+                initial_read_barrier: Barrier::new(2),
+                busy_acquisitions: AtomicUsize::new(0),
+                busy_acquisition_seen: Notify::new(),
+                fail_next_release: AtomicBool::new(false),
+            }
+        }
+
+        fn has_index(&self, session_id: &str) -> bool {
+            self.index.contains_key(session_id)
+        }
+
+        fn block_one_update(&self) {
+            self.block_next_update.store(true, Ordering::SeqCst);
+        }
+
+        fn coordinate_two_initial_reads(&self) {
+            self.coordinated_initial_reads.store(2, Ordering::SeqCst);
+        }
+
+        fn fail_one_release(&self) {
+            self.fail_next_release.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ClientAuthStore for IndexedMemoryAuthStore {
+        async fn get_session(
+            &self,
+            did: &Did<'_>,
+            session_id: &str,
+        ) -> core::result::Result<
+            Option<ClientSessionData<'_>>,
+            jacquard_common::session::SessionStoreError,
+        > {
+            let coordinate = self
+                .coordinated_initial_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            if coordinate {
+                let snapshot = self.inner.get_session(did, session_id).await;
+                self.initial_read_barrier.wait().await;
+                return snapshot;
+            }
+            self.inner.get_session(did, session_id).await
+        }
+
+        async fn create_session(
+            &self,
+            session: ClientSessionData<'_>,
+        ) -> core::result::Result<
+            ClientSessionData<'static>,
+            jacquard_common::session::SessionStoreError,
+        > {
+            let session = self.inner.create_session(session).await?;
+            self.index.insert(
+                session.session_id.to_string(),
+                session.account_did.to_string(),
+            );
+            Ok(session)
+        }
+
+        async fn update_session(
+            &self,
+            session: ClientSessionData<'_>,
+        ) -> core::result::Result<bool, jacquard_common::session::SessionStoreError> {
+            if self.block_next_update.swap(false, Ordering::SeqCst) {
+                self.update_entered.notify_one();
+                self.release_update.notified().await;
+            }
+            let session_id = session.session_id.to_string();
+            let did = session.account_did.to_string();
+            let updated = self.inner.update_session(session).await?;
+            if updated {
+                self.index.insert(session_id, did);
+            }
+            Ok(updated)
+        }
+
+        async fn delete_session(
+            &self,
+            did: &Did<'_>,
+            session_id: &str,
+            lifecycle_generation: &str,
+        ) -> core::result::Result<bool, jacquard_common::session::SessionStoreError> {
+            let deleted = self
+                .inner
+                .delete_session(did, session_id, lifecycle_generation)
+                .await?;
+            if deleted {
+                self.index.remove(session_id);
+            }
+            Ok(deleted)
+        }
+
+        async fn acquire_session_operation(
+            &self,
+            did: &Did<'_>,
+            session_id: &str,
+            kind: crate::authstore::SessionOperationKind,
+            owner: &str,
+            ttl: std::time::Duration,
+        ) -> core::result::Result<
+            crate::authstore::SessionOperationAcquire,
+            jacquard_common::session::SessionStoreError,
+        > {
+            let acquired = self
+                .inner
+                .acquire_session_operation(did, session_id, kind, owner, ttl)
+                .await?;
+            if matches!(acquired, crate::authstore::SessionOperationAcquire::Busy) {
+                self.busy_acquisitions.fetch_add(1, Ordering::SeqCst);
+                self.busy_acquisition_seen.notify_one();
+            }
+            Ok(acquired)
+        }
+
+        async fn renew_session_operation(
+            &self,
+            lease: &crate::authstore::SessionOperationLease,
+            ttl: std::time::Duration,
+        ) -> core::result::Result<bool, jacquard_common::session::SessionStoreError> {
+            let countdown = self.fail_renew_countdown.load(Ordering::SeqCst);
+            if countdown > 0 {
+                let previous = self.fail_renew_countdown.fetch_sub(1, Ordering::SeqCst);
+                if previous == 1 {
+                    return Ok(false);
+                }
+            }
+            self.inner.renew_session_operation(lease, ttl).await
+        }
+
+        async fn commit_session_refresh(
+            &self,
+            lease: &crate::authstore::SessionOperationLease,
+            refreshed: ClientSessionData<'_>,
+        ) -> core::result::Result<
+            Option<ClientSessionData<'static>>,
+            jacquard_common::session::SessionStoreError,
+        > {
+            if self.block_next_update.swap(false, Ordering::SeqCst) {
+                self.update_entered.notify_one();
+                self.release_update.notified().await;
+            }
+            let installed = self.inner.commit_session_refresh(lease, refreshed).await?;
+            if let Some(session) = &installed {
+                self.index.insert(
+                    session.session_id.to_string(),
+                    session.account_did.to_string(),
+                );
+            }
+            Ok(installed)
+        }
+
+        async fn complete_session_revoke(
+            &self,
+            lease: &crate::authstore::SessionOperationLease,
+        ) -> core::result::Result<bool, jacquard_common::session::SessionStoreError> {
+            let completed = self.inner.complete_session_revoke(lease).await?;
+            if completed {
+                self.index.remove(lease.session.session_id.as_ref());
+            }
+            Ok(completed)
+        }
+
+        async fn release_session_operation(
+            &self,
+            lease: &crate::authstore::SessionOperationLease,
+            uncertain: bool,
+        ) -> core::result::Result<bool, jacquard_common::session::SessionStoreError> {
+            if self.fail_next_release.swap(false, Ordering::SeqCst) {
+                return Ok(false);
+            }
+            self.inner.release_session_operation(lease, uncertain).await
+        }
+
+        async fn get_auth_req_info(
+            &self,
+            state: &str,
+        ) -> core::result::Result<
+            Option<crate::session::AuthRequestData<'_>>,
+            jacquard_common::session::SessionStoreError,
+        > {
+            self.inner.get_auth_req_info(state).await
+        }
+
+        async fn save_auth_req_info(
+            &self,
+            auth_req_info: &crate::session::AuthRequestData<'_>,
+        ) -> core::result::Result<(), jacquard_common::session::SessionStoreError> {
+            self.inner.save_auth_req_info(auth_req_info).await
+        }
+
+        async fn delete_auth_req_info(
+            &self,
+            state: &str,
+        ) -> core::result::Result<(), jacquard_common::session::SessionStoreError> {
+            self.inner.delete_auth_req_info(state).await
+        }
+    }
+
     fn test_session() -> ClientSessionData<'static> {
         let did = Did::new_static("did:plc:alice").unwrap();
         ClientSessionData {
+            lifecycle_generation: CowStr::default(),
             account_did: did.clone(),
             session_id: CowStr::new_static("session-a"),
             host_url: CowStr::new_static("https://pds.example"),
@@ -234,8 +703,116 @@ mod revocation_security_tests {
         }
     }
 
-    async fn assert_logout_result(revocation: RequestResult<()>, should_delete: bool) {
+    #[tokio::test]
+    async fn durable_uncertainty_is_typed_reauthentication_without_session_deletion() {
         let store = Arc::new(MemoryAuthStore::new());
+        let session = store.create_session(test_session()).await.unwrap();
+        let refresh_lease = match store
+            .acquire_session_operation(
+                &session.account_did,
+                &session.session_id,
+                SessionOperationKind::Refresh,
+                "refresh-owner",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap()
+        {
+            SessionOperationAcquire::Acquired(lease) => lease,
+            other => panic!("expected acquired refresh lease, got {other:?}"),
+        };
+
+        let active = store
+            .get_session(&session.account_did, &session.session_id)
+            .await
+            .unwrap_err();
+        assert!(!is_reauthentication_required(&active));
+        assert!(is_session_operation_active(&active));
+
+        let registry = SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::new(NoopResolver),
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        );
+        assert!(matches!(
+            registry
+                .get(&session.account_did, &session.session_id, false)
+                .await,
+            Err(crate::session::Error::OperationInProgress)
+        ));
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        let quarantined = store
+            .get_session(&session.account_did, &session.session_id)
+            .await
+            .unwrap_err();
+        assert!(is_reauthentication_required(&quarantined));
+
+        assert!(matches!(
+            registry
+                .get(&session.account_did, &session.session_id, false)
+                .await,
+            Err(crate::session::Error::ReauthenticationRequired)
+        ));
+
+        let retained = store
+            .acquire_session_operation(
+                &session.account_did,
+                &session.session_id,
+                SessionOperationKind::Revoke,
+                "revoke-owner",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            retained,
+            SessionOperationAcquire::Acquired(ref lease)
+                if lease.uncertain_refresh
+                    && lease.session.session_id == session.session_id
+                    && lease.session.token_set.refresh_token
+                        == refresh_lease.session.token_set.refresh_token
+        ));
+
+        let session = store.create_session(test_session()).await.unwrap();
+        let revoke_lease = match store
+            .acquire_session_operation(
+                &session.account_did,
+                &session.session_id,
+                SessionOperationKind::Revoke,
+                "expiring-revoke-owner",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap()
+        {
+            SessionOperationAcquire::Acquired(lease) => lease,
+            other => panic!("expected acquired revoke lease, got {other:?}"),
+        };
+        let active = store
+            .get_session(&session.account_did, &session.session_id)
+            .await
+            .unwrap_err();
+        assert!(!is_reauthentication_required(&active));
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let readable = store
+            .get_session(&session.account_did, &session.session_id)
+            .await
+            .unwrap()
+            .expect("expired revoke lease must not hide the retained session");
+        assert_eq!(
+            readable.lifecycle_generation,
+            revoke_lease.session.lifecycle_generation
+        );
+    }
+
+    async fn assert_logout_result(revocation: RequestResult<()>, should_delete: bool) {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
         let registry = SessionRegistry::new_shared(
             Arc::clone(&store),
             Arc::new(NoopResolver),
@@ -245,7 +822,7 @@ mod revocation_security_tests {
             },
         );
         let session = test_session();
-        registry.set(session.clone()).await.unwrap();
+        registry.create(session.clone()).await.unwrap();
 
         let result = complete_logout_after_revocation(
             &registry,
@@ -263,6 +840,7 @@ mod revocation_security_tests {
                 .is_none(),
             should_delete
         );
+        assert_eq!(!store.has_index(&session.session_id), should_delete);
     }
 
     #[test]
@@ -314,6 +892,866 @@ mod revocation_security_tests {
         )
         .await;
         assert_logout_result(Err(RequestError::token_verification()), false).await;
+    }
+
+    #[tokio::test]
+    async fn blocked_refresh_finishes_before_logout_deletes_session() {
+        let store = Arc::new(MemoryAuthStore::new());
+        let refresh_entered = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+        let resolver = Arc::new(BlockingRefreshResolver {
+            refresh_entered: Arc::clone(&refresh_entered),
+            release_refresh: Arc::clone(&release_refresh),
+            revocation_started: Arc::new(AtomicBool::new(false)),
+            revocation_bodies: Arc::new(Mutex::new(Vec::new())),
+            fail_refresh: Arc::new(AtomicBool::new(false)),
+            fail_issuer: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_sub: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_error: Arc::new(AtomicBool::new(false)),
+            revoke_as_inactive: Arc::new(AtomicBool::new(false)),
+        });
+        let registry = Arc::new(SessionRegistry::new_shared(
+            Arc::clone(&store),
+            resolver,
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        ));
+        let session = test_session();
+        registry.create(session.clone()).await.unwrap();
+
+        let refresh_registry = Arc::clone(&registry);
+        let did = session.account_did.clone();
+        let session_id = session.session_id.clone();
+        let refresh_task = tokio::spawn(async move {
+            refresh_registry
+                .get(&did, &session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        refresh_entered.notified().await;
+
+        let logout_registry = Arc::clone(&registry);
+        let did = session.account_did.clone();
+        let session_id = session.session_id.clone();
+        let logout_task = tokio::spawn(async move {
+            complete_logout_after_revocation(logout_registry.as_ref(), &did, &session_id, Ok(()))
+                .await
+        });
+
+        release_refresh.notify_one();
+        assert_eq!(
+            refresh_task.await.unwrap().unwrap().token_set.access_token,
+            "refreshed-access"
+        );
+        logout_task.await.unwrap().unwrap();
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_object_logout_waits_for_refresh_and_revokes_refreshed_credentials() {
+        let store = Arc::new(MemoryAuthStore::new());
+        let refresh_entered = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+        let revocation_started = Arc::new(AtomicBool::new(false));
+        let revocation_bodies = Arc::new(Mutex::new(Vec::new()));
+        let resolver = Arc::new(BlockingRefreshResolver {
+            refresh_entered: Arc::clone(&refresh_entered),
+            release_refresh: Arc::clone(&release_refresh),
+            revocation_started: Arc::clone(&revocation_started),
+            revocation_bodies: Arc::clone(&revocation_bodies),
+            fail_refresh: Arc::new(AtomicBool::new(false)),
+            fail_issuer: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_sub: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_error: Arc::new(AtomicBool::new(false)),
+            revoke_as_inactive: Arc::new(AtomicBool::new(false)),
+        });
+        let registry = Arc::new(SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        ));
+        let original = test_session();
+        let created = registry.create(original.clone()).await.unwrap();
+        let session = Arc::new(super::OAuthSession::new(
+            Arc::clone(&registry),
+            resolver,
+            created,
+        ));
+
+        let refreshing = Arc::clone(&session);
+        let refresh_task = tokio::spawn(async move {
+            refreshing.refresh().await.map(|token| match token {
+                jacquard_common::AuthorizationToken::Dpop(token) => token.to_string(),
+                _ => panic!("refresh returned the wrong authorization scheme"),
+            })
+        });
+        refresh_entered.notified().await;
+        let logging_out = Arc::clone(&session);
+        let logout_task = tokio::spawn(async move { logging_out.logout().await });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !revocation_started.load(Ordering::SeqCst),
+            "logout must not revoke stale credentials while refresh owns the object fence"
+        );
+
+        release_refresh.notify_one();
+        assert_eq!(refresh_task.await.unwrap().unwrap(), "refreshed-access");
+        logout_task.await.unwrap().unwrap();
+        assert!(revocation_started.load(Ordering::SeqCst));
+        assert!(
+            revocation_bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("token=refreshed-refresh")),
+            "logout must revoke the refreshed token, not the pre-refresh token"
+        );
+        assert!(
+            store
+                .get_session(&original.account_did, &original.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session.refresh().await.is_err(),
+            "refresh must not publish credentials after logout completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_registry_logout_revokes_a_concurrently_issued_refresh_grant() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        let refresh_entered = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+        let revocation_started = Arc::new(AtomicBool::new(false));
+        let revocation_bodies = Arc::new(Mutex::new(Vec::new()));
+        let resolver = Arc::new(BlockingRefreshResolver {
+            refresh_entered: Arc::clone(&refresh_entered),
+            release_refresh: Arc::clone(&release_refresh),
+            revocation_started,
+            revocation_bodies: Arc::clone(&revocation_bodies),
+            fail_refresh: Arc::new(AtomicBool::new(false)),
+            fail_issuer: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_sub: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_error: Arc::new(AtomicBool::new(false)),
+            revoke_as_inactive: Arc::new(AtomicBool::new(false)),
+        });
+        let client_data = ClientData {
+            keyset: None,
+            config: AtprotoClientMetadata::default_localhost(),
+        };
+        let refresh_client = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data.clone(),
+        ));
+        let logout_client = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            resolver,
+            client_data,
+        ));
+        let session = refresh_client
+            .registry
+            .create(test_session())
+            .await
+            .unwrap();
+        let refreshing = Arc::clone(&refresh_client);
+        let did = session.account_did.clone();
+        let session_id = session.session_id.clone();
+        let refresh_task = tokio::spawn(async move {
+            refreshing
+                .registry
+                .get(&did, &session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        refresh_entered.notified().await;
+        let logging_out = Arc::clone(&logout_client);
+        let logout_did = session.account_did.clone();
+        let logout_session_id = session.session_id.clone();
+        let logout_task =
+            tokio::spawn(async move { logging_out.revoke(&logout_did, &logout_session_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !logout_client
+                .client
+                .revocation_started
+                .load(Ordering::SeqCst)
+        );
+        release_refresh.notify_one();
+        assert!(refresh_task.await.unwrap().is_ok());
+        logout_task.await.unwrap().unwrap();
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let bodies = revocation_bodies.lock().unwrap();
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("token=refreshed-refresh")),
+            "logout must reload and revoke the grant committed by the lease holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_registry_waiter_rechecks_fresh_session_after_acquiring_lease() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        store.coordinate_two_initial_reads();
+        let refresh_dispatches = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(RefreshResponseResolver::new(
+            StatusCode::OK,
+            Arc::clone(&refresh_dispatches),
+        ));
+        resolver.block_one_dispatch();
+        let client_data = ClientData {
+            keyset: None,
+            config: AtprotoClientMetadata::default_localhost(),
+        };
+        let first = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data.clone(),
+        ));
+        let second = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data,
+        ));
+        let session = first.registry.create(test_session()).await.unwrap();
+
+        let first_did = session.account_did.clone();
+        let first_session_id = session.session_id.clone();
+        let first_task = tokio::spawn(async move {
+            first
+                .registry
+                .get(&first_did, &first_session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        let second_did = session.account_did.clone();
+        let second_session_id = session.session_id.clone();
+        let second_task = tokio::spawn(async move {
+            second
+                .registry
+                .get(&second_did, &second_session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+
+        resolver.dispatch_entered.notified().await;
+        store.busy_acquisition_seen.notified().await;
+        assert!(store.busy_acquisitions.load(Ordering::SeqCst) > 0);
+        resolver.release_dispatch.notify_one();
+
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        assert_eq!(
+            first_result.unwrap().unwrap().token_set.access_token,
+            "refreshed-access"
+        );
+        assert_eq!(
+            second_result.unwrap().unwrap().token_set.access_token,
+            "refreshed-access"
+        );
+        assert_eq!(
+            refresh_dispatches.load(Ordering::SeqCst),
+            1,
+            "a waiter must not rotate a grant that became fresh before lease acquisition"
+        );
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the redundant lease must be released without quarantining the fresh session"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_registry_waiter_never_refreshes_an_uncertain_lease() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        store.coordinate_two_initial_reads();
+        let refresh_dispatches = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(RefreshResponseResolver::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::clone(&refresh_dispatches),
+        ));
+        resolver.block_one_dispatch();
+        let client_data = ClientData {
+            keyset: None,
+            config: AtprotoClientMetadata::default_localhost(),
+        };
+        let first = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data.clone(),
+        ));
+        let second = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data,
+        ));
+        let session = first.registry.create(test_session()).await.unwrap();
+
+        let first_did = session.account_did.clone();
+        let first_session_id = session.session_id.clone();
+        let first_task = tokio::spawn(async move {
+            first
+                .registry
+                .get(&first_did, &first_session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        let second_did = session.account_did.clone();
+        let second_session_id = session.session_id.clone();
+        let second_task = tokio::spawn(async move {
+            second
+                .registry
+                .get(&second_did, &second_session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+
+        resolver.dispatch_entered.notified().await;
+        store.busy_acquisition_seen.notified().await;
+        resolver.release_dispatch.notify_one();
+
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let results = [first_result.unwrap(), second_result.unwrap()];
+        assert!(
+            results.iter().any(|result| matches!(
+                result,
+                Err(crate::session::Error::ReauthenticationRequired)
+            ))
+        );
+        assert_eq!(
+            refresh_dispatches.load(Ordering::SeqCst),
+            1,
+            "a waiter must not dispatch a quarantined refresh token"
+        );
+        assert!(is_reauthentication_required(
+            &store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_session_release_owner_mismatch_fails_closed() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        store.coordinate_two_initial_reads();
+        let refresh_dispatches = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(RefreshResponseResolver::new(
+            StatusCode::OK,
+            Arc::clone(&refresh_dispatches),
+        ));
+        resolver.block_one_dispatch();
+        let client_data = ClientData {
+            keyset: None,
+            config: AtprotoClientMetadata::default_localhost(),
+        };
+        let first = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data.clone(),
+        ));
+        let second = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            client_data,
+        ));
+        let session = first.registry.create(test_session()).await.unwrap();
+
+        let first_did = session.account_did.clone();
+        let first_session_id = session.session_id.clone();
+        let first_task = tokio::spawn(async move {
+            first
+                .registry
+                .get(&first_did, &first_session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        let second_did = session.account_did.clone();
+        let second_session_id = session.session_id.clone();
+        let second_task = tokio::spawn(async move {
+            second
+                .registry
+                .get(&second_did, &second_session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+
+        resolver.dispatch_entered.notified().await;
+        store.busy_acquisition_seen.notified().await;
+        store.fail_one_release();
+        resolver.release_dispatch.notify_one();
+
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let results = [first_result.unwrap(), second_result.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, Err(crate::session::Error::SessionNotFound)))
+        );
+        assert_eq!(store.busy_acquisitions.load(Ordering::SeqCst), 1);
+        assert_eq!(refresh_dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn postdispatch_server_error_quarantines_refresh_family() {
+        let store = Arc::new(MemoryAuthStore::new());
+        let refresh_dispatches = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(RefreshResponseResolver::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::clone(&refresh_dispatches),
+        ));
+        let client = super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            resolver,
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        );
+        let session = client.registry.create(test_session()).await.unwrap();
+
+        assert!(
+            client
+                .registry
+                .get(&session.account_did, &session.session_id, true)
+                .await
+                .is_err()
+        );
+        assert_eq!(refresh_dispatches.load(Ordering::SeqCst), 1);
+        let quarantined = store
+            .get_session(&session.account_did, &session.session_id)
+            .await
+            .expect_err("post-dispatch 5xx must retain durable refresh uncertainty");
+        assert!(is_reauthentication_required(&quarantined));
+    }
+
+    #[tokio::test]
+    async fn lost_refresh_fence_revokes_the_uncommitted_grant() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        store.fail_renew_countdown.store(2, Ordering::SeqCst);
+        let refresh_entered = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+        let revocation_bodies = Arc::new(Mutex::new(Vec::new()));
+        let resolver = Arc::new(BlockingRefreshResolver {
+            refresh_entered: Arc::clone(&refresh_entered),
+            release_refresh: Arc::clone(&release_refresh),
+            revocation_started: Arc::new(AtomicBool::new(false)),
+            revocation_bodies: Arc::clone(&revocation_bodies),
+            fail_refresh: Arc::new(AtomicBool::new(false)),
+            fail_issuer: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_sub: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_error: Arc::new(AtomicBool::new(false)),
+            revoke_as_inactive: Arc::new(AtomicBool::new(false)),
+        });
+        let client = super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            resolver,
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        );
+        let session = client.registry.create(test_session()).await.unwrap();
+        let did = session.account_did.clone();
+        let session_id = session.session_id.clone();
+        let refresh_task = tokio::spawn(async move {
+            client
+                .registry
+                .get(&did, &session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        refresh_entered.notified().await;
+        release_refresh.notify_one();
+        assert!(refresh_task.await.unwrap().is_err());
+        assert!(
+            revocation_bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("token=refreshed-refresh"))
+        );
+    }
+
+    #[tokio::test]
+    async fn predispatch_issuer_failure_releases_quarantine_and_remains_refreshable() {
+        let store = Arc::new(MemoryAuthStore::new());
+        let refresh_entered = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+        let fail_issuer = Arc::new(AtomicBool::new(true));
+        let resolver = Arc::new(BlockingRefreshResolver {
+            refresh_entered: Arc::clone(&refresh_entered),
+            release_refresh: Arc::clone(&release_refresh),
+            revocation_started: Arc::new(AtomicBool::new(false)),
+            revocation_bodies: Arc::new(Mutex::new(Vec::new())),
+            fail_refresh: Arc::new(AtomicBool::new(false)),
+            fail_issuer: Arc::clone(&fail_issuer),
+            malformed_refresh_sub: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_error: Arc::new(AtomicBool::new(false)),
+            revoke_as_inactive: Arc::new(AtomicBool::new(false)),
+        });
+        let client = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            resolver,
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        ));
+        let session = client.registry.create(test_session()).await.unwrap();
+
+        assert!(
+            client
+                .registry
+                .get(&session.account_did, &session.session_id, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "issuer preflight failure must clear the temporary uncertainty marker"
+        );
+
+        fail_issuer.store(false, Ordering::SeqCst);
+        let retrying = Arc::clone(&client);
+        let did = session.account_did.clone();
+        let session_id = session.session_id.clone();
+        let retry = tokio::spawn(async move {
+            retrying
+                .registry
+                .get(&did, &session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        refresh_entered.notified().await;
+        release_refresh.notify_one();
+        assert_eq!(
+            retry.await.unwrap().unwrap().token_set.access_token,
+            "refreshed-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_response_stage_controls_uncertainty() {
+        for (malformed_sub, malformed_error, expect_quarantined) in
+            [(true, false, true), (false, true, false)]
+        {
+            let store = Arc::new(MemoryAuthStore::new());
+            let release_refresh = Arc::new(Notify::new());
+            let resolver = Arc::new(BlockingRefreshResolver {
+                refresh_entered: Arc::new(Notify::new()),
+                release_refresh: Arc::clone(&release_refresh),
+                revocation_started: Arc::new(AtomicBool::new(false)),
+                revocation_bodies: Arc::new(Mutex::new(Vec::new())),
+                fail_refresh: Arc::new(AtomicBool::new(false)),
+                fail_issuer: Arc::new(AtomicBool::new(false)),
+                malformed_refresh_sub: Arc::new(AtomicBool::new(malformed_sub)),
+                malformed_refresh_error: Arc::new(AtomicBool::new(malformed_error)),
+                revoke_as_inactive: Arc::new(AtomicBool::new(false)),
+            });
+            let client = super::OAuthClient::new_with_shared(
+                Arc::clone(&store),
+                resolver,
+                ClientData {
+                    keyset: None,
+                    config: AtprotoClientMetadata::default_localhost(),
+                },
+            );
+            let session = client.registry.create(test_session()).await.unwrap();
+
+            release_refresh.notify_one();
+            assert!(
+                client
+                    .registry
+                    .get(&session.account_did, &session.session_id, true)
+                    .await
+                    .is_err()
+            );
+            let stored = store
+                .get_session(&session.account_did, &session.session_id)
+                .await;
+            assert_eq!(
+                stored.is_err(),
+                expect_quarantined,
+                "malformed accepted success must quarantine; malformed explicit error must not"
+            );
+            if !expect_quarantined {
+                assert!(stored.unwrap().is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_refresh_quarantine_rejects_old_token_inactive_as_logout_proof() {
+        let store = Arc::new(MemoryAuthStore::new());
+        let refresh_entered = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+        let fail_refresh = Arc::new(AtomicBool::new(true));
+        let revoke_as_inactive = Arc::new(AtomicBool::new(true));
+        let revocation_bodies = Arc::new(Mutex::new(Vec::new()));
+        let resolver = Arc::new(BlockingRefreshResolver {
+            refresh_entered: Arc::clone(&refresh_entered),
+            release_refresh: Arc::clone(&release_refresh),
+            revocation_started: Arc::new(AtomicBool::new(false)),
+            revocation_bodies: Arc::clone(&revocation_bodies),
+            fail_refresh,
+            fail_issuer: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_sub: Arc::new(AtomicBool::new(false)),
+            malformed_refresh_error: Arc::new(AtomicBool::new(false)),
+            revoke_as_inactive: Arc::clone(&revoke_as_inactive),
+        });
+        let client = Arc::new(super::OAuthClient::new_with_shared(
+            Arc::clone(&store),
+            resolver,
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        ));
+        let session = client.registry.create(test_session()).await.unwrap();
+        let refreshing = Arc::clone(&client);
+        let did = session.account_did.clone();
+        let session_id = session.session_id.clone();
+        let refresh_task = tokio::spawn(async move {
+            refreshing
+                .registry
+                .get(&did, &session_id, true)
+                .await
+                .map(IntoStatic::into_static)
+        });
+        refresh_entered.notified().await;
+        release_refresh.notify_one();
+        assert!(refresh_task.await.unwrap().is_err());
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .is_err(),
+            "ambiguous refresh must quarantine ordinary reads"
+        );
+        assert!(
+            client
+                .revoke(&session.account_did, &session.session_id)
+                .await
+                .is_err(),
+            "invalid_grant for the pre-refresh token cannot close an uncertain token family"
+        );
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .is_err(),
+            "failed logout must preserve quarantine"
+        );
+        revoke_as_inactive.store(false, Ordering::SeqCst);
+        assert!(
+            client
+                .revoke(&session.account_did, &session.session_id)
+                .await
+                .is_err(),
+            "RFC 7009 success for the old token cannot prove an uncertain descendant inactive"
+        );
+        assert!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .is_err(),
+            "successful old-token revocation must preserve uncertainty quarantine"
+        );
+        assert!(
+            revocation_bodies.lock().unwrap().is_empty(),
+            "quarantined sessions must fail before sending a stale revocation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_fence_blocks_nonce_writer_and_rejects_stolen_owner() {
+        use crate::authstore::{SessionOperationAcquire, SessionOperationKind};
+        let store = MemoryAuthStore::new();
+        let created = store.create_session(test_session()).await.unwrap();
+        let lease = match store
+            .acquire_session_operation(
+                &created.account_did,
+                &created.session_id,
+                SessionOperationKind::Revoke,
+                "owner-a",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+        {
+            SessionOperationAcquire::Acquired(lease) => lease,
+            other => panic!("unexpected acquisition result: {other:?}"),
+        };
+        let mut stale_nonce_write = created;
+        stale_nonce_write.dpop_data.dpop_host_nonce = CowStr::new_static("stale-nonce");
+        assert!(!store.update_session(stale_nonce_write).await.unwrap());
+
+        let mut stolen = lease.clone();
+        stolen.owner = "owner-b".into();
+        assert!(
+            !store
+                .renew_session_operation(&stolen, std::time::Duration::from_secs(30))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .release_session_operation(&stolen, false)
+                .await
+                .unwrap()
+        );
+        assert!(store.complete_session_revoke(&lease).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_background_set_after_logout_cannot_recreate_session_or_identity() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        let registry = SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::new(NoopResolver),
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        );
+        let mut stale = registry.create(test_session()).await.unwrap();
+        stale.dpop_data.dpop_host_nonce = CowStr::new_static("stale-nonce");
+
+        // Model logout after it has acquired the lifecycle fence but before
+        // it deletes. The background write is already queued at that point.
+        let lifecycle = registry
+            .lock_session(&stale.account_did, &stale.session_id)
+            .await;
+        let registry = Arc::new(registry);
+        let stale_writer = Arc::clone(&registry);
+        let stale_value = stale.clone();
+        let stale_task = tokio::spawn(async move { stale_writer.set(stale_value).await });
+        tokio::task::yield_now().await;
+        registry
+            .delete_locked(
+                &stale.account_did,
+                &stale.session_id,
+                &stale.lifecycle_generation,
+            )
+            .await
+            .unwrap();
+        drop(lifecycle);
+
+        assert!(stale_task.await.unwrap().is_err());
+        assert!(
+            store
+                .get_session(&stale.account_did, &stale.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.has_index(&stale.session_id));
+    }
+
+    #[tokio::test]
+    async fn store_clones_share_logout_fence_across_independent_registries() {
+        let store = Arc::new(IndexedMemoryAuthStore::new());
+        let client_data = ClientData {
+            keyset: None,
+            config: AtprotoClientMetadata::default_localhost(),
+        };
+        let first = Arc::new(SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::new(NoopResolver),
+            client_data.clone(),
+        ));
+        let second = Arc::new(SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::new(NoopResolver),
+            client_data,
+        ));
+        let mut stale = first.create(test_session()).await.unwrap();
+        stale.dpop_data.dpop_host_nonce = CowStr::new_static("other-registry-stale");
+        store.block_one_update();
+
+        let lifecycle = first
+            .lock_session(&stale.account_did, &stale.session_id)
+            .await;
+        let stale_writer = Arc::clone(&second);
+        let stale_value = stale.clone();
+        let stale_task = tokio::spawn(async move { stale_writer.set(stale_value).await });
+        store.update_entered.notified().await;
+        first
+            .delete_locked(
+                &stale.account_did,
+                &stale.session_id,
+                &stale.lifecycle_generation,
+            )
+            .await
+            .unwrap();
+        drop(lifecycle);
+        store.release_update.notify_one();
+
+        assert!(stale_task.await.unwrap().is_err());
+        assert!(
+            store
+                .get_session(&stale.account_did, &stale.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.has_index(&stale.session_id));
+    }
+
+    #[tokio::test]
+    async fn explicit_create_and_atomic_existing_update_preserve_normal_session_flow() {
+        let store = Arc::new(MemoryAuthStore::new());
+        let registry = SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::new(NoopResolver),
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        );
+        let session = registry.create(test_session()).await.unwrap();
+        registry
+            .update(&session.account_did, &session.session_id, |current| {
+                current.dpop_data.dpop_host_nonce = CowStr::new_static("fresh-nonce");
+            })
+            .await
+            .unwrap();
+
+        let stored = store
+            .get_session(&session.account_did, &session.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.dpop_data.dpop_host_nonce, "fresh-nonce");
     }
 }
 
@@ -440,6 +1878,7 @@ where
                     vec![]
                 };
                 let client_data = ClientSessionData {
+                    lifecycle_generation: CowStr::default(),
                     account_did: token_set.sub.clone(),
                     session_id: auth_req_info.state,
                     host_url: token_set.aud.clone(),
@@ -465,7 +1904,16 @@ where
     }
 
     async fn create_session(&self, data: ClientSessionData<'_>) -> Result<OAuthSession<T, S>> {
-        self.registry.set(data.clone()).await?;
+        let data = self.registry.create(data).await?;
+        Ok(OAuthSession::new(
+            self.registry.clone(),
+            self.client.clone(),
+            data,
+        ))
+    }
+
+    pub async fn restore(&self, did: &Did<'_>, session_id: &str) -> Result<OAuthSession<T, S>> {
+        let data = self.registry.get(did, session_id, true).await?;
         Ok(OAuthSession::new(
             self.registry.clone(),
             self.client.clone(),
@@ -473,20 +1921,8 @@ where
         ))
     }
 
-    pub async fn restore(&self, did: &Did<'_>, session_id: &str) -> Result<OAuthSession<T, S>> {
-        self.create_session(self.registry.get(did, session_id, true).await?)
-            .await
-    }
-
     pub async fn revoke(&self, did: &Did<'_>, session_id: &str) -> Result<()> {
-        let data = self.registry.get(did, session_id, false).await?;
-        OAuthSession::new(
-            self.registry.clone(),
-            self.client.clone(),
-            data.into_static(),
-        )
-        .logout()
-        .await
+        revoke_stored_session(&self.registry, self.client.as_ref(), did, session_id).await
     }
 }
 
@@ -687,24 +2123,134 @@ where
     T: OAuthResolver + DpopExt + Send + Sync + 'static,
 {
     pub async fn logout(&self) -> Result<()> {
-        use crate::request::{OAuthMetadata, revoke};
         let mut data = self.data.write().await;
-        let meta =
-            OAuthMetadata::new(self.client.as_ref(), &self.registry.client_data, &data).await?;
-        let token = required_revocation_token(
-            meta.server_metadata.revocation_endpoint.is_some(),
-            data.token_set.refresh_token.as_deref(),
-            data.token_set.access_token.as_ref(),
-        )?
-        .to_owned();
-        let revocation = revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta).await;
         let did = data.account_did.clone();
         let session_id = data.session_id.clone();
-        complete_logout_after_revocation(self.registry.as_ref(), &did, &session_id, revocation)
-            .await
+        revoke_stored_session(&self.registry, self.client.as_ref(), &did, &session_id).await?;
+        data.lifecycle_generation = CowStr::default();
+        Ok(())
     }
 }
 
+async fn revoke_stored_session<T, S>(
+    registry: &SessionRegistry<T, S>,
+    client: &T,
+    did: &Did<'_>,
+    session_id: &str,
+) -> Result<()>
+where
+    S: ClientAuthStore + Send + Sync + 'static,
+    T: OAuthResolver + DpopExt + Send + Sync + 'static,
+{
+    use crate::{
+        authstore::SessionOperationKind,
+        request::{OAuthMetadata, revoke},
+    };
+    let _local = registry.lock_session(did, session_id).await;
+    let lease = registry
+        .acquire_operation(did, session_id, SessionOperationKind::Revoke)
+        .await?;
+    if lease.uncertain_refresh {
+        let _ = registry.store.release_session_operation(&lease, true).await;
+        return Err(crate::session::Error::Store(
+            jacquard_common::session::SessionStoreError::Other(
+                "session has an unresolved refresh outcome; reauthentication is required".into(),
+            ),
+        )
+        .into());
+    }
+    let mut latest = lease.session.clone();
+    let meta = match OAuthMetadata::new(client, &registry.client_data, &latest).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            let _ = registry
+                .store
+                .release_session_operation(&lease, lease.uncertain_refresh)
+                .await;
+            return Err(error.into());
+        }
+    };
+    let token = match required_revocation_token(
+        meta.server_metadata.revocation_endpoint.is_some(),
+        latest.token_set.refresh_token.as_deref(),
+        latest.token_set.access_token.as_ref(),
+    ) {
+        Ok(token) => token.to_owned(),
+        Err(error) => {
+            let _ = registry
+                .store
+                .release_session_operation(&lease, lease.uncertain_refresh)
+                .await;
+            return Err(error);
+        }
+    };
+    if !registry
+        .store
+        .renew_session_operation(&lease, std::time::Duration::from_secs(120))
+        .await?
+    {
+        return Err(crate::session::Error::SessionNotFound.into());
+    }
+    let (stop_renewal, mut renewal_stopped) = tokio::sync::oneshot::channel::<()>();
+    let renewal_store = Arc::clone(&registry.store);
+    let renewal_lease = lease.clone();
+    let renewal = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut renewal_stopped => return true,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(40)) => {
+                    match renewal_store.renew_session_operation(
+                        &renewal_lease,
+                        std::time::Duration::from_secs(120),
+                    ).await {
+                        Ok(true) => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+    });
+    let revocation = revoke(client, &mut latest.dpop_data, &token, &meta).await;
+    let _ = stop_renewal.send(());
+    let renewal_live = renewal.await.unwrap_or(false);
+    if !renewal_live
+        || !registry
+            .store
+            .renew_session_operation(&lease, std::time::Duration::from_secs(120))
+            .await
+            .unwrap_or(false)
+    {
+        return Err(crate::session::Error::SessionNotFound.into());
+    }
+    let proven = match revocation {
+        Ok(()) => true,
+        Err(error) if !lease.uncertain_refresh && error.proves_token_inactive() => true,
+        Err(error) => {
+            let _ = registry
+                .store
+                .release_session_operation(&lease, lease.uncertain_refresh)
+                .await;
+            return Err(error.into());
+        }
+    };
+    debug_assert!(proven);
+    if registry.store.complete_session_revoke(&lease).await? {
+        Ok(())
+    } else {
+        Err(crate::session::Error::SessionNotFound.into())
+    }
+}
+
+#[cfg(test)]
+fn require_local_delete_after_revocation(revocation: crate::request::Result<()>) -> Result<()> {
+    match revocation {
+        Ok(()) => Ok(()),
+        Err(error) if error.proves_token_inactive() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
 async fn complete_logout_after_revocation<T, S>(
     registry: &SessionRegistry<T, S>,
     did: &Did<'_>,
@@ -715,11 +2261,7 @@ where
     S: ClientAuthStore + Send + Sync + 'static,
     T: OAuthResolver + DpopExt + Send + Sync + 'static,
 {
-    match revocation {
-        Ok(()) => {}
-        Err(error) if error.proves_token_inactive() => {}
-        Err(error) => return Err(error.into()),
-    }
+    require_local_delete_after_revocation(revocation)?;
     registry.del(did, session_id).await?;
     Ok(())
 }
@@ -756,17 +2298,15 @@ where
 {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
     pub async fn refresh(&self) -> Result<AuthorizationToken<'_>> {
-        // Read identifiers without holding the lock across await
-        let (did, sid) = {
-            let data = self.data.read().await;
-            (data.account_did.clone(), data.session_id.clone())
-        };
+        // Keep this session object's write fence for the whole refresh so a
+        // same-object logout cannot revoke and delete while refresh is using
+        // and replacing its credentials.
+        let mut data = self.data.write().await;
+        let did = data.account_did.clone();
+        let sid = data.session_id.clone();
         let refreshed = self.registry.as_ref().get(&did, &sid, true).await?;
         let token = AuthorizationToken::Dpop(refreshed.token_set.access_token.clone());
-        // Write back updated session
-        *self.data.write().await = refreshed.clone().into_static();
-        // Store in the registry
-        self.registry.set(refreshed).await?;
+        *data = refreshed.into_static();
         Ok(token)
     }
 }
