@@ -144,6 +144,127 @@ where
 
 #[cfg(test)]
 mod revocation_security_tests {
+    use super::complete_logout_after_revocation;
+    use crate::{
+        atproto::AtprotoClientMetadata,
+        authstore::{ClientAuthStore, MemoryAuthStore},
+        dpop::DpopExt,
+        request::{RequestError, Result as RequestResult},
+        resolver::OAuthResolver,
+        session::{ClientData, ClientSessionData, DpopClientData, SessionRegistry},
+        types::{OAuthTokenType, TokenSet},
+    };
+    use http::{Request, Response, StatusCode};
+    use jacquard_common::{
+        CowStr,
+        http_client::HttpClient,
+        types::{did::Did, string::Handle},
+    };
+    use jacquard_identity::resolver::{
+        DidDocResponse, IdentityError, IdentityResolver, ResolverOptions,
+    };
+    use std::{convert::Infallible, sync::Arc};
+
+    #[derive(Clone)]
+    struct NoopResolver;
+
+    impl HttpClient for NoopResolver {
+        type Error = Infallible;
+
+        async fn send_http(
+            &self,
+            _request: Request<Vec<u8>>,
+        ) -> core::result::Result<Response<Vec<u8>>, Self::Error> {
+            unreachable!("logout decision tests do not perform HTTP")
+        }
+    }
+
+    impl IdentityResolver for NoopResolver {
+        fn options(&self) -> &ResolverOptions {
+            use std::sync::LazyLock;
+            static OPTIONS: LazyLock<ResolverOptions> = LazyLock::new(ResolverOptions::default);
+            &OPTIONS
+        }
+
+        async fn resolve_handle(
+            &self,
+            _handle: &Handle<'_>,
+        ) -> core::result::Result<Did<'static>, IdentityError> {
+            unreachable!("logout decision tests do not resolve handles")
+        }
+
+        async fn resolve_did_doc(
+            &self,
+            _did: &Did<'_>,
+        ) -> core::result::Result<DidDocResponse, IdentityError> {
+            unreachable!("logout decision tests do not resolve DID documents")
+        }
+    }
+
+    impl OAuthResolver for NoopResolver {}
+    impl DpopExt for NoopResolver {}
+
+    fn test_session() -> ClientSessionData<'static> {
+        let did = Did::new_static("did:plc:alice").unwrap();
+        ClientSessionData {
+            account_did: did.clone(),
+            session_id: CowStr::new_static("session-a"),
+            host_url: CowStr::new_static("https://pds.example"),
+            authserver_url: CowStr::new_static("https://issuer.example"),
+            authserver_token_endpoint: CowStr::new_static("https://issuer.example/token"),
+            authserver_revocation_endpoint: Some(CowStr::new_static(
+                "https://issuer.example/revoke",
+            )),
+            scopes: vec![],
+            dpop_data: DpopClientData {
+                dpop_key: crate::utils::generate_key(&[CowStr::new_static("ES256")]).unwrap(),
+                dpop_authserver_nonce: CowStr::new_static(""),
+                dpop_host_nonce: CowStr::new_static(""),
+            },
+            token_set: TokenSet {
+                iss: CowStr::new_static("https://issuer.example"),
+                sub: did,
+                aud: CowStr::new_static("https://pds.example"),
+                scope: None,
+                refresh_token: Some(CowStr::new_static("refresh")),
+                access_token: CowStr::new_static("access"),
+                token_type: OAuthTokenType::DPoP,
+                expires_at: None,
+            },
+        }
+    }
+
+    async fn assert_logout_result(revocation: RequestResult<()>, should_delete: bool) {
+        let store = Arc::new(MemoryAuthStore::new());
+        let registry = SessionRegistry::new_shared(
+            Arc::clone(&store),
+            Arc::new(NoopResolver),
+            ClientData {
+                keyset: None,
+                config: AtprotoClientMetadata::default_localhost(),
+            },
+        );
+        let session = test_session();
+        registry.set(session.clone()).await.unwrap();
+
+        let result = complete_logout_after_revocation(
+            &registry,
+            &session.account_did,
+            &session.session_id,
+            revocation,
+        )
+        .await;
+        assert_eq!(result.is_ok(), should_delete);
+        assert_eq!(
+            store
+                .get_session(&session.account_did, &session.session_id)
+                .await
+                .unwrap()
+                .is_none(),
+            should_delete
+        );
+    }
+
     #[test]
     fn logout_requires_revocation_endpoint_and_prefers_refresh_grant_token() {
         assert!(super::required_revocation_token(false, Some("refresh"), "access").is_err());
@@ -155,6 +276,44 @@ mod revocation_security_tests {
             super::required_revocation_token(true, None, "access").unwrap(),
             "access"
         );
+    }
+
+    #[tokio::test]
+    async fn local_session_deletion_requires_success_or_status_bound_inactive_grant() {
+        assert_logout_result(Ok(()), true).await;
+        for code in ["invalid_token", "invalid_grant"] {
+            assert_logout_result(
+                Err(RequestError::http_status_with_body(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "error": code }),
+                )),
+                true,
+            )
+            .await;
+        }
+
+        for (status, code) in [
+            (StatusCode::BAD_REQUEST, "access_denied"),
+            (StatusCode::BAD_REQUEST, "invalid_client"),
+            (StatusCode::BAD_REQUEST, "temporarily_unavailable"),
+            (StatusCode::UNAUTHORIZED, "invalid_token"),
+            (StatusCode::TOO_MANY_REQUESTS, "invalid_grant"),
+        ] {
+            assert_logout_result(
+                Err(RequestError::http_status_with_body(
+                    status,
+                    serde_json::json!({ "error": code }),
+                )),
+                false,
+            )
+            .await;
+        }
+        assert_logout_result(
+            Err(RequestError::http_status(StatusCode::SERVICE_UNAVAILABLE)),
+            false,
+        )
+        .await;
+        assert_logout_result(Err(RequestError::token_verification()), false).await;
     }
 }
 
@@ -538,17 +697,31 @@ where
             data.token_set.access_token.as_ref(),
         )?
         .to_owned();
-        match revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta).await {
-            Ok(()) => {}
-            Err(error) if error.proves_token_inactive() => {}
-            Err(error) => return Err(error.into()),
-        }
-        // Remove from store
-        self.registry
-            .del(&data.account_did, &data.session_id)
-            .await?;
-        Ok(())
+        let revocation = revoke(self.client.as_ref(), &mut data.dpop_data, &token, &meta).await;
+        let did = data.account_did.clone();
+        let session_id = data.session_id.clone();
+        complete_logout_after_revocation(self.registry.as_ref(), &did, &session_id, revocation)
+            .await
     }
+}
+
+async fn complete_logout_after_revocation<T, S>(
+    registry: &SessionRegistry<T, S>,
+    did: &Did<'_>,
+    session_id: &str,
+    revocation: crate::request::Result<()>,
+) -> Result<()>
+where
+    S: ClientAuthStore + Send + Sync + 'static,
+    T: OAuthResolver + DpopExt + Send + Sync + 'static,
+{
+    match revocation {
+        Ok(()) => {}
+        Err(error) if error.proves_token_inactive() => {}
+        Err(error) => return Err(error.into()),
+    }
+    registry.del(did, session_id).await?;
+    Ok(())
 }
 
 fn required_revocation_token<'a>(

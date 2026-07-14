@@ -325,10 +325,13 @@ impl RequestError {
     /// not prove that a refresh grant has been revoked.
     pub fn proves_token_inactive(&self) -> bool {
         match &self.kind {
-            RequestErrorKind::HttpStatusWithBody { body, .. } => body
-                .get("error")
-                .and_then(|error| error.as_str())
-                .is_some_and(|error| matches!(error, "invalid_grant" | "invalid_token")),
+            RequestErrorKind::HttpStatusWithBody { status, body }
+                if *status == StatusCode::BAD_REQUEST =>
+            {
+                body.get("error")
+                    .and_then(|error| error.as_str())
+                    .is_some_and(|error| matches!(error, "invalid_grant" | "invalid_token"))
+            }
             _ => false,
         }
     }
@@ -454,6 +457,15 @@ impl OAuthRequest<'_> {
             // Unlike https://datatracker.ietf.org/doc/html/rfc7009#section-2.2, oauth-provider seems to return `204`.
             Self::Revocation(_) => StatusCode::NO_CONTENT,
             _ => unimplemented!(),
+        }
+    }
+
+    pub fn accepts_status(&self, status: StatusCode) -> bool {
+        match self {
+            // RFC 7009 requires 200. The deployed provider historically uses
+            // 204, so accept both successful, bodyless revocation responses.
+            Self::Revocation(_) => matches!(status, StatusCode::OK | StatusCode::NO_CONTENT),
+            _ => status == self.expected_status(),
         }
     }
 }
@@ -782,7 +794,7 @@ where
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body.into_bytes())?;
     let res = client.dpop_server_call(data_source).send(req).await?;
-    if res.status() == request.expected_status() {
+    if request.accepts_status(res.status()) {
         let body = res.body();
         if body.is_empty() {
             // since an empty body cannot be deserialized, use “null” temporarily to allow deserialization to `()`.
@@ -1160,6 +1172,35 @@ mod tests {
             );
             assert!(!error.proves_token_inactive(), "accepted {code}");
         }
+
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            for code in ["invalid_token", "invalid_grant"] {
+                let error = RequestError::http_status_with_body(
+                    status,
+                    serde_json::json!({ "error": code }),
+                );
+                assert!(
+                    !error.proves_token_inactive(),
+                    "accepted {code} with status {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revocation_accepts_rfc_7009_ok_and_provider_no_content() {
+        let request = OAuthRequest::Revocation(RevocationRequestParameters {
+            token: "grant".into(),
+        });
+
+        assert!(request.accepts_status(StatusCode::OK));
+        assert!(request.accepts_status(StatusCode::NO_CONTENT));
+        assert!(!request.accepts_status(StatusCode::CREATED));
     }
 
     #[test]

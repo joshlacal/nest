@@ -607,7 +607,7 @@ pub(crate) async fn resolve_background_session(
         .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
 
     let mapped_did = auth_store.lookup_did_for_session(session_id).await?;
-    validate_background_session_mapping(mapped_did.as_deref(), account_did)?;
+    let repair_index = validate_background_session_mapping(mapped_did.as_deref(), account_did)?;
 
     let did = Did::new(account_did)
         .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
@@ -616,6 +616,17 @@ pub(crate) async fn resolve_background_session(
         .get(&did, session_id, true)
         .await
         .map_err(|err| anyhow!("Jacquard session lookup failed: {}", err))?;
+    validate_background_session_record(
+        session_data.account_did.as_str(),
+        &session_data.session_id,
+        account_did,
+        session_id,
+    )?;
+    if repair_index {
+        auth_store
+            .write_session_index(session_id, account_did)
+            .await?;
+    }
 
     let expires_at = session_data
         .token_set
@@ -654,12 +665,35 @@ pub(crate) async fn resolve_background_session(
     Ok((session, dpop))
 }
 
-fn validate_background_session_mapping(mapped_did: Option<&str>, expected_did: &str) -> Result<()> {
+fn validate_background_session_mapping(
+    mapped_did: Option<&str>,
+    expected_did: &str,
+) -> Result<bool> {
     match mapped_did {
-        Some(mapped_did) if mapped_did == expected_did => Ok(()),
-        _ => Err(anyhow!(
+        Some(mapped_did) if mapped_did == expected_did => Ok(false),
+        Some(_) => Err(anyhow!(
             "Background OAuth session is not bound to the requested account"
         )),
+        // Background jobs already carry an authoritative account DID from
+        // their database row. A missing secondary index may be repaired only
+        // after the primary session record is loaded by that DID and its
+        // embedded principal and session ID are verified below.
+        None => Ok(true),
+    }
+}
+
+fn validate_background_session_record(
+    stored_did: &str,
+    stored_session_id: &str,
+    expected_did: &str,
+    expected_session_id: &str,
+) -> Result<()> {
+    if stored_did == expected_did && stored_session_id == expected_session_id {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Background OAuth session record is not bound to the requested account"
+        ))
     }
 }
 
@@ -683,13 +717,38 @@ mod session_binding_tests {
     fn background_session_mapping_requires_exact_expected_did() {
         assert!(
             super::validate_background_session_mapping(Some("did:plc:alice"), "did:plc:alice")
-                .is_ok()
+                .is_ok_and(|repair_index| !repair_index)
         );
         assert!(super::validate_background_session_mapping(
             Some("did:plc:mallory"),
             "did:plc:alice"
         )
         .is_err());
-        assert!(super::validate_background_session_mapping(None, "did:plc:alice").is_err());
+        assert!(
+            super::validate_background_session_mapping(None, "did:plc:alice")
+                .is_ok_and(|repair_index| repair_index)
+        );
+
+        assert!(super::validate_background_session_record(
+            "did:plc:alice",
+            "session-a",
+            "did:plc:alice",
+            "session-a"
+        )
+        .is_ok());
+        assert!(super::validate_background_session_record(
+            "did:plc:mallory",
+            "session-a",
+            "did:plc:alice",
+            "session-a"
+        )
+        .is_err());
+        assert!(super::validate_background_session_record(
+            "did:plc:alice",
+            "session-b",
+            "did:plc:alice",
+            "session-a"
+        )
+        .is_err());
     }
 }
