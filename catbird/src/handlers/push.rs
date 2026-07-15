@@ -14,6 +14,7 @@ use crate::{
     models::CatbirdSession,
     services::push::{
         push_unavailable_error,
+        subscriptions::{bounded_page_limit, bounded_page_offset},
         types::{
             PutActivitySubscriptionInput, PutPreferencesInput, RegisterPushInput,
             UnregisterPushInput,
@@ -114,31 +115,24 @@ pub async fn list_activity_subscriptions(
         .await
         .map_err(internal_error)?;
 
-    let mut subscriptions = push
+    let (offset, limit) = normalize_list_query(query);
+    let page = push
         .subscriptions
-        .list_profiles_json(&state.http_client, &session.did)
+        .list_profiles_page_json(&state.outbound_policy, &session.did, offset, limit)
         .await
         .map_err(internal_error)?;
 
-    let offset = query
-        .cursor
-        .as_deref()
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .unwrap_or(0);
-    let limit = query.limit.unwrap_or(50).max(1);
-    let total = subscriptions.len();
-
-    let next_offset = offset.saturating_add(limit);
-    let slice = subscriptions
-        .drain(offset.min(total)..total.min(next_offset))
-        .collect::<Vec<_>>();
-
-    let cursor = (next_offset < total).then(|| next_offset.to_string());
-
     Ok(Json(json!({
-        "cursor": cursor,
-        "subscriptions": slice,
+        "cursor": page.cursor,
+        "subscriptions": page.profiles,
     })))
+}
+
+fn normalize_list_query(query: ListActivitySubscriptionsQuery) -> (i64, usize) {
+    (
+        bounded_page_offset(query.cursor.as_deref()),
+        bounded_page_limit(query.limit),
+    )
 }
 
 pub async fn put_activity_subscription(
@@ -166,4 +160,24 @@ pub async fn put_activity_subscription(
 
 fn internal_error(err: anyhow::Error) -> AppError {
     AppError::Internal(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_query_normalization_clamps_hostile_limits_and_cursors() {
+        let normal = normalize_list_query(ListActivitySubscriptionsQuery {
+            limit: Some(25),
+            cursor: Some("50".to_string()),
+        });
+        assert_eq!(normal, (50, 25));
+
+        let hostile = normalize_list_query(ListActivitySubscriptionsQuery {
+            limit: Some(usize::MAX),
+            cursor: Some("184467440737095516160".to_string()),
+        });
+        assert_eq!(hostile, (0, 50));
+    }
 }
