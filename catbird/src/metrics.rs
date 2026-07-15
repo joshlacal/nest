@@ -2,6 +2,7 @@
 //!
 //! Provides HTTP request, proxy, auth, and rate limit metrics.
 
+use jacquard_common::types::string::Nsid;
 use lazy_static::lazy_static;
 use prometheus::{
     self, CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
@@ -127,12 +128,41 @@ pub fn record_http_request(method: &str, path: &str, status: u16, duration_secs:
 
 /// Record a proxy request metric
 pub fn record_proxy_request(lexicon: &str, status: u16, duration_secs: f64) {
-    PROXY_REQUESTS_TOTAL
-        .with_label_values(&[lexicon, &status.to_string()])
+    record_proxy_request_metrics(
+        &PROXY_REQUESTS_TOTAL,
+        &PROXY_DURATION,
+        lexicon,
+        status,
+        duration_secs,
+    );
+}
+
+fn record_proxy_request_metrics(
+    requests: &CounterVec,
+    duration: &HistogramVec,
+    lexicon: &str,
+    status: u16,
+    duration_secs: f64,
+) {
+    let family = proxy_metric_lexicon_label(lexicon);
+    requests
+        .with_label_values(&[family, &status.to_string()])
         .inc();
-    PROXY_DURATION
-        .with_label_values(&[lexicon])
-        .observe(duration_secs);
+    duration.with_label_values(&[family]).observe(duration_secs);
+}
+
+fn proxy_metric_lexicon_label(lexicon: &str) -> &'static str {
+    let Ok(nsid) = Nsid::new(lexicon) else {
+        return "invalid";
+    };
+    let mut segments = nsid.as_str().split('.');
+    match (segments.next(), segments.next()) {
+        (Some("com"), Some("atproto")) => "com.atproto",
+        (Some("app"), Some("bsky")) => "app.bsky",
+        (Some("chat"), Some("bsky")) => "chat.bsky",
+        (Some("blue"), Some("catbird")) => "blue.catbird",
+        _ => "other",
+    }
 }
 
 /// Record an OAuth login attempt
@@ -226,5 +256,160 @@ mod mls_binding_tests {
         assert!(!encoded.contains("did:plc"));
         assert!(!encoded.contains("device_id"));
         assert!(!encoded.contains("secret-session-bearer"));
+    }
+}
+
+#[cfg(test)]
+mod proxy_metric_tests {
+    use super::*;
+    use prometheus::core::Collector;
+    use std::collections::BTreeSet;
+
+    const ALLOWED_LABELS: [&str; 6] = [
+        "app.bsky",
+        "blue.catbird",
+        "chat.bsky",
+        "com.atproto",
+        "invalid",
+        "other",
+    ];
+
+    fn fresh_proxy_metrics() -> (Registry, CounterVec, HistogramVec) {
+        let registry = Registry::new();
+        let requests = CounterVec::new(
+            Opts::new("test_proxy_requests_total", "Test proxy requests"),
+            &["lexicon", "status"],
+        )
+        .unwrap();
+        let duration = HistogramVec::new(
+            HistogramOpts::new("test_proxy_duration_seconds", "Test proxy duration"),
+            &["lexicon"],
+        )
+        .unwrap();
+        registry.register(Box::new(requests.clone())).unwrap();
+        registry.register(Box::new(duration.clone())).unwrap();
+        (registry, requests, duration)
+    }
+
+    #[test]
+    fn proxy_metrics_do_not_retain_raw_third_party_nsid_labels() {
+        const ATTACKER_NSID: &str = "evil.example.attackerMethod";
+
+        record_proxy_request(ATTACKER_NSID, 200, 0.01);
+
+        let retained_labels = PROXY_REQUESTS_TOTAL
+            .collect()
+            .into_iter()
+            .flat_map(|family| family.get_metric().to_vec())
+            .flat_map(|metric| metric.get_label().to_vec())
+            .filter(|label| label.get_name() == "lexicon")
+            .map(|label| label.get_value().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !retained_labels.iter().any(|label| label == ATTACKER_NSID),
+            "attacker-controlled NSID leaked into the Prometheus label set: {retained_labels:?}"
+        );
+    }
+
+    #[test]
+    fn valid_nsids_map_to_closed_protocol_family_labels() {
+        for (nsid, expected) in [
+            ("com.atproto.repo.createRecord", "com.atproto"),
+            ("app.bsky.feed.getTimeline", "app.bsky"),
+            ("chat.bsky.convo.getConvo", "chat.bsky"),
+            ("blue.catbird.mlsChat.sendMessage", "blue.catbird"),
+            ("org.example.customMethod", "other"),
+            ("com.atprotox.customMethod", "other"),
+        ] {
+            assert_eq!(proxy_metric_lexicon_label(nsid), expected, "{nsid}");
+        }
+    }
+
+    #[test]
+    fn malformed_nsids_map_to_invalid() {
+        let oversized = format!("com.example.{}", "a".repeat(306));
+        let malformed = [
+            "",
+            "com.atproto",
+            "com..atproto.method",
+            "com.atproto.1method",
+            "com.atproto.method/extra",
+            "com.atproto.method\nextra",
+            "app.bsky.méthod",
+            oversized.as_str(),
+        ];
+
+        for nsid in malformed {
+            assert_eq!(proxy_metric_lexicon_label(nsid), "invalid", "{nsid:?}");
+        }
+    }
+
+    #[test]
+    fn attacker_cardinality_is_bounded_in_a_fresh_registry() {
+        let (registry, requests, duration) = fresh_proxy_metrics();
+
+        for index in 0..5_000 {
+            record_proxy_request_metrics(
+                &requests,
+                &duration,
+                &format!("org.attacker{index}.method"),
+                200,
+                0.001,
+            );
+        }
+        for nsid in [
+            "com.atproto.repo.getRecord",
+            "app.bsky.feed.getTimeline",
+            "chat.bsky.convo.getConvo",
+            "blue.catbird.mlsChat.getConvos",
+            "not an nsid",
+        ] {
+            record_proxy_request_metrics(&requests, &duration, nsid, 200, 0.001);
+        }
+
+        let labels = registry
+            .gather()
+            .into_iter()
+            .flat_map(|family| family.get_metric().to_vec())
+            .flat_map(|metric| metric.get_label().to_vec())
+            .filter(|label| label.get_name() == "lexicon")
+            .map(|label| label.get_value().to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            labels,
+            ALLOWED_LABELS
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn proxy_counter_status_and_histogram_observations_are_preserved() {
+        let (_registry, requests, duration) = fresh_proxy_metrics();
+
+        record_proxy_request_metrics(
+            &requests,
+            &duration,
+            "com.atproto.repo.getRecord",
+            201,
+            0.25,
+        );
+        record_proxy_request_metrics(
+            &requests,
+            &duration,
+            "com.atproto.repo.putRecord",
+            201,
+            0.75,
+        );
+
+        assert_eq!(
+            requests.with_label_values(&["com.atproto", "201"]).get(),
+            2.0
+        );
+        let family_duration = duration.with_label_values(&["com.atproto"]);
+        assert_eq!(family_duration.get_sample_count(), 2);
+        assert_eq!(family_duration.get_sample_sum(), 1.0);
     }
 }
