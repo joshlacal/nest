@@ -805,6 +805,7 @@ pub async fn resolve_authorization_server<T: HttpClient + ?Sized>(
         // https://datatracker.ietf.org/doc/html/rfc8414#section-3.3
         // Accept semantically equivalent issuer (normalize to the requested URL form)
         if issuer_equivalent(&metadata.issuer, server.as_str()) {
+            validate_credential_endpoint_origins(&metadata)?;
             // if equivalent, keep the canonical form
             Ok(metadata.into_static())
         } else {
@@ -815,6 +816,61 @@ pub async fn resolve_authorization_server<T: HttpClient + ?Sized>(
     } else {
         Err(ResolverError::http_status(res.status()))
     }
+}
+
+fn validate_credential_endpoint_origins(
+    metadata: &OAuthAuthorizationServerMetadata<'_>,
+) -> Result<()> {
+    let issuer = Url::parse(metadata.issuer.as_str())
+        .map_err(|_| ResolverError::authorization_server_metadata("issuer is not a valid URL"))?;
+    if issuer.scheme() != "https"
+        || issuer.host_str().is_none()
+        || !issuer.username().is_empty()
+        || issuer.password().is_some()
+        || issuer.fragment().is_some()
+    {
+        return Err(ResolverError::authorization_server_metadata(
+            "issuer origin is not acceptable",
+        ));
+    }
+
+    let endpoints = [
+        Some(("token", &metadata.token_endpoint)),
+        metadata
+            .pushed_authorization_request_endpoint
+            .as_ref()
+            .map(|endpoint| ("pushed authorization request", endpoint)),
+        metadata
+            .revocation_endpoint
+            .as_ref()
+            .map(|endpoint| ("revocation", endpoint)),
+        metadata
+            .introspection_endpoint
+            .as_ref()
+            .map(|endpoint| ("introspection", endpoint)),
+    ];
+
+    for (name, endpoint) in endpoints.into_iter().flatten() {
+        let endpoint = Url::parse(endpoint.as_str()).map_err(|_| {
+            ResolverError::authorization_server_metadata(smol_str::format_smolstr!(
+                "{name} endpoint is not a valid URL"
+            ))
+        })?;
+        let same_origin = endpoint.scheme() == "https"
+            && endpoint.host_str().is_some()
+            && endpoint.username().is_empty()
+            && endpoint.password().is_none()
+            && endpoint.fragment().is_none()
+            && endpoint.scheme() == issuer.scheme()
+            && endpoint.host_str() == issuer.host_str()
+            && endpoint.port_or_known_default() == issuer.port_or_known_default();
+        if !same_origin {
+            return Err(ResolverError::authorization_server_metadata(
+                smol_str::format_smolstr!("{name} endpoint is outside the issuer origin"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub async fn resolve_protected_resource_info<T: HttpClient + ?Sized>(
@@ -942,6 +998,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(md.issuer.as_str(), "https://bsky.social");
+    }
+
+    #[tokio::test]
+    async fn authorization_server_rejects_cross_origin_credential_endpoints_at_resolution() {
+        for (field, endpoint) in [
+            ("token_endpoint", "https://evil.example/token"),
+            (
+                "pushed_authorization_request_endpoint",
+                "https://bsky.social.evil.example/par",
+            ),
+            ("revocation_endpoint", "https://bsky.social:444/revoke"),
+            (
+                "introspection_endpoint",
+                "https://user@bsky.social/introspect",
+            ),
+        ] {
+            let client = MockHttp::default();
+            let mut metadata = serde_json::json!({
+                "issuer": "https://bsky.social",
+                "authorization_endpoint": "https://bsky.social/oauth/authorize",
+                "token_endpoint": "https://bsky.social/oauth/token",
+                "scopes_supported": [],
+                "response_types_supported": ["code"]
+            });
+            metadata[field] = serde_json::Value::String(endpoint.to_string());
+            *client.next.lock().await = Some(
+                HttpResponse::builder()
+                    .status(StatusCode::OK)
+                    .body(serde_json::to_vec(&metadata).unwrap())
+                    .unwrap(),
+            );
+
+            let error = super::resolve_authorization_server(
+                &client,
+                &CowStr::new_static("https://bsky.social"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    ResolverErrorKind::AuthorizationServerMetadata(_)
+                ),
+                "accepted {field}={endpoint}"
+            );
+        }
     }
 
     #[test]
