@@ -21,4 +21,6 @@ pub(crate) use mls_device_binding::{
     parse_complete_response, MlsDeviceBindingStore, BEGIN_BINDING_NSID, COMPLETE_BINDING_NSID,
 };
 pub use push::PushServices;
-pub use redis_auth_store::RedisAuthStore;
+pub use redis_auth_store::{
+    LifecycleFenceInventoryEntry, LifecycleFenceMigration, LifecycleFenceStatus, RedisAuthStore,
+};

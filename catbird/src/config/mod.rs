@@ -28,6 +28,45 @@ pub fn sanitized_redis_endpoint(redis_url: &str) -> String {
     }
 }
 
+fn parse_redis_cluster_enabled(info: &str) -> Result<bool, anyhow::Error> {
+    let values: Vec<&str> = info
+        .lines()
+        .filter_map(|line| line.strip_prefix("cluster_enabled:"))
+        .map(str::trim)
+        .collect();
+    match values.as_slice() {
+        ["0"] => Ok(false),
+        ["1"] => Ok(true),
+        [_] => anyhow::bail!("Redis topology probe returned an invalid cluster_enabled value"),
+        [] => anyhow::bail!("Redis topology probe omitted cluster_enabled"),
+        _ => anyhow::bail!("Redis topology probe returned duplicate cluster_enabled values"),
+    }
+}
+
+fn validate_standalone_redis_info(info: &str) -> Result<(), anyhow::Error> {
+    if parse_redis_cluster_enabled(info)? {
+        anyhow::bail!(
+            "Redis Cluster is unsupported: Nest requires a standalone Redis/Valkey server"
+        );
+    }
+    Ok(())
+}
+
+/// Nest currently requires one standalone Redis/Valkey server. Its OAuth
+/// lifecycle transactions and complete-keyspace migration audits are not safe
+/// on a node-local Redis Cluster connection, so startup and operator tools must
+/// reject cluster mode before reading or mutating session state.
+pub async fn require_standalone_redis(
+    redis: &mut redis::aio::ConnectionManager,
+) -> Result<(), anyhow::Error> {
+    let info: String = redis::cmd("INFO")
+        .arg("cluster")
+        .query_async(redis)
+        .await
+        .map_err(|error| anyhow::anyhow!("Redis topology probe failed: {error}"))?;
+    validate_standalone_redis_info(&info)
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -333,7 +372,8 @@ impl AppState {
             .build()?;
 
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
-        let redis = redis::aio::ConnectionManager::new(redis_client).await?;
+        let mut redis = redis::aio::ConnectionManager::new(redis_client).await?;
+        require_standalone_redis(&mut redis).await?;
 
         let mut state = Self {
             config: Arc::new(config),
@@ -528,7 +568,40 @@ impl AppState {
 
 #[cfg(test)]
 mod mls_config_tests {
-    use super::MlsConfig;
+    use super::{parse_redis_cluster_enabled, validate_standalone_redis_info, MlsConfig};
+
+    #[test]
+    fn redis_topology_parser_accepts_only_explicit_standalone_mode() {
+        assert!(!parse_redis_cluster_enabled("# Cluster\r\ncluster_enabled:0\r\n").unwrap());
+        assert!(parse_redis_cluster_enabled("# Cluster\ncluster_enabled:1\n").unwrap());
+        assert!(validate_standalone_redis_info("cluster_enabled:0\r\n").is_ok());
+        assert!(validate_standalone_redis_info("cluster_enabled:1\r\n")
+            .unwrap_err()
+            .to_string()
+            .contains("Redis Cluster is unsupported"));
+
+        for ambiguous in [
+            "# Cluster\r\n",
+            "cluster_enabled:yes\r\n",
+            "cluster_enabled:0\r\ncluster_enabled:1\r\n",
+            "cluster_enabled:0:unexpected\r\n",
+        ] {
+            assert!(parse_redis_cluster_enabled(ambiguous).is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL pointing to standalone Redis/Valkey"]
+    async fn live_redis_topology_probe_accepts_standalone_server() {
+        let redis_url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL is required");
+        let client = redis::Client::open(redis_url).expect("TEST_REDIS_URL must be valid");
+        let mut connection = redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("TEST_REDIS_URL must be reachable");
+        super::require_standalone_redis(&mut connection)
+            .await
+            .expect("the test server must explicitly report standalone mode");
+    }
 
     #[test]
     fn gateway_did_is_canonicalized_once_and_invalid_configuration_fails() {

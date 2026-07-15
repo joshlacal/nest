@@ -41,6 +41,14 @@ pub enum Error {
     Inner(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+impl Error {
+    /// Only an inner transport failure occurs after `send_http` was invoked.
+    /// All other DPoP failures happen while constructing the request/proof.
+    pub(crate) fn request_may_have_been_dispatched(&self) -> bool {
+        matches!(self, Self::Inner(_))
+    }
+}
+
 type Result<T> = core::result::Result<T, Error>;
 
 #[cfg_attr(not(target_arch = "wasm32"), trait_variant::make(Send))]

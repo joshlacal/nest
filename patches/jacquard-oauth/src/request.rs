@@ -151,6 +151,13 @@ pub enum RequestErrorKind {
     #[diagnostic(code(jacquard_oauth::request::serde_json))]
     SerdeJson,
 
+    /// An accepted success response could not be safely consumed. For token
+    /// operations this is ambiguous because the server may have rotated the
+    /// refresh grant before returning the unusable response.
+    #[error("successful response could not be accepted")]
+    #[diagnostic(code(jacquard_oauth::request::ambiguous_success_response))]
+    AmbiguousSuccessResponse,
+
     /// Atproto metadata error
     #[error("atproto error")]
     #[diagnostic(code(jacquard_oauth::request::atproto))]
@@ -288,6 +295,13 @@ impl RequestError {
         Self::new(RequestErrorKind::HttpStatusWithBody { status, body }, None)
     }
 
+    fn ambiguous_success_response(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::new(
+            RequestErrorKind::AmbiguousSuccessResponse,
+            Some(Box::new(source)),
+        )
+    }
+
     /// Create an identity error
     pub fn identity(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::new(RequestErrorKind::Identity, Some(Box::new(source)))
@@ -315,6 +329,41 @@ impl RequestError {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .is_some_and(|e| matches!(e, "invalid_grant" | "access_denied")),
+            _ => false,
+        }
+    }
+
+    /// Returns true only when the authorization server explicitly reports
+    /// that the submitted grant token is already unusable. This is narrower
+    /// than `is_permanent`: access denial or client-authentication failures do
+    /// not prove that a refresh grant has been revoked.
+    pub fn proves_token_inactive(&self) -> bool {
+        match &self.kind {
+            RequestErrorKind::HttpStatusWithBody { status, body }
+                if *status == StatusCode::BAD_REQUEST =>
+            {
+                body.get("error")
+                    .and_then(|error| error.as_str())
+                    .is_some_and(|error| matches!(error, "invalid_grant" | "invalid_token"))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a failed refresh may have produced credentials that the caller
+    /// never received. Explicit OAuth error responses are not ambiguous;
+    /// transport loss and invalid successful token responses are.
+    pub(crate) fn refresh_outcome_is_ambiguous(&self) -> bool {
+        match &self.kind {
+            RequestErrorKind::TokenVerification
+            | RequestErrorKind::InvalidDid
+            | RequestErrorKind::AmbiguousSuccessResponse => true,
+            RequestErrorKind::HttpStatus(status) if status.is_server_error() => true,
+            RequestErrorKind::Dpop => self
+                .source
+                .as_deref()
+                .and_then(|source| source.downcast_ref::<crate::dpop::Error>())
+                .is_some_and(crate::dpop::Error::request_may_have_been_dispatched),
             _ => false,
         }
     }
@@ -440,6 +489,15 @@ impl OAuthRequest<'_> {
             // Unlike https://datatracker.ietf.org/doc/html/rfc7009#section-2.2, oauth-provider seems to return `204`.
             Self::Revocation(_) => StatusCode::NO_CONTENT,
             _ => unimplemented!(),
+        }
+    }
+
+    pub fn accepts_status(&self, status: StatusCode) -> bool {
+        match self {
+            // RFC 7009 requires 200. The deployed provider historically uses
+            // 204, so accept both successful, bodyless revocation responses.
+            Self::Revocation(_) => matches!(status, StatusCode::OK | StatusCode::NO_CONTENT),
+            _ => status == self.expected_status(),
         }
     }
 }
@@ -599,12 +657,15 @@ where
     )
     .await?;
 
-    let expires_at = response.expires_in.and_then(|expires_in| {
+    let (_, expires_in) =
+        validate_oauth_token_response(&response, Some(&session_data.token_set.sub), false)?;
+
+    let expires_at = {
         let now = Datetime::now();
         now.as_ref()
             .checked_add_signed(TimeDelta::seconds(expires_in))
             .map(Datetime::new)
-    });
+    };
 
     session_data.update_with_tokens(TokenSet {
         iss,
@@ -627,6 +688,7 @@ pub async fn exchange_code<'r, T, D>(
     code: &str,
     verifier: &str,
     metadata: &OAuthMetadata,
+    expected_sub: Option<&Did<'_>>,
 ) -> Result<TokenSet<'r>>
 where
     T: OAuthResolver + DpopExt + Send + Sync + 'static,
@@ -648,10 +710,8 @@ where
         metadata,
     )
     .await?;
-    let Some(sub) = token_response.sub else {
-        return Err(RequestError::token_verification());
-    };
-    let sub = Did::new_owned(sub)?;
+    let (sub, expires_in) = validate_oauth_token_response(&token_response, expected_sub, true)?;
+    let sub = sub.expect("required token subject was validated");
     let iss = metadata.server_metadata.issuer.clone();
     // /!\ IMPORTANT /!\
     //
@@ -661,12 +721,12 @@ where
         .verify_issuer(&metadata.server_metadata, &sub)
         .await?;
 
-    let expires_at = token_response.expires_in.and_then(|expires_in| {
+    let expires_at = {
         Datetime::now()
             .as_ref()
             .checked_add_signed(TimeDelta::seconds(expires_in))
             .map(Datetime::new)
-    });
+    };
     Ok(TokenSet {
         iss,
         sub,
@@ -677,6 +737,33 @@ where
         token_type: token_response.token_type,
         expires_at,
     })
+}
+
+fn validate_oauth_token_response(
+    response: &OAuthTokenResponse,
+    expected_sub: Option<&Did<'_>>,
+    require_sub: bool,
+) -> Result<(Option<Did<'static>>, i64)> {
+    if response.token_type != crate::types::OAuthTokenType::DPoP {
+        return Err(RequestError::token_verification());
+    }
+
+    let expires_in = response
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(RequestError::token_verification)?;
+    let returned_sub = response.sub.clone().map(Did::new_owned).transpose()?;
+
+    if require_sub && returned_sub.is_none() {
+        return Err(RequestError::token_verification());
+    }
+    if let (Some(expected), Some(returned)) = (expected_sub, returned_sub.as_ref()) {
+        if returned != expected {
+            return Err(RequestError::token_verification());
+        }
+    }
+
+    Ok((returned_sub, expires_in))
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
@@ -716,8 +803,9 @@ where
     let Some(url) = endpoint_for_req(&metadata.server_metadata, &request) else {
         return Err(RequestError::no_endpoint(request.name()));
     };
-    require_exact_issuer_origin(&metadata.server_metadata.issuer, url)
-        .map_err(|_| RequestError::no_endpoint(format!("{} endpoint outside issuer origin", request.name())))?;
+    require_exact_issuer_origin(&metadata.server_metadata.issuer, url).map_err(|_| {
+        RequestError::no_endpoint(format!("{} endpoint outside issuer origin", request.name()))
+    })?;
     let client_assertions = build_auth(
         metadata.keyset.as_ref(),
         &metadata.server_metadata,
@@ -738,13 +826,20 @@ where
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body.into_bytes())?;
     let res = client.dpop_server_call(data_source).send(req).await?;
-    if res.status() == request.expected_status() {
+    if request.accepts_status(res.status()) {
+        if matches!(request, OAuthRequest::Revocation(_)) {
+            // RFC 7009 defines no success payload and requires clients to
+            // ignore any response content. Return unit for both 200 and the
+            // deployed provider's compatible 204 response.
+            return Ok(serde_json::from_slice(b"null")?);
+        }
         let body = res.body();
         if body.is_empty() {
             // since an empty body cannot be deserialized, use “null” temporarily to allow deserialization to `()`.
-            Ok(serde_json::from_slice(b"null")?)
+            serde_json::from_slice(b"null").map_err(RequestError::ambiguous_success_response)
         } else {
-            let output: O = serde_json::from_slice(body)?;
+            let output: O =
+                serde_json::from_slice(body).map_err(RequestError::ambiguous_success_response)?;
             Ok(output)
         }
     } else if res.status().is_client_error() {
@@ -757,13 +852,20 @@ where
     }
 }
 
-fn require_exact_issuer_origin(issuer: &CowStr<'_>, endpoint: &CowStr<'_>) -> core::result::Result<(), ()> {
+fn require_exact_issuer_origin(
+    issuer: &CowStr<'_>,
+    endpoint: &CowStr<'_>,
+) -> core::result::Result<(), ()> {
     let issuer = url::Url::parse(issuer.as_str()).map_err(|_| ())?;
     let endpoint = url::Url::parse(endpoint.as_str()).map_err(|_| ())?;
     let valid = issuer.scheme() == "https"
         && endpoint.scheme() == "https"
-        && issuer.username().is_empty() && issuer.password().is_none() && issuer.fragment().is_none()
-        && endpoint.username().is_empty() && endpoint.password().is_none() && endpoint.fragment().is_none()
+        && issuer.username().is_empty()
+        && issuer.password().is_none()
+        && issuer.fragment().is_none()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.fragment().is_none()
         && issuer.host_str() == endpoint.host_str()
         && issuer.port_or_known_default() == endpoint.port_or_known_default();
     if valid { Ok(()) } else { Err(()) }
@@ -890,6 +992,43 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("simulated transport failure")]
+    struct SimulatedTransportFailure;
+
+    #[test]
+    fn refresh_ambiguity_tracks_the_dispatch_boundary() {
+        let predispatch = RequestError::resolver(SimulatedTransportFailure);
+        assert!(!predispatch.refresh_outcome_is_ambiguous());
+
+        let postdispatch = RequestError::from(crate::dpop::Error::Inner(Box::new(
+            SimulatedTransportFailure,
+        )));
+        assert!(postdispatch.refresh_outcome_is_ambiguous());
+
+        let explicit_oauth_error = RequestError::http_status_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "temporarily_unavailable"}),
+        );
+        assert!(!explicit_oauth_error.refresh_outcome_is_ambiguous());
+
+        let unparsed_server_error = RequestError::http_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unparsed_server_error.refresh_outcome_is_ambiguous());
+
+        assert!(RequestError::token_verification().refresh_outcome_is_ambiguous());
+        assert!(
+            RequestError::invalid_did(SimulatedTransportFailure).refresh_outcome_is_ambiguous()
+        );
+        assert!(
+            RequestError::ambiguous_success_response(SimulatedTransportFailure)
+                .refresh_outcome_is_ambiguous()
+        );
+        assert!(
+            !RequestError::from(serde_json::from_slice::<Value>(b"not-json").unwrap_err())
+                .refresh_outcome_is_ambiguous()
+        );
+    }
+
     #[derive(Clone, Default)]
     struct MockClient {
         resp: Arc<Mutex<Option<HttpResponse<Vec<u8>>>>>,
@@ -999,6 +1138,7 @@ mod tests {
         let client = MockClient::default();
         let meta = base_metadata();
         let session = ClientSessionData {
+            lifecycle_generation: CowStr::default(),
             account_did: Did::new_static("did:plc:alice").unwrap(),
             session_id: CowStr::from("state"),
             host_url: CowStr::new_static("https://pds"),
@@ -1048,20 +1188,133 @@ mod tests {
             dpop_key: crate::utils::generate_key(&[CowStr::from("ES256")]).unwrap(),
             dpop_authserver_nonce: None,
         };
-        let err = super::exchange_code(&client, &mut dpop, "abc", "verifier", &meta)
+        let err = super::exchange_code(&client, &mut dpop, "abc", "verifier", &meta, None)
             .await
             .unwrap_err();
         assert!(matches!(err.kind(), RequestErrorKind::TokenVerification));
     }
 
     #[test]
+    fn token_response_security_rejects_bearer_missing_or_nonpositive_expiry_and_subject_swap() {
+        let expected = Did::new_static("did:plc:alice").unwrap();
+        let valid = OAuthTokenResponse {
+            access_token: "token".into(),
+            token_type: crate::types::OAuthTokenType::DPoP,
+            expires_in: Some(3600),
+            refresh_token: Some("refresh".into()),
+            scope: None,
+            sub: Some("did:plc:alice".into()),
+        };
+
+        assert!(super::validate_oauth_token_response(&valid, Some(&expected), true).is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.token_type = crate::types::OAuthTokenType::Bearer;
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.expires_in = None;
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.expires_in = Some(0);
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.sub = Some("did:plc:mallory".into());
+        assert!(super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err());
+
+        let mut refresh_without_sub = valid;
+        refresh_without_sub.sub = None;
+        assert!(
+            super::validate_oauth_token_response(&refresh_without_sub, Some(&expected), false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_invalid_token_or_grant_proves_revocation_is_already_complete() {
+        for code in ["invalid_token", "invalid_grant"] {
+            let error = RequestError::http_status_with_body(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "error": code }),
+            );
+            assert!(error.proves_token_inactive(), "rejected {code}");
+        }
+
+        for code in ["access_denied", "temporarily_unavailable", "invalid_client"] {
+            let error = RequestError::http_status_with_body(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "error": code }),
+            );
+            assert!(!error.proves_token_inactive(), "accepted {code}");
+        }
+
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            for code in ["invalid_token", "invalid_grant"] {
+                let error = RequestError::http_status_with_body(
+                    status,
+                    serde_json::json!({ "error": code }),
+                );
+                assert!(
+                    !error.proves_token_inactive(),
+                    "accepted {code} with status {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revocation_accepts_rfc_7009_ok_and_provider_no_content() {
+        let request = OAuthRequest::Revocation(RevocationRequestParameters {
+            token: "grant".into(),
+        });
+
+        assert!(request.accepts_status(StatusCode::OK));
+        assert!(request.accepts_status(StatusCode::NO_CONTENT));
+        assert!(!request.accepts_status(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn revocation_http_path_ignores_success_response_content() {
+        for (status, body) in [
+            (StatusCode::OK, br#"{"ignored":true}"#.to_vec()),
+            (StatusCode::OK, b" \n ".to_vec()),
+            (StatusCode::NO_CONTENT, Vec::new()),
+        ] {
+            let client = MockClient::default();
+            *client.resp.lock().await =
+                Some(HttpResponse::builder().status(status).body(body).unwrap());
+            let mut metadata = base_metadata();
+            metadata.server_metadata.revocation_endpoint =
+                Some(CowStr::new_static("https://issuer/revoke"));
+            let mut dpop = DpopClientData {
+                dpop_key: crate::utils::generate_key(&[CowStr::new_static("ES256")]).unwrap(),
+                dpop_authserver_nonce: CowStr::new_static(""),
+                dpop_host_nonce: CowStr::new_static(""),
+            };
+
+            super::revoke(&client, &mut dpop, "grant", &metadata)
+                .await
+                .unwrap_or_else(|error| panic!("status {status} failed: {error}"));
+        }
+    }
+
+    #[test]
     fn credential_endpoints_are_exactly_bound_to_issuer_origin() {
         let issuer = CowStr::from("https://issuer.example/path");
-        assert!(super::require_exact_issuer_origin(
-            &issuer,
-            &CowStr::from("https://issuer.example/token")
-        )
-        .is_ok());
+        assert!(
+            super::require_exact_issuer_origin(
+                &issuer,
+                &CowStr::from("https://issuer.example/token")
+            )
+            .is_ok()
+        );
         for endpoint in [
             "https://issuer.example.evil/token",
             "https://issuer.example:444/token",

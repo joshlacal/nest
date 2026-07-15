@@ -474,20 +474,13 @@ async fn persist_host_nonce(
         }
     };
 
-    let mut session_data = match jacquard_client.registry.get(&did, session_id, false).await {
-        Ok(data) => data,
-        Err(err) => {
-            tracing::debug!(
-                did = %account_did,
-                error = %err,
-                "Chat poll: failed to load session for DPoP nonce persist"
-            );
-            return;
-        }
-    };
-
-    session_data.dpop_data.dpop_host_nonce = nonce.to_string().into();
-    if let Err(err) = jacquard_client.registry.set(session_data).await {
+    if let Err(err) = jacquard_client
+        .registry
+        .update(&did, session_id, |session_data| {
+            session_data.dpop_data.dpop_host_nonce = nonce.to_string().into();
+        })
+        .await
+    {
         tracing::debug!(
             did = %account_did,
             error = %err,

@@ -653,19 +653,38 @@ fn build_app_redirect(state_str: &str, session_id: &str) -> String {
 /// Handle logout
 ///
 /// POST /auth/logout
+struct LogoutOutcome {
+    result: AppResult<()>,
+    clear_cookie: bool,
+}
+
+impl LogoutOutcome {
+    fn retained(error: AppError) -> Self {
+        Self {
+            result: Err(error),
+            clear_cookie: false,
+        }
+    }
+}
+
 async fn ordered_logout<Delete, DeleteFuture, Revoke, RevokeFuture>(
     delete_bindings: Delete,
     revoke: Revoke,
-) -> AppResult<()>
+) -> LogoutOutcome
 where
     Delete: FnOnce() -> DeleteFuture,
     DeleteFuture: std::future::Future<Output = AppResult<()>>,
     Revoke: FnOnce() -> RevokeFuture,
     RevokeFuture: std::future::Future<Output = AppResult<()>>,
 {
+    // MLS bindings are a local authorization grant. Remove that privilege
+    // before attempting remote token revocation; if revocation is transiently
+    // unavailable, retaining the browser cookie permits retry without leaving
+    // stale MLS authority active.
     let delete_result = delete_bindings().await;
     let revoke_result = revoke().await;
-    match (delete_result, revoke_result) {
+    let clear_cookie = revoke_result.is_ok();
+    let result = match (delete_result, revoke_result) {
         (Err(_), Err(_)) => Err(AppError::AuthTemporarilyUnavailable(
             "Logout could not revoke the authenticated session and clear MLS device bindings"
                 .into(),
@@ -673,17 +692,25 @@ where
         (Err(delete_error), Ok(())) => Err(delete_error),
         (Ok(()), Err(revoke_error)) => Err(revoke_error),
         (Ok(()), Ok(())) => Ok(()),
+    };
+    LogoutOutcome {
+        result,
+        clear_cookie,
     }
 }
 
-fn finish_logout(jar: CookieJar, result: AppResult<()>) -> Response {
-    let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
-        .path("/")
-        .http_only(true)
-        .max_age(time::Duration::ZERO)
-        .build();
-    let jar = jar.remove(cookie);
-    match result {
+fn finish_logout(jar: CookieJar, outcome: LogoutOutcome) -> Response {
+    let jar = if outcome.clear_cookie {
+        let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
+            .path("/")
+            .http_only(true)
+            .max_age(time::Duration::ZERO)
+            .build();
+        jar.remove(cookie)
+    } else {
+        jar
+    };
+    match outcome.result {
         Ok(()) => (
             jar,
             Json(LogoutResponse {
@@ -702,7 +729,7 @@ pub(crate) async fn logout(
     Extension(authenticated_session_id): Extension<AuthenticatedSessionId>,
     jar: CookieJar,
 ) -> Response {
-    let result = async {
+    let outcome = async {
         let jacquard_client = state
             .jacquard_client
             .as_ref()
@@ -711,32 +738,35 @@ pub(crate) async fn logout(
         let did = jacquard_common::types::did::Did::new(&session.did)
             .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
 
-        ordered_logout(
-            || async {
-                binding_store
-                    .delete_session(authenticated_session_id.as_str())
-                    .await
-                    .map_err(record_mls_binding_error)
-            },
-            || async {
-                jacquard_client
-                    .revoke(&did, authenticated_session_id.as_str())
-                    .await
-                    .map_err(|_| {
-                        AppError::AuthTemporarilyUnavailable(
-                            "Logout could not revoke the authenticated session".into(),
-                        )
-                    })
-            },
+        Ok::<_, AppError>(
+            ordered_logout(
+                || async {
+                    binding_store
+                        .delete_session(authenticated_session_id.as_str())
+                        .await
+                        .map_err(record_mls_binding_error)
+                },
+                || async {
+                    jacquard_client
+                        .revoke(&did, authenticated_session_id.as_str())
+                        .await
+                        .map_err(|_| {
+                            AppError::AuthTemporarilyUnavailable(
+                                "Logout could not revoke the authenticated session".into(),
+                            )
+                        })
+                },
+            )
+            .await,
         )
-        .await
     }
-    .await;
+    .await
+    .unwrap_or_else(LogoutOutcome::retained);
 
-    if result.is_ok() {
+    if outcome.result.is_ok() {
         tracing::info!("User {} logged out successfully", session.did);
     }
-    finish_logout(jar, result)
+    finish_logout(jar, outcome)
 }
 
 #[cfg(test)]
@@ -750,7 +780,7 @@ mod logout_tests {
         let revoke_events = events.clone();
         let delete_events = events.clone();
 
-        ordered_logout(
+        let outcome = ordered_logout(
             move || async move {
                 delete_events.lock().unwrap().push("delete");
                 Ok(())
@@ -760,19 +790,20 @@ mod logout_tests {
                 Ok(())
             },
         )
-        .await
-        .unwrap();
+        .await;
+        outcome.result.unwrap();
+        assert!(outcome.clear_cookie);
 
         assert_eq!(*events.lock().unwrap(), ["delete", "revoke"]);
     }
 
     #[tokio::test]
-    async fn upstream_revoke_failure_still_deletes_bindings_and_expires_browser_cookie() {
-        let delete_called = Arc::new(Mutex::new(false));
-        let delete_observer = delete_called.clone();
-        let result = ordered_logout(
+    async fn transient_revoke_failure_retains_cookie_but_removes_mls_privilege() {
+        let mls_privilege_active = Arc::new(Mutex::new(true));
+        let privilege_observer = mls_privilege_active.clone();
+        let outcome = ordered_logout(
             move || async move {
-                *delete_observer.lock().unwrap() = true;
+                *privilege_observer.lock().unwrap() = false;
                 Ok(())
             },
             || async {
@@ -783,31 +814,33 @@ mod logout_tests {
         )
         .await;
 
-        assert!(result.is_err());
-        assert!(*delete_called.lock().unwrap());
+        assert!(outcome.result.is_err());
+        assert!(!outcome.clear_cookie);
+        assert!(
+            !*mls_privilege_active.lock().unwrap(),
+            "a retained browser session must not retain stale MLS authorization"
+        );
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
         let jar = CookieJar::from_headers(&request_headers);
-        let response = finish_logout(jar, result);
+        let response = finish_logout(jar, outcome);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let set_cookie = response
             .headers()
             .get_all("set-cookie")
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .find(|value| value.starts_with("catbird_session="))
-            .unwrap_or_else(|| panic!("session removal cookie: {:?}", response.headers()));
-        assert!(set_cookie.contains("Max-Age=0"));
-        assert!(!set_cookie.contains("browser-session"));
+            .find(|value| value.starts_with("catbird_session="));
+        assert!(set_cookie.is_none(), "transient failure must retain cookie");
     }
 
     #[tokio::test]
-    async fn combined_logout_failure_is_503_and_still_expires_browser_cookie() {
+    async fn combined_logout_failure_is_503_and_preserves_browser_cookie() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let revoke_events = events.clone();
         let delete_events = events.clone();
-        let result = ordered_logout(
+        let outcome = ordered_logout(
             move || async move {
                 delete_events.lock().unwrap().push("delete");
                 Err(AppError::Internal("binding cleanup unavailable".into()))
@@ -823,14 +856,15 @@ mod logout_tests {
 
         assert_eq!(*events.lock().unwrap(), ["delete", "revoke"]);
         assert!(matches!(
-            &result,
+            &outcome.result,
             Err(AppError::AuthTemporarilyUnavailable(message))
                 if message.contains("revoke") && message.contains("device bindings")
         ));
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
-        let response = finish_logout(CookieJar::from_headers(&request_headers), result);
+        assert!(!outcome.clear_cookie);
+        let response = finish_logout(CookieJar::from_headers(&request_headers), outcome);
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let set_cookie = response
@@ -838,8 +872,30 @@ mod logout_tests {
             .get_all("set-cookie")
             .iter()
             .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("catbird_session="));
+        assert!(set_cookie.is_none(), "transient failure must retain cookie");
+    }
+
+    #[tokio::test]
+    async fn completed_revocation_expires_cookie_even_if_binding_cleanup_reports_failure() {
+        let outcome = ordered_logout(
+            || async { Err(AppError::Internal("binding cleanup unavailable".into())) },
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(outcome.result.is_err());
+        assert!(outcome.clear_cookie);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
+        let response = finish_logout(CookieJar::from_headers(&request_headers), outcome);
+        let set_cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
             .find(|value| value.starts_with("catbird_session="))
-            .unwrap_or_else(|| panic!("session removal cookie: {:?}", response.headers()));
+            .expect("completed revocation must remove the browser cookie");
         assert!(set_cookie.contains("Max-Age=0"));
         assert!(!set_cookie.contains("browser-session"));
     }

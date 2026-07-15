@@ -606,24 +606,29 @@ pub(crate) async fn resolve_background_session(
         .as_ref()
         .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
 
-    if let Some(mapped_did) = auth_store.lookup_did_for_session(session_id).await? {
-        if mapped_did != account_did {
-            tracing::warn!(
-                mapped_did = %mapped_did,
-                requested_did = %account_did,
-                "Push background session lookup resolved a different DID than expected"
-            );
-        }
-    }
+    let mapped_did = auth_store.lookup_did_for_session(session_id).await?;
+    let repair_index = validate_background_session_mapping(mapped_did.as_deref(), account_did)?;
 
-    let did = Did::new(account_did)
-        .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
+    let did =
+        Did::new(account_did).map_err(|_| BackgroundSessionValidationError::InvalidAccountDid)?;
+    if repair_index {
+        require_background_index_repair(
+            auth_store
+                .repair_missing_session_index(&did, session_id)
+                .await,
+        )?;
+    }
     let session_data = jacquard_client
         .registry
         .get(&did, session_id, true)
         .await
-        .map_err(|err| anyhow!("Jacquard session lookup failed: {}", err))?;
-
+        .map_err(background_session_lookup_error)?;
+    validate_background_session_record(
+        session_data.account_did.as_str(),
+        &session_data.session_id,
+        account_did,
+        session_id,
+    )?;
     let expires_at = session_data
         .token_set
         .expires_at
@@ -661,7 +666,77 @@ pub(crate) async fn resolve_background_session(
     Ok((session, dpop))
 }
 
+fn background_session_lookup_error(error: jacquard_oauth::session::Error) -> anyhow::Error {
+    // Keep the concrete Jacquard error in anyhow's source chain. Background
+    // workers use that type to distinguish durable credential quarantine from
+    // a retryable operation lease or store outage.
+    anyhow::Error::new(error).context("Jacquard session lookup failed")
+}
+
+#[derive(Debug, thiserror::Error)]
+enum BackgroundSessionValidationError {
+    #[error("Background OAuth session is not bound to the requested account")]
+    MappingMismatch,
+    #[error("Background OAuth session record is not bound to the requested account")]
+    RecordMismatch,
+    #[error("Background OAuth session not found: primary record is missing")]
+    MissingPrimary,
+    #[error("Invalid DID in push background session")]
+    InvalidAccountDid,
+}
+
+fn require_background_index_repair(
+    result: std::result::Result<bool, jacquard_common::session::SessionStoreError>,
+) -> Result<()> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BackgroundSessionValidationError::MissingPrimary.into()),
+        // Preserve typed store failures so infrastructure outages remain
+        // retryable instead of being misclassified as credential revocation.
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
+}
+
+fn validate_background_session_mapping(
+    mapped_did: Option<&str>,
+    expected_did: &str,
+) -> Result<bool> {
+    match mapped_did {
+        Some(mapped_did) if mapped_did == expected_did => Ok(false),
+        Some(_) => Err(BackgroundSessionValidationError::MappingMismatch.into()),
+        // Background jobs already carry an authoritative account DID from
+        // their database row. A missing secondary index may be repaired only
+        // after the primary session record is loaded by that DID and its
+        // embedded principal and session ID are verified below.
+        None => Ok(true),
+    }
+}
+
+fn validate_background_session_record(
+    stored_did: &str,
+    stored_session_id: &str,
+    expected_did: &str,
+    expected_session_id: &str,
+) -> Result<()> {
+    if stored_did == expected_did && stored_session_id == expected_session_id {
+        Ok(())
+    } else {
+        Err(BackgroundSessionValidationError::RecordMismatch.into())
+    }
+}
+
 pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<jacquard_oauth::session::Error>()
+            .is_some_and(jacquard_oauth::session::Error::is_permanent)
+            || cause
+                .downcast_ref::<BackgroundSessionValidationError>()
+                .is_some()
+    }) {
+        return true;
+    }
+
     let message = err.to_string().to_ascii_lowercase();
     message.contains("invalid_grant")
         || message.contains("invalid_token")
@@ -673,4 +748,134 @@ pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
 
 pub(crate) fn push_unavailable_error() -> AppError {
     AppError::Config("Push control plane is not configured".into())
+}
+
+#[cfg(test)]
+mod session_binding_tests {
+    #[test]
+    fn missing_background_session_is_classified_as_revoked() {
+        let error =
+            anyhow::anyhow!("Background OAuth session not found: primary record is missing");
+        assert!(super::is_auth_revocation_error(&error));
+    }
+
+    #[test]
+    fn typed_reauthentication_survives_background_context_and_is_revoked() {
+        let error = super::background_session_lookup_error(
+            jacquard_oauth::session::Error::ReauthenticationRequired,
+        );
+
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<jacquard_oauth::session::Error>()
+            .is_some_and(|error| matches!(
+                error,
+                jacquard_oauth::session::Error::ReauthenticationRequired
+            ))));
+        assert!(super::is_auth_revocation_error(&error));
+    }
+
+    #[test]
+    fn every_typed_permanent_session_error_is_revoked() {
+        for session_error in [
+            jacquard_oauth::session::Error::SessionNotFound,
+            jacquard_oauth::session::Error::RefreshFailed(
+                jacquard_oauth::request::RequestError::no_refresh_token(),
+            ),
+            jacquard_oauth::session::Error::ServerAgent(
+                jacquard_oauth::request::RequestError::no_refresh_token(),
+            ),
+        ] {
+            let error = super::background_session_lookup_error(session_error);
+            assert!(super::is_auth_revocation_error(&error));
+        }
+    }
+
+    #[test]
+    fn typed_active_operation_remains_transient_for_background_workers() {
+        for session_error in [
+            jacquard_oauth::session::Error::OperationInProgress,
+            jacquard_oauth::session::Error::Store(
+                jacquard_common::session::SessionStoreError::Other("temporary Redis outage".into()),
+            ),
+            jacquard_oauth::session::Error::ServerAgent(
+                jacquard_oauth::request::RequestError::token_verification(),
+            ),
+        ] {
+            let error = super::background_session_lookup_error(session_error);
+            assert!(!super::is_auth_revocation_error(&error));
+        }
+
+        assert!(!super::is_auth_revocation_error(&anyhow::anyhow!(
+            "temporary network failure"
+        )));
+    }
+
+    #[test]
+    fn every_typed_local_validation_failure_is_revoked() {
+        for error in [
+            super::BackgroundSessionValidationError::MissingPrimary,
+            super::BackgroundSessionValidationError::InvalidAccountDid,
+        ] {
+            assert!(super::is_auth_revocation_error(&anyhow::Error::new(error)));
+        }
+    }
+
+    #[test]
+    fn background_index_repair_distinguishes_missing_primary_from_store_outage() {
+        let missing = super::require_background_index_repair(Ok(false)).unwrap_err();
+        assert!(missing.chain().any(|cause| matches!(
+            cause.downcast_ref::<super::BackgroundSessionValidationError>(),
+            Some(super::BackgroundSessionValidationError::MissingPrimary)
+        )));
+        assert!(super::is_auth_revocation_error(&missing));
+
+        let outage = super::require_background_index_repair(Err(
+            jacquard_common::session::SessionStoreError::Other("temporary Redis outage".into()),
+        ))
+        .unwrap_err();
+        assert!(outage.chain().any(|cause| cause
+            .downcast_ref::<jacquard_common::session::SessionStoreError>()
+            .is_some()));
+        assert!(!super::is_auth_revocation_error(&outage));
+    }
+
+    #[test]
+    fn background_session_mapping_requires_exact_expected_did() {
+        assert!(
+            super::validate_background_session_mapping(Some("did:plc:alice"), "did:plc:alice")
+                .is_ok_and(|repair_index| !repair_index)
+        );
+        let mapping_error =
+            super::validate_background_session_mapping(Some("did:plc:mallory"), "did:plc:alice")
+                .unwrap_err();
+        assert!(super::is_auth_revocation_error(&mapping_error));
+        assert!(
+            super::validate_background_session_mapping(None, "did:plc:alice")
+                .is_ok_and(|repair_index| repair_index)
+        );
+
+        assert!(super::validate_background_session_record(
+            "did:plc:alice",
+            "session-a",
+            "did:plc:alice",
+            "session-a"
+        )
+        .is_ok());
+        let principal_error = super::validate_background_session_record(
+            "did:plc:mallory",
+            "session-a",
+            "did:plc:alice",
+            "session-a",
+        )
+        .unwrap_err();
+        assert!(super::is_auth_revocation_error(&principal_error));
+        let session_error = super::validate_background_session_record(
+            "did:plc:alice",
+            "session-b",
+            "did:plc:alice",
+            "session-a",
+        )
+        .unwrap_err();
+        assert!(super::is_auth_revocation_error(&session_error));
+    }
 }
