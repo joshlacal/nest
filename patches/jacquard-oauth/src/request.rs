@@ -39,6 +39,12 @@ use crate::{
 const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// Internal transport marker for requests that carry OAuth credentials.
+///
+/// The embedding HTTP client must consume this header and disable redirect
+/// following before putting the request on the wire.
+pub const OAUTH_CREDENTIAL_REQUEST_HEADER: &str = "x-jacquard-oauth-credential-request";
+
 use smol_str::SmolStr;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -824,6 +830,7 @@ where
         .uri(url.to_string())
         .method(Method::POST)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        .header(OAUTH_CREDENTIAL_REQUEST_HEADER, "1")
         .body(body.into_bytes())?;
     let res = client.dpop_server_call(data_source).send(req).await?;
     if request.accepts_status(res.status()) {
@@ -1032,18 +1039,23 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockClient {
         resp: Arc<Mutex<Option<HttpResponse<Vec<u8>>>>>,
+        requests: Arc<Mutex<Vec<http::Request<Vec<u8>>>>>,
     }
 
     impl HttpClient for MockClient {
         type Error = std::convert::Infallible;
         fn send_http(
             &self,
-            _request: http::Request<Vec<u8>>,
+            request: http::Request<Vec<u8>>,
         ) -> impl core::future::Future<
             Output = core::result::Result<http::Response<Vec<u8>>, Self::Error>,
         > + Send {
             let resp = self.resp.clone();
-            async move { Ok(resp.lock().await.take().unwrap()) }
+            let requests = self.requests.clone();
+            async move {
+                requests.lock().await.push(request);
+                Ok(resp.lock().await.take().unwrap())
+            }
         }
     }
 
@@ -1303,6 +1315,39 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("status {status} failed: {error}"));
         }
+    }
+
+    #[tokio::test]
+    async fn credential_requests_mark_transport_as_no_redirect() {
+        let client = MockClient::default();
+        *client.resp.lock().await = Some(
+            HttpResponse::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Vec::new())
+                .unwrap(),
+        );
+        let mut metadata = base_metadata();
+        metadata.server_metadata.revocation_endpoint =
+            Some(CowStr::new_static("https://issuer/revoke"));
+        let mut dpop = DpopClientData {
+            dpop_key: crate::utils::generate_key(&[CowStr::new_static("ES256")]).unwrap(),
+            dpop_authserver_nonce: CowStr::new_static(""),
+            dpop_host_nonce: CowStr::new_static(""),
+        };
+
+        super::revoke(&client, &mut dpop, "grant", &metadata)
+            .await
+            .unwrap();
+
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers()
+                .get("x-jacquard-oauth-credential-request")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     #[test]

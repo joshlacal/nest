@@ -8,16 +8,166 @@ use super::ssrf::validate_pds_url;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::CatbirdSession;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 /// Maximum response size allowed (50MB)
 pub const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Threshold above which responses are streamed instead of buffered (1MB)
 pub const STREAM_THRESHOLD: usize = 1 * 1024 * 1024;
+
+trait ProxyTransport: Send + Sync {
+    fn send_before<'a>(
+        &'a self,
+        method: reqwest::Method,
+        url: &'a str,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<reqwest::Response, String>> + Send + 'a>>;
+}
+
+impl ProxyTransport for crate::config::outbound_policy::OutboundPolicy {
+    fn send_before<'a>(
+        &'a self,
+        method: reqwest::Method,
+        url: &'a str,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<reqwest::Response, String>> + Send + 'a>> {
+        Box::pin(async move {
+            crate::config::outbound_policy::OutboundPolicy::send_before(
+                self, method, url, headers, body, deadline,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+}
+
+fn remaining_response_budget(consumed: usize) -> AppResult<usize> {
+    MAX_RESPONSE_SIZE.checked_sub(consumed).ok_or_else(|| {
+        AppError::ResponseTooLarge(format!(
+            "cumulative response size exceeds maximum allowed {} bytes",
+            MAX_RESPONSE_SIZE
+        ))
+    })
+}
+
+struct BoundedStreamState<S> {
+    stream: Pin<Box<S>>,
+    seen: usize,
+    max_size: usize,
+    deadline: tokio::time::Instant,
+    declared_oversize: bool,
+    terminal: bool,
+}
+
+fn bounded_response_stream<S, E>(
+    stream: S,
+    content_length: Option<u64>,
+    max_size: usize,
+    deadline: tokio::time::Instant,
+) -> impl Stream<Item = AppResult<bytes::Bytes>> + Send
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: fmt::Display,
+{
+    let state = BoundedStreamState {
+        stream: Box::pin(stream),
+        seen: 0,
+        max_size,
+        deadline,
+        declared_oversize: content_length.is_some_and(|length| length > max_size as u64),
+        terminal: false,
+    };
+
+    futures_util::stream::unfold(state, |mut state| async move {
+        if state.terminal {
+            return None;
+        }
+        if state.declared_oversize {
+            state.terminal = true;
+            return Some((
+                Err(AppError::ResponseTooLarge(format!(
+                    "declared response size exceeds maximum allowed {} bytes",
+                    state.max_size
+                ))),
+                state,
+            ));
+        }
+
+        match tokio::time::timeout_at(state.deadline, state.stream.next()).await {
+            Err(_) => {
+                state.terminal = true;
+                Some((
+                    Err(AppError::Upstream {
+                        status: 504,
+                        message: "outbound request deadline exceeded reading stream".to_string(),
+                    }),
+                    state,
+                ))
+            }
+            Ok(None) => None,
+            Ok(Some(Err(error))) => {
+                state.terminal = true;
+                Some((
+                    Err(AppError::Upstream {
+                        status: 502,
+                        message: format!("upstream response read failed: {error}"),
+                    }),
+                    state,
+                ))
+            }
+            Ok(Some(Ok(chunk))) => {
+                let next_size = state.seen.checked_add(chunk.len());
+                if next_size.is_none_or(|size| size > state.max_size) {
+                    state.terminal = true;
+                    Some((
+                        Err(AppError::ResponseTooLarge(format!(
+                            "response exceeded maximum size of {} bytes while streaming",
+                            state.max_size
+                        ))),
+                        state,
+                    ))
+                } else {
+                    state.seen = next_size.expect("checked above");
+                    Some((Ok(chunk), state))
+                }
+            }
+        }
+    })
+}
+
+pub struct BoundedResponse {
+    response: reqwest::Response,
+    max_size: usize,
+    deadline: tokio::time::Instant,
+}
+
+impl BoundedResponse {
+    fn new(response: reqwest::Response, max_size: usize, deadline: tokio::time::Instant) -> Self {
+        Self {
+            response,
+            max_size,
+            deadline,
+        }
+    }
+
+    pub fn bytes_stream(self) -> impl Stream<Item = AppResult<bytes::Bytes>> + Send {
+        let content_length = self.response.content_length();
+        bounded_response_stream(
+            self.response.bytes_stream(),
+            content_length,
+            self.max_size,
+            self.deadline,
+        )
+    }
+}
 
 const FORWARDED_CLIENT_HEADERS: &[&str] = &[
     "accept",
@@ -54,7 +204,7 @@ pub enum ProxyResponse {
     Streaming {
         status: u16,
         headers: HeaderMap,
-        body: reqwest::Response,
+        body: BoundedResponse,
     },
 }
 
@@ -78,12 +228,19 @@ impl ProxyResponse {
 
 /// ATProto client for making authenticated requests to PDS
 pub struct AtProtoClient {
-    state: Arc<AppState>,
+    transport: Arc<dyn ProxyTransport>,
 }
 
 impl AtProtoClient {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            transport: Arc::new(state.outbound_policy.clone()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: Arc<dyn ProxyTransport>) -> Self {
+        Self { transport }
     }
 
     /// Proxy a raw request to the PDS, preserving method and body
@@ -157,6 +314,8 @@ impl AtProtoClient {
                             );
 
                             // Retry with the nonce - use streaming-aware version
+                            let remaining_budget =
+                                remaining_response_budget(first_response.2.len())?;
                             return self
                                 .do_proxy_request(
                                     session,
@@ -170,6 +329,7 @@ impl AtProtoClient {
                                     2,
                                     jacquard_dpop,
                                     deadline,
+                                    remaining_budget,
                                 )
                                 .await;
                         }
@@ -208,6 +368,7 @@ impl AtProtoClient {
         attempt: u8,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
         deadline: tokio::time::Instant,
+        max_response_size: usize,
     ) -> AppResult<ProxyResponse> {
         let has_nonce = nonce.is_some();
         let mut headers = self
@@ -233,8 +394,7 @@ impl AtProtoClient {
 
         let start = std::time::Instant::now();
         let response = match self
-            .state
-            .outbound_policy
+            .transport
             .send_before(method, url, headers, body, deadline)
             .await
         {
@@ -265,16 +425,16 @@ impl AtProtoClient {
 
         // Reject responses that are too large
         if let Some(len) = content_length {
-            if len > MAX_RESPONSE_SIZE {
+            if len > max_response_size {
                 tracing::warn!(
                     request_id = %request_id,
                     content_length = len,
-                    max_size = MAX_RESPONSE_SIZE,
+                    max_size = max_response_size,
                     "[BFF-UPSTREAM-ERR] Response too large"
                 );
                 return Err(AppError::ResponseTooLarge(format!(
                     "Response size {} bytes exceeds maximum allowed {} bytes",
-                    len, MAX_RESPONSE_SIZE
+                    len, max_response_size
                 )));
             }
         }
@@ -306,13 +466,13 @@ impl AtProtoClient {
             Ok(ProxyResponse::Streaming {
                 status,
                 headers: response_headers,
-                body: response,
+                body: BoundedResponse::new(response, max_response_size, deadline),
             })
         } else {
             // Buffer small JSON responses
             let body = tokio::time::timeout_at(
                 deadline,
-                self.read_response_with_limit(response, MAX_RESPONSE_SIZE, request_id),
+                self.read_response_with_limit(response, max_response_size, request_id),
             )
             .await
             .map_err(|_| AppError::Upstream {
@@ -404,8 +564,7 @@ impl AtProtoClient {
 
         let start = std::time::Instant::now();
         let response = match self
-            .state
-            .outbound_policy
+            .transport
             .send_before(method, url, headers, body, deadline)
             .await
         {
@@ -560,6 +719,125 @@ impl AtProtoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use jacquard_common::CowStr;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    struct QueueProxyTransport {
+        replies: Mutex<VecDeque<(Duration, reqwest::Response)>>,
+        deadlines: Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl QueueProxyTransport {
+        fn new(replies: Vec<(Duration, reqwest::Response)>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                deadlines: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProxyTransport for QueueProxyTransport {
+        fn send_before<'a>(
+            &'a self,
+            _method: reqwest::Method,
+            _url: &'a str,
+            _headers: HeaderMap,
+            _body: Option<bytes::Bytes>,
+            deadline: tokio::time::Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<reqwest::Response, String>> + Send + 'a>> {
+            self.deadlines.lock().expect("deadline lock").push(deadline);
+            let (delay, response) = self
+                .replies
+                .lock()
+                .expect("reply lock")
+                .pop_front()
+                .expect("queued response");
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            })
+        }
+    }
+
+    fn test_response(
+        status: reqwest::StatusCode,
+        headers: &[(&str, &str)],
+        body: reqwest::Body,
+    ) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(body).expect("test response").into()
+    }
+
+    fn nonce_challenge() -> bytes::Bytes {
+        bytes::Bytes::from_static(br#"{"error":"use_dpop_nonce","padding":"bounded"}"#)
+    }
+
+    fn test_session() -> CatbirdSession {
+        let now = chrono::Utc::now();
+        CatbirdSession {
+            id: uuid::Uuid::new_v4(),
+            did: "did:plc:alice".to_string(),
+            handle: "alice.example".to_string(),
+            pds_url: "https://pds.example".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            access_token_expires_at: now + chrono::Duration::hours(1),
+            created_at: now,
+            last_used_at: now,
+        }
+    }
+
+    fn test_dpop() -> crate::middleware::JacquardDpopData {
+        crate::middleware::JacquardDpopData {
+            dpop_key: jacquard_oauth::utils::generate_key(&[CowStr::new_static("ES256")])
+                .expect("test DPoP key"),
+            dpop_host_nonce: String::new(),
+        }
+    }
+
+    async fn run_nonce_retry(
+        retry_body: reqwest::Body,
+        retry_headers: &[(&str, &str)],
+        first_delay: Duration,
+    ) -> (ProxyResponse, Arc<QueueProxyTransport>) {
+        let challenge = nonce_challenge();
+        let first = test_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &[
+                ("content-type", "application/json"),
+                ("dpop-nonce", "server-nonce"),
+            ],
+            reqwest::Body::from(challenge),
+        );
+        let second = test_response(reqwest::StatusCode::OK, retry_headers, retry_body);
+        let transport = Arc::new(QueueProxyTransport::new(vec![
+            (first_delay, first),
+            (Duration::ZERO, second),
+        ]));
+        let client = AtProtoClient::with_transport(transport.clone());
+        let response = client
+            .proxy_request(
+                &test_session(),
+                reqwest::Method::GET,
+                "/xrpc/app.bsky.feed.getTimeline",
+                None,
+                None,
+                None,
+                None,
+                "nonce-retry-test",
+                Some(&test_dpop()),
+            )
+            .await
+            .expect("proxy response");
+        (response, transport)
+    }
 
     #[test]
     fn proxy_headers_forward_only_the_explicit_allowlist() {
@@ -640,5 +918,166 @@ mod tests {
         ] {
             assert!(!outbound.contains_key(name), "blocked header {name}");
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_response_rejects_declared_oversize_before_polling() {
+        let stream = stream::pending::<Result<bytes::Bytes, io::Error>>();
+        let results: Vec<_> = bounded_response_stream(
+            stream,
+            Some((MAX_RESPONSE_SIZE + 1) as u64),
+            MAX_RESPONSE_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .collect()
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(AppError::ResponseTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn streamed_response_rejects_unknown_length_oversize() {
+        let stream = stream::iter([
+            Ok::<_, io::Error>(bytes::Bytes::from(vec![0; MAX_RESPONSE_SIZE])),
+            Ok(bytes::Bytes::from_static(b"x")),
+        ]);
+        let results: Vec<_> = bounded_response_stream(
+            stream,
+            None,
+            MAX_RESPONSE_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .collect()
+        .await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0]
+            .as_ref()
+            .is_ok_and(|chunk| chunk.len() == MAX_RESPONSE_SIZE));
+        assert!(matches!(results[1], Err(AppError::ResponseTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn streamed_response_accepts_exact_limit() {
+        let stream = stream::iter([Ok::<_, io::Error>(bytes::Bytes::from(vec![
+            0;
+            MAX_RESPONSE_SIZE
+        ]))]);
+        let results: Vec<_> = bounded_response_stream(
+            stream,
+            None,
+            MAX_RESPONSE_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .collect()
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .as_ref()
+            .is_ok_and(|chunk| chunk.len() == MAX_RESPONSE_SIZE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streamed_response_uses_absolute_deadline() {
+        let stream = stream::once(async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok::<_, io::Error>(bytes::Bytes::from_static(b"late"))
+        });
+        let results: Vec<_> = bounded_response_stream(
+            stream,
+            None,
+            MAX_RESPONSE_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .collect()
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0],
+            Err(AppError::Upstream { status: 504, .. })
+        ));
+    }
+
+    #[test]
+    fn nonce_retry_uses_remaining_cumulative_response_budget() {
+        assert_eq!(remaining_response_budget(0).unwrap(), MAX_RESPONSE_SIZE);
+        assert_eq!(remaining_response_budget(MAX_RESPONSE_SIZE - 8).unwrap(), 8);
+        assert_eq!(remaining_response_budget(MAX_RESPONSE_SIZE).unwrap(), 0);
+        assert!(matches!(
+            remaining_response_budget(MAX_RESPONSE_SIZE + 1),
+            Err(AppError::ResponseTooLarge(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn proxy_nonce_retry_accepts_exact_cumulative_stream_limit() {
+        let remaining = MAX_RESPONSE_SIZE - nonce_challenge().len();
+        let content_length = remaining.to_string();
+        let (response, transport) = run_nonce_retry(
+            reqwest::Body::from(vec![0_u8; remaining]),
+            &[
+                ("content-type", "application/octet-stream"),
+                ("content-length", content_length.as_str()),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let ProxyResponse::Streaming { body, .. } = response else {
+            panic!("retry response was not streamed");
+        };
+        let chunks: Vec<_> = body.bytes_stream().collect().await;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].as_ref().unwrap().len(), remaining);
+        assert_eq!(transport.deadlines.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn proxy_nonce_retry_rejects_cumulative_unknown_length_oversize() {
+        let remaining = MAX_RESPONSE_SIZE - nonce_challenge().len();
+        let retry_stream = stream::iter([Ok::<_, io::Error>(bytes::Bytes::from(vec![
+            0_u8;
+            remaining
+                + 1
+        ]))]);
+        let (response, _) = run_nonce_retry(
+            reqwest::Body::wrap_stream(retry_stream),
+            &[("content-type", "application/octet-stream")],
+            Duration::ZERO,
+        )
+        .await;
+
+        let ProxyResponse::Streaming { body, .. } = response else {
+            panic!("retry response was not streamed");
+        };
+        let chunks: Vec<_> = body.bytes_stream().collect().await;
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], Err(AppError::ResponseTooLarge(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_nonce_retry_stream_keeps_original_absolute_deadline() {
+        let retry_stream = stream::once(async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            Ok::<_, io::Error>(bytes::Bytes::from_static(b"late"))
+        });
+        let (response, transport) = run_nonce_retry(
+            reqwest::Body::wrap_stream(retry_stream),
+            &[("content-type", "application/octet-stream")],
+            Duration::from_secs(25),
+        )
+        .await;
+
+        let ProxyResponse::Streaming { body, .. } = response else {
+            panic!("retry response was not streamed");
+        };
+        let chunks: Vec<_> = body.bytes_stream().collect().await;
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            &chunks[0],
+            Err(AppError::Upstream { status: 504, .. })
+        ));
+        let deadlines = transport.deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert_eq!(deadlines[0], deadlines[1]);
     }
 }

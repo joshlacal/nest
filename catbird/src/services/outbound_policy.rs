@@ -7,7 +7,9 @@ use jacquard_identity::resolver::{DidDocResponse, IdentityResolver, ResolverOpti
 use reqwest::{header::HeaderMap, Method, Response, Url};
 use std::{
     fmt,
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     time::Duration,
 };
 
@@ -20,6 +22,29 @@ const MAX_REDIRECT_HOPS: usize = 3;
 /// unbounded allocation. The authenticated XRPC proxy keeps its separate
 /// 50 MiB response policy.
 const DISCOVERY_RESPONSE_LIMIT: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedirectMode {
+    FollowSameOrigin,
+    Reject,
+}
+
+trait OutboundIo: Send + Sync {
+    fn validate_before<'a>(
+        &'a self,
+        input: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<ValidatedUrl, PolicyError>> + Send + 'a>>;
+
+    fn send_once<'a>(
+        &'a self,
+        method: Method,
+        target: &'a ValidatedUrl,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+        remaining: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, PolicyError>> + Send + 'a>>;
+}
 
 #[derive(Debug, Clone)]
 pub struct PolicyError(String);
@@ -128,9 +153,16 @@ impl OutboundPolicy {
         headers: HeaderMap,
         body: Option<bytes::Bytes>,
     ) -> Result<Response, PolicyError> {
-        self.send_bounded(method, input, headers, body, REQUEST_TIMEOUT)
-            .await
-            .map(|(response, _)| response)
+        self.send_bounded(
+            method,
+            input,
+            headers,
+            body,
+            REQUEST_TIMEOUT,
+            RedirectMode::FollowSameOrigin,
+        )
+        .await
+        .map(|(response, _)| response)
     }
 
     pub(crate) async fn send_before(
@@ -144,9 +176,16 @@ impl OutboundPolicy {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .ok_or_else(|| PolicyError("outbound request deadline exceeded".into()))?;
-        self.send_bounded(method, input, headers, body, remaining)
-            .await
-            .map(|(response, _)| response)
+        self.send_bounded(
+            method,
+            input,
+            headers,
+            body,
+            remaining,
+            RedirectMode::FollowSameOrigin,
+        )
+        .await
+        .map(|(response, _)| response)
     }
 
     /// Send a discovery/enrichment request and collect its body under the
@@ -159,7 +198,14 @@ impl OutboundPolicy {
         body: Option<bytes::Bytes>,
     ) -> Result<(reqwest::StatusCode, HeaderMap, bytes::Bytes), PolicyError> {
         let (response, deadline) = self
-            .send_bounded(method, input, headers, body, REQUEST_TIMEOUT)
+            .send_bounded(
+                method,
+                input,
+                headers,
+                body,
+                REQUEST_TIMEOUT,
+                RedirectMode::FollowSameOrigin,
+            )
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
@@ -169,51 +215,14 @@ impl OutboundPolicy {
 
     async fn send_bounded(
         &self,
-        mut method: Method,
+        method: Method,
         input: &str,
         headers: HeaderMap,
-        mut body: Option<bytes::Bytes>,
+        body: Option<bytes::Bytes>,
         budget: Duration,
+        redirect_mode: RedirectMode,
     ) -> Result<(Response, tokio::time::Instant), PolicyError> {
-        let deadline = tokio::time::Instant::now() + budget;
-        let original = ValidatedUrl::parse(input)?;
-        let mut current = original.url.clone();
-        for hop in 0..=MAX_REDIRECT_HOPS {
-            let target = self.validate_before(current.as_str(), deadline).await?;
-            let remaining = deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .ok_or_else(|| PolicyError("outbound request deadline exceeded".into()))?;
-            let response = self
-                .send_once(
-                    method.clone(),
-                    &target,
-                    headers.clone(),
-                    body.clone(),
-                    remaining,
-                )
-                .await?;
-            if !is_followed_redirect(response.status()) {
-                return Ok((response, deadline));
-            }
-            if hop == MAX_REDIRECT_HOPS {
-                return Err(PolicyError("outbound redirect limit exceeded".into()));
-            }
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| PolicyError("redirect missing valid Location".into()))?;
-            let next = current
-                .join(location)
-                .map_err(|e| PolicyError(format!("invalid redirect Location: {e}")))?;
-            original.require_same_origin(next.as_str())?;
-            if matches!(response.status().as_u16(), 301..=303) {
-                method = Method::GET;
-                body = None;
-            }
-            current = next;
-        }
-        unreachable!("bounded redirect loop returns")
+        send_bounded_with_io(self, method, input, headers, body, budget, redirect_mode).await
     }
 
     async fn send_once(
@@ -247,6 +256,79 @@ impl OutboundPolicy {
             .send()
             .await
             .map_err(|e| PolicyError(format!("outbound request failed: {e}")))
+    }
+}
+
+async fn send_bounded_with_io<I: OutboundIo + ?Sized>(
+    io: &I,
+    mut method: Method,
+    input: &str,
+    headers: HeaderMap,
+    mut body: Option<bytes::Bytes>,
+    budget: Duration,
+    redirect_mode: RedirectMode,
+) -> Result<(Response, tokio::time::Instant), PolicyError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let original = ValidatedUrl::parse(input)?;
+    let mut current = original.url.clone();
+    for hop in 0..=MAX_REDIRECT_HOPS {
+        let target = io.validate_before(current.as_str(), deadline).await?;
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| PolicyError("outbound request deadline exceeded".into()))?;
+        let response = io
+            .send_once(
+                method.clone(),
+                &target,
+                headers.clone(),
+                body.clone(),
+                remaining,
+            )
+            .await?;
+        if !should_follow_redirect(response.status(), redirect_mode) {
+            return Ok((response, deadline));
+        }
+        if hop == MAX_REDIRECT_HOPS {
+            return Err(PolicyError("outbound redirect limit exceeded".into()));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| PolicyError("redirect missing valid Location".into()))?;
+        let next = current
+            .join(location)
+            .map_err(|e| PolicyError(format!("invalid redirect Location: {e}")))?;
+        original.require_same_origin(next.as_str())?;
+        if matches!(response.status().as_u16(), 301..=303) {
+            method = Method::GET;
+            body = None;
+        }
+        current = next;
+    }
+    unreachable!("bounded redirect loop returns")
+}
+
+impl OutboundIo for OutboundPolicy {
+    fn validate_before<'a>(
+        &'a self,
+        input: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<ValidatedUrl, PolicyError>> + Send + 'a>> {
+        Box::pin(OutboundPolicy::validate_before(self, input, deadline))
+    }
+
+    fn send_once<'a>(
+        &'a self,
+        method: Method,
+        target: &'a ValidatedUrl,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+        remaining: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, PolicyError>> + Send + 'a>> {
+        Box::pin(OutboundPolicy::send_once(
+            self, method, target, headers, body, remaining,
+        ))
     }
 }
 
@@ -311,27 +393,36 @@ impl HttpClient for OutboundPolicy {
         &self,
         request: http::Request<Vec<u8>>,
     ) -> Result<http::Response<Vec<u8>>, Self::Error> {
-        let (parts, body) = request.into_parts();
-        let method = Method::from_bytes(parts.method.as_str().as_bytes())
-            .map_err(|e| PolicyError(format!("invalid method: {e}")))?;
-        let (response, deadline) = self
-            .send_bounded(
-                method,
-                &parts.uri.to_string(),
-                parts.headers,
-                Some(body.into()),
-                REQUEST_TIMEOUT,
-            )
-            .await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_response_bounded(response, DISCOVERY_RESPONSE_LIMIT, deadline).await?;
-        let mut builder = http::Response::builder().status(status);
-        *builder.headers_mut().expect("response builder headers") = headers;
-        builder
-            .body(bytes.to_vec())
-            .map_err(|e| PolicyError(format!("response build failed: {e}")))
+        send_http_with_io(self, request).await
     }
+}
+
+async fn send_http_with_io<I: OutboundIo + ?Sized>(
+    io: &I,
+    request: http::Request<Vec<u8>>,
+) -> Result<http::Response<Vec<u8>>, PolicyError> {
+    let (mut parts, body) = request.into_parts();
+    let redirect_mode = take_redirect_mode(&mut parts.headers);
+    let method = Method::from_bytes(parts.method.as_str().as_bytes())
+        .map_err(|e| PolicyError(format!("invalid method: {e}")))?;
+    let (response, deadline) = send_bounded_with_io(
+        io,
+        method,
+        &parts.uri.to_string(),
+        parts.headers,
+        Some(body.into()),
+        REQUEST_TIMEOUT,
+        redirect_mode,
+    )
+    .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = read_response_bounded(response, DISCOVERY_RESPONSE_LIMIT, deadline).await?;
+    let mut builder = http::Response::builder().status(status);
+    *builder.headers_mut().expect("response builder headers") = headers;
+    builder
+        .body(bytes.to_vec())
+        .map_err(|e| PolicyError(format!("response build failed: {e}")))
 }
 
 #[derive(Clone)]
@@ -391,6 +482,21 @@ fn is_followed_redirect(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
+fn should_follow_redirect(status: reqwest::StatusCode, mode: RedirectMode) -> bool {
+    mode == RedirectMode::FollowSameOrigin && is_followed_redirect(status)
+}
+
+fn take_redirect_mode(headers: &mut HeaderMap) -> RedirectMode {
+    if headers
+        .remove(jacquard_oauth::request::OAUTH_CREDENTIAL_REQUEST_HEADER)
+        .is_some()
+    {
+        RedirectMode::Reject
+    } else {
+        RedirectMode::FollowSameOrigin
+    }
+}
+
 fn is_global_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
     !(a == 0
@@ -441,6 +547,80 @@ mod tests {
     use reqwest::StatusCode;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    struct CapturedDispatch {
+        url: String,
+        headers: HeaderMap,
+        body: Option<Bytes>,
+    }
+
+    #[derive(Clone)]
+    struct CaptureIo {
+        redirect_status: StatusCode,
+        dispatches: Arc<Mutex<Vec<CapturedDispatch>>>,
+    }
+
+    impl CaptureIo {
+        fn new(redirect_status: StatusCode) -> Self {
+            Self {
+                redirect_status,
+                dispatches: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn response(status: StatusCode, location: Option<&str>) -> Response {
+            let mut builder = http::Response::builder().status(status);
+            if let Some(location) = location {
+                builder = builder.header(reqwest::header::LOCATION, location);
+            }
+            builder
+                .body(reqwest::Body::from(Vec::new()))
+                .expect("test response")
+                .into()
+        }
+    }
+
+    impl OutboundIo for CaptureIo {
+        fn validate_before<'a>(
+            &'a self,
+            input: &'a str,
+            _deadline: tokio::time::Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<ValidatedUrl, PolicyError>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(ValidatedUrl {
+                    url: Url::parse(input).expect("test URL"),
+                    addresses: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                })
+            })
+        }
+
+        fn send_once<'a>(
+            &'a self,
+            _method: Method,
+            target: &'a ValidatedUrl,
+            headers: HeaderMap,
+            body: Option<Bytes>,
+            _remaining: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<Response, PolicyError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.dispatches
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedDispatch {
+                        url: target.url.to_string(),
+                        headers,
+                        body,
+                    });
+                if target.url.path() == "/source" {
+                    Ok(Self::response(self.redirect_status, Some("/target")))
+                } else {
+                    Ok(Self::response(StatusCode::OK, None))
+                }
+            })
+        }
+    }
 
     #[test]
     fn rejects_non_https_and_ambiguous_urls() {
@@ -541,6 +721,101 @@ mod tests {
     }
 
     #[test]
+    fn credential_transport_never_follows_redirects_and_consumes_marker() {
+        for status in [301, 302, 303, 307, 308] {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert!(should_follow_redirect(
+                status,
+                RedirectMode::FollowSameOrigin
+            ));
+            assert!(!should_follow_redirect(status, RedirectMode::Reject));
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            jacquard_oauth::request::OAUTH_CREDENTIAL_REQUEST_HEADER,
+            "1".parse().unwrap(),
+        );
+        assert!(matches!(
+            take_redirect_mode(&mut headers),
+            RedirectMode::Reject
+        ));
+        assert!(!headers.contains_key(jacquard_oauth::request::OAUTH_CREDENTIAL_REQUEST_HEADER));
+    }
+
+    #[tokio::test]
+    async fn credential_transport_dispatches_once_and_never_replays_secrets_to_redirect_target() {
+        for status in [301, 302, 303, 307, 308] {
+            let io = CaptureIo::new(StatusCode::from_u16(status).unwrap());
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://issuer.example/source")
+                .header(
+                    jacquard_oauth::request::OAUTH_CREDENTIAL_REQUEST_HEADER,
+                    "1",
+                )
+                .header("DPoP", "proof-secret")
+                .header("Authorization", "DPoP access-secret")
+                .body(b"client_assertion=assertion-secret".to_vec())
+                .unwrap();
+
+            let response = send_http_with_io(&io, request).await.unwrap();
+            assert_eq!(response.status().as_u16(), status);
+
+            let dispatches = io.dispatches.lock().expect("capture lock");
+            assert_eq!(dispatches.len(), 1, "status {status} followed redirect");
+            let source = &dispatches[0];
+            assert_eq!(source.url, "https://issuer.example/source");
+            assert!(!source
+                .headers
+                .contains_key(jacquard_oauth::request::OAUTH_CREDENTIAL_REQUEST_HEADER));
+            assert_eq!(source.headers.get("dpop").unwrap(), "proof-secret");
+            assert!(source
+                .body
+                .as_ref()
+                .is_some_and(|body| body.as_ref().starts_with(b"client_assertion=")));
+            let target_dispatches: Vec<_> = dispatches
+                .iter()
+                .filter(|dispatch| dispatch.url == "https://issuer.example/target")
+                .collect();
+            assert!(
+                target_dispatches.is_empty(),
+                "status {status} reached target"
+            );
+            assert!(target_dispatches.iter().all(|dispatch| {
+                !dispatch
+                    .headers
+                    .values()
+                    .any(|value| value.as_bytes().windows(6).any(|part| part == b"secret"))
+                    && dispatch
+                        .body
+                        .as_ref()
+                        .is_none_or(|body| !body.as_ref().windows(6).any(|part| part == b"secret"))
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn noncredential_same_origin_redirect_still_dispatches_target() {
+        let io = CaptureIo::new(StatusCode::TEMPORARY_REDIRECT);
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://issuer.example/source")
+            .body(Vec::new())
+            .unwrap();
+
+        let response = send_http_with_io(&io, request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let dispatches = io.dispatches.lock().expect("capture lock");
+        assert_eq!(dispatches.len(), 2);
+        assert_eq!(dispatches[0].url, "https://issuer.example/source");
+        assert_eq!(dispatches[1].url, "https://issuer.example/target");
+        assert!(dispatches.iter().all(|dispatch| !dispatch
+            .headers
+            .contains_key(jacquard_oauth::request::OAUTH_CREDENTIAL_REQUEST_HEADER)));
+    }
+
+    #[test]
     fn rejects_all_reviewed_special_use_and_compatible_forms() {
         for ip in [
             "192.0.0.1",
@@ -569,6 +844,7 @@ mod tests {
                 HeaderMap::new(),
                 None,
                 Duration::ZERO,
+                RedirectMode::FollowSameOrigin,
             )
             .await
             .unwrap_err();
