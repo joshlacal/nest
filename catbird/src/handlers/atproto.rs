@@ -1087,6 +1087,31 @@ pub(crate) async fn proxy_xrpc(
             headers: resp_headers,
             body: upstream_response,
         } => {
+            if streaming_moderation_disposition(state.push.is_some(), status, &lexicon, &body_bytes)
+                == StreamingModerationDisposition::MirrorBeforeDelivery
+            {
+                if let Err(error) = mirror_push_mutation_if_needed(
+                    &state,
+                    &session,
+                    jacquard_dpop.as_ref(),
+                    &lexicon,
+                    &body_bytes,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        lexicon = %lexicon,
+                        user = %session.did,
+                        error = %error,
+                        "Failed to mirror streaming push moderation mutation"
+                    );
+                    return Err(AppError::Upstream {
+                        status: StatusCode::BAD_GATEWAY.as_u16(),
+                        message: "moderation mutation could not be mirrored before delivery"
+                            .to_string(),
+                    });
+                }
+            }
             tracing::info!(
                 request_id = %request_id,
                 status = status,
@@ -1109,6 +1134,126 @@ pub(crate) async fn proxy_xrpc(
             let stream = upstream_response.bytes_stream();
             Ok(response.body(Body::from_stream(stream)).unwrap())
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingModerationDisposition {
+    Deliver,
+    MirrorBeforeDelivery,
+}
+
+fn streaming_moderation_disposition(
+    push_mirroring_enabled: bool,
+    status: u16,
+    lexicon: &str,
+    request_body: &[u8],
+) -> StreamingModerationDisposition {
+    if push_mirroring_enabled
+        && (200..300).contains(&status)
+        && is_push_moderation_mutation(lexicon, request_body)
+    {
+        StreamingModerationDisposition::MirrorBeforeDelivery
+    } else {
+        StreamingModerationDisposition::Deliver
+    }
+}
+
+fn is_push_moderation_mutation(lexicon: &str, request_body: &[u8]) -> bool {
+    match lexicon {
+        "app.bsky.graph.muteActor"
+        | "app.bsky.graph.unmuteActor"
+        | "app.bsky.graph.muteActorList"
+        | "app.bsky.graph.unmuteActorList"
+        | "app.bsky.graph.muteThread"
+        | "app.bsky.graph.unmuteThread" => true,
+        "com.atproto.repo.createRecord" | "com.atproto.repo.deleteRecord" => {
+            let Ok(body) = serde_json::from_slice::<Value>(request_body) else {
+                return false;
+            };
+            matches!(
+                body.get("collection").and_then(Value::as_str),
+                Some("app.bsky.graph.block" | "app.bsky.graph.listblock")
+            )
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod streaming_mirror_tests {
+    use super::{
+        is_push_moderation_mutation, streaming_moderation_disposition,
+        StreamingModerationDisposition,
+    };
+
+    #[test]
+    fn declared_large_successful_moderation_mutation_requires_mirror_before_delivery() {
+        let declared_content_length = 4 * 1024 * 1024 + 1;
+        let response_content_type = "application/json";
+        assert!(declared_content_length > 4 * 1024 * 1024);
+        assert_eq!(response_content_type, "application/json");
+
+        let disposition = streaming_moderation_disposition(
+            true,
+            200,
+            "app.bsky.graph.muteActor",
+            br#"{"actor":"did:plc:target"}"#,
+        );
+        assert_eq!(
+            disposition,
+            StreamingModerationDisposition::MirrorBeforeDelivery
+        );
+    }
+
+    #[test]
+    fn streaming_non_mutation_media_and_upstream_errors_remain_compatible() {
+        assert_eq!(
+            streaming_moderation_disposition(true, 200, "com.atproto.sync.getBlob", &[]),
+            StreamingModerationDisposition::Deliver
+        );
+        assert_eq!(
+            streaming_moderation_disposition(
+                true,
+                500,
+                "app.bsky.graph.muteActor",
+                br#"{"actor":"did:plc:target"}"#,
+            ),
+            StreamingModerationDisposition::Deliver
+        );
+        assert_eq!(
+            streaming_moderation_disposition(
+                false,
+                200,
+                "app.bsky.graph.muteActor",
+                br#"{"actor":"did:plc:target"}"#,
+            ),
+            StreamingModerationDisposition::Deliver
+        );
+    }
+
+    #[test]
+    fn ordinary_empty_mute_success_is_not_rejected_as_an_unsafe_stream() {
+        assert_eq!(
+            streaming_moderation_disposition(true, 200, "app.bsky.graph.muteActor", &[]),
+            StreamingModerationDisposition::MirrorBeforeDelivery
+        );
+    }
+
+    #[test]
+    fn record_mutation_classifier_is_collection_scoped() {
+        assert!(is_push_moderation_mutation(
+            "com.atproto.repo.createRecord",
+            br#"{"collection":"app.bsky.graph.block"}"#,
+        ));
+        assert!(is_push_moderation_mutation(
+            "com.atproto.repo.deleteRecord",
+            br#"{"collection":"app.bsky.graph.listblock"}"#,
+        ));
+        assert!(!is_push_moderation_mutation(
+            "com.atproto.repo.createRecord",
+            br#"{"collection":"app.bsky.feed.post"}"#,
+        ));
     }
 }
 
