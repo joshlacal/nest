@@ -555,9 +555,28 @@ impl ModerationCache {
                 Ok((list_name, members))
             },
             |(list_name, members)| async move {
-                let mut tx = self.db_pool.begin().await?;
-                sqlx::query(
-                    r#"
+                self.replace_list_snapshot(&session.did, list_uri, purpose, list_name, members)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn replace_list_snapshot(
+        &self,
+        user_did: &str,
+        list_uri: &str,
+        purpose: &str,
+        list_name: Option<String>,
+        members: Vec<String>,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
             INSERT INTO moderation_list_subscriptions (
                 user_did,
                 list_uri,
@@ -575,42 +594,112 @@ impl ModerationCache {
                 last_synced_at = NOW(),
                 updated_at = NOW()
             "#,
+        )
+        .bind(user_did)
+        .bind(list_uri)
+        .bind(purpose)
+        .bind(list_name)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM moderation_list_members_by_user WHERE user_did = $1 AND list_uri = $2",
+        )
+        .bind(user_did)
+        .bind(list_uri)
+        .execute(&mut *tx)
+        .await?;
+
+        for subject_did in members {
+            sqlx::query(
+                r#"
+                INSERT INTO moderation_list_members_by_user (user_did, list_uri, subject_did)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_did, list_uri, subject_did) DO NOTHING
+                "#,
+            )
+            .bind(user_did)
+            .bind(list_uri)
+            .bind(subject_did)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn replace_all_list_snapshots(
+        &self,
+        user_did: &str,
+        snapshots: Vec<(ListSubscription, Vec<String>)>,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM moderation_list_members_by_user WHERE user_did = $1")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM moderation_list_subscriptions WHERE user_did = $1")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
+
+        for (list, members) in snapshots {
+            sqlx::query(
+                r#"
+                INSERT INTO moderation_list_subscriptions (
+                    user_did,
+                    list_uri,
+                    list_purpose,
+                    list_name,
+                    last_synced_at,
+                    created_at,
+                    updated_at
                 )
-                .bind(&session.did)
-                .bind(list_uri)
-                .bind(purpose)
-                .bind(list_name)
+                VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())
+                "#,
+            )
+            .bind(user_did)
+            .bind(&list.uri)
+            .bind(&list.purpose)
+            .bind(&list.name)
+            .execute(&mut *tx)
+            .await?;
+
+            for subject_did in members {
+                sqlx::query(
+                    r#"
+                    INSERT INTO moderation_list_members_by_user (
+                        user_did,
+                        list_uri,
+                        subject_did
+                    )
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_did, list_uri, subject_did) DO NOTHING
+                    "#,
+                )
+                .bind(user_did)
+                .bind(&list.uri)
+                .bind(subject_did)
                 .execute(&mut *tx)
                 .await?;
+            }
+        }
 
-                sqlx::query("DELETE FROM moderation_list_members WHERE list_uri = $1")
-                    .bind(list_uri)
-                    .execute(&mut *tx)
-                    .await?;
-
-                for subject_did in members {
-                    sqlx::query(
-                        r#"
-                INSERT INTO moderation_list_members (list_uri, subject_did)
-                VALUES ($1, $2)
-                ON CONFLICT (list_uri, subject_did) DO NOTHING
-                "#,
-                    )
-                    .bind(list_uri)
-                    .bind(subject_did)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-
-                tx.commit().await?;
-                Ok(())
-            },
-        )
-        .await
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn remove_list_subscription(&self, user_did: &str, list_uri: &str) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "DELETE FROM moderation_list_subscriptions WHERE user_did = $1 AND list_uri = $2",
         )
@@ -620,16 +709,9 @@ impl ModerationCache {
         .await?;
 
         sqlx::query(
-            r#"
-            DELETE FROM moderation_list_members m
-            WHERE m.list_uri = $1
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM moderation_list_subscriptions s
-                  WHERE s.list_uri = m.list_uri
-              )
-            "#,
+            "DELETE FROM moderation_list_members_by_user WHERE user_did = $1 AND list_uri = $2",
         )
+        .bind(user_did)
         .bind(list_uri)
         .execute(&mut *tx)
         .await?;
@@ -660,10 +742,9 @@ impl ModerationCache {
             r#"
             SELECT EXISTS (
                 SELECT 1
-                FROM moderation_list_members m
-                INNER JOIN moderation_list_subscriptions s ON s.list_uri = m.list_uri
-                WHERE s.user_did = $1
-                  AND m.subject_did = $2
+                FROM moderation_list_members_by_user
+                WHERE user_did = $1
+                  AND subject_did = $2
             ) AS filtered
             "#,
         )
@@ -800,71 +881,7 @@ impl ModerationCache {
                 }
                 Ok(member_map)
             },
-            |member_map| async move {
-                let mut tx = self.db_pool.begin().await?;
-                sqlx::query("DELETE FROM moderation_list_subscriptions WHERE user_did = $1")
-                    .bind(&session.did)
-                    .execute(&mut *tx)
-                    .await?;
-
-                for (list, members) in member_map {
-                    sqlx::query(
-                        r#"
-                INSERT INTO moderation_list_subscriptions (
-                    user_did,
-                    list_uri,
-                    list_purpose,
-                    list_name,
-                    last_synced_at,
-                    created_at,
-                    updated_at
-                )
-                VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())
-                "#,
-                    )
-                    .bind(&session.did)
-                    .bind(&list.uri)
-                    .bind(&list.purpose)
-                    .bind(&list.name)
-                    .execute(&mut *tx)
-                    .await?;
-
-                    sqlx::query("DELETE FROM moderation_list_members WHERE list_uri = $1")
-                        .bind(&list.uri)
-                        .execute(&mut *tx)
-                        .await?;
-
-                    for member in members {
-                        sqlx::query(
-                            r#"
-                    INSERT INTO moderation_list_members (list_uri, subject_did)
-                    VALUES ($1, $2)
-                    ON CONFLICT (list_uri, subject_did) DO NOTHING
-                    "#,
-                        )
-                        .bind(&list.uri)
-                        .bind(member)
-                        .execute(&mut *tx)
-                        .await?;
-                    }
-                }
-
-                sqlx::query(
-                    r#"
-            DELETE FROM moderation_list_members m
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM moderation_list_subscriptions s
-                WHERE s.list_uri = m.list_uri
-            )
-            "#,
-                )
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-                Ok(())
-            },
+            |member_map| self.replace_all_list_snapshots(&session.did, member_map),
         )
         .await
     }
@@ -1161,6 +1178,7 @@ fn parse_json_body(body: &Bytes) -> Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
     use std::{
         collections::VecDeque,
         future::ready,
@@ -1226,6 +1244,318 @@ mod tests {
             strings,
         )
         .await
+    }
+
+    async fn live_pool() -> PgPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for the ignored Postgres suite");
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect test Postgres")
+    }
+
+    async fn cleanup_tenant_fixture(pool: &PgPool, users: &[&str], lists: &[&str]) {
+        sqlx::query("DELETE FROM moderation_list_members_by_user WHERE user_did = ANY($1)")
+            .bind(users)
+            .execute(pool)
+            .await
+            .expect("clean tenant members");
+        sqlx::query("DELETE FROM moderation_list_subscriptions WHERE user_did = ANY($1)")
+            .bind(users)
+            .execute(pool)
+            .await
+            .expect("clean tenant subscriptions");
+        sqlx::query("DELETE FROM moderation_list_members WHERE list_uri = ANY($1)")
+            .bind(lists)
+            .execute(pool)
+            .await
+            .expect("clean legacy members");
+    }
+
+    async fn tenant_members(pool: &PgPool, user_did: &str) -> Vec<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT list_uri, subject_did
+            FROM moderation_list_members_by_user
+            WHERE user_did = $1
+            ORDER BY list_uri, subject_did
+            "#,
+        )
+        .bind(user_did)
+        .fetch_all(pool)
+        .await
+        .expect("load tenant members")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with Nest push migrations applied"]
+    async fn live_postgres_tenant_direct_replacement_and_removal_are_did_scoped() {
+        let pool = live_pool().await;
+        let cache = ModerationCache::new(pool.clone(), 60);
+        let user_a = "did:plc:moderation-tenant-a";
+        let user_b = "did:plc:moderation-tenant-b";
+        let list = "at://did:plc:list-owner/app.bsky.graph.list/shared";
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[list]).await;
+
+        cache
+            .replace_list_snapshot(
+                user_a,
+                list,
+                "modlist",
+                Some("shared".to_owned()),
+                vec!["did:plc:member-a".to_owned()],
+            )
+            .await
+            .expect("seed DID A snapshot");
+        cache
+            .replace_list_snapshot(
+                user_b,
+                list,
+                "modlist",
+                Some("shared".to_owned()),
+                vec!["did:plc:member-b".to_owned()],
+            )
+            .await
+            .expect("replace DID B snapshot");
+
+        assert!(cache
+            .is_actor_list_filtered(user_a, "did:plc:member-a")
+            .await
+            .expect("filter DID A member"));
+        assert!(!cache
+            .is_actor_list_filtered(user_a, "did:plc:member-b")
+            .await
+            .expect("exclude DID B member from DID A"));
+        assert!(cache
+            .is_actor_list_filtered(user_b, "did:plc:member-b")
+            .await
+            .expect("filter DID B member"));
+
+        cache
+            .remove_list_subscription(user_b, list)
+            .await
+            .expect("remove DID B subscription");
+        assert!(cache
+            .is_actor_list_filtered(user_a, "did:plc:member-a")
+            .await
+            .expect("DID A survives DID B removal"));
+        assert!(!cache
+            .is_actor_list_filtered(user_b, "did:plc:member-b")
+            .await
+            .expect("DID B rows removed"));
+
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[list]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with Nest push migrations applied"]
+    async fn live_postgres_tenant_full_refresh_and_failures_preserve_isolation() {
+        let pool = live_pool().await;
+        let cache = ModerationCache::new(pool.clone(), 60);
+        let user_a = "did:plc:moderation-refresh-a";
+        let user_b = "did:plc:moderation-refresh-b";
+        let shared_list = "at://did:plc:list-owner/app.bsky.graph.list/refresh-shared";
+        let omitted_list = "at://did:plc:list-owner/app.bsky.graph.list/refresh-omitted";
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[shared_list, omitted_list]).await;
+
+        cache
+            .replace_list_snapshot(
+                user_a,
+                shared_list,
+                "modlist",
+                None,
+                vec!["did:plc:refresh-a".to_owned()],
+            )
+            .await
+            .expect("seed DID A");
+        cache
+            .replace_list_snapshot(
+                user_b,
+                shared_list,
+                "modlist",
+                None,
+                vec!["did:plc:refresh-b-old".to_owned()],
+            )
+            .await
+            .expect("seed DID B shared list");
+        cache
+            .replace_list_snapshot(
+                user_b,
+                omitted_list,
+                "curatelist",
+                None,
+                vec!["did:plc:refresh-b-omitted".to_owned()],
+            )
+            .await
+            .expect("seed DID B omitted list");
+
+        cache
+            .replace_all_list_snapshots(
+                user_b,
+                vec![(
+                    ListSubscription {
+                        uri: shared_list.to_owned(),
+                        purpose: "modlist".to_owned(),
+                        name: Some("refreshed".to_owned()),
+                    },
+                    vec!["did:plc:refresh-b-new".to_owned()],
+                )],
+            )
+            .await
+            .expect("replace only DID B full snapshot");
+
+        assert_eq!(
+            tenant_members(&pool, user_a).await,
+            vec![(shared_list.to_owned(), "did:plc:refresh-a".to_owned())]
+        );
+        assert_eq!(
+            tenant_members(&pool, user_b).await,
+            vec![(shared_list.to_owned(), "did:plc:refresh-b-new".to_owned())]
+        );
+
+        sqlx::query(
+            "ALTER TABLE moderation_list_members_by_user ADD CONSTRAINT moderation_test_reject_boom CHECK (subject_did <> 'did:plc:boom')",
+        )
+        .execute(&pool)
+        .await
+        .expect("install forced transaction failure");
+        let transaction_error = cache
+            .replace_all_list_snapshots(
+                user_b,
+                vec![(
+                    ListSubscription {
+                        uri: shared_list.to_owned(),
+                        purpose: "modlist".to_owned(),
+                        name: None,
+                    },
+                    vec!["did:plc:boom".to_owned()],
+                )],
+            )
+            .await
+            .expect_err("forced insert failure must roll back replacement");
+        assert!(transaction_error
+            .to_string()
+            .contains("moderation_test_reject_boom"));
+        sqlx::query(
+            "ALTER TABLE moderation_list_members_by_user DROP CONSTRAINT moderation_test_reject_boom",
+        )
+        .execute(&pool)
+        .await
+        .expect("remove forced transaction failure");
+
+        let fetch_error = replace_after_complete_snapshot(
+            async {
+                Err::<Vec<(ListSubscription, Vec<String>)>, _>(anyhow!("forced fetch failure"))
+            },
+            |snapshots| cache.replace_all_list_snapshots(user_b, snapshots),
+        )
+        .await
+        .expect_err("fetch failure must skip replacement transaction");
+        assert!(fetch_error.to_string().contains("forced fetch failure"));
+
+        assert_eq!(
+            tenant_members(&pool, user_a).await,
+            vec![(shared_list.to_owned(), "did:plc:refresh-a".to_owned())]
+        );
+        assert_eq!(
+            tenant_members(&pool, user_b).await,
+            vec![(shared_list.to_owned(), "did:plc:refresh-b-new".to_owned())]
+        );
+
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[shared_list, omitted_list]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
+    async fn live_postgres_migration_backfills_subscribers_without_orphans() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for the ignored Postgres suite");
+        let mut connection = PgConnection::connect(&database_url)
+            .await
+            .expect("connect test Postgres");
+        let schema = format!("moderation_tenant_{}", uuid::Uuid::new_v4().simple());
+
+        sqlx::raw_sql(&format!(
+            r#"
+            CREATE SCHEMA {schema};
+            SET search_path TO {schema}, public;
+            CREATE TABLE moderation_list_subscriptions (
+                user_did TEXT NOT NULL,
+                list_uri TEXT NOT NULL,
+                UNIQUE (user_did, list_uri)
+            );
+            CREATE TABLE moderation_list_members (
+                list_uri TEXT NOT NULL,
+                subject_did TEXT NOT NULL,
+                UNIQUE (list_uri, subject_did)
+            );
+            INSERT INTO moderation_list_subscriptions (user_did, list_uri) VALUES
+                ('did:plc:migration-a', 'at://list/shared'),
+                ('did:plc:migration-b', 'at://list/shared');
+            INSERT INTO moderation_list_members (list_uri, subject_did) VALUES
+                ('at://list/shared', 'did:plc:shared-member'),
+                ('at://list/orphan', 'did:plc:orphan-member');
+            "#
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("seed isolated legacy schema");
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/20260715100000_scope_moderation_list_members_by_did.up.sql"
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("apply exact tenant-isolation migration");
+
+        let backfilled = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+            SELECT user_did, list_uri, subject_did
+            FROM moderation_list_members_by_user
+            ORDER BY user_did, list_uri, subject_did
+            "#,
+        )
+        .fetch_all(&mut connection)
+        .await
+        .expect("load migration backfill");
+        assert_eq!(
+            backfilled,
+            vec![
+                (
+                    "did:plc:migration-a".to_owned(),
+                    "at://list/shared".to_owned(),
+                    "did:plc:shared-member".to_owned(),
+                ),
+                (
+                    "did:plc:migration-b".to_owned(),
+                    "at://list/shared".to_owned(),
+                    "did:plc:shared-member".to_owned(),
+                ),
+            ]
+        );
+
+        sqlx::query(
+            "DELETE FROM moderation_list_members_by_user WHERE user_did = 'did:plc:migration-b'",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("diverge DID B snapshot");
+        let remaining = sqlx::query_scalar::<_, String>(
+            "SELECT user_did FROM moderation_list_members_by_user ORDER BY user_did",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .expect("load independently mutable snapshots");
+        assert_eq!(remaining, vec!["did:plc:migration-a"]);
+
+        sqlx::raw_sql(&format!(
+            "SET search_path TO public; DROP SCHEMA {schema} CASCADE;"
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("clean isolated migration schema");
     }
 
     #[tokio::test]
