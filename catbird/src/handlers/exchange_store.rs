@@ -21,14 +21,8 @@ pub struct ExchangeStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeInit {
-    pub nonce_hash: Option<String>,
+    pub nonce_hash: String,
     pub redirect_origin: String,
-    pub redirect_target: Option<String>,
-    pub client_selector: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyExchangeInit {
     pub redirect_target: Option<String>,
     pub client_selector: String,
 }
@@ -114,22 +108,11 @@ fn exchange_key_for(prefix: &str, keyring: &Keyring, code: &str) -> String {
     )
 }
 
-fn take_legacy_init_script() -> redis::Script {
-    redis::Script::new(
-        r#"
-        local client = redis.call('GET', KEYS[1])
-        local redirect = redis.call('GET', KEYS[2])
-        redis.call('DEL', KEYS[1], KEYS[2])
-        return {client or false, redirect or false}
-        "#,
-    )
-}
-
 impl ExchangeStore {
     pub async fn store_init(
         &self,
         state: &str,
-        nonce: Option<&str>,
+        nonce: &str,
         redirect_target: Option<&str>,
         client_selector: &str,
     ) -> Result<(), ExchangeError> {
@@ -139,7 +122,7 @@ impl ExchangeStore {
             return Err(ExchangeError::Unauthorized);
         }
         let record = ExchangeInit {
-            nonce_hash: nonce.map(nonce_hash),
+            nonce_hash: nonce_hash(nonce),
             redirect_origin,
             redirect_target: redirect_target.map(str::to_string),
             client_selector: client_selector.to_string(),
@@ -158,31 +141,6 @@ impl ExchangeStore {
             .await
     }
 
-    /// Consume pre-migration callback keys as one Redis transaction.
-    ///
-    /// This is called only while the explicit legacy callback window is open.
-    /// Both keys are bound to the provider-returned OAuth state and their values
-    /// are validated before they influence client selection or redirection.
-    pub async fn take_legacy_init(
-        &self,
-        state: &str,
-    ) -> Result<Option<LegacyExchangeInit>, ExchangeError> {
-        if state.len() > 4096 {
-            return Err(ExchangeError::Unauthorized);
-        }
-        let client_key = format!("oauth_client:{state}");
-        let redirect_key = format!("oauth_redirect:{state}");
-        let mut connection = self.redis.clone();
-        let (client_selector, redirect_target): (Option<String>, Option<String>) =
-            take_legacy_init_script()
-                .key(client_key)
-                .key(redirect_key)
-                .invoke_async(&mut connection)
-                .await
-                .map_err(|_| ExchangeError::Unavailable)?;
-        validate_legacy_init(client_selector, redirect_target)
-    }
-
     pub async fn issue(
         &self,
         session_id: &str,
@@ -191,7 +149,7 @@ impl ExchangeStore {
         let code = self.new_code();
         let record = ExchangeRecord {
             session_id: session_id.to_string(),
-            nonce_hash: init.nonce_hash.ok_or(ExchangeError::Unauthorized)?,
+            nonce_hash: init.nonce_hash,
             redirect_origin: init.redirect_origin,
             created_at: chrono::Utc::now().timestamp(),
         };
@@ -266,29 +224,6 @@ impl ExchangeStore {
     }
 }
 
-fn validate_legacy_init(
-    client_selector: Option<String>,
-    redirect_target: Option<String>,
-) -> Result<Option<LegacyExchangeInit>, ExchangeError> {
-    let Some(client_selector) = client_selector else {
-        return if redirect_target.is_none() {
-            Ok(None)
-        } else {
-            Err(ExchangeError::Unauthorized)
-        };
-    };
-    if !matches!(client_selector.as_str(), "catmos" | "default") {
-        return Err(ExchangeError::Unauthorized);
-    }
-    if let Some(target) = redirect_target.as_deref() {
-        normalize_origin(target)?;
-    }
-    Ok(Some(LegacyExchangeInit {
-        redirect_target,
-        client_selector,
-    }))
-}
-
 pub fn normalize_origin(target: &str) -> Result<String, ExchangeError> {
     let url = url::Url::parse(target).map_err(|_| ExchangeError::Unauthorized)?;
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
@@ -359,11 +294,6 @@ mod tests {
         assert!(!include_str!("exchange_store.rs").contains(&forbidden));
     }
 
-    #[test]
-    fn legacy_init_script_returns_two_explicit_optional_slots() {
-        let expected = ["return {client ", "or false, redirect or false}"].concat();
-        assert!(include_str!("exchange_store.rs").contains(&expected));
-    }
     use crate::services::redis_crypto::KeyMaterial;
 
     #[test]
@@ -449,28 +379,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_init_values_are_validated_before_use() {
-        let init = validate_legacy_init(
-            Some("catmos".to_string()),
-            Some("https://catmos.catbird.blue/callback".to_string()),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(init.client_selector, "catmos");
-        assert_eq!(
-            init.redirect_target.as_deref(),
-            Some("https://catmos.catbird.blue/callback")
-        );
-        assert!(validate_legacy_init(Some("admin".to_string()), None).is_err());
-        assert!(validate_legacy_init(
-            Some("catmos".to_string()),
-            Some("https://evil.example/callback".to_string())
-        )
-        .is_err());
-        assert!(validate_legacy_init(None, None).unwrap().is_none());
-    }
-
     #[tokio::test]
     #[ignore = "requires TEST_REDIS_URL"]
     async fn redis_concurrency_ttl_and_aad_are_enforced() {
@@ -488,43 +396,49 @@ mod tests {
             .unwrap(),
         };
         let legacy_state = format!("legacy-{}", uuid::Uuid::new_v4());
-        let mut legacy_connection = store.redis.clone();
+        let legacy_client_key = format!("oauth_client:{legacy_state}");
+        let legacy_redirect_key = format!("oauth_redirect:{legacy_state}");
+        let mut connection = store.redis.clone();
         redis::pipe()
             .cmd("SET")
-            .arg(format!("oauth_client:{legacy_state}"))
+            .arg(&legacy_client_key)
             .arg("catmos")
             .arg("EX")
             .arg(600)
             .ignore()
             .cmd("SET")
-            .arg(format!("oauth_redirect:{legacy_state}"))
+            .arg(&legacy_redirect_key)
             .arg("https://catmos.catbird.blue/callback")
             .arg("EX")
             .arg(600)
             .ignore()
-            .query_async::<_, ()>(&mut legacy_connection)
+            .query_async::<_, ()>(&mut connection)
             .await
             .unwrap();
-        let legacy = store
-            .take_legacy_init(&legacy_state)
+        assert!(matches!(
+            store.take_init(&legacy_state).await,
+            Err(ExchangeError::Missing)
+        ));
+        let legacy_values: (Option<String>, Option<String>) = redis::pipe()
+            .cmd("GET")
+            .arg(&legacy_client_key)
+            .cmd("GET")
+            .arg(&legacy_redirect_key)
+            .query_async(&mut connection)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(legacy.client_selector, "catmos");
         assert_eq!(
-            legacy.redirect_target.as_deref(),
-            Some("https://catmos.catbird.blue/callback")
+            legacy_values,
+            (
+                Some("catmos".to_string()),
+                Some("https://catmos.catbird.blue/callback".to_string())
+            )
         );
-        assert!(store
-            .take_legacy_init(&legacy_state)
-            .await
-            .unwrap()
-            .is_none());
 
         store
             .store_init(
                 "cancelled-state",
-                Some("browser-secret"),
+                "browser-secret",
                 Some("https://catmos.catbird.blue/callback"),
                 "catmos",
             )
@@ -537,14 +451,13 @@ mod tests {
             Err(ExchangeError::Missing)
         ));
         let init = ExchangeInit {
-            nonce_hash: Some(nonce_hash("browser-secret")),
+            nonce_hash: nonce_hash("browser-secret"),
             redirect_origin: "https://catmos.catbird.blue".into(),
             redirect_target: Some("https://catmos.catbird.blue/callback".into()),
             client_selector: "catmos".into(),
         };
         let code = store.issue("session", init).await.unwrap();
         let key = store.exchange_key(&code);
-        let mut connection = store.redis.clone();
         let ttl: i64 = redis::cmd("TTL")
             .arg(&key)
             .query_async(&mut connection)
@@ -561,7 +474,7 @@ mod tests {
             .issue(
                 "expired-session",
                 ExchangeInit {
-                    nonce_hash: Some(nonce_hash("browser-secret")),
+                    nonce_hash: nonce_hash("browser-secret"),
                     redirect_origin: "https://catmos.catbird.blue".into(),
                     redirect_target: Some("https://catmos.catbird.blue/callback".into()),
                     client_selector: "catmos".into(),
@@ -587,7 +500,7 @@ mod tests {
             .issue(
                 "aad-session",
                 ExchangeInit {
-                    nonce_hash: Some(nonce_hash("browser-secret")),
+                    nonce_hash: nonce_hash("browser-secret"),
                     redirect_origin: "https://catmos.catbird.blue".into(),
                     redirect_target: Some("https://catmos.catbird.blue/callback".into()),
                     client_selector: "catmos".into(),
@@ -614,79 +527,5 @@ mod tests {
                 .await,
             Err(ExchangeError::Unauthorized)
         ));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires TEST_REDIS_URL"]
-    async fn redis_legacy_init_missing_values_keep_fixed_slots_and_delete_atomically() {
-        let redis_url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL is required");
-        let client = redis::Client::open(redis_url).unwrap();
-        let manager = redis::aio::ConnectionManager::new(client).await.unwrap();
-        let store = ExchangeStore {
-            redis: manager,
-            key_prefix: format!("test:oauth-exchange:{}:", uuid::Uuid::new_v4()),
-            keyring: Keyring::new(
-                KeyMaterial::new("active", [1; 32]).unwrap(),
-                vec![],
-                [2; 32],
-            )
-            .unwrap(),
-        };
-        let mut connection = store.redis.clone();
-
-        let client_only_state = format!("client-only-{}", uuid::Uuid::new_v4());
-        let client_only_key = format!("oauth_client:{client_only_state}");
-        let client_only_redirect_key = format!("oauth_redirect:{client_only_state}");
-        redis::cmd("SET")
-            .arg(&client_only_key)
-            .arg("catmos")
-            .query_async::<_, ()>(&mut connection)
-            .await
-            .unwrap();
-        let client_only = store
-            .take_legacy_init(&client_only_state)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(client_only.client_selector, "catmos");
-        assert_eq!(client_only.redirect_target, None);
-        let client_only_after: (Option<String>, Option<String>) = redis::pipe()
-            .cmd("GET")
-            .arg(&client_only_key)
-            .cmd("GET")
-            .arg(&client_only_redirect_key)
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert_eq!(client_only_after, (None, None));
-
-        let redirect_only_state = format!("redirect-only-{}", uuid::Uuid::new_v4());
-        let redirect_only_client_key = format!("oauth_client:{redirect_only_state}");
-        let redirect_only_key = format!("oauth_redirect:{redirect_only_state}");
-        redis::cmd("SET")
-            .arg(&redirect_only_key)
-            .arg("https://catmos.catbird.blue/callback")
-            .query_async::<_, ()>(&mut connection)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.take_legacy_init(&redirect_only_state).await,
-            Err(ExchangeError::Unauthorized)
-        );
-        let redirect_only_after: (Option<String>, Option<String>) = redis::pipe()
-            .cmd("GET")
-            .arg(&redirect_only_client_key)
-            .cmd("GET")
-            .arg(&redirect_only_key)
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert_eq!(redirect_only_after, (None, None));
-
-        let json_state_fallback = format!("json-state-{}", uuid::Uuid::new_v4());
-        assert_eq!(
-            store.take_legacy_init(&json_state_fallback).await.unwrap(),
-            None
-        );
     }
 }
