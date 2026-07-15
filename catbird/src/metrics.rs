@@ -155,13 +155,17 @@ fn proxy_metric_lexicon_label(lexicon: &str) -> &'static str {
     let Ok(nsid) = Nsid::new(lexicon) else {
         return "invalid";
     };
-    let mut segments = nsid.as_str().split('.');
-    match (segments.next(), segments.next()) {
-        (Some("com"), Some("atproto")) => "com.atproto",
-        (Some("app"), Some("bsky")) => "app.bsky",
-        (Some("chat"), Some("bsky")) => "chat.bsky",
-        (Some("blue"), Some("catbird")) => "blue.catbird",
-        _ => "other",
+    let nsid = nsid.as_str();
+    if nsid.starts_with("com.atproto.") {
+        "com.atproto"
+    } else if nsid.starts_with("app.bsky.") {
+        "app.bsky"
+    } else if nsid.starts_with("chat.bsky.") {
+        "chat.bsky"
+    } else if nsid.starts_with("blue.catbird.") {
+        "blue.catbird"
+    } else {
+        "other"
     }
 }
 
@@ -262,7 +266,6 @@ mod mls_binding_tests {
 #[cfg(test)]
 mod proxy_metric_tests {
     use super::*;
-    use prometheus::core::Collector;
     use std::collections::BTreeSet;
 
     const ALLOWED_LABELS: [&str; 6] = [
@@ -294,11 +297,12 @@ mod proxy_metric_tests {
     #[test]
     fn proxy_metrics_do_not_retain_raw_third_party_nsid_labels() {
         const ATTACKER_NSID: &str = "evil.example.attackerMethod";
+        let (registry, requests, duration) = fresh_proxy_metrics();
 
-        record_proxy_request(ATTACKER_NSID, 200, 0.01);
+        record_proxy_request_metrics(&requests, &duration, ATTACKER_NSID, 200, 0.01);
 
-        let retained_labels = PROXY_REQUESTS_TOTAL
-            .collect()
+        let retained_labels = registry
+            .gather()
             .into_iter()
             .flat_map(|family| family.get_metric().to_vec())
             .flat_map(|metric| metric.get_label().to_vec())
