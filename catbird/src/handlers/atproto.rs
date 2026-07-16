@@ -782,16 +782,56 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
     })
 }
 
+fn validate_proxy_lexicon(lexicon: &str) -> AppResult<jacquard_common::types::nsid::Nsid<'_>> {
+    let nsid = jacquard_common::types::nsid::Nsid::new(lexicon)
+        .map_err(|_| AppError::BadRequest("Invalid XRPC NSID".into()))?;
+    let authority_is_too_long = lexicon
+        .rsplit_once('.')
+        .is_none_or(|(authority, _)| authority.len() > 253);
+    if nsid.as_str() != lexicon || authority_is_too_long {
+        return Err(AppError::BadRequest("Invalid XRPC NSID".into()));
+    }
+    Ok(nsid)
+}
+
+pub(crate) struct ValidatedProxyLexicon(String);
+
+impl ValidatedProxyLexicon {
+    pub(crate) fn from_raw_route_tail(lexicon: &str) -> AppResult<Self> {
+        if lexicon.as_bytes().contains(&b'%') {
+            return Err(AppError::BadRequest("Invalid XRPC NSID".into()));
+        }
+        validate_proxy_lexicon(lexicon)?;
+        Ok(Self(lexicon.to_owned()))
+    }
+}
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for ValidatedProxyLexicon
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(lexicon) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| AppError::BadRequest("Invalid XRPC NSID".into()))?;
+        Self::from_raw_route_tail(&lexicon)
+    }
+}
+
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
 pub(crate) async fn proxy_xrpc(
+    ValidatedProxyLexicon(lexicon): ValidatedProxyLexicon,
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedProxyContext,
     method: Method,
-    Path(lexicon): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Body,
 ) -> AppResult<Response> {
+    let lexicon = lexicon.as_str();
     let start = std::time::Instant::now();
     let AuthenticatedProxyContext {
         session,
@@ -842,7 +882,7 @@ pub(crate) async fn proxy_xrpc(
 
     // Check if this is an MLS lexicon and direct routing is enabled
     let mls_service = MlsAuthService::new(state.clone());
-    if MlsAuthService::is_mls_lexicon(&lexicon) && mls_service.is_enabled() {
+    if MlsAuthService::is_mls_lexicon(lexicon) && mls_service.is_enabled() {
         let dpop_data = dpop_data.as_ref().ok_or_else(|| {
             AppError::Unauthorized("Authenticated MLS requests require session DPoP".into())
         })?;
@@ -897,7 +937,7 @@ pub(crate) async fn proxy_xrpc(
             None
         };
         let device_id = authoritative_device_id(
-            &lexicon,
+            lexicon,
             begin_input.as_ref().map(|input| input.device_id.as_str()),
             pending.as_ref(),
             bound.as_ref(),
@@ -916,7 +956,7 @@ pub(crate) async fn proxy_xrpc(
                 session_dpop_key: &dpop_data.dpop_key,
                 device_id,
                 method,
-                lexicon: &lexicon,
+                lexicon,
                 query_string: query_string.as_deref(),
                 body: body_option,
                 content_type,
@@ -968,7 +1008,7 @@ pub(crate) async fn proxy_xrpc(
 
         // Record proxy metrics
         let duration = start.elapsed().as_secs_f64();
-        metrics::record_proxy_request(&lexicon, status, duration);
+        metrics::record_proxy_request(lexicon, status, duration);
 
         let mut response = Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
@@ -1015,7 +1055,7 @@ pub(crate) async fn proxy_xrpc(
 
     // Record proxy metrics
     let duration = start.elapsed().as_secs_f64();
-    metrics::record_proxy_request(&lexicon, proxy_response.status(), duration);
+    metrics::record_proxy_request(lexicon, proxy_response.status(), duration);
 
     match proxy_response {
         ProxyResponse::Buffered {
@@ -1054,7 +1094,7 @@ pub(crate) async fn proxy_xrpc(
                     &state,
                     &session,
                     jacquard_dpop.as_ref(),
-                    &lexicon,
+                    lexicon,
                     &body_bytes,
                 )
                 .await
@@ -1087,14 +1127,14 @@ pub(crate) async fn proxy_xrpc(
             headers: resp_headers,
             body: upstream_response,
         } => {
-            if streaming_moderation_disposition(state.push.is_some(), status, &lexicon, &body_bytes)
+            if streaming_moderation_disposition(state.push.is_some(), status, lexicon, &body_bytes)
                 == StreamingModerationDisposition::MirrorBeforeDelivery
             {
                 if let Err(error) = mirror_push_mutation_if_needed(
                     &state,
                     &session,
                     jacquard_dpop.as_ref(),
-                    &lexicon,
+                    lexicon,
                     &body_bytes,
                 )
                 .await
@@ -1134,6 +1174,257 @@ pub(crate) async fn proxy_xrpc(
             let stream = upstream_response.bytes_stream();
             Ok(response.body(Body::from_stream(stream)).unwrap())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_proxy_lexicon, ValidatedProxyLexicon};
+    use axum::{
+        extract::{RawQuery, State},
+        http::{Request, StatusCode},
+        response::{IntoResponse, Response},
+        routing::get,
+        Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tower::ServiceExt;
+
+    type SeenRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    #[derive(Default)]
+    struct SinkSentinels {
+        body: AtomicUsize,
+        metrics: AtomicUsize,
+        mls: AtomicUsize,
+        pds: AtomicUsize,
+        dpop: AtomicUsize,
+        outbound: AtomicUsize,
+    }
+
+    impl SinkSentinels {
+        fn record_handler_entry(&self) {
+            self.body.fetch_add(1, Ordering::SeqCst);
+            self.metrics.fetch_add(1, Ordering::SeqCst);
+            self.mls.fetch_add(1, Ordering::SeqCst);
+            self.pds.fetch_add(1, Ordering::SeqCst);
+            self.dpop.fetch_add(1, Ordering::SeqCst);
+            self.outbound.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn counts(&self) -> [usize; 6] {
+            [
+                self.body.load(Ordering::SeqCst),
+                self.metrics.load(Ordering::SeqCst),
+                self.mls.load(Ordering::SeqCst),
+                self.pds.load(Ordering::SeqCst),
+                self.dpop.load(Ordering::SeqCst),
+                self.outbound.load(Ordering::SeqCst),
+            ]
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DownstreamProbe {
+        sinks: Arc<SinkSentinels>,
+        seen: SeenRequests,
+    }
+
+    async fn wildcard_probe(
+        ValidatedProxyLexicon(lexicon): ValidatedProxyLexicon,
+        State(probe): State<DownstreamProbe>,
+        RawQuery(raw_query): RawQuery,
+    ) -> Response {
+        probe.sinks.record_handler_entry();
+        probe
+            .seen
+            .lock()
+            .unwrap()
+            .push((lexicon.clone(), raw_query));
+        (StatusCode::OK, lexicon).into_response()
+    }
+
+    async fn named_route() -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    fn probe_router(probe: DownstreamProbe) -> Router {
+        Router::new()
+            .route("/xrpc/com.atproto.server.getSession", get(named_route))
+            .route("/xrpc/*lexicon", get(wildcard_probe).post(wildcard_probe))
+            .with_state(probe)
+    }
+
+    fn boundary_nsid(authority_final_label_len: usize, method_len: usize) -> String {
+        let segments = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(authority_final_label_len),
+            format!("e{}", "f".repeat(method_len - 1)),
+        ];
+        segments.join(".")
+    }
+
+    #[test]
+    fn proxy_lexicon_enforces_exact_authority_total_and_method_boundaries() {
+        let valid_317 = boundary_nsid(61, 63);
+        assert_eq!(valid_317.rsplit_once('.').unwrap().0.len(), 253);
+        assert_eq!(valid_317.len(), 317);
+
+        for lexicon in [
+            "app.bsky.feed.getTimeline",
+            "com.atproto.repo.createRecord",
+            "blue.catbird.mls.sendMessage",
+            "com.long-domain.fooBar123",
+            "custom.example.dynamicMethod",
+            valid_317.as_str(),
+        ] {
+            let nsid = validate_proxy_lexicon(lexicon).expect("canonical NSID must be accepted");
+            assert_eq!(nsid.as_str().as_bytes(), lexicon.as_bytes());
+        }
+
+        let invalid_authority_254 = boundary_nsid(62, 62);
+        assert_eq!(invalid_authority_254.rsplit_once('.').unwrap().0.len(), 254);
+        assert_eq!(invalid_authority_254.len(), 317);
+        assert!(validate_proxy_lexicon(&invalid_authority_254).is_err());
+
+        let invalid_method_64 = boundary_nsid(1, 64);
+        assert!(invalid_method_64.rsplit_once('.').unwrap().0.len() <= 253);
+        assert!(invalid_method_64.len() <= 317);
+        assert!(validate_proxy_lexicon(&invalid_method_64).is_err());
+
+        let invalid_318 = boundary_nsid(61, 64);
+        assert_eq!(invalid_318.len(), 318);
+        assert!(validate_proxy_lexicon(&invalid_318).is_err());
+    }
+
+    #[test]
+    fn proxy_lexicon_rejects_noncanonical_and_path_shaped_values() {
+        let oversized_segment = format!("{}.example.method", "a".repeat(64));
+        let invalid = [
+            ".",
+            "..",
+            "/app.bsky.feed.getTimeline",
+            "app.bsky.feed.getTimeline/",
+            "app.bsky//feed.getTimeline",
+            "app.bsky/feed.getTimeline",
+            r"app.bsky\feed.getTimeline",
+            "app.bsky.feed.getTimeline.",
+            ".app.bsky.feed.getTimeline",
+            "app..bsky.feed.getTimeline",
+            "app.bsky.feed.getTimeline?cursor=1",
+            "app.bsky.feed.getTimeline#fragment",
+            "app.bsky.feed.get Timeline",
+            "app.bsky.feed.getTimeline\n",
+            "app.bsky.feed.get\0Timeline",
+            "app_bsky.feed.getTimeline",
+            "-app.bsky.getTimeline",
+            "app-.bsky.getTimeline",
+            "app.-bsky.getTimeline",
+            "app.bsky-.getTimeline",
+            "app.bsky.get-Timeline",
+            "app.bsky.9getTimeline",
+            "app.bsky",
+            "app",
+            "app．bsky.feed.getTimeline",
+            "ａｐｐ.bsky.feed.getTimeline",
+            oversized_segment.as_str(),
+        ];
+
+        for lexicon in invalid {
+            let error = validate_proxy_lexicon(lexicon)
+                .expect_err("noncanonical wildcard value must be rejected");
+            assert!(matches!(error, crate::error::AppError::BadRequest(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn encoded_and_dot_path_probes_fail_before_downstream() {
+        let invalid_paths = [
+            "/xrpc/%2e",
+            "/xrpc/%2e%2e",
+            "/xrpc/.%2e",
+            "/xrpc/%2e.",
+            "/xrpc/app.bsky.%2e.getTimeline",
+            "/xrpc/app.bsky.%2e%2e.getTimeline",
+            "/xrpc/app.bsky.feed%2e%2egetTimeline",
+            "/xrpc/app.bsky.feed%2fgetTimeline",
+            "/xrpc/app.bsky.feed%5cgetTimeline",
+            "/xrpc/app.bsky.feed%00getTimeline",
+            "/xrpc/app.bsky.feed%25getTimeline",
+            "/xrpc/app.bsky.feed%252egetTimeline",
+            "/xrpc/app.bsky.feed%252fgetTimeline",
+            "/xrpc/app.bsky.feed%3fquery",
+            "/xrpc/app.bsky.feed%23fragment",
+            "/xrpc/app.bsky.feed%20getTimeline",
+            "/xrpc/app.bsky.feed%0agetTimeline",
+            "/xrpc/app%E3%80%82bsky.feed.getTimeline",
+            "/xrpc/%EF%BD%81pp.bsky.feed.getTimeline",
+            "/xrpc//app.bsky.feed.getTimeline",
+            "/xrpc/app.bsky.feed.getTimeline/",
+        ];
+
+        for uri in invalid_paths {
+            let probe = DownstreamProbe::default();
+            let response = probe_router(probe.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "URI {uri}");
+            assert_eq!(probe.sinks.counts(), [0; 6], "URI {uri}");
+            assert!(probe.seen.lock().unwrap().is_empty(), "URI {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_axum_wildcard_preserves_exact_nsid_query_and_methods() {
+        for method in ["GET", "POST"] {
+            let probe = DownstreamProbe::default();
+            let response = probe_router(probe.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/xrpc/custom.example.dynamicMethod?feed=a&feed=b")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(probe.sinks.counts(), [1; 6]);
+            assert_eq!(
+                *probe.seen.lock().unwrap(),
+                [(
+                    "custom.example.dynamicMethod".to_string(),
+                    Some("feed=a&feed=b".to_string())
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn named_route_keeps_precedence_over_wildcard() {
+        let probe = DownstreamProbe::default();
+        let response = probe_router(probe.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/xrpc/com.atproto.server.getSession")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(probe.sinks.counts(), [0; 6]);
     }
 }
 
