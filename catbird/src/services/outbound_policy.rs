@@ -4,6 +4,7 @@ use futures_util::{pin_mut, Stream, StreamExt};
 use jacquard_common::http_client::HttpClient;
 use jacquard_common::types::{did::Did, string::Handle};
 use jacquard_identity::resolver::{DidDocResponse, IdentityResolver, ResolverOptions};
+use jacquard_oauth::dpop::DpopOperationContext;
 use reqwest::{header::HeaderMap, Method, Response, Url};
 use std::{
     fmt,
@@ -16,6 +17,7 @@ use std::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECT_HOPS: usize = 3;
+const MAX_OPERATION_ATTEMPTS: usize = 2 * (MAX_REDIRECT_HOPS + 1);
 /// OAuth metadata, identity documents, and post-login profile enrichment are
 /// compact JSON/text documents. One MiB leaves ample room for real DID docs
 /// while preventing discovery endpoints from turning a login into an
@@ -261,14 +263,40 @@ impl OutboundPolicy {
 
 async fn send_bounded_with_io<I: OutboundIo + ?Sized>(
     io: &I,
-    mut method: Method,
+    method: Method,
     input: &str,
     headers: HeaderMap,
-    mut body: Option<bytes::Bytes>,
+    body: Option<bytes::Bytes>,
     budget: Duration,
     redirect_mode: RedirectMode,
 ) -> Result<(Response, tokio::time::Instant), PolicyError> {
     let deadline = tokio::time::Instant::now() + budget;
+    send_bounded_until_with_io(
+        io,
+        method,
+        input,
+        headers,
+        body,
+        deadline,
+        redirect_mode,
+        None,
+        MAX_REDIRECT_HOPS + 1,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_bounded_until_with_io<I: OutboundIo + ?Sized>(
+    io: &I,
+    mut method: Method,
+    input: &str,
+    headers: HeaderMap,
+    mut body: Option<bytes::Bytes>,
+    deadline: tokio::time::Instant,
+    redirect_mode: RedirectMode,
+    operation: Option<&DpopOperationContext>,
+    max_operation_attempts: usize,
+) -> Result<(Response, tokio::time::Instant), PolicyError> {
     let original = ValidatedUrl::parse(input)?;
     let mut current = original.url.clone();
     for hop in 0..=MAX_REDIRECT_HOPS {
@@ -276,6 +304,12 @@ async fn send_bounded_with_io<I: OutboundIo + ?Sized>(
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .ok_or_else(|| PolicyError("outbound request deadline exceeded".into()))?;
+        if operation.is_some_and(|operation| !operation.try_record_attempt(max_operation_attempts))
+        {
+            return Err(PolicyError(
+                "outbound operation attempt limit exceeded".into(),
+            ));
+        }
         let response = io
             .send_once(
                 method.clone(),
@@ -401,23 +435,59 @@ async fn send_http_with_io<I: OutboundIo + ?Sized>(
     io: &I,
     request: http::Request<Vec<u8>>,
 ) -> Result<http::Response<Vec<u8>>, PolicyError> {
+    send_http_with_io_limits(
+        io,
+        request,
+        REQUEST_TIMEOUT,
+        DISCOVERY_RESPONSE_LIMIT,
+        MAX_OPERATION_ATTEMPTS,
+    )
+    .await
+}
+
+async fn send_http_with_io_limits<I: OutboundIo + ?Sized>(
+    io: &I,
+    request: http::Request<Vec<u8>>,
+    timeout: Duration,
+    max_response_bytes: usize,
+    max_operation_attempts: usize,
+) -> Result<http::Response<Vec<u8>>, PolicyError> {
     let (mut parts, body) = request.into_parts();
+    let operation = parts
+        .extensions
+        .remove::<DpopOperationContext>()
+        .unwrap_or_default();
+    let deadline = operation
+        .started_at()
+        .checked_add(timeout)
+        .map(tokio::time::Instant::from_std)
+        .ok_or_else(|| PolicyError("outbound request deadline is invalid".into()))?;
     let redirect_mode = take_redirect_mode(&mut parts.headers);
     let method = Method::from_bytes(parts.method.as_str().as_bytes())
         .map_err(|e| PolicyError(format!("invalid method: {e}")))?;
-    let (response, deadline) = send_bounded_with_io(
+    let (response, deadline) = send_bounded_until_with_io(
         io,
         method,
         &parts.uri.to_string(),
         parts.headers,
         Some(body.into()),
-        REQUEST_TIMEOUT,
+        deadline,
         redirect_mode,
+        Some(&operation),
+        max_operation_attempts,
     )
     .await?;
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = read_response_bounded(response, DISCOVERY_RESPONSE_LIMIT, deadline).await?;
+    let remaining_bytes = operation
+        .remaining_response_bytes(max_response_bytes)
+        .ok_or_else(|| PolicyError("response byte limit exceeded".into()))?;
+    let bytes = read_response_bounded(response, remaining_bytes, deadline).await?;
+    if !operation.try_record_response_bytes(bytes.len(), max_response_bytes) {
+        return Err(PolicyError(format!(
+            "response byte limit exceeded ({max_response_bytes} bytes)"
+        )));
+    }
     let mut builder = http::Response::builder().status(status);
     *builder.headers_mut().expect("response builder headers") = headers;
     builder
@@ -544,6 +614,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures_util::stream;
+    use jacquard_common::http_client::HttpClient;
+    use jacquard_oauth::{dpop::wrap_request_with_dpop, session::DpopReqData};
     use reqwest::StatusCode;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -560,6 +632,110 @@ mod tests {
     struct CaptureIo {
         redirect_status: StatusCode,
         dispatches: Arc<Mutex<Vec<CapturedDispatch>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct DpopRetryIo {
+        dispatches: Arc<Mutex<usize>>,
+        delay: Duration,
+    }
+
+    impl DpopRetryIo {
+        fn response(status: StatusCode, nonce: Option<&str>, body: Vec<u8>) -> Response {
+            let mut builder = http::Response::builder().status(status);
+            if let Some(nonce) = nonce {
+                builder = builder.header("DPoP-Nonce", nonce);
+            }
+            builder
+                .body(reqwest::Body::from(body))
+                .expect("test response")
+                .into()
+        }
+    }
+
+    impl OutboundIo for DpopRetryIo {
+        fn validate_before<'a>(
+            &'a self,
+            input: &'a str,
+            _deadline: tokio::time::Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<ValidatedUrl, PolicyError>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(ValidatedUrl {
+                    url: Url::parse(input).expect("test URL"),
+                    addresses: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                })
+            })
+        }
+
+        fn send_once<'a>(
+            &'a self,
+            _method: Method,
+            _target: &'a ValidatedUrl,
+            _headers: HeaderMap,
+            _body: Option<Bytes>,
+            remaining: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<Response, PolicyError>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.delay > remaining {
+                    tokio::time::sleep(remaining).await;
+                    return Err(PolicyError("outbound request deadline exceeded".into()));
+                }
+                tokio::time::sleep(self.delay).await;
+                let dispatch = {
+                    let mut dispatches = self.dispatches.lock().expect("dispatch lock");
+                    *dispatches += 1;
+                    *dispatches
+                };
+                let mut body = if dispatch == 1 {
+                    br#"{"error":"use_dpop_nonce"}"#.to_vec()
+                } else {
+                    Vec::new()
+                };
+                body.resize(600 * 1024, b' ');
+                Ok(if dispatch == 1 {
+                    Self::response(StatusCode::BAD_REQUEST, Some("retry-nonce"), body)
+                } else {
+                    Self::response(StatusCode::OK, None, body)
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct DpopPolicyClient {
+        io: DpopRetryIo,
+        timeout: Duration,
+        max_response_bytes: usize,
+        max_operation_attempts: usize,
+    }
+
+    impl Default for DpopPolicyClient {
+        fn default() -> Self {
+            Self {
+                io: DpopRetryIo::default(),
+                timeout: REQUEST_TIMEOUT,
+                max_response_bytes: DISCOVERY_RESPONSE_LIMIT,
+                max_operation_attempts: MAX_OPERATION_ATTEMPTS,
+            }
+        }
+    }
+
+    impl HttpClient for DpopPolicyClient {
+        type Error = PolicyError;
+
+        async fn send_http(
+            &self,
+            request: http::Request<Vec<u8>>,
+        ) -> Result<http::Response<Vec<u8>>, Self::Error> {
+            send_http_with_io_limits(
+                &self.io,
+                request,
+                self.timeout,
+                self.max_response_bytes,
+                self.max_operation_attempts,
+            )
+            .await
+        }
     }
 
     impl CaptureIo {
@@ -907,6 +1083,88 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("response byte limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn dpop_nonce_retry_shares_one_cumulative_response_budget() {
+        let client = DpopPolicyClient::default();
+        let secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let mut dpop = DpopReqData {
+            dpop_key: jose_jwk::Key::from(&jose_jwk::crypto::Key::from(secret)),
+            dpop_authserver_nonce: None,
+        };
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://issuer.example/token")
+            .body(Vec::new())
+            .unwrap();
+
+        let error = wrap_request_with_dpop(&client, &mut dpop, true, request)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Content-Length")
+                || error.to_string().contains("response byte limit exceeded"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(*client.io.dispatches.lock().expect("dispatch lock"), 2);
+    }
+
+    #[tokio::test]
+    async fn dpop_nonce_retry_shares_one_absolute_deadline() {
+        let client = DpopPolicyClient {
+            io: DpopRetryIo {
+                dispatches: Arc::new(Mutex::new(0)),
+                delay: Duration::from_millis(120),
+            },
+            timeout: Duration::from_millis(200),
+            max_response_bytes: 2 * DISCOVERY_RESPONSE_LIMIT,
+            max_operation_attempts: MAX_OPERATION_ATTEMPTS,
+        };
+        let secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let mut dpop = DpopReqData {
+            dpop_key: jose_jwk::Key::from(&jose_jwk::crypto::Key::from(secret)),
+            dpop_authserver_nonce: None,
+        };
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://issuer.example/token")
+            .body(Vec::new())
+            .unwrap();
+
+        let error = wrap_request_with_dpop(&client, &mut dpop, true, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(*client.io.dispatches.lock().expect("dispatch lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn dpop_nonce_retry_counts_against_one_attempt_limit() {
+        let client = DpopPolicyClient {
+            max_response_bytes: 2 * DISCOVERY_RESPONSE_LIMIT,
+            max_operation_attempts: 1,
+            ..DpopPolicyClient::default()
+        };
+        let secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let mut dpop = DpopReqData {
+            dpop_key: jose_jwk::Key::from(&jose_jwk::crypto::Key::from(secret)),
+            dpop_authserver_nonce: None,
+        };
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://issuer.example/token")
+            .body(Vec::new())
+            .unwrap();
+
+        let error = wrap_request_with_dpop(&client, &mut dpop, true, request)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("attempt limit exceeded"));
+        assert_eq!(*client.io.dispatches.lock().expect("dispatch lock"), 1);
     }
 
     #[tokio::test]

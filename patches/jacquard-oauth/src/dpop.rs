@@ -1,4 +1,11 @@
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -21,6 +28,67 @@ use crate::{
 };
 
 pub const JWT_HEADER_TYP_DPOP: &str = "dpop+jwt";
+
+/// Shared transport accounting for one DPoP operation, including its nonce
+/// retry. The context lives in request extensions, so it is never serialized
+/// onto the wire.
+#[derive(Clone, Debug)]
+pub struct DpopOperationContext(Arc<DpopOperationState>);
+
+#[derive(Debug)]
+struct DpopOperationState {
+    started_at: Instant,
+    attempts: AtomicUsize,
+    response_bytes: AtomicUsize,
+}
+
+impl Default for DpopOperationContext {
+    fn default() -> Self {
+        Self(Arc::new(DpopOperationState {
+            started_at: Instant::now(),
+            attempts: AtomicUsize::new(0),
+            response_bytes: AtomicUsize::new(0),
+        }))
+    }
+}
+
+impl DpopOperationContext {
+    pub fn started_at(&self) -> Instant {
+        self.0.started_at
+    }
+
+    pub fn attempts(&self) -> usize {
+        self.0.attempts.load(Ordering::Acquire)
+    }
+
+    pub fn response_bytes(&self) -> usize {
+        self.0.response_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn try_record_attempt(&self, max_attempts: usize) -> bool {
+        self.0
+            .attempts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |attempts| {
+                (attempts < max_attempts).then_some(attempts + 1)
+            })
+            .is_ok()
+    }
+
+    pub fn remaining_response_bytes(&self, max_bytes: usize) -> Option<usize> {
+        max_bytes.checked_sub(self.response_bytes())
+    }
+
+    pub fn try_record_response_bytes(&self, bytes: usize, max_bytes: usize) -> bool {
+        self.0
+            .response_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |consumed| {
+                consumed
+                    .checked_add(bytes)
+                    .filter(|total| *total <= max_bytes)
+            })
+            .is_ok()
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct ErrorResponse {
@@ -199,6 +267,9 @@ where
     T: HttpClient,
     N: DpopDataSource,
 {
+    request
+        .extensions_mut()
+        .insert(DpopOperationContext::default());
     let uri = request.uri().clone();
     let method = request.method().to_cowstr().into_static();
     let uri = uri.to_cowstr();
@@ -256,6 +327,10 @@ where
     N: DpopDataSource,
 {
     use jacquard_common::xrpc::StreamingResponse;
+
+    request
+        .extensions_mut()
+        .insert(DpopOperationContext::default());
 
     let uri = request.uri().clone();
     let method = request.method().to_cowstr().into_static();
@@ -320,6 +395,8 @@ where
     N: DpopDataSource,
 {
     use jacquard_common::xrpc::StreamingResponse;
+
+    parts.extensions.insert(DpopOperationContext::default());
 
     let uri = parts.uri.clone();
     let method = parts.method.to_cowstr().into_static();
