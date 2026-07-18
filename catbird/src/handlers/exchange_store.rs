@@ -108,6 +108,16 @@ fn exchange_key_for(prefix: &str, keyring: &Keyring, code: &str) -> String {
     )
 }
 
+fn compare_and_delete_script() -> redis::Script {
+    redis::Script::new(
+        r#"
+        local current = redis.call('GET', KEYS[1])
+        if not current or current ~= ARGV[1] then return 0 end
+        return redis.call('DEL', KEYS[1])
+        "#,
+    )
+}
+
 impl ExchangeStore {
     pub async fn store_init(
         &self,
@@ -170,15 +180,20 @@ impl ExchangeStore {
         origin: &str,
     ) -> Result<String, ExchangeError> {
         let origin = normalize_origin(origin)?;
-        let record: ExchangeRecord = self
-            .take_encrypted(&self.exchange_key(code), "oauth-exchange")
+        let key = self.exchange_key(code);
+        let (record, envelope): (ExchangeRecord, String) = self
+            .read_encrypted(&key, "oauth-exchange")
             .await
             .map_err(|error| match error {
                 ExchangeError::Missing => ExchangeError::Unauthorized,
                 other => other,
             })?;
         record.validate(nonce, &origin, chrono::Utc::now().timestamp())?;
-        Ok(record.session_id)
+        if self.consume_if_unchanged(&key, &envelope).await? {
+            Ok(record.session_id)
+        } else {
+            Err(ExchangeError::Unauthorized)
+        }
     }
 
     async fn store_encrypted<T: Serialize>(
@@ -221,6 +236,41 @@ impl ExchangeStore {
             .open(&RecordContext::new(kind, key), &envelope)
             .map_err(|_| ExchangeError::Unauthorized)?;
         serde_json::from_slice(&plaintext).map_err(|_| ExchangeError::Unauthorized)
+    }
+
+    async fn read_encrypted<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+        kind: &str,
+    ) -> Result<(T, String), ExchangeError> {
+        let mut connection = self.redis.clone();
+        let envelope: Option<String> = redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|_| ExchangeError::Unavailable)?;
+        let envelope = envelope.ok_or(ExchangeError::Missing)?;
+        let plaintext = self
+            .keyring
+            .open(&RecordContext::new(kind, key), &envelope)
+            .map_err(|_| ExchangeError::Unauthorized)?;
+        let record = serde_json::from_slice(&plaintext).map_err(|_| ExchangeError::Unauthorized)?;
+        Ok((record, envelope))
+    }
+
+    async fn consume_if_unchanged(
+        &self,
+        key: &str,
+        expected_envelope: &str,
+    ) -> Result<bool, ExchangeError> {
+        let mut connection = self.redis.clone();
+        let deleted: i64 = compare_and_delete_script()
+            .key(key)
+            .arg(expected_envelope)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|_| ExchangeError::Unavailable)?;
+        Ok(deleted == 1)
     }
 }
 
@@ -464,9 +514,65 @@ mod tests {
             .await
             .unwrap();
         assert!((1..=60).contains(&ttl));
+        assert_eq!(
+            store
+                .redeem(&code, "wrong-browser-secret", "https://catmos.catbird.blue")
+                .await,
+            Err(ExchangeError::Unauthorized)
+        );
+        assert!(store
+            .redeem(&code, "browser-secret", "https://catmos.catbird.blue")
+            .await
+            .is_ok());
+        assert_eq!(
+            store
+                .redeem(&code, "browser-secret", "https://catmos.catbird.blue")
+                .await,
+            Err(ExchangeError::Unauthorized)
+        );
+
+        let origin_bound = store
+            .issue(
+                "origin-bound-session",
+                ExchangeInit {
+                    nonce_hash: nonce_hash("browser-secret"),
+                    redirect_origin: "https://catbird.blue".into(),
+                    redirect_target: Some("https://catbird.blue/oauth/callback".into()),
+                    client_selector: "default".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .redeem(
+                    &origin_bound,
+                    "browser-secret",
+                    "https://catmos.catbird.blue"
+                )
+                .await,
+            Err(ExchangeError::Unauthorized)
+        );
+        assert!(store
+            .redeem(&origin_bound, "browser-secret", "https://catbird.blue")
+            .await
+            .is_ok());
+
+        let concurrent = store
+            .issue(
+                "concurrent-session",
+                ExchangeInit {
+                    nonce_hash: nonce_hash("browser-secret"),
+                    redirect_origin: "https://catmos.catbird.blue".into(),
+                    redirect_target: Some("https://catmos.catbird.blue/callback".into()),
+                    client_selector: "catmos".into(),
+                },
+            )
+            .await
+            .unwrap();
         let (first, second) = tokio::join!(
-            store.redeem(&code, "browser-secret", "https://catmos.catbird.blue"),
-            store.redeem(&code, "browser-secret", "https://catmos.catbird.blue")
+            store.redeem(&concurrent, "browser-secret", "https://catmos.catbird.blue"),
+            store.redeem(&concurrent, "browser-secret", "https://catmos.catbird.blue")
         );
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
 

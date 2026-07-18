@@ -1,4 +1,5 @@
 catbird/target/
 patches/jacquard-oauth/target/
+patches/jacquard-identity/target/
 .claude/
 .DS_Store

@@ -163,12 +163,26 @@ fn record_mls_binding_error(error: AppError) -> AppError {
     error
 }
 
+fn require_mls_device_id(device_id: Option<&str>) -> AppResult<&str> {
+    device_id
+        .ok_or_else(|| AppError::Unauthorized("MLS device binding required".into()))
+        .map_err(record_mls_binding_error)
+}
+
 fn require_browser_nonce(nonce: Option<&str>) -> AppResult<&str> {
     let nonce = nonce.ok_or_else(|| AppError::BadRequest("Browser nonce required".into()))?;
     if !(16..=256).contains(&nonce.len()) {
         return Err(AppError::BadRequest("Invalid browser nonce".into()));
     }
     Ok(nonce)
+}
+
+fn authorization_redirect(location: &str) -> AppResult<Response> {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header("Location", location)
+        .body(Body::empty())
+        .map_err(|_| AppError::OAuth("Authorization server returned an invalid redirect".into()))
 }
 
 /// Handle login initiation (Redirect flow)
@@ -217,13 +231,14 @@ pub async fn login(
 
     use jacquard_oauth::types::AuthorizeOptions;
 
-    // Generate a clean UUID for the OAuth state (= Jacquard session_id).
-    let session_nonce = uuid::Uuid::new_v4().to_string();
+    // Generate single-use OAuth correlation state. The completed session gets a
+    // separate opaque credential after provider-controlled data is validated.
+    let oauth_state = uuid::Uuid::new_v4().to_string();
     let store = exchange_store(&state)?;
 
     store
         .store_init(
-            &session_nonce,
+            &oauth_state,
             browser_nonce,
             redirect_to.as_deref(),
             client_selector,
@@ -237,7 +252,7 @@ pub async fn login(
         })?;
 
     let options = AuthorizeOptions {
-        state: Some(session_nonce.into()),
+        state: Some(oauth_state.into()),
         ..Default::default()
     };
 
@@ -246,12 +261,9 @@ pub async fn login(
         .await
         .map_err(|e| AppError::OAuth(format!("Authorization failed: {}", e)))?;
 
-    // Redirect to the PDS authorization URL
-    Ok(Response::builder()
-        .status(StatusCode::FOUND)
-        .header("Location", auth_url.as_str())
-        .body(Body::empty())
-        .unwrap())
+    // Redirect to the PDS authorization URL without reflecting invalid header
+    // bytes or provider-controlled details in an error.
+    authorization_redirect(auth_url.as_str())
 }
 
 /// Handle OAuth callback
@@ -335,7 +347,7 @@ pub async fn oauth_callback(
         .map_err(|e| AppError::OAuth(format!("Callback failed: {}", e)))?;
 
     // Jacquard stores the session in RedisAuthStore automatically.
-    // Extract the session_id (now a clean UUID) and DID from the session data.
+    // Extract the independent opaque session credential and DID.
     let session_data = oauth_session.data.read().await;
     let did = session_data.account_did.as_str().to_string();
     let session_id = session_data.session_id.to_string();
@@ -539,21 +551,39 @@ impl LogoutOutcome {
     }
 }
 
-async fn ordered_logout<Delete, DeleteFuture, Revoke, RevokeFuture>(
+async fn ordered_logout<Delete, DeleteFuture, FencePush, FencePushFuture, Revoke, RevokeFuture>(
     delete_bindings: Delete,
+    fence_push: FencePush,
     revoke: Revoke,
 ) -> LogoutOutcome
 where
     Delete: FnOnce() -> DeleteFuture,
     DeleteFuture: std::future::Future<Output = AppResult<()>>,
+    FencePush: FnOnce() -> FencePushFuture,
+    FencePushFuture: std::future::Future<Output = AppResult<()>>,
     Revoke: FnOnce() -> RevokeFuture,
     RevokeFuture: std::future::Future<Output = AppResult<()>>,
 {
     // MLS bindings are a local authorization grant. Remove that privilege
-    // before attempting remote token revocation; if revocation is transiently
-    // unavailable, retaining the browser cookie permits retry without leaving
-    // stale MLS authority active.
+    // before attempting any fallible logout work. Push delivery must then be
+    // fenced durably before remote token revocation: if the local fence cannot
+    // be stored, retaining the still-valid browser cookie permits a retry and
+    // avoids reporting a logout that can continue delivering queued pushes.
     let delete_result = delete_bindings().await;
+    if let Err(fence_error) = fence_push().await {
+        let result = if delete_result.is_err() {
+            Err(AppError::AuthTemporarilyUnavailable(
+                "Logout could not fence push delivery or clear MLS device bindings".into(),
+            ))
+        } else {
+            Err(fence_error)
+        };
+        return LogoutOutcome {
+            result,
+            clear_cookie: false,
+        };
+    }
+
     let revoke_result = revoke().await;
     let clear_cookie = revoke_result.is_ok();
     let result = match (delete_result, revoke_result) {
@@ -619,6 +649,19 @@ pub(crate) async fn logout(
                         .map_err(record_mls_binding_error)
                 },
                 || async {
+                    let Some(push) = state.push.as_ref() else {
+                        return Ok(());
+                    };
+                    push.registry
+                        .mark_auth_revoked(&session.did, &session.id.to_string())
+                        .await
+                        .map_err(|_| {
+                            AppError::AuthTemporarilyUnavailable(
+                                "Logout could not fence push delivery".into(),
+                            )
+                        })
+                },
+                || async {
                     jacquard_client
                         .revoke(&did, authenticated_session_id.as_str())
                         .await
@@ -647,14 +690,19 @@ mod logout_tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
-    async fn local_binding_cleanup_finishes_before_upstream_revoke_starts() {
+    async fn local_fences_finish_before_upstream_revoke_starts() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let revoke_events = events.clone();
+        let push_events = events.clone();
         let delete_events = events.clone();
 
         let outcome = ordered_logout(
             move || async move {
                 delete_events.lock().unwrap().push("delete");
+                Ok(())
+            },
+            move || async move {
+                push_events.lock().unwrap().push("push");
                 Ok(())
             },
             move || async move {
@@ -666,7 +714,56 @@ mod logout_tests {
         outcome.result.unwrap();
         assert!(outcome.clear_cookie);
 
-        assert_eq!(*events.lock().unwrap(), ["delete", "revoke"]);
+        assert_eq!(*events.lock().unwrap(), ["delete", "push", "revoke"]);
+    }
+
+    #[tokio::test]
+    async fn push_fence_failure_stops_upstream_revoke_and_keeps_logout_retryable() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let delete_events = events.clone();
+        let push_events = events.clone();
+        let revoke_events = events.clone();
+
+        let outcome = ordered_logout(
+            move || async move {
+                delete_events.lock().unwrap().push("delete");
+                Ok(())
+            },
+            move || async move {
+                push_events.lock().unwrap().push("push");
+                Err(AppError::AuthTemporarilyUnavailable(
+                    "push database unavailable".into(),
+                ))
+            },
+            move || async move {
+                revoke_events.lock().unwrap().push("revoke");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(*events.lock().unwrap(), ["delete", "push"]);
+        assert!(matches!(
+            &outcome.result,
+            Err(AppError::AuthTemporarilyUnavailable(message))
+                if message.contains("push database unavailable")
+        ));
+        assert!(!outcome.clear_cookie);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("cookie", "catbird_session=browser-session".parse().unwrap());
+        let response = finish_logout(CookieJar::from_headers(&request_headers), outcome);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .all(|value| !value
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("catbird_session="))),
+            "a failed push fence must retain the browser cookie for retry"
+        );
     }
 
     #[tokio::test]
@@ -678,6 +775,7 @@ mod logout_tests {
                 *privilege_observer.lock().unwrap() = false;
                 Ok(())
             },
+            || async { Ok(()) },
             || async {
                 Err(AppError::AuthTemporarilyUnavailable(
                     "upstream unavailable".into(),
@@ -711,11 +809,16 @@ mod logout_tests {
     async fn combined_logout_failure_is_503_and_preserves_browser_cookie() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let revoke_events = events.clone();
+        let push_events = events.clone();
         let delete_events = events.clone();
         let outcome = ordered_logout(
             move || async move {
                 delete_events.lock().unwrap().push("delete");
                 Err(AppError::Internal("binding cleanup unavailable".into()))
+            },
+            move || async move {
+                push_events.lock().unwrap().push("push");
+                Ok(())
             },
             move || async move {
                 revoke_events.lock().unwrap().push("revoke");
@@ -726,7 +829,7 @@ mod logout_tests {
         )
         .await;
 
-        assert_eq!(*events.lock().unwrap(), ["delete", "revoke"]);
+        assert_eq!(*events.lock().unwrap(), ["delete", "push", "revoke"]);
         assert!(matches!(
             &outcome.result,
             Err(AppError::AuthTemporarilyUnavailable(message))
@@ -752,6 +855,7 @@ mod logout_tests {
     async fn completed_revocation_expires_cookie_even_if_binding_cleanup_reports_failure() {
         let outcome = ordered_logout(
             || async { Err(AppError::Internal("binding cleanup unavailable".into())) },
+            || async { Ok(()) },
             || async { Ok(()) },
         )
         .await;
@@ -936,12 +1040,12 @@ pub(crate) async fn proxy_xrpc(
         } else {
             None
         };
-        let device_id = authoritative_device_id(
+        let device_id = require_mls_device_id(authoritative_device_id(
             lexicon,
             begin_input.as_ref().map(|input| input.device_id.as_str()),
             pending.as_ref(),
             bound.as_ref(),
-        );
+        ))?;
 
         tracing::debug!(
             request_id = %request_id,
@@ -954,7 +1058,7 @@ pub(crate) async fn proxy_xrpc(
             .proxy_request(MlsProxyRequest {
                 session: &session,
                 session_dpop_key: &dpop_data.dpop_key,
-                device_id,
+                device_id: Some(device_id),
                 method,
                 lexicon,
                 query_string: query_string.as_deref(),
@@ -1706,9 +1810,10 @@ async fn mirror_push_mutation_if_needed(
 #[cfg(test)]
 mod redirect_tests {
     use super::{
-        exchange_success_redirect, is_allowed_redirect, parse_exchange_request,
-        redirect_with_query, require_browser_nonce,
+        authorization_redirect, exchange_success_redirect, is_allowed_redirect,
+        parse_exchange_request, redirect_with_query, require_browser_nonce, require_mls_device_id,
     };
+    use crate::error::AppError;
 
     #[test]
     fn login_requires_a_valid_browser_nonce_without_legacy_bypass() {
@@ -1725,6 +1830,37 @@ mod redirect_tests {
         assert_eq!(
             require_browser_nonce(Some("0123456789abcdef")).unwrap(),
             "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn authorization_location_is_fallible_and_sanitized() {
+        let response = authorization_redirect("https://issuer.example/authorize").unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "https://issuer.example/authorize"
+        );
+
+        let error =
+            authorization_redirect("https://issuer.example/authorize\ninvalid").unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::OAuth(message)
+                if message == "Authorization server returned an invalid redirect"
+        ));
+    }
+
+    #[test]
+    fn ordinary_mls_routing_rejects_missing_authoritative_device_binding() {
+        let error = require_mls_device_id(None).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Unauthorized(message) if message == "MLS device binding required"
+        ));
+        assert_eq!(
+            require_mls_device_id(Some("123e4567-e89b-12d3-a456-426614174000")).unwrap(),
+            "123e4567-e89b-12d3-a456-426614174000"
         );
     }
 

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use reqwest::Method;
 use serde_json::Value;
-use sqlx::{Pool, Postgres, Row};
+use sqlx::{Pool, Postgres, Row, Transaction};
 use std::{collections::HashSet, future::Future, sync::Arc, time::Duration as StdDuration};
 use time::{Duration, OffsetDateTime};
 
@@ -24,6 +24,18 @@ struct ListSubscription {
     uri: String,
     purpose: String,
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModerationSnapshotKind {
+    Actor,
+    List,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotApplyOutcome {
+    Applied,
+    Superseded,
 }
 
 const MODERATION_SYNC_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -313,6 +325,7 @@ where
     Err(anyhow!("moderation pagination page limit exceeded"))
 }
 
+#[cfg(test)]
 async fn replace_after_complete_snapshot<Snapshot, Load, Replace, ReplaceFuture>(
     load: Load,
     replace: Replace,
@@ -334,6 +347,193 @@ impl ModerationCache {
         Self {
             db_pool,
             sync_interval: Duration::seconds(sync_interval_seconds as i64),
+        }
+    }
+
+    async fn lock_moderation_did(tx: &mut Transaction<'_, Postgres>, user_did: &str) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(user_did)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn bump_snapshot_generation_locked(
+        tx: &mut Transaction<'_, Postgres>,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+    ) -> Result<i64> {
+        let generation = match kind {
+            ModerationSnapshotKind::Actor => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    INSERT INTO moderation_snapshot_generations (
+                        user_did,
+                        actor_generation,
+                        list_generation,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES ($1, 1, 0, NOW(), NOW())
+                    ON CONFLICT (user_did)
+                    DO UPDATE SET
+                        actor_generation = moderation_snapshot_generations.actor_generation + 1,
+                        updated_at = NOW()
+                    RETURNING actor_generation
+                    "#,
+                )
+                .bind(user_did)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+            ModerationSnapshotKind::List => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    INSERT INTO moderation_snapshot_generations (
+                        user_did,
+                        actor_generation,
+                        list_generation,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES ($1, 0, 1, NOW(), NOW())
+                    ON CONFLICT (user_did)
+                    DO UPDATE SET
+                        list_generation = moderation_snapshot_generations.list_generation + 1,
+                        updated_at = NOW()
+                    RETURNING list_generation
+                    "#,
+                )
+                .bind(user_did)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+        };
+        Ok(generation)
+    }
+
+    async fn current_snapshot_generation_locked(
+        tx: &mut Transaction<'_, Postgres>,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+    ) -> Result<Option<i64>> {
+        let generation = match kind {
+            ModerationSnapshotKind::Actor => sqlx::query_scalar::<_, i64>(
+                "SELECT actor_generation FROM moderation_snapshot_generations WHERE user_did = $1",
+            )
+            .bind(user_did)
+            .fetch_optional(&mut **tx)
+            .await?,
+            ModerationSnapshotKind::List => sqlx::query_scalar::<_, i64>(
+                "SELECT list_generation FROM moderation_snapshot_generations WHERE user_did = $1",
+            )
+            .bind(user_did)
+            .fetch_optional(&mut **tx)
+            .await?,
+        };
+        Ok(generation)
+    }
+
+    async fn set_snapshot_freshness_locked(
+        tx: &mut Transaction<'_, Postgres>,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+        fresh: bool,
+    ) -> Result<()> {
+        match (kind, fresh) {
+            (ModerationSnapshotKind::Actor, true) => {
+                sqlx::query(
+                    "UPDATE push_accounts SET last_actor_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
+                )
+                .bind(user_did)
+                .execute(&mut **tx)
+                .await?;
+            }
+            (ModerationSnapshotKind::Actor, false) => {
+                sqlx::query(
+                    "UPDATE push_accounts SET last_actor_sync_at = NULL, updated_at = NOW() WHERE account_did = $1",
+                )
+                .bind(user_did)
+                .execute(&mut **tx)
+                .await?;
+            }
+            (ModerationSnapshotKind::List, true) => {
+                sqlx::query(
+                    "UPDATE push_accounts SET last_list_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
+                )
+                .bind(user_did)
+                .execute(&mut **tx)
+                .await?;
+            }
+            (ModerationSnapshotKind::List, false) => {
+                sqlx::query(
+                    "UPDATE push_accounts SET last_list_sync_at = NULL, updated_at = NOW() WHERE account_did = $1",
+                )
+                .bind(user_did)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn allocate_snapshot_generation(
+        &self,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+    ) -> Result<i64> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        let generation = Self::bump_snapshot_generation_locked(&mut tx, user_did, kind).await?;
+        // A started refresh is not fresh. Clearing the timestamp before any
+        // network await also makes cancellation and fetch failure fail closed.
+        Self::set_snapshot_freshness_locked(&mut tx, user_did, kind, false).await?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
+    async fn invalidate_snapshot_freshness_if_current(
+        &self,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+        generation: i64,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        if Self::current_snapshot_generation_locked(&mut tx, user_did, kind).await?
+            == Some(generation)
+        {
+            Self::set_snapshot_freshness_locked(&mut tx, user_did, kind, false).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn fail_snapshot<T>(
+        &self,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+        generation: i64,
+        error: anyhow::Error,
+    ) -> Result<T> {
+        self.invalidate_snapshot_freshness_if_current(user_did, kind, generation)
+            .await?;
+        Err(error)
+    }
+
+    async fn finish_snapshot_apply(
+        &self,
+        user_did: &str,
+        kind: ModerationSnapshotKind,
+        generation: i64,
+        result: Result<SnapshotApplyOutcome>,
+    ) -> Result<()> {
+        match result {
+            Ok(SnapshotApplyOutcome::Applied) => Ok(()),
+            Ok(SnapshotApplyOutcome::Superseded) => Err(anyhow!(
+                "moderation snapshot generation {generation} was superseded before apply"
+            )),
+            Err(error) => self.fail_snapshot(user_did, kind, generation, error).await,
         }
     }
 
@@ -410,22 +610,10 @@ impl ModerationCache {
         if actor_stale {
             self.sync_actor_relationships(state, &session, &dpop)
                 .await?;
-            sqlx::query(
-                "UPDATE push_accounts SET last_actor_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-            )
-            .bind(user_did)
-            .execute(&self.db_pool)
-            .await?;
         }
 
         if list_stale {
             self.sync_list_relationships(state, &session, &dpop).await?;
-            sqlx::query(
-                "UPDATE push_accounts SET last_list_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-            )
-            .bind(user_did)
-            .execute(&self.db_pool)
-            .await?;
         }
 
         Ok(())
@@ -437,14 +625,7 @@ impl ModerationCache {
         session: &CatbirdSession,
         dpop: &JacquardDpopData,
     ) -> Result<()> {
-        self.sync_actor_relationships(state, session, dpop).await?;
-        sqlx::query(
-            "UPDATE push_accounts SET last_actor_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-        )
-        .bind(&session.did)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
+        self.sync_actor_relationships(state, session, dpop).await
     }
 
     pub async fn refresh_list_relationships_for_session(
@@ -453,17 +634,14 @@ impl ModerationCache {
         session: &CatbirdSession,
         dpop: &JacquardDpopData,
     ) -> Result<()> {
-        self.sync_list_relationships(state, session, dpop).await?;
-        sqlx::query(
-            "UPDATE push_accounts SET last_list_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-        )
-        .bind(&session.did)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
+        self.sync_list_relationships(state, session, dpop).await
     }
 
     pub async fn upsert_actor_mute(&self, user_did: &str, muted_did: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        Self::bump_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::Actor)
+            .await?;
         sqlx::query(
             r#"
             INSERT INTO user_mutes (user_did, muted_did)
@@ -473,21 +651,45 @@ impl ModerationCache {
         )
         .bind(user_did)
         .bind(muted_did)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        Self::set_snapshot_freshness_locked(
+            &mut tx,
+            user_did,
+            ModerationSnapshotKind::Actor,
+            false,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn remove_actor_mute(&self, user_did: &str, muted_did: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        Self::bump_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::Actor)
+            .await?;
         sqlx::query("DELETE FROM user_mutes WHERE user_did = $1 AND muted_did = $2")
             .bind(user_did)
             .bind(muted_did)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await?;
+        Self::set_snapshot_freshness_locked(
+            &mut tx,
+            user_did,
+            ModerationSnapshotKind::Actor,
+            false,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn upsert_actor_block(&self, user_did: &str, blocked_did: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        Self::bump_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::Actor)
+            .await?;
         sqlx::query(
             r#"
             INSERT INTO user_blocks (user_did, blocked_did)
@@ -497,17 +699,37 @@ impl ModerationCache {
         )
         .bind(user_did)
         .bind(blocked_did)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        Self::set_snapshot_freshness_locked(
+            &mut tx,
+            user_did,
+            ModerationSnapshotKind::Actor,
+            false,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn remove_actor_block(&self, user_did: &str, blocked_did: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        Self::bump_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::Actor)
+            .await?;
         sqlx::query("DELETE FROM user_blocks WHERE user_did = $1 AND blocked_did = $2")
             .bind(user_did)
             .bind(blocked_did)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await?;
+        Self::set_snapshot_freshness_locked(
+            &mut tx,
+            user_did,
+            ModerationSnapshotKind::Actor,
+            false,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -543,38 +765,70 @@ impl ModerationCache {
         list_uri: &str,
         purpose: &str,
     ) -> Result<()> {
-        replace_after_complete_snapshot(
-            async {
-                let mut sync = ModerationSyncContext::new();
-                let list_name = self
-                    .fetch_list_name(state, session, dpop, list_uri, &mut sync)
-                    .await?;
-                let members = self
-                    .fetch_list_members(state, session, dpop, list_uri, &mut sync)
-                    .await?;
-                Ok((list_name, members))
-            },
-            |(list_name, members)| async move {
-                self.replace_list_snapshot(&session.did, list_uri, purpose, list_name, members)
-                    .await
-            },
+        let generation = self
+            .allocate_snapshot_generation(&session.did, ModerationSnapshotKind::List)
+            .await?;
+        let snapshot = async {
+            let mut sync = ModerationSyncContext::new();
+            let list_name = self
+                .fetch_list_name(state, session, dpop, list_uri, &mut sync)
+                .await?;
+            let members = self
+                .fetch_list_members(state, session, dpop, list_uri, &mut sync)
+                .await?;
+            Ok((list_name, members))
+        }
+        .await;
+        let (list_name, members) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self
+                    .fail_snapshot(
+                        &session.did,
+                        ModerationSnapshotKind::List,
+                        generation,
+                        error,
+                    )
+                    .await;
+            }
+        };
+        let result = self
+            .replace_list_snapshot_if_current(
+                &session.did,
+                generation,
+                list_uri,
+                purpose,
+                list_name,
+                members,
+            )
+            .await;
+        self.finish_snapshot_apply(
+            &session.did,
+            ModerationSnapshotKind::List,
+            generation,
+            result,
         )
         .await
     }
 
-    async fn replace_list_snapshot(
+    async fn replace_list_snapshot_if_current(
         &self,
         user_did: &str,
+        generation: i64,
         list_uri: &str,
         purpose: &str,
         list_name: Option<String>,
         members: Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<SnapshotApplyOutcome> {
         let mut tx = self.db_pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(user_did)
-            .execute(&mut *tx)
-            .await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        if Self::current_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::List)
+            .await?
+            != Some(generation)
+        {
+            tx.rollback().await?;
+            return Ok(SnapshotApplyOutcome::Superseded);
+        }
         sqlx::query(
             r#"
             INSERT INTO moderation_list_subscriptions (
@@ -610,35 +864,44 @@ impl ModerationCache {
         .execute(&mut *tx)
         .await?;
 
-        for subject_did in members {
-            sqlx::query(
-                r#"
-                INSERT INTO moderation_list_members_by_user (user_did, list_uri, subject_did)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (user_did, list_uri, subject_did) DO NOTHING
-                "#,
-            )
-            .bind(user_did)
-            .bind(list_uri)
-            .bind(subject_did)
-            .execute(&mut *tx)
+        sqlx::query(
+            r#"
+            INSERT INTO moderation_list_members_by_user (user_did, list_uri, subject_did)
+            SELECT $1, $2, subject_did
+            FROM UNNEST($3::TEXT[]) AS input(subject_did)
+            ON CONFLICT (user_did, list_uri, subject_did) DO NOTHING
+            "#,
+        )
+        .bind(user_did)
+        .bind(list_uri)
+        .bind(&members)
+        .execute(&mut *tx)
+        .await?;
+
+        // A direct list mutation refreshes only one list, so require a full
+        // reconciliation before the next moderation decision.
+        Self::set_snapshot_freshness_locked(&mut tx, user_did, ModerationSnapshotKind::List, false)
             .await?;
-        }
 
         tx.commit().await?;
-        Ok(())
+        Ok(SnapshotApplyOutcome::Applied)
     }
 
-    async fn replace_all_list_snapshots(
+    async fn replace_all_list_snapshots_if_current(
         &self,
         user_did: &str,
+        generation: i64,
         snapshots: Vec<(ListSubscription, Vec<String>)>,
-    ) -> Result<()> {
+    ) -> Result<SnapshotApplyOutcome> {
         let mut tx = self.db_pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(user_did)
-            .execute(&mut *tx)
-            .await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        if Self::current_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::List)
+            .await?
+            != Some(generation)
+        {
+            tx.rollback().await?;
+            return Ok(SnapshotApplyOutcome::Superseded);
+        }
         sqlx::query("DELETE FROM moderation_list_members_by_user WHERE user_did = $1")
             .bind(user_did)
             .execute(&mut *tx)
@@ -648,57 +911,94 @@ impl ModerationCache {
             .execute(&mut *tx)
             .await?;
 
-        for (list, members) in snapshots {
-            sqlx::query(
-                r#"
-                INSERT INTO moderation_list_subscriptions (
-                    user_did,
-                    list_uri,
-                    list_purpose,
-                    list_name,
-                    last_synced_at,
-                    created_at,
-                    updated_at
-                )
-                VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())
-                "#,
-            )
-            .bind(user_did)
-            .bind(&list.uri)
-            .bind(&list.purpose)
-            .bind(&list.name)
-            .execute(&mut *tx)
-            .await?;
-
+        let mut list_uris = Vec::with_capacity(snapshots.len());
+        let mut list_purposes = Vec::with_capacity(snapshots.len());
+        let mut list_names = Vec::with_capacity(snapshots.len());
+        let mut list_name_present = Vec::with_capacity(snapshots.len());
+        let mut member_list_indexes = Vec::new();
+        let mut member_dids = Vec::new();
+        for (index, (list, members)) in snapshots.into_iter().enumerate() {
+            list_uris.push(list.uri);
+            list_purposes.push(list.purpose);
+            list_name_present.push(list.name.is_some());
+            list_names.push(list.name.unwrap_or_default());
+            let list_index = i64::try_from(index)? + 1;
             for subject_did in members {
-                sqlx::query(
-                    r#"
-                    INSERT INTO moderation_list_members_by_user (
-                        user_did,
-                        list_uri,
-                        subject_did
-                    )
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (user_did, list_uri, subject_did) DO NOTHING
-                    "#,
-                )
-                .bind(user_did)
-                .bind(&list.uri)
-                .bind(subject_did)
-                .execute(&mut *tx)
-                .await?;
+                member_list_indexes.push(list_index);
+                member_dids.push(subject_did);
             }
         }
 
+        sqlx::query(
+            r#"
+            INSERT INTO moderation_list_subscriptions (
+                user_did,
+                list_uri,
+                list_purpose,
+                list_name,
+                last_synced_at,
+                created_at,
+                updated_at
+            )
+            SELECT
+                $1,
+                input.list_uri,
+                input.list_purpose,
+                CASE WHEN input.list_name_present THEN input.list_name ELSE NULL END,
+                NOW(),
+                NOW(),
+                NOW()
+            FROM UNNEST(
+                $2::TEXT[],
+                $3::TEXT[],
+                $4::TEXT[],
+                $5::BOOLEAN[]
+            ) AS input(list_uri, list_purpose, list_name, list_name_present)
+            "#,
+        )
+        .bind(user_did)
+        .bind(&list_uris)
+        .bind(&list_purposes)
+        .bind(&list_names)
+        .bind(&list_name_present)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            WITH list_input AS (
+                SELECT list_uri, ordinal::BIGINT AS list_index
+                FROM UNNEST($2::TEXT[]) WITH ORDINALITY AS lists(list_uri, ordinal)
+            ),
+            member_input AS (
+                SELECT list_index, subject_did
+                FROM UNNEST($3::BIGINT[], $4::TEXT[]) AS members(list_index, subject_did)
+            )
+            INSERT INTO moderation_list_members_by_user (user_did, list_uri, subject_did)
+            SELECT $1, lists.list_uri, members.subject_did
+            FROM member_input AS members
+            INNER JOIN list_input AS lists USING (list_index)
+            ON CONFLICT (user_did, list_uri, subject_did) DO NOTHING
+            "#,
+        )
+        .bind(user_did)
+        .bind(&list_uris)
+        .bind(&member_list_indexes)
+        .bind(&member_dids)
+        .execute(&mut *tx)
+        .await?;
+
+        Self::set_snapshot_freshness_locked(&mut tx, user_did, ModerationSnapshotKind::List, true)
+            .await?;
+
         tx.commit().await?;
-        Ok(())
+        Ok(SnapshotApplyOutcome::Applied)
     }
 
     pub async fn remove_list_subscription(&self, user_did: &str, list_uri: &str) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(user_did)
-            .execute(&mut *tx)
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        Self::bump_snapshot_generation_locked(&mut tx, user_did, ModerationSnapshotKind::List)
             .await?;
         sqlx::query(
             "DELETE FROM moderation_list_subscriptions WHERE user_did = $1 AND list_uri = $2",
@@ -715,6 +1015,8 @@ impl ModerationCache {
         .bind(list_uri)
         .execute(&mut *tx)
         .await?;
+        Self::set_snapshot_freshness_locked(&mut tx, user_did, ModerationSnapshotKind::List, false)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -778,67 +1080,119 @@ impl ModerationCache {
         session: &CatbirdSession,
         dpop: &JacquardDpopData,
     ) -> Result<()> {
-        replace_after_complete_snapshot(
-            async {
-                let mut sync = ModerationSyncContext::new();
-                let muted_dids = self
-                    .fetch_paginated_profile_dids(
-                        state,
-                        session,
-                        dpop,
-                        "app.bsky.graph.getMutes",
-                        "mutes",
-                        &mut sync,
+        let generation = self
+            .allocate_snapshot_generation(&session.did, ModerationSnapshotKind::Actor)
+            .await?;
+        let snapshot = async {
+            let mut sync = ModerationSyncContext::new();
+            let muted_dids = self
+                .fetch_paginated_profile_dids(
+                    state,
+                    session,
+                    dpop,
+                    "app.bsky.graph.getMutes",
+                    "mutes",
+                    &mut sync,
+                )
+                .await?;
+            let blocked_dids = self
+                .fetch_paginated_profile_dids(
+                    state,
+                    session,
+                    dpop,
+                    "app.bsky.graph.getBlocks",
+                    "blocks",
+                    &mut sync,
+                )
+                .await?;
+            Ok((muted_dids, blocked_dids))
+        }
+        .await;
+        let (muted_dids, blocked_dids) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self
+                    .fail_snapshot(
+                        &session.did,
+                        ModerationSnapshotKind::Actor,
+                        generation,
+                        error,
                     )
-                    .await?;
-                let blocked_dids = self
-                    .fetch_paginated_profile_dids(
-                        state,
-                        session,
-                        dpop,
-                        "app.bsky.graph.getBlocks",
-                        "blocks",
-                        &mut sync,
-                    )
-                    .await?;
-                Ok((muted_dids, blocked_dids))
-            },
-            |(muted_dids, blocked_dids)| async move {
-                let mut tx = self.db_pool.begin().await?;
-                sqlx::query("DELETE FROM user_mutes WHERE user_did = $1")
-                    .bind(&session.did)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("DELETE FROM user_blocks WHERE user_did = $1")
-                    .bind(&session.did)
-                    .execute(&mut *tx)
-                    .await?;
-
-                for muted_did in muted_dids {
-                    sqlx::query(
-                "INSERT INTO user_mutes (user_did, muted_did) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    )
-                    .bind(&session.did)
-                    .bind(muted_did)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-
-                for blocked_did in blocked_dids {
-                    sqlx::query(
-                "INSERT INTO user_blocks (user_did, blocked_did) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    )
-                    .bind(&session.did)
-                    .bind(blocked_did)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-
-                tx.commit().await?;
-                Ok(())
-            },
+                    .await;
+            }
+        };
+        let result = self
+            .replace_actor_snapshot_if_current(&session.did, generation, muted_dids, blocked_dids)
+            .await;
+        self.finish_snapshot_apply(
+            &session.did,
+            ModerationSnapshotKind::Actor,
+            generation,
+            result,
         )
         .await
+    }
+
+    async fn replace_actor_snapshot_if_current(
+        &self,
+        user_did: &str,
+        generation: i64,
+        muted_dids: Vec<String>,
+        blocked_dids: Vec<String>,
+    ) -> Result<SnapshotApplyOutcome> {
+        let mut tx = self.db_pool.begin().await?;
+        Self::lock_moderation_did(&mut tx, user_did).await?;
+        if Self::current_snapshot_generation_locked(
+            &mut tx,
+            user_did,
+            ModerationSnapshotKind::Actor,
+        )
+        .await?
+            != Some(generation)
+        {
+            tx.rollback().await?;
+            return Ok(SnapshotApplyOutcome::Superseded);
+        }
+
+        sqlx::query("DELETE FROM user_mutes WHERE user_did = $1")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM user_blocks WHERE user_did = $1")
+            .bind(user_did)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_mutes (user_did, muted_did)
+            SELECT $1, muted_did
+            FROM UNNEST($2::TEXT[]) AS input(muted_did)
+            ON CONFLICT (user_did, muted_did) DO NOTHING
+            "#,
+        )
+        .bind(user_did)
+        .bind(&muted_dids)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_blocks (user_did, blocked_did)
+            SELECT $1, blocked_did
+            FROM UNNEST($2::TEXT[]) AS input(blocked_did)
+            ON CONFLICT (user_did, blocked_did) DO NOTHING
+            "#,
+        )
+        .bind(user_did)
+        .bind(&blocked_dids)
+        .execute(&mut *tx)
+        .await?;
+
+        Self::set_snapshot_freshness_locked(&mut tx, user_did, ModerationSnapshotKind::Actor, true)
+            .await?;
+        tx.commit().await?;
+        Ok(SnapshotApplyOutcome::Applied)
     }
 
     async fn sync_list_relationships(
@@ -847,41 +1201,64 @@ impl ModerationCache {
         session: &CatbirdSession,
         dpop: &JacquardDpopData,
     ) -> Result<()> {
-        replace_after_complete_snapshot(
-            async {
-                let mut sync = ModerationSyncContext::new();
-                let mut lists = self
-                    .fetch_paginated_lists(
-                        state,
-                        session,
-                        dpop,
-                        "app.bsky.graph.getListMutes",
-                        "curatelist",
-                        &mut sync,
-                    )
-                    .await?;
-                lists.extend(
-                    self.fetch_paginated_lists(
-                        state,
-                        session,
-                        dpop,
-                        "app.bsky.graph.getListBlocks",
-                        "modlist",
-                        &mut sync,
-                    )
-                    .await?,
-                );
+        let generation = self
+            .allocate_snapshot_generation(&session.did, ModerationSnapshotKind::List)
+            .await?;
+        let snapshot = async {
+            let mut sync = ModerationSyncContext::new();
+            let mut lists = self
+                .fetch_paginated_lists(
+                    state,
+                    session,
+                    dpop,
+                    "app.bsky.graph.getListMutes",
+                    "curatelist",
+                    &mut sync,
+                )
+                .await?;
+            lists.extend(
+                self.fetch_paginated_lists(
+                    state,
+                    session,
+                    dpop,
+                    "app.bsky.graph.getListBlocks",
+                    "modlist",
+                    &mut sync,
+                )
+                .await?,
+            );
 
-                let mut member_map = Vec::with_capacity(lists.len());
-                for list in &lists {
-                    let members = self
-                        .fetch_list_members(state, session, dpop, &list.uri, &mut sync)
-                        .await?;
-                    member_map.push((list.clone(), members));
-                }
-                Ok(member_map)
-            },
-            |member_map| self.replace_all_list_snapshots(&session.did, member_map),
+            let mut member_map = Vec::with_capacity(lists.len());
+            for list in &lists {
+                let members = self
+                    .fetch_list_members(state, session, dpop, &list.uri, &mut sync)
+                    .await?;
+                member_map.push((list.clone(), members));
+            }
+            Ok(member_map)
+        }
+        .await;
+        let member_map = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self
+                    .fail_snapshot(
+                        &session.did,
+                        ModerationSnapshotKind::List,
+                        generation,
+                        error,
+                    )
+                    .await;
+            }
+        };
+        let result = self
+            .replace_all_list_snapshots_if_current(&session.did, generation, member_map)
+            .await;
+        self.finish_snapshot_apply(
+            &session.did,
+            ModerationSnapshotKind::List,
+            generation,
+            result,
         )
         .await
     }
@@ -1272,6 +1649,26 @@ mod tests {
             .execute(pool)
             .await
             .expect("clean legacy members");
+        sqlx::query("DELETE FROM user_mutes WHERE user_did = ANY($1)")
+            .bind(users)
+            .execute(pool)
+            .await
+            .expect("clean tenant mutes");
+        sqlx::query("DELETE FROM user_blocks WHERE user_did = ANY($1)")
+            .bind(users)
+            .execute(pool)
+            .await
+            .expect("clean tenant blocks");
+        sqlx::query("DELETE FROM moderation_snapshot_generations WHERE user_did = ANY($1)")
+            .bind(users)
+            .execute(pool)
+            .await
+            .expect("clean tenant generations");
+        sqlx::query("DELETE FROM push_accounts WHERE account_did = ANY($1)")
+            .bind(users)
+            .execute(pool)
+            .await
+            .expect("clean tenant push accounts");
     }
 
     async fn tenant_members(pool: &PgPool, user_did: &str) -> Vec<(String, String)> {
@@ -1289,6 +1686,67 @@ mod tests {
         .expect("load tenant members")
     }
 
+    async fn insert_push_account_fixture(pool: &PgPool, user_did: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO push_accounts (
+                account_did,
+                session_id,
+                pds_url,
+                last_actor_sync_at,
+                last_list_sync_at
+            )
+            VALUES ($1, 'fixture-session', 'https://fixture.invalid', NOW(), NOW())
+            ON CONFLICT (account_did)
+            DO UPDATE SET
+                session_id = EXCLUDED.session_id,
+                pds_url = EXCLUDED.pds_url,
+                last_actor_sync_at = NOW(),
+                last_list_sync_at = NOW(),
+                auth_revoked_at = NULL,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(user_did)
+        .execute(pool)
+        .await
+        .expect("insert push account fixture");
+    }
+
+    async fn apply_list_snapshot_fixture(
+        cache: &ModerationCache,
+        user_did: &str,
+        list_uri: &str,
+        purpose: &str,
+        list_name: Option<String>,
+        members: Vec<String>,
+    ) {
+        let generation = cache
+            .allocate_snapshot_generation(user_did, ModerationSnapshotKind::List)
+            .await
+            .expect("allocate list fixture generation");
+        let outcome = cache
+            .replace_list_snapshot_if_current(
+                user_did, generation, list_uri, purpose, list_name, members,
+            )
+            .await
+            .expect("apply list fixture snapshot");
+        assert_eq!(outcome, SnapshotApplyOutcome::Applied);
+    }
+
+    async fn apply_full_list_snapshot_fixture(
+        cache: &ModerationCache,
+        user_did: &str,
+        snapshots: Vec<(ListSubscription, Vec<String>)>,
+    ) -> Result<SnapshotApplyOutcome> {
+        let generation = cache
+            .allocate_snapshot_generation(user_did, ModerationSnapshotKind::List)
+            .await?;
+        cache
+            .replace_all_list_snapshots_if_current(user_did, generation, snapshots)
+            .await
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with Nest push migrations applied"]
     async fn live_postgres_tenant_direct_replacement_and_removal_are_did_scoped() {
@@ -1299,26 +1757,24 @@ mod tests {
         let list = "at://did:plc:list-owner/app.bsky.graph.list/shared";
         cleanup_tenant_fixture(&pool, &[user_a, user_b], &[list]).await;
 
-        cache
-            .replace_list_snapshot(
-                user_a,
-                list,
-                "modlist",
-                Some("shared".to_owned()),
-                vec!["did:plc:member-a".to_owned()],
-            )
-            .await
-            .expect("seed DID A snapshot");
-        cache
-            .replace_list_snapshot(
-                user_b,
-                list,
-                "modlist",
-                Some("shared".to_owned()),
-                vec!["did:plc:member-b".to_owned()],
-            )
-            .await
-            .expect("replace DID B snapshot");
+        apply_list_snapshot_fixture(
+            &cache,
+            user_a,
+            list,
+            "modlist",
+            Some("shared".to_owned()),
+            vec!["did:plc:member-a".to_owned()],
+        )
+        .await;
+        apply_list_snapshot_fixture(
+            &cache,
+            user_b,
+            list,
+            "modlist",
+            Some("shared".to_owned()),
+            vec!["did:plc:member-b".to_owned()],
+        )
+        .await;
 
         assert!(cache
             .is_actor_list_filtered(user_a, "did:plc:member-a")
@@ -1360,51 +1816,48 @@ mod tests {
         let omitted_list = "at://did:plc:list-owner/app.bsky.graph.list/refresh-omitted";
         cleanup_tenant_fixture(&pool, &[user_a, user_b], &[shared_list, omitted_list]).await;
 
-        cache
-            .replace_list_snapshot(
-                user_a,
-                shared_list,
-                "modlist",
-                None,
-                vec!["did:plc:refresh-a".to_owned()],
-            )
-            .await
-            .expect("seed DID A");
-        cache
-            .replace_list_snapshot(
-                user_b,
-                shared_list,
-                "modlist",
-                None,
-                vec!["did:plc:refresh-b-old".to_owned()],
-            )
-            .await
-            .expect("seed DID B shared list");
-        cache
-            .replace_list_snapshot(
-                user_b,
-                omitted_list,
-                "curatelist",
-                None,
-                vec!["did:plc:refresh-b-omitted".to_owned()],
-            )
-            .await
-            .expect("seed DID B omitted list");
+        apply_list_snapshot_fixture(
+            &cache,
+            user_a,
+            shared_list,
+            "modlist",
+            None,
+            vec!["did:plc:refresh-a".to_owned()],
+        )
+        .await;
+        apply_list_snapshot_fixture(
+            &cache,
+            user_b,
+            shared_list,
+            "modlist",
+            None,
+            vec!["did:plc:refresh-b-old".to_owned()],
+        )
+        .await;
+        apply_list_snapshot_fixture(
+            &cache,
+            user_b,
+            omitted_list,
+            "curatelist",
+            None,
+            vec!["did:plc:refresh-b-omitted".to_owned()],
+        )
+        .await;
 
-        cache
-            .replace_all_list_snapshots(
-                user_b,
-                vec![(
-                    ListSubscription {
-                        uri: shared_list.to_owned(),
-                        purpose: "modlist".to_owned(),
-                        name: Some("refreshed".to_owned()),
-                    },
-                    vec!["did:plc:refresh-b-new".to_owned()],
-                )],
-            )
-            .await
-            .expect("replace only DID B full snapshot");
+        apply_full_list_snapshot_fixture(
+            &cache,
+            user_b,
+            vec![(
+                ListSubscription {
+                    uri: shared_list.to_owned(),
+                    purpose: "modlist".to_owned(),
+                    name: Some("refreshed".to_owned()),
+                },
+                vec!["did:plc:refresh-b-new".to_owned()],
+            )],
+        )
+        .await
+        .expect("replace only DID B full snapshot");
 
         assert_eq!(
             tenant_members(&pool, user_a).await,
@@ -1421,20 +1874,20 @@ mod tests {
         .execute(&pool)
         .await
         .expect("install forced transaction failure");
-        let transaction_error = cache
-            .replace_all_list_snapshots(
-                user_b,
-                vec![(
-                    ListSubscription {
-                        uri: shared_list.to_owned(),
-                        purpose: "modlist".to_owned(),
-                        name: None,
-                    },
-                    vec!["did:plc:boom".to_owned()],
-                )],
-            )
-            .await
-            .expect_err("forced insert failure must roll back replacement");
+        let transaction_error = apply_full_list_snapshot_fixture(
+            &cache,
+            user_b,
+            vec![(
+                ListSubscription {
+                    uri: shared_list.to_owned(),
+                    purpose: "modlist".to_owned(),
+                    name: None,
+                },
+                vec!["did:plc:boom".to_owned()],
+            )],
+        )
+        .await
+        .expect_err("forced insert failure must roll back replacement");
         assert!(transaction_error
             .to_string()
             .contains("moderation_test_reject_boom"));
@@ -1449,7 +1902,9 @@ mod tests {
             async {
                 Err::<Vec<(ListSubscription, Vec<String>)>, _>(anyhow!("forced fetch failure"))
             },
-            |snapshots| cache.replace_all_list_snapshots(user_b, snapshots),
+            |_snapshots| async {
+                Err::<(), _>(anyhow!("replacement must not run after fetch failure"))
+            },
         )
         .await
         .expect_err("fetch failure must skip replacement transaction");
@@ -1465,6 +1920,222 @@ mod tests {
         );
 
         cleanup_tenant_fixture(&pool, &[user_a, user_b], &[shared_list, omitted_list]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with Nest push migrations applied"]
+    async fn live_postgres_actor_generations_reject_older_snapshot_and_isolate_dids() {
+        let pool = live_pool().await;
+        let cache = ModerationCache::new(pool.clone(), 60);
+        let user_a = "did:plc:actor-generation-a";
+        let user_b = "did:plc:actor-generation-b";
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[]).await;
+        insert_push_account_fixture(&pool, user_a).await;
+        insert_push_account_fixture(&pool, user_b).await;
+
+        let older_a = cache
+            .allocate_snapshot_generation(user_a, ModerationSnapshotKind::Actor)
+            .await
+            .expect("allocate older DID A actor snapshot");
+        let current_b = cache
+            .allocate_snapshot_generation(user_b, ModerationSnapshotKind::Actor)
+            .await
+            .expect("allocate DID B actor snapshot");
+        let current_a = cache
+            .allocate_snapshot_generation(user_a, ModerationSnapshotKind::Actor)
+            .await
+            .expect("allocate current DID A actor snapshot");
+
+        assert_eq!(
+            cache
+                .replace_actor_snapshot_if_current(
+                    user_a,
+                    current_a,
+                    vec!["did:plc:actor-current-a".to_owned()],
+                    vec![],
+                )
+                .await
+                .expect("apply current DID A actor snapshot"),
+            SnapshotApplyOutcome::Applied
+        );
+        assert_eq!(
+            cache
+                .replace_actor_snapshot_if_current(
+                    user_b,
+                    current_b,
+                    vec![],
+                    vec!["did:plc:actor-current-b".to_owned()],
+                )
+                .await
+                .expect("apply DID B actor snapshot"),
+            SnapshotApplyOutcome::Applied
+        );
+
+        sqlx::query(
+            "UPDATE push_accounts SET last_actor_sync_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' WHERE account_did = $1",
+        )
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .expect("install deterministic stale actor timestamp");
+
+        assert_eq!(
+            cache
+                .replace_actor_snapshot_if_current(
+                    user_a,
+                    older_a,
+                    vec!["did:plc:actor-stale-a".to_owned()],
+                    vec![],
+                )
+                .await
+                .expect("reject older DID A actor snapshot"),
+            SnapshotApplyOutcome::Superseded
+        );
+
+        let actor_rows = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT 'mute', muted_did FROM user_mutes WHERE user_did = $1
+            UNION ALL
+            SELECT 'block', blocked_did FROM user_blocks WHERE user_did = $1
+            ORDER BY 1, 2
+            "#,
+        )
+        .bind(user_a)
+        .fetch_all(&pool)
+        .await
+        .expect("load DID A actor state");
+        assert_eq!(
+            actor_rows,
+            vec![("mute".to_owned(), "did:plc:actor-current-a".to_owned())]
+        );
+        assert!(cache
+            .is_actor_muted_or_blocked(user_b, "did:plc:actor-current-b")
+            .await
+            .expect("DID B actor state survives DID A stale apply"));
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT last_actor_sync_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' FROM push_accounts WHERE account_did = $1",
+        )
+        .bind(user_a)
+        .fetch_one(&pool)
+        .await
+        .expect("check stale actor snapshot did not mark freshness"));
+
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with Nest push migrations applied"]
+    async fn live_postgres_list_generations_reject_older_snapshot_and_isolate_dids() {
+        let pool = live_pool().await;
+        let cache = ModerationCache::new(pool.clone(), 60);
+        let user_a = "did:plc:list-generation-a";
+        let user_b = "did:plc:list-generation-b";
+        let list_a = "at://did:plc:list-owner/app.bsky.graph.list/generation-a";
+        let list_b = "at://did:plc:list-owner/app.bsky.graph.list/generation-b";
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[list_a, list_b]).await;
+        insert_push_account_fixture(&pool, user_a).await;
+        insert_push_account_fixture(&pool, user_b).await;
+
+        let older_a = cache
+            .allocate_snapshot_generation(user_a, ModerationSnapshotKind::List)
+            .await
+            .expect("allocate older DID A list snapshot");
+        let current_b = cache
+            .allocate_snapshot_generation(user_b, ModerationSnapshotKind::List)
+            .await
+            .expect("allocate DID B list snapshot");
+        let current_a = cache
+            .allocate_snapshot_generation(user_a, ModerationSnapshotKind::List)
+            .await
+            .expect("allocate current DID A list snapshot");
+
+        assert_eq!(
+            cache
+                .replace_all_list_snapshots_if_current(
+                    user_a,
+                    current_a,
+                    vec![(
+                        ListSubscription {
+                            uri: list_a.to_owned(),
+                            purpose: "modlist".to_owned(),
+                            name: Some("current-a".to_owned()),
+                        },
+                        vec!["did:plc:list-member-current-a".to_owned()],
+                    )],
+                )
+                .await
+                .expect("apply current DID A list snapshot"),
+            SnapshotApplyOutcome::Applied
+        );
+        assert_eq!(
+            cache
+                .replace_all_list_snapshots_if_current(
+                    user_b,
+                    current_b,
+                    vec![(
+                        ListSubscription {
+                            uri: list_b.to_owned(),
+                            purpose: "curatelist".to_owned(),
+                            name: None,
+                        },
+                        vec!["did:plc:list-member-current-b".to_owned()],
+                    )],
+                )
+                .await
+                .expect("apply DID B list snapshot"),
+            SnapshotApplyOutcome::Applied
+        );
+
+        sqlx::query(
+            "UPDATE push_accounts SET last_list_sync_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' WHERE account_did = $1",
+        )
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .expect("install deterministic stale list timestamp");
+
+        assert_eq!(
+            cache
+                .replace_all_list_snapshots_if_current(
+                    user_a,
+                    older_a,
+                    vec![(
+                        ListSubscription {
+                            uri: list_a.to_owned(),
+                            purpose: "modlist".to_owned(),
+                            name: Some("stale-a".to_owned()),
+                        },
+                        vec!["did:plc:list-member-stale-a".to_owned()],
+                    )],
+                )
+                .await
+                .expect("reject older DID A list snapshot"),
+            SnapshotApplyOutcome::Superseded
+        );
+
+        assert_eq!(
+            tenant_members(&pool, user_a).await,
+            vec![(
+                list_a.to_owned(),
+                "did:plc:list-member-current-a".to_owned()
+            )]
+        );
+        assert_eq!(
+            tenant_members(&pool, user_b).await,
+            vec![(
+                list_b.to_owned(),
+                "did:plc:list-member-current-b".to_owned()
+            )]
+        );
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT last_list_sync_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' FROM push_accounts WHERE account_did = $1",
+        )
+        .bind(user_a)
+        .fetch_one(&pool)
+        .await
+        .expect("check stale list snapshot did not mark freshness"));
+
+        cleanup_tenant_fixture(&pool, &[user_a, user_b], &[list_a, list_b]).await;
     }
 
     #[tokio::test]

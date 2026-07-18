@@ -99,31 +99,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Build CORS layer
-    let cors = if app_config.server.allowed_origins.is_empty() {
-        CorsLayer::permissive()
-    } else {
-        let origins: Vec<axum::http::HeaderValue> = app_config
-            .server
-            .allowed_origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods([
-                axum::http::Method::GET,
-                axum::http::Method::POST,
-                axum::http::Method::DELETE,
-                axum::http::Method::PUT,
-                axum::http::Method::OPTIONS,
-            ])
-            .allow_headers([
-                axum::http::header::AUTHORIZATION,
-                axum::http::header::CONTENT_TYPE,
-                axum::http::header::ACCEPT,
-            ])
-    };
+    // Build an exact-origin CORS layer. An empty list intentionally leaves
+    // allow_origin unset, which denies all cross-origin browser access.
+    let cors = build_cors_layer(&app_config.server)?;
 
     // Start admin metrics server on internal-only port
     let admin_port = app_config.server.admin_port;
@@ -166,11 +144,36 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
+}
+
+fn build_cors_layer(server: &config::ServerConfig) -> anyhow::Result<CorsLayer> {
+    let origins = server.cors_origin_headers().map_err(anyhow::Error::msg)?;
+    let cors = CorsLayer::new()
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+            axum::http::Method::PUT,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+        ]);
+    Ok(if origins.is_empty() {
+        cors
+    } else {
+        cors.allow_origin(origins)
+    })
 }
 
 /// Wait for SIGTERM or CTRL+C for graceful shutdown
@@ -210,4 +213,105 @@ async fn count_active_sessions(
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::get};
+    use tower::ServiceExt;
+
+    fn server_config(allowed_origins: &[&str]) -> config::ServerConfig {
+        config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 3000,
+            admin_port: 9090,
+            base_url: "http://localhost:3000".into(),
+            allowed_origins: allowed_origins
+                .iter()
+                .map(|origin| (*origin).to_string())
+                .collect(),
+            trusted_proxy_ips: Vec::new(),
+        }
+    }
+
+    async fn cors_response(allowed_origins: &[&str], origin: &str) -> axum::response::Response {
+        Router::new()
+            .route("/resource", get(|| async { "ok" }))
+            .layer(build_cors_layer(&server_config(allowed_origins)).unwrap())
+            .oneshot(
+                Request::get("/resource")
+                    .header(axum::http::header::ORIGIN, origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn cors_preflight(allowed_origins: &[&str], origin: &str) -> axum::response::Response {
+        Router::new()
+            .route("/resource", get(|| async { "ok" }))
+            .layer(build_cors_layer(&server_config(allowed_origins)).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri("/resource")
+                    .header(axum::http::header::ORIGIN, origin)
+                    .header(
+                        axum::http::header::ACCESS_CONTROL_REQUEST_METHOD,
+                        axum::http::Method::POST.as_str(),
+                    )
+                    .header(
+                        axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        axum::http::header::AUTHORIZATION.as_str(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_cors_allowlist_grants_no_origin() {
+        let response = cors_response(&[], "https://evil.example").await;
+        assert!(response
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+
+        let preflight = cors_preflight(&[], "https://evil.example").await;
+        assert!(preflight
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_cors_origin_matches_exactly() {
+        let allowed = cors_response(&["https://catbird.blue"], "https://catbird.blue").await;
+        assert_eq!(
+            allowed
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://catbird.blue"
+        );
+        let allowed_preflight =
+            cors_preflight(&["https://catbird.blue"], "https://catbird.blue").await;
+        assert_eq!(
+            allowed_preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://catbird.blue"
+        );
+
+        let denied = cors_response(&["https://catbird.blue"], "https://evil.example").await;
+        assert!(denied
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
 }

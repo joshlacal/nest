@@ -5,7 +5,7 @@
 use jacquard_common::IntoStatic;
 use serde::Deserialize;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 #[path = "../services/outbound_policy.rs"]
 pub mod outbound_policy;
@@ -207,9 +207,55 @@ pub struct ServerConfig {
     pub admin_port: u16,
     /// Base URL for this server (used in OAuth metadata)
     pub base_url: String,
-    /// Allowed CORS origins (empty = permissive in dev)
+    /// Exact CORS origins. Empty denies all cross-origin browser access.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Socket peers permitted to assert X-Forwarded-For or X-Real-IP.
+    #[serde(default)]
+    pub trusted_proxy_ips: Vec<IpAddr>,
+}
+
+impl ServerConfig {
+    /// Parse exact HTTP(S) origins for the CORS layer.
+    ///
+    /// Browser Origin values never contain credentials, paths, queries, or
+    /// fragments. Requiring the configured spelling to equal the URL origin's
+    /// canonical serialization prevents a value that looks like an allowlist
+    /// entry from silently matching something different at runtime.
+    pub(crate) fn cors_origin_headers(&self) -> Result<Vec<http::HeaderValue>, String> {
+        self.allowed_origins
+            .iter()
+            .enumerate()
+            .map(|(index, configured)| {
+                let parsed = url::Url::parse(configured)
+                    .map_err(|_| format!("server.allowed_origins[{index}] is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err(format!(
+                        "server.allowed_origins[{index}] must use http or https"
+                    ));
+                }
+                if !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.path() != "/"
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(format!(
+                        "server.allowed_origins[{index}] must be an origin without credentials, path, query, or fragment"
+                    ));
+                }
+                let canonical = parsed.origin().ascii_serialization();
+                if canonical == "null" || canonical != *configured {
+                    return Err(format!(
+                        "server.allowed_origins[{index}] must use the canonical origin form `{canonical}`"
+                    ));
+                }
+                http::HeaderValue::from_str(configured).map_err(|_| {
+                    format!("server.allowed_origins[{index}] is not a valid HTTP header value")
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -305,6 +351,8 @@ impl AppConfig {
                 config::Environment::with_prefix("CATBIRD")
                     .separator("__")
                     .with_list_parse_key("CATBIRD__OAUTH__SCOPES")
+                    .with_list_parse_key("CATBIRD__SERVER__ALLOWED_ORIGINS")
+                    .with_list_parse_key("CATBIRD__SERVER__TRUSTED_PROXY_IPS")
                     .list_separator(",")
                     .try_parsing(true),
             )
@@ -314,6 +362,10 @@ impl AppConfig {
         config
             .mls
             .validate_and_normalize()
+            .map_err(config::ConfigError::Message)?;
+        config
+            .server
+            .cors_origin_headers()
             .map_err(config::ConfigError::Message)?;
         Ok(config)
     }
@@ -349,6 +401,10 @@ impl AppState {
         config
             .mls
             .validate_and_normalize()
+            .map_err(anyhow::Error::msg)?;
+        config
+            .server
+            .cors_origin_headers()
             .map_err(anyhow::Error::msg)?;
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
@@ -568,7 +624,52 @@ impl AppState {
 
 #[cfg(test)]
 mod mls_config_tests {
-    use super::{parse_redis_cluster_enabled, validate_standalone_redis_info, MlsConfig};
+    use super::{
+        parse_redis_cluster_enabled, validate_standalone_redis_info, MlsConfig, ServerConfig,
+    };
+
+    fn server_config(allowed_origins: &[&str]) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 3000,
+            admin_port: 9090,
+            base_url: "http://localhost:3000".into(),
+            allowed_origins: allowed_origins
+                .iter()
+                .map(|origin| (*origin).to_string())
+                .collect(),
+            trusted_proxy_ips: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cors_origins_are_exact_and_empty_is_a_valid_deny_all_policy() {
+        assert!(server_config(&[]).cors_origin_headers().unwrap().is_empty());
+
+        let origins = server_config(&["https://catbird.blue", "http://localhost:3000"])
+            .cors_origin_headers()
+            .unwrap();
+        assert_eq!(origins[0], "https://catbird.blue");
+        assert_eq!(origins[1], "http://localhost:3000");
+    }
+
+    #[test]
+    fn malformed_or_non_origin_cors_values_fail_configuration_validation() {
+        for invalid in [
+            "not-an-origin",
+            "ftp://catbird.blue",
+            "https://catbird.blue/",
+            "https://catbird.blue/path",
+            "https://catbird.blue?query",
+            "https://user@catbird.blue",
+            "HTTPS://catbird.blue",
+        ] {
+            assert!(
+                server_config(&[invalid]).cors_origin_headers().is_err(),
+                "accepted invalid CORS origin {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn redis_topology_parser_accepts_only_explicit_standalone_mode() {

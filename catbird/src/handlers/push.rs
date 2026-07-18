@@ -14,7 +14,7 @@ use crate::{
     models::CatbirdSession,
     services::push::{
         push_unavailable_error,
-        subscriptions::{bounded_page_limit, bounded_page_offset},
+        subscriptions::{bounded_page_limit, bounded_page_offset, ActivitySubscriptionWriteError},
         types::{
             PutActivitySubscriptionInput, PutPreferencesInput, RegisterPushInput,
             UnregisterPushInput,
@@ -34,7 +34,7 @@ pub async fn register_push(
     Json(input): Json<RegisterPushInput>,
 ) -> AppResult<StatusCode> {
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
-    push.registry.validate_service_did(&input.service_did)?;
+    push.registry.validate_register_input(&input)?;
     push.registry
         .upsert_registration(&session, &input)
         .await
@@ -49,7 +49,7 @@ pub async fn unregister_push(
     Json(input): Json<UnregisterPushInput>,
 ) -> AppResult<StatusCode> {
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
-    push.registry.validate_service_did(&input.service_did)?;
+    push.registry.validate_unregister_input(&input)?;
     push.registry
         .deactivate_registration(&session, &input)
         .await
@@ -150,12 +150,20 @@ pub async fn put_activity_subscription(
         .subscriptions
         .put(&session.did, &input.subject, &input.activity_subscription)
         .await
-        .map_err(internal_error)?;
+        .map_err(activity_subscription_write_error)?;
 
     Ok(Json(json!({
         "subject": input.subject,
         "activitySubscription": subscription,
     })))
+}
+
+fn activity_subscription_write_error(err: anyhow::Error) -> AppError {
+    if let Some(client_error) = err.downcast_ref::<ActivitySubscriptionWriteError>() {
+        AppError::BadRequest(client_error.client_message().to_owned())
+    } else {
+        internal_error(err)
+    }
 }
 
 fn internal_error(err: anyhow::Error) -> AppError {
@@ -165,6 +173,7 @@ fn internal_error(err: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     #[test]
     fn list_query_normalization_clamps_hostile_limits_and_cursors() {
@@ -179,5 +188,43 @@ mod tests {
             cursor: Some("184467440737095516160".to_string()),
         });
         assert_eq!(hostile, (0, 50));
+    }
+
+    #[test]
+    fn permanent_activity_subscription_write_errors_map_to_fixed_bad_requests() {
+        for (error, expected_message) in [
+            (
+                ActivitySubscriptionWriteError::InvalidSubscriberDid,
+                "Invalid authenticated subscriber DID.",
+            ),
+            (
+                ActivitySubscriptionWriteError::InvalidSubjectDid,
+                "Subject must be a canonical DID.",
+            ),
+            (
+                ActivitySubscriptionWriteError::QuotaExceeded,
+                "Activity subscription limit reached.",
+            ),
+        ] {
+            let mapped = activity_subscription_write_error(anyhow::Error::new(error));
+            assert!(matches!(
+                &mapped,
+                AppError::BadRequest(message) if message == expected_message
+            ));
+            assert_eq!(mapped.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn unexpected_activity_subscription_write_errors_remain_internal() {
+        let mapped = activity_subscription_write_error(anyhow::anyhow!("database unavailable"));
+        assert!(matches!(
+            &mapped,
+            AppError::Internal(message) if message == "database unavailable"
+        ));
+        assert_eq!(
+            mapped.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

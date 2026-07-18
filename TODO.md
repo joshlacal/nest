@@ -1,5 +1,7 @@
 # Nest Implementation Checklist
 
+> **Historical design artifact:** This unchecked checklist records the original implementation plan and is not an authoritative statement of current status or architecture. Several items were implemented under different names or designs (including Jacquard OAuth, the one-time browser exchange, Redis-backed session storage, health/metrics routes, and bounded proxy streaming), while the response-enrichment phase was not implemented. Use `CLAUDE.md`, `NEST_ARCHITECTURE.md`, and the current code/tests for present behavior.
+
 ## Phase 1: Foundation & Setup
 - [ ] **Project Structure:** Ensure `axum`, `tokio`, `tracing`, `config` are set up in `main.rs`.
 - [ ] **Redis Connection:** Implement `services/cache.rs` to handle Redis connections and basic Get/Set/Expire operations.

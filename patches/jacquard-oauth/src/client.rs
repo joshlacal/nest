@@ -3,12 +3,14 @@ use crate::{
     authstore::ClientAuthStore,
     dpop::DpopExt,
     error::{CallbackError, Result},
-    request::{OAuthMetadata, exchange_code, par},
+    request::{OAuthMetadata, RequestError, exchange_code, par},
     resolver::OAuthResolver,
     scopes::Scope,
     session::{ClientData, ClientSessionData, DpopClientData, SessionRegistry},
     types::{AuthorizeOptions, CallbackParams},
+    utils::generate_verifier,
 };
+use http::HeaderValue;
 use jacquard_common::{
     AuthorizationToken, CowStr, IntoStatic,
     cowstr::ToCowStr,
@@ -34,6 +36,24 @@ use smol_str::ToSmolStr;
 use std::{future::Future, sync::Arc};
 use tokio::sync::RwLock;
 use url::Url;
+
+fn validate_authorization_location(value: &str) -> Result<()> {
+    HeaderValue::from_str(value)
+        .map(|_| ())
+        .map_err(|error| RequestError::http_build(error).into())
+}
+
+fn parse_returned_scopes(scope: Option<&str>) -> Result<Vec<Scope<'static>>> {
+    scope
+        .map(Scope::parse_multiple_reduced)
+        .transpose()
+        .map(|scopes| scopes.unwrap_or_default().into_static())
+        .map_err(|_| RequestError::token_verification().into())
+}
+
+fn fresh_session_id() -> CowStr<'static> {
+    generate_verifier()
+}
 
 pub struct OAuthClient<T, S>
 where
@@ -144,7 +164,10 @@ where
 
 #[cfg(test)]
 mod revocation_security_tests {
-    use super::complete_logout_after_revocation;
+    use super::{
+        complete_logout_after_revocation, fresh_session_id, parse_returned_scopes,
+        validate_authorization_location,
+    };
     use crate::types::OAuthAuthorizationServerMetadata;
     use crate::{
         atproto::AtprotoClientMetadata,
@@ -701,6 +724,33 @@ mod revocation_security_tests {
                 expires_at: None,
             },
         }
+    }
+
+    #[test]
+    fn completed_session_credential_is_fresh_and_provider_state_independent() {
+        let provider_visible_state = "provider-visible-oauth-state";
+        let first = fresh_session_id();
+        let second = fresh_session_id();
+
+        assert_ne!(first.as_str(), provider_visible_state);
+        assert_ne!(second.as_str(), provider_visible_state);
+        assert_ne!(first, second);
+        assert!(first.len() >= 43);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+    }
+
+    #[test]
+    fn returned_scopes_and_authorization_locations_fail_typed() {
+        assert!(parse_returned_scopes(Some("atproto")).is_ok());
+        assert!(parse_returned_scopes(Some("unknown:scope")).is_err());
+        assert!(validate_authorization_location("https://issuer.example/authorize").is_ok());
+        assert!(
+            validate_authorization_location("https://issuer.example/authorize\ninvalid").is_err()
+        );
     }
 
     #[tokio::test]
@@ -1791,6 +1841,10 @@ where
             keyset: self.registry.client_data.keyset.clone(),
         };
 
+        // Reject metadata that cannot be represented as a single HTTP Location
+        // value before PAR work or callback state is persisted.
+        validate_authorization_location(metadata.server_metadata.authorization_endpoint.as_str())?;
+
         let mut auth_req_info = par(
             self.client.as_ref(),
             login_hint,
@@ -1812,13 +1866,14 @@ where
             client_id: CowStr<'s>,
             request_uri: CowStr<'s>,
         }
-        Ok(metadata.server_metadata.authorization_endpoint.to_string()
-            + "?"
-            + &serde_html_form::to_string(Parameters {
-                client_id: metadata.client_metadata.client_id,
-                request_uri: auth_req_info.request_uri,
-            })
-            .unwrap())
+        let parameters = serde_html_form::to_string(Parameters {
+            client_id: metadata.client_metadata.client_id,
+            request_uri: auth_req_info.request_uri,
+        })?;
+        let authorization_location =
+            metadata.server_metadata.authorization_endpoint.to_string() + "?" + &parameters;
+        validate_authorization_location(&authorization_location)?;
+        Ok(authorization_location)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "info", skip_all, fields(state = params.state.as_ref().map(|s| s.as_ref()))))]
@@ -1870,17 +1925,15 @@ where
         .await
         {
             Ok(token_set) => {
-                let scopes = if let Some(scope) = &token_set.scope {
-                    Scope::parse_multiple_reduced(&scope)
-                        .expect("Failed to parse scopes")
-                        .into_static()
-                } else {
-                    vec![]
-                };
+                let scopes = parse_returned_scopes(token_set.scope.as_deref())?;
+                // OAuth state is provider-visible protocol correlation data. A
+                // completed Nest session receives a new independent capability
+                // only after the token, subject, issuer, and scopes are valid.
+                let session_id = fresh_session_id();
                 let client_data = ClientSessionData {
                     lifecycle_generation: CowStr::default(),
                     account_did: token_set.sub.clone(),
-                    session_id: auth_req_info.state,
+                    session_id,
                     host_url: token_set.aud.clone(),
                     authserver_url: auth_req_info.authserver_url.to_cowstr(),
                     authserver_token_endpoint: auth_req_info.authserver_token_endpoint,

@@ -5,12 +5,13 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use reqwest::header::HeaderValue;
+use reqwest::{header::HeaderValue, Method};
 use sqlx::{Pool, Postgres};
 
 use crate::config::AppState;
 use crate::services::push::{is_auth_revocation_error, resolve_background_session};
 
+use super::poller::{CHAT_REQUEST_TIMEOUT, MAX_CHAT_RESPONSE_BYTES};
 use super::scheduler::ChatPollScheduler;
 use super::types::ListConvosResponse;
 
@@ -80,11 +81,21 @@ async fn sync_mutes_for_account(
             HeaderValue::from_static("did:web:api.bsky.chat#bsky_chat"),
         );
 
-        let response = state.http_client.get(&url).headers(headers).send().await?;
-
-        let status = response.status().as_u16();
+        let (status, _response_headers, body_bytes) = state
+            .outbound_policy
+            .send_credential_bounded_before(
+                Method::GET,
+                &url,
+                headers,
+                None,
+                MAX_CHAT_RESPONSE_BYTES,
+                tokio::time::Instant::now() + CHAT_REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|error| anyhow!("Mute sync outbound policy rejected request: {error}"))?;
+        let status = status.as_u16();
         if status != 200 {
-            let body = response.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&body_bytes);
             return Err(anyhow!(
                 "listConvos returned {} for {}: {}",
                 status,
@@ -93,7 +104,6 @@ async fn sync_mutes_for_account(
             ));
         }
 
-        let body_bytes = response.bytes().await?;
         let page: ListConvosResponse = serde_json::from_slice(&body_bytes)?;
 
         for convo in &page.convos {

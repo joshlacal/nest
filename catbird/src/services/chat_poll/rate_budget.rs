@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+const MAX_HOST_BACKOFF: Duration = Duration::from_secs(60 * 60);
+
 pub struct PdsRateBudget {
     buckets: Mutex<HashMap<String, TokenBucket>>,
     global_bucket: Mutex<TokenBucket>,
@@ -36,14 +38,20 @@ impl TokenBucket {
 
     fn refill(&mut self) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let Some(elapsed) = now.checked_duration_since(self.last_refill) else {
+            return;
+        };
+        let elapsed = elapsed.as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
         self.last_refill = now;
     }
 
     fn backoff(&mut self, duration: Duration) {
         self.tokens = 0.0;
-        self.last_refill = Instant::now() + duration;
+        let now = Instant::now();
+        self.last_refill = now
+            .checked_add(duration.min(MAX_HOST_BACKOFF))
+            .unwrap_or(now);
     }
 }
 
@@ -92,5 +100,22 @@ impl PdsRateBudget {
         if let Some(bucket) = buckets.get_mut(pds_host) {
             bucket.backoff(duration);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extreme_backoff_is_clamped_and_refill_during_backoff_is_safe() {
+        let mut bucket = TokenBucket::new(10.0, 1.0);
+        let before = Instant::now();
+
+        bucket.backoff(Duration::MAX);
+
+        assert!(bucket.last_refill <= before + MAX_HOST_BACKOFF + Duration::from_secs(1));
+        assert!(!bucket.try_consume());
+        assert_eq!(bucket.tokens, 0.0);
     }
 }

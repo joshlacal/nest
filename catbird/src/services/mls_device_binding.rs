@@ -867,6 +867,16 @@ mod tests {
             ),
             Some(bound.device_id.as_str())
         );
+        assert_eq!(
+            authoritative_device_id(
+                "blue.catbird.mlsChat.commitGroupChange",
+                Some("123e4567-e89b-12d3-a456-426614174999"),
+                None,
+                None,
+            ),
+            None,
+            "request-supplied device fields must not substitute for a bound device"
+        );
     }
 
     #[test]

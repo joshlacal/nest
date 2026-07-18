@@ -8,6 +8,7 @@ pub mod subscriptions;
 pub mod types;
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -23,13 +24,54 @@ use crate::{
 
 use self::{
     apns::ApnsDelivery,
-    decision::{PushDecisionEngine, QueueDisposition},
+    decision::{PushDecisionEngine, QueueDisposition, AUTH_REVOKED_DROP_REASON},
     moderation_cache::ModerationCache,
     preferences::PushPreferences,
     queue::PushQueue,
     registry::PushRegistry,
     subscriptions::PushSubscriptions,
+    types::QueueRow,
 };
+
+#[derive(Debug, PartialEq, Eq)]
+enum FencedDelivery<T> {
+    Revoked,
+    LeaseLost,
+    Sent(T),
+}
+
+/// Keep the authorization and ownership checks adjacent to the external send.
+/// Making the send a callback prevents call sites from accidentally performing
+/// the side effect before either fence succeeds.
+async fn send_with_delivery_fences<
+    T,
+    CheckRevoked,
+    CheckRevokedFuture,
+    Renew,
+    RenewFuture,
+    Send,
+    SendFuture,
+>(
+    check_revoked: CheckRevoked,
+    renew: Renew,
+    send: Send,
+) -> Result<FencedDelivery<T>>
+where
+    CheckRevoked: FnOnce() -> CheckRevokedFuture,
+    CheckRevokedFuture: Future<Output = Result<bool>>,
+    Renew: FnOnce() -> RenewFuture,
+    RenewFuture: Future<Output = Result<bool>>,
+    Send: FnOnce() -> SendFuture,
+    SendFuture: Future<Output = Result<T>>,
+{
+    if check_revoked().await? {
+        return Ok(FencedDelivery::Revoked);
+    }
+    if !renew().await? {
+        return Ok(FencedDelivery::LeaseLost);
+    }
+    Ok(FencedDelivery::Sent(send().await?))
+}
 
 #[derive(Clone)]
 pub struct PushServices {
@@ -81,6 +123,50 @@ impl PushServices {
         });
     }
 
+    async fn delete_claimed_row(&self, row: &QueueRow, action: &'static str) {
+        match self.queue.delete(row.id, row.lease_owner).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    queue_id = row.id,
+                    action,
+                    "Lost push lease before row deletion; current owner will finish it"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    queue_id = row.id,
+                    action,
+                    "Failed to delete claimed push event"
+                );
+            }
+        }
+    }
+
+    async fn retry_claimed_row(&self, row: &QueueRow, error: &str) {
+        match self
+            .queue
+            .retry_later(row.id, row.lease_owner, row.attempts, error)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    queue_id = row.id,
+                    "Lost push lease before retry scheduling; current owner will finish it"
+                );
+            }
+            Err(update_err) => {
+                tracing::error!(
+                    error = %update_err,
+                    queue_id = row.id,
+                    "Failed to schedule push retry"
+                );
+            }
+        }
+    }
+
     async fn run_worker_loop(self: Arc<Self>, state: Arc<AppState>) {
         let Some(apns) = self.apns.clone() else {
             return;
@@ -126,9 +212,7 @@ impl PushServices {
                                 notification_type = %row.notification_type,
                                 "Skipping push event for revoked account (batch cache)"
                             );
-                            if let Err(err) = self.queue.delete(row.id).await {
-                                tracing::error!(error = %err, "Failed to delete revoked-account push event");
-                            }
+                            self.delete_claimed_row(&row, "drop_revoked_batch").await;
                             continue;
                         }
 
@@ -146,36 +230,57 @@ impl PushServices {
                                 age_secs = age.whole_seconds(),
                                 "Dropping stale queued push event"
                             );
-                            if let Err(err) = self.queue.delete(row.id).await {
-                                tracing::error!(error = %err, "Failed to delete stale push event");
-                            }
+                            self.delete_claimed_row(&row, "drop_stale").await;
                             continue;
                         }
 
                         match self.decision.evaluate(&state, &self, &row).await {
                             Ok(QueueDisposition::Drop(reason)) => {
+                                if reason == AUTH_REVOKED_DROP_REASON {
+                                    revoked_dids.insert(row.recipient_did.clone());
+                                }
                                 tracing::debug!(
                                     recipient = %row.recipient_did,
                                     notification_type = %row.notification_type,
                                     reason = reason,
                                     "Dropping queued push event"
                                 );
-                                if let Err(err) = self.queue.delete(row.id).await {
-                                    tracing::error!(error = %err, "Failed to delete dropped push event");
-                                }
+                                self.delete_claimed_row(&row, "drop_decision").await;
                             }
                             Ok(QueueDisposition::Deliver(deliveries)) => {
                                 let mut transient_error = None;
+                                let mut lease_lost = false;
 
                                 for (registration, notification) in deliveries {
-                                    match apns.send(&registration, &notification).await {
-                                        Ok(delivered_env) => {
+                                    match send_with_delivery_fences(
+                                        || self.registry.is_auth_revoked(&row.recipient_did),
+                                        || self.queue.renew(row.id, row.lease_owner),
+                                        || apns.send(&registration, &notification),
+                                    )
+                                    .await
+                                    {
+                                        Ok(FencedDelivery::Revoked) => {
+                                            tracing::info!(
+                                                recipient = %row.recipient_did,
+                                                "Auth revoked before APNs delivery; skipping remaining events for account"
+                                            );
+                                            revoked_dids.insert(row.recipient_did.clone());
+                                            break;
+                                        }
+                                        Ok(FencedDelivery::LeaseLost) => {
+                                            tracing::warn!(
+                                                queue_id = row.id,
+                                                "Lost push lease before APNs delivery; suppressing stale side effect"
+                                            );
+                                            lease_lost = true;
+                                            break;
+                                        }
+                                        Ok(FencedDelivery::Sent(delivered_env)) => {
                                             if registration.apns_environment.as_deref()
                                                 != Some(delivered_env)
                                             {
                                                 tracing::info!(
                                                     did = %registration.did,
-                                                    token = %registration.device_token,
                                                     env = delivered_env,
                                                     "Learned APNs environment"
                                                 );
@@ -192,55 +297,56 @@ impl PushServices {
                                                 }
                                             }
                                         }
-                                        Err(err) if is_invalid_token(&err) => {
-                                            tracing::info!(
-                                                did = %registration.did,
-                                                token = %registration.device_token,
-                                                "Deactivating invalid APNs token"
-                                            );
-                                            if let Err(update_err) = self
-                                                .registry
-                                                .deactivate_invalid_token(
-                                                    &registration.did,
-                                                    &registration.device_token,
-                                                    "apns_unregistered",
-                                                )
-                                                .await
-                                            {
-                                                tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
-                                            } else if let Some(push_db) = state.push_db.as_ref() {
-                                                let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
-                                                if let Err(err) = scheduler
-                                                    .unenroll_account_if_no_active_devices(
+                                        Err(err) => match classify_apns_failure(&err) {
+                                            ApnsFailureKind::InvalidToken => {
+                                                tracing::info!(
+                                                    did = %registration.did,
+                                                    "Deactivating invalid APNs token"
+                                                );
+                                                if let Err(update_err) = self
+                                                    .registry
+                                                    .deactivate_invalid_token(
                                                         &registration.did,
+                                                        &registration.device_token,
+                                                        "apns_invalid_token",
                                                     )
                                                     .await
                                                 {
-                                                    tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
+                                                    tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
+                                                } else if let Some(push_db) = state.push_db.as_ref()
+                                                {
+                                                    let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
+                                                    if let Err(err) = scheduler
+                                                        .unenroll_account_if_no_active_devices(
+                                                            &registration.did,
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
+                                                    }
                                                 }
                                             }
-                                        }
-                                        Err(err) if is_auth_revocation_error(&err) => {
-                                            tracing::info!(
-                                                recipient = %row.recipient_did,
-                                                error = %err,
-                                                "Auth revoked during delivery; skipping remaining events for account"
-                                            );
-                                            revoked_dids.insert(row.recipient_did.clone());
-                                            break;
-                                        }
-                                        Err(err) => {
-                                            transient_error = Some(err);
-                                            break;
-                                        }
+                                            ApnsFailureKind::Permanent => {
+                                                tracing::warn!(
+                                                    error = %err,
+                                                    did = %registration.did,
+                                                    "Permanent APNs rejection; dropping delivery without retry"
+                                                );
+                                            }
+                                            ApnsFailureKind::Transient => {
+                                                transient_error = Some(err);
+                                                break;
+                                            }
+                                        },
                                     }
                                 }
 
-                                if revoked_dids.contains(&row.recipient_did) {
+                                if lease_lost {
+                                    // A newer claimant owns completion and retry state.
+                                    continue;
+                                } else if revoked_dids.contains(&row.recipient_did) {
                                     // Auth was revoked during delivery — delete, don't retry
-                                    if let Err(err) = self.queue.delete(row.id).await {
-                                        tracing::error!(error = %err, "Failed to delete revoked-account push event");
-                                    }
+                                    self.delete_claimed_row(&row, "drop_revoked_delivery").await;
                                 } else if let Some(err) = transient_error {
                                     // Known limitation: retrying the row re-sends to
                                     // registrations that already succeeded this attempt.
@@ -254,15 +360,9 @@ impl PushServices {
                                         error = %err,
                                         "Transient push delivery failure; scheduling retry"
                                     );
-                                    if let Err(update_err) = self
-                                        .queue
-                                        .retry_later(row.id, row.attempts, &err.to_string())
-                                        .await
-                                    {
-                                        tracing::error!(error = %update_err, "Failed to schedule push retry");
-                                    }
-                                } else if let Err(err) = self.queue.delete(row.id).await {
-                                    tracing::error!(error = %err, "Failed to delete delivered push event");
+                                    self.retry_claimed_row(&row, &err.to_string()).await;
+                                } else {
+                                    self.delete_claimed_row(&row, "complete_delivery").await;
                                 }
                             }
                             Err(err) if is_auth_revocation_error(&err) => {
@@ -272,9 +372,7 @@ impl PushServices {
                                     "Auth revoked during decision evaluation; skipping remaining events for account"
                                 );
                                 revoked_dids.insert(row.recipient_did.clone());
-                                if let Err(del_err) = self.queue.delete(row.id).await {
-                                    tracing::error!(error = %del_err, "Failed to delete revoked-account push event");
-                                }
+                                self.delete_claimed_row(&row, "drop_revoked_decision").await;
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -283,13 +381,7 @@ impl PushServices {
                                     error = %err,
                                     "Push decision pipeline failed; scheduling retry"
                                 );
-                                if let Err(update_err) = self
-                                    .queue
-                                    .retry_later(row.id, row.attempts, &err.to_string())
-                                    .await
-                                {
-                                    tracing::error!(error = %update_err, "Failed to schedule push retry");
-                                }
+                                self.retry_claimed_row(&row, &err.to_string()).await;
                             }
                         }
                     }
@@ -358,9 +450,9 @@ impl PushServices {
                         }
                     };
 
-                // Claim the queue row before doing anything else: only an
-                // UNLEASED row (one the durable worker hasn't picked up) is
-                // deleted here, so at most one path ever delivers this event.
+                // Claim the queue row before doing anything else. Only a
+                // never-leased row for an account that is still active can be
+                // deleted here; durable attempts remain under lease fencing.
                 let dedupe_key = event.dedupe_key();
                 match self.queue.claim_by_dedupe_key(&dedupe_key).await {
                     Ok(true) => {}
@@ -370,6 +462,37 @@ impl PushServices {
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "Chat push claim failed; leaving to durable path");
+                        continue;
+                    }
+                }
+
+                // Account state can change immediately after the atomic claim.
+                // Recheck before any policy work; a lookup outage requeues to
+                // preserve at-least-once delivery.
+                match self.registry.is_auth_revoked(&event.recipient_did).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        tracing::debug!(
+                            did = %event.recipient_did,
+                            "Chat push fast-path dropped: auth_revoked"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            did = %event.recipient_did,
+                            "Chat push fast-path revocation lookup failed; requeuing"
+                        );
+                        if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
+                            self.queue.pool(),
+                            &event,
+                            0,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %err, "Failed to requeue chat push after revocation lookup failure");
+                        }
                         continue;
                     }
                 }
@@ -479,16 +602,38 @@ impl PushServices {
                     thread_id: Some(format!("chat:{}", event.convo_id)),
                 };
 
-                // Fan out to all devices
-                let mut delivered_count = 0usize;
+                // Fan out to all devices. Revocation is checked immediately
+                // before every APNs side effect; the successful atomic delete
+                // above is the fast path's ownership claim.
+                let mut retryable_failure = false;
+                let mut revoked = false;
                 for registration in &registrations {
+                    match self.registry.is_auth_revoked(&event.recipient_did).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            revoked = true;
+                            tracing::info!(
+                                recipient = %event.recipient_did,
+                                "Auth revoked before chat fast-path APNs delivery"
+                            );
+                            break;
+                        }
+                        Err(err) => {
+                            retryable_failure = true;
+                            tracing::warn!(
+                                error = %err,
+                                did = %event.recipient_did,
+                                "Chat fast-path revocation check failed before APNs delivery"
+                            );
+                            break;
+                        }
+                    }
+
                     match apns.send(registration, &notification).await {
                         Ok(delivered_env) => {
-                            delivered_count += 1;
                             if registration.apns_environment.as_deref() != Some(delivered_env) {
                                 tracing::info!(
                                     did = %registration.did,
-                                    token = %registration.device_token,
                                     env = delivered_env,
                                     "Learned APNs environment (chat push fast-path)"
                                 );
@@ -505,49 +650,59 @@ impl PushServices {
                                 }
                             }
                         }
-                        Err(err) if is_invalid_token(&err) => {
-                            tracing::info!(
-                                did = %registration.did,
-                                token = %registration.device_token,
-                                "Deactivating invalid APNs token (chat push fast-path)"
-                            );
-                            if let Err(update_err) = self
-                                .registry
-                                .deactivate_invalid_token(
-                                    &registration.did,
-                                    &registration.device_token,
-                                    "apns_unregistered",
-                                )
-                                .await
-                            {
-                                tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
-                            } else if let Some(push_db) = state.push_db.as_ref() {
-                                let scheduler =
-                                    crate::services::chat_poll::scheduler::ChatPollScheduler::new(
-                                        push_db.clone(),
-                                    );
-                                if let Err(err) = scheduler
-                                    .unenroll_account_if_no_active_devices(&registration.did)
+                        Err(err) => match classify_apns_failure(&err) {
+                            ApnsFailureKind::InvalidToken => {
+                                tracing::info!(
+                                    did = %registration.did,
+                                    "Deactivating invalid APNs token (chat push fast-path)"
+                                );
+                                if let Err(update_err) = self
+                                    .registry
+                                    .deactivate_invalid_token(
+                                        &registration.did,
+                                        &registration.device_token,
+                                        "apns_invalid_token",
+                                    )
                                     .await
                                 {
-                                    tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
+                                    tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
+                                } else if let Some(push_db) = state.push_db.as_ref() {
+                                    let scheduler =
+                                        crate::services::chat_poll::scheduler::ChatPollScheduler::new(
+                                            push_db.clone(),
+                                        );
+                                    if let Err(err) = scheduler
+                                        .unenroll_account_if_no_active_devices(&registration.did)
+                                        .await
+                                    {
+                                        tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
+                                    }
                                 }
                             }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                did = %event.recipient_did,
-                                token = %registration.device_token,
-                                "Chat push fast-path delivery failed"
-                            );
-                        }
+                            ApnsFailureKind::Permanent => {
+                                tracing::warn!(
+                                    error = %err,
+                                    did = %event.recipient_did,
+                                    "Permanent chat fast-path APNs rejection; not requeuing"
+                                );
+                            }
+                            ApnsFailureKind::Transient => {
+                                retryable_failure = true;
+                                tracing::warn!(
+                                    error = %err,
+                                    did = %event.recipient_did,
+                                    "Transient chat push fast-path delivery failure"
+                                );
+                                break;
+                            }
+                        },
                     }
                 }
 
-                // We claimed the row; if NOTHING was delivered, hand it back
-                // to the durable path so the notification isn't lost.
-                if delivered_count == 0 {
+                // Requeue every genuinely transient failure, including partial
+                // fanout. This can duplicate an earlier successful send but
+                // preserves the queue's at-least-once contract.
+                if retryable_failure && !revoked {
                     if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
                         self.queue.pool(),
                         &event,
@@ -567,26 +722,55 @@ impl PushServices {
     }
 }
 
-fn is_invalid_token(err: &anyhow::Error) -> bool {
-    if let Some(a2_err) = err.downcast_ref::<a2::Error>() {
-        if let a2::Error::ResponseError(response) = a2_err {
-            if response.code == 410 {
-                return true;
-            }
-            // ApnsDelivery::send already retries BadDeviceToken once against
-            // the other environment, so a BadDeviceToken reaching here means
-            // both endpoints rejected the token — it's genuinely invalid,
-            // not just aimed at the wrong environment.
-            if let Some(body) = response.error.as_ref() {
-                if body.reason == a2::ErrorReason::BadDeviceToken {
-                    return true;
-                }
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApnsFailureKind {
+    InvalidToken,
+    Permanent,
+    Transient,
+}
+
+fn classify_apns_failure(err: &anyhow::Error) -> ApnsFailureKind {
+    if let Some(a2::Error::ResponseError(response)) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<a2::Error>())
+    {
+        if response.code == 410 {
+            return ApnsFailureKind::InvalidToken;
         }
+        if let Some(body) = response.error.as_ref() {
+            use a2::ErrorReason;
+            return match &body.reason {
+                ErrorReason::BadDeviceToken
+                | ErrorReason::DeviceTokenNotForTopic
+                | ErrorReason::Unregistered => ApnsFailureKind::InvalidToken,
+                ErrorReason::IdleTimeout
+                | ErrorReason::ExpiredProviderToken
+                | ErrorReason::TooManyProviderTokenUpdates
+                | ErrorReason::TooManyRequests
+                | ErrorReason::InternalServerError
+                | ErrorReason::ServiceUnavailable
+                | ErrorReason::Shutdown => ApnsFailureKind::Transient,
+                _ => ApnsFailureKind::Permanent,
+            };
+        }
+        return match response.code {
+            429 | 500 | 503 => ApnsFailureKind::Transient,
+            400 | 403 | 405 | 413 => ApnsFailureKind::Permanent,
+            _ => ApnsFailureKind::Transient,
+        };
     }
 
     let message = err.to_string().to_ascii_lowercase();
-    message.contains("unregistered")
+    if message.contains("unregistered")
+        || message.contains("bad device token")
+        || message.contains("device token does not match")
+    {
+        ApnsFailureKind::InvalidToken
+    } else {
+        // Transport, database-fence, and unknown failures retain at-least-once
+        // retry semantics.
+        ApnsFailureKind::Transient
+    }
 }
 
 pub(crate) async fn resolve_background_session(
@@ -748,6 +932,118 @@ pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
 
 pub(crate) fn push_unavailable_error() -> AppError {
     AppError::Config("Push control plane is not configured".into())
+}
+
+#[cfg(test)]
+mod delivery_fencing_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    use super::*;
+
+    fn apns_error(reason: a2::ErrorReason, code: u16) -> anyhow::Error {
+        anyhow::Error::new(a2::Error::ResponseError(a2::Response {
+            error: Some(a2::ErrorBody {
+                reason,
+                timestamp: None,
+            }),
+            apns_id: None,
+            code,
+        }))
+    }
+
+    #[tokio::test]
+    async fn delivery_fence_renews_immediately_before_send() {
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let check_steps = steps.clone();
+        let renew_steps = steps.clone();
+        let send_steps = steps.clone();
+
+        let outcome = send_with_delivery_fences(
+            move || async move {
+                check_steps.lock().unwrap().push("revocation");
+                Ok(false)
+            },
+            move || async move {
+                renew_steps.lock().unwrap().push("renew");
+                Ok(true)
+            },
+            move || async move {
+                send_steps.lock().unwrap().push("send");
+                Ok("production")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, FencedDelivery::Sent("production"));
+        assert_eq!(
+            steps.lock().unwrap().as_slice(),
+            ["revocation", "renew", "send"]
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_lease_suppresses_external_send() {
+        let sent = Arc::new(AtomicBool::new(false));
+        let send_state = sent.clone();
+
+        let outcome = send_with_delivery_fences(
+            || async { Ok(false) },
+            || async { Ok(false) },
+            move || async move {
+                send_state.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, FencedDelivery::LeaseLost);
+        assert!(!sent.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn permanent_apns_rejections_never_enter_transient_retry() {
+        assert_eq!(
+            classify_apns_failure(&apns_error(a2::ErrorReason::DeviceTokenNotForTopic, 400)),
+            ApnsFailureKind::InvalidToken
+        );
+        assert_eq!(
+            classify_apns_failure(&apns_error(a2::ErrorReason::Unregistered, 410)),
+            ApnsFailureKind::InvalidToken
+        );
+        assert_eq!(
+            classify_apns_failure(&apns_error(a2::ErrorReason::PayloadTooLarge, 413)),
+            ApnsFailureKind::Permanent
+        );
+        assert_eq!(
+            classify_apns_failure(&apns_error(a2::ErrorReason::ServiceUnavailable, 503)),
+            ApnsFailureKind::Transient
+        );
+    }
+
+    #[test]
+    fn operational_push_logs_do_not_emit_device_tokens() {
+        let sources = [include_str!("mod.rs"), include_str!("apns.rs")];
+        let forbidden = [
+            ["token", " = %registration.device_token"].concat(),
+            ["device_", "token ="].concat(),
+            ["token_", "hash"].concat(),
+            ["token_", "prefix"].concat(),
+        ];
+
+        for source in sources {
+            for value in &forbidden {
+                assert!(
+                    !source.contains(value),
+                    "push source contains forbidden token log field"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

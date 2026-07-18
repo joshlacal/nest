@@ -596,7 +596,7 @@ pub async fn par<'r, T: OAuthResolver + DpopExt + Send + Sync + 'static>(
 
         let scopes = if let Some(scope) = &metadata.client_metadata.scope {
             Scope::parse_multiple_reduced(&scope)
-                .expect("Failed to parse scopes")
+                .map_err(|_| RequestError::token_verification())?
                 .into_static()
         } else {
             vec![]
@@ -663,15 +663,8 @@ where
     )
     .await?;
 
-    let (_, expires_in) =
+    let (_, expires_at) =
         validate_oauth_token_response(&response, Some(&session_data.token_set.sub), false)?;
-
-    let expires_at = {
-        let now = Datetime::now();
-        now.as_ref()
-            .checked_add_signed(TimeDelta::seconds(expires_in))
-            .map(Datetime::new)
-    };
 
     session_data.update_with_tokens(TokenSet {
         iss,
@@ -681,7 +674,7 @@ where
         access_token: CowStr::Owned(response.access_token),
         refresh_token: response.refresh_token.map(CowStr::Owned),
         token_type: response.token_type,
-        expires_at,
+        expires_at: Some(expires_at),
     });
 
     Ok(session_data)
@@ -716,7 +709,7 @@ where
         metadata,
     )
     .await?;
-    let (sub, expires_in) = validate_oauth_token_response(&token_response, expected_sub, true)?;
+    let (sub, expires_at) = validate_oauth_token_response(&token_response, expected_sub, true)?;
     let sub = sub.expect("required token subject was validated");
     let iss = metadata.server_metadata.issuer.clone();
     // /!\ IMPORTANT /!\
@@ -727,12 +720,6 @@ where
         .verify_issuer(&metadata.server_metadata, &sub)
         .await?;
 
-    let expires_at = {
-        Datetime::now()
-            .as_ref()
-            .checked_add_signed(TimeDelta::seconds(expires_in))
-            .map(Datetime::new)
-    };
     Ok(TokenSet {
         iss,
         sub,
@@ -741,7 +728,7 @@ where
         access_token: CowStr::Owned(token_response.access_token),
         refresh_token: token_response.refresh_token.map(CowStr::Owned),
         token_type: token_response.token_type,
-        expires_at,
+        expires_at: Some(expires_at),
     })
 }
 
@@ -749,7 +736,7 @@ fn validate_oauth_token_response(
     response: &OAuthTokenResponse,
     expected_sub: Option<&Did<'_>>,
     require_sub: bool,
-) -> Result<(Option<Did<'static>>, i64)> {
+) -> Result<(Option<Did<'static>>, Datetime)> {
     if response.token_type != crate::types::OAuthTokenType::DPoP {
         return Err(RequestError::token_verification());
     }
@@ -758,6 +745,16 @@ fn validate_oauth_token_response(
         .expires_in
         .filter(|seconds| *seconds > 0)
         .ok_or_else(RequestError::token_verification)?;
+    let expires_delta =
+        TimeDelta::try_seconds(expires_in).ok_or_else(RequestError::token_verification)?;
+    let expires_at = Datetime::now()
+        .as_ref()
+        .checked_add_signed(expires_delta)
+        .map(Datetime::new)
+        .ok_or_else(RequestError::token_verification)?;
+    if let Some(scope) = response.scope.as_deref() {
+        Scope::parse_multiple_reduced(scope).map_err(|_| RequestError::token_verification())?;
+    }
     let returned_sub = response.sub.clone().map(Did::new_owned).transpose()?;
 
     if require_sub && returned_sub.is_none() {
@@ -769,7 +766,7 @@ fn validate_oauth_token_response(
         }
     }
 
-    Ok((returned_sub, expires_in))
+    Ok((returned_sub, expires_at))
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
@@ -1241,6 +1238,43 @@ mod tests {
         assert!(
             super::validate_oauth_token_response(&refresh_without_sub, Some(&expected), false)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn token_response_security_rejects_unrepresentable_expiry_and_malformed_scope() {
+        let expected = Did::new_static("did:plc:alice").unwrap();
+        let valid = OAuthTokenResponse {
+            access_token: "token".into(),
+            token_type: crate::types::OAuthTokenType::DPoP,
+            expires_in: Some(3600),
+            refresh_token: Some("refresh".into()),
+            scope: Some("atproto".into()),
+            sub: Some("did:plc:alice".into()),
+        };
+
+        for expires_in in [i64::MAX, i64::MAX / 1000] {
+            let mut invalid = valid.clone();
+            invalid.expires_in = Some(expires_in);
+            assert!(
+                super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err(),
+                "initial exchange accepted expires_in={expires_in}"
+            );
+            assert!(
+                super::validate_oauth_token_response(&invalid, Some(&expected), false).is_err(),
+                "refresh accepted expires_in={expires_in}"
+            );
+        }
+
+        let mut invalid = valid;
+        invalid.scope = Some("unknown:scope".into());
+        assert!(
+            super::validate_oauth_token_response(&invalid, Some(&expected), true).is_err(),
+            "initial exchange accepted malformed returned scope"
+        );
+        assert!(
+            super::validate_oauth_token_response(&invalid, Some(&expected), false).is_err(),
+            "refresh accepted malformed returned scope"
         );
     }
 

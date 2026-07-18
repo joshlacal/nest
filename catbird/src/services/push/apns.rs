@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use a2::{
     Client, DefaultNotificationBuilder, Error as A2Error, ErrorReason, NotificationBuilder,
@@ -26,6 +26,28 @@ pub struct ApnsNotification {
 /// was signed/installed.
 const ENV_PRODUCTION: &str = "production";
 const ENV_SANDBOX: &str = "sandbox";
+
+/// Bound one complete APNs endpoint attempt, including receipt of a rejected
+/// response body. This is also installed in `a2::ClientConfig`, but the outer
+/// timeout is intentional: a2's internal timeout ends once response headers
+/// arrive, before it collects a non-success response body.
+pub(super) const APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS: u64 = 20;
+
+/// Delivery tries at most the recorded/default environment and, only for a
+/// `BadDeviceToken`, the other environment.
+pub(super) const APNS_MAX_ENDPOINT_ATTEMPTS: u64 = 2;
+
+/// A durable queue lease must outlive every bounded endpoint attempt plus
+/// scheduling/processing margin. Keep the lease derived from the configured
+/// attempt timeout so changing that timeout cannot silently reopen the
+/// duplicate-send window.
+pub(super) const APNS_DELIVERY_LEASE_MARGIN_SECS: u64 = 15;
+pub(super) const APNS_DELIVERY_LEASE_SECS: u64 = APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS
+    * APNS_MAX_ENDPOINT_ATTEMPTS
+    + APNS_DELIVERY_LEASE_MARGIN_SECS;
+const _: () = assert!(
+    APNS_DELIVERY_LEASE_SECS > APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS * APNS_MAX_ENDPOINT_ATTEMPTS
+);
 
 /// Picks which APNs environment to try first for a registration.
 ///
@@ -95,13 +117,13 @@ impl ApnsDelivery {
             std::fs::File::open(key_path)?,
             key_id,
             team_id,
-            a2::ClientConfig::new(a2::Endpoint::Production),
+            client_config(a2::Endpoint::Production),
         )?;
         let sandbox_client = Client::token(
             std::fs::File::open(key_path)?,
             key_id,
             team_id,
-            a2::ClientConfig::new(a2::Endpoint::Sandbox),
+            client_config(a2::Endpoint::Sandbox),
         )?;
 
         Ok(Some(Self {
@@ -120,13 +142,29 @@ impl ApnsDelivery {
         }
     }
 
+    async fn send_to_environment<'a>(
+        &self,
+        env: &str,
+        payload: a2::request::payload::Payload<'a>,
+    ) -> std::result::Result<a2::Response, A2Error> {
+        match tokio::time::timeout(
+            Duration::from_secs(APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS),
+            self.client_for(env).send(payload),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(A2Error::RequestTimeout(APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS)),
+        }
+    }
+
     /// Sends a notification to a device, trying the environment recorded on
     /// the registration (or the configured default if unknown) first.
     ///
     /// If APNs rejects the token with `BadDeviceToken` — which happens when a
     /// sandbox token is sent to the production endpoint or vice versa — the
     /// notification is retried once against the other environment. If that
-    /// also fails with `BadDeviceToken`, the original error is returned so
+    /// also fails with `BadDeviceToken`, the second rejection is returned so
     /// callers can deactivate the token as invalid.
     ///
     /// Returns the APNs environment ("production" or "sandbox") that
@@ -144,7 +182,7 @@ impl ApnsDelivery {
             self.default_production,
         );
 
-        match self.client_for(first_env).send(payload.clone()).await {
+        match self.send_to_environment(first_env, payload.clone()).await {
             Ok(_) => Ok(first_env),
             Err(err) if is_bad_device_token(&err) => {
                 let second_env = other_env(first_env);
@@ -154,14 +192,14 @@ impl ApnsDelivery {
                     second_env,
                     "APNs BadDeviceToken on first attempt; retrying on other environment"
                 );
-                match self.client_for(second_env).send(payload).await {
+                match self.send_to_environment(second_env, payload).await {
                     Ok(_) => Ok(second_env),
                     Err(second_err) => {
                         // BadDeviceToken on both endpoints means the token is
                         // genuinely invalid, not just aimed at the wrong
-                        // environment. Surface the original error so
-                        // `is_invalid_token` (which also checks for
-                        // BadDeviceToken) can deactivate it.
+                        // environment. Surface the second typed response so the
+                        // caller can classify token, permanent, and transient
+                        // failures without losing APNs' reason.
                         Err(anyhow::Error::new(second_err))
                     }
                 }
@@ -208,6 +246,12 @@ impl ApnsDelivery {
     }
 }
 
+fn client_config(endpoint: a2::Endpoint) -> a2::ClientConfig {
+    let mut config = a2::ClientConfig::new(endpoint);
+    config.request_timeout_secs = Some(APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS);
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +281,20 @@ mod tests {
     }
 
     #[test]
+    fn delivery_lease_covers_all_bounded_endpoint_attempts_with_margin() {
+        assert_eq!(
+            client_config(a2::Endpoint::Production).request_timeout_secs,
+            Some(APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS)
+        );
+        assert_eq!(APNS_MAX_ENDPOINT_ATTEMPTS, 2);
+        assert_eq!(
+            APNS_DELIVERY_LEASE_SECS,
+            APNS_ENDPOINT_ATTEMPT_TIMEOUT_SECS * APNS_MAX_ENDPOINT_ATTEMPTS
+                + APNS_DELIVERY_LEASE_MARGIN_SECS
+        );
+    }
+
+    #[test]
     fn is_bad_device_token_matches_response_error_reason() {
         let bad_token_err = A2Error::ResponseError(a2::Response {
             error: Some(a2::ErrorBody {
@@ -257,5 +315,15 @@ mod tests {
             code: 410,
         });
         assert!(!is_bad_device_token(&unregistered_err));
+
+        let wrong_topic_err = A2Error::ResponseError(a2::Response {
+            error: Some(a2::ErrorBody {
+                reason: ErrorReason::DeviceTokenNotForTopic,
+                timestamp: None,
+            }),
+            apns_id: None,
+            code: 400,
+        });
+        assert!(!is_bad_device_token(&wrong_topic_err));
     }
 }

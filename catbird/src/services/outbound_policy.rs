@@ -215,6 +215,34 @@ impl OutboundPolicy {
         Ok((status, headers, body))
     }
 
+    /// Send a credential-bearing request without ever replaying its headers
+    /// across a redirect, and collect the response under the caller's byte
+    /// budget and absolute deadline.
+    ///
+    /// DNS is resolved and classified immediately before dispatch, and the
+    /// accepted addresses are pinned into the per-request HTTP client. This
+    /// is the authenticated counterpart to [`Self::send_discovery`].
+    pub(crate) async fn send_credential_bounded_before(
+        &self,
+        method: Method,
+        input: &str,
+        headers: HeaderMap,
+        body: Option<bytes::Bytes>,
+        max_response_bytes: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<(reqwest::StatusCode, HeaderMap, bytes::Bytes), PolicyError> {
+        send_credential_bounded_before_with_io(
+            self,
+            method,
+            input,
+            headers,
+            body,
+            max_response_bytes,
+            deadline,
+        )
+        .await
+    }
+
     async fn send_bounded(
         &self,
         method: Method,
@@ -259,6 +287,33 @@ impl OutboundPolicy {
             .await
             .map_err(|e| PolicyError(format!("outbound request failed: {e}")))
     }
+}
+
+async fn send_credential_bounded_before_with_io<I: OutboundIo + ?Sized>(
+    io: &I,
+    method: Method,
+    input: &str,
+    headers: HeaderMap,
+    body: Option<bytes::Bytes>,
+    max_response_bytes: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(reqwest::StatusCode, HeaderMap, bytes::Bytes), PolicyError> {
+    let (response, deadline) = send_bounded_until_with_io(
+        io,
+        method,
+        input,
+        headers,
+        body,
+        deadline,
+        RedirectMode::Reject,
+        None,
+        1,
+    )
+    .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = read_response_bounded(response, max_response_bytes, deadline).await?;
+    Ok((status, headers, body))
 }
 
 async fn send_bounded_with_io<I: OutboundIo + ?Sized>(
@@ -541,6 +596,11 @@ impl IdentityResolver for PolicyOAuthResolver {
 impl jacquard_oauth::resolver::OAuthResolver for PolicyOAuthResolver {}
 impl jacquard_oauth::dpop::DpopExt for PolicyOAuthResolver {}
 
+/// Shared fail-closed SSRF classifier for literal and DNS-resolved addresses.
+///
+/// IPv6 is limited to IANA's global-unicast `2000::/3` allocation, with the
+/// existing special-purpose exclusions applied inside that allocation. IPv4-
+/// mapped IPv6 addresses deliberately reuse the IPv4 policy.
 pub fn is_global(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_global_v4(ip),
@@ -589,24 +649,25 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
         return is_global_v4(v4);
     }
     let segments = ip.segments();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || (segments[0] == 0
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0
-            && segments[4] == 0
-            && segments[5] == 0)
-        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
-        || (segments[0] == 0x0100 && segments[1] == 0)
-        || (segments[0] == 0x2001 && segments[1] <= 0x01ff)
-        || segments[0] == 0x2002
-        || (segments[0] & 0xfff0) == 0x3ff0
-        || segments[0] == 0x5f00
-        || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+    (segments[0] & 0xe000) == 0x2000
+        && !(ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || (segments[0] == 0
+                && segments[1] == 0
+                && segments[2] == 0
+                && segments[3] == 0
+                && segments[4] == 0
+                && segments[5] == 0)
+            || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+            || (segments[0] == 0x0100 && segments[1] == 0)
+            || (segments[0] == 0x2001 && segments[1] <= 0x01ff)
+            || segments[0] == 0x2002
+            || (segments[0] & 0xfff0) == 0x3ff0
+            || segments[0] == 0x5f00
+            || (segments[0] & 0xfe00) == 0xfc00
+            || (segments[0] & 0xffc0) == 0xfe80
+            || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
 #[cfg(test)]
@@ -617,6 +678,7 @@ mod tests {
     use jacquard_common::http_client::HttpClient;
     use jacquard_oauth::{dpop::wrap_request_with_dpop, session::DpopReqData};
     use reqwest::StatusCode;
+    use std::collections::VecDeque;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex};
@@ -632,6 +694,22 @@ mod tests {
     struct CaptureIo {
         redirect_status: StatusCode,
         dispatches: Arc<Mutex<Vec<CapturedDispatch>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedPinnedDispatch {
+        url: String,
+        addresses: Vec<IpAddr>,
+        headers: HeaderMap,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedAddressIo {
+        answers: Arc<Mutex<VecDeque<Vec<IpAddr>>>>,
+        validations: Arc<Mutex<usize>>,
+        dispatches: Arc<Mutex<Vec<CapturedPinnedDispatch>>>,
+        response_status: StatusCode,
+        response_body: Bytes,
     }
 
     #[derive(Clone, Default)]
@@ -758,6 +836,70 @@ mod tests {
         }
     }
 
+    impl ScriptedAddressIo {
+        fn new(answers: Vec<Vec<IpAddr>>, response_status: StatusCode) -> Self {
+            Self {
+                answers: Arc::new(Mutex::new(answers.into())),
+                validations: Arc::new(Mutex::new(0)),
+                dispatches: Arc::new(Mutex::new(Vec::new())),
+                response_status,
+                response_body: Bytes::new(),
+            }
+        }
+
+        fn with_response_body(mut self, response_body: Bytes) -> Self {
+            self.response_body = response_body;
+            self
+        }
+    }
+
+    impl OutboundIo for ScriptedAddressIo {
+        fn validate_before<'a>(
+            &'a self,
+            input: &'a str,
+            _deadline: tokio::time::Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<ValidatedUrl, PolicyError>> + Send + 'a>> {
+            Box::pin(async move {
+                *self.validations.lock().expect("validation lock") += 1;
+                let answers = self
+                    .answers
+                    .lock()
+                    .expect("answer lock")
+                    .pop_front()
+                    .ok_or_else(|| PolicyError("missing scripted DNS answer".into()))?;
+                ValidatedUrl::parse(input)?.with_addresses(answers)
+            })
+        }
+
+        fn send_once<'a>(
+            &'a self,
+            _method: Method,
+            target: &'a ValidatedUrl,
+            headers: HeaderMap,
+            _body: Option<Bytes>,
+            _remaining: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<Response, PolicyError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.dispatches
+                    .lock()
+                    .expect("dispatch lock")
+                    .push(CapturedPinnedDispatch {
+                        url: target.url.to_string(),
+                        addresses: target.addresses.clone(),
+                        headers,
+                    });
+                let mut builder = http::Response::builder().status(self.response_status);
+                if self.response_status.is_redirection() {
+                    builder = builder.header(reqwest::header::LOCATION, "/rebound");
+                }
+                Ok(builder
+                    .body(reqwest::Body::from(self.response_body.clone()))
+                    .expect("test response")
+                    .into())
+            })
+        }
+    }
+
     impl OutboundIo for CaptureIo {
         fn validate_before<'a>(
             &'a self,
@@ -871,11 +1013,33 @@ mod tests {
             "fe80::1",
             "ff00::1",
             "2001:db8::1",
+            "fec0::1",
+            "4000::1",
         ] {
             assert!(!is_global(ip.parse().unwrap()), "classified {ip} global");
         }
         assert!(is_global("93.184.216.34".parse().unwrap()));
         assert!(is_global("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_global_unicast_and_special_purpose_boundaries_fail_closed() {
+        for ip in [
+            "1fff:ffff::1",
+            "2001:1ff::1",
+            "2001:db8::1",
+            "3fff::1",
+            "4000::1",
+            "5f00::1",
+            "fec0::1",
+        ] {
+            assert!(!is_global(ip.parse().unwrap()), "classified {ip} global");
+        }
+
+        assert!(is_global("2001:200::1".parse().unwrap()));
+        assert!(is_global("2606:4700:4700::1111".parse().unwrap()));
+        assert!(is_global("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!is_global("::ffff:127.0.0.1".parse().unwrap()));
     }
 
     #[test]
@@ -969,6 +1133,101 @@ mod tests {
                         .is_none_or(|body| !body.as_ref().windows(6).any(|part| part == b"secret"))
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn credential_transport_rejects_private_and_mixed_dns_before_dispatch() {
+        for answers in [
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))],
+            vec![
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ],
+        ] {
+            let io = ScriptedAddressIo::new(vec![answers], StatusCode::OK);
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "DPoP access-secret".parse().unwrap());
+            headers.insert("dpop", "proof-secret".parse().unwrap());
+
+            let error = send_credential_bounded_before_with_io(
+                &io,
+                Method::GET,
+                "https://pds.example/xrpc/chat.bsky.convo.getLog",
+                headers,
+                None,
+                1024,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.to_string().contains("non-global address"));
+            assert!(io.dispatches.lock().expect("dispatch lock").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_transport_pins_dns_and_never_replays_to_a_rebound_redirect() {
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let io = ScriptedAddressIo::new(
+            vec![vec![public], vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]],
+            StatusCode::TEMPORARY_REDIRECT,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "DPoP access-secret".parse().unwrap());
+        headers.insert("dpop", "proof-secret".parse().unwrap());
+
+        let (status, _, _) = send_credential_bounded_before_with_io(
+            &io,
+            Method::GET,
+            "https://pds.example/xrpc/chat.bsky.convo.getLog",
+            headers,
+            None,
+            1024,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(*io.validations.lock().expect("validation lock"), 1);
+        assert_eq!(io.answers.lock().expect("answer lock").len(), 1);
+        let dispatches = io.dispatches.lock().expect("dispatch lock");
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].url,
+            "https://pds.example/xrpc/chat.bsky.convo.getLog"
+        );
+        assert_eq!(dispatches[0].addresses, vec![public]);
+        assert!(dispatches[0].headers.contains_key("authorization"));
+        assert!(dispatches[0].headers.contains_key("dpop"));
+    }
+
+    #[tokio::test]
+    async fn credential_transport_enforces_the_caller_response_bound() {
+        let io = ScriptedAddressIo::new(
+            vec![vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]],
+            StatusCode::OK,
+        )
+        .with_response_body(Bytes::from_static(b"ninebytes"));
+
+        let error = send_credential_bounded_before_with_io(
+            &io,
+            Method::GET,
+            "https://pds.example/xrpc/chat.bsky.convo.getLog",
+            HeaderMap::new(),
+            None,
+            8,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Content-Length")
+                || error.to_string().contains("response byte limit exceeded")
+        );
+        assert_eq!(io.dispatches.lock().expect("dispatch lock").len(), 1);
     }
 
     #[tokio::test]

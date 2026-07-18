@@ -63,8 +63,13 @@ where
 /// - /xrpc/* - AT Protocol XRPC proxy
 /// - /.well-known/* - OAuth metadata
 pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
-    // Create rate limit state with default configuration
-    let rate_limit_state = Arc::new(RateLimitState::default());
+    // Redis provides the fleet-shared counter. The limiter also enforces an
+    // always-on bounded local ceiling if Redis becomes unavailable.
+    let rate_limit_state = Arc::new(RateLimitState::distributed(
+        state.redis.clone(),
+        state.config.redis.key_prefix.clone(),
+        state.config.server.trusted_proxy_ips.clone(),
+    ));
 
     // Start background cleanup task for rate limiter
     rate_limit_state.clone().start_cleanup_task();

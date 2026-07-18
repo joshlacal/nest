@@ -4,8 +4,11 @@
 //! requests to private networks, loopback addresses, and other potentially
 //! dangerous destinations.
 
-use crate::error::{AppError, AppResult};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::{
+    config::outbound_policy::is_global,
+    error::{AppError, AppResult},
+};
+use std::net::IpAddr;
 use url::{Host, Url};
 
 /// Validates a PDS URL to prevent SSRF attacks.
@@ -13,7 +16,7 @@ use url::{Host, Url};
 /// This function checks that:
 /// 1. The URL is valid and parseable
 /// 2. The scheme is HTTPS (HTTP only allowed for localhost in debug mode)
-/// 3. The host is not a private/loopback IP address
+/// 3. A literal IP host is allowed by the shared public-address policy
 ///
 /// # Arguments
 /// * `url` - The URL string to validate
@@ -48,16 +51,16 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
 
     match host {
         Host::Ipv4(ipv4) => {
-            if is_private_ipv4(&ipv4) {
-                tracing::warn!(url = %url, ip = %ipv4, "SSRF: Blocked private/loopback IPv4");
+            if !is_global(IpAddr::V4(ipv4)) {
+                tracing::warn!(url = %url, ip = %ipv4, "SSRF: Blocked non-public IPv4");
                 return Err(AppError::BadRequest(
                     "Invalid PDS URL: private network not allowed".to_string(),
                 ));
             }
         }
         Host::Ipv6(ipv6) => {
-            if is_private_ipv6(&ipv6) {
-                tracing::warn!(url = %url, ip = %ipv6, "SSRF: Blocked private/loopback IPv6");
+            if !is_global(IpAddr::V6(ipv6)) {
+                tracing::warn!(url = %url, ip = %ipv6, "SSRF: Blocked non-public IPv6");
                 return Err(AppError::BadRequest(
                     "Invalid PDS URL: private network not allowed".to_string(),
                 ));
@@ -97,102 +100,6 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
     }
 
     Ok(())
-}
-
-/// Check if an IP address is in a private, loopback, or otherwise restricted range
-#[allow(dead_code)]
-fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => is_private_ipv4(ipv4),
-        IpAddr::V6(ipv6) => is_private_ipv6(ipv6),
-    }
-}
-
-/// Check if an IPv4 address is private/restricted
-fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    // Loopback: 127.0.0.0/8
-    if ip.is_loopback() {
-        return true;
-    }
-
-    // Private ranges
-    // 10.0.0.0/8
-    if ip.octets()[0] == 10 {
-        return true;
-    }
-
-    // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-    if ip.octets()[0] == 172 && (ip.octets()[1] >= 16 && ip.octets()[1] <= 31) {
-        return true;
-    }
-
-    // 192.168.0.0/16
-    if ip.octets()[0] == 192 && ip.octets()[1] == 168 {
-        return true;
-    }
-
-    // Link-local: 169.254.0.0/16
-    if ip.is_link_local() {
-        return true;
-    }
-
-    // Broadcast: 255.255.255.255
-    if ip.is_broadcast() {
-        return true;
-    }
-
-    // Unspecified: 0.0.0.0
-    if ip.is_unspecified() {
-        return true;
-    }
-
-    // Documentation ranges (TEST-NET)
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-    if (ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 2)
-        || (ip.octets()[0] == 198 && ip.octets()[1] == 51 && ip.octets()[2] == 100)
-        || (ip.octets()[0] == 203 && ip.octets()[1] == 0 && ip.octets()[2] == 113)
-    {
-        return true;
-    }
-
-    // Carrier-grade NAT: 100.64.0.0/10
-    if ip.octets()[0] == 100 && (ip.octets()[1] >= 64 && ip.octets()[1] <= 127) {
-        return true;
-    }
-
-    false
-}
-
-/// Check if an IPv6 address is private/restricted
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    // Loopback: ::1
-    if ip.is_loopback() {
-        return true;
-    }
-
-    // Unspecified: ::
-    if ip.is_unspecified() {
-        return true;
-    }
-
-    // Unique local addresses: fc00::/7 (fc00:: - fdff::)
-    let segments = ip.segments();
-    if (segments[0] & 0xfe00) == 0xfc00 {
-        return true;
-    }
-
-    // Link-local: fe80::/10
-    if (segments[0] & 0xffc0) == 0xfe80 {
-        return true;
-    }
-
-    // IPv4-mapped addresses: ::ffff:0:0/96
-    // Check the underlying IPv4 address
-    if let Some(ipv4) = ip.to_ipv4_mapped() {
-        return is_private_ipv4(&ipv4);
-    }
-
-    false
 }
 
 /// Check if a hostname is a localhost variant
@@ -245,6 +152,23 @@ mod tests {
     }
 
     #[test]
+    fn test_blocks_non_public_ipv6_literals() {
+        for ip in [
+            "64:ff9b::1",
+            "100::1",
+            "2001:2::1",
+            "2002::1",
+            "3fff::1",
+            "4000::1",
+            "5f00::1",
+            "fec0::1",
+        ] {
+            let url = format!("https://[{ip}]");
+            assert!(validate_pds_url(&url).is_err(), "accepted {ip}");
+        }
+    }
+
+    #[test]
     fn test_blocks_http_for_public_urls() {
         assert!(validate_pds_url("http://bsky.social").is_err());
         assert!(validate_pds_url("http://example.com").is_err());
@@ -281,6 +205,7 @@ mod tests {
         // Public IPs should be allowed
         assert!(validate_pds_url("https://8.8.8.8").is_ok());
         assert!(validate_pds_url("https://1.1.1.1").is_ok());
+        assert!(validate_pds_url("https://[2606:4700:4700::1111]").is_ok());
     }
 
     #[test]

@@ -65,7 +65,9 @@ pub struct ClientSessionData<'s> {
     #[serde(borrow)]
     pub account_did: Did<'s>,
 
-    // Identifier to distinguish this particular session for the account. Server backends generally support multiple sessions for the same account. This package will re-use the random 'state' token from the auth flow as the session ID.
+    // Independent opaque credential generated only after the OAuth token,
+    // subject, issuer, and returned scopes have been validated. It must never
+    // reuse provider-visible OAuth state.
     pub session_id: CowStr<'s>,
 
     // Base URL of the "resource server" (eg, PDS). Should include scheme, hostname, port; no path or auth info.

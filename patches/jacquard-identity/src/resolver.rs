@@ -162,6 +162,22 @@ impl DidDocResponse {
             Err(IdentityError::http_status(self.status))
         }
     }
+
+    /// Parse as an owned document and enforce the requested DID when present.
+    ///
+    /// On mismatch, returns the same typed `DocIdMismatch` as
+    /// [`DidDocResponse::parse_validated`], including the fetched document for
+    /// inspection.
+    pub fn into_owned_validated(self) -> Result<DidDocument<'static>> {
+        let expected = self.requested.clone();
+        let doc = self.into_owned()?;
+        if let Some(expected) = expected {
+            if doc.id.as_str() != expected.as_str() {
+                return Err(IdentityError::doc_id_mismatch(expected, doc));
+            }
+        }
+        Ok(doc)
+    }
 }
 
 /// Slingshot mini-doc data (subset of DID doc info)
@@ -383,7 +399,14 @@ pub trait IdentityResolver {
     where
         Self: Sync,
     {
-        async { self.resolve_did_doc(did).await?.into_owned() }
+        async {
+            let response = self.resolve_did_doc(did).await?;
+            if self.options().validate_doc_id {
+                response.into_owned_validated()
+            } else {
+                response.into_owned()
+            }
+        }
     }
 
     /// Resolve the DID document and return an owned version
@@ -392,7 +415,14 @@ pub trait IdentityResolver {
         &self,
         did: &Did<'_>,
     ) -> impl Future<Output = Result<DidDocument<'static>>> {
-        async { self.resolve_did_doc(did).await?.into_owned() }
+        async {
+            let response = self.resolve_did_doc(did).await?;
+            if self.options().validate_doc_id {
+                response.into_owned_validated()
+            } else {
+                response.into_owned()
+            }
+        }
     }
 
     /// Return the PDS url for a DID
@@ -781,6 +811,60 @@ impl From<reqwest::Error> for IdentityError {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    struct OwnedHelperResolver {
+        options: ResolverOptions,
+        handle_did: Did<'static>,
+        document_did: Did<'static>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl OwnedHelperResolver {
+        fn new(validate_doc_id: bool, handle_did: &str, document_did: &str) -> Self {
+            let mut options = ResolverOptions::default();
+            options.validate_doc_id = validate_doc_id;
+            Self {
+                options,
+                handle_did: Did::new_owned(handle_did).expect("valid handle DID"),
+                document_did: Did::new_owned(document_did).expect("valid document DID"),
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl IdentityResolver for OwnedHelperResolver {
+        fn options(&self) -> &ResolverOptions {
+            &self.options
+        }
+
+        async fn resolve_handle(&self, _handle: &Handle<'_>) -> Result<Did<'static>> {
+            Ok(self.handle_did.clone())
+        }
+
+        async fn resolve_did_doc(&self, did: &Did<'_>) -> Result<DidDocResponse> {
+            let buffer = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "id": self.document_did.as_str() }))
+                    .expect("serialize DID document"),
+            );
+            Ok(DidDocResponse {
+                buffer,
+                status: StatusCode::OK,
+                requested: Some(did.clone().into_static()),
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_doc_id_mismatch(error: IdentityError, expected: &str, actual: &str) {
+        match error.kind() {
+            IdentityErrorKind::DocIdMismatch { expected: got, doc } => {
+                assert_eq!(got.as_str(), expected);
+                assert_eq!(doc.id.as_str(), actual);
+            }
+            other => panic!("expected DocIdMismatch, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_validated_ok() {
         let buf = Bytes::from_static(br#"{"id":"did:plc:alice"}"#);
@@ -835,5 +919,73 @@ mod tests {
             response.into_owned().unwrap_err().kind(),
             IdentityErrorKind::InvalidDoc(_)
         ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn direct_did_owned_helper_rejects_mismatched_document_id_when_enabled() {
+        let resolver = OwnedHelperResolver::new(
+            true,
+            "did:web:resolved.example.com",
+            "did:web:substituted.example.com",
+        );
+        let requested = Did::new_owned("did:web:resolved.example.com").unwrap();
+
+        let error = resolver
+            .resolve_did_doc_owned(&requested)
+            .await
+            .expect_err("owned direct-DID resolution must reject a substituted document id");
+
+        assert_doc_id_mismatch(
+            error,
+            "did:web:resolved.example.com",
+            "did:web:substituted.example.com",
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn handle_owned_helper_rejects_mismatched_resolved_did_when_enabled() {
+        let resolver = OwnedHelperResolver::new(
+            true,
+            "did:web:resolved.example.com",
+            "did:web:substituted.example.com",
+        );
+        let actor = AtIdentifier::new("alice.example.com").unwrap();
+
+        let error = resolver
+            .resolve_ident_owned(&actor)
+            .await
+            .expect_err("owned handle resolution must bind the document to the resolved DID");
+
+        assert_doc_id_mismatch(
+            error,
+            "did:web:resolved.example.com",
+            "did:web:substituted.example.com",
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn owned_helpers_preserve_mismatch_when_validation_is_disabled() {
+        let resolver = OwnedHelperResolver::new(
+            false,
+            "did:web:resolved.example.com",
+            "did:web:substituted.example.com",
+        );
+        let requested = Did::new_owned("did:web:resolved.example.com").unwrap();
+        let actor = AtIdentifier::new("alice.example.com").unwrap();
+
+        let direct = resolver
+            .resolve_did_doc_owned(&requested)
+            .await
+            .expect("disabled validation must preserve direct owned resolution behavior");
+        let via_handle = resolver
+            .resolve_ident_owned(&actor)
+            .await
+            .expect("disabled validation must preserve handle owned resolution behavior");
+
+        assert_eq!(direct.id.as_str(), "did:web:substituted.example.com");
+        assert_eq!(via_handle.id.as_str(), "did:web:substituted.example.com");
     }
 }

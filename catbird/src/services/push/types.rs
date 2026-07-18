@@ -263,6 +263,8 @@ pub struct RegistrationRow {
 #[derive(Debug, Clone, FromRow)]
 pub struct QueueRow {
     pub id: i64,
+    /// Fresh, unguessable ownership token assigned for this claim attempt.
+    pub lease_owner: sqlx::types::Uuid,
     pub recipient_did: String,
     pub actor_did: String,
     pub notification_type: String,

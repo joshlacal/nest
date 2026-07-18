@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Method,
+};
 use serde_json::Value;
 use sqlx::{Pool, Postgres};
 
@@ -16,6 +19,11 @@ use crate::services::push::{is_auth_revocation_error, resolve_background_session
 use super::rate_budget::PdsRateBudget;
 use super::scheduler::ChatPollScheduler;
 use super::types::{ChatPollRow, ChatPushEvent, GetLogResponse, LogEntry};
+
+const MIN_RETRY_AFTER_SECONDS: i64 = 60;
+const MAX_RETRY_AFTER_SECONDS: i64 = 60 * 60;
+pub(super) const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const MAX_CHAT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Polls a single account's chat log and returns new messages that need push notifications.
 pub async fn poll_account(
@@ -94,7 +102,7 @@ pub async fn poll_account(
             // Handle rate limiting (429) identically to the main path —
             // retry-after was packed into the body by fetch_log_page.
             if status == 429 {
-                let retry_after: i64 = String::from_utf8_lossy(&body).parse().unwrap_or(60);
+                let retry_after = retry_after_from_body(&body);
 
                 tracing::warn!(
                     did = %row.account_did,
@@ -103,10 +111,7 @@ pub async fn poll_account(
                     "Prime pass got 429 from PDS"
                 );
 
-                rate_budget.backoff_host(
-                    &row.pds_host,
-                    Duration::from_secs(retry_after.max(60) as u64),
-                );
+                rate_budget.backoff_host(&row.pds_host, Duration::from_secs(retry_after as u64));
                 scheduler
                     .backoff_pds_host(&row.pds_host, retry_after)
                     .await?;
@@ -196,7 +201,7 @@ pub async fn poll_account(
 
     // Handle rate limiting (429) — retry-after was packed into the body by fetch_log_page.
     if status == 429 {
-        let retry_after: i64 = String::from_utf8_lossy(&body).parse().unwrap_or(60);
+        let retry_after = retry_after_from_body(&body);
 
         tracing::warn!(
             did = %row.account_did,
@@ -205,10 +210,7 @@ pub async fn poll_account(
             "Chat poll got 429 from PDS"
         );
 
-        rate_budget.backoff_host(
-            &row.pds_host,
-            Duration::from_secs(retry_after.max(60) as u64),
-        );
+        rate_budget.backoff_host(&row.pds_host, Duration::from_secs(retry_after as u64));
         scheduler
             .backoff_pds_host(&row.pds_host, retry_after)
             .await?;
@@ -324,13 +326,15 @@ pub async fn poll_account(
 /// status, response headers (needed to read `retry-after` / `DPoP-Nonce`),
 /// and buffered body.
 async fn send_get_log_request(
-    client: &crate::services::AtProtoClient,
     state: &Arc<AppState>,
     session: &crate::models::CatbirdSession,
     dpop: &crate::middleware::JacquardDpopData,
     url: &str,
     nonce: Option<String>,
+    max_response_bytes: usize,
+    deadline: tokio::time::Instant,
 ) -> Result<(u16, HeaderMap, bytes::Bytes)> {
+    let client = crate::services::AtProtoClient::new(state.clone());
     let mut headers = client
         .build_auth_headers_for_request(session, "GET", url, nonce, Some(dpop))
         .await
@@ -340,20 +344,41 @@ async fn send_get_log_request(
         HeaderValue::from_static("did:web:api.bsky.chat#bsky_chat"),
     );
 
-    let response = state.http_client.get(url).headers(headers).send().await?;
-    let status = response.status().as_u16();
-    let response_headers = response.headers().clone();
-    let body = response.bytes().await?;
-    Ok((status, response_headers, body))
+    let (status, response_headers, body) = state
+        .outbound_policy
+        .send_credential_bounded_before(
+            Method::GET,
+            url,
+            headers,
+            None,
+            max_response_bytes,
+            deadline,
+        )
+        .await
+        .map_err(|error| anyhow!("Chat getLog outbound policy rejected request: {error}"))?;
+    Ok((status.as_u16(), response_headers, body))
 }
 
 fn retry_after_body(headers: &HeaderMap) -> Vec<u8> {
-    let retry_after = headers
+    let raw = headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(60);
+        .unwrap_or("");
+    let retry_after = bounded_retry_after_seconds(raw);
     retry_after.to_string().into_bytes()
+}
+
+fn retry_after_from_body(body: &[u8]) -> i64 {
+    bounded_retry_after_seconds(&String::from_utf8_lossy(body))
+}
+
+fn bounded_retry_after_seconds(raw: &str) -> i64 {
+    raw.trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(MIN_RETRY_AFTER_SECONDS)
+        .clamp(MIN_RETRY_AFTER_SECONDS, MAX_RETRY_AFTER_SECONDS)
 }
 
 /// One getLog page. Returns (status, body_bytes, dpop_nonce_for_next_call).
@@ -373,6 +398,10 @@ async fn fetch_log_page(
     cursor: Option<&str>,
     nonce_hint: Option<&str>,
 ) -> Result<(u16, Vec<u8>, Option<String>)> {
+    // A nonce challenge and its one allowed retry share one absolute request
+    // deadline and one response bound. Credential-bearing redirects are
+    // returned to this caller and never followed by the outbound policy.
+    let deadline = tokio::time::Instant::now() + CHAT_REQUEST_TIMEOUT;
     let base = session.pds_url.trim_end_matches('/');
     let url = match cursor {
         Some(c) => format!(
@@ -383,15 +412,14 @@ async fn fetch_log_page(
         None => format!("{}/xrpc/chat.bsky.convo.getLog", base),
     };
 
-    let client = crate::services::AtProtoClient::new(state.clone());
-
     let (status, headers, body) = send_get_log_request(
-        &client,
         state,
         session,
         dpop,
         &url,
         nonce_hint.map(str::to_string),
+        MAX_CHAT_RESPONSE_BYTES,
+        deadline,
     )
     .await?;
 
@@ -408,17 +436,21 @@ async fn fetch_log_page(
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
             {
+                let retry_response_budget = MAX_CHAT_RESPONSE_BYTES
+                    .checked_sub(body.len())
+                    .ok_or_else(|| anyhow!("Chat getLog response budget exhausted"))?;
                 tracing::info!(
                     did = %session.did,
                     "Chat poll getLog got use_dpop_nonce challenge; retrying with fresh nonce"
                 );
                 let (status, headers, body) = send_get_log_request(
-                    &client,
                     state,
                     session,
                     dpop,
                     &url,
                     Some(fresh_nonce.clone()),
+                    retry_response_budget,
+                    deadline,
                 )
                 .await?;
 
@@ -607,6 +639,35 @@ async fn publish_to_redis(state: &Arc<AppState>, event: &ChatPushEvent) -> Resul
 mod tests {
     use super::super::types::{LogMessage, LogMessageEvent, LogSender};
     use super::*;
+
+    #[test]
+    fn retry_after_is_bounded_before_reaching_scheduler_or_rate_budget() {
+        assert_eq!(bounded_retry_after_seconds("1"), MIN_RETRY_AFTER_SECONDS);
+        assert_eq!(bounded_retry_after_seconds("120"), 120);
+        assert_eq!(
+            bounded_retry_after_seconds("9223372036854775807"),
+            MAX_RETRY_AFTER_SECONDS
+        );
+        assert_eq!(bounded_retry_after_seconds("-1"), MIN_RETRY_AFTER_SECONDS);
+        assert_eq!(
+            bounded_retry_after_seconds("not-a-number"),
+            MIN_RETRY_AFTER_SECONDS
+        );
+        assert_eq!(retry_after_from_body(b"7200"), MAX_RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn retry_after_header_serializes_only_the_bounded_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("9223372036854775807"),
+        );
+        assert_eq!(
+            retry_after_body(&headers),
+            MAX_RETRY_AFTER_SECONDS.to_string().into_bytes()
+        );
+    }
 
     #[test]
     fn notify_when_no_watermark() {
