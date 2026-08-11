@@ -1,0 +1,688 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.defs",
+  "description": "Closed clean-cutover protocol types. Runtime validators reject duplicate keys, null, unknown fields, unknown union tags, noncanonical identifiers/timestamps/order, and all size/depth/count overflow before DTO deserialization. For each request the server captures one trusted instant T. First execution of every signed mutation requires canonical signedAt in [T-300 seconds,T+60 seconds] and otherwise returns InvalidRequest; only an exact already-completed idempotent replay with the identical stored transcript digest and separate 64-byte signature may bypass signedAt age, and it still requires fresh valid DPoP/JTI. The canonical request digest is raw 32-byte SHA-256 of the exact domain-prefixed canonical Ed25519 signing transcript, never raw JSON, generated DTO bytes, or a signature-containing wrapper. Idempotency identity is endpoint NSID plus authenticated principal plus signed idempotencyKey, except sendMessage uses messageId; exact digest and exact signature must both match or the request conflicts. Durable pending-work expiry derives from server receivedAt, never signedAt; typing TTL and every server timestamp derive from T. Nest is the trusted token exchanger/gateway and sends only issuer-signed clean JWTs of at most 120 seconds using Authorization DPoP. Exact required claims are iss, sub, aud, lxm, iat, exp, jti, cnf.jkt, device_id, and chat_instance. Token/grant jti, device_id, and chat_instance are canonical lowercase UUIDv4 strings; token/grant jti is consumed once in the configured issuer token namespace. Proof jti is canonical base64url without padding decoding to 12-32 bytes and replay uniqueness is exactly (JKT,decoded jti bytes) in a separate namespace; htu and htm remain validated audit claims and never widen that key. Token cnf.jkt, proof RFC7638 JKT, and signed-body or stored JKT must match, except rebind bootstrap authenticates signed newDpopJkt and the immutable stored Ed25519 key before CAS. First enrollment additionally requires a one-use fresh-auth grant from an enrollment-purpose-bound OAuth authorization_code flow. Nest creates fresh evidence only after successful callback/code exchange and issuer, subject, scope, and DPoP validation; restore, refresh, cookie exchange, or an existing session alone never creates evidence. Callback completion opens one encrypted enrollment capability through auth_time + 300 seconds, and auth_time is Nest callback-completion time, not upstream auth_time. Capability states are unpinned, pinned/pending, and terminal-success. Before pinning, Nest performs strict canonical decode, bounds, and capability/body binding checks and verifies the body's Ed25519 signature under its supplied immutable signing key. A malformed, out-of-bounds, binding-invalid, or signature-invalid attempt neither pins nor burns the capability. The first body that passes all of those checks transitions unpinned to pinned/pending and atomically pins its exact canonical request digest, signature, DID, device ID, DPoP JKT, key ID, signing-key digest, and enrollment-transcript digest. While pinned/pending and Nest has not durably recorded downstream success, including ambiguous response loss after delivery-service commit, the same exact body may mint another downstream grant; each attempt retains original auth_time but gets fresh token/proof JTIs and auth_txn, and delivery-service exact idempotent replay returns its stored result. auth_txn is a server-generated per-grant canonical lowercase UUIDv4 distinct from provider state and client input. Changed body cannot reuse the capability. Once Nest durably records success it stores the terminal result/binding, transitions to terminal-success, and closes the capability; exact client retry is then answered from that Nest-stored terminal result without a new downstream grant. Expiry before terminal success requires a new purpose-bound code flow. prompt=login and an ephemeral browser are best-effort only; neither is a server security predicate, fresh authorization-code completion does not attest credential entry or user presence, and the protocol does not claim user reauthentication. Exact additional grant claims are key_id, signing_key_sha256, enrollment_transcript_sha256, auth_time, and auth_txn. Enrollment grant exp = min(iat + 120, auth_time + 300) using checked NumericDate arithmetic; ordinary tokens require exp <= iat + 120. The delivery service independently accepts the Nest issuer attestation only when 0 <= T-auth_time <= 300 seconds. DPoP htu uses only a configured trusted external base, never Host, Forwarded, or X-Forwarded headers: scheme is https, host is lowercase ASCII/IDNA A-label form with no userinfo or trailing dot, the base has no path/query/fragment, port 443 is omitted, only an explicitly allowed nondefault port is retained, and htu is that base plus exact /xrpc/{NSID} with the request query and fragment excluded.",
+  "defs": {
+    "protocolVersion": {"type": "string", "enum": ["1"]},
+    "cipherSuite": {"type": "string", "enum": ["MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"]},
+    "canonicalDatetime": {"type": "string", "format": "datetime", "minLength": 24, "maxLength": 24, "description": "Exact UTC grammar YYYY-MM-DDTHH:MM:SS.sssZ; offsets, lowercase, leap seconds, and variable fractions are invalid."},
+    "deviceId": {"type": "string", "minLength": 36, "maxLength": 36, "description": "Canonical lowercase hyphenated UUIDv4 with RFC 4122 variant."},
+    "operationId": {"type": "string", "minLength": 36, "maxLength": 36, "description": "Canonical lowercase hyphenated UUIDv4 for every client-generated conversation, transition, reset, recovery, Welcome, message, blob, and idempotency identifier."},
+    "bareDid": {"type": "string", "format": "did", "minLength": 12, "maxLength": 261, "description": "Production ATProto bare DID only: did:plc followed by exactly 24 lowercase base32 [a-z2-7] characters, or hostname-level did:web followed by a normalized lowercase handle-shaped ASCII hostname of 1-253 bytes with at least two dot-separated labels, each 1-63 bytes, alphanumeric endpoints, and a nonnumeric-leading TLD. Production rejects TLDs alt, arpa, example, internal, invalid, local, localhost, onion, and test. did:web path DIDs, ports, percent escapes, IP literals, single-label names including localhost, trailing dots, queries, fragments, Unicode hostnames, and other methods are forbidden. The exact semantic length is 12-261 bytes; actorDid#deviceId BasicCredential identity is 49-298 bytes. Equality with token DID, BasicCredential identity, signer, roster, and ordering uses exact UTF-8 bytes."},
+    "keyId": {"type": "string", "minLength": 43, "maxLength": 43, "description": "Base64url without padding SHA-256 thumbprint of the exact raw 32-byte Ed25519 public key."},
+    "lifecycle": {"type": "string", "enum": ["active", "superseded"]},
+    "conversationKind": {"type": "string", "enum": ["direct", "group"]},
+    "memberRole": {"type": "string", "enum": ["admin", "member"]},
+    "participantStatus": {"type": "string", "enum": ["pending", "active"]},
+    "incomingConsentPolicy": {"type": "string", "enum": ["all", "none", "following"]},
+    "deviceStatus": {"type": "string", "enum": ["active", "revoked"]},
+    "packageStatus": {"type": "string", "enum": ["available", "reserved", "consumed", "expired", "revoked"]},
+    "reservationStatus": {"type": "string", "enum": ["active", "consumed", "expired", "released"]},
+    "welcomeStatus": {"type": "string", "enum": ["pending", "acknowledged", "rejected", "expired", "superseded"]},
+    "welcomeRejectionReason": {"type": "string", "enum": ["noMatchingKeyPackage", "invalidWelcome", "unsupportedCipherSuite", "coordinateMismatch", "localStateConflict"]},
+    "leafRecoveryStatus": {"type": "string", "enum": ["open", "fulfilled", "cancelled", "expired", "superseded"]},
+    "recoveryWorkSourceKind": {"type": "string", "enum": ["welcomeExpired", "welcomeRejected"]},
+    "recoveryWorkStatus": {"type": "string", "enum": ["pending", "completed", "superseded"]},
+    "leaveRequestStatus": {"type": "string", "enum": ["pending", "fulfilled", "cancelled", "expired", "stale"]},
+    "leafRecoveryKind": {"type": "string", "enum": ["add", "replace"]},
+    "leafOrigin": {"type": "string", "enum": ["genesis", "keyPackage"]},
+    "resetReason": {"type": "string", "enum": ["localStateLost", "poisonedState", "epochDivergence", "manualRecovery"]},
+    "blobPurpose": {"type": "string", "enum": ["attachment", "metadata"]},
+
+    "conversationCoordinates": {
+      "type": "object",
+      "required": ["conversationId", "generation", "stateVersion", "groupId", "epoch", "groupContextHash", "confirmationTag", "lifecycle"],
+      "properties": {
+        "conversationId": {"type": "ref", "ref": "#operationId"},
+        "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "stateVersion": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "groupId": {"type": "bytes", "minLength": 32, "maxLength": 32},
+        "epoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "groupContextHash": {"type": "bytes", "minLength": 32, "maxLength": 32},
+        "confirmationTag": {"type": "bytes", "minLength": 32, "maxLength": 32},
+        "lifecycle": {"type": "ref", "ref": "#lifecycle"}
+      }
+    },
+    "applicationFrameContext": {
+      "type": "object", "required": ["conversationId", "generation", "stateVersion", "groupId", "epoch", "groupContextHash", "confirmationTag", "lifecycle"],
+      "properties": {"conversationId": {"type": "ref", "ref": "#identifierBytes"}, "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "stateVersion": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupId": {"type": "bytes", "minLength": 32, "maxLength": 32}, "epoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupContextHash": {"type": "bytes", "minLength": 32, "maxLength": 32}, "confirmationTag": {"type": "bytes", "minLength": 32, "maxLength": 32}, "lifecycle": {"type": "string", "const": "active"}}
+    },
+    "metadataCryptoContext": {
+      "type": "object", "required": ["conversationId", "generation", "groupId", "epoch", "groupContextHash", "confirmationTag"],
+      "properties": {"conversationId": {"type": "ref", "ref": "#identifierBytes"}, "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupId": {"type": "bytes", "minLength": 32, "maxLength": 32}, "epoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupContextHash": {"type": "bytes", "minLength": 32, "maxLength": 32}, "confirmationTag": {"type": "bytes", "minLength": 32, "maxLength": 32}}
+    },
+    "mlsAadPriorContext": {
+      "type": "object", "required": ["conversationId", "generation", "stateVersion", "groupId", "epoch", "groupContextHash", "confirmationTag", "lifecycle"],
+      "properties": {"conversationId": {"type": "ref", "ref": "#identifierBytes"}, "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "stateVersion": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupId": {"type": "bytes", "minLength": 32, "maxLength": 32}, "epoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupContextHash": {"type": "bytes", "minLength": 32, "maxLength": 32}, "confirmationTag": {"type": "bytes", "minLength": 32, "maxLength": 32}, "lifecycle": {"type": "string", "const": "active"}},
+      "description": "Internal canonical DAG-CBOR projection. UUID transport text is converted to exact 16 bytes and must equal the separately signed outer conversationCoordinates field-for-field."
+    },
+    "artifactHash": {"type": "bytes", "minLength": 32, "maxLength": 32},
+    "keyPackageArtifact": {
+      "type": "object",
+      "required": ["framing", "contentType", "bytes", "sha256", "keyPackageRef"],
+      "properties": {
+        "framing": {"type": "string", "const": "mlsMessage"},
+        "contentType": {"type": "string", "const": "keyPackage"},
+        "bytes": {"type": "bytes", "minLength": 8, "maxLength": 65536},
+        "sha256": {"type": "ref", "ref": "#artifactHash"},
+        "keyPackageRef": {"type": "bytes", "minLength": 32, "maxLength": 32}
+      },
+      "description": "Exactly one MLS 1.0 MLSMessage wire-format 5 wrapper. KeyPackageRef is RefHash over the exact inner KeyPackage TLS bytes, never the wrapper or a plain SHA-256."
+    },
+    "publicCommit": {
+      "type": "object",
+      "required": ["framing", "contentType", "bytes", "sha256"],
+      "properties": {
+        "framing": {"type": "string", "const": "mlsMessage"},
+        "contentType": {"type": "string", "const": "publicMessageCommit"},
+        "bytes": {"type": "bytes", "minLength": 8, "maxLength": 1048576},
+        "sha256": {"type": "ref", "ref": "#artifactHash"}
+      },
+      "description": "Exactly one MLS 1.0 MLSMessage public Commit. The server exact-parses, canonical-reencodes, and structurally validates suite-specific XWing update-path ciphertext, but structural validity does not prove that any recipient can decrypt deliberately bogus path ciphertext."
+    },
+    "groupInfoArtifact": {
+      "type": "object",
+      "required": ["framing", "contentType", "bytes", "sha256"],
+      "properties": {
+        "framing": {"type": "string", "const": "mlsMessage"},
+        "contentType": {"type": "string", "const": "groupInfo"},
+        "bytes": {"type": "bytes", "minLength": 8, "maxLength": 1048576},
+        "sha256": {"type": "ref", "ref": "#artifactHash"}
+      },
+      "description": "Exactly one MLS 1.0 MLSMessage wire-format 4 wrapper. OpenMLS 0.8.1 GroupInfo extensions are frozen to exactly ratchet_tree followed by external_pub; every other GroupInfo extension is rejected. external_pub presence does not authorize external commits, which protocol policy forbids."
+    },
+    "privateApplicationMessage": {
+      "type": "object",
+      "required": ["framing", "contentType", "bytes", "sha256"],
+      "properties": {
+        "framing": {"type": "string", "const": "mlsMessage"},
+        "contentType": {"type": "string", "const": "privateMessageApplication"},
+        "bytes": {"type": "bytes", "minLength": 8, "maxLength": 1048576},
+        "sha256": {"type": "ref", "ref": "#artifactHash"}
+      }
+    },
+
+    "deviceCapability": {
+      "type": "object",
+      "required": ["protocolVersion", "mlsVersion", "cipherSuite", "credentialType", "addByValue", "updatePath", "removeByValue", "ratchetTreeGroupInfo", "externalPubGroupInfo", "applicationFrameProfile", "controlProfile", "attachmentProfile", "metadataProfile", "typingProfile"],
+      "properties": {
+        "protocolVersion": {"type": "ref", "ref": "#protocolVersion"},
+        "mlsVersion": {"type": "string", "const": "1.0"},
+        "cipherSuite": {"type": "ref", "ref": "#cipherSuite"},
+        "credentialType": {"type": "string", "const": "basic"},
+        "addByValue": {"type": "string", "const": "supported"},
+        "updatePath": {"type": "string", "const": "supported"},
+        "removeByValue": {"type": "string", "const": "supported"},
+        "ratchetTreeGroupInfo": {"type": "string", "const": "supported"},
+        "externalPubGroupInfo": {"type": "string", "const": "presentButExternalCommitsForbidden"},
+        "applicationFrameProfile": {"type": "string", "const": "dagCborApplication1"},
+        "controlProfile": {"type": "string", "const": "publicGroup1"},
+        "attachmentProfile": {"type": "string", "const": "aes256GcmBlob1"},
+        "metadataProfile": {"type": "string", "const": "exporterAes256Gcm1"},
+        "typingProfile": {"type": "string", "const": "signedClearEphemeral1"}
+      },
+      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; OpenMLS 0.8.1 GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy."
+    },
+    "deviceView": {
+      "type": "object",
+      "required": ["deviceId", "keyId", "signaturePublicKey", "authGeneration", "dpopJkt", "status", "createdAt", "updatedAt", "availablePackageCount", "reservedPackageCount"],
+      "properties": {
+        "deviceId": {"type": "ref", "ref": "#deviceId"},
+        "keyId": {"type": "ref", "ref": "#keyId"},
+        "signaturePublicKey": {"type": "bytes", "minLength": 32, "maxLength": 32},
+        "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "dpopJkt": {"type": "string", "minLength": 43, "maxLength": 43},
+        "status": {"type": "ref", "ref": "#deviceStatus"},
+        "createdAt": {"type": "ref", "ref": "#canonicalDatetime"},
+        "updatedAt": {"type": "ref", "ref": "#canonicalDatetime"},
+        "availablePackageCount": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "reservedPackageCount": {"type": "integer", "minimum": 0, "maximum": 1000}
+      },
+      "description": "availablePackageCount plus reservedPackageCount is at most 1000 live nonterminal KeyPackages for this device."
+    },
+    "ownDeviceView": {"type": "object", "required": ["device"], "properties": {"device": {"type": "ref", "ref": "#deviceView"}}},
+    "addressableDevice": {
+      "type": "object",
+      "required": ["userDid", "deviceId", "keyId", "capability", "availablePackageCount"],
+      "properties": {
+        "userDid": {"type": "ref", "ref": "#bareDid"},
+        "deviceId": {"type": "ref", "ref": "#deviceId"},
+        "keyId": {"type": "ref", "ref": "#keyId"},
+        "capability": {"type": "ref", "ref": "#deviceCapability"},
+        "availablePackageCount": {"type": "integer", "minimum": 0, "maximum": 1000}
+      }
+    },
+
+    "invitationProvenance": {"type": "object", "required": ["invitationTransitionId", "invitedByDid", "invitedByDeviceId"], "properties": {"invitationTransitionId": {"type": "ref", "ref": "#operationId"}, "invitedByDid": {"type": "ref", "ref": "#bareDid"}, "invitedByDeviceId": {"type": "ref", "ref": "#deviceId"}}, "description": "Exact immutable provenance of the creation or admin policy transition that inserted this pending participant. The transition ID and inviter device must equal that signed transition; acceptance repeats this object byte-for-byte."},
+    "participant": {"type": "object", "required": ["userDid", "role", "status"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "role": {"type": "ref", "ref": "#memberRole"}, "status": {"type": "ref", "ref": "#participantStatus"}, "invitationProvenance": {"type": "ref", "ref": "#invitationProvenance"}}, "description": "The creator is active/admin and has no invitationProvenance. A group invitation is pending/member/zero-leaf. The one direct invitee is pending/admin/zero-leaf, but pending status grants no authority; acceptance changes only status to active and preserves role and provenance. Every pending participant requires immutable invitationProvenance and can never be an MLS leaf."},
+    "participantView": {"type": "object", "required": ["userDid", "role", "status", "leafCount"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "role": {"type": "ref", "ref": "#memberRole"}, "status": {"type": "ref", "ref": "#participantStatus"}, "invitationProvenance": {"type": "ref", "ref": "#invitationProvenance"}, "leafCount": {"type": "integer", "minimum": 0, "maximum": 20}}, "description": "Pending participants have leafCount zero and immutable invitationProvenance. A group pending participant is member; the sole direct pending invitee is admin but has no authority until active. The active creator lacks provenance; accepted participants retain it for audit and exact replay."},
+    "deviceLeaf": {"type": "object", "required": ["userDid", "deviceId", "leafOrigin"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"}, "leafOrigin": {"type": "ref", "ref": "#leafOrigin"}, "joinKeyPackageRef": {"type": "bytes", "minLength": 32, "maxLength": 32}}, "description": "genesis is valid only for the actor/activator's epoch-zero leaf and forbids joinKeyPackageRef. Its LeafNode lifetime is validated at the same captured Unix second T as a KeyPackage: not_before < T < not_after, at least 600 seconds remain, and total lifetime is at most 2595600 seconds. keyPackage requires joinKeyPackageRef from the consumed Add package. Epoch zero never invents or consumes a KeyPackageRef."},
+    "deviceLeafView": {"type": "object", "required": ["userDid", "deviceId", "leafOrigin", "keyId", "deviceStatus"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"}, "leafOrigin": {"type": "ref", "ref": "#leafOrigin"}, "joinKeyPackageRef": {"type": "bytes", "minLength": 32, "maxLength": 32}, "keyId": {"type": "ref", "ref": "#keyId"}, "deviceStatus": {"type": "ref", "ref": "#deviceStatus"}}, "description": "joinKeyPackageRef is absent for genesis and required for keyPackage origin."},
+
+    "addParticipant": {"type": "object", "required": ["userDid", "role", "status", "invitationProvenance"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "role": {"type": "string", "const": "member"}, "status": {"type": "string", "const": "pending"}, "invitationProvenance": {"type": "ref", "ref": "#invitationProvenance"}}, "description": "Group-only admin invitation. It creates only pending/member/zero-leaf state; provenance must name this exact policy transition and signing inviter. It can never share a transition with an Add leaf. Direct conversations forbid addParticipant after creation."},
+    "removeParticipant": {"type": "object", "required": ["userDid"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}}},
+    "changeParticipantRole": {"type": "object", "required": ["userDid", "role"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "role": {"type": "ref", "ref": "#memberRole"}}, "description": "Group-only role change for an active participant. Pending group participants remain members; direct conversations forbid every role mutation."},
+    "participantChange": {"type": "union", "refs": ["#addParticipant", "#removeParticipant", "#changeParticipantRole"], "closed": true},
+    "addLeafByRecovery": {"type": "object", "required": ["userDid", "deviceId", "recoveryRequestId", "keyPackageRef"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"}, "recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "keyPackageRef": {"type": "bytes", "minLength": 32, "maxLength": 32}}},
+    "removeLeaf": {"type": "object", "required": ["userDid", "deviceId"], "properties": {"userDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"}}},
+    "leafChange": {"type": "union", "refs": ["#addLeafByRecovery", "#removeLeaf"], "closed": true},
+
+    "recoveryWelcomeProvenance": {"type": "object", "required": ["recoveryRequestId", "keyPackageRef"], "properties": {"recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "keyPackageRef": {"type": "bytes", "minLength": 32, "maxLength": 32}}},
+    "welcomeDelivery": {
+      "type": "object",
+      "required": ["recipientDid", "recipientDeviceId", "provenance"],
+      "properties": {"recipientDid": {"type": "ref", "ref": "#bareDid"}, "recipientDeviceId": {"type": "ref", "ref": "#deviceId"}, "provenance": {"type": "ref", "ref": "#recoveryWelcomeProvenance"}},
+      "description": "Provenance exactly equals the addLeafByRecovery recoveryRequestId and its target-device-signed request-bound KeyPackageRef. A mismatched target, request, or package is invalid."
+    },
+    "welcomeBundle": {
+      "type": "object",
+      "required": ["welcomeId", "framing", "contentType", "opaqueWelcome", "sha256", "deliveries"],
+      "properties": {
+        "welcomeId": {"type": "ref", "ref": "#operationId"},
+        "framing": {"type": "string", "const": "mlsMessage"},
+        "contentType": {"type": "string", "const": "welcome"},
+        "opaqueWelcome": {"type": "bytes", "minLength": 8, "maxLength": 1048576},
+        "sha256": {"type": "ref", "ref": "#artifactHash"},
+        "deliveries": {"type": "array", "items": {"type": "ref", "ref": "#welcomeDelivery"}, "minLength": 1, "maxLength": 1}
+      },
+      "description": "Version 1 has exactly one delivery for the one target-device-signed recovery request fulfilled by this Add Commit. The row maps that added leaf to its exact recovery provenance."
+    },
+    "welcomeView": {
+      "type": "object",
+      "required": ["welcomeId", "conversationId", "transitionSeq", "coordinates", "status", "opaqueWelcome", "sha256", "recipientDid", "recipientDeviceId", "provenance", "expiresAt"],
+      "properties": {
+        "welcomeId": {"type": "ref", "ref": "#operationId"},
+        "conversationId": {"type": "ref", "ref": "#operationId"},
+        "transitionSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "coordinates": {"type": "ref", "ref": "#conversationCoordinates"},
+        "status": {"type": "ref", "ref": "#welcomeStatus"},
+        "opaqueWelcome": {"type": "bytes", "minLength": 8, "maxLength": 1048576},
+        "sha256": {"type": "ref", "ref": "#artifactHash"},
+        "recipientDid": {"type": "ref", "ref": "#bareDid"},
+        "recipientDeviceId": {"type": "ref", "ref": "#deviceId"},
+        "provenance": {"type": "ref", "ref": "#recoveryWelcomeProvenance"},
+        "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}
+      },
+      "description": "One immutable recipient row is retained for every Welcome delivery. expiresAt is the canonical UTC datetime representation of the exact consumed Add KeyPackage not_after Unix second and therefore has .000Z fractional seconds. At that instant a still-pending row atomically becomes expired and creates recovery work; its encrypted Welcome bytes, provenance, historical coordinate, transition seq, recipient, and terminal disposition are never deleted or rewritten. Acknowledge/reject/expiry/supersession use one compare-and-set terminal race. Exact delayed idempotent replay returns the recorded disposition, while changed bytes conflict and a delayed acknowledge/reject cannot overturn a terminal result."
+    },
+
+    "commitAad": {
+      "type": "object",
+      "required": ["protocolVersion", "conversationId", "generation", "transitionId", "prior"],
+      "properties": {
+        "protocolVersion": {"type": "ref", "ref": "#protocolVersion"},
+        "conversationId": {"type": "ref", "ref": "#identifierBytes"},
+        "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "transitionId": {"type": "ref", "ref": "#identifierBytes"},
+        "prior": {"type": "ref", "ref": "#mlsAadPriorContext"}
+      },
+      "description": "Exact deterministic DAG-CBOR projection prefixed by CATBIRD-CHAT-MLS-AAD-COMMIT\\0. All UUIDs are raw 16-byte strings and prior is the active bytes-based context exactly equivalent to the outer signed transport coordinate; it never includes the enclosing MLSMessage hash."
+    },
+    "applicationAad": {
+      "type": "object",
+      "required": ["protocolVersion", "conversationId", "generation", "messageId", "prior"],
+      "properties": {
+        "protocolVersion": {"type": "ref", "ref": "#protocolVersion"},
+        "conversationId": {"type": "ref", "ref": "#identifierBytes"},
+        "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "messageId": {"type": "ref", "ref": "#identifierBytes"},
+        "prior": {"type": "ref", "ref": "#mlsAadPriorContext"}
+      },
+      "description": "Exact deterministic DAG-CBOR projection prefixed by CATBIRD-CHAT-MLS-AAD-MESSAGE\\0. All UUIDs are raw 16-byte strings and prior is the active bytes-based context exactly equivalent to the outer signed transport coordinate; it never includes the enclosing MLSMessage hash."
+    },
+
+    "transitionManifest": {
+      "type": "object",
+      "required": ["participantChanges", "leafChanges"],
+      "properties": {
+        "participantChanges": {"type": "array", "items": {"type": "ref", "ref": "#participantChange"}, "minLength": 0, "maxLength": 100},
+        "leafChanges": {"type": "array", "items": {"type": "ref", "ref": "#leafChange"}, "minLength": 0, "maxLength": 100},
+        "welcomeBundle": {"type": "ref", "ref": "#welcomeBundle"},
+        "leafRecoveryRequestId": {"type": "ref", "ref": "#operationId"}
+      },
+      "description": "participantChanges are strictly increasing and duplicate-free by affected userDid exact UTF-8 bytes; leafChanges are strictly increasing and duplicate-free by (userDid exact UTF-8 bytes, deviceId raw UUID bytes, operation rank). Operation rank is removeLeaf before addLeafByRecovery for the same (userDid, deviceId). addParticipant is policy-only and can never coexist with an Add leaf; every Add DID must already be active in prior state. Direct conversations require participantChanges empty forever. Every Add is exactly one addLeafByRecovery refining an open target-device-signed request; leafRecoveryRequestId and a one-delivery welcomeBundle are required and match that Add, request-bound KeyPackageRef, and recovery Welcome provenance exactly. No admin or current leaf can reserve or Add another device without that target device's signed request. Removes never have deliveries. Under the conversation mutation lock the server rechecks block policy for every unordered pair in the resulting roster immediately before the final Add. Inputs are rejected rather than sorted."
+    },
+    "creationManifest": {
+      "type": "object",
+      "required": ["participants", "actorLeaf"],
+      "properties": {
+        "participants": {"type": "array", "items": {"type": "ref", "ref": "#participant"}, "minLength": 1, "maxLength": 100},
+        "actorLeaf": {"type": "ref", "ref": "#deviceLeaf"}
+      },
+      "description": "participants are strictly increasing and duplicate-free by userDid exact UTF-8 bytes. The signing creator appears exactly once as active/admin with no invitation provenance; actorLeaf matches that creator and is the only MLS leaf at epoch zero. For group, every other participant is pending/member/zero-leaf. For direct, the roster is exactly the creator plus one pending/admin/zero-leaf invitee; pending status grants that invitee no authority. Every pending row has provenance naming this creation transition and signer. Pending invitations are the only consent request and carry no server-readable message. Inputs are rejected rather than sorted."
+    },
+    "resetActivationManifest": {
+      "type": "object",
+      "required": ["participants", "actorLeaf"],
+      "properties": {
+        "participants": {"type": "array", "items": {"type": "ref", "ref": "#participant"}, "minLength": 1, "maxLength": 100},
+        "actorLeaf": {"type": "ref", "ref": "#deviceLeaf"}
+      },
+      "description": "participants are strictly increasing and duplicate-free by userDid exact UTF-8 bytes and preserve immutable conversationKind plus every prior status, role, and invitation provenance exactly. The signing activator is an active admin, actorLeaf matches it, and it is the only successor MLS leaf at epoch zero. Every other participant has zero successor leaves; only active participants may later be re-added by ordinary recovery/membership Commits. A direct roster remains its exact two admin-role participants. Inputs are rejected rather than sorted."
+    },
+
+    "leafRecoveryReservation": {
+      "type": "object",
+      "required": ["recoveryRequestId", "conversationId", "boundCoordinate", "requesterDid", "requesterDeviceId", "requesterKeyId", "requesterAuthGeneration", "keyPackageRef", "cipherSuite", "purpose", "status", "expiresAt", "keyPackage"],
+      "properties": {
+        "recoveryRequestId": {"type": "ref", "ref": "#operationId"},
+        "conversationId": {"type": "ref", "ref": "#operationId"},
+        "boundCoordinate": {"type": "ref", "ref": "#conversationCoordinates"},
+        "requesterDid": {"type": "ref", "ref": "#bareDid"},
+        "requesterDeviceId": {"type": "ref", "ref": "#deviceId"},
+        "requesterKeyId": {"type": "ref", "ref": "#keyId"},
+        "requesterAuthGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "keyPackageRef": {"type": "bytes", "minLength": 32, "maxLength": 32},
+        "cipherSuite": {"type": "ref", "ref": "#cipherSuite"},
+        "purpose": {"type": "string", "const": "leafRecovery"},
+        "status": {"type": "ref", "ref": "#reservationStatus"},
+        "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"},
+        "keyPackage": {"type": "ref", "ref": "#keyPackageArtifact"}
+      },
+      "description": "Dedicated recovery reservation bound to the requester's signed recoveryRequestId, recoveryKind, identity, and boundCoordinate. For requestLeafRecovery, boundCoordinate equals the signed prior. For acceptConversation, it equals the exact post-acceptance next coordinate, never prior. add requires requesterDeviceId to be absent from the bound MLS tree. replace requires requesterDeviceId to identify its exact existing bound leaf; fulfillment must remove and re-add that same (requesterDid, requesterDeviceId), consuming this package. It has no future transitionId or aliased/invented reservation ID; the future fulfiller independently signs transitionId plus recoveryRequestId."
+    },
+
+    "uploadedBlobBinding": {
+      "type": "object",
+      "required": ["blobId", "ciphertextSha256", "ciphertextSize", "purpose"],
+      "properties": {
+        "blobId": {"type": "ref", "ref": "#operationId"},
+        "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"},
+        "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760},
+        "purpose": {"type": "ref", "ref": "#blobPurpose"}
+      },
+      "description": "Upload completion reflects the exact prepared attachment or metadata purpose. Signed application and metadata projections must use their narrower purpose-constant binding types rather than this transport result type."
+    },
+    "applicationAttachmentBinding": {
+      "type": "object",
+      "required": ["blobId", "ciphertextSha256", "ciphertextSize", "purpose"],
+      "properties": {
+        "blobId": {"type": "ref", "ref": "#operationId"},
+        "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"},
+        "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760},
+        "purpose": {"type": "string", "const": "attachment"}
+      },
+      "description": "Closed signed-application binding. The purpose is exactly attachment; a metadata-purpose upload cannot inhabit applicationSendBody."
+    },
+    "metadataAvatarBinding": {
+      "type": "object",
+      "required": ["blobId", "ciphertextSha256", "ciphertextSize", "purpose"],
+      "properties": {
+        "blobId": {"type": "ref", "ref": "#operationId"},
+        "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"},
+        "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760},
+        "purpose": {"type": "string", "const": "metadata"}
+      },
+      "description": "Closed metadata-snapshot avatar binding. The purpose is exactly metadata; an attachment-purpose upload cannot inhabit metadataSnapshot."
+    },
+    "blobUploadView": {
+      "type": "object",
+      "required": ["blobId", "uploadTicket", "ciphertextSha256", "ciphertextSize", "purpose", "expiresAt"],
+      "properties": {
+        "blobId": {"type": "ref", "ref": "#operationId"},
+        "uploadTicket": {"type": "string", "minLength": 32, "maxLength": 512},
+        "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"},
+        "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760},
+        "purpose": {"type": "ref", "ref": "#blobPurpose"},
+        "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}
+      }
+    },
+    "blobUsageView": {
+      "type": "object",
+      "required": ["usedBytes", "reservedBytes", "quotaBytes", "blobCount", "liveUnboundCount"],
+      "properties": {
+        "usedBytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "reservedBytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "quotaBytes": {"type": "integer", "const": 524288000},
+        "blobCount": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "liveUnboundCount": {"type": "integer", "minimum": 0, "maximum": 100}
+      }
+    },
+
+    "deviceEnrollmentBody": {
+      "type": "object",
+      "required": ["signatureDomain", "actorDid", "deviceId", "deviceName", "keyId", "signaturePublicKey", "dpopJkt", "expectedAuthGeneration", "capability", "keyPackages", "idempotencyKey", "signedAt"],
+      "properties": {
+        "signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-DEVICE-ENROLL\u0000"},
+        "actorDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"},
+        "deviceName": {"type": "string", "minLength": 1, "maxLength": 128}, "keyId": {"type": "ref", "ref": "#keyId"},
+        "signaturePublicKey": {"type": "bytes", "minLength": 32, "maxLength": 32}, "dpopJkt": {"type": "string", "minLength": 43, "maxLength": 43},
+        "expectedAuthGeneration": {"type": "integer", "const": 0}, "capability": {"type": "ref", "ref": "#deviceCapability"},
+        "keyPackages": {"type": "array", "items": {"type": "ref", "ref": "#keyPackageArtifact"}, "minLength": 1, "maxLength": 100},
+        "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}
+      },
+      "description": "First enrollment requires a one-use at-most-120-second Nest fresh-auth grant from an enrollment-purpose-bound OAuth authorization_code flow. Nest creates evidence only after successful callback/code exchange and issuer, subject, scope, and DPoP validation; restore, refresh, cookie exchange, or an existing session alone never creates evidence. Callback completion opens one encrypted capability through auth_time + 300 seconds, with auth_time equal to Nest callback-completion time and not upstream auth_time. Capability states are unpinned, pinned/pending, and terminal-success. Before pinning, Nest performs strict canonical decode, bounds, and capability/body binding checks and verifies the body's Ed25519 signature under its supplied immutable signing key. A malformed, out-of-bounds, binding-invalid, or signature-invalid attempt neither pins nor burns the capability. The first body that passes all of those checks transitions unpinned to pinned/pending and atomically pins the exact canonical request digest, separate signature, DID, device ID, DPoP JKT, key ID, signing-key digest, and enrollment-transcript digest. While pinned/pending and Nest has not durably recorded downstream success, including ambiguous response loss after delivery-service commit, the same exact body may mint another downstream grant. Each such attempt retains original auth_time but gets fresh token/proof JTIs and a server-generated per-grant canonical lowercase UUIDv4 auth_txn distinct from provider state and client input; delivery-service exact idempotent replay returns its stored result. Changed body cannot reuse the capability. Once Nest durably records success it stores the terminal result/binding, transitions to terminal-success, and closes the capability; exact client retry is then answered from that Nest-stored terminal result without a new downstream grant. Expiry before terminal success requires a new code flow. Besides common claims iss, sub, aud, lxm, iat, exp, jti, cnf.jkt, device_id, and chat_instance, exact additional claims are key_id, signing_key_sha256, enrollment_transcript_sha256, auth_time, and auth_txn. Enrollment grant exp = min(iat + 120, auth_time + 300) using checked NumericDate arithmetic; ordinary tokens require exp <= iat + 120. The delivery service independently accepts the Nest issuer attestation only when 0 <= T-auth_time <= 300 seconds. prompt=login and an ephemeral browser are best-effort only; neither is a security predicate, fresh authorization-code completion does not attest credential entry or user presence, and the protocol does not claim user reauthentication. Subject, endpoint, device ID, key ID, SHA-256(signaturePublicKey), dpopJkt through cnf.jkt, and raw SHA-256 of this exact canonical signing transcript must match; grant cnf.jkt, proof RFC7638 JKT, and body dpopJkt are byte-equal before device lookup. A generic bearer/session token is invalid. keyPackages are strictly increasing and duplicate-free by computed raw KeyPackageRef. Every package lifetime is checked against one captured Unix second T: not_before < T < not_after, not_after - T >= 600, and not_after - not_before <= 2595600, with checked arithmetic and underflow rejection. The whole batch is rejected rather than sorted."
+    },
+    "keyPackageReplenishmentBody": {
+      "type": "object",
+      "required": ["signatureDomain", "actorDid", "actorDeviceId", "keyId", "authGeneration", "dpopJkt", "signaturePublicKey", "keyPackages", "idempotencyKey", "signedAt"],
+      "properties": {
+        "signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-DEVICE-REPLENISH\u0000"}, "actorDid": {"type": "ref", "ref": "#bareDid"},
+        "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "dpopJkt": {"type": "string", "minLength": 43, "maxLength": 43}, "signaturePublicKey": {"type": "bytes", "minLength": 32, "maxLength": 32},
+        "keyPackages": {"type": "array", "items": {"type": "ref", "ref": "#keyPackageArtifact"}, "minLength": 1, "maxLength": 100},
+        "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}
+      },
+      "description": "keyPackages are strictly increasing and duplicate-free by computed raw KeyPackageRef. Every package lifetime is checked against one captured Unix second T: not_before < T < not_after, not_after - T >= 600, and not_after - not_before <= 2595600, with checked arithmetic and underflow rejection. The whole batch is rejected rather than sorted."
+    },
+    "deviceAuthenticationRebindBody": {
+      "type": "object",
+      "required": ["signatureDomain", "actorDid", "actorDeviceId", "keyId", "expectedAuthGeneration", "currentDpopJkt", "newDpopJkt", "idempotencyKey", "signedAt"],
+      "properties": {
+        "signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-DEVICE-REBIND\u0000"}, "actorDid": {"type": "ref", "ref": "#bareDid"},
+        "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "expectedAuthGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "currentDpopJkt": {"type": "string", "minLength": 43, "maxLength": 43}, "newDpopJkt": {"type": "string", "minLength": 43, "maxLength": 43},
+        "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}
+      },
+      "description": "Rebind is an explicit bootstrap exception for loss of the old DPoP key. First execution uses a valid Nest token/proof bound to newDpopJkt, looks up exact (actorDid,actorDeviceId), CASes signed currentDpopJkt plus expectedAuthGeneration, verifies this body with the immutable stored Ed25519 key, then installs proofJKT = newDpopJkt and increments generation. If the Ed25519 key is lost, enroll a new device and revoke the old. Exact completed replay requires the stored transcript digest/signature and fresh token/proof under only the recorded new JKT."
+    },
+    "deviceRevocationBody": {
+      "type": "object",
+      "required": ["signatureDomain", "actorDid", "actorDeviceId", "keyId", "authGeneration", "targetDeviceId", "targetAuthGeneration", "idempotencyKey", "signedAt"],
+      "properties": {
+        "signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-DEVICE-REVOKE\u0000"}, "actorDid": {"type": "ref", "ref": "#bareDid"},
+        "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "targetDeviceId": {"type": "ref", "ref": "#deviceId"}, "targetAuthGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}
+      }
+    },
+
+    "creationBody": {
+      "type": "object", "required": ["signatureDomain", "conversationId", "conversationKind", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "absence", "next", "manifest", "genesisGroupInfo", "metadataSnapshot", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-CREATE\u0000"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "conversationKind": {"type": "ref", "ref": "#conversationKind"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "absence": {"type": "boolean", "const": true}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "manifest": {"type": "ref", "ref": "#creationManifest"}, "genesisGroupInfo": {"type": "ref", "ref": "#groupInfoArtifact"}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "True-absence CAS creation from client-staged actor-only epoch-zero state. next is exactly generation 0, stateVersion 0, epoch 0, lifecycle active, with the stable conversationId, fresh random groupId, GroupContext-derived hash, and exact client-produced confirmation tag whose GroupInfo/public-state/signed-coordinate/snapshot bytes agree; the public-only service does not derive or verify the secret confirmation MAC. conversationKind is immutable. The creator is active/admin and the sole genesis leaf; every other creation-roster participant is pending and zero-leaf. Direct is exactly creator plus one pending admin-role invitee and uses allowIncoming; group pending rows are members and use allowGroupInvites when present, otherwise allowIncoming. The service checks consent, exact invitation limits, and block policy for every unordered roster pair under the creation lock. At most one nonterminal direct exists for the unordered DID pair; a concurrent/direct duplicate CAS returns the existing identity as a typed outcome. There is no preparation lease, KeyPackage reservation, bootstrap Commit, or Welcome."
+    },
+    "commitTransitionBody": {
+      "type": "object", "required": ["signatureDomain", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "aad", "manifest", "commit", "metadataSnapshot", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-COMMIT\u0000"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "aad": {"type": "ref", "ref": "#commitAad"}, "manifest": {"type": "ref", "ref": "#transitionManifest"}, "commit": {"type": "ref", "ref": "#publicCommit"}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Ordinary generic signedCommitTransition requires zero Add proposals and zero membership changes; only signedLeafRecoveryFulfillment may contain exactly one request-bound Add. It requires the same conversationId, generation, active lifecycle, and groupId as prior; next.stateVersion = prior.stateVersion + 1 and next.epoch = prior.epoch + 1. The next GroupContext hash is derived from validated merged public state and differs from prior. The exact 32-byte confirmation tag also differs and must byte-equal the parsed authenticated Commit, merged OpenMLS public state, signed next, authoritative coordinate, and persisted snapshot. The public-only service does not cryptographically derive or verify that secret confirmation MAC; recipients do after processing. Checked increment overflow rejects the entire transition."
+    },
+    "policyTransitionBody": {
+      "type": "object", "required": ["signatureDomain", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "participantChanges", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-POLICY\u0000"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "participantChanges": {"type": "array", "items": {"type": "ref", "ref": "#participantChange"}, "minLength": 1, "maxLength": 100}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Group-only active-admin policy transition; direct conversations reject every policy transition and preserve their exact two-role roster until unilateral close. participantChanges are strictly increasing and duplicate-free by affected userDid exact UTF-8 bytes. addParticipant creates pending/member/zero-leaf only, carries provenance naming this transition/actor, and is never combined with any Add leaf. Invitation creation rechecks consent, exact pending-invitation limits, and block policy for every unordered pair in the resulting roster under lock. next equals prior in conversationId, generation, groupId, epoch, GroupContext hash, confirmation tag, and active lifecycle; only stateVersion increments by exactly one. Checked increment overflow rejects the entire transition."
+    },
+    "participantAcceptanceBody": {
+      "type": "object", "required": ["signatureDomain", "transitionId", "recoveryRequestId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "invitationProvenance", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-ACCEPT\u0000"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "invitationProvenance": {"type": "ref", "ref": "#invitationProvenance"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "A pending participant's active registered device accepts the exact immutable invitation. The actor DID equals that pending row, provenance matches byte-for-byte, and next changes only stateVersion = prior + 1 while status becomes active and role is preserved: member for group, admin for direct. Under the same conversation lock, the service rechecks consent and block policy for every unordered roster pair and atomically selects the actor device's KeyPackage into an add-kind leaf-recovery reservation bound to recoveryRequestId and the exact post-acceptance next coordinate, never prior. This uses the unique-open constraint for exact (conversationId,generation,actorDid,actorDeviceId); binding next prevents the acceptance transaction's prior-coordinate supersession rule from immediately superseding its own request. Failure changes neither policy state nor package state; a different current leaf later fulfills the recovery Commit/Welcome."
+    },
+    "applicationSendBody": {
+      "type": "object", "required": ["signatureDomain", "messageId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "aad", "applicationMessage", "blobBindings", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-MESSAGE\u0000"}, "messageId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "aad": {"type": "ref", "ref": "#applicationAad"}, "applicationMessage": {"type": "ref", "ref": "#privateApplicationMessage"}, "blobBindings": {"type": "array", "items": {"type": "ref", "ref": "#applicationAttachmentBinding"}, "minLength": 0, "maxLength": 1}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "messageId is the sole idempotency identity, unique within conversationId. Its canonical request digest is raw SHA-256 of the exact domain-prefixed canonical Ed25519 transcript and its 64-byte signature is stored separately. Exact completed replay requires both digest and signature byte-equal; either mismatch conflicts. Raw JSON or generated DTO bytes are never hashed. blobBindings contains zero or one exact applicationAttachmentBinding with purpose attachment; metadataAvatarBinding and generic uploadedBlobBinding are forbidden. A stale-coordinate attempt retires that messageId under the same digest/signature rule, so retry requires a newly encrypted frame and new messageId."
+    },
+
+    "identifierBytes": {"type": "bytes", "minLength": 16, "maxLength": 16, "description": "Exact 16 UUID bytes corresponding to the canonical outer UUIDv4 text."},
+    "messageTarget": {"type": "object", "required": ["targetSeq", "targetMessageId"], "properties": {"targetSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "targetMessageId": {"type": "ref", "ref": "#identifierBytes"}}, "description": "Both fields identify one exact earlier original message-body entry in the same conversation and inside the reducer's application interval. A reaction, edit, tombstone, readState, or other mutation is never a target. Reducers never fetch outside the interval. An unavailable reply becomes a stub; unavailable reaction/edit/tombstone becomes an UnavailableTarget no-op/rejection while seq still advances."},
+    "encryptedImageEmbed": {
+      "type": "object", "required": ["blobId", "purpose", "algorithm", "key", "nonce", "ciphertextSha256", "ciphertextSize", "plaintextSize", "mimeType", "width", "height"],
+      "properties": {"blobId": {"type": "ref", "ref": "#identifierBytes"}, "purpose": {"type": "string", "const": "attachment"}, "algorithm": {"type": "string", "const": "A256GCM"}, "key": {"type": "bytes", "minLength": 32, "maxLength": 32}, "nonce": {"type": "bytes", "minLength": 12, "maxLength": 12}, "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"}, "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760}, "plaintextSize": {"type": "integer", "minimum": 1, "maximum": 10485744}, "mimeType": {"type": "string", "enum": ["image/heic", "image/jpeg", "image/png", "image/webp", "image/gif"]}, "width": {"type": "integer", "minimum": 1, "maximum": 16384}, "height": {"type": "integer", "minimum": 1, "maximum": 16384}, "altText": {"type": "string", "minLength": 1, "maxLength": 4096}, "blurhash": {"type": "string", "minLength": 6, "maxLength": 256}},
+      "description": "Runtime requires ciphertextSize == plaintextSize + 16 using checked safe-integer arithmetic; mismatch or overflow rejects. Ciphertext bytes include the appended 16-byte AES-GCM tag and exclude the nonce."
+    },
+    "encryptedAudioEmbed": {
+      "type": "object", "required": ["blobId", "purpose", "algorithm", "key", "nonce", "ciphertextSha256", "ciphertextSize", "plaintextSize", "mimeType", "durationMillis", "waveform"],
+      "properties": {"blobId": {"type": "ref", "ref": "#identifierBytes"}, "purpose": {"type": "string", "const": "attachment"}, "algorithm": {"type": "string", "const": "A256GCM"}, "key": {"type": "bytes", "minLength": 32, "maxLength": 32}, "nonce": {"type": "bytes", "minLength": 12, "maxLength": 12}, "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"}, "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 8388608}, "plaintextSize": {"type": "integer", "minimum": 1, "maximum": 8388592}, "mimeType": {"type": "string", "enum": ["audio/aac", "audio/mp4", "audio/ogg", "audio/opus"]}, "durationMillis": {"type": "integer", "minimum": 1, "maximum": 300000}, "waveform": {"type": "bytes", "minLength": 64, "maxLength": 64}, "transcript": {"type": "string", "minLength": 1, "maxLength": 16384}},
+      "description": "Runtime requires ciphertextSize == plaintextSize + 16 using checked safe-integer arithmetic; mismatch or overflow rejects. Ciphertext bytes include the appended 16-byte AES-GCM tag and exclude the nonce."
+    },
+    "atprotoRecordEmbed": {"type": "object", "required": ["uri", "cid"], "properties": {"uri": {"type": "string", "format": "at-uri", "minLength": 1, "maxLength": 1097}, "cid": {"type": "string", "format": "cid", "minLength": 1, "maxLength": 256}}, "description": "uri must be the deliberately unescaped restricted canonical AT URI of at most 1097 ASCII bytes: exact lowercase at:// scheme; no percent sign or escape anywhere; authority is an exact supported did:plc, a hostname-level did:web whose normalized lowercase hostname satisfies the same production handle syntax, or a normalized lowercase production handle; exact collection plus record key; lowercase collection domain-authority segments while its terminal name and the record key remain case-sensitive; and no query, fragment, trailing slash, duplicate slash, record key equal to . or .., or extra path segment. The exact maximum is 5-byte at:// plus 261-byte did:web authority plus slash plus 317-byte NSID plus slash plus 512-byte record key. Every hostname authority has at least two labels and rejects path/port/IP/single-label/localhost forms plus TLDs alt, arpa, example, internal, invalid, local, localhost, onion, and test; handle.invalid is not an authority. Parser acceptance or round-trip alone is not canonicality proof. cid must be canonical round-trip CID text: parse succeeds and reserialization byte-equals the exact 1-256 UTF-8-byte input."},
+    "externalLinkEmbed": {"type": "object", "required": ["uri"], "properties": {"uri": {"type": "string", "format": "uri", "minLength": 1, "maxLength": 2048}, "title": {"type": "string", "minLength": 1, "maxLength": 512}, "description": {"type": "string", "minLength": 1, "maxLength": 2048}}, "description": "Runtime requires an absolute HTTPS URI with a nonempty host, no userinfo, no backslash, no whitespace or control character, a valid port when present, and valid percent encoding."},
+    "encryptedImageEmbedVariant": {"type": "object", "required": ["encryptedImage"], "properties": {"encryptedImage": {"type": "ref", "ref": "#encryptedImageEmbed"}}},
+    "encryptedAudioEmbedVariant": {"type": "object", "required": ["encryptedAudio"], "properties": {"encryptedAudio": {"type": "ref", "ref": "#encryptedAudioEmbed"}}},
+    "atprotoRecordEmbedVariant": {"type": "object", "required": ["atprotoRecord"], "properties": {"atprotoRecord": {"type": "ref", "ref": "#atprotoRecordEmbed"}}},
+    "externalLinkEmbedVariant": {"type": "object", "required": ["externalLink"], "properties": {"externalLink": {"type": "ref", "ref": "#externalLinkEmbed"}}},
+    "applicationEmbed": {"type": "union", "refs": ["#encryptedImageEmbedVariant", "#encryptedAudioEmbedVariant", "#atprotoRecordEmbedVariant", "#externalLinkEmbedVariant"], "closed": true},
+    "messageFrameBody": {"type": "object", "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 16384}, "replyTo": {"type": "ref", "ref": "#messageTarget"}, "embed": {"type": "ref", "ref": "#applicationEmbed"}}, "description": "Runtime requires nonempty text or embed; no empty sentinel is accepted."},
+    "reactionFrameBody": {"type": "object", "required": ["target", "emoji", "operation"], "properties": {"target": {"type": "ref", "ref": "#messageTarget"}, "emoji": {"type": "string", "minLength": 1, "maxLength": 64, "minGraphemes": 1, "maxGraphemes": 1}, "operation": {"type": "string", "enum": ["add", "remove"]}}, "description": "The reaction string must use Unicode 17.0.0 NFC, be control-free, and contain exactly one Unicode 17.0.0 UAX #29 extended grapheme cluster; no Unicode emoji-property requirement is imposed. Per verified DID plus emoji, greatest conversation seq wins. A target tombstone suppresses all reactions in the rendered state."},
+    "editFrameBody": {"type": "object", "required": ["target", "replacementText"], "properties": {"target": {"type": "ref", "ref": "#messageTarget"}, "replacementText": {"type": "string", "minLength": 1, "maxLength": 16384}}, "description": "Only the verified DID that authored the original message may edit it. Greatest valid conversation seq wins. Once a valid tombstone exists, every later edit is a terminal no-op/rejection; tombstone dominates regardless of arrival order."},
+    "tombstoneFrameBody": {"type": "object", "required": ["target"], "properties": {"target": {"type": "ref", "ref": "#messageTarget"}}, "description": "Only the verified DID that authored the original message may tombstone it. A valid tombstone permanently dominates edits, reactions, and message rendering regardless of later mutation arrival."},
+    "readStateFrameBody": {"type": "object", "required": ["throughSeq", "throughMessageId"], "properties": {"throughSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "throughMessageId": {"type": "ref", "ref": "#identifierBytes"}}, "description": "The pair must identify the same accessible original message-body entry in this conversation. Per verified DID, a read frontier may advance to a greater throughSeq or exact-replay the same pair; regression, same seq with a different ID, inaccessible targets, and mutation targets are terminal no-ops/rejections."},
+    "messageFrameVariant": {"type": "object", "required": ["message"], "properties": {"message": {"type": "ref", "ref": "#messageFrameBody"}}},
+    "reactionFrameVariant": {"type": "object", "required": ["reaction"], "properties": {"reaction": {"type": "ref", "ref": "#reactionFrameBody"}}},
+    "editFrameVariant": {"type": "object", "required": ["edit"], "properties": {"edit": {"type": "ref", "ref": "#editFrameBody"}}},
+    "tombstoneFrameVariant": {"type": "object", "required": ["tombstone"], "properties": {"tombstone": {"type": "ref", "ref": "#tombstoneFrameBody"}}},
+    "readStateFrameVariant": {"type": "object", "required": ["readState"], "properties": {"readState": {"type": "ref", "ref": "#readStateFrameBody"}}},
+    "applicationFrameBody": {"type": "union", "refs": ["#messageFrameVariant", "#reactionFrameVariant", "#editFrameVariant", "#tombstoneFrameVariant", "#readStateFrameVariant"], "closed": true},
+    "applicationFrame": {
+      "type": "object", "required": ["protocol", "version", "messageId", "context", "body"],
+      "properties": {"protocol": {"type": "string", "const": "blue.catbird.chat.application"}, "version": {"type": "integer", "const": 1}, "messageId": {"type": "ref", "ref": "#identifierBytes"}, "context": {"type": "ref", "ref": "#applicationFrameContext"}, "body": {"type": "ref", "ref": "#applicationFrameBody"}},
+      "description": "Encrypted plaintext is one deterministic RFC 8949 4.2.3 DAG-CBOR map, at most 65536 bytes, exact-reencoded by Rust with no JSON/unknown fallback, duplicate/unknown/null/tag/float/indefinite/trailing form. Inner context/messageId/blob binding exactly match MLS AAD and signed outer entry."
+    },
+    "blobAad": {"type": "object", "required": ["protocol", "context", "messageId", "attachmentIndex", "blobId", "purpose", "mediaType", "plaintextSize"], "properties": {"protocol": {"type": "string", "const": "blue.catbird.chat.blob"}, "context": {"type": "ref", "ref": "#applicationFrameContext"}, "messageId": {"type": "ref", "ref": "#identifierBytes"}, "attachmentIndex": {"type": "integer", "const": 0}, "blobId": {"type": "ref", "ref": "#identifierBytes"}, "purpose": {"type": "string", "const": "attachment"}, "mediaType": {"type": "string", "minLength": 1, "maxLength": 128}, "plaintextSize": {"type": "integer", "minimum": 1, "maximum": 10485744}}, "description": "AES-256-GCM AAD is CATBIRD-CHAT-BLOB\\0 followed by exact deterministic DAG-CBOR. The 16-byte tag is appended to ciphertext; there is no plaintext hash. A message attachment is bound once to messageId/index and cannot be transplanted or reused."},
+    "metadataAvatarEmbed": {
+      "type": "object", "required": ["blobId", "purpose", "algorithm", "key", "nonce", "ciphertextSha256", "ciphertextSize", "plaintextSize", "mimeType", "width", "height", "originTransitionId", "originalMetadataVersion"],
+      "properties": {"blobId": {"type": "ref", "ref": "#identifierBytes"}, "purpose": {"type": "string", "const": "metadata"}, "algorithm": {"type": "string", "const": "A256GCM"}, "key": {"type": "bytes", "minLength": 32, "maxLength": 32}, "nonce": {"type": "bytes", "minLength": 12, "maxLength": 12}, "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"}, "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760}, "plaintextSize": {"type": "integer", "minimum": 1, "maximum": 10485744}, "mimeType": {"type": "string", "enum": ["image/heic", "image/jpeg", "image/png", "image/webp"]}, "width": {"type": "integer", "minimum": 1, "maximum": 16384}, "height": {"type": "integer", "minimum": 1, "maximum": 16384}, "altText": {"type": "string", "minLength": 1, "maxLength": 4096}, "blurhash": {"type": "string", "minLength": 6, "maxLength": 256}, "originTransitionId": {"type": "ref", "ref": "#identifierBytes"}, "originalMetadataVersion": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}},
+      "description": "Runtime requires ciphertextSize == plaintextSize + 16 using checked safe-integer arithmetic; mismatch or overflow rejects, including for metadata avatars. Ciphertext bytes include the appended 16-byte AES-GCM tag and exclude the nonce. The origin fields are immutable and identify the metadata version whose AAD first bound these blob bytes. A later title-only metadata version may reuse the descriptor and existing binding without reencrypting the avatar."
+    },
+    "metadataAvatarBlobAad": {
+      "type": "object", "required": ["protocol", "conversationId", "originTransitionId", "originalMetadataVersion", "blobId", "purpose", "mediaType", "plaintextSize"],
+      "properties": {"protocol": {"type": "string", "const": "blue.catbird.chat.metadata.avatar"}, "conversationId": {"type": "ref", "ref": "#identifierBytes"}, "originTransitionId": {"type": "ref", "ref": "#identifierBytes"}, "originalMetadataVersion": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "blobId": {"type": "ref", "ref": "#identifierBytes"}, "purpose": {"type": "string", "const": "metadata"}, "mediaType": {"type": "string", "minLength": 1, "maxLength": 128}, "plaintextSize": {"type": "integer", "minimum": 1, "maximum": 10485744}},
+      "description": "AES-256-GCM AAD is CATBIRD-CHAT-METADATA-AVATAR-BLOB\\0 followed by exact deterministic DAG-CBOR. The server validates the immutable original metadata origin fields when a later snapshot reuses an already-bound avatar."
+    },
+    "metadataExporterContext": {
+      "type": "object",
+      "required": ["protocol", "version", "conversationId", "generation", "epoch", "groupContextHash", "metadataVersion"],
+      "properties": {"protocol": {"type": "string", "const": "blue.catbird.chat.metadata"}, "version": {"type": "integer", "const": 1}, "conversationId": {"type": "ref", "ref": "#identifierBytes"}, "generation": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "epoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "groupContextHash": {"type": "ref", "ref": "#artifactHash"}, "metadataVersion": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}},
+      "description": "Exact canonical DAG-CBOR exporter context. Derive exactly 32 bytes with label blue.catbird.chat.metadata.v1. metadataVersion is included, so only snapshots with the same exact context are guaranteed to share the exporter-derived key; different metadata versions in one MLS epoch may derive different keys. groupId, confirmationTag, stateVersion, originTransitionId, ciphertext size, and avatar binding are forbidden from this projection."
+    },
+    "metadataAadAvatarBinding": {
+      "type": "object",
+      "required": ["blobId", "ciphertextSha256", "ciphertextSize", "purpose"],
+      "properties": {"blobId": {"type": "ref", "ref": "#identifierBytes"}, "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"}, "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760}, "purpose": {"type": "string", "const": "metadata"}}
+    },
+    "metadataAad": {
+      "type": "object",
+      "required": ["protocol", "version", "coordinate", "metadataVersion", "originTransitionId", "ciphertextSize"],
+      "properties": {"protocol": {"type": "string", "const": "blue.catbird.chat.metadata"}, "version": {"type": "integer", "const": 1}, "coordinate": {"type": "ref", "ref": "#metadataCryptoContext"}, "metadataVersion": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "originTransitionId": {"type": "ref", "ref": "#identifierBytes"}, "ciphertextSize": {"type": "integer", "minimum": 16, "maximum": 16384}, "avatarBinding": {"type": "ref", "ref": "#metadataAadAvatarBinding"}},
+      "description": "AES-256-GCM AAD is exactly CATBIRD-CHAT-METADATA\\0 followed by canonical DAG-CBOR of this map. coordinate remains nested; absent avatarBinding is omitted."
+    },
+    "metadataAuthorProof": {
+      "type": "object",
+      "required": ["authorDid", "authorDeviceId", "authorKeyId", "signaturePublicKey", "authGenerationAtOrigin", "originTransitionId", "originSeq", "roleAtOrigin", "deviceStatusAtOrigin"],
+      "properties": {"authorDid": {"type": "ref", "ref": "#bareDid"}, "authorDeviceId": {"type": "ref", "ref": "#deviceId"}, "authorKeyId": {"type": "ref", "ref": "#keyId"}, "signaturePublicKey": {"type": "bytes", "minLength": 32, "maxLength": 32}, "authGenerationAtOrigin": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "originTransitionId": {"type": "ref", "ref": "#operationId"}, "originSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "roleAtOrigin": {"type": "string", "const": "admin"}, "deviceStatusAtOrigin": {"type": "string", "const": "active"}},
+      "description": "Immutable server-validated historical proof for the encrypted content author. It remains available with every current metadata snapshot after later device revocation or participant removal, and must match the decrypted author/key/origin fields exactly."
+    },
+    "metadataContentProjection": {
+      "type": "object", "required": ["protocol", "version", "originTransitionId", "metadataVersion", "authorDid", "authorDeviceId", "authorKeyId", "title"],
+      "properties": {"protocol": {"type": "string", "const": "blue.catbird.chat.metadata"}, "version": {"type": "integer", "const": 1}, "originTransitionId": {"type": "ref", "ref": "#identifierBytes"}, "metadataVersion": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "authorDid": {"type": "ref", "ref": "#bareDid"}, "authorDeviceId": {"type": "ref", "ref": "#identifierBytes"}, "authorKeyId": {"type": "ref", "ref": "#keyId"}, "title": {"type": "string", "minLength": 0, "maxLength": 256}, "description": {"type": "string", "minLength": 1, "maxLength": 2048}, "avatar": {"type": "ref", "ref": "#metadataAvatarEmbed"}}
+    },
+    "metadataPlaintext": {"type": "object", "required": ["content", "contentSignature"], "properties": {"content": {"type": "ref", "ref": "#metadataContentProjection"}, "contentSignature": {"type": "bytes", "minLength": 64, "maxLength": 64}}, "description": "contentSignature is strict Ed25519 over CATBIRD-CHAT-METADATA-CONTENT\\0 plus canonical DAG-CBOR of content. Historical immutable device keys and authorization at origin are verified after decryption."},
+    "metadataSnapshot": {
+      "type": "object", "required": ["coordinate", "originTransitionId", "metadataVersion", "nonce", "ciphertext", "ciphertextSha256", "ciphertextSize", "authorProof"],
+      "properties": {"coordinate": {"type": "ref", "ref": "#metadataCryptoContext"}, "originTransitionId": {"type": "ref", "ref": "#operationId"}, "metadataVersion": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "nonce": {"type": "bytes", "minLength": 12, "maxLength": 12}, "ciphertext": {"type": "bytes", "minLength": 16, "maxLength": 16384}, "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"}, "ciphertextSize": {"type": "integer", "minimum": 16, "maximum": 16384}, "avatarBinding": {"type": "ref", "ref": "#metadataAvatarBinding"}, "authorProof": {"type": "ref", "ref": "#metadataAuthorProof"}},
+      "description": "Exporter label blue.catbird.chat.metadata.v1 with exact metadataExporterContext derives 32 bytes. metadataVersion participates in that context, so snapshots at different metadata versions in one epoch may use different keys. Every non-idempotent snapshot nevertheless uses a fresh unpredictable 96-bit CSPRNG nonce, and the server enforces uniqueness across the deliberately broader exact (conversationId,generation,epoch,nonce) tuple as defense-in-depth that subsumes nonce uniqueness whenever the exact metadataExporterContext and key are the same. Only exact idempotent replay may repeat a nonce; every other collision returns MetadataNonceReuse atomically. AES-256-GCM AAD uses exact metadataAad. Hash covers ciphertext plus appended tag, excluding nonce. avatarBinding, when present, is the exact metadataAvatarBinding with purpose metadata; applicationAttachmentBinding and generic uploadedBlobBinding are forbidden. Creation uses metadataVersion 1 and its create transition as origin. A metadata update increments version and uses its own transition as origin. Epoch-changing commits reencrypt byte-identical signed content/version/origin; reset either reencrypts that same content or creates an empty activator-signed prior-version-plus-one snapshot. policy-only transitions leave the snapshot unchanged."
+    },
+    "metadataTransitionBody": {
+      "type": "object", "required": ["signatureDomain", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "metadataSnapshot", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-METADATA\u0000"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Admin-only metadata transition. next equals prior in conversationId, generation, groupId, epoch, GroupContext hash, confirmation tag, and active lifecycle; only stateVersion increments by exactly one. metadataSnapshot.metadataVersion is exactly the prior metadataVersion plus one. Checked coordinate or metadata-version overflow rejects the entire transition."
+    },
+
+    "typingBody": {
+      "type": "object", "required": ["signatureDomain", "typingId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "coordinates", "isTyping", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-TYPING\u0000"}, "typingId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "isTyping": {"type": "boolean"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "typingId is the sole idempotency identity. Publishing is current-leaf-only, rate-limited and coalesced; the eight-second TTL and every server timestamp derive from the request's single trusted server instant T. The result is best-effort, uncursored, and never durable."
+    },
+    "typingEvent": {"type": "object", "required": ["typingId", "conversationId", "actorDid", "actorDeviceId", "isTyping", "expiresAt"], "properties": {"typingId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "isTyping": {"type": "boolean"}, "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}}, "description": "Best-effort eight-second coalesced ephemeral event with no event cursor, previousCursor, or durable conversation entry."},
+
+    "blobUploadPreparationBody": {
+      "type": "object", "required": ["signatureDomain", "blobId", "conversationId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "ciphertextSha256", "ciphertextSize", "mediaType", "plaintextSize", "purpose", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-BLOB-PREPARE\u0000"}, "blobId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "ciphertextSha256": {"type": "ref", "ref": "#artifactHash"}, "ciphertextSize": {"type": "integer", "minimum": 17, "maximum": 10485760}, "mediaType": {"type": "string", "minLength": 1, "maxLength": 128}, "plaintextSize": {"type": "integer", "minimum": 1, "maximum": 10485744}, "purpose": {"type": "ref", "ref": "#blobPurpose"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+    "blobDeletionBody": {
+      "type": "object", "required": ["signatureDomain", "blobId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-BLOB-DELETE\u0000"}, "blobId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+
+    "resetRequestBody": {
+      "type": "object", "required": ["signatureDomain", "resetRequestId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "reason", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-RESET-REQUEST\u0000"}, "resetRequestId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "reason": {"type": "ref", "ref": "#resetReason"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+    "resetActivationBody": {
+      "type": "object", "required": ["signatureDomain", "resetRequestId", "transitionId", "conversationKind", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "retired", "successor", "manifest", "genesisGroupInfo", "metadataSnapshot", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-RESET-ACTIVATE\u0000"}, "resetRequestId": {"type": "ref", "ref": "#operationId"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "conversationKind": {"type": "ref", "ref": "#conversationKind"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "retired": {"type": "ref", "ref": "#conversationCoordinates"}, "successor": {"type": "ref", "ref": "#conversationCoordinates"}, "manifest": {"type": "ref", "ref": "#resetActivationManifest"}, "genesisGroupInfo": {"type": "ref", "ref": "#groupInfoArtifact"}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "CASes prior to retired with stateVersion = prior.stateVersion + 1 and lifecycle superseded while conversationId, generation, groupId, epoch, GroupContext hash, and confirmation tag remain unchanged. successor keeps conversationId, immutable conversationKind, exact participant statuses/roles/provenance, sets generation = prior.generation + 1, stateVersion 0, epoch 0, lifecycle active, and uses a fresh random groupId, successor GroupContext-derived hash, and exact client-produced confirmation tag whose GroupInfo/public-state/signed-coordinate/snapshot bytes agree; the public-only service does not derive or verify the secret confirmation MAC. The registered signing activator must be an active roster admin but need not be an old-generation leaf; it becomes the sole successor genesis leaf. In direct conversations both participants retain role admin, but a pending invitee remains unauthorized and cannot activate. Checked stateVersion or generation overflow rejects the entire activation. There is no reset KeyPackage reservation, bootstrap Commit, or Welcome."
+    },
+    "resetRequestView": {
+      "type": "object", "required": ["resetRequestId", "conversationId", "requesterDid", "requesterDeviceId", "prior", "reason", "status", "requestedAt", "expiresAt"],
+      "properties": {"resetRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "requesterDid": {"type": "ref", "ref": "#bareDid"}, "requesterDeviceId": {"type": "ref", "ref": "#deviceId"}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "reason": {"type": "ref", "ref": "#resetReason"}, "status": {"type": "string", "enum": ["pending", "stale", "consumed", "expired", "revoked"]}, "requestedAt": {"type": "ref", "ref": "#canonicalDatetime"}, "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+
+    "leafRecoveryRequestBody": {
+      "type": "object", "required": ["signatureDomain", "recoveryRequestId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "recoveryKind", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\u0000"}, "recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "recoveryKind": {"type": "ref", "ref": "#leafRecoveryKind"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "The requester must be a registered device of an active current participant; pending participants must first use acceptConversation. At most one request/reservation is open for exact (conversationId,generation,actorDid,actorDeviceId): exact replay is idempotent and a changed concurrent request rejects LeafRecoveryAlreadyOpen. Every coordinate-changing transaction supersedes and releases every open request at its prior coordinate. Relationship block policy is rechecked under lock before reserving. add requires actorDeviceId to be absent from the prior MLS tree. replace requires actorDeviceId to identify its exact existing prior leaf; fulfillment removes and re-adds that same (actorDid, actorDeviceId) using the request-bound package. A poisoned honest client can sign replace outside MLS with a fresh package; poison is not server-visible and structural Commit validation cannot prove decryptability."
+    },
+    "leafRecoveryCancellationBody": {
+      "type": "object", "required": ["signatureDomain", "recoveryRequestId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAF-RECOVERY-CANCEL\u0000"}, "recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+    "leafRecoveryFulfillmentBody": {
+      "type": "object", "required": ["signatureDomain", "recoveryRequestId", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "aad", "manifest", "commit", "metadataSnapshot", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\u0000"}, "recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "aad": {"type": "ref", "ref": "#commitAad"}, "manifest": {"type": "ref", "ref": "#transitionManifest"}, "commit": {"type": "ref", "ref": "#publicCommit"}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "A different current leaf fulfills the request with an ordinary Commit coordinate increment. The requester DID is active in prior state. add contains exactly one matching addLeafByRecovery. replace contains exactly one removeLeaf and one addLeafByRecovery for the same requester's (userDid, deviceId), with no other leaf effect for that tuple. Under the mutation lock, block policy is rechecked for every unordered pair in the resulting roster immediately before the final Add. Honest poison containment selects a healthy different-DID fulfiller, but the server enforces only different-current-leaf because poison has no server-visible marker. Replacement opens a new application interval and never backfills history."
+    },
+    "leafRecoveryView": {
+      "type": "object", "required": ["recoveryRequestId", "conversationId", "requesterDid", "requesterDeviceId", "recoveryKind", "boundCoordinate", "reservation", "status", "requestedAt", "expiresAt"],
+      "properties": {"recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "requesterDid": {"type": "ref", "ref": "#bareDid"}, "requesterDeviceId": {"type": "ref", "ref": "#deviceId"}, "recoveryKind": {"type": "ref", "ref": "#leafRecoveryKind"}, "boundCoordinate": {"type": "ref", "ref": "#conversationCoordinates"}, "reservation": {"type": "ref", "ref": "#leafRecoveryReservation"}, "status": {"type": "ref", "ref": "#leafRecoveryStatus"}, "requestedAt": {"type": "ref", "ref": "#canonicalDatetime"}, "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+    "recoveryWorkPendingView": {
+      "type": "object", "required": ["recoveryWorkId", "conversationId", "recipientDid", "recipientDeviceId", "sourceKind", "sourceId", "sourceCoordinate", "status", "createdAt"],
+      "properties": {"recoveryWorkId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "recipientDid": {"type": "ref", "ref": "#bareDid"}, "recipientDeviceId": {"type": "ref", "ref": "#deviceId"}, "sourceKind": {"type": "ref", "ref": "#recoveryWorkSourceKind"}, "sourceId": {"type": "ref", "ref": "#operationId"}, "sourceCoordinate": {"type": "ref", "ref": "#conversationCoordinates"}, "status": {"type": "string", "const": "pending"}, "createdAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Open advisory with no terminalTransitionId, terminalRevocationId, or terminalAt field."
+    },
+    "recoveryWorkCompletedByTransitionView": {
+      "type": "object", "required": ["recoveryWorkId", "conversationId", "recipientDid", "recipientDeviceId", "sourceKind", "sourceId", "sourceCoordinate", "status", "createdAt", "terminalTransitionId", "terminalAt"],
+      "properties": {"recoveryWorkId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "recipientDid": {"type": "ref", "ref": "#bareDid"}, "recipientDeviceId": {"type": "ref", "ref": "#deviceId"}, "sourceKind": {"type": "ref", "ref": "#recoveryWorkSourceKind"}, "sourceId": {"type": "ref", "ref": "#operationId"}, "sourceCoordinate": {"type": "ref", "ref": "#conversationCoordinates"}, "status": {"type": "string", "const": "completed"}, "createdAt": {"type": "ref", "ref": "#canonicalDatetime"}, "terminalTransitionId": {"type": "ref", "ref": "#operationId"}, "terminalAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Completed advisory bound to exactly the accepted leaf-recovery fulfillment transition and terminal time."
+    },
+    "recoveryWorkSupersededByTransitionView": {
+      "type": "object", "required": ["recoveryWorkId", "conversationId", "recipientDid", "recipientDeviceId", "sourceKind", "sourceId", "sourceCoordinate", "status", "createdAt", "terminalTransitionId", "terminalAt"],
+      "properties": {"recoveryWorkId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "recipientDid": {"type": "ref", "ref": "#bareDid"}, "recipientDeviceId": {"type": "ref", "ref": "#deviceId"}, "sourceKind": {"type": "ref", "ref": "#recoveryWorkSourceKind"}, "sourceId": {"type": "ref", "ref": "#operationId"}, "sourceCoordinate": {"type": "ref", "ref": "#conversationCoordinates"}, "status": {"type": "string", "const": "superseded"}, "createdAt": {"type": "ref", "ref": "#canonicalDatetime"}, "terminalTransitionId": {"type": "ref", "ref": "#operationId"}, "terminalAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Superseded advisory bound to exactly the coordinate-changing transition that invalidated it and the terminal time."
+    },
+    "recoveryWorkSupersededByRevocationView": {
+      "type": "object", "required": ["recoveryWorkId", "conversationId", "recipientDid", "recipientDeviceId", "sourceKind", "sourceId", "sourceCoordinate", "status", "createdAt", "terminalRevocationId", "terminalAt"],
+      "properties": {"recoveryWorkId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "recipientDid": {"type": "ref", "ref": "#bareDid"}, "recipientDeviceId": {"type": "ref", "ref": "#deviceId"}, "sourceKind": {"type": "ref", "ref": "#recoveryWorkSourceKind"}, "sourceId": {"type": "ref", "ref": "#operationId"}, "sourceCoordinate": {"type": "ref", "ref": "#conversationCoordinates"}, "status": {"type": "string", "const": "superseded"}, "createdAt": {"type": "ref", "ref": "#canonicalDatetime"}, "terminalRevocationId": {"type": "ref", "ref": "#operationId"}, "terminalAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Superseded advisory whose terminalRevocationId resolves to immutable signed revocation evidence whose target DID byte-equals recipientDid and whose target device ID byte-equals recipientDeviceId; a same-DID sibling-device revocation rejects. terminalAt is that revocation's exact trusted acceptance time."
+    },
+    "recoveryWorkView": {"type": "union", "refs": ["#recoveryWorkPendingView", "#recoveryWorkCompletedByTransitionView", "#recoveryWorkSupersededByTransitionView", "#recoveryWorkSupersededByRevocationView"], "closed": true, "description": "Closed recovery-work family of four concrete object variants for the exact recipient DID/device of one retained Welcome disposition. sourceKind/sourceId identify only an immutable expired or rejected Welcome and sourceCoordinate byte-equals that Welcome's historical coordinate; no local client failure classification is a server work source. It does not authorize recovery. It does not create or reserve a KeyPackage. It does not grant application history. It does not prove MLS poison or decryptability failure; the device must separately submit a valid signed requestLeafRecovery against its then-current coordinate. The shapes are structural: pending has no terminal fields; completed-by-transition requires exactly terminalTransitionId plus terminalAt; superseded-by-transition requires exactly terminalTransitionId plus terminalAt; superseded-by-revocation requires exactly terminalRevocationId plus terminalAt, and that revocation evidence must target this exact recipientDid and recipientDeviceId rather than a same-DID sibling. Missing, extra, cross-kind, both-terminal, wrong-status, unknown, and misbound-revocation variants reject."},
+    "leafRecoveryInboxItem": {"type": "union", "refs": ["#leafRecoveryView", "#recoveryWorkPendingView", "#recoveryWorkCompletedByTransitionView", "#recoveryWorkSupersededByTransitionView", "#recoveryWorkSupersededByRevocationView"], "closed": true, "description": "Flat closed exact-device inbox union: the unchanged target-device-signed leafRecoveryView or one of the four concrete non-authorizing recoveryWorkView-family variants. Every ref is a concrete object; no union directly refs another union."},
+
+    "conversationCloseBody": {
+      "type": "object", "required": ["signatureDomain", "transitionId", "conversationKind", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "retired", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-CLOSE\u0000"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "conversationKind": {"type": "ref", "ref": "#conversationKind"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "retired": {"type": "ref", "ref": "#conversationCoordinates"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Terminal close CAS. retired preserves conversationId, generation, groupId, epoch, GroupContext hash, and confirmation tag, sets stateVersion = prior + 1 and lifecycle superseded, and has no successor. For direct, either exact logical participant may sign with an active registered device, including the pending invitee. For group, only the sole remaining logical participant may sign and must be active admin. The transaction closes every device application interval, releases live invitation counts and request-bound package reservations, supersedes pending Welcomes and reset/recovery/leave work, and emits one terminal tombstone, entry, and event."
+    },
+
+    "leaveRequestBody": {
+      "type": "object", "required": ["signatureDomain", "leaveRequestId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAVE-REQUEST\u0000"}, "leaveRequestId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Group-only durable consent used when the active requester currently has one or more MLS leaves. An active registered requester device signs removal of that participant and every current leaf. Requester must not be the last active admin; handoff occurs first. It expires after 24 hours and any coordinate change makes it stale. Group zero-leaf pending or active participants use zeroLeafLeaveBody. Either direct participant instead uses directCloseBody regardless of status or leaf count."
+    },
+    "zeroLeafLeaveBody": {
+      "type": "object", "required": ["signatureDomain", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAVE-ZERO-LEAF\u0000"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Group-only immediate self-removal. A pending or active participant with zero leaves removes its own exact participant row without admin fulfillment. next changes only stateVersion = prior + 1 and the operation emits no Welcome. A last active admin still must hand off first. Removing a pending invitation or active zero-leaf participant releases all associated pending-invitation counts and any open unconsumed recovery reservation atomically. Direct participants use directCloseBody instead."
+    },
+    "leaveCancellationBody": {
+      "type": "object", "required": ["signatureDomain", "conversationId", "leaveRequestId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAVE-CANCEL\u0000"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "leaveRequestId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "conversationId must byte-equal the cancellation entry row conversationId. Before append or fingerprinting, resolve the exact retained authenticated leaveRequestEntry and durable request named by leaveRequestId. The referenced body leaveRequestId must byte-equal this leaveRequestId; leaveRequestId is the exact globally resolved signed request key; the referenced row and body conversationId must byte-equal this conversationId; and actorDid must byte-equal the referenced requester actorDid. The retained reference entry is distinct and has seq strictly less than cancellation seq. Same-seq, later, and self-reference reject. actorDeviceId may differ from the requesting device only when it is another currently active registered device of that same DID and its own key, authentication generation, canonical transcript, and Ed25519 signature all verify. Missing, wrong-type, wrong-ID, cross-conversation, and wrong-requester references reject. The retained reference remains independently verifiable after cancellation."
+    },
+    "leaveCommitFulfillmentBody": {
+      "type": "object", "required": ["signatureDomain", "leaveRequestId", "transitionId", "actorDid", "actorDeviceId", "keyId", "authGeneration", "prior", "next", "aad", "manifest", "commit", "metadataSnapshot", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-LEAVE-FULFILL-COMMIT\u0000"}, "leaveRequestId": {"type": "ref", "ref": "#operationId"}, "transitionId": {"type": "ref", "ref": "#operationId"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "next": {"type": "ref", "ref": "#conversationCoordinates"}, "aad": {"type": "ref", "ref": "#commitAad"}, "manifest": {"type": "ref", "ref": "#transitionManifest"}, "commit": {"type": "ref", "ref": "#publicCommit"}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}},
+      "description": "Group-only fulfillment. For an active requester with one or more leaves, a current leaf of a different DID fulfills the exact unexpired request with an ordinary Commit. The manifest contains exactly one removeParticipant for requesterDid and removeLeaf for every and only current requester leaf, with no Add, reservation, or Welcome. The requester's signature supplies consent, but removal still rejects if requester is the last active admin."
+    },
+    "leaveRequestView": {
+      "type": "object", "required": ["leaveRequestId", "conversationId", "requesterDid", "requesterDeviceId", "prior", "status", "requestedAt", "expiresAt"],
+      "properties": {"leaveRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "requesterDid": {"type": "ref", "ref": "#bareDid"}, "requesterDeviceId": {"type": "ref", "ref": "#deviceId"}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "status": {"type": "ref", "ref": "#leaveRequestStatus"}, "requestedAt": {"type": "ref", "ref": "#canonicalDatetime"}, "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+    "durableLeaveRequestResult": {"type": "object", "required": ["leaveRequest", "entry"], "properties": {"leaveRequest": {"type": "ref", "ref": "#leaveRequestView"}, "entry": {"type": "ref", "ref": "#leaveRequestEntry"}}},
+    "zeroLeafLeaveResult": {"type": "object", "required": ["coordinates", "entry"], "properties": {"coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "entry": {"type": "ref", "ref": "#zeroLeafLeaveEntry"}}},
+    "leaveOperationResult": {"type": "union", "refs": ["#durableLeaveRequestResult", "#zeroLeafLeaveResult"], "closed": true},
+
+    "conversationCreatedResult": {"type": "object", "required": ["coordinates", "entry"], "properties": {"coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "entry": {"type": "ref", "ref": "#creationEntry"}}},
+    "existingDirectConversationResult": {"type": "object", "required": ["conversationKind", "conversationId", "coordinates"], "properties": {"conversationKind": {"type": "string", "const": "direct"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}}, "description": "Typed successful CAS-loser outcome for the one already-nonterminal direct conversation of the same unordered DID pair. No proposed conversation state, entry, metadata nonce, or invitation is committed."},
+    "conversationCreationResult": {"type": "union", "refs": ["#conversationCreatedResult", "#existingDirectConversationResult"], "closed": true},
+
+    "welcomeAcknowledgementBody": {
+      "type": "object", "required": ["signatureDomain", "welcomeId", "transitionSeq", "coordinates", "actorDid", "actorDeviceId", "keyId", "authGeneration", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-WELCOME-ACK\u0000"}, "welcomeId": {"type": "ref", "ref": "#operationId"}, "transitionSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+    "welcomeRejectionBody": {
+      "type": "object", "required": ["signatureDomain", "welcomeId", "transitionSeq", "coordinates", "reason", "actorDid", "actorDeviceId", "keyId", "authGeneration", "idempotencyKey", "signedAt"],
+      "properties": {"signatureDomain": {"type": "string", "const": "CATBIRD-CHAT-WELCOME-REJECT\u0000"}, "welcomeId": {"type": "ref", "ref": "#operationId"}, "transitionSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "reason": {"type": "ref", "ref": "#welcomeRejectionReason"}, "actorDid": {"type": "ref", "ref": "#bareDid"}, "actorDeviceId": {"type": "ref", "ref": "#deviceId"}, "keyId": {"type": "ref", "ref": "#keyId"}, "authGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "idempotencyKey": {"type": "ref", "ref": "#operationId"}, "signedAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+    },
+
+    "signedDeviceEnrollment": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#deviceEnrollmentBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedKeyPackageReplenishment": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#keyPackageReplenishmentBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedDeviceAuthenticationRebind": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#deviceAuthenticationRebindBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedDeviceRevocation": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#deviceRevocationBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedBlobUploadPreparation": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#blobUploadPreparationBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedBlobDeletion": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#blobDeletionBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedCreation": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#creationBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedCommitTransition": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#commitTransitionBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedPolicyTransition": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#policyTransitionBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedParticipantAcceptance": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#participantAcceptanceBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedApplicationSend": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#applicationSendBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedTyping": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#typingBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedMetadataTransition": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#metadataTransitionBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedResetRequest": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#resetRequestBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedResetActivation": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#resetActivationBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedLeafRecoveryRequest": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#leafRecoveryRequestBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedLeafRecoveryCancellation": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#leafRecoveryCancellationBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedLeafRecoveryFulfillment": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#leafRecoveryFulfillmentBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedConversationClose": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#conversationCloseBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedLeaveRequest": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#leaveRequestBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedZeroLeafLeave": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#zeroLeafLeaveBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedLeaveOperation": {"type": "union", "refs": ["#signedLeaveRequest", "#signedZeroLeafLeave"], "closed": true},
+    "signedLeaveCancellation": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#leaveCancellationBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedLeaveCommitFulfillment": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#leaveCommitFulfillmentBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedWelcomeAcknowledgement": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#welcomeAcknowledgementBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedWelcomeRejection": {"type": "object", "required": ["body", "signature"], "properties": {"body": {"type": "union", "refs": ["#welcomeRejectionBody"], "closed": true}, "signature": {"type": "bytes", "minLength": 64, "maxLength": 64}}},
+    "signedTransition": {"type": "union", "refs": ["#signedCommitTransition", "#signedPolicyTransition", "#signedLeafRecoveryFulfillment", "#signedMetadataTransition", "#signedLeaveCommitFulfillment"], "closed": true},
+
+    "conversationState": {
+      "type": "object", "required": ["conversationKind", "coordinates", "cipherSuite", "participants", "leaves", "metadataSnapshot", "snapshotSeq"],
+      "properties": {"conversationKind": {"type": "ref", "ref": "#conversationKind"}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "cipherSuite": {"type": "ref", "ref": "#cipherSuite"}, "participants": {"type": "array", "items": {"type": "ref", "ref": "#participantView"}, "minLength": 1, "maxLength": 100}, "leaves": {"type": "array", "items": {"type": "ref", "ref": "#deviceLeafView"}, "minLength": 1, "maxLength": 100}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "snapshotSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}},
+      "description": "conversationKind is immutable across every transition and reset and is never inferred from participant count. Every active post-state has 1-100 unique logical participants, at least one active admin, and 1-100 MLS leaves. Group pending participants are members; the sole direct pending invitee is admin-role but unauthorized until active. Every pending participant has zero leaves and every MLS leaf belongs to an active participant. Direct has exactly two fixed admin-role participants until close and at most one nonterminal conversation per unordered DID pair; group remains group at every participant count. A DID has at most 20 leaves. There is exactly one leaf per (userDid, deviceId), BasicCredential identity, and public-tree leaf index; every leaf binds the exact registered immutable device/key and may open only while both are active. Later revocation immediately removes authentication and delivery eligibility but may leave that dead cryptographic leaf MLS-active until a signed Remove, reset, or close. snapshotSeq is the greatest committed conversation seq included in the transactionally observed state snapshot; it is not a caller entry cursor or proof of application visibility. Output participants are strictly ordered by userDid exact UTF-8 bytes; leaves are strictly ordered by (userDid exact UTF-8 bytes, deviceId raw UUID bytes)."
+    },
+    "conversationInventoryState": {"type": "object", "required": ["state"], "properties": {"state": {"type": "ref", "ref": "#conversationState"}}},
+    "conversationRemovalTombstone": {"type": "object", "required": ["conversationId", "membershipIntervalId", "userDid", "deviceId", "terminalSeq", "removedAt"], "properties": {"conversationId": {"type": "ref", "ref": "#operationId"}, "membershipIntervalId": {"type": "ref", "ref": "#operationId"}, "userDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"}, "terminalSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "removedAt": {"type": "ref", "ref": "#canonicalDatetime"}}, "description": "A tombstone is for one exact authenticated (userDid,deviceId) leaf interval. membershipIntervalId equals the opening creation, reset activation, or Add transition ID for this concrete device interval. terminalSeq is the inclusive seq of that device's Remove or reset; another leaf of the same DID never extends it."},
+    "conversationCloseTombstone": {"type": "object", "required": ["conversationId", "conversationKind", "retired", "closedByDid", "closedByDeviceId", "terminalSeq", "closedAt"], "properties": {"conversationId": {"type": "ref", "ref": "#operationId"}, "conversationKind": {"type": "ref", "ref": "#conversationKind"}, "retired": {"type": "ref", "ref": "#conversationCoordinates"}, "closedByDid": {"type": "ref", "ref": "#bareDid"}, "closedByDeviceId": {"type": "ref", "ref": "#deviceId"}, "terminalSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "closedAt": {"type": "ref", "ref": "#canonicalDatetime"}}, "description": "Immutable terminal conversation record. retired is superseded and has no successor; terminalSeq inclusively closes every concrete device application interval."},
+    "conversationCloseResult": {"type": "object", "required": ["tombstone", "entry"], "properties": {"tombstone": {"type": "ref", "ref": "#conversationCloseTombstone"}, "entry": {"type": "ref", "ref": "#conversationCloseEntry"}}},
+    "conversationInventoryItem": {"type": "union", "refs": ["#conversationInventoryState", "#conversationRemovalTombstone", "#conversationCloseTombstone"], "closed": true},
+
+    "applicationEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedApplicationSend"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}, "description": "conversationId must byte-equal signedRequest.body.prior.conversationId before append or fingerprinting. Clients strictly validate the signed request and verify its 64-byte Ed25519 signature over the exact CATBIRD-CHAT-MESSAGE\\0 canonical signing transcript before decryption, attribution, display, or effects. The immutable outer-entry fingerprint is raw SHA-256 of UTF8(CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exactly {entryId: UUID bytes16, conversationId: UUID bytes16, seq: safe integer, requestDigest: bytes32, signature: bytes64, receivedAt: canonical text}. requestDigest is raw SHA-256 of the exact send signing transcript, so it commits every signed actor, device, coordinate, message, artifact, and blob-binding field; signature and server row identity/time are committed separately. Raw JSON, generated DTO bytes, plaintext-only digests, and unsigned outer surrogates are forbidden. Application visibility is per concrete authenticated (userDid,deviceId) MLS leaf. The genesis creator device begins at creation seq; an ordinary Add begins that added device at its Welcome-producing transition; that exact device's Remove or reset closes its interval inclusively. Reset begins only the activator device's successor interval at the same reset seq. A sibling registered device, logical roster member, or zero-leaf device inherits no ciphertext. Re-addition opens a new interval and never backfills the gap."},
+    "commitEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedCommitTransition"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "policyEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedPolicyTransition"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "metadataEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedMetadataTransition"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "creationEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedCreation"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "participantAcceptanceEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "recovery", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedParticipantAcceptance"}, "recovery": {"type": "ref", "ref": "#leafRecoveryView"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}, "description": "One atomic policy entry records pending-to-active acceptance and the request-bound add recovery reservation created for the accepting device."},
+    "conversationCloseEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "tombstone", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedConversationClose"}, "tombstone": {"type": "ref", "ref": "#conversationCloseTombstone"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "resetRequestEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedResetRequest"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "resetActivationEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedResetActivation"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "leafRecoveryFulfillmentEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedLeafRecoveryFulfillment"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "leaveRequestEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedLeaveRequest"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "zeroLeafLeaveEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedZeroLeafLeave"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "leaveCancellationEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedLeaveCancellation"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "leaveCommitFulfillmentEntry": {"type": "object", "required": ["entryId", "conversationId", "seq", "signedRequest", "receivedAt"], "properties": {"entryId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "signedRequest": {"type": "ref", "ref": "#signedLeaveCommitFulfillment"}, "receivedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "conversationEntry": {"type": "union", "refs": ["#applicationEntry", "#commitEntry", "#policyEntry", "#metadataEntry", "#creationEntry", "#participantAcceptanceEntry", "#conversationCloseEntry", "#resetRequestEntry", "#resetActivationEntry", "#leafRecoveryFulfillmentEntry", "#leaveRequestEntry", "#zeroLeafLeaveEntry", "#leaveCancellationEntry", "#leaveCommitFulfillmentEntry"], "closed": true, "description": "The union is closed. For each of its 13 non-application variants, the immutable control outer-entry fingerprint is raw SHA-256 of UTF8(CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exactly {entryKind,entryId:bytes16,conversationId:bytes16,seq:positive-safe-integer,requestDigest:bytes32,signature:bytes64,serverFields,receivedAt:canonical-text}. entryKind is the exact full type ID of the selected conversationEntry variant. requestDigest is raw SHA-256 of the exact variant domain-prefixed canonical unsigned signing transcript. signature is the exact 64-byte signedRequest signature. serverFields is always present: {} for an ordinary five-field control row, {recovery: exact #leafRecoveryView} for participantAcceptanceEntry, or {tombstone: exact #conversationCloseTombstone} for conversationCloseEntry. Unknown, missing, or extra fields reject at the row, selected variant, serverFields, and fingerprint-projection levels. Every nested closed-union value in an unsigned signing projection carries its exact full $type. Missing, wrong, or unknown nested tags reject before signature acceptance. Exact row/body conversation binding, closed variant consistency, canonical transcript reconstruction, and historical Ed25519 signature verification all succeed before fingerprinting. Raw JSON, generated DTO bytes, and signature-containing wrapper bytes are forbidden fingerprint inputs."},
+
+    "conversationChangedEvent": {"type": "object", "required": ["conversationId"], "properties": {"conversationId": {"type": "ref", "ref": "#operationId"}}},
+    "conversationClosedEvent": {"type": "object", "required": ["conversationId", "conversationKind", "terminalSeq"], "properties": {"conversationId": {"type": "ref", "ref": "#operationId"}, "conversationKind": {"type": "ref", "ref": "#conversationKind"}, "terminalSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}}},
+    "messageAvailableEvent": {"type": "object", "required": ["conversationId", "seq"], "properties": {"conversationId": {"type": "ref", "ref": "#operationId"}, "seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}}},
+    "welcomeAvailableEvent": {"type": "object", "required": ["welcomeId", "conversationId"], "properties": {"welcomeId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}}},
+    "welcomeDispositionEvent": {"type": "object", "required": ["welcomeId", "status"], "properties": {"welcomeId": {"type": "ref", "ref": "#operationId"}, "status": {"type": "ref", "ref": "#welcomeStatus"}}},
+    "resetRequestedEvent": {"type": "object", "required": ["resetRequestId", "conversationId"], "properties": {"resetRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}}},
+    "leafRecoveryEvent": {"type": "object", "required": ["recoveryRequestId", "conversationId", "status"], "properties": {"recoveryRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "status": {"type": "ref", "ref": "#leafRecoveryStatus"}}},
+    "leaveRequestEvent": {"type": "object", "required": ["leaveRequestId", "conversationId", "status"], "properties": {"leaveRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "status": {"type": "ref", "ref": "#leaveRequestStatus"}}},
+    "accessEndedEvent": {"type": "object", "required": ["conversationId", "membershipIntervalId", "userDid", "deviceId", "terminalSeq"], "properties": {"conversationId": {"type": "ref", "ref": "#operationId"}, "membershipIntervalId": {"type": "ref", "ref": "#operationId"}, "userDid": {"type": "ref", "ref": "#bareDid"}, "deviceId": {"type": "ref", "ref": "#deviceId"}, "terminalSeq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}}, "description": "Frozen-audience notice closing one exact device-leaf interval inclusively; another device of the same DID does not extend it."},
+    "watermarkEvent": {"type": "object", "required": ["issuedAt"], "properties": {"issuedAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "protocolEventPayload": {"type": "union", "refs": ["#conversationChangedEvent", "#conversationClosedEvent", "#messageAvailableEvent", "#welcomeAvailableEvent", "#welcomeDispositionEvent", "#resetRequestedEvent", "#leafRecoveryEvent", "#leaveRequestEvent", "#accessEndedEvent", "#watermarkEvent"], "closed": true},
+    "eventEnvelope": {"type": "object", "required": ["previousCursor", "cursor", "payload", "createdAt"], "properties": {"previousCursor": {"type": "string", "minLength": 1, "maxLength": 512}, "cursor": {"type": "string", "minLength": 1, "maxLength": 512}, "payload": {"type": "ref", "ref": "#protocolEventPayload"}, "createdAt": {"type": "ref", "ref": "#canonicalDatetime"}}},
+    "subscriptionMessage": {"type": "union", "refs": ["#eventEnvelope", "#typingEvent"], "closed": true}
+  }
+}

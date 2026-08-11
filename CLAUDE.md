@@ -51,6 +51,25 @@ Catbird iOS --[Session Cookie]--> Nest Gateway --[DPoP + Access Token]--> User P
 
 MLS implementation and storage live in **mls-ds**, but nest retains an **active MLS proxy**. MLS lexicons (`blue.catbird.mlsChat.*`) are intercepted in `handlers/atproto.rs` and routed through `MlsAuthService` (`services/mls_auth.rs`) to local mls-ds at `http://127.0.0.1:3001`, with a minted service-auth JWT (`aud=did:web:mlschat.catbird.blue`, `gateway_did=did:web:api.catbird.blue`). Do not assume "MLS moved to mls-ds" means nest no longer touches MLS — it is on the hot request path.
 
+### Push notifications (nest owns ALL push — social + chat)
+
+Since July 2026, nest is the single push-notification owner for Catbird
+(`bluesky-push-notifier` is **deprecated**). Two pieces:
+
+- **`services/push/`** — APNS delivery pipeline: `apns.rs` (sender),
+  `decision.rs` (should-notify logic — use staleness guards, not
+  notification-type exclusion), `preferences.rs`, `queue.rs`,
+  `registry.rs` (device tokens), `subscriptions.rs` (activity
+  subscriptions), `moderation_cache.rs`.
+- **`services/chat_poll/`** — polls `chat.bsky.convo.getLog` for enrolled
+  accounts and enqueues chat push (`poller.rs`, `scheduler.rs`,
+  `rate_budget.rs` per-PDS budgets, `mute_sync.rs`). Dormant in prod as of
+  Jul 2026 (Bsky chat parity program).
+
+Client-facing endpoints in `handlers/push.rs`: `register_push`,
+`unregister_push`, `get_preferences`, `put_preferences_v2`,
+`list_activity_subscriptions`, `put_activity_subscription`.
+
 ### Source Structure
 
 ```
@@ -60,8 +79,12 @@ nest/catbird/src/
 ├── error.rs             # Error types
 ├── metrics.rs           # Prometheus metrics
 ├── config/              # Configuration loading
+├── bin/
+│   └── session_migrate.rs # One-off session-store migration tool
 ├── handlers/
 │   ├── atproto.rs       # XRPC proxy handler
+│   ├── push.rs          # Push registration + preferences endpoints
+│   ├── chat_poll.rs     # Chat-poll enrollment endpoints
 │   └── mod.rs
 ├── middleware/
 │   ├── auth.rs          # Session validation middleware
@@ -74,6 +97,10 @@ nest/catbird/src/
     ├── crypto.rs          # DPoP key management
     ├── mls_auth.rs        # MLS proxy: mints service-auth JWT, forwards MLS lexicons to mls-ds (live hot path)
     ├── oauth.rs           # OAuth flow (PAR, token exchange)
+    ├── push/              # APNS push pipeline (see Push notifications above)
+    ├── chat_poll/         # chat.bsky poller (see Push notifications above)
+    ├── redis_auth_store.rs # Session/auth persistence in Redis/Valkey
+    ├── redis_crypto.rs    # Encryption for Redis-stored secrets
     └── ssrf.rs            # SSRF prevention
 ```
 

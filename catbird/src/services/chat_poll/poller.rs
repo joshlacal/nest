@@ -57,8 +57,16 @@ pub async fn poll_account(
     // `fetch_log_page` updates it in place whenever a `use_dpop_nonce` 401
     // forces a retry with a fresh one, so later pages in this same poll (and
     // the persist call below) reuse it instead of eating the round trip again.
+    //
+    // When this account's own persisted nonce is empty (e.g. its first-ever
+    // poll, or the persisted value was never set), fall back to the
+    // process-wide per-origin cache shared with `AtProtoClient::proxy_request`
+    // — many accounts share the same PDS host (bsky.social etc.), so another
+    // account's (or the XRPC proxy's) recent traffic to the same origin has
+    // likely already primed a usable nonce.
     let mut dpop_nonce: Option<String> = if dpop.dpop_host_nonce.is_empty() {
-        None
+        crate::services::DpopNonceCache::origin_key(&session.pds_url)
+            .and_then(|origin| state.dpop_nonce_cache.get(&origin))
     } else {
         Some(dpop.dpop_host_nonce.clone())
     };
@@ -384,6 +392,7 @@ async fn fetch_log_page(
     };
 
     let client = crate::services::AtProtoClient::new(state.clone());
+    let origin = crate::services::DpopNonceCache::origin_key(&url);
 
     let (status, headers, body) = send_get_log_request(
         &client,
@@ -394,6 +403,12 @@ async fn fetch_log_page(
         nonce_hint.map(str::to_string),
     )
     .await?;
+
+    // Feed the shared per-origin cache from every response, success or
+    // not — a 200 can hand out the next nonce just as a 401 challenge
+    // does, and doing this unconditionally lets other accounts on the
+    // same PDS (and the XRPC proxy path) skip a round trip too.
+    client.record_nonce_from_headers(origin.as_deref(), &headers);
 
     if status == 401 {
         let is_use_dpop_nonce = serde_json::from_slice::<Value>(&body)
@@ -421,6 +436,7 @@ async fn fetch_log_page(
                     Some(fresh_nonce.clone()),
                 )
                 .await?;
+                client.record_nonce_from_headers(origin.as_deref(), &headers);
 
                 if status == 429 {
                     return Ok((429, retry_after_body(&headers), Some(fresh_nonce)));
@@ -564,13 +580,20 @@ async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(Str
 /// enqueues pass the durable grace window (15s) so the fast-path subscriber
 /// gets first crack at claiming and delivering; requeues after a fast-path
 /// delivery failure pass 0 so the durable worker can pick it up immediately.
+///
+/// `message_text` is deliberately dropped before persisting — the queue row
+/// only needs to survive long enough to build a generic notification. The
+/// fast (Redis pub/sub) path carries the real text for the one immediate
+/// delivery attempt and never writes it to disk; see `publish_to_redis`.
 pub(crate) async fn enqueue_push(
     db_pool: &Pool<Postgres>,
     event: &ChatPushEvent,
     delay_secs: i64,
 ) -> Result<()> {
     let dedupe_key = event.dedupe_key();
-    let event_json = serde_json::to_value(event)?;
+    let mut persisted_event = event.clone();
+    persisted_event.message_text.clear();
+    let event_json = serde_json::to_value(&persisted_event)?;
     let now_epoch = chrono::Utc::now().timestamp();
 
     sqlx::query(
