@@ -480,8 +480,18 @@ impl AppState {
     /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
     /// stale identity data to persist indefinitely when users retried login.
     fn build_resolver() -> jacquard_identity::JacquardResolver {
+        // `reqwest::Client::new()` has NO timeout: a hung identity lookup
+        // waits forever. This resolver is reached from background workers that
+        // process work sequentially, so one unbounded request stalls the whole
+        // pipeline behind it.
+        let resolver_client = reqwest::Client::builder()
+            .user_agent("Catbird/0.1.0")
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resolver = jacquard_identity::JacquardResolver::new(
-            reqwest::Client::new(),
+            resolver_client,
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         resolver.with_system_dns()

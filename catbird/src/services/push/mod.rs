@@ -152,7 +152,42 @@ impl PushServices {
                             continue;
                         }
 
-                        match self.decision.evaluate(&state, &self, &row).await {
+                        // Bound the whole decision. Nothing inside this path
+                        // carries a timeout of its own, and it performs network
+                        // work (session refresh, moderation sync) while the
+                        // worker processes rows strictly sequentially — so one
+                        // hung upstream connection stops ALL push delivery
+                        // indefinitely, with no error logged because nothing
+                        // ever returns. That is how the queue reached 2000+
+                        // events with the worker silent.
+                        let evaluated = tokio::time::timeout(
+                            DECISION_TIMEOUT,
+                            self.decision.evaluate(&state, &self, &row),
+                        )
+                        .await;
+                        let evaluated = match evaluated {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                // Requeue rather than drop: a timeout may be
+                                // transient, and dropping would silently lose a
+                                // deliverable notification.
+                                tracing::warn!(
+                                    recipient = %row.recipient_did,
+                                    notification_type = %row.notification_type,
+                                    timeout_secs = DECISION_TIMEOUT.as_secs(),
+                                    "Push decision timed out; scheduling retry and moving on"
+                                );
+                                if let Err(update_err) = self
+                                    .queue
+                                    .retry_later(row.id, row.attempts, "decision_timeout")
+                                    .await
+                                {
+                                    tracing::error!(error = %update_err, "Failed to schedule push retry after timeout");
+                                }
+                                continue;
+                            }
+                        };
+                        match evaluated {
                             Ok(QueueDisposition::Drop(reason)) => {
                                 tracing::debug!(
                                     recipient = %row.recipient_did,
@@ -673,6 +708,11 @@ pub(crate) async fn resolve_background_session(
 
     Ok((session, dpop))
 }
+
+/// Upper bound on evaluating one queued event. The decision path performs
+/// network work with no internal timeout, and the worker is sequential, so an
+/// unbounded hang wedges every pending notification behind it.
+const DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
     let message = err.to_string().to_ascii_lowercase();
