@@ -276,6 +276,19 @@ impl PushServices {
                                     tracing::error!(error = %del_err, "Failed to delete revoked-account push event");
                                 }
                             }
+                            Err(err) if is_unregistered_account_error(&err) => {
+                                // Terminal, not transient: without a
+                                // push_accounts row this event fails the same
+                                // way on every attempt.
+                                tracing::info!(
+                                    recipient = %row.recipient_did,
+                                    notification_type = %row.notification_type,
+                                    "Recipient has no push account; dropping undeliverable event"
+                                );
+                                if let Err(del_err) = self.queue.delete(row.id).await {
+                                    tracing::error!(error = %del_err, "Failed to delete undeliverable push event");
+                                }
+                            }
                             Err(err) => {
                                 tracing::warn!(
                                     recipient = %row.recipient_did,
@@ -669,8 +682,81 @@ pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
         || message.contains("no per-session oauth data")
         || message.contains("session not found")
         || message.contains("session expired")
+        // Jacquard phrases a missing session as "session does not exist".
+        // Without this the event is rescheduled forever, because the session
+        // is never coming back.
+        || message.contains("session does not exist")
+}
+
+/// True when the recipient has no `push_accounts` row.
+///
+/// `push_preferences.account_did` is a foreign key onto `push_accounts`, so
+/// building preferences for such a recipient fails identically on every
+/// attempt — the event can never be delivered. Retrying is not merely
+/// wasteful: in production 842 of 2048 queued events were in this state,
+/// averaging ~90 attempts each, crowding out deliverable ones and keeping the
+/// queue permanently backlogged.
+pub(crate) fn is_unregistered_account_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("push_preferences_account_did_fkey")
 }
 
 pub(crate) fn push_unavailable_error() -> AppError {
     AppError::Config("Push control plane is not configured".into())
+}
+
+#[cfg(test)]
+mod terminal_failure_tests {
+    use super::*;
+
+    #[test]
+    fn session_does_not_exist_is_auth_revocation() {
+        // Observed verbatim in production: 57 occurrences in six minutes,
+        // each one rescheduled forever because this phrasing was not matched.
+        let err = anyhow::anyhow!("Jacquard session lookup failed: session does not exist");
+        assert!(is_auth_revocation_error(&err));
+    }
+
+    #[test]
+    fn existing_auth_revocation_phrasings_still_match() {
+        for message in [
+            "invalid_grant",
+            "invalid_token",
+            "no refresh token",
+            "no per-session oauth data",
+            "session not found",
+            "session expired",
+        ] {
+            assert!(
+                is_auth_revocation_error(&anyhow::anyhow!("{message}")),
+                "regressed on {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_push_account_is_terminal() {
+        // The recipient has no push_accounts row, so building preferences
+        // violates the foreign key on every single attempt.
+        let err = anyhow::anyhow!(
+            "error returned from database: insert or update on table \"push_preferences\" violates foreign key constraint \"push_preferences_account_did_fkey\""
+        );
+        assert!(is_unregistered_account_error(&err));
+    }
+
+    #[test]
+    fn ordinary_failures_stay_retryable() {
+        for message in [
+            "connection reset by peer",
+            "timed out",
+            "error returned from database: deadlock detected",
+        ] {
+            let err = anyhow::anyhow!("{message}");
+            assert!(!is_auth_revocation_error(&err), "misclassified {message}");
+            assert!(
+                !is_unregistered_account_error(&err),
+                "misclassified {message}"
+            );
+        }
+    }
 }
