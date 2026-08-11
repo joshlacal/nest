@@ -90,16 +90,30 @@ impl AtProtoClient {
             format!("{}{}", base, path)
         };
 
+        // Per-origin DPoP nonce cache: if we've already seen a nonce for
+        // this origin (from any prior request, on any code path that
+        // shares this cache), supply it on attempt 1 instead of always
+        // paying a guaranteed `use_dpop_nonce` 401 round trip. `origin` is
+        // `None` only if `url` fails to parse, which shouldn't happen for a
+        // URL built from an SSRF-validated PDS URL; in that case we simply
+        // skip the cache and behave exactly as before.
+        let origin = crate::services::DpopNonceCache::origin_key(&url);
+        let cached_nonce = origin
+            .as_deref()
+            .and_then(|o| self.state.dpop_nonce_cache.get(o));
+
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
         tracing::debug!(
             request_id = %request_id,
             url = %url,
             method = %method,
             body_size = body_size,
-            "[BFF-UPSTREAM] First attempt (no nonce)"
+            has_cached_nonce = cached_nonce.is_some(),
+            "[BFF-UPSTREAM] First attempt"
         );
 
-        // First attempt without nonce - always buffer since we may need to inspect for DPoP nonce
+        // First attempt, with the cached nonce if we have one - always
+        // buffer since we may need to inspect for a DPoP nonce challenge.
         let first_response = self
             .do_proxy_request_buffered(
                 session,
@@ -107,11 +121,12 @@ impl AtProtoClient {
                 &url,
                 body.clone(),
                 content_type,
-                None,
+                cached_nonce,
                 client_headers,
                 request_id,
                 1,
                 jacquard_dpop,
+                origin.as_deref(),
             )
             .await?;
 
@@ -131,7 +146,10 @@ impl AtProtoClient {
                                 "[BFF-DPOP-RETRY] Received nonce challenge, retrying"
                             );
 
-                            // Retry with the nonce - use streaming-aware version
+                            // Retry with the nonce - use streaming-aware version.
+                            // This is the one-and-only retry: whatever this
+                            // call returns (success or another challenge) is
+                            // final, we never loop.
                             return self
                                 .do_proxy_request(
                                     session,
@@ -144,6 +162,7 @@ impl AtProtoClient {
                                     request_id,
                                     2,
                                     jacquard_dpop,
+                                    origin.as_deref(),
                                 )
                                 .await;
                         }
@@ -169,6 +188,7 @@ impl AtProtoClient {
     /// - Responses > MAX_RESPONSE_SIZE (50MB): Rejected with error
     /// - Responses > STREAM_THRESHOLD (1MB) or non-JSON: Streamed directly
     /// - Small JSON responses: Buffered for potential processing
+    #[allow(clippy::too_many_arguments)]
     async fn do_proxy_request(
         &self,
         session: &CatbirdSession,
@@ -181,6 +201,7 @@ impl AtProtoClient {
         request_id: &str,
         attempt: u8,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        origin: Option<&str>,
     ) -> AppResult<ProxyResponse> {
         let has_nonce = nonce.is_some();
         let mut headers = self
@@ -259,6 +280,13 @@ impl AtProtoClient {
 
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
+
+        // Record whatever nonce this response carries — success or not —
+        // so the *next* request to this origin (this call or any other,
+        // via the shared cache) can skip straight to attempt 1 with a
+        // nonce. Deliberately unconditional on `status`: servers commonly
+        // rotate nonces and hand out the next one on a 2xx response too.
+        self.record_nonce_from_headers(origin, &response_headers);
 
         // Check Content-Length for size limits
         let content_length = response_headers
@@ -354,6 +382,7 @@ impl AtProtoClient {
     }
 
     /// Internal helper for first request that always buffers (needed for DPoP nonce inspection)
+    #[allow(clippy::too_many_arguments)]
     async fn do_proxy_request_buffered(
         &self,
         session: &CatbirdSession,
@@ -366,6 +395,7 @@ impl AtProtoClient {
         request_id: &str,
         attempt: u8,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        origin: Option<&str>,
     ) -> AppResult<(u16, HeaderMap, bytes::Bytes)> {
         let has_nonce = nonce.is_some();
         let mut headers = self
@@ -452,6 +482,10 @@ impl AtProtoClient {
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
 
+        // See the comment on the equivalent call in `do_proxy_request` —
+        // unconditional on `status` on purpose.
+        self.record_nonce_from_headers(origin, &response_headers);
+
         // Check Content-Length for size limits on initial request
         let content_length = response_headers
             .get("content-length")
@@ -523,6 +557,29 @@ impl AtProtoClient {
         }
 
         Ok(bytes::Bytes::from(body))
+    }
+
+    /// Update the shared per-origin DPoP nonce cache from a response's
+    /// `DPoP-Nonce` header, if present. No-op if `origin` is `None` (URL
+    /// didn't parse) or the response carried no nonce header. Intentionally
+    /// takes no `status` parameter — callers should invoke this for every
+    /// response regardless of status, since servers can rotate nonces on
+    /// success responses too.
+    ///
+    /// `pub(crate)` so `chat_poll::poller` — which talks to PDS hosts
+    /// directly rather than through `proxy_request` — can feed observed
+    /// nonces into the same shared cache.
+    pub(crate) fn record_nonce_from_headers(&self, origin: Option<&str>, headers: &HeaderMap) {
+        let Some(origin) = origin else {
+            return;
+        };
+        if let Some(value) = headers.get("dpop-nonce") {
+            if let Ok(nonce) = value.to_str() {
+                self.state
+                    .dpop_nonce_cache
+                    .set(origin.to_string(), nonce.to_string());
+            }
+        }
     }
 
     /// Build authentication headers with DPoP for a specific request

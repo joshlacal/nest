@@ -247,6 +247,11 @@ pub struct AppState {
     pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
     /// Push subsystem managers (only present when push is configured)
     pub push: Option<Arc<crate::services::push::PushServices>>,
+    /// Process-wide per-origin DPoP nonce cache, shared by the XRPC proxy
+    /// path and the chat poller so a nonce learned via one saves the other
+    /// a guaranteed `use_dpop_nonce` round trip. See
+    /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
+    pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
 }
 
 impl AppState {
@@ -284,6 +289,7 @@ impl AppState {
             catmos_jacquard_client: None,
             auth_store: None,
             push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
         };
 
         // Initialize KeyStore first (needed by OAuth client)
