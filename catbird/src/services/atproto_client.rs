@@ -605,10 +605,20 @@ impl AtProtoClient {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
         };
 
+        // RFC 9449 section 4.2: `htu` is the HTTP target URI **without** its
+        // query and fragment. Signing the full URL works against lenient
+        // validators (bsky.social normalises before comparing) but fails
+        // against a strict one: Swan builds `scheme://host[:port]path` and
+        // compares the claim byte-for-byte, so every query-bearing request
+        // was rejected 401 while query-less ones on the same session
+        // succeeded. Strip at the proof, not at the request — the request
+        // itself must still carry the query.
+        let dpop_htu = url.split('?').next().unwrap_or(url);
+
         let dpop_proof = jacquard_oauth::dpop::build_dpop_proof(
             &dpop_data.dpop_key,
             method.to_string().into(),
-            url.to_string().into(),
+            dpop_htu.to_string().into(),
             nonce.map(|n| n.into()),
             Some(ath.into()),
         )
