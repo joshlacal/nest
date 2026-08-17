@@ -22,6 +22,84 @@ pub struct AppConfig {
     /// Push control-plane configuration (optional)
     #[serde(default)]
     pub push: PushConfig,
+    /// Clean-chat configuration (blue.catbird.chat.*)
+    #[serde(default)]
+    pub chat: ChatConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatConfig {
+    /// Whether clean-chat routing/exchanger is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Token issuer (default: "https://api.catbird.blue")
+    #[serde(default = "default_chat_issuer")]
+    pub issuer: String,
+    /// Token audience (default: "did:web:mlschat.catbird.blue")
+    #[serde(default = "default_chat_audience")]
+    pub audience: String,
+    /// Token header kid (default: "catbird-chat-key-1")
+    #[serde(default = "default_chat_key_id")]
+    pub key_id: String,
+    /// Private key for ES256 minting (base64 PKCS#8 DER, SEC1, or PEM)
+    #[serde(default)]
+    pub signing_key_base64: Option<String>,
+    /// Chat instance UUID (default: "e9a27f41-d4a6-4507-8687-b921733ec41a")
+    #[serde(default = "default_chat_instance_id")]
+    pub instance_id: String,
+    /// External base URL for DPoP htu (default: "https://mlschat.catbird.blue")
+    #[serde(default = "default_chat_external_base")]
+    pub external_base: String,
+    /// Internal URL to reach delivery service (default: "http://127.0.0.1:3001")
+    #[serde(default = "default_chat_ds_internal_url")]
+    pub ds_internal_url: String,
+    /// Token TTL in seconds (default: 120)
+    #[serde(default = "default_chat_token_ttl_seconds")]
+    pub token_ttl_seconds: i64,
+}
+
+fn default_chat_issuer() -> String {
+    "https://api.catbird.blue".to_string()
+}
+
+fn default_chat_audience() -> String {
+    "did:web:mlschat.catbird.blue".to_string()
+}
+
+fn default_chat_key_id() -> String {
+    "catbird-chat-key-1".to_string()
+}
+
+fn default_chat_instance_id() -> String {
+    "e9a27f41-d4a6-4507-8687-b921733ec41a".to_string()
+}
+
+fn default_chat_external_base() -> String {
+    "https://mlschat.catbird.blue".to_string()
+}
+
+fn default_chat_ds_internal_url() -> String {
+    "http://127.0.0.1:3001".to_string()
+}
+
+fn default_chat_token_ttl_seconds() -> i64 {
+    120
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: default_chat_issuer(),
+            audience: default_chat_audience(),
+            key_id: default_chat_key_id(),
+            signing_key_base64: None,
+            instance_id: default_chat_instance_id(),
+            external_base: default_chat_external_base(),
+            ds_internal_url: default_chat_ds_internal_url(),
+            token_ttl_seconds: default_chat_token_ttl_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -221,7 +299,56 @@ impl AppConfig {
             )
             .build()?;
 
-        config.try_deserialize()
+        let mut app_config: AppConfig = config.try_deserialize()?;
+
+        // Override chat config with direct CHAT_* environment variables if present
+        if let Ok(val) = std::env::var("CHAT_ENABLED") {
+            app_config.chat.enabled = matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("CHAT_NEST_ISSUER") {
+            if !val.is_empty() {
+                app_config.chat.issuer = val;
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_NEST_AUDIENCE") {
+            if !val.is_empty() {
+                app_config.chat.audience = val;
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_NEST_KEY_ID") {
+            if !val.is_empty() {
+                app_config.chat.key_id = val;
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_NEST_SIGNING_KEY") {
+            if !val.is_empty() {
+                app_config.chat.signing_key_base64 = Some(val);
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_INSTANCE_ID") {
+            if !val.is_empty() {
+                app_config.chat.instance_id = val;
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_EXTERNAL_BASE") {
+            if !val.is_empty() {
+                app_config.chat.external_base = val;
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_DS_INTERNAL_URL") {
+            if !val.is_empty() {
+                app_config.chat.ds_internal_url = val;
+            }
+        }
+        if let Ok(val) = std::env::var("CHAT_TOKEN_TTL_SECONDS") {
+            if let Ok(ttl) = val.parse::<i64>() {
+                if ttl > 0 {
+                    app_config.chat.token_ttl_seconds = ttl;
+                }
+            }
+        }
+
+        Ok(app_config)
     }
 }
 
