@@ -4,7 +4,7 @@
 //! Supports both:
 //! - Clean-chat (`blue.catbird.chat.*`, all 32 endpoints): sender-constrained DPoP ES256 access tokens
 //!   and DPoP proofs according to CHAT_PROTOCOL §3 and 03-NEST-CHAT-TOKEN-BRIEF.md.
-//! - Legacy MLS (`blue.catbird.mlsChat.*`): bearer tokens for backwards compatibility with v1.
+//! - Clean Chat MLS (`blue.catbird.chat.*`): DPoP token authentication and direct Delivery Service routing.
 
 use super::atproto_client::MAX_RESPONSE_SIZE;
 use crate::config::AppState;
@@ -378,15 +378,12 @@ impl MlsAuthService {
 
     /// Check if a lexicon is an MLS or clean-chat endpoint that should be routed directly
     pub fn is_mls_lexicon(lexicon: &str) -> bool {
-        Self::is_v1_mls_lexicon(lexicon) || Self::is_clean_chat_lexicon(lexicon)
+        Self::is_clean_chat_lexicon(lexicon)
     }
 
     /// Check if a lexicon belongs to v1 legacy MLS (`blue.catbird.mlsChat.*`)
-    pub fn is_v1_mls_lexicon(lexicon: &str) -> bool {
-        let prefix = Self::v1_mls_lexicon_prefix();
-        lexicon.len() > prefix.len()
-            && lexicon.starts_with(prefix)
-            && lexicon.as_bytes().get(prefix.len()) == Some(&b'.')
+    pub fn is_v1_mls_lexicon(_lexicon: &str) -> bool {
+        false
     }
 
     /// Check if a lexicon belongs to clean-chat (`blue.catbird.chat.*`, 32 endpoints)
@@ -396,13 +393,6 @@ impl MlsAuthService {
             && lexicon.starts_with(prefix)
             && lexicon.as_bytes().get(prefix.len()) == Some(&b'.')
             && lexicon != "blue.catbird.chat.defs"
-    }
-
-    fn v1_mls_lexicon_prefix() -> &'static str {
-        catbird_atproto::catbird::mls_chat::get_convos::NSID
-            .rsplit_once('.')
-            .map(|(prefix, _)| prefix)
-            .unwrap_or("blue.catbird.mlsChat")
     }
 
     /// Check if direct MLS or clean-chat routing is enabled
@@ -1044,11 +1034,11 @@ mod tests {
 
     #[test]
     fn test_is_mls_lexicon_recognition() {
-        // v1 MLS endpoints
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.getConvos"));
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.sendMessage"));
-        assert!(MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.publishKeyPackages"));
-        assert!(MlsAuthService::is_v1_mls_lexicon("blue.catbird.mlsChat.getConvos"));
+        // Legacy v1 MLS endpoints must NOT be routed as active MLS endpoints
+        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.getConvos"));
+        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.sendMessage"));
+        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.publishKeyPackages"));
+        assert!(!MlsAuthService::is_v1_mls_lexicon("blue.catbird.mlsChat.getConvos"));
         assert!(!MlsAuthService::is_clean_chat_lexicon("blue.catbird.mlsChat.getConvos"));
 
         // All 32 clean-chat endpoints
