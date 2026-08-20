@@ -508,16 +508,46 @@ pub async fn proxy_xrpc(
             "Routing MLS request directly to MLS service"
         );
 
-        let (status, response_headers, response_body) = mls_service
-            .proxy_request(
-                &session,
-                method.try_into().unwrap_or(reqwest::Method::GET),
-                &lexicon,
-                query_string.as_deref(),
-                body_option,
-                content_type,
-            )
-            .await?;
+        let device_id_header = headers
+            .get("x-catbird-chat-device-id")
+            .or_else(|| headers.get("x-catbird-device-id"))
+            .or_else(|| headers.get("x-device-id"))
+            .and_then(|v| v.to_str().ok());
+
+        let session_dpop_key = dpop_data.as_ref().and_then(|ext| {
+            match jose_jwk::crypto::Key::try_from(&ext.0.dpop_key).ok()? {
+                jose_jwk::crypto::Key::P256(jose_jwk::crypto::Kind::Secret(sk)) => {
+                    Some(p256::ecdsa::SigningKey::from(sk))
+                }
+                _ => None,
+            }
+        });
+
+        let (status, response_headers, response_body) = if MlsAuthService::is_clean_chat_lexicon(&lexicon) {
+            mls_service
+                .proxy_clean_chat_request(
+                    &session,
+                    method.try_into().unwrap_or(reqwest::Method::GET),
+                    &lexicon,
+                    query_string.as_deref(),
+                    body_option,
+                    content_type,
+                    device_id_header,
+                    session_dpop_key.as_ref(),
+                )
+                .await?
+        } else {
+            mls_service
+                .proxy_request(
+                    &session,
+                    method.try_into().unwrap_or(reqwest::Method::GET),
+                    &lexicon,
+                    query_string.as_deref(),
+                    body_option,
+                    content_type,
+                )
+                .await?
+        };
 
         let response_shape = json_shape(&response_body);
         tracing::info!(

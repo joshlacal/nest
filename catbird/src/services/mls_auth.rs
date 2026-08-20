@@ -869,27 +869,41 @@ impl MlsAuthService {
             format!("{}/xrpc/{}", service_url.trim_end_matches('/'), lexicon)
         };
 
-        // Determine device ID
-        let device_id = match device_id_override {
-            Some(id) => id.to_string(),
-            None => {
-                if let Some(ref b) = body {
-                    serde_json::from_slice::<serde_json::Value>(b)
-                        .ok()
-                        .and_then(|v| {
-                            let inner = v.get("body").unwrap_or(&v);
-                            inner
-                                .get("actorDeviceId")
-                                .or_else(|| inner.get("deviceId"))
-                                .or_else(|| inner.get("recipientDeviceId"))
-                                .and_then(|d| d.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string())
-                } else {
-                    Uuid::new_v4().hyphenated().to_string()
-                }
-            }
+        // Determine device ID:
+        // 1. Explicit override (e.g. from x-catbird-chat-device-id header)
+        // 2. Request body (actorDeviceId / deviceId / recipientDeviceId)
+        // 3. Database lookup for session.did in chat.devices (active device)
+        // 4. Fallback UUIDv4
+        let device_id = if let Some(id) = device_id_override {
+            id.to_string()
+        } else if let Some(id) = body.as_ref().and_then(|b| {
+            serde_json::from_slice::<serde_json::Value>(b).ok().and_then(|v| {
+                let inner = v
+                    .get("signedRequest")
+                    .and_then(|sr| sr.get("body"))
+                    .unwrap_or_else(|| v.get("body").unwrap_or(&v));
+                inner
+                    .get("actorDeviceId")
+                    .or_else(|| inner.get("deviceId"))
+                    .or_else(|| inner.get("recipientDeviceId"))
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string())
+            })
+        }) {
+            id
+        } else if let Some(ref pool) = self.state.push_db {
+            let row: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT device_id FROM chat.devices WHERE user_did = $1 AND status = 'active' ORDER BY updated_at DESC LIMIT 1",
+            )
+            .bind(&session.did)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            row.map(|(id,)| id.hyphenated().to_string())
+                .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string())
+        } else {
+            Uuid::new_v4().hyphenated().to_string()
         };
 
         // Determine session DPoP key
@@ -908,17 +922,32 @@ impl MlsAuthService {
         let token = if lexicon == "blue.catbird.chat.enrollDevice" {
             let enrollment_info = body.as_ref().and_then(|b| {
                 serde_json::from_slice::<serde_json::Value>(b).ok().and_then(|v| {
-                    let inner = v.get("body").unwrap_or(&v);
+                    let inner = v
+                        .get("signedRequest")
+                        .and_then(|sr| sr.get("body"))
+                        .unwrap_or_else(|| v.get("body").unwrap_or(&v));
                     let key_id = inner.get("keyId").and_then(|k| k.as_str())?;
                     let signing_key_sha256 = inner
                         .get("signingKeySha256")
                         .or_else(|| inner.get("signingKey"))
-                        .and_then(|k| k.as_str())?;
+                        .and_then(|k| k.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            inner
+                                .get("signaturePublicKey")
+                                .and_then(|pk| pk.as_str())
+                                .and_then(|pk_str| {
+                                    let bytes = STANDARD.decode(pk_str).ok()?;
+                                    Some(URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes)))
+                                })
+                        })?;
                     let transcript = inner
                         .get("enrollmentTranscriptSha256")
                         .or_else(|| inner.get("enrollmentTranscript"))
-                        .and_then(|k| k.as_str())?;
-                    Some((key_id.to_string(), signing_key_sha256.to_string(), transcript.to_string()))
+                        .and_then(|k| k.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| signing_key_sha256.clone());
+                    Some((key_id.to_string(), signing_key_sha256, transcript))
                 })
             });
 
