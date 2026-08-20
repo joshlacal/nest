@@ -29,13 +29,19 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatConfig {
-    /// Whether clean-chat routing/exchanger is enabled
+    /// Whether the standard AppView proxy path is enabled.
     #[serde(default)]
     pub enabled: bool,
+    /// Exact account DIDs admitted to the dark/canary path.
+    #[serde(default)]
+    pub canary_dids: Vec<String>,
+    /// Exact ATProto service reference placed in `atproto-proxy`.
+    #[serde(default = "default_chat_service_ref")]
+    pub service_ref: String,
     /// Token issuer (default: "https://api.catbird.blue")
     #[serde(default = "default_chat_issuer")]
     pub issuer: String,
-    /// Token audience (default: "did:web:mlschat.catbird.blue")
+    /// Token audience (default: "did:web:chat.catbird.blue")
     #[serde(default = "default_chat_audience")]
     pub audience: String,
     /// Token header kid (default: "catbird-chat-key-1")
@@ -47,7 +53,7 @@ pub struct ChatConfig {
     /// Chat instance UUID (default: "e9a27f41-d4a6-4507-8687-b921733ec41a")
     #[serde(default = "default_chat_instance_id")]
     pub instance_id: String,
-    /// External base URL for DPoP htu (default: "https://mlschat.catbird.blue")
+    /// External base URL for DPoP htu (default: "https://chat.catbird.blue")
     #[serde(default = "default_chat_external_base")]
     pub external_base: String,
     /// Internal URL to reach delivery service (default: "http://127.0.0.1:3001")
@@ -62,8 +68,12 @@ fn default_chat_issuer() -> String {
     "https://api.catbird.blue".to_string()
 }
 
+fn default_chat_service_ref() -> String {
+    "did:web:chat.catbird.blue#atproto_mls".to_string()
+}
+
 fn default_chat_audience() -> String {
-    "did:web:mlschat.catbird.blue".to_string()
+    "did:web:chat.catbird.blue".to_string()
 }
 
 fn default_chat_key_id() -> String {
@@ -75,7 +85,7 @@ fn default_chat_instance_id() -> String {
 }
 
 fn default_chat_external_base() -> String {
-    "https://mlschat.catbird.blue".to_string()
+    "https://chat.catbird.blue".to_string()
 }
 
 fn default_chat_ds_internal_url() -> String {
@@ -90,6 +100,8 @@ impl Default for ChatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            canary_dids: Vec::new(),
+            service_ref: default_chat_service_ref(),
             issuer: default_chat_issuer(),
             audience: default_chat_audience(),
             key_id: default_chat_key_id(),
@@ -111,13 +123,13 @@ pub struct MlsConfig {
     /// DID of this gateway for service auth (e.g., did:web:api.catbird.blue)
     #[serde(default)]
     pub gateway_did: Option<String>,
-    /// DID of the MLS service (e.g., did:web:mls.catbird.blue)
+    /// DID of the MLS service (e.g., did:web:chat.catbird.blue)
     #[serde(default = "default_mls_service_did")]
     pub service_did: String,
 }
 
 fn default_mls_service_did() -> String {
-    "did:web:mlschat.catbird.blue".to_string()
+    "did:web:chat.catbird.blue".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -270,6 +282,8 @@ fn default_scopes() -> Vec<String> {
         "atproto".to_string(),
         "transition:generic".to_string(),
         "transition:chat.bsky".to_string(),
+        "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls"
+            .to_string(),
     ]
 }
 
@@ -293,7 +307,8 @@ impl AppConfig {
             .add_source(
                 config::Environment::with_prefix("CATBIRD")
                     .separator("__")
-                    .with_list_parse_key("CATBIRD__OAUTH__SCOPES")
+                    .with_list_parse_key("oauth.scopes")
+                    .with_list_parse_key("chat.canary_dids")
                     .list_separator(",")
                     .try_parsing(true),
             )
@@ -303,7 +318,21 @@ impl AppConfig {
 
         // Override chat config with direct CHAT_* environment variables if present
         if let Ok(val) = std::env::var("CHAT_ENABLED") {
-            app_config.chat.enabled = matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+            app_config.chat.enabled =
+                matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("CHAT_CANARY_DIDS") {
+            app_config.chat.canary_dids = val
+                .split(',')
+                .map(str::trim)
+                .filter(|did| !did.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        if let Ok(val) = std::env::var("CHAT_SERVICE_REF") {
+            if !val.is_empty() {
+                app_config.chat.service_ref = val;
+            }
         }
         if let Ok(val) = std::env::var("CHAT_NEST_ISSUER") {
             if !val.is_empty() {
@@ -541,8 +570,12 @@ impl AppState {
             .oauth
             .scopes
             .iter()
-            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
-            .collect();
+            .map(|s| {
+                Scope::parse(s)
+                    .map(|sc| sc.into_static())
+                    .map_err(|e| anyhow::anyhow!("Invalid OAuth scope '{}': {:?}", s, e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let metadata = AtprotoClientMetadata::new(
             client_id,
@@ -582,13 +615,29 @@ impl AppState {
             state.config.server.base_url.trim_end_matches('/')
         ))?;
 
-        // Use CATMOS_OAUTH_SCOPES if set, otherwise fall back to "atproto transition:generic"
-        let scope_str = std::env::var("CATMOS_OAUTH_SCOPES")
-            .unwrap_or_else(|_| "atproto transition:generic".to_string());
-        let scopes: Vec<Scope<'static>> = scope_str
-            .split_whitespace()
-            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
-            .collect();
+        // Use CATMOS_OAUTH_SCOPES if set, otherwise fall back to configured oauth.scopes
+        let scopes: Vec<Scope<'static>> = if let Ok(scope_str) = std::env::var("CATMOS_OAUTH_SCOPES") {
+            scope_str
+                .split_whitespace()
+                .map(|s| {
+                    Scope::parse(s)
+                        .map(|sc| sc.into_static())
+                        .map_err(|e| anyhow::anyhow!("Invalid CATMOS_OAUTH_SCOPES entry '{}': {:?}", s, e))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            state
+                .config
+                .oauth
+                .scopes
+                .iter()
+                .map(|s| {
+                    Scope::parse(s)
+                        .map(|sc| sc.into_static())
+                        .map_err(|e| anyhow::anyhow!("Invalid OAuth scope '{}': {:?}", s, e))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
 
         let metadata = AtprotoClientMetadata::new(
             client_id,
@@ -628,5 +677,37 @@ impl AppState {
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         resolver.with_system_dns()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_load_with_env_list_vars() {
+        std::env::set_var(
+            "CATBIRD__OAUTH__SCOPES",
+            "atproto,transition:generic,transition:chat.bsky,include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls",
+        );
+        std::env::set_var("CATBIRD__CHAT__CANARY_DIDS", "did:plc:test1,did:plc:test2");
+        std::env::set_var("CATBIRD__CHAT__ENABLED", "true");
+
+        let loaded = AppConfig::load().expect("AppConfig::load must succeed with list env vars");
+        assert_eq!(loaded.oauth.scopes.len(), 4);
+        assert_eq!(loaded.oauth.scopes[0], "atproto");
+        assert_eq!(
+            loaded.oauth.scopes[3],
+            "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls"
+        );
+        assert_eq!(
+            loaded.chat.canary_dids,
+            vec!["did:plc:test1".to_string(), "did:plc:test2".to_string()]
+        );
+        assert!(loaded.chat.enabled);
+
+        std::env::remove_var("CATBIRD__OAUTH__SCOPES");
+        std::env::remove_var("CATBIRD__CHAT__CANARY_DIDS");
+        std::env::remove_var("CATBIRD__CHAT__ENABLED");
     }
 }

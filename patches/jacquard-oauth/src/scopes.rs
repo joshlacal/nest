@@ -53,6 +53,8 @@ pub enum Scope<'s> {
     Profile,
     /// Email scope - access to user email address
     Email,
+    /// Include scope for referencing permission set definitions
+    Include(IncludeScope<'s>),
 }
 
 impl Serialize for Scope<'_> {
@@ -105,6 +107,7 @@ impl IntoStatic for Scope<'_> {
             Scope::OpenId => Scope::OpenId,
             Scope::Profile => Scope::Profile,
             Scope::Email => Scope::Email,
+            Scope::Include(scope) => Scope::Include(scope.into_static()),
         }
     }
 }
@@ -309,6 +312,26 @@ impl IntoStatic for RpcAudience<'_> {
     }
 }
 
+/// Include scope for referencing permission set definitions
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IncludeScope<'s> {
+    /// Permission set NSID
+    pub nsid: Nsid<'s>,
+    /// Audiences (service references, DIDs, or wildcard)
+    pub aud: BTreeSet<CowStr<'s>>,
+}
+
+impl IntoStatic for IncludeScope<'_> {
+    type Output = IncludeScope<'static>;
+
+    fn into_static(self) -> Self::Output {
+        IncludeScope {
+            nsid: self.nsid.into_static(),
+            aud: self.aud.into_iter().map(|s| s.into_static()).collect(),
+        }
+    }
+}
+
 impl<'s> Scope<'s> {
     /// Parse multiple space-separated scopes from a string
     ///
@@ -458,6 +481,7 @@ impl<'s> Scope<'s> {
             "openid",
             "profile",
             "email",
+            "include",
         ];
         let mut found_prefix = None;
         let mut suffix = None;
@@ -497,6 +521,7 @@ impl<'s> Scope<'s> {
             "openid" => Self::parse_openid(suffix),
             "profile" => Self::parse_profile(suffix),
             "email" => Self::parse_email(suffix),
+            "include" => Self::parse_include(suffix),
             _ => Err(ParseError::UnknownPrefix(prefix.to_string())),
         }
     }
@@ -745,6 +770,39 @@ impl<'s> Scope<'s> {
         }
         Ok(Scope::Email)
     }
+    fn parse_include(suffix: Option<&'s str>) -> Result<Self, ParseError> {
+        let suffix = suffix.ok_or(ParseError::MissingResource)?;
+        let mut aud = BTreeSet::new();
+
+        let (nsid_str, params) = match suffix.find('?') {
+            Some(pos) => {
+                let nsid = &suffix[..pos];
+                let params = parse_query_string(&suffix[pos + 1..]);
+                (nsid, Some(params))
+            }
+            None => (suffix, None),
+        };
+
+        if nsid_str.is_empty() {
+            return Err(ParseError::MissingResource);
+        }
+
+        let nsid = Nsid::new(nsid_str)?;
+
+        if let Some(params) = params {
+            if let Some(values) = params.get("aud") {
+                for value in values {
+                    aud.insert(value.clone());
+                }
+            }
+        }
+
+        Ok(Scope::Include(IncludeScope {
+            nsid: nsid.into_static(),
+            aud,
+        }))
+    }
+
 
     /// Convert the scope to its normalized string representation
     pub fn to_string_normalized(&self) -> String {
@@ -863,6 +921,19 @@ impl<'s> Scope<'s> {
             Scope::OpenId => "openid".to_string(),
             Scope::Profile => "profile".to_string(),
             Scope::Email => "email".to_string(),
+            Scope::Include(scope) => {
+                if scope.aud.is_empty() {
+                    format!("include:{}", scope.nsid)
+                } else {
+                    let mut params: Vec<String> = scope
+                        .aud
+                        .iter()
+                        .map(|aud| format!("aud={}", aud))
+                        .collect();
+                    params.sort();
+                    format!("include:{}?{}", scope.nsid, params.join("&"))
+                }
+            }
         }
     }
 
@@ -950,6 +1021,16 @@ impl<'s> Scope<'s> {
                 };
 
                 lxm_match && aud_match
+            }
+            (Scope::Include(a), Scope::Include(b)) => {
+                if a.nsid != b.nsid {
+                    return false;
+                }
+                if a.aud.is_empty() {
+                    true
+                } else {
+                    b.aud.is_subset(&a.aud)
+                }
             }
             _ => false,
         }
@@ -2009,5 +2090,50 @@ mod tests {
         assert!(!result.contains(&Scope::parse("account:email").unwrap()));
         assert!(result.contains(&Scope::parse("account:email?action=manage").unwrap()));
         assert!(result.contains(&Scope::parse("account:repo").unwrap()));
+    }
+
+    #[test]
+    fn test_include_scope_parsing_and_normalization() {
+        let scope = Scope::parse(
+            "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls",
+        )
+        .unwrap();
+        assert_eq!(
+            scope.to_string_normalized(),
+            "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls"
+        );
+
+        let scope_no_aud = Scope::parse("include:blue.catbird.chat.authFull").unwrap();
+        assert_eq!(
+            scope_no_aud.to_string_normalized(),
+            "include:blue.catbird.chat.authFull"
+        );
+
+        assert!(Scope::parse("include").is_err());
+        assert!(Scope::parse("include:").is_err());
+        assert!(Scope::parse("include:invalid nsid").is_err());
+    }
+
+    #[test]
+    fn test_include_scope_grants() {
+        let full = Scope::parse(
+            "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls",
+        )
+        .unwrap();
+        let same = Scope::parse(
+            "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls",
+        )
+        .unwrap();
+        let other_aud = Scope::parse(
+            "include:blue.catbird.chat.authFull?aud=did:web:other.service",
+        )
+        .unwrap();
+        let other_nsid = Scope::parse("include:other.permission.set").unwrap();
+        let wildcard_aud = Scope::parse("include:blue.catbird.chat.authFull").unwrap();
+
+        assert!(full.grants(&same));
+        assert!(wildcard_aud.grants(&full));
+        assert!(!full.grants(&other_aud));
+        assert!(!full.grants(&other_nsid));
     }
 }

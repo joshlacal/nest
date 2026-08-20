@@ -444,7 +444,8 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
     })
 }
 
-/// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
+/// Proxy XRPC requests to the user's PDS. MLS v2 uses the standard ATProto
+/// service-proxy path; Nest never mints MLS authorization.
 pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
@@ -498,85 +499,72 @@ pub async fn proxy_xrpc(
         Some(body_bytes.clone())
     };
 
-    // Check if this is an MLS lexicon and direct routing is enabled
-    let mls_service = MlsAuthService::new(state.clone());
-    if MlsAuthService::is_mls_lexicon(&lexicon) && mls_service.is_enabled() {
-        tracing::debug!(
-            request_id = %request_id,
-            lexicon = %lexicon,
-            user = %session.did,
-            "Routing MLS request directly to MLS service"
-        );
+    if MlsAuthService::is_retired_chat_lexicon(&lexicon) {
+        return Ok(Response::builder()
+            .status(StatusCode::UPGRADE_REQUIRED)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "ProtocolUpgradeRequired",
+                    "message": "This MLS protocol version or endpoint is retired"
+                })
+                .to_string(),
+            ))
+            .unwrap());
+    }
 
-        let device_id_header = headers
-            .get("x-catbird-chat-device-id")
-            .or_else(|| headers.get("x-catbird-device-id"))
-            .or_else(|| headers.get("x-device-id"))
-            .and_then(|v| v.to_str().ok());
+    if lexicon == "blue.catbird.chat.subscribeEvents" {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "InvalidRequest",
+                    "message": "subscribeEvents is a direct WebSocket transport authenticated via getSubscriptionTicket; direct HTTP proxying is not supported"
+                })
+                .to_string(),
+            ))
+            .unwrap());
+    }
 
-        let session_dpop_key = dpop_data.as_ref().and_then(|ext| {
-            match jose_jwk::crypto::Key::try_from(&ext.0.dpop_key).ok()? {
-                jose_jwk::crypto::Key::P256(jose_jwk::crypto::Kind::Secret(sk)) => {
-                    Some(p256::ecdsa::SigningKey::from(sk))
-                }
-                _ => None,
-            }
-        });
-
-        let (status, response_headers, response_body) = if MlsAuthService::is_clean_chat_lexicon(&lexicon) {
-            mls_service
-                .proxy_clean_chat_request(
-                    &session,
-                    method.try_into().unwrap_or(reqwest::Method::GET),
-                    &lexicon,
-                    query_string.as_deref(),
-                    body_option,
-                    content_type,
-                    device_id_header,
-                    session_dpop_key.as_ref(),
-                )
-                .await?
-        } else {
-            mls_service
-                .proxy_request(
-                    &session,
-                    method.try_into().unwrap_or(reqwest::Method::GET),
-                    &lexicon,
-                    query_string.as_deref(),
-                    body_option,
-                    content_type,
-                )
-                .await?
-        };
-
-        let response_shape = json_shape(&response_body);
-        tracing::info!(
-            request_id = %request_id,
-            status = status,
-            body_bytes = response_body.len(),
-            body_shape = ?response_shape,
-            "[BFF-RESP] MLS response"
-        );
-
-        // Record proxy metrics
-        let duration = start.elapsed().as_secs_f64();
-        metrics::record_proxy_request(&lexicon, status, duration);
-
-        let mut response = Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
-        for (name, value) in response_headers.iter() {
-            let name_str = name.as_str();
-            if matches!(
-                name_str,
-                "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
-            ) {
-                if let Ok(v) = reqwest::header::HeaderValue::to_str(value) {
-                    response = response.header(name_str, v);
-                }
-            }
+    let mut upstream_headers = headers.clone();
+    if MlsAuthService::is_active_chat_http_lexicon(&lexicon) {
+        let chat = &state.config.chat;
+        let is_canary = chat.enabled && chat.canary_dids.iter().any(|did| did == &session.did);
+        if !is_canary {
+            return Ok(Response::builder()
+                .status(StatusCode::UPGRADE_REQUIRED)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "error": "ProtocolUpgradeRequired",
+                        "message": "MLS v2 standard AppView access is not enabled for this account"
+                    })
+                    .to_string(),
+                ))
+                .unwrap());
         }
-
-        return Ok(response.body(Body::from(response_body)).unwrap());
+        if chat.service_ref != "did:web:chat.catbird.blue#atproto_mls" {
+            return Err(AppError::Internal(
+                "CHAT_SERVICE_REF must equal did:web:chat.catbird.blue#atproto_mls".into(),
+            ));
+        }
+        upstream_headers.insert(
+            "atproto-proxy",
+            reqwest::header::HeaderValue::from_static("did:web:chat.catbird.blue#atproto_mls"),
+        );
+    } else if MlsAuthService::is_clean_chat_lexicon(&lexicon) {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "InvalidRequest",
+                    "message": "This chat endpoint is not supported for HTTP proxying"
+                })
+                .to_string(),
+            ))
+            .unwrap());
     }
 
     // Default: proxy through PDS
@@ -599,7 +587,7 @@ pub async fn proxy_xrpc(
             query_string.as_deref(),
             body_option,
             content_type,
-            Some(&headers),
+            Some(&upstream_headers),
             &request_id,
             jacquard_dpop.as_ref(),
         )

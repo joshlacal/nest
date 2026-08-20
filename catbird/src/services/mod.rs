@@ -20,8 +20,7 @@ pub use mls_auth::{
     p256_verifying_key_thumbprint, parse_p256_signing_key, public_p256_jwk_from_signing_key,
     public_p256_jwk_from_verifying_key, verify_dpop_proof, CleanChatClaims, CleanChatConfirmation,
     CleanChatEnrollmentClaims, CleanChatTokenHeader, DpopProofClaims, DpopProofHeader,
-    MlsAuthService, PublicP256Jwk, CHAT_ENDPOINTS,
+    MlsAuthService, PublicP256Jwk, CHAT_ENDPOINTS, CHAT_HTTP_ENDPOINTS,
 };
 pub use push::PushServices;
 pub use redis_auth_store::RedisAuthStore;
-

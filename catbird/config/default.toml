@@ -25,4 +25,9 @@ redirect_uri = "http://localhost:3000/auth/callback"
 # ]
 # active_key_id = "catbird-key-2"  # Which key to use for signing
 
-scopes = ["atproto", "transition:generic", "transition:chat.bsky"]
+scopes = [
+  "atproto",
+  "transition:generic",
+  "transition:chat.bsky",
+  "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls"
+]

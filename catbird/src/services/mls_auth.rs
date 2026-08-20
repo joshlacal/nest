@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// All 32 clean-chat endpoints defined in blue.catbird.chat.*
+/// Standard proxied clean-chat HTTP endpoints. `subscribeEvents` is direct to
+/// mls-ds and authenticated by a ticket obtained through this surface.
 pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.acceptConversation",
     "blue.catbird.chat.acknowledgeWelcome",
@@ -49,7 +50,6 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.getSubscriptionTicket",
     "blue.catbird.chat.prepareBlobUpload",
     "blue.catbird.chat.publishTyping",
-    "blue.catbird.chat.rebindDeviceAuthentication",
     "blue.catbird.chat.rejectWelcome",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.requestLeafRecovery",
@@ -59,6 +59,41 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.sendMessage",
     "blue.catbird.chat.submitTransition",
     "blue.catbird.chat.subscribeEvents",
+    "blue.catbird.chat.uploadBlob",
+];
+
+/// Active clean-chat HTTP endpoints proxied through PDS with atproto-proxy.
+/// Excludes WebSocket-only `subscribeEvents` and retired `rebindDeviceAuthentication`.
+pub const CHAT_HTTP_ENDPOINTS: &[&str] = &[
+    "blue.catbird.chat.acceptConversation",
+    "blue.catbird.chat.acknowledgeWelcome",
+    "blue.catbird.chat.activateReset",
+    "blue.catbird.chat.cancelLeafRecovery",
+    "blue.catbird.chat.cancelLeave",
+    "blue.catbird.chat.closeConversation",
+    "blue.catbird.chat.createConversation",
+    "blue.catbird.chat.deleteBlob",
+    "blue.catbird.chat.enrollDevice",
+    "blue.catbird.chat.getBlob",
+    "blue.catbird.chat.getBlobUsage",
+    "blue.catbird.chat.getConversationState",
+    "blue.catbird.chat.getConversations",
+    "blue.catbird.chat.getDevices",
+    "blue.catbird.chat.getEntries",
+    "blue.catbird.chat.getLeafRecoveryInbox",
+    "blue.catbird.chat.getOwnDevices",
+    "blue.catbird.chat.getPendingWelcomes",
+    "blue.catbird.chat.getSubscriptionTicket",
+    "blue.catbird.chat.prepareBlobUpload",
+    "blue.catbird.chat.publishTyping",
+    "blue.catbird.chat.rejectWelcome",
+    "blue.catbird.chat.replenishKeyPackages",
+    "blue.catbird.chat.requestLeafRecovery",
+    "blue.catbird.chat.requestLeave",
+    "blue.catbird.chat.requestReset",
+    "blue.catbird.chat.revokeDevice",
+    "blue.catbird.chat.sendMessage",
+    "blue.catbird.chat.submitTransition",
     "blue.catbird.chat.uploadBlob",
 ];
 
@@ -239,12 +274,10 @@ pub fn generate_dpop_proof(
         jti,
     };
 
-    let encoded_header = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?,
-    );
-    let encoded_payload = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?,
-    );
+    let encoded_header = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?);
+    let encoded_payload = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?);
 
     let signing_input = format!("{}.{}", encoded_header, encoded_payload);
     let signature: Signature = dpop_signing_key.sign(signing_input.as_bytes());
@@ -274,10 +307,14 @@ pub fn verify_dpop_proof(
         .map_err(|e| AppError::BadRequest(format!("invalid DPoP header JSON: {e}")))?;
 
     if header.typ != "dpop+jwt" || header.alg != "ES256" {
-        return Err(AppError::BadRequest("unsupported DPoP proof header alg/typ".into()));
+        return Err(AppError::BadRequest(
+            "unsupported DPoP proof header alg/typ".into(),
+        ));
     }
     if header.jwk.kty != "EC" || header.jwk.crv != "P-256" {
-        return Err(AppError::BadRequest("DPoP proof JWK must be EC P-256".into()));
+        return Err(AppError::BadRequest(
+            "DPoP proof JWK must be EC P-256".into(),
+        ));
     }
 
     let proof_jkt = calculate_rfc7638_jkt(&header.jwk);
@@ -297,7 +334,9 @@ pub fn verify_dpop_proof(
         .decode(&header.jwk.y)
         .map_err(|e| AppError::BadRequest(format!("invalid base64url jwk.y: {e}")))?;
     if x_bytes.len() != 32 || y_bytes.len() != 32 {
-        return Err(AppError::BadRequest("invalid P-256 coordinate length".into()));
+        return Err(AppError::BadRequest(
+            "invalid P-256 coordinate length".into(),
+        ));
     }
 
     let mut point_bytes = Vec::with_capacity(65);
@@ -319,7 +358,9 @@ pub fn verify_dpop_proof(
 
     verifying_key
         .verify(signing_input.as_bytes(), &signature)
-        .map_err(|e| AppError::BadRequest(format!("DPoP proof signature verification failed: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!("DPoP proof signature verification failed: {e}"))
+        })?;
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -381,9 +422,10 @@ impl MlsAuthService {
         Self::is_clean_chat_lexicon(lexicon)
     }
 
-    /// Check if a lexicon belongs to v1 legacy MLS (`blue.catbird.mlsChat.*`)
-    pub fn is_v1_mls_lexicon(_lexicon: &str) -> bool {
-        false
+    /// Check if a lexicon belongs to retired v1 MLS. These requests are
+    /// upgrade-blocked before any network mutation.
+    pub fn is_v1_mls_lexicon(lexicon: &str) -> bool {
+        lexicon.starts_with("blue.catbird.mlsChat.")
     }
 
     /// Check if a lexicon belongs to clean-chat (`blue.catbird.chat.*`, 32 endpoints)
@@ -393,6 +435,17 @@ impl MlsAuthService {
             && lexicon.starts_with(prefix)
             && lexicon.as_bytes().get(prefix.len()) == Some(&b'.')
             && lexicon != "blue.catbird.chat.defs"
+    }
+
+    /// Check if a lexicon belongs to active clean-chat HTTP endpoints (30 endpoints).
+    pub fn is_active_chat_http_lexicon(lexicon: &str) -> bool {
+        CHAT_HTTP_ENDPOINTS.contains(&lexicon)
+    }
+
+    /// Check if a lexicon is retired / deprecated (e.g. v1 MLS or rebindDeviceAuthentication).
+    pub fn is_retired_chat_lexicon(lexicon: &str) -> bool {
+        Self::is_v1_mls_lexicon(lexicon)
+            || lexicon == "blue.catbird.chat.rebindDeviceAuthentication"
     }
 
     /// Check if direct MLS or clean-chat routing is enabled
@@ -406,18 +459,13 @@ impl MlsAuthService {
 
     /// Get the delivery service URL (loopback target)
     pub fn service_url(&self) -> Option<&str> {
-        self.state
-            .config
-            .mls
-            .service_url
-            .as_deref()
-            .or_else(|| {
-                if !self.state.config.chat.ds_internal_url.is_empty() {
-                    Some(self.state.config.chat.ds_internal_url.as_str())
-                } else {
-                    None
-                }
-            })
+        self.state.config.mls.service_url.as_deref().or_else(|| {
+            if !self.state.config.chat.ds_internal_url.is_empty() {
+                Some(self.state.config.chat.ds_internal_url.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     pub fn chat_issuer(&self) -> &str {
@@ -432,7 +480,7 @@ impl MlsAuthService {
         if !self.state.config.chat.audience.is_empty() {
             &self.state.config.chat.audience
         } else {
-            "did:web:mlschat.catbird.blue"
+            "did:web:chat.catbird.blue"
         }
     }
 
@@ -458,7 +506,7 @@ impl MlsAuthService {
         if !self.state.config.chat.external_base.is_empty() {
             &self.state.config.chat.external_base
         } else {
-            "https://mlschat.catbird.blue"
+            "https://chat.catbird.blue"
         }
     }
 
@@ -469,11 +517,9 @@ impl MlsAuthService {
         if let Ok(b64) = std::env::var("CHAT_NEST_SIGNING_KEY") {
             return parse_p256_signing_key(&b64);
         }
-        let key_store = self
-            .state
-            .key_store
-            .as_ref()
-            .ok_or_else(|| AppError::Config("KeyStore or CHAT_NEST_SIGNING_KEY not configured".into()))?;
+        let key_store = self.state.key_store.as_ref().ok_or_else(|| {
+            AppError::Config("KeyStore or CHAT_NEST_SIGNING_KEY not configured".into())
+        })?;
         let active_key = key_store.active_key();
         Ok(SigningKey::from(&active_key.secret_key))
     }
@@ -605,12 +651,10 @@ impl MlsAuthService {
             chat_instance: self.chat_instance_id().to_string(),
         };
 
-        let encoded_header = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
-        let encoded_payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
+        let encoded_header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?);
+        let encoded_payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?);
 
         let signing_input = format!("{}.{}", encoded_header, encoded_payload);
         let signature: Signature = signing_key.sign(signing_input.as_bytes());
@@ -667,8 +711,11 @@ impl MlsAuthService {
 
         // Enrollment exp is exactly min(iat + 120, auth_time + 300)
         let exp = std::cmp::min(
-            iat.checked_add(120).ok_or_else(|| AppError::Internal("iat overflow".into()))?,
-            auth_time.checked_add(300).ok_or_else(|| AppError::Internal("auth_time overflow".into()))?,
+            iat.checked_add(120)
+                .ok_or_else(|| AppError::Internal("iat overflow".into()))?,
+            auth_time
+                .checked_add(300)
+                .ok_or_else(|| AppError::Internal("auth_time overflow".into()))?,
         );
 
         let header = CleanChatTokenHeader {
@@ -697,12 +744,10 @@ impl MlsAuthService {
             auth_txn: auth_txn.to_string(),
         };
 
-        let encoded_header = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
-        let encoded_payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
+        let encoded_header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?);
+        let encoded_payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?);
 
         let signing_input = format!("{}.{}", encoded_header, encoded_payload);
         let signature: Signature = signing_key.sign(signing_input.as_bytes());
@@ -749,15 +794,8 @@ impl MlsAuthService {
             )
             .await
         } else {
-            self.proxy_v1_request(
-                session,
-                method,
-                lexicon,
-                query_string,
-                body,
-                content_type,
-            )
-            .await
+            self.proxy_v1_request(session, method, lexicon, query_string, body, content_type)
+                .await
         }
     }
 
@@ -776,7 +814,12 @@ impl MlsAuthService {
             .ok_or_else(|| AppError::Config("MLS service_url not configured".into()))?;
 
         let url = if let Some(qs) = query_string {
-            format!("{}/xrpc/{}?{}", service_url.trim_end_matches('/'), lexicon, qs)
+            format!(
+                "{}/xrpc/{}?{}",
+                service_url.trim_end_matches('/'),
+                lexicon,
+                qs
+            )
         } else {
             format!("{}/xrpc/{}", service_url.trim_end_matches('/'), lexicon)
         };
@@ -864,7 +907,12 @@ impl MlsAuthService {
             .ok_or_else(|| AppError::Config("Chat delivery service URL not configured".into()))?;
 
         let url = if let Some(qs) = query_string {
-            format!("{}/xrpc/{}?{}", service_url.trim_end_matches('/'), lexicon, qs)
+            format!(
+                "{}/xrpc/{}?{}",
+                service_url.trim_end_matches('/'),
+                lexicon,
+                qs
+            )
         } else {
             format!("{}/xrpc/{}", service_url.trim_end_matches('/'), lexicon)
         };
@@ -877,18 +925,20 @@ impl MlsAuthService {
         let device_id = if let Some(id) = device_id_override {
             id.to_string()
         } else if let Some(id) = body.as_ref().and_then(|b| {
-            serde_json::from_slice::<serde_json::Value>(b).ok().and_then(|v| {
-                let inner = v
-                    .get("signedRequest")
-                    .and_then(|sr| sr.get("body"))
-                    .unwrap_or_else(|| v.get("body").unwrap_or(&v));
-                inner
-                    .get("actorDeviceId")
-                    .or_else(|| inner.get("deviceId"))
-                    .or_else(|| inner.get("recipientDeviceId"))
-                    .and_then(|d| d.as_str())
-                    .map(|s| s.to_string())
-            })
+            serde_json::from_slice::<serde_json::Value>(b)
+                .ok()
+                .and_then(|v| {
+                    let inner = v
+                        .get("signedRequest")
+                        .and_then(|sr| sr.get("body"))
+                        .unwrap_or_else(|| v.get("body").unwrap_or(&v));
+                    inner
+                        .get("actorDeviceId")
+                        .or_else(|| inner.get("deviceId"))
+                        .or_else(|| inner.get("recipientDeviceId"))
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string())
+                })
         }) {
             id
         } else if let Some(ref pool) = self.state.push_db {
@@ -921,34 +971,36 @@ impl MlsAuthService {
         // Mint clean-chat access token
         let token = if lexicon == "blue.catbird.chat.enrollDevice" {
             let enrollment_info = body.as_ref().and_then(|b| {
-                serde_json::from_slice::<serde_json::Value>(b).ok().and_then(|v| {
-                    let inner = v
-                        .get("signedRequest")
-                        .and_then(|sr| sr.get("body"))
-                        .unwrap_or_else(|| v.get("body").unwrap_or(&v));
-                    let key_id = inner.get("keyId").and_then(|k| k.as_str())?;
-                    let signing_key_sha256 = inner
-                        .get("signingKeySha256")
-                        .or_else(|| inner.get("signingKey"))
-                        .and_then(|k| k.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            inner
-                                .get("signaturePublicKey")
-                                .and_then(|pk| pk.as_str())
-                                .and_then(|pk_str| {
-                                    let bytes = STANDARD.decode(pk_str).ok()?;
-                                    Some(URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes)))
-                                })
-                        })?;
-                    let transcript = inner
-                        .get("enrollmentTranscriptSha256")
-                        .or_else(|| inner.get("enrollmentTranscript"))
-                        .and_then(|k| k.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| signing_key_sha256.clone());
-                    Some((key_id.to_string(), signing_key_sha256, transcript))
-                })
+                serde_json::from_slice::<serde_json::Value>(b)
+                    .ok()
+                    .and_then(|v| {
+                        let inner = v
+                            .get("signedRequest")
+                            .and_then(|sr| sr.get("body"))
+                            .unwrap_or_else(|| v.get("body").unwrap_or(&v));
+                        let key_id = inner.get("keyId").and_then(|k| k.as_str())?;
+                        let signing_key_sha256 = inner
+                            .get("signingKeySha256")
+                            .or_else(|| inner.get("signingKey"))
+                            .and_then(|k| k.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                inner
+                                    .get("signaturePublicKey")
+                                    .and_then(|pk| pk.as_str())
+                                    .and_then(|pk_str| {
+                                        let bytes = STANDARD.decode(pk_str).ok()?;
+                                        Some(URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes)))
+                                    })
+                            })?;
+                        let transcript = inner
+                            .get("enrollmentTranscriptSha256")
+                            .or_else(|| inner.get("enrollmentTranscript"))
+                            .and_then(|k| k.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| signing_key_sha256.clone());
+                        Some((key_id.to_string(), signing_key_sha256, transcript))
+                    })
             });
 
             let now = Utc::now().timestamp();
@@ -1064,11 +1116,33 @@ mod tests {
     #[test]
     fn test_is_mls_lexicon_recognition() {
         // Legacy v1 MLS endpoints must NOT be routed as active MLS endpoints
-        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.getConvos"));
-        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.sendMessage"));
-        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.publishKeyPackages"));
-        assert!(!MlsAuthService::is_v1_mls_lexicon("blue.catbird.mlsChat.getConvos"));
-        assert!(!MlsAuthService::is_clean_chat_lexicon("blue.catbird.mlsChat.getConvos"));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.sendMessage"
+        ));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.publishKeyPackages"
+        ));
+        assert!(MlsAuthService::is_v1_mls_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
+        assert!(MlsAuthService::is_retired_chat_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
+        assert!(MlsAuthService::is_retired_chat_lexicon(
+            "blue.catbird.chat.rebindDeviceAuthentication"
+        ));
+        assert!(!MlsAuthService::is_active_chat_http_lexicon(
+            "blue.catbird.chat.rebindDeviceAuthentication"
+        ));
+        assert!(!MlsAuthService::is_active_chat_http_lexicon(
+            "blue.catbird.chat.subscribeEvents"
+        ));
+        assert!(!MlsAuthService::is_clean_chat_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
 
         // All 32 clean-chat endpoints
         for endpoint in CHAT_ENDPOINTS {
@@ -1088,10 +1162,16 @@ mod tests {
 
         // Non-MLS endpoints
         assert!(!MlsAuthService::is_mls_lexicon("app.bsky.feed.getTimeline"));
-        assert!(!MlsAuthService::is_mls_lexicon("chat.bsky.convo.listConvos"));
-        assert!(!MlsAuthService::is_mls_lexicon("com.atproto.repo.getRecord"));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "chat.bsky.convo.listConvos"
+        ));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "com.atproto.repo.getRecord"
+        ));
         assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.chat.defs"));
-        assert!(!MlsAuthService::is_clean_chat_lexicon("blue.catbird.chat.defs"));
+        assert!(!MlsAuthService::is_clean_chat_lexicon(
+            "blue.catbird.chat.defs"
+        ));
     }
 
     #[test]
@@ -1135,7 +1215,7 @@ mod tests {
         let claims = CleanChatClaims {
             iss: "https://api.catbird.blue".to_string(),
             sub: user_did.to_string(),
-            aud: "did:web:mlschat.catbird.blue".to_string(),
+            aud: "did:web:chat.catbird.blue".to_string(),
             lxm: lexicon.to_string(),
             iat: now,
             exp,
@@ -1151,7 +1231,11 @@ mod tests {
         let encoded_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         let signing_input = format!("{}.{}", encoded_header, encoded_payload);
         let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        let token = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+        let token = format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
 
         // Verify token structure
         let parts: Vec<&str> = token.split('.').collect();
@@ -1169,7 +1253,7 @@ mod tests {
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(decoded_claims.iss, "https://api.catbird.blue");
         assert_eq!(decoded_claims.sub, user_did);
-        assert_eq!(decoded_claims.aud, "did:web:mlschat.catbird.blue");
+        assert_eq!(decoded_claims.aud, "did:web:chat.catbird.blue");
         assert_eq!(decoded_claims.lxm, lexicon);
         assert_eq!(decoded_claims.iat, now);
         assert_eq!(decoded_claims.exp, exp);
@@ -1208,7 +1292,7 @@ mod tests {
         let claims = CleanChatEnrollmentClaims {
             iss: "https://api.catbird.blue".to_string(),
             sub: user_did.to_string(),
-            aud: "did:web:mlschat.catbird.blue".to_string(),
+            aud: "did:web:chat.catbird.blue".to_string(),
             lxm: "blue.catbird.chat.enrollDevice".to_string(),
             iat,
             exp: expected_exp,
@@ -1235,7 +1319,11 @@ mod tests {
         let encoded_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         let signing_input = format!("{}.{}", encoded_header, encoded_payload);
         let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        let token = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+        let token = format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
 
         // Decode and verify
         let parts: Vec<&str> = token.split('.').collect();
@@ -1264,22 +1352,15 @@ mod tests {
         let dpop_jkt = p256_jwk_thumbprint(&dpop_key);
 
         let method = "POST";
-        let htu = "https://mlschat.catbird.blue/xrpc/blue.catbird.chat.sendMessage";
+        let htu = "https://chat.catbird.blue/xrpc/blue.catbird.chat.sendMessage";
         let access_token = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.test_signature";
         let now = 1700000000;
 
         let proof = generate_dpop_proof(&dpop_key, method, htu, access_token, now).unwrap();
 
         // Verify valid proof
-        let claims = verify_dpop_proof(
-            &proof,
-            method,
-            htu,
-            access_token,
-            Some(&dpop_jkt),
-            now,
-        )
-        .unwrap();
+        let claims =
+            verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now).unwrap();
 
         assert_eq!(claims.htm, "POST");
         assert_eq!(claims.htu, htu);
@@ -1291,14 +1372,38 @@ mod tests {
         // 1. Wrong method
         assert!(verify_dpop_proof(&proof, "GET", htu, access_token, Some(&dpop_jkt), now).is_err());
         // 2. Wrong htu
-        assert!(verify_dpop_proof(&proof, method, "https://mlschat.catbird.blue/xrpc/blue.catbird.chat.getEntries", access_token, Some(&dpop_jkt), now).is_err());
+        assert!(verify_dpop_proof(
+            &proof,
+            method,
+            "https://chat.catbird.blue/xrpc/blue.catbird.chat.getEntries",
+            access_token,
+            Some(&dpop_jkt),
+            now
+        )
+        .is_err());
         // 3. Wrong access token (ath mismatch)
-        assert!(verify_dpop_proof(&proof, method, htu, "tampered_token", Some(&dpop_jkt), now).is_err());
+        assert!(
+            verify_dpop_proof(&proof, method, htu, "tampered_token", Some(&dpop_jkt), now).is_err()
+        );
         // 4. Wrong JKT
-        assert!(verify_dpop_proof(&proof, method, htu, access_token, Some("different_jkt_43_chars_long_aaaaaaaaaaaaaa"), now).is_err());
+        assert!(verify_dpop_proof(
+            &proof,
+            method,
+            htu,
+            access_token,
+            Some("different_jkt_43_chars_long_aaaaaaaaaaaaaa"),
+            now
+        )
+        .is_err());
         // 5. Expired / clock skew > 60s
-        assert!(verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now + 61).is_err());
-        assert!(verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now - 61).is_err());
+        assert!(
+            verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now + 61)
+                .is_err()
+        );
+        assert!(
+            verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now - 61)
+                .is_err()
+        );
     }
 
     #[test]
