@@ -22,7 +22,10 @@ use crate::error::{AppError, AppResult};
 use crate::metrics;
 use crate::middleware::JacquardDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
-use crate::models::{CatbirdSession, LogoutResponse, OAuthCallback, SessionInfo};
+use crate::models::{
+    CatbirdSession, ExchangeRequest, ExchangeResponse, LogoutResponse, OAuthCallback,
+    SessionInfo,
+};
 use crate::services::{AtProtoClient, MlsAuthService, ProxyResponse};
 
 /// Handle login initiation (Redirect flow)
@@ -39,6 +42,7 @@ pub async fn login(
         .ok_or_else(|| AppError::BadRequest("Missing identifier".into()))?;
     let client = params.get("client").cloned();
     let redirect_to = params.get("redirect_to").cloned();
+    let browser_nonce = params.get("browser_nonce").cloned();
 
     // Select the appropriate OAuth client based on the client parameter.
     // The chosen selector is persisted to Redis so the callback handler can
@@ -47,6 +51,42 @@ pub async fn login(
     let is_catmos = matches!(client.as_deref(), Some("catmos-web") | Some("catmos"));
     let client_selector = if is_catmos { "catmos" } else { "default" };
 
+    // FIX 3: The native callback (ALLOWED_EXACT_REDIRECT_URLS) is valid ONLY in
+    // exchange-code mode. If requested without browser_nonce, reject with 400.
+    if let Some(ref r) = redirect_to {
+        if ALLOWED_EXACT_REDIRECT_URLS.contains(&r.as_str()) && browser_nonce.is_none() {
+            return Err(AppError::BadRequest(
+                "Native callback requires browser_nonce".into(),
+            ));
+        }
+    }
+
+    // ADR-014 validations BEFORE any Redis write or PDS redirect:
+    // If browser_nonce is supplied:
+    // 1. Encryption key MUST be configured (fail closed, no plaintext fallback)
+    // 2. Must be exactly 43 base64url characters
+    // 3. redirect_to must be present
+    // 4. redirect_to must pass is_allowed_redirect
+    if let Some(ref nonce) = browser_nonce {
+        if state.session_encryption_key.is_none() {
+            return Err(AppError::Internal(
+                "Session encryption key not configured; cannot admit exchange flow".into(),
+            ));
+        }
+        if !is_valid_base64url_43(nonce) {
+            return Err(AppError::BadRequest(
+                "Invalid browser_nonce: must be exactly 43 base64url characters".into(),
+            ));
+        }
+        let Some(ref r) = redirect_to else {
+            return Err(AppError::BadRequest(
+                "Missing redirect_to: required when browser_nonce is supplied".into(),
+            ));
+        };
+        if !is_allowed_redirect(r) {
+            return Err(AppError::BadRequest("Disallowed redirect_to URL".into()));
+        }
+    }
     tracing::info!(
         "Login request for identifier: {}, client: {:?}, redirect_to: {:?}, selector: {}",
         identifier,
@@ -73,41 +113,90 @@ pub async fn login(
     // Generate a clean UUID for the OAuth state (= Jacquard session_id).
     let session_nonce = uuid::Uuid::new_v4().to_string();
 
-    // Persist the chosen OAuth client selector so the callback handler can
-    // pick the same jacquard client. Stored unconditionally (including
-    // "default") so callback has a single source of truth. 600s TTL matches
-    // the redirect_to key.
-    {
+    // Persist session state to Redis.
+    // Contract Rule 2: Fail closed in exchange mode on ANY persistence error.
+    // FIX 4: Persist explicit oauth_mode:"exchange" marker for admitted exchange flows.
+    // Absent browser_nonce: maintain legacy tolerant error handling.
+    if let Some(ref nonce) = browser_nonce {
         let mut conn = state.redis.clone();
-        let key = format!("oauth_client:{}", session_nonce);
-        if let Err(e) = redis::cmd("SET")
-            .arg(&key)
+
+        // 1. oauth_mode marker
+        let mode_key = format!("oauth_mode:{}", session_nonce);
+        redis::cmd("SET")
+            .arg(&mode_key)
+            .arg("exchange")
+            .arg("EX")
+            .arg(600)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to persist oauth_mode: {}", e)))?;
+
+        // 2. oauth_client
+        let client_key = format!("oauth_client:{}", session_nonce);
+        redis::cmd("SET")
+            .arg(&client_key)
             .arg(client_selector)
             .arg("EX")
             .arg(600)
             .query_async::<_, ()>(&mut conn)
             .await
-        {
-            // Don't fail login — callback will fall back to legacy inference.
-            tracing::warn!(
-                "Failed to persist oauth_client selector to Redis for session {}: {}",
-                session_nonce,
-                e
-            );
-        }
-    }
+            .map_err(|e| AppError::Internal(format!("Failed to persist oauth_client: {}", e)))?;
 
-    // Store redirect_to in Redis so the callback can look it up.
-    if let Some(ref r) = redirect_to {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_redirect:{}", session_nonce);
-        let _: Result<(), _> = redis::cmd("SET")
-            .arg(&key)
-            .arg(r.as_str())
+        // 3. oauth_redirect
+        if let Some(ref r) = redirect_to {
+            let redirect_key = format!("oauth_redirect:{}", session_nonce);
+            redis::cmd("SET")
+                .arg(&redirect_key)
+                .arg(r.as_str())
+                .arg("EX")
+                .arg(600)
+                .query_async::<_, ()>(&mut conn)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to persist oauth_redirect: {}", e)))?;
+        }
+
+        // 4. oauth_nonce
+        let nonce_key = format!("oauth_nonce:{}", session_nonce);
+        redis::cmd("SET")
+            .arg(&nonce_key)
+            .arg(nonce.as_str())
             .arg("EX")
-            .arg(600) // 10 minute TTL
-            .query_async(&mut conn)
-            .await;
+            .arg(600)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to persist oauth_nonce: {}", e)))?;
+    } else {
+        {
+            let mut conn = state.redis.clone();
+            let key = format!("oauth_client:{}", session_nonce);
+            if let Err(e) = redis::cmd("SET")
+                .arg(&key)
+                .arg(client_selector)
+                .arg("EX")
+                .arg(600)
+                .query_async::<_, ()>(&mut conn)
+                .await
+            {
+                // Don't fail login — callback will fall back to legacy inference.
+                tracing::warn!(
+                    "Failed to persist oauth_client selector to Redis: {}",
+                    e
+                );
+            }
+        }
+
+        // Store redirect_to in Redis so the callback can look it up.
+        if let Some(ref r) = redirect_to {
+            let mut conn = state.redis.clone();
+            let key = format!("oauth_redirect:{}", session_nonce);
+            let _: Result<(), _> = redis::cmd("SET")
+                .arg(&key)
+                .arg(r.as_str())
+                .arg("EX")
+                .arg(600) // 10 minute TTL
+                .query_async(&mut conn)
+                .await;
+        }
     }
 
     let options = AuthorizeOptions {
@@ -138,8 +227,23 @@ pub async fn oauth_callback(
 ) -> AppResult<(CookieJar, Response)> {
     tracing::info!("OAuth callback received");
 
-    // Check if this session has a stored redirect_to (catmos-web flow).
-    // Legacy sessions with JSON state won't have this key.
+    // FIX 4: Check if this session was admitted as an exchange flow
+    let stored_mode: Option<String> = {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_mode:{}", &callback.state);
+        redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .ok()
+    };
+    if stored_mode.is_some() {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_mode:{}", &callback.state);
+        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+    }
+
+    // Check if this session has a stored redirect_to
     let redirect_to: Option<String> = {
         let mut conn = state.redis.clone();
         let key = format!("oauth_redirect:{}", &callback.state);
@@ -156,6 +260,22 @@ pub async fn oauth_callback(
         let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
     }
 
+    // Check if this session has a stored browser_nonce (ADR-014 exchange flow)
+    let stored_nonce: Option<String> = {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_nonce:{}", &callback.state);
+        redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .ok()
+    };
+    // Clean up the nonce key (one-time use)
+    if stored_nonce.is_some() {
+        let mut conn = state.redis.clone();
+        let key = format!("oauth_nonce:{}", &callback.state);
+        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+    }
     // Deny/cancel path: the provider redirects back without a code
     // (RFC 6749 §4.1.2.1 — `error` + optional `error_description` instead).
     let Some(code) = callback.code else {
@@ -283,9 +403,51 @@ pub async fn oauth_callback(
         .max_age(time::Duration::days(30))
         .build();
 
-    // Redirect back to the app
-    let app_redirect = if let Some(ref r) = redirect_to {
-        // catmos-web: redirect_to was stored in Redis during login
+    // Mode selection (Contract Rule 1 & FIX 4):
+    // If the flow was admitted in exchange mode (stored_mode == "exchange"),
+    // it MUST complete in exchange mode or FAIL CLOSED (refusing downgrade).
+    let is_exchange_mode = stored_mode.as_deref() == Some("exchange");
+
+    let app_redirect = if is_exchange_mode {
+        let (Some(ref r), Some(ref nonce)) = (&redirect_to, &stored_nonce) else {
+            tracing::error!("Exchange flow state missing from Redis for state");
+            return Err(AppError::Internal(
+                "Exchange flow state missing; refusing downgrade to session-bearing redirect".into(),
+            ));
+        };
+
+        if !is_allowed_redirect(r) || !is_valid_base64url_43(nonce) {
+            tracing::error!("Exchange flow state invalid for state");
+            return Err(AppError::Internal(
+                "Exchange flow state invalid; refusing downgrade to session-bearing redirect".into(),
+            ));
+        }
+
+        let canonical_origin = canonicalize_origin(r)
+            .ok_or_else(|| AppError::Internal("Invalid redirect_to origin".into()))?;
+
+        let exchange_code = generate_exchange_code();
+        let exchange_key = compute_exchange_redis_key(&exchange_code, nonce, &canonical_origin);
+
+        // FIX 1 + FIX 2 (Amended): Seal session_id directly with AES-256-GCM (fail closed, no fallback).
+        let enc_key = state.session_encryption_key.as_ref().ok_or_else(|| {
+            AppError::Internal("Session encryption key required for exchange record".into())
+        })?;
+        let sealed_session_id = crate::services::redis_crypto::seal(enc_key, session_id.as_bytes())
+            .map_err(|e| AppError::Internal(format!("Failed to seal session_id: {}", e)))?;
+
+        let mut conn = state.redis.clone();
+        redis::cmd("SET")
+            .arg(&exchange_key)
+            .arg(&sealed_session_id)
+            .arg("EX")
+            .arg(60) // 60s TTL
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to store exchange key in Redis: {}", e)))?;
+        format!("{}?code={}", r, exchange_code)
+    } else if let Some(ref r) = redirect_to {
+        // catmos-web: redirect_to was stored in Redis during login (no browser_nonce)
         if is_allowed_redirect(r) {
             format!("{}?session_id={}", r, session_id)
         } else {
@@ -296,10 +458,9 @@ pub async fn oauth_callback(
             )
         }
     } else {
-        // Legacy: try parsing session_id as JSON state (for in-flight sessions)
+        // Legacy / iOS: no redirect_to stored in Redis
         build_app_redirect(&session_id, &session_id)
     };
-
     Ok((
         jar.add(cookie),
         Response::builder()
@@ -350,40 +511,57 @@ fn legacy_infer_catmos(redirect_to: &Option<String>, state_str: &str) -> bool {
                 .unwrap_or(false))
 }
 
+/// Allowed exact redirect URLs for OAuth callback (native app registered callback).
+const ALLOWED_EXACT_REDIRECT_URLS: &[&str] = &["https://catbird.blue/oauth/callback"];
+
 /// Allowed redirect origins for OAuth callback (beyond localhost).
 const ALLOWED_REDIRECT_ORIGINS: &[&str] =
     &["https://catmos.catbird.blue", "https://catmos.pages.dev"];
 
-/// Build the redirect URL after OAuth callback.
 /// Redirect-target allowlist shared by the success and deny/cancel paths:
-/// local dev loopback, known production origins, and catmos.pages.dev previews.
-fn is_allowed_redirect(r: &str) -> bool {
-    r.starts_with("http://127.0.0.1:")
-        || r.starts_with("http://[::1]:")
-        || ALLOWED_REDIRECT_ORIGINS
-            .iter()
-            .any(|origin| r.starts_with(origin))
-        || url::Url::parse(r)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.ends_with(".catmos.pages.dev")))
+/// local dev loopback, known production origins, catmos.pages.dev previews,
+/// and registered app callback URLs.
+pub fn is_allowed_redirect(r: &str) -> bool {
+    if ALLOWED_EXACT_REDIRECT_URLS.contains(&r) {
+        return true;
+    }
+
+    let Ok(u) = url::Url::parse(r) else {
+        return false;
+    };
+
+    // Allow loopback (dev)
+    if u.scheme() == "http"
+        && (u.host_str() == Some("127.0.0.1")
+            || u.host_str() == Some("[::1]")
+            || u.host_str() == Some("localhost"))
+    {
+        return true;
+    }
+
+    // Allow known production origins (exact origin match, preventing subdomain attacks)
+    let origin = u.origin().ascii_serialization();
+    if ALLOWED_REDIRECT_ORIGINS.contains(&origin.as_str()) {
+        return true;
+    }
+
+    // Allow Cloudflare Pages preview deployments
+    if u.scheme() == "https"
+        && u.host_str()
+            .map(|h| h.ends_with(".catmos.pages.dev"))
             .unwrap_or(false)
+    {
+        return true;
+    }
+
+    false
 }
 
-fn build_app_redirect(state_str: &str, session_id: &str) -> String {
+pub fn build_app_redirect(state_str: &str, session_id: &str) -> String {
     if state_str.starts_with('{') {
         if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
             if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
-                // Allow localhost redirects (dev)
-                if redirect_to.starts_with("http://127.0.0.1:")
-                    || redirect_to.starts_with("http://[::1]:")
-                {
-                    return format!("{}?session_id={}", redirect_to, session_id);
-                }
-                // Allow known production origins
-                if ALLOWED_REDIRECT_ORIGINS
-                    .iter()
-                    .any(|origin| redirect_to.starts_with(origin))
-                {
+                if is_allowed_redirect(redirect_to) {
                     return format!("{}?session_id={}", redirect_to, session_id);
                 }
                 tracing::warn!("Rejected redirect_to: {}", redirect_to);
@@ -442,6 +620,132 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
         handle: session.handle,
         created_at: session.created_at,
     })
+}
+
+/// Consume an exchange code and return the session ID (ADR-014 confidential gateway exchange)
+///
+/// POST /auth/exchange
+pub async fn exchange_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ExchangeRequest>,
+) -> AppResult<Json<ExchangeResponse>> {
+    // 1. Validate format of code and browser_nonce (both 43-char base64url)
+    if !is_valid_base64url_43(&payload.code) || !is_valid_base64url_43(&payload.browser_nonce) {
+        tracing::warn!("Exchange failed: invalid code or nonce format");
+        return Err(AppError::Unauthorized("Invalid exchange request".into()));
+    }
+
+    // 2. Validate and canonicalize Origin header
+    let origin_header = headers.get("origin").and_then(|v| v.to_str().ok());
+    let Some(raw_origin) = origin_header else {
+        tracing::warn!("Exchange failed: missing or invalid Origin header");
+        return Err(AppError::Unauthorized("Invalid exchange request".into()));
+    };
+    let Some(canonical_origin) = canonicalize_origin(raw_origin) else {
+        tracing::warn!("Exchange failed: unparseable Origin header");
+        return Err(AppError::Unauthorized("Invalid exchange request".into()));
+    };
+
+    // 3. FIX 1 + FIX 2: Compute composite key. Lookup IS validation.
+    let exchange_key = compute_exchange_redis_key(&payload.code, &payload.browser_nonce, &canonical_origin);
+
+    // 4. Atomically consume the key using GETDEL.
+    // If the nonce or origin was wrong, the computed key did not match, returning None (401),
+    // and the legitimate key in Redis is untouched and still redeemable.
+    let mut conn = state.redis.clone();
+    let raw_sealed = atomic_getdel(&mut conn, &exchange_key).await.map_err(|e| {
+        tracing::error!("Redis error during atomic GETDEL of exchange key: {}", e);
+        AppError::Internal("Database error during exchange".into())
+    })?;
+
+    let Some(sealed_b64) = raw_sealed else {
+        tracing::warn!("Exchange failed: key not found, expired, or already consumed");
+        return Err(AppError::Unauthorized("Invalid exchange request".into()));
+    };
+
+    // 5. Decrypt sealed value with AES-256-GCM. Any failure is 401 (no fallback).
+    let Some(enc_key) = state.session_encryption_key.as_ref() else {
+        tracing::error!("Exchange failed: session encryption key not configured");
+        return Err(AppError::Unauthorized("Invalid exchange request".into()));
+    };
+
+    let plaintext_bytes = crate::services::redis_crypto::open(enc_key, &sealed_b64).map_err(|e| {
+        tracing::warn!("Exchange failed: decryption failed: {}", e);
+        AppError::Unauthorized("Invalid exchange request".into())
+    })?;
+
+    let session_id = String::from_utf8(plaintext_bytes).map_err(|_| {
+        tracing::warn!("Exchange failed: decrypted session_id is not valid UTF-8");
+        AppError::Unauthorized("Invalid exchange request".into())
+    })?;
+
+    tracing::info!("Exchange code successfully redeemed");
+
+    Ok(Json(ExchangeResponse { session_id }))
+}
+/// Canonicalize an origin string (scheme + host + optional non-default port, lowercase, no trailing slash).
+pub fn canonicalize_origin(raw: &str) -> Option<String> {
+    let u = url::Url::parse(raw).ok()?;
+    let scheme = u.scheme().to_lowercase();
+    let host = u.host_str()?.to_lowercase();
+    let port_str = match (scheme.as_str(), u.port()) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => String::new(),
+        (_, Some(p)) => format!(":{}", p),
+    };
+    Some(format!("{}://{}{}", scheme, host, port_str))
+}
+
+/// Compute the composite Redis key for exchange code lookup:
+/// `exchange:<hex SHA-256( code || 0x00 || browser_nonce || 0x00 || canonical_origin )>`
+pub fn compute_exchange_redis_key(code: &str, browser_nonce: &str, canonical_origin: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(code.as_bytes());
+    hasher.update(&[0x00]);
+    hasher.update(browser_nonce.as_bytes());
+    hasher.update(&[0x00]);
+    hasher.update(canonical_origin.as_bytes());
+    let digest = hasher.finalize();
+    format!("exchange:{:x}", digest)
+}
+
+/// Validate 43-character unpadded base64url string ([A-Za-z0-9_-])
+pub fn is_valid_base64url_43(s: &str) -> bool {
+    s.len() == 43 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+
+/// Mint a 43-character unpadded base64url exchange code from 32 CSPRNG bytes
+pub fn generate_exchange_code() -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Atomically retrieve and delete a key from Redis using GETDEL (or Lua script fallback)
+async fn atomic_getdel(
+    conn: &mut redis::aio::ConnectionManager,
+    key: &str,
+) -> Result<Option<String>, redis::RedisError> {
+    match redis::cmd("GETDEL").arg(key).query_async::<_, Option<String>>(conn).await {
+        Ok(val) => Ok(val),
+        Err(err) if err.to_string().contains("unknown command") => {
+            let script = redis::Script::new(r#"
+                local val = redis.call('GET', KEYS[1])
+                if val then
+                    redis.call('DEL', KEYS[1])
+                end
+                return val
+            "#);
+            script.key(key).invoke_async(conn).await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Proxy XRPC requests to the user's PDS. MLS v2 uses the standard ATProto

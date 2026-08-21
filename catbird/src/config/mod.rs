@@ -408,6 +408,8 @@ pub struct AppState {
     /// a guaranteed `use_dpop_nonce` round trip. See
     /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
+    /// AES-256-GCM encryption key for Redis session records
+    pub session_encryption_key: Option<[u8; 32]>,
 }
 
 impl AppState {
@@ -435,6 +437,24 @@ impl AppState {
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
         let redis = redis::aio::ConnectionManager::new(redis_client).await?;
 
+        // Parse encryption key from env (base64-encoded 32-byte key)
+        let session_encryption_key = std::env::var("SESSION_ENCRYPTION_KEY")
+            .ok()
+            .and_then(|b64| {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .ok()?;
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                } else {
+                    tracing::warn!("SESSION_ENCRYPTION_KEY must be 32 bytes (44 base64 chars)");
+                    None
+                }
+            });
+
         let mut state = Self {
             config: Arc::new(config),
             http_client,
@@ -446,8 +466,8 @@ impl AppState {
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key,
         };
-
         // Initialize KeyStore first (needed by OAuth client)
         match crate::services::KeyStore::from_config(&state) {
             Ok(store) => {
@@ -530,29 +550,11 @@ impl AppState {
         use jacquard_oauth::scopes::Scope;
         use jacquard_oauth::session::ClientData;
 
-        // Parse encryption key from env (base64-encoded 32-byte key)
-        let encryption_key = std::env::var("SESSION_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|b64| {
-                use base64::Engine;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&b64)
-                    .ok()?;
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    Some(arr)
-                } else {
-                    tracing::warn!("SESSION_ENCRYPTION_KEY must be 32 bytes (44 base64 chars)");
-                    None
-                }
-            });
-
         let store = crate::services::RedisAuthStore::new(
             state.redis.clone(),
             state.config.redis.key_prefix.clone(),
             state.config.redis.session_ttl_seconds,
-            encryption_key,
+            state.session_encryption_key,
         );
 
         let keyset = key_store.to_jacquard_keyset()?;

@@ -9,7 +9,7 @@ mod dpop_nonce_cache;
 mod mls_auth;
 pub mod push;
 pub(crate) mod redis_auth_store;
-pub(crate) mod redis_crypto;
+pub mod redis_crypto;
 mod ssrf;
 
 pub use atproto_client::{AtProtoClient, ProxyResponse};
