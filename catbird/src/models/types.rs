@@ -72,3 +72,16 @@ pub struct LogoutResponse {
     pub success: bool,
     pub message: String,
 }
+
+/// Request body for POST /auth/exchange (ADR-014 confidential gateway exchange)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeRequest {
+    pub code: String,
+    pub browser_nonce: String,
+}
+
+/// Response body for POST /auth/exchange
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeResponse {
+    pub session_id: String,
+}
