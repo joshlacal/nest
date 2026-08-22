@@ -1,8 +1,18 @@
 //! MLS AppView Service Authentication Provider
 //!
-//! Obtains and caches PDS-issued service auth tokens for MLS AppView communication.
+//! Obtains PDS-issued service auth tokens for MLS AppView communication.
 //! Tokens are issued by the user's PDS via `com.atproto.server.getServiceAuth`
 //! with `aud = MLS_APPVIEW_SERVICE_REF` and `lxm = <lexicon>`, and returned verbatim.
+//!
+//! DELIBERATELY NOT CACHED. mls-ds enforces single-use replay protection: it
+//! records each token's `jti` in the Postgres `auth_jti_nonce` table and rejects
+//! any second presentation (`auth.rs:1163-1178`, applied at `:1253` via
+//! `enforce_standard_with_replay_store`). A cached token therefore yields HTTP
+//! 200 on its first use and 401 on every later one. Measured in production on
+//! 2026-08-22: a fresh token returned 200 with a 22KB conversation payload; the
+//! same token replayed returned `{"error":"NotAuthorized"}`, byte-identical to
+//! the response for a deliberately corrupted token. One `getServiceAuth` call
+//! per chat request is the correct cost, not an inefficiency to optimise away.
 
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
@@ -10,27 +20,9 @@ use crate::middleware::JacquardDpopData;
 use crate::models::CatbirdSession;
 use crate::services::{AtProtoClient, ProxyResponse};
 use chrono::Utc;
-use dashmap::DashMap;
-use std::sync::{Arc, LazyLock};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
-
-/// Safety margin in seconds subtracted from token exp to cover clock skew and network latency.
-pub const SAFETY_MARGIN_SECS: i64 = 10;
-
-#[derive(Clone, Debug)]
-struct CachedToken {
-    token: String,
-    exp: i64,
-}
-
-// Global cache and per-key locks shared across all ServiceAuthProvider instances.
-// ponytail: per-key mutex, single global map. If chat traffic ever makes this
-// map hot, shard it — but a token per (account, endpoint) with a <60s life is
-// a small working set.
-static CACHE: LazyLock<DashMap<(String, String), CachedToken>> = LazyLock::new(DashMap::new);
-static LOCKS: LazyLock<DashMap<(String, String), Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
 
 pub struct ServiceAuthProvider {
     state: Arc<AppState>,
@@ -41,58 +33,17 @@ impl ServiceAuthProvider {
         Self { state }
     }
 
-    /// Clear all cached service auth tokens and in-flight locks.
-    pub fn clear_cache() {
-        CACHE.clear();
-        LOCKS.clear();
-    }
 
     /// PDS-issued service-auth JWT: `iss` is the user's own bare DID, `aud` is
     /// MLS_APPVIEW_SERVICE_REF, `lxm` is exactly `lexicon`. Returned verbatim —
-    /// never re-signed or re-wrapped. Cached per `(did, lexicon)` against the
-    /// token's own `exp` minus a safety margin.
+    /// never re-signed or re-wrapped. Minted fresh on every call because the
+    /// token is single-use; see the module comment.
     pub async fn token_for(
         &self,
         session: &CatbirdSession,
         lexicon: &str,
     ) -> AppResult<String> {
-        let key = (session.did.clone(), lexicon.to_string());
-        let now = Utc::now().timestamp();
-
-        // 1. Fast path: check cache with safety margin
-        if let Some(entry) = CACHE.get(&key) {
-            if now + SAFETY_MARGIN_SECS < entry.exp {
-                return Ok(entry.token.clone());
-            }
-        }
-
-        // 2. Slow path: acquire per-key mutex to prevent concurrent miss stampede
-        let lock = LOCKS
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
-
-        // Re-check cache under the lock
-        let now = Utc::now().timestamp();
-        if let Some(entry) = CACHE.get(&key) {
-            if now + SAFETY_MARGIN_SECS < entry.exp {
-                return Ok(entry.token.clone());
-            }
-        }
-
-        // 3. Request fresh token from user's PDS
-        let token = self.fetch_service_auth_from_pds(session, lexicon).await?;
-
-        // 4. Derive TTL by decoding token's own exp claim
-        let exp = extract_jwt_exp(&token).unwrap_or_else(|| now + 60);
-
-        CACHE.insert(key, CachedToken {
-            token: token.clone(),
-            exp,
-        });
-
-        Ok(token)
+        self.fetch_service_auth_from_pds(session, lexicon).await
     }
 
     async fn fetch_service_auth_from_pds(
@@ -181,20 +132,6 @@ impl ServiceAuthProvider {
     }
 }
 
-/// Extract the `exp` claim from an unverified JWT payload
-fn extract_jwt_exp(token: &str) -> Option<i64> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-    claims.get("exp").and_then(|v| v.as_i64())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,7 +158,6 @@ mod tests {
 
     struct MockPds {
         server: MockServer,
-        lifetime_secs: Arc<AtomicI64>,
     }
 
     impl MockPds {
@@ -274,17 +210,11 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            Self {
-                server,
-                lifetime_secs,
-            }
+            Self { server }
         }
 
         fn uri(&self) -> String {
             self.server.uri().replace("127.0.0.1", "localhost")
-        }
-        fn set_token_lifetime_secs(&self, secs: i64) {
-            self.lifetime_secs.store(secs, Ordering::SeqCst);
         }
 
         async fn call_count(&self) -> usize {
@@ -337,9 +267,19 @@ mod tests {
         }
     }
 
+    /// Read the `jti` from an unverified JWT payload. mls-ds keys its replay
+    /// protection on this claim, so distinctness per call is the invariant.
+    fn jti_of(token: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let payload = token.split('.').nth(1).expect("jwt payload segment");
+        let bytes = URL_SAFE_NO_PAD.decode(payload).expect("payload decodes");
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).expect("payload is json");
+        claims["jti"].as_str().expect("jti claim present").to_string()
+    }
+
     #[tokio::test]
     async fn requests_a_pds_token_audienced_to_the_mls_appview_and_bound_to_one_nsid() {
-        ServiceAuthProvider::clear_cache();
         let pds = MockPds::new().await;
         let provider = ServiceAuthProvider::new(test_state().await);
         let session = test_session("did:plc:alice-req", &pds.uri());
@@ -366,12 +306,17 @@ mod tests {
         );
     }
 
+    /// Regression test for the production defect found 2026-08-22. Tokens were
+    /// cached per `(did, lexicon)` for ~50s, but mls-ds records every `jti` in
+    /// the Postgres `auth_jti_nonce` table and rejects any second presentation
+    /// (`auth.rs:1163-1178`, applied at `:1253`). The first poll returned 200 and
+    /// every poll inside the cache window returned 401. A service-auth token is
+    /// single-use: each call MUST mint a fresh one.
     #[tokio::test]
-    async fn reuses_a_live_token_for_the_same_did_and_nsid() {
-        ServiceAuthProvider::clear_cache();
+    async fn mints_a_distinct_single_use_token_on_every_call() {
         let pds = MockPds::new().await;
         let provider = ServiceAuthProvider::new(test_state().await);
-        let session = test_session("did:plc:alice-reuse", &pds.uri());
+        let session = test_session("did:plc:alice-single-use", &pds.uri());
 
         let first = provider
             .token_for(&session, "blue.catbird.chat.getConversations")
@@ -382,13 +327,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(first, second);
-        assert_eq!(pds.call_count().await, 1, "a live cached token must not re-hit the PDS");
+        assert_ne!(
+            first, second,
+            "a replayed token is rejected by mls-ds; every call must mint a fresh token"
+        );
+        assert_ne!(
+            jti_of(&first),
+            jti_of(&second),
+            "distinct jti is exactly what mls-ds replay protection keys on"
+        );
+        assert_eq!(
+            pds.call_count().await,
+            2,
+            "one getServiceAuth call per chat request is the correct, required cost"
+        );
     }
 
     #[tokio::test]
     async fn does_not_share_a_token_across_nsids_or_accounts() {
-        ServiceAuthProvider::clear_cache();
         let pds = MockPds::new().await;
         let provider = ServiceAuthProvider::new(test_state().await);
         let alice = test_session("did:plc:alice-share", &pds.uri());
@@ -410,30 +366,5 @@ mod tests {
         // lxm is single-endpoint by mls-ds contract and tokens are per-account:
         // three distinct cache keys, three distinct PDS calls.
         assert_eq!(pds.call_count().await, 3);
-    }
-
-    #[tokio::test]
-    async fn refreshes_before_expiry_rather_than_serving_a_dead_token() {
-        ServiceAuthProvider::clear_cache();
-        let pds = MockPds::new().await;
-        // Mint a token that is already inside the safety margin.
-        pds.set_token_lifetime_secs(5);
-        let provider = ServiceAuthProvider::new(test_state().await);
-        let session = test_session("did:plc:alice-refresh", &pds.uri());
-
-        provider
-            .token_for(&session, "blue.catbird.chat.getConversations")
-            .await
-            .unwrap();
-        provider
-            .token_for(&session, "blue.catbird.chat.getConversations")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            pds.call_count().await,
-            2,
-            "a token inside the refresh margin must be re-minted, not served"
-        );
     }
 }
