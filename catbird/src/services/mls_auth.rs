@@ -1,11 +1,11 @@
 //! MLS and Clean-Chat Service Authentication
 //!
-//! Generates service auth tokens and DPoP proofs for Gateway → Delivery Service communication.
+//! Handles service auth tokens for Gateway → Delivery Service communication.
 //! Supports both:
-//! - Clean-chat (`blue.catbird.chat.*`, all 32 endpoints): sender-constrained DPoP ES256 access tokens
-//!   and DPoP proofs according to CHAT_PROTOCOL §3 and 03-NEST-CHAT-TOKEN-BRIEF.md.
-//! - Clean Chat MLS (`blue.catbird.chat.*`): DPoP token authentication and direct Delivery Service routing.
-
+//! - Clean-chat (`blue.catbird.chat.*`, all 32 endpoints): PDS-issued user service auth tokens (Bearer)
+//!   and direct Delivery Service routing.
+//! - Legacy MLS (`blue.catbird.mlsChat.*`): Gateway-issued ES256 service tokens (Bearer)
+//!   and direct Delivery Service routing.
 use super::atproto_client::MAX_RESPONSE_SIZE;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
@@ -61,59 +61,6 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.subscribeEvents",
     "blue.catbird.chat.uploadBlob",
 ];
-
-/// Exact token header for clean-chat JWTs (deny_unknown_fields)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CleanChatTokenHeader {
-    pub alg: String,
-    pub typ: String,
-    pub kid: String,
-}
-
-/// Confirmation claim holding the RFC 7638 JKT thumbprint of the client DPoP public key (deny_unknown_fields)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CleanChatConfirmation {
-    pub jkt: String,
-}
-
-/// Exact claims for ordinary clean-chat access tokens (deny_unknown_fields)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CleanChatClaims {
-    pub iss: String,
-    pub sub: String,
-    pub aud: String,
-    pub lxm: String,
-    pub iat: i64,
-    pub exp: i64,
-    pub jti: String,
-    pub cnf: CleanChatConfirmation,
-    pub device_id: String,
-    pub chat_instance: String,
-}
-
-/// Exact claims for enrollment grant clean-chat tokens (deny_unknown_fields)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CleanChatEnrollmentClaims {
-    pub iss: String,
-    pub sub: String,
-    pub aud: String,
-    pub lxm: String,
-    pub iat: i64,
-    pub exp: i64,
-    pub jti: String,
-    pub cnf: CleanChatConfirmation,
-    pub device_id: String,
-    pub chat_instance: String,
-    pub key_id: String,
-    pub signing_key_sha256: String,
-    pub enrollment_transcript_sha256: String,
-    pub auth_time: i64,
-    pub auth_txn: String,
-}
 
 /// Public EC P-256 JWK embedded in DPoP proof headers (deny_unknown_fields)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,21 +409,6 @@ impl MlsAuthService {
         }
     }
 
-    pub fn chat_signing_key(&self) -> AppResult<SigningKey> {
-        if let Some(ref b64) = self.state.config.chat.signing_key_base64 {
-            return parse_p256_signing_key(b64);
-        }
-        if let Ok(b64) = std::env::var("CHAT_NEST_SIGNING_KEY") {
-            return parse_p256_signing_key(&b64);
-        }
-        let key_store = self
-            .state
-            .key_store
-            .as_ref()
-            .ok_or_else(|| AppError::Config("KeyStore or CHAT_NEST_SIGNING_KEY not configured".into()))?;
-        let active_key = key_store.active_key();
-        Ok(SigningKey::from(&active_key.secret_key))
-    }
 
     /// Generate legacy v1 service auth token for MLS requests (Bearer auth)
     pub fn generate_service_token(
@@ -545,185 +477,6 @@ impl MlsAuthService {
         let encoded_signature = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         Ok(format!("{}.{}", signing_input, encoded_signature))
-    }
-
-    /// Mint an ordinary clean-chat access token (ES256 P-256, deny_unknown_fields exact claims)
-    pub fn mint_clean_chat_token(
-        &self,
-        session: &CatbirdSession,
-        lexicon: &str,
-        device_id: &str,
-        dpop_jkt: &str,
-    ) -> AppResult<String> {
-        let now = Utc::now().timestamp();
-        let exp = now + self.state.config.chat.token_ttl_seconds;
-        let jti = Uuid::new_v4().hyphenated().to_string();
-
-        self.mint_clean_chat_token_with_params(
-            &session.did,
-            lexicon,
-            device_id,
-            dpop_jkt,
-            now,
-            exp,
-            &jti,
-        )
-    }
-
-    /// Mint an ordinary clean-chat access token with explicit timestamp and JTI parameters
-    pub fn mint_clean_chat_token_with_params(
-        &self,
-        user_did: &str,
-        lexicon: &str,
-        device_id: &str,
-        dpop_jkt: &str,
-        iat: i64,
-        exp: i64,
-        jti: &str,
-    ) -> AppResult<String> {
-        let kid = self.chat_key_id();
-        let signing_key = self.chat_signing_key()?;
-
-        let header = CleanChatTokenHeader {
-            alg: "ES256".to_string(),
-            typ: "JWT".to_string(),
-            kid,
-        };
-
-        let claims = CleanChatClaims {
-            iss: self.chat_issuer().to_string(),
-            sub: user_did.to_string(),
-            aud: self.chat_audience().to_string(),
-            lxm: lexicon.to_string(),
-            iat,
-            exp,
-            jti: jti.to_string(),
-            cnf: CleanChatConfirmation {
-                jkt: dpop_jkt.to_string(),
-            },
-            device_id: device_id.to_string(),
-            chat_instance: self.chat_instance_id().to_string(),
-        };
-
-        let encoded_header = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
-        let encoded_payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
-
-        let signing_input = format!("{}.{}", encoded_header, encoded_payload);
-        let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        let encoded_signature = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-        Ok(format!("{}.{}", signing_input, encoded_signature))
-    }
-
-    /// Mint an enrollment grant clean-chat token (for blue.catbird.chat.enrollDevice)
-    pub fn mint_clean_chat_enrollment_grant(
-        &self,
-        session: &CatbirdSession,
-        device_id: &str,
-        dpop_jkt: &str,
-        key_id: &str,
-        signing_key_sha256: &str,
-        enrollment_transcript_sha256: &str,
-        auth_time: i64,
-        auth_txn: &str,
-    ) -> AppResult<String> {
-        let now = Utc::now().timestamp();
-        let jti = Uuid::new_v4().hyphenated().to_string();
-
-        self.mint_clean_chat_enrollment_grant_with_params(
-            &session.did,
-            device_id,
-            dpop_jkt,
-            key_id,
-            signing_key_sha256,
-            enrollment_transcript_sha256,
-            auth_time,
-            auth_txn,
-            now,
-            &jti,
-        )
-    }
-
-    /// Mint an enrollment grant clean-chat token with explicit timestamp and JTI parameters
-    pub fn mint_clean_chat_enrollment_grant_with_params(
-        &self,
-        user_did: &str,
-        device_id: &str,
-        dpop_jkt: &str,
-        key_id: &str,
-        signing_key_sha256: &str,
-        enrollment_transcript_sha256: &str,
-        auth_time: i64,
-        auth_txn: &str,
-        iat: i64,
-        jti: &str,
-    ) -> AppResult<String> {
-        let kid = self.chat_key_id();
-        let signing_key = self.chat_signing_key()?;
-
-        // Enrollment exp is exactly min(iat + 120, auth_time + 300)
-        let exp = std::cmp::min(
-            iat.checked_add(120).ok_or_else(|| AppError::Internal("iat overflow".into()))?,
-            auth_time.checked_add(300).ok_or_else(|| AppError::Internal("auth_time overflow".into()))?,
-        );
-
-        let header = CleanChatTokenHeader {
-            alg: "ES256".to_string(),
-            typ: "JWT".to_string(),
-            kid,
-        };
-
-        let claims = CleanChatEnrollmentClaims {
-            iss: self.chat_issuer().to_string(),
-            sub: user_did.to_string(),
-            aud: self.chat_audience().to_string(),
-            lxm: "blue.catbird.chat.enrollDevice".to_string(),
-            iat,
-            exp,
-            jti: jti.to_string(),
-            cnf: CleanChatConfirmation {
-                jkt: dpop_jkt.to_string(),
-            },
-            device_id: device_id.to_string(),
-            chat_instance: self.chat_instance_id().to_string(),
-            key_id: key_id.to_string(),
-            signing_key_sha256: signing_key_sha256.to_string(),
-            enrollment_transcript_sha256: enrollment_transcript_sha256.to_string(),
-            auth_time,
-            auth_txn: auth_txn.to_string(),
-        };
-
-        let encoded_header = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
-        let encoded_payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?,
-        );
-
-        let signing_input = format!("{}.{}", encoded_header, encoded_payload);
-        let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        let encoded_signature = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-        Ok(format!("{}.{}", signing_input, encoded_signature))
-    }
-
-    /// Mint a rebind clean-chat token (for blue.catbird.chat.rebindDeviceAuthentication)
-    pub fn mint_clean_chat_rebind_token(
-        &self,
-        session: &CatbirdSession,
-        device_id: &str,
-        new_dpop_jkt: &str,
-    ) -> AppResult<String> {
-        self.mint_clean_chat_token(
-            session,
-            "blue.catbird.chat.rebindDeviceAuthentication",
-            device_id,
-            new_dpop_jkt,
-        )
     }
 
     /// Make an authenticated request to the MLS/Chat delivery service
@@ -846,7 +599,7 @@ impl MlsAuthService {
         Ok((status, headers, body))
     }
 
-    /// Make a sender-constrained clean-chat authenticated request (Authorization: DPoP + DPoP header)
+    /// Make a clean-chat authenticated request (Authorization: Bearer <token>)
     #[allow(clippy::too_many_arguments)]
     pub async fn proxy_clean_chat_request(
         &self,
@@ -857,7 +610,7 @@ impl MlsAuthService {
         body: Option<bytes::Bytes>,
         content_type: Option<&str>,
         device_id_override: Option<&str>,
-        dpop_key_override: Option<&SigningKey>,
+        _dpop_key_override: Option<&SigningKey>,
     ) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
         let service_url = self
             .service_url()
@@ -906,97 +659,16 @@ impl MlsAuthService {
             Uuid::new_v4().hyphenated().to_string()
         };
 
-        // Determine session DPoP key
-        let ephemeral_key;
-        let dpop_key = match dpop_key_override {
-            Some(k) => k,
-            None => {
-                ephemeral_key = SigningKey::random(&mut rand::thread_rng());
-                &ephemeral_key
-            }
-        };
-
-        let dpop_jkt = p256_jwk_thumbprint(dpop_key);
-
-        // Mint clean-chat access token
-        let token = if lexicon == "blue.catbird.chat.enrollDevice" {
-            let enrollment_info = body.as_ref().and_then(|b| {
-                serde_json::from_slice::<serde_json::Value>(b).ok().and_then(|v| {
-                    let inner = v
-                        .get("signedRequest")
-                        .and_then(|sr| sr.get("body"))
-                        .unwrap_or_else(|| v.get("body").unwrap_or(&v));
-                    let key_id = inner.get("keyId").and_then(|k| k.as_str())?;
-                    let signing_key_sha256 = inner
-                        .get("signingKeySha256")
-                        .or_else(|| inner.get("signingKey"))
-                        .and_then(|k| k.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            inner
-                                .get("signaturePublicKey")
-                                .and_then(|pk| pk.as_str())
-                                .and_then(|pk_str| {
-                                    let bytes = STANDARD.decode(pk_str).ok()?;
-                                    Some(URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes)))
-                                })
-                        })?;
-                    let transcript = inner
-                        .get("enrollmentTranscriptSha256")
-                        .or_else(|| inner.get("enrollmentTranscript"))
-                        .and_then(|k| k.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| signing_key_sha256.clone());
-                    Some((key_id.to_string(), signing_key_sha256, transcript))
-                })
-            });
-
-            let now = Utc::now().timestamp();
-            let auth_txn = Uuid::new_v4().hyphenated().to_string();
-
-            if let Some((kid, sk_sha, transcript_sha)) = enrollment_info {
-                self.mint_clean_chat_enrollment_grant(
-                    session,
-                    &device_id,
-                    &dpop_jkt,
-                    &kid,
-                    &sk_sha,
-                    &transcript_sha,
-                    now,
-                    &auth_txn,
-                )?
-            } else {
-                let placeholder_digest = URL_SAFE_NO_PAD.encode([0u8; 32]);
-                let placeholder_key_id = URL_SAFE_NO_PAD.encode([0u8; 32]);
-                self.mint_clean_chat_enrollment_grant(
-                    session,
-                    &device_id,
-                    &dpop_jkt,
-                    &placeholder_key_id,
-                    &placeholder_digest,
-                    &placeholder_digest,
-                    now,
-                    &auth_txn,
-                )?
-            }
-        } else if lexicon == "blue.catbird.chat.rebindDeviceAuthentication" {
-            self.mint_clean_chat_rebind_token(session, &device_id, &dpop_jkt)?
-        } else {
-            self.mint_clean_chat_token(session, lexicon, &device_id, &dpop_jkt)?
-        };
-
-        // Generate DPoP proof
-        let external_base = self.chat_external_base().trim_end_matches('/');
-        let htu = format!("{}/xrpc/{}", external_base, lexicon);
-        let now = Utc::now().timestamp();
-        let dpop_proof = generate_dpop_proof(dpop_key, method.as_str(), &htu, &token, now)?;
+        // Obtain PDS-issued user service auth token
+        let token = super::service_auth::ServiceAuthProvider::new(self.state.clone())
+            .token_for(session, lexicon)
+            .await?;
 
         let mut request = self
             .state
             .http_client
             .request(method, &url)
-            .header("Authorization", format!("DPoP {}", token))
-            .header("DPoP", dpop_proof)
+            .header("Authorization", format!("Bearer {}", token))
             .header("x-catbird-chat-device-id", &device_id);
 
         if let Some(ct) = content_type {
@@ -1108,154 +780,6 @@ mod tests {
         // Base64url without padding SHA-256 is exactly 43 characters
         assert_eq!(jkt.len(), 43);
         assert_eq!(p256_jwk_thumbprint(&signing_key), jkt);
-    }
-
-    #[test]
-    fn test_clean_chat_token_minting_and_exact_claims() {
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
-        let verifying_key = signing_key.verifying_key();
-        let dpop_key = SigningKey::random(&mut rand::thread_rng());
-        let dpop_jkt = p256_jwk_thumbprint(&dpop_key);
-
-        let user_did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let device_id = "3b241101-e2bb-4255-8caf-4136c566a962";
-        let chat_instance = "e9a27f41-d4a6-4507-8687-b921733ec41a";
-        let kid = "catbird-chat-key-1";
-        let now = 1700000000;
-        let exp = now + 120;
-        let jti = "8cb4f5d2-0d31-4b6f-a9c2-7e18f5403d61";
-        let lexicon = "blue.catbird.chat.getEntries";
-
-        let header = CleanChatTokenHeader {
-            alg: "ES256".to_string(),
-            typ: "JWT".to_string(),
-            kid: kid.to_string(),
-        };
-
-        let claims = CleanChatClaims {
-            iss: "https://api.catbird.blue".to_string(),
-            sub: user_did.to_string(),
-            aud: "did:web:mlschat.catbird.blue".to_string(),
-            lxm: lexicon.to_string(),
-            iat: now,
-            exp,
-            jti: jti.to_string(),
-            cnf: CleanChatConfirmation {
-                jkt: dpop_jkt.clone(),
-            },
-            device_id: device_id.to_string(),
-            chat_instance: chat_instance.to_string(),
-        };
-
-        let encoded_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
-        let encoded_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signing_input = format!("{}.{}", encoded_header, encoded_payload);
-        let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        let token = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature.to_bytes()));
-
-        // Verify token structure
-        let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3);
-
-        // Verify header
-        let decoded_header: CleanChatTokenHeader =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
-        assert_eq!(decoded_header.alg, "ES256");
-        assert_eq!(decoded_header.typ, "JWT");
-        assert_eq!(decoded_header.kid, kid);
-
-        // Verify claims with deny_unknown_fields
-        let decoded_claims: CleanChatClaims =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
-        assert_eq!(decoded_claims.iss, "https://api.catbird.blue");
-        assert_eq!(decoded_claims.sub, user_did);
-        assert_eq!(decoded_claims.aud, "did:web:mlschat.catbird.blue");
-        assert_eq!(decoded_claims.lxm, lexicon);
-        assert_eq!(decoded_claims.iat, now);
-        assert_eq!(decoded_claims.exp, exp);
-        assert_eq!(decoded_claims.exp - decoded_claims.iat, 120);
-        assert_eq!(decoded_claims.jti, jti);
-        assert_eq!(decoded_claims.cnf.jkt, dpop_jkt);
-        assert_eq!(decoded_claims.device_id, device_id);
-        assert_eq!(decoded_claims.chat_instance, chat_instance);
-
-        // Verify signature
-        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
-        let sig = Signature::from_slice(&sig_bytes).unwrap();
-        assert!(verifying_key.verify(signing_input.as_bytes(), &sig).is_ok());
-    }
-
-    #[test]
-    fn test_enrollment_grant_minting_and_expiry_formula() {
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
-        let verifying_key = signing_key.verifying_key();
-        let dpop_key = SigningKey::random(&mut rand::thread_rng());
-        let dpop_jkt = p256_jwk_thumbprint(&dpop_key);
-
-        let user_did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let device_id = "3b241101-e2bb-4255-8caf-4136c566a962";
-        let key_id = "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk";
-        let signing_key_sha256 = URL_SAFE_NO_PAD.encode([1u8; 32]);
-        let transcript_sha256 = URL_SAFE_NO_PAD.encode([2u8; 32]);
-        let auth_time = 1700000000;
-        let auth_txn = "36e5e67b-98d1-4c47-96d5-44c09bc2b921";
-        let jti = "8cb4f5d2-0d31-4b6f-a9c2-7e18f5403d61";
-
-        // Test branch 1: iat + 120 < auth_time + 300
-        let iat = auth_time + 50; // iat + 120 = 1700000170, auth_time + 300 = 1700000300
-        let expected_exp = iat + 120;
-
-        let claims = CleanChatEnrollmentClaims {
-            iss: "https://api.catbird.blue".to_string(),
-            sub: user_did.to_string(),
-            aud: "did:web:mlschat.catbird.blue".to_string(),
-            lxm: "blue.catbird.chat.enrollDevice".to_string(),
-            iat,
-            exp: expected_exp,
-            jti: jti.to_string(),
-            cnf: CleanChatConfirmation {
-                jkt: dpop_jkt.clone(),
-            },
-            device_id: device_id.to_string(),
-            chat_instance: "e9a27f41-d4a6-4507-8687-b921733ec41a".to_string(),
-            key_id: key_id.to_string(),
-            signing_key_sha256: signing_key_sha256.clone(),
-            enrollment_transcript_sha256: transcript_sha256.clone(),
-            auth_time,
-            auth_txn: auth_txn.to_string(),
-        };
-
-        let header = CleanChatTokenHeader {
-            alg: "ES256".to_string(),
-            typ: "JWT".to_string(),
-            kid: "catbird-chat-key-1".to_string(),
-        };
-
-        let encoded_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
-        let encoded_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signing_input = format!("{}.{}", encoded_header, encoded_payload);
-        let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        let token = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature.to_bytes()));
-
-        // Decode and verify
-        let parts: Vec<&str> = token.split('.').collect();
-        let decoded: CleanChatEnrollmentClaims =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
-        assert_eq!(decoded.lxm, "blue.catbird.chat.enrollDevice");
-        assert_eq!(decoded.key_id, key_id);
-        assert_eq!(decoded.signing_key_sha256, signing_key_sha256);
-        assert_eq!(decoded.enrollment_transcript_sha256, transcript_sha256);
-        assert_eq!(decoded.auth_time, auth_time);
-        assert_eq!(decoded.auth_txn, auth_txn);
-        assert_eq!(decoded.exp, expected_exp);
-
-        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
-        assert!(verifying_key.verify(signing_input.as_bytes(), &sig).is_ok());
-
-        // Test branch 2: auth_time + 300 < iat + 120
-        let late_iat = auth_time + 250; // late_iat + 120 = 1700000370, auth_time + 300 = 1700000300
-        let capped_exp = auth_time + 300;
-        assert_eq!(std::cmp::min(late_iat + 120, auth_time + 300), capped_exp);
     }
 
     #[test]
