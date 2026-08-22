@@ -718,6 +718,8 @@ impl MlsAuthService {
 
         let body = bytes::Bytes::from(body_vec);
 
+        probe_bytes_encoding(lexicon, status, &body);
+
         tracing::debug!(
             lexicon = %lexicon,
             status = %status,
@@ -726,6 +728,93 @@ impl MlsAuthService {
         );
 
         Ok((status, headers, body))
+    }
+}
+
+/// TEMPORARY diagnostic (2026-08-22). The iOS client cannot decode
+/// `coordinates.groupId`: the lexicon declares it as `bytes`, whose JSON contract
+/// is `{"$bytes": "<base64>"}`, but some mls-ds producers hand-roll `json!` and
+/// emit a bare base64 string. Device views are correct, so the fault is
+/// path-specific and we need production traffic to say which response shape is
+/// wrong.
+///
+/// Reports only the JSON *type* of each byte-typed field plus a collapsed path.
+/// Never logs a value, so no conversation metadata, key material, or token can
+/// leak through it. Remove once the offending producer is fixed.
+fn probe_bytes_encoding(lexicon: &str, status: u16, body: &[u8]) {
+    /// Fields the chat lexicon declares as `bytes`.
+    const BYTE_FIELDS: [&str; 3] = ["groupId", "groupContextHash", "confirmationTag"];
+    /// Bound the work: a probe must never become the reason a request is slow.
+    const MAX_PROBE_BYTES: usize = 512 * 1024;
+
+    if status != 200
+        || !lexicon.starts_with("blue.catbird.chat.")
+        || body.is_empty()
+        || body.len() > MAX_PROBE_BYTES
+    {
+        return;
+    }
+
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+
+    fn walk(
+        value: &serde_json::Value,
+        path: &mut Vec<String>,
+        out: &mut std::collections::BTreeMap<String, &'static str>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if BYTE_FIELDS.contains(&key.as_str()) {
+                        let kind = match child {
+                            serde_json::Value::String(_) => "BARE-STRING",
+                            serde_json::Value::Object(o) if o.contains_key("$bytes") => "$bytes",
+                            serde_json::Value::Object(_) => "object-without-$bytes",
+                            serde_json::Value::Null => "null",
+                            _ => "other",
+                        };
+                        let mut full = path.join(".");
+                        if !full.is_empty() {
+                            full.push('.');
+                        }
+                        full.push_str(key);
+                        out.insert(full, kind);
+                    }
+                    path.push(key.clone());
+                    walk(child, path, out);
+                    path.pop();
+                }
+            }
+            // Only the first element: the encoding is uniform per producer, and
+            // this keeps the probe O(depth) rather than O(page size).
+            serde_json::Value::Array(items) => {
+                if let Some(first) = items.first() {
+                    path.push("[]".to_owned());
+                    walk(first, path, out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut findings = std::collections::BTreeMap::new();
+    walk(&value, &mut Vec::new(), &mut findings);
+
+    if findings.values().any(|kind| *kind == "BARE-STRING") {
+        tracing::warn!(
+            lexicon = %lexicon,
+            findings = ?findings,
+            "BYTES-PROBE: byte-typed field emitted as a bare string"
+        );
+    } else if !findings.is_empty() {
+        tracing::info!(
+            lexicon = %lexicon,
+            findings = ?findings,
+            "BYTES-PROBE: byte-typed fields encoded correctly"
+        );
     }
 }
 
