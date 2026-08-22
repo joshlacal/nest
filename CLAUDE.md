@@ -49,7 +49,7 @@ Catbird iOS --[Session Cookie]--> Nest Gateway --[DPoP + Access Token]--> User P
 
 ### MLS proxy path (nest is NOT MLS-free)
 
-MLS implementation and storage live in **mls-ds**, but nest retains an **active MLS proxy**. MLS lexicons (`blue.catbird.mlsChat.*`) are intercepted in `handlers/atproto.rs` and routed through `MlsAuthService` (`services/mls_auth.rs`) to local mls-ds at `http://127.0.0.1:3001`, with a minted service-auth JWT (`aud=did:web:mlschat.catbird.blue`, `gateway_did=did:web:api.catbird.blue`). Do not assume "MLS moved to mls-ds" means nest no longer touches MLS — it is on the hot request path.
+MLS implementation and storage live in **mls-ds**, but nest retains an **active MLS proxy**. MLS lexicons (`blue.catbird.mlsChat.*`) are intercepted in `handlers/atproto.rs` and routed through `MlsAuthService` (`services/mls_auth.rs`) to local mls-ds at `http://127.0.0.1:3001`, with a minted service-auth JWT (`aud=did:web:chat.catbird.blue`, `gateway_did=did:web:api.catbird.blue`). Do not assume "MLS moved to mls-ds" means nest no longer touches MLS — it is on the hot request path.
 
 ### Push notifications (nest owns ALL push — social + chat)
 
