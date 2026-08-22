@@ -10,6 +10,7 @@ mod mls_auth;
 pub mod push;
 pub(crate) mod redis_auth_store;
 pub mod redis_crypto;
+pub mod service_auth;
 mod ssrf;
 
 pub use atproto_client::{AtProtoClient, ProxyResponse};
@@ -18,10 +19,10 @@ pub use dpop_nonce_cache::DpopNonceCache;
 pub use mls_auth::{
     calculate_ath, calculate_rfc7638_jkt, generate_dpop_proof, p256_jwk_thumbprint,
     p256_verifying_key_thumbprint, parse_p256_signing_key, public_p256_jwk_from_signing_key,
-    public_p256_jwk_from_verifying_key, verify_dpop_proof, CleanChatClaims, CleanChatConfirmation,
-    CleanChatEnrollmentClaims, CleanChatTokenHeader, DpopProofClaims, DpopProofHeader,
+    public_p256_jwk_from_verifying_key, verify_dpop_proof, DpopProofClaims, DpopProofHeader,
     MlsAuthService, PublicP256Jwk, CHAT_ENDPOINTS,
 };
 pub use push::PushServices;
 pub use redis_auth_store::RedisAuthStore;
+pub use service_auth::{ServiceAuthProvider, MLS_APPVIEW_SERVICE_REF};
 

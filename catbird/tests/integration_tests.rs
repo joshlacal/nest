@@ -63,71 +63,32 @@ mod tests {
         assert!(expected_length >= 43 && expected_length <= 128);
     }
 
-    /// Test clean-chat token minting and DPoP proof generation & verification
+    /// Test clean-chat DPoP proof generation & verification and endpoints
     #[tokio::test]
     async fn test_clean_chat_token_and_dpop_proof_flow() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
         use catbird::services::{
             calculate_ath, generate_dpop_proof, p256_jwk_thumbprint, verify_dpop_proof,
-            CleanChatClaims, CleanChatConfirmation, CleanChatEnrollmentClaims,
-            CleanChatTokenHeader, CHAT_ENDPOINTS,
+            CHAT_ENDPOINTS,
         };
-        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-        use sha2::{Digest, Sha256};
-        use uuid::Uuid;
+        use p256::ecdsa::SigningKey;
 
-        let nest_signing_key = SigningKey::random(&mut rand::thread_rng());
         let dpop_signing_key = SigningKey::random(&mut rand::thread_rng());
         let dpop_jkt = p256_jwk_thumbprint(&dpop_signing_key);
 
-        let user_did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let device_id = Uuid::new_v4().hyphenated().to_string();
-        let chat_instance = "e9a27f41-d4a6-4507-8687-b921733ec41a";
-        let kid = "catbird-chat-key-1";
         let now = 1700000000;
-        let exp = now + 120;
-        let jti = Uuid::new_v4().hyphenated().to_string();
         let endpoint = "blue.catbird.chat.sendMessage";
+        let token = "mock.service.auth.token";
 
-        // 1. Mint clean-chat ordinary token
-        let header = CleanChatTokenHeader {
-            alg: "ES256".to_string(),
-            typ: "JWT".to_string(),
-            kid: kid.to_string(),
-        };
-
-        let claims = CleanChatClaims {
-            iss: "https://api.catbird.blue".to_string(),
-            sub: user_did.to_string(),
-            aud: "did:web:mlschat.catbird.blue".to_string(),
-            lxm: endpoint.to_string(),
-            iat: now,
-            exp,
-            jti: jti.clone(),
-            cnf: CleanChatConfirmation {
-                jkt: dpop_jkt.clone(),
-            },
-            device_id: device_id.clone(),
-            chat_instance: chat_instance.to_string(),
-        };
-
-        let encoded_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
-        let encoded_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signing_input = format!("{}.{}", encoded_header, encoded_payload);
-        let signature: Signature = nest_signing_key.sign(signing_input.as_bytes());
-        let token = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature.to_bytes()));
-
-        // 2. Generate DPoP proof
+        // 1. Generate DPoP proof
         let htu = format!("https://mlschat.catbird.blue/xrpc/{}", endpoint);
-        let proof = generate_dpop_proof(&dpop_signing_key, "POST", &htu, &token, now).unwrap();
+        let proof = generate_dpop_proof(&dpop_signing_key, "POST", &htu, token, now).unwrap();
 
-        // 3. Verify DPoP proof
+        // 2. Verify DPoP proof
         let proof_claims = verify_dpop_proof(
             &proof,
             "POST",
             &htu,
-            &token,
+            token,
             Some(&dpop_jkt),
             now,
         )
@@ -135,54 +96,10 @@ mod tests {
 
         assert_eq!(proof_claims.htm, "POST");
         assert_eq!(proof_claims.htu, htu);
-        assert_eq!(proof_claims.ath, calculate_ath(&token));
+        assert_eq!(proof_claims.ath, calculate_ath(token));
         assert_eq!(proof_claims.iat, now);
 
-        // 4. Verify enrollment grant claims
-        let auth_time = 1700000000;
-        let auth_txn = Uuid::new_v4().hyphenated().to_string();
-        let enrollment_jti = Uuid::new_v4().hyphenated().to_string();
-        let key_id = "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk";
-        let signing_key_sha256 = URL_SAFE_NO_PAD.encode([1u8; 32]);
-        let transcript_sha256 = URL_SAFE_NO_PAD.encode([2u8; 32]);
-
-        let enrollment_claims = CleanChatEnrollmentClaims {
-            iss: "https://api.catbird.blue".to_string(),
-            sub: user_did.to_string(),
-            aud: "did:web:mlschat.catbird.blue".to_string(),
-            lxm: "blue.catbird.chat.enrollDevice".to_string(),
-            iat: now,
-            exp: std::cmp::min(now + 120, auth_time + 300),
-            jti: enrollment_jti.clone(),
-            cnf: CleanChatConfirmation {
-                jkt: dpop_jkt.clone(),
-            },
-            device_id: device_id.clone(),
-            chat_instance: chat_instance.to_string(),
-            key_id: key_id.to_string(),
-            signing_key_sha256: signing_key_sha256.clone(),
-            enrollment_transcript_sha256: transcript_sha256.clone(),
-            auth_time,
-            auth_txn: auth_txn.clone(),
-        };
-
-        let encoded_enrollment = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&enrollment_claims).unwrap());
-        let signing_enrollment = format!("{}.{}", encoded_header, encoded_enrollment);
-        let enrollment_sig: Signature = nest_signing_key.sign(signing_enrollment.as_bytes());
-        let enrollment_token = format!(
-            "{}.{}",
-            signing_enrollment,
-            URL_SAFE_NO_PAD.encode(enrollment_sig.to_bytes())
-        );
-
-        // Verify deserialization with deny_unknown_fields
-        let parsed_claims: CleanChatEnrollmentClaims =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded_enrollment).unwrap()).unwrap();
-        assert_eq!(parsed_claims.lxm, "blue.catbird.chat.enrollDevice");
-        assert_eq!(parsed_claims.auth_txn, auth_txn);
-        assert_eq!(parsed_claims.exp, 1700000120);
-
-        // 5. Verify all 32 endpoint NSIDs
+        // 3. Verify all 32 endpoint NSIDs
         assert_eq!(CHAT_ENDPOINTS.len(), 32);
     }
 

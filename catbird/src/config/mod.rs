@@ -270,6 +270,8 @@ fn default_scopes() -> Vec<String> {
         "atproto".to_string(),
         "transition:generic".to_string(),
         "transition:chat.bsky".to_string(),
+        "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls"
+            .to_string(),
     ]
 }
 
@@ -630,5 +632,20 @@ impl AppState {
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         resolver.with_system_dns()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_scopes_include_mls_chat_auth_full() {
+        let scopes = default_scopes();
+        assert!(
+            scopes.iter().any(|s| s.contains("blue.catbird.chat.authFull")
+                && s.contains("did:web:chat.catbird.blue%23atproto_mls")),
+            "default scopes must permit getServiceAuth for the MLS AppView audience; got {scopes:?}"
+        );
     }
 }
