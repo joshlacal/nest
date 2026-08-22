@@ -266,12 +266,18 @@ fn default_session_ttl() -> u64 {
 }
 
 fn default_scopes() -> Vec<String> {
+    // Deliberately does NOT request a chat-specific scope. Verified 2026-08-22
+    // by live call against two PDS hosts (selfhosted.social,
+    // enoki.us-east.host.bsky.network): an existing session holding only these
+    // three scopes mints com.atproto.server.getServiceAuth for
+    // aud=did:web:chat.catbird.blue#atproto_mls with HTTP 200, and the returned
+    // JWT satisfies every constraint in mls-ds validate_mls_service_claims.
+    // Adding an unrecognised scope here would risk the OAuth authorize path for
+    // zero gain.
     vec![
         "atproto".to_string(),
         "transition:generic".to_string(),
         "transition:chat.bsky".to_string(),
-        "include:blue.catbird.chat.authFull?aud=did:web:chat.catbird.blue%23atproto_mls"
-            .to_string(),
     ]
 }
 
@@ -639,13 +645,20 @@ impl AppState {
 mod tests {
     use super::*;
 
+    /// Pins the scope set proven sufficient to mint MLS service auth. A
+    /// chat-specific scope is NOT required; see `default_scopes`. This test
+    /// fails if one is added back without new evidence.
     #[test]
-    fn default_scopes_include_mls_chat_auth_full() {
+    fn default_scopes_are_the_set_proven_to_mint_mls_service_auth() {
         let scopes = default_scopes();
-        assert!(
-            scopes.iter().any(|s| s.contains("blue.catbird.chat.authFull")
-                && s.contains("did:web:chat.catbird.blue%23atproto_mls")),
-            "default scopes must permit getServiceAuth for the MLS AppView audience; got {scopes:?}"
+        assert_eq!(
+            scopes,
+            vec![
+                "atproto".to_string(),
+                "transition:generic".to_string(),
+                "transition:chat.bsky".to_string(),
+            ],
+            "default scopes changed; re-verify getServiceAuth against a real PDS first"
         );
     }
 }
