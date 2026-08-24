@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace dependencies
-COPY catbird-atproto /catbird-atproto
+COPY catbird-atproto ./catbird-atproto
 COPY nest/circle-appview ./nest/circle-appview
 
 WORKDIR /app/nest/circle-appview

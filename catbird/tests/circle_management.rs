@@ -696,6 +696,7 @@ async fn bounds_validation_rejects_oversized_inputs(pool: PgPool) {
     assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
 
     // 4. Duplicate initial member DIDs
+    env._pds.reset().await;
     let duplicate_members = CreateCircle {
         name: "Duplicates".into(),
         member_dids: vec![bob(), bob()],
@@ -703,6 +704,11 @@ async fn bounds_validation_rejects_oversized_inputs(pool: PgPool) {
     };
     let res = env.service.create_circle(&env.session, duplicate_members).await;
     assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
+    assert_eq!(
+        env._pds.received_requests().await.unwrap().len(),
+        0,
+        "Zero PDS requests must be made when duplicate initial DIDs are rejected"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1765,7 +1771,59 @@ async fn initial_member_indeterminate_503_returns_pending_status(pool: PgPool) {
 async fn reconciliation_treats_408_425_429_as_retryable_stays_executing(pool: PgPool) {
     let env = setup_env(pool.clone()).await;
 
-    let add_op_id = env.service
+    for status_code in [408u16, 425u16, 429u16] {
+        let add_op_id = env
+            .service
+            .enqueue_projection(
+                "did:plc:alice",
+                &env.session.id.to_string(),
+                space().as_str(),
+                catbird::models::CircleProjectionKind::MemberAdd,
+                serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+                catbird::models::CircleProjectionState::Intent,
+            )
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE circle_projection_outbox SET state = 'executing', execution_started_at = now() - interval '60 seconds' WHERE id = $1",
+        )
+        .bind(add_op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        env._pds.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.simplespace.addMember"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string("Retryable Status"))
+            .mount(&env._pds)
+            .await;
+
+        let reconciled = env.service.reconcile_stale_projections(10).await.unwrap();
+        assert_eq!(reconciled, 0);
+
+        // Verify row stays in 'executing' and records retryable error, NOT transitioned to 'failed'
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1",
+        )
+        .bind(add_op_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "executing");
+        assert!(row.1.unwrap().contains(&status_code.to_string()));
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn claimed_row_contention_bypasses_pds_mutation(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    // Enqueue an operation and mark it executing with an active claim_token
+    let existing_token = uuid::Uuid::new_v4();
+    let op_id = env
+        .service
         .enqueue_projection(
             "did:plc:alice",
             &env.session.id.to_string(),
@@ -1777,35 +1835,60 @@ async fn reconciliation_treats_408_425_429_as_retryable_stays_executing(pool: Pg
         .await
         .unwrap();
 
+    // Set state = executing with fresh execution_started_at so claim_projection returns None
     sqlx::query(
-        "UPDATE circle_projection_outbox SET state = 'executing', execution_started_at = now() - interval '60 seconds' WHERE id = $1"
+        "UPDATE circle_projection_outbox SET state = 'executing', claim_token = $1, execution_started_at = now() WHERE id = $2",
     )
-    .bind(add_op_id)
+    .bind(existing_token)
+    .bind(op_id)
     .execute(&pool)
     .await
     .unwrap();
 
-    // Mock PDS to return 429 Too Many Requests
     env._pds.reset().await;
-    Mock::given(method("POST"))
-        .and(path("/xrpc/com.atproto.simplespace.addMember"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("Rate Limit Exceeded"))
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
         .mount(&env._pds)
         .await;
 
-    let reconciled = env.service.reconcile_stale_projections(10).await.unwrap();
-    assert_eq!(reconciled, 0);
+    // Call update_member when another executor actively holds the claim
+    let update_input = catbird_atproto::generated::blue_catbird::circle::update_member::UpdateMember {
+        space: space(),
+        member_did: bob(),
+        action: catbird_atproto::generated::blue_catbird::circle::defs::MemberAction::Add,
+        extra_data: None,
+    };
 
-    // Verify row stays in 'executing' and records retryable error, NOT transitioned to 'failed'
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1"
+    let op = env
+        .service
+        .update_member(&env.session, update_input)
+        .await
+        .unwrap();
+
+    // Returned status is Pending, and zero PDS mutation requests happen
+    assert_eq!(
+        op.status,
+        catbird_atproto::generated::blue_catbird::circle::defs::OperationStatus::Pending
+    );
+    let received = env._pds.received_requests().await.unwrap();
+    assert!(
+        !received.iter().any(|req| req.url.path() == "/xrpc/com.atproto.simplespace.addMember"),
+        "No addMember PDS mutation request must be made when claim_projection returns None"
+    );
+
+    // Row state is still executing with original claim_token
+    let row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT state, claim_token FROM circle_projection_outbox WHERE id = $1",
     )
-    .bind(add_op_id)
+    .bind(op_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(row.0, "executing");
-    assert!(row.1.unwrap().contains("429"));
+    assert_eq!(row.1, Some(existing_token));
 }
 
 #[sqlx::test(migrations = "./migrations")]

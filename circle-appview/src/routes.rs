@@ -1,16 +1,16 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     middleware,
-    response::Json,
     routing::get,
-    Extension, Router,
+    Json, Router,
 };
 use catbird_atproto::generated::blue_catbird::circle::{
-    get_feed::GetFeedOutput,
-    list_circles::ListCirclesOutput,
-    list_notifications::ListNotificationsOutput,
+    get_capabilities::GetCapabilitiesOutput,
+    get_feed::{GetFeed, GetFeedOutput},
+    list_circles::{ListCircles, ListCirclesOutput},
+    list_notifications::{ListNotifications, ListNotificationsOutput},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::auth::{self, AuthenticatedUser};
 use crate::config::AppState;
@@ -19,13 +19,6 @@ use crate::error::AppError;
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-}
-
-#[derive(Serialize)]
-pub struct CapabilitiesResponse {
-    pub enabled: bool,
-    #[serde(rename = "protocolRevision")]
-    pub protocol_revision: u32,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -67,73 +60,53 @@ async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-async fn get_capabilities() -> Json<CapabilitiesResponse> {
-    Json(CapabilitiesResponse {
+async fn get_capabilities() -> Json<GetCapabilitiesOutput> {
+    Json(GetCapabilitiesOutput {
         enabled: true,
-        protocol_revision: 1,
+        protocol_revision: "1".into(),
+        supports_images: true,
+        extra_data: None,
     })
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GetFeedQuery {
-    pub space: Option<String>,
-    pub limit: Option<i64>,
-    pub cursor: Option<String>,
-}
-
 async fn get_feed_handler(
-    Extension(user): Extension<AuthenticatedUser>,
-    Query(_query): Query<GetFeedQuery>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Query(_query): Query<GetFeed>,
     State(_state): State<AppState>,
 ) -> Result<Json<GetFeedOutput>, AppError> {
-    tracing::debug!(did = %user.did, "Handling getFeed request");
+    tracing::debug!("Handling getFeed request");
 
-    // Returns authenticated empty feed structure
     Ok(Json(GetFeedOutput {
         feed: Vec::new(),
         cursor: None,
-        extra_data: Default::default(),
+        extra_data: None,
     }))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ListCirclesQuery {
-    pub limit: Option<i64>,
-    pub cursor: Option<String>,
 }
 
 async fn list_circles_handler(
-    Extension(user): Extension<AuthenticatedUser>,
-    Query(_query): Query<ListCirclesQuery>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Query(_query): Query<ListCircles>,
     State(_state): State<AppState>,
 ) -> Result<Json<ListCirclesOutput>, AppError> {
-    tracing::debug!(did = %user.did, "Handling listCircles request");
+    tracing::debug!("Handling listCircles request");
 
-    // Returns authenticated empty circle list structure
     Ok(Json(ListCirclesOutput {
         circles: Vec::new(),
         cursor: None,
-        extra_data: Default::default(),
+        extra_data: None,
     }))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ListNotificationsQuery {
-    pub limit: Option<i64>,
-    pub cursor: Option<String>,
-}
-
 async fn list_notifications_handler(
-    Extension(user): Extension<AuthenticatedUser>,
-    Query(_query): Query<ListNotificationsQuery>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Query(_query): Query<ListNotifications>,
     State(_state): State<AppState>,
 ) -> Result<Json<ListNotificationsOutput>, AppError> {
-    tracing::debug!(did = %user.did, "Handling listNotifications request");
+    tracing::debug!("Handling listNotifications request");
 
-    // Returns authenticated empty notifications list structure
     Ok(Json(ListNotificationsOutput {
         notifications: Vec::new(),
         cursor: None,
-        extra_data: Default::default(),
+        extra_data: None,
     }))
 }
