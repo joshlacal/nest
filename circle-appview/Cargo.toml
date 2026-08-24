@@ -30,3 +30,6 @@ anyhow = "1"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+rcgen = "0.13"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }

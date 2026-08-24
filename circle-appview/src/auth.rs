@@ -193,7 +193,43 @@ pub trait DidWebTransport: Send + Sync {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct DefaultDidWebTransport;
+pub struct DefaultDidWebTransport {
+    test_root_cert: Option<reqwest::Certificate>,
+}
+
+impl DefaultDidWebTransport {
+    pub fn new() -> Self {
+        Self {
+            test_root_cert: None,
+        }
+    }
+
+    pub fn with_test_root_certificate(cert: reqwest::Certificate) -> Self {
+        Self {
+            test_root_cert: Some(cert),
+        }
+    }
+}
+
+/// Builds the pinned reqwest client used for did:web document fetches.
+/// Enforces no-proxy, redirects disabled, request timeout, and hostname pinning.
+pub fn build_did_web_client(
+    host: &str,
+    pinned_addr: SocketAddr,
+    test_root_cert: Option<reqwest::Certificate>,
+) -> Result<reqwest::Client, AuthReason> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .resolve(host, pinned_addr);
+
+    if let Some(cert) = test_root_cert {
+        builder = builder.add_root_certificate(cert);
+    }
+
+    builder.build().map_err(|_| AuthReason::DidResolutionFailed)
+}
 
 impl DidWebTransport for DefaultDidWebTransport {
     fn resolve_dns<'a>(
@@ -222,14 +258,9 @@ impl DidWebTransport for DefaultDidWebTransport {
     ) -> Pin<Box<dyn Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>> {
         let url = url.to_string();
         let host = host.to_string();
+        let test_cert = self.test_root_cert.clone();
         Box::pin(async move {
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(5))
-                .resolve(&host, pinned_addr)
-                .build()
-                .map_err(|_| AuthReason::DidResolutionFailed)?;
+            let client = build_did_web_client(&host, pinned_addr, test_cert)?;
 
             let resp = client
                 .get(&url)
@@ -259,7 +290,7 @@ impl DidResolver {
         Self {
             plc_directory_url,
             http_client,
-            web_transport: Arc::new(DefaultDidWebTransport),
+            web_transport: Arc::new(DefaultDidWebTransport::new()),
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -493,8 +524,9 @@ pub async fn verify_service_jwt(
     if exp <= iat {
         return Err(AppError::Unauthorized(AuthReason::Expired));
     }
-    if (exp - iat) > 60 {
-        return Err(AppError::Unauthorized(AuthReason::LifetimeExceeded));
+    match exp.checked_sub(iat) {
+        Some(lifetime) if lifetime <= 60 => {}
+        _ => return Err(AppError::Unauthorized(AuthReason::LifetimeExceeded)),
     }
 
     // 4. Verify audience
@@ -665,9 +697,12 @@ pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
     if ip.is_link_local() || (octets[0] == 169 && octets[1] == 254) {
         return true;
     }
-    // 192.0.0.0/24
+    // IETF Protocol Assignments: 192.0.0.0/24
     if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return true;
+        // 192.0.0.9 (PCP Anycast, RFC 7723) and 192.0.0.10 (TURN Anycast, RFC 8155) are global exceptions
+        if octets[3] != 9 && octets[3] != 10 {
+            return true;
+        }
     }
     // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
     if (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
@@ -724,9 +759,31 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     if (segments[0] & 0xffc0) == 0xfec0 {
         return true;
     }
-    // IETF Protocol Assignments: 2001::/23 (covers 2001::/32, 2001:2::/48, 2001:5::/32, 2001:10::/28, 2001:20::/28, etc.)
+    // IETF Protocol Assignments: 2001::/23
     if segments[0] == 0x2001 && segments[1] <= 0x01ff {
-        return true;
+        // Check named IANA globally reachable exceptions inside 2001::/23:
+        // 1. 2001:1::1/128 (PCP Anycast, RFC 7723)
+        // 2. 2001:1::2/128 (TURN Anycast, RFC 8155)
+        // 3. 2001:1::3/128 (DNS-SD Anycast)
+        let is_2001_1_anycast = segments[1] == 1
+            && segments[2] == 0
+            && segments[3] == 0
+            && segments[4] == 0
+            && segments[5] == 0
+            && segments[6] == 0
+            && (segments[7] == 1 || segments[7] == 2 || segments[7] == 3);
+        // 4. 2001:3::/32 (AMT, RFC 7450)
+        let is_2001_3 = segments[1] == 3;
+        // 5. 2001:4:112::/48 (AS112-v6, RFC 7535)
+        let is_2001_4_112 = segments[1] == 4 && segments[2] == 0x0112;
+        // 6. 2001:20::/28 (ORCHIDv2, RFC 7343)
+        let is_2001_20 = (segments[1] & 0xfff0) == 0x0020;
+        // 7. 2001:30::/28 (Drone Remote ID DETs, RFC 9374)
+        let is_2001_30 = (segments[1] & 0xfff0) == 0x0030;
+
+        if !is_2001_1_anycast && !is_2001_3 && !is_2001_4_112 && !is_2001_20 && !is_2001_30 {
+            return true;
+        }
     }
     // Documentation: 2001:db8::/32
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {

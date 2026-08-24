@@ -173,15 +173,18 @@ fn create_service_token(
 }
 
 async fn request_feed(app: &axum::Router, token: &str) -> Response {
+    request_feed_with_uri(app, token, "/xrpc/blue.catbird.circle.getFeed").await
+}
+
+async fn request_feed_with_uri(app: &axum::Router, token: &str, uri: &str) -> Response {
     let request = Request::builder()
-        .uri("/xrpc/blue.catbird.circle.getFeed")
+        .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
 
     app.clone().oneshot(request).await.unwrap()
 }
-
 #[derive(Clone)]
 struct MockDidWebTransport {
     dns_result: Result<Vec<SocketAddr>, AuthReason>,
@@ -567,6 +570,66 @@ async fn enforces_exact_iat_exp_and_lifetime_bounds(pool: PgPool) {
         request_feed(&setup.app, &token_exp_at_now).await.status(),
         StatusCode::UNAUTHORIZED
     );
+
+    // 7. Arithmetic extreme: iat = i64::MIN, exp = now + 10 -> rejected safely without panic
+    let token_iat_min = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(i64::MIN),
+            exp: Some(now + 10),
+            jti: Some("jti-iat-min"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_iat_min).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 8. Arithmetic extreme: iat = i64::MIN, exp = i64::MAX -> rejected safely without panic
+    let token_iat_min_exp_max = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(i64::MIN),
+            exp: Some(i64::MAX),
+            jti: Some("jti-iat-min-exp-max"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_iat_min_exp_max).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 9. Arithmetic extreme: iat = now, exp = i64::MAX -> rejected safely without panic
+    let token_exp_max = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(now),
+            exp: Some(i64::MAX),
+            jti: Some("jti-exp-max"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_exp_max).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 10. Arithmetic extreme: iat = i64::MIN, exp = i64::MIN -> rejected (exp <= iat)
+    let token_both_min = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(i64::MIN),
+            exp: Some(i64::MIN),
+            jti: Some("jti-both-min"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_both_min).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -737,39 +800,66 @@ async fn rejects_wrong_lxm(pool: PgPool) {
 
 #[test]
 fn complete_ipv6_and_ipv4_non_global_policy_coverage() {
-    // 1. IETF Protocol Assignments 2001::/23 remainder (e.g. 2001:5::1, 2001:2::1, 2001:20::1)
+    use circle_appview::auth::is_private_ipv4;
+    use std::net::Ipv4Addr;
+
+    // IPv4: IANA globally reachable exceptions in 192.0.0.0/24
+    assert!(!is_private_ipv4(&"192.0.0.9".parse::<Ipv4Addr>().unwrap())); // PCP Anycast (RFC 7723)
+    assert!(!is_private_ipv4(&"192.0.0.10".parse::<Ipv4Addr>().unwrap())); // TURN Anycast (RFC 8155)
+    // IPv4: Non-global remainder of 192.0.0.0/24
+    assert!(is_private_ipv4(&"192.0.0.1".parse::<Ipv4Addr>().unwrap()));
+    assert!(is_private_ipv4(&"192.0.0.8".parse::<Ipv4Addr>().unwrap()));
+    assert!(is_private_ipv4(&"192.0.0.11".parse::<Ipv4Addr>().unwrap()));
+    assert!(is_private_ipv4(&"192.0.0.254".parse::<Ipv4Addr>().unwrap()));
+
+    // IPv6: IANA globally reachable exceptions inside 2001::/23
+    assert!(!is_private_ipv6(&"2001:1::1".parse::<Ipv6Addr>().unwrap())); // PCP Anycast (RFC 7723)
+    assert!(!is_private_ipv6(&"2001:1::2".parse::<Ipv6Addr>().unwrap())); // TURN Anycast (RFC 8155)
+    assert!(!is_private_ipv6(&"2001:1::3".parse::<Ipv6Addr>().unwrap())); // DNS-SD Anycast
+    assert!(!is_private_ipv6(&"2001:3::1".parse::<Ipv6Addr>().unwrap())); // AMT (RFC 7450)
+    assert!(!is_private_ipv6(&"2001:4:112::1".parse::<Ipv6Addr>().unwrap())); // AS112-v6 (RFC 7535)
+    assert!(!is_private_ipv6(&"2001:20::1".parse::<Ipv6Addr>().unwrap())); // ORCHIDv2 (RFC 7343)
+    assert!(!is_private_ipv6(&"2001:2f:ffff::1".parse::<Ipv6Addr>().unwrap())); // ORCHIDv2 end of /28
+    assert!(!is_private_ipv6(&"2001:30::1".parse::<Ipv6Addr>().unwrap())); // Drone Remote ID DETs (RFC 9374)
+    assert!(!is_private_ipv6(&"2001:3f:ffff::1".parse::<Ipv6Addr>().unwrap())); // Drone Remote ID end of /28
+
+    // IPv6: Non-global remainder inside 2001::/23
+    assert!(is_private_ipv6(&"2001:0000::1".parse::<Ipv6Addr>().unwrap())); // TEREDO (RFC 4380)
+    assert!(is_private_ipv6(&"2001:1::4".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:2::1".parse::<Ipv6Addr>().unwrap())); // Benchmarking (RFC 5180)
+    assert!(is_private_ipv6(&"2001:4:113::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"2001:5::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"2001:2::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"2001:20::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"2001:0000::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:10::1".parse::<Ipv6Addr>().unwrap())); // Deprecated ORCHID (RFC 4843)
+    assert!(is_private_ipv6(&"2001:1f::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:40::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"2001:01ff:ffff:ffff:ffff:ffff:ffff:ffff".parse::<Ipv6Addr>().unwrap()));
 
-    // 2. Documentation ranges (2001:db8::/32 and 3fff::/20)
+    // Documentation ranges (2001:db8::/32 and 3fff::/20)
     assert!(is_private_ipv6(&"2001:db8::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"3fff:0::1".parse::<Ipv6Addr>().unwrap()));
 
-    // 3. Discard and Dummy prefixes (100::/64, 100:0:0:1::/64)
+    // Discard and Dummy prefixes (100::/64, 100:0:0:1::/64)
     assert!(is_private_ipv6(&"100::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"100:0:0:1::1".parse::<Ipv6Addr>().unwrap()));
 
-    // 4. SRv6 SIDs (5f00::/16)
+    // SRv6 SIDs (5f00::/16)
     assert!(is_private_ipv6(&"5f00::1".parse::<Ipv6Addr>().unwrap()));
 
-    // 5. ULA (fc00::/7), Link-Local (fe80::/10), Site-Local (fec0::/10)
+    // ULA (fc00::/7), Link-Local (fe80::/10), Site-Local (fec0::/10)
     assert!(is_private_ipv6(&"fc00::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"fd12:3456:789a::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"fe80::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"fec0::1".parse::<Ipv6Addr>().unwrap()));
 
-    // 6. Loopback and Unspecified
+    // Loopback and Unspecified
     assert!(is_private_ipv6(&"::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"::".parse::<Ipv6Addr>().unwrap()));
 
-    // 7. IPv4-mapped private
+    // IPv4-mapped private
     assert!(is_private_ipv6(&"::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"::ffff:192.168.1.1".parse::<Ipv6Addr>().unwrap()));
 
-    // 8. Public globally reachable IPv6 addresses are permitted
+    // Public globally reachable IPv6 addresses outside 2001::/23
     assert!(!is_private_ipv6(&"2600::1".parse::<Ipv6Addr>().unwrap()));
     assert!(!is_private_ipv6(&"2001:0200::1".parse::<Ipv6Addr>().unwrap()));
     assert!(!is_private_ipv6(&"2a00:1450:4009:81f::200e".parse::<Ipv6Addr>().unwrap()));
@@ -941,33 +1031,140 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
 }
 
 #[tokio::test]
-async fn default_web_transport_policy_rejects_redirects() {
-    // Start local server that responds with a 302 redirect
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_rejects_redirects() {
+    use circle_appview::auth::build_did_web_client;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let redirect_app = axum::Router::new().route(
-        "/.well-known/did.json",
-        axum::routing::get(|| async {
-            (
-                StatusCode::FOUND,
-                [(header::LOCATION, "https://example.com/other/did.json")],
-                "",
-            )
-        }),
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    // 1. Generate test self-signed certificate for public hostname "did-web.example.org"
+    let params = rcgen::CertificateParams::new(vec![
+        "did-web.example.org".to_string(),
+        "example.com".to_string(),
+    ])
+    .unwrap();
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
+
+    // 2. Build tokio-rustls TLS server config
+    let rustls_cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let rustls_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
     );
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![rustls_cert], rustls_key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
+    // 3. Bind local TCP listener for TLS fixture
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_addr = listener.local_addr().unwrap();
+
+    // 4. Run local HTTPS server that handles did.json and redirect responses
     tokio::spawn(async move {
-        axum::serve(listener, redirect_app).await.unwrap();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let Ok(n) = tls_stream.read(&mut buf).await else {
+                    return;
+                };
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                if req_str.starts_with("GET /.well-known/did.json") {
+                    let body = r#"{"id":"did:web:did-web.example.org","verificationMethod":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                } else if req_str.starts_with("GET /redirect") {
+                    let response = "HTTP/1.1 302 Found\r\nLocation: https://example.com/other/did.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                } else {
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                }
+                let _ = tls_stream.shutdown().await;
+            });
+        }
     });
 
-    let transport = DefaultDidWebTransport;
-    let url = format!("http://{addr}/.well-known/did.json");
-    let result = transport.fetch(&url, "127.0.0.1", addr).await;
+    // 5. Set invalid proxy environment variables to verify .no_proxy() immunity
+    std::env::set_var(
+        "HTTPS_PROXY",
+        "http://invalid-unreachable-proxy.example.local:9999",
+    );
+    std::env::set_var(
+        "HTTP_PROXY",
+        "http://invalid-unreachable-proxy.example.local:9999",
+    );
+    std::env::set_var(
+        "ALL_PROXY",
+        "http://invalid-unreachable-proxy.example.local:9999",
+    );
 
-    // Must fail because Policy::none() does not follow redirect and 302 is not a 2xx success
-    assert!(result.is_err());
-    assert_eq!(result.err().unwrap(), AuthReason::DidResolutionFailed);
+    let reqwest_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+
+    // 6. Test successful pinned HTTPS fetch via DefaultDidWebTransport
+    let transport = DefaultDidWebTransport::with_test_root_certificate(reqwest_cert.clone());
+    let valid_url = format!(
+        "https://did-web.example.org:{}/.well-known/did.json",
+        fixture_addr.port()
+    );
+
+    let doc = transport
+        .fetch(&valid_url, "did-web.example.org", fixture_addr)
+        .await
+        .expect("Pinned HTTPS fetch must succeed via injected test certificate and resolve pin");
+    assert_eq!(doc.id, "did:web:did-web.example.org");
+
+    // 7. Test that redirects are rejected and not followed
+    let redirect_url = format!(
+        "https://did-web.example.org:{}/redirect",
+        fixture_addr.port()
+    );
+    let redirect_res = transport
+        .fetch(&redirect_url, "did-web.example.org", fixture_addr)
+        .await;
+    assert!(
+        redirect_res.is_err(),
+        "Redirect must be rejected by Policy::none()"
+    );
+    assert_eq!(redirect_res.err().unwrap(), AuthReason::DidResolutionFailed);
+
+    // 8. Test that connection strictly uses the pinned address (wrong port fails)
+    let wrong_addr = SocketAddr::from(([127, 0, 0, 2], fixture_addr.port()));
+    let wrong_pin_res = transport
+        .fetch(&valid_url, "did-web.example.org", wrong_addr)
+        .await;
+    assert!(
+        wrong_pin_res.is_err(),
+        "Connecting to non-listening pinned address must fail immediately"
+    );
+
+    // 9. Direct build_did_web_client verification
+    let client = build_did_web_client(
+        "did-web.example.org",
+        fixture_addr,
+        Some(reqwest_cert.clone()),
+    )
+    .expect("build_did_web_client must build successfully");
+    let direct_resp = client
+        .get(&valid_url)
+        .send()
+        .await
+        .expect("Direct client must connect ignoring invalid proxy env");
+    assert_eq!(direct_resp.status(), StatusCode::OK);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -989,7 +1186,7 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
     let jti_canary = "jti-canary-secret-777";
     let lxm_canary = "blue.catbird.circle.secretLxmCanary";
 
-    // Test 1: Bad signature with canaries
+    // Bad signature token containing issuer, JTI, and LXM canaries
     let bad_sig_token = create_service_token(
         &p256::ecdsa::SigningKey::random(&mut OsRng),
         iss_canary,
@@ -1000,7 +1197,13 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
         None,
     );
 
-    let resp = request_feed(&setup.app, &bad_sig_token).await;
+    // Build request URI explicitly including space_canary and query canary
+    let request_uri = format!(
+        "/xrpc/blue.catbird.circle.getFeed?space={}&canaryParam=secretQueryValue99",
+        space_canary
+    );
+
+    let resp = request_feed_with_uri(&setup.app, &bad_sig_token, &request_uri).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -1014,6 +1217,10 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
     assert!(
         !body_str.contains(space_canary),
         "Response body must not contain space canary"
+    );
+    assert!(
+        !body_str.contains("secretQueryValue99"),
+        "Response body must not contain query canary"
     );
     assert!(
         !body_str.contains(jti_canary),
@@ -1043,6 +1250,10 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
     assert!(
         !logs.contains(space_canary),
         "Captured logs must not contain space canary"
+    );
+    assert!(
+        !logs.contains("secretQueryValue99"),
+        "Captured logs must not contain query canary"
     );
     assert!(
         !logs.contains(jti_canary),
