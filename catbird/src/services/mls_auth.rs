@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// All 32 clean-chat endpoints defined in blue.catbird.chat.*
+/// All 33 clean-chat procedures defined in blue.catbird.chat.*
 pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.acceptConversation",
     "blue.catbird.chat.acknowledgeWelcome",
@@ -60,6 +60,7 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.submitTransition",
     "blue.catbird.chat.subscribeEvents",
     "blue.catbird.chat.uploadBlob",
+    "blue.catbird.chat.updatePushToken",
 ];
 
 /// Public EC P-256 JWK embedded in DPoP proof headers (deny_unknown_fields)
@@ -831,7 +832,7 @@ mod tests {
         assert!(!MlsAuthService::is_v1_mls_lexicon("blue.catbird.mlsChat.getConvos"));
         assert!(!MlsAuthService::is_clean_chat_lexicon("blue.catbird.mlsChat.getConvos"));
 
-        // All 32 clean-chat endpoints
+        // All 33 clean-chat procedures
         for endpoint in CHAT_ENDPOINTS {
             assert!(
                 MlsAuthService::is_mls_lexicon(endpoint),

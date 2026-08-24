@@ -99,8 +99,9 @@ mod tests {
         assert_eq!(proof_claims.ath, calculate_ath(token));
         assert_eq!(proof_claims.iat, now);
 
-        // 3. Verify all 32 endpoint NSIDs
-        assert_eq!(CHAT_ENDPOINTS.len(), 32);
+        // 3. Verify the complete procedure registry, including push registration.
+        assert_eq!(CHAT_ENDPOINTS.len(), 33);
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.updatePushToken"));
     }
 
     /// Test ADR-014 is_allowed_redirect validation and origin matching
