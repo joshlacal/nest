@@ -51,8 +51,17 @@ pub struct DidDocument {
     pub id: String,
     #[serde(default, rename = "verificationMethod")]
     pub verification_method: Vec<VerificationMethod>,
+    #[serde(default)]
+    pub service: Vec<DidService>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DidService {
+    pub id: String,
+    pub r#type: String,
+    #[serde(rename = "serviceEndpoint")]
+    pub service_endpoint: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationMethod {
     pub id: String,
@@ -611,8 +620,11 @@ pub async fn authenticate(
         .ok_or(AppError::Unauthorized(AuthReason::InvalidHeader))?;
 
     let path = request.uri().path();
-    let expected_lxm = path.strip_prefix("/xrpc/").map(|s| s.trim_start_matches('/'));
-
+    let expected_lxm = if path == "/internal/projections" {
+        Some("blue.catbird.circle.syncProjection")
+    } else {
+        path.strip_prefix("/xrpc/").map(|s| s.trim_start_matches('/'))
+    };
     let user = verify_service_jwt(&state, token, &state.config.service_did, expected_lxm).await?;
 
     request.extensions_mut().insert(user);
@@ -845,7 +857,7 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     false
 }
 
-fn is_localhost_hostname(host: &str) -> bool {
+pub fn is_localhost_hostname(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     let trimmed = lower.trim_end_matches('.');
 

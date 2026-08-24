@@ -86,8 +86,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
             }),
             public_key_multibase: Some(p256_multikey),
         }],
+        service: vec![],
     };
-
     state.did_resolver.insert_cached(ALICE_DID.into(), did_doc);
     let app = create_router(state.clone());
     TestSetup {
@@ -670,9 +670,9 @@ async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: P
             public_key_jwk: None,
             public_key_multibase: Some(secp_multikey),
         }],
+        service: vec![],
     };
     setup.state.did_resolver.insert_cached(bob_did.into(), bob_doc);
-
     // 3. Mismatch: Token signed by secp256k1 key with alg: "ES256" -> rejected
     let now = Utc::now().timestamp();
     let header_secp_wrong_alg = json!({
@@ -736,6 +736,7 @@ async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: P
             }),
             public_key_multibase: None,
         }],
+        service: vec![],
     };
     setup
         .state
@@ -889,8 +890,8 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             }),
             public_key_multibase: None,
         }],
+        service: vec![],
     };
-
     let public_socket: SocketAddr = "93.184.216.34:443".parse().unwrap();
     let captured = Arc::new(Mutex::new(Vec::new()));
 

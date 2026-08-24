@@ -1,7 +1,9 @@
 use std::env;
 use std::sync::Arc;
 use sqlx::PgPool;
+use crate::access::CredentialStore;
 use crate::auth::DidResolver;
+use crate::space_client::SpaceClient;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -42,7 +44,10 @@ pub struct AppState {
     pub db: PgPool,
     pub http_client: reqwest::Client,
     pub did_resolver: Arc<DidResolver>,
+    pub credential_store: Arc<CredentialStore>,
+    pub space_client: Arc<SpaceClient>,
 }
+
 impl AppState {
     pub fn new(config: Config, db: PgPool) -> Self {
         let config = Arc::new(config);
@@ -54,16 +59,45 @@ impl AppState {
             config.plc_directory_url.clone(),
             http_client.clone(),
         ));
+        let credential_store = Arc::new(CredentialStore::new());
+        let space_client = Arc::new(SpaceClient::new(http_client.clone()));
 
         Self {
             config,
             db,
             http_client,
             did_resolver,
+            credential_store,
+            space_client,
         }
     }
 
     pub fn with_did_resolver(config: Config, db: PgPool, did_resolver: Arc<DidResolver>) -> Self {
+        let config = Arc::new(config);
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let credential_store = Arc::new(CredentialStore::new());
+        let space_client = Arc::new(SpaceClient::new(http_client.clone()));
+
+        Self {
+            config,
+            db,
+            http_client,
+            did_resolver,
+            credential_store,
+            space_client,
+        }
+    }
+
+    pub fn with_services(
+        config: Config,
+        db: PgPool,
+        did_resolver: Arc<DidResolver>,
+        credential_store: Arc<CredentialStore>,
+        space_client: Arc<SpaceClient>,
+    ) -> Self {
         let config = Arc::new(config);
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -75,6 +109,8 @@ impl AppState {
             db,
             http_client,
             did_resolver,
+            credential_store,
+            space_client,
         }
     }
 }

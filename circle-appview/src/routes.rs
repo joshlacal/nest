@@ -1,20 +1,26 @@
 use axum::{
     extract::{Extension, Query, State},
+    http::StatusCode,
     middleware,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use catbird_atproto::generated::blue_catbird::circle::{
+    activate_space::ActivateSpaceOutput,
+    defs::AccessState,
     get_capabilities::GetCapabilitiesOutput,
     get_feed::{GetFeed, GetFeedOutput},
     list_circles::{ListCircles, ListCirclesOutput},
     list_notifications::{ListNotifications, ListNotificationsOutput},
 };
-use serde::Serialize;
+use catbird_atproto::jacquard_common::types::string::Datetime;
+use serde::{Deserialize, Serialize};
 
+use crate::access;
 use crate::auth::{self, AuthenticatedUser};
 use crate::config::AppState;
-use crate::error::AppError;
+use crate::error::{AppError, AuthReason};
+use crate::projections::{self, SyncProjectionInput};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -44,6 +50,18 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/xrpc/blue.catbird.circle.listNotifications",
             get(list_notifications_handler),
+        )
+        .route(
+            "/xrpc/blue.catbird.circle.activateSpace",
+            post(activate_space_handler),
+        )
+        .route(
+            "/blue.catbird.circle.activateSpace",
+            post(activate_space_handler),
+        )
+        .route(
+            "/internal/projections",
+            post(sync_projections_handler),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -109,4 +127,60 @@ async fn list_notifications_handler(
         cursor: None,
         extra_data: None,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateSpaceInput {
+    pub space: String,
+    pub delegation_token: String,
+    #[serde(default)]
+    pub client_attestation: Option<String>,
+}
+
+async fn activate_space_handler(
+    Extension(user): Extension<AuthenticatedUser>,
+    State(state): State<AppState>,
+    Json(input): Json<ActivateSpaceInput>,
+) -> Result<Json<ActivateSpaceOutput>, AppError> {
+    tracing::debug!("Handling activateSpace request");
+
+    let expires_at = access::activate_space(
+        &state,
+        &user.did,
+        &input.space,
+        &input.delegation_token,
+        input.client_attestation.as_deref(),
+    )
+    .await?;
+
+    let dt = Datetime::try_from(expires_at.to_rfc3339())
+        .map_err(|e| AppError::Internal(format!("Failed to format datetime: {e}")))?;
+
+    Ok(Json(ActivateSpaceOutput {
+        access_state: AccessState::Active,
+        expires_at: Some(dt),
+        extra_data: None,
+    }))
+}
+
+async fn sync_projections_handler(
+    Extension(user): Extension<AuthenticatedUser>,
+    State(state): State<AppState>,
+    Json(input): Json<SyncProjectionInput>,
+) -> Result<StatusCode, AppError> {
+    tracing::debug!(
+        operation_id = %input.operation_id,
+        kind = %input.kind,
+        "Handling syncProjection request"
+    );
+
+    if user.lxm != "blue.catbird.circle.syncProjection" {
+        return Err(AppError::Unauthorized(AuthReason::LxmMismatch));
+    }
+
+    let projection = input.to_projection()?;
+    projections::apply_projection(&state.db, input.operation_id, projection).await?;
+
+    Ok(StatusCode::OK)
 }
