@@ -1030,8 +1030,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
     );
 }
 
-#[tokio::test]
-async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_rejects_redirects() {
+async fn run_production_pinned_client_tls_fixture() {
     use circle_appview::auth::build_did_web_client;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1088,7 +1087,10 @@ async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_reje
                     );
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else if req_str.starts_with("GET /redirect") {
-                    let response = "HTTP/1.1 302 Found\r\nLocation: https://example.com/other/did.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    // Redirect to the same TLS fixture's valid DID document endpoint.
+                    // If Policy::none() is removed/absent, following this redirect would return 200 OK (and Ok(DidDocument)),
+                    // proving that Policy::none() is what actively defends the endpoint and causes resolution to fail.
+                    let response = "HTTP/1.1 302 Found\r\nLocation: /.well-known/did.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else {
                     let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -1099,23 +1101,9 @@ async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_reje
         }
     });
 
-    // 5. Set invalid proxy environment variables to verify .no_proxy() immunity
-    std::env::set_var(
-        "HTTPS_PROXY",
-        "http://invalid-unreachable-proxy.example.local:9999",
-    );
-    std::env::set_var(
-        "HTTP_PROXY",
-        "http://invalid-unreachable-proxy.example.local:9999",
-    );
-    std::env::set_var(
-        "ALL_PROXY",
-        "http://invalid-unreachable-proxy.example.local:9999",
-    );
-
     let reqwest_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
 
-    // 6. Test successful pinned HTTPS fetch via DefaultDidWebTransport
+    // 5. Test successful pinned HTTPS fetch via DefaultDidWebTransport (exercising production builder)
     let transport = DefaultDidWebTransport::with_test_root_certificate(reqwest_cert.clone());
     let valid_url = format!(
         "https://did-web.example.org:{}/.well-known/did.json",
@@ -1128,7 +1116,9 @@ async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_reje
         .expect("Pinned HTTPS fetch must succeed via injected test certificate and resolve pin");
     assert_eq!(doc.id, "did:web:did-web.example.org");
 
-    // 7. Test that redirects are rejected and not followed
+    // 6. Test that redirects are rejected and not followed
+    // The redirect target is /.well-known/did.json on this same TLS fixture which returns a valid DID document.
+    // If redirects were followed, this would yield Ok; returning Err proves Policy::none() is enforced.
     let redirect_url = format!(
         "https://did-web.example.org:{}/redirect",
         fixture_addr.port()
@@ -1142,17 +1132,25 @@ async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_reje
     );
     assert_eq!(redirect_res.err().unwrap(), AuthReason::DidResolutionFailed);
 
-    // 8. Test that connection strictly uses the pinned address (wrong port fails)
-    let wrong_addr = SocketAddr::from(([127, 0, 0, 2], fixture_addr.port()));
+    // 7. Test that connection strictly uses the pinned address (closed port fails immediately)
+    let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+
+    let wrong_url = format!(
+        "https://did-web.example.org:{}/.well-known/did.json",
+        closed_addr.port()
+    );
     let wrong_pin_res = transport
-        .fetch(&valid_url, "did-web.example.org", wrong_addr)
+        .fetch(&wrong_url, "did-web.example.org", closed_addr)
         .await;
     assert!(
         wrong_pin_res.is_err(),
         "Connecting to non-listening pinned address must fail immediately"
     );
+    assert_eq!(wrong_pin_res.err().unwrap(), AuthReason::DidResolutionFailed);
 
-    // 9. Direct build_did_web_client verification
+    // 8. Direct build_did_web_client verification (production builder function)
     let client = build_did_web_client(
         "did-web.example.org",
         fixture_addr,
@@ -1163,8 +1161,66 @@ async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_reje
         .get(&valid_url)
         .send()
         .await
-        .expect("Direct client must connect ignoring invalid proxy env");
+        .expect("Direct client must connect over pinned TLS");
     assert_eq!(direct_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn production_pinned_client_builder_proxy_subprocess_helper() {
+    run_production_pinned_client_tls_fixture().await;
+}
+
+#[tokio::test]
+async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_rejects_redirects() {
+    // 1. Capture parent process environment variables to assert they are never mutated
+    let orig_https_proxy = std::env::var_os("HTTPS_PROXY");
+    let orig_http_proxy = std::env::var_os("HTTP_PROXY");
+    let orig_all_proxy = std::env::var_os("ALL_PROXY");
+
+    // 2. Spawn subprocess with poisoned proxy environment variables
+    let current_exe = std::env::current_exe().expect("Must get current test executable");
+    let output = std::process::Command::new(current_exe)
+        .arg("production_pinned_client_builder_proxy_subprocess_helper")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(
+            "HTTPS_PROXY",
+            "http://invalid-unreachable-proxy.example.local:9999",
+        )
+        .env(
+            "HTTP_PROXY",
+            "http://invalid-unreachable-proxy.example.local:9999",
+        )
+        .env(
+            "ALL_PROXY",
+            "http://invalid-unreachable-proxy.example.local:9999",
+        )
+        .output()
+        .expect("Failed to execute proxy isolation test subprocess");
+
+    assert!(
+        output.status.success(),
+        "Subprocess failed to run with invalid proxy env (no_proxy must bypass invalid proxies):\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 3. Verify parent process environment was never mutated
+    assert_eq!(
+        std::env::var_os("HTTPS_PROXY"),
+        orig_https_proxy,
+        "Parent process HTTPS_PROXY must not be mutated"
+    );
+    assert_eq!(
+        std::env::var_os("HTTP_PROXY"),
+        orig_http_proxy,
+        "Parent process HTTP_PROXY must not be mutated"
+    );
+    assert_eq!(
+        std::env::var_os("ALL_PROXY"),
+        orig_all_proxy,
+        "Parent process ALL_PROXY must not be mutated"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
