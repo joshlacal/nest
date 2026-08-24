@@ -1,4 +1,12 @@
+target/
+**/target/
 catbird/target/
+circle-appview/target/
 patches/jacquard-oauth/target/
+target/**
+**/target/**
+catbird/target/**
+circle-appview/target/**
+patches/jacquard-oauth/target/**
 .claude/
 .DS_Store
