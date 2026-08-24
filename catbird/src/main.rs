@@ -84,14 +84,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Start Circle retry worker when Circle is enabled
     let (circle_shutdown_tx, circle_shutdown_rx) = tokio::sync::watch::channel(false);
-    if state.config.circle.service_url.is_some() {
+    let _circle_worker_handle = if state.config.circle.service_url.is_some() {
         if state.push_db.is_none() {
             anyhow::bail!("Circle is enabled (service_url is configured) but push_db (PostgreSQL) is not configured");
         }
         let circle_service = Arc::new(crate::services::CircleService::new(state.clone()));
-        circle_service.spawn_retry_worker(circle_shutdown_rx);
+        let handle = circle_service.spawn_retry_worker(circle_shutdown_rx);
         tracing::info!("Circle retry worker started");
-    }
+        Some(handle)
+    } else {
+        None
+    };
     // Start background task to update active sessions gauge
     let metrics_state = state.clone();
     let key_prefix = app_config.redis.key_prefix.clone();

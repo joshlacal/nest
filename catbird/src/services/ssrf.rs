@@ -48,6 +48,11 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
 
     match host {
         Host::Ipv4(ipv4) => {
+            #[cfg(debug_assertions)]
+            if ipv4.is_loopback() && is_http {
+                tracing::debug!(url = %url, "SSRF: Allowing loopback in debug mode");
+                return Ok(());
+            }
             if is_private_ipv4(&ipv4) {
                 tracing::warn!(url = %url, ip = %ipv4, "SSRF: Blocked private/loopback IPv4");
                 return Err(AppError::BadRequest(

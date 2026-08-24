@@ -10,6 +10,7 @@ pub struct CircleProjectionOperation {
     pub id: Uuid,
     pub operation_key: String,
     pub actor_did: String,
+    pub session_id: String,
     pub space_uri: String,
     pub kind: CircleProjectionKind,
     pub payload: serde_json::Value,
@@ -63,11 +64,11 @@ impl std::str::FromStr for CircleProjectionKind {
     }
 }
 
-/// The lifecycle state of an outbox projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum CircleProjectionState {
+    Intent,
     Pending,
     Delivered,
     Failed,
@@ -76,6 +77,7 @@ pub enum CircleProjectionState {
 impl CircleProjectionState {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Intent => "intent",
             Self::Pending => "pending",
             Self::Delivered => "delivered",
             Self::Failed => "failed",
@@ -94,6 +96,7 @@ impl std::str::FromStr for CircleProjectionState {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "intent" => Ok(Self::Intent),
             "pending" => Ok(Self::Pending),
             "delivered" => Ok(Self::Delivered),
             "failed" => Ok(Self::Failed),

@@ -265,19 +265,20 @@ impl AtProtoClient {
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
+                let clean_err = e.without_url();
                 let safe_url = sanitize_url_for_logging(url);
                 tracing::error!(
                     request_id = %request_id,
                     attempt = attempt,
                     url = %safe_url,
-                    error = %e,
-                    is_builder = e.is_builder(),
-                    is_request = e.is_request(),
-                    is_connect = e.is_connect(),
-                    is_body = e.is_body(),
+                    error = %clean_err,
+                    is_builder = clean_err.is_builder(),
+                    is_request = clean_err.is_request(),
+                    is_connect = clean_err.is_connect(),
+                    is_body = clean_err.is_body(),
                     "[BFF-UPSTREAM-ERR] Request failed"
                 );
-                return Err(e.into());
+                return Err(clean_err.into());
             }
         };
 
@@ -468,19 +469,20 @@ impl AtProtoClient {
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
+                let clean_err = e.without_url();
                 let safe_url = sanitize_url_for_logging(url);
                 tracing::error!(
                     request_id = %request_id,
                     attempt = attempt,
                     url = %safe_url,
-                    error = %e,
-                    is_builder = e.is_builder(),
-                    is_request = e.is_request(),
-                    is_connect = e.is_connect(),
-                    is_body = e.is_body(),
+                    error = %clean_err,
+                    is_builder = clean_err.is_builder(),
+                    is_request = clean_err.is_request(),
+                    is_connect = clean_err.is_connect(),
+                    is_body = clean_err.is_body(),
                     "[BFF-UPSTREAM-ERR] Request failed"
                 );
-                return Err(e.into());
+                return Err(clean_err.into());
             }
         };
 

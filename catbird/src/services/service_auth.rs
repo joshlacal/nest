@@ -19,9 +19,9 @@ use crate::error::{AppError, AppResult};
 use crate::middleware::JacquardDpopData;
 use crate::models::CatbirdSession;
 use crate::services::{AtProtoClient, ProxyResponse};
+use axum::http::StatusCode;
 use chrono::Utc;
 use std::sync::Arc;
-
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
 pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circle";
 
@@ -157,21 +157,29 @@ impl ServiceAuthProvider {
             ProxyResponse::Buffered { status, body, .. } => {
                 if !(200..300).contains(&status) {
                     let msg = String::from_utf8_lossy(&body).into_owned();
-                    return Err(AppError::Upstream {
-                        status,
-                        message: format!("com.atproto.server.getServiceAuth failed: {}", msg),
+                    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                    let error_code = match status {
+                        401 => "AuthRequired",
+                        403 => "AccessRemoved",
+                        400 => "InvalidRequest",
+                        _ => "UpstreamUnavailable",
+                    };
+                    return Err(AppError::AtprotoResponse {
+                        status: status_code,
+                        error: error_code.into(),
+                        message: format!("com.atproto.server.getServiceAuth failed ({status}): {msg}"),
                     });
                 }
                 body
             }
             ProxyResponse::Streaming { status, .. } => {
-                return Err(AppError::Upstream {
-                    status,
-                    message: "Unexpected streaming response for getServiceAuth".into(),
+                return Err(AppError::AtprotoResponse {
+                    status: StatusCode::BAD_GATEWAY,
+                    error: "UpstreamUnavailable".into(),
+                    message: format!("Unexpected streaming response for getServiceAuth ({status})"),
                 });
             }
         };
-
         let json: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| AppError::Internal(format!("Invalid getServiceAuth JSON response: {}", e)))?;
 
@@ -329,6 +337,7 @@ mod tests {
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
             circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
+            circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_encryption_key: None,
         })
     }
@@ -532,6 +541,7 @@ mod tests {
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
             circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
+            circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_encryption_key: None,
         })
     }

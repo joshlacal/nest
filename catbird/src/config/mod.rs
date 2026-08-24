@@ -412,6 +412,8 @@ pub struct AppState {
     /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
     pub circle_capability: Arc<crate::services::CircleCapabilityService<crate::services::AtProtoCircleProbe>>,
+    /// Liveness flag for the Circle projection retry worker
+    pub circle_worker_alive: Arc<std::sync::atomic::AtomicBool>,
     /// AES-256-GCM encryption key for Redis session records
     pub session_encryption_key: Option<[u8; 32]>,
 }
@@ -490,6 +492,7 @@ impl AppState {
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
+            circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_encryption_key,
         };
         // Initialize KeyStore first (needed by OAuth client)

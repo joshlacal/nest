@@ -94,7 +94,7 @@ impl IntoResponse for AppError {
             AppError::OAuth(msg) => (StatusCode::BAD_REQUEST, "oauth_error", msg.clone()),
             AppError::Upstream { status, message } => {
                 let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-                (status_code, "upstream_error", message.clone())
+                (status_code, "UpstreamUnavailable", message.clone())
             }
             AppError::TokenRefresh(msg) => (
                 StatusCode::UNAUTHORIZED,

@@ -9,11 +9,57 @@ use crate::models::CatbirdSession;
 use crate::services::{CircleService, ServiceAuthProvider};
 use axum::{
     body::Body,
-    extract::{Query, State},
-    http::{header, StatusCode},
+    extract::{FromRequest, FromRequestParts, Request, State},
+    http::{header, request::Parts, StatusCode},
     response::Response,
     Extension, Json,
 };
+
+/// Custom JSON extractor that maps deserialization errors to `InvalidRequest` in standard Lexicon error format.
+pub struct XrpcJson<T>(pub T);
+
+#[axum::async_trait]
+impl<T, S> FromRequest<S> for XrpcJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(val)) => Ok(XrpcJson(val)),
+            Err(rejection) => Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: format!("Malformed request body: {rejection}"),
+            }),
+        }
+    }
+}
+
+/// Custom Query extractor that maps query parameter errors to `InvalidRequest` in standard Lexicon error format.
+pub struct XrpcQuery<T>(pub T);
+
+#[axum::async_trait]
+impl<T, S> FromRequestParts<S> for XrpcQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(val)) => Ok(XrpcQuery(val)),
+            Err(rejection) => Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: format!("Malformed query parameters: {rejection}"),
+            }),
+        }
+    }
+}
 use catbird_atproto::generated::blue_catbird::circle::activate_space::{
     ActivateSpace, ActivateSpaceOutput,
 };
@@ -75,7 +121,7 @@ pub async fn get_capabilities(
 pub async fn create_circle(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
-    Json(input): Json<CreateCircle>,
+    XrpcJson(input): XrpcJson<CreateCircle>,
 ) -> AppResult<Json<CreateCircleOutput>> {
     let service = CircleService::new(state);
     let op = service.create_circle(&session, input).await?;
@@ -89,7 +135,7 @@ pub async fn create_circle(
 pub async fn update_member(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
-    Json(input): Json<UpdateMember>,
+    XrpcJson(input): XrpcJson<UpdateMember>,
 ) -> AppResult<Json<UpdateMemberOutput>> {
     let service = CircleService::new(state);
     let op = service.update_member(&session, input).await?;
@@ -103,7 +149,7 @@ pub async fn update_member(
 pub async fn delete_circle(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
-    Json(input): Json<DeleteCircle>,
+    XrpcJson(input): XrpcJson<DeleteCircle>,
 ) -> AppResult<Json<DeleteCircleOutput>> {
     let service = CircleService::new(state);
     let op = service.delete_circle(&session, input).await?;
@@ -117,7 +163,7 @@ pub async fn delete_circle(
 pub async fn activate_space(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
-    Json(input): Json<ActivateSpace>,
+    XrpcJson(input): XrpcJson<ActivateSpace>,
 ) -> AppResult<Json<ActivateSpaceOutput>> {
     let service = CircleService::new(state);
     let out = service.activate_space(&session, input).await?;
@@ -129,7 +175,7 @@ pub async fn list_circles(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Query(query): Query<ListCircles>,
+    XrpcQuery(query): XrpcQuery<ListCircles>,
 ) -> AppResult<Response> {
     if let Some(limit) = query.limit {
         if !(1..=100).contains(&limit) {
@@ -169,7 +215,7 @@ pub async fn update_preferences(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Json(input): Json<UpdatePreferences>,
+    XrpcJson(input): XrpcJson<UpdatePreferences>,
 ) -> AppResult<Response> {
     let body = serde_json::json!({
         "space": input.space.as_str(),
@@ -191,7 +237,7 @@ pub async fn report_record(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Json(input): Json<ReportRecord>,
+    XrpcJson(input): XrpcJson<ReportRecord>,
 ) -> AppResult<Response> {
     if let Some(details) = &input.details {
         if details.chars().count() > 2000 {
@@ -241,7 +287,7 @@ pub async fn get_feed(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Query(query): Query<GetFeed>,
+    XrpcQuery(query): XrpcQuery<GetFeed>,
 ) -> AppResult<Response> {
     if let Some(limit) = query.limit {
         if !(1..=100).contains(&limit) {
@@ -284,7 +330,7 @@ pub async fn get_post_thread(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Query(query): Query<GetPostThread>,
+    XrpcQuery(query): XrpcQuery<GetPostThread>,
 ) -> AppResult<Response> {
     if let Some(depth) = query.depth {
         if !(0..=10).contains(&depth) {
@@ -331,7 +377,7 @@ pub async fn list_notifications(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Query(query): Query<ListNotifications>,
+    XrpcQuery(query): XrpcQuery<ListNotifications>,
 ) -> AppResult<Response> {
     if let Some(limit) = query.limit {
         if !(1..=100).contains(&limit) {
@@ -371,7 +417,7 @@ pub async fn get_media(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    Query(query): Query<GetMedia>,
+    XrpcQuery(query): XrpcQuery<GetMedia>,
 ) -> AppResult<Response> {
     let qs = format!(
         "?space={}&did={}&cid={}",

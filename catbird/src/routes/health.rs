@@ -66,8 +66,17 @@ pub async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "circle enabled but database not configured",
             );
         }
-    }
 
+        if !state
+            .circle_worker_alive
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "circle retry worker not ready",
+            );
+        }
+    }
     (axum::http::StatusCode::OK, "ready")
 }
 
