@@ -582,7 +582,7 @@ pub struct DecodedRepoCar {
     pub records: Vec<RepoRecord>,
 }
 
-fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
+pub fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
     while val >= 0x80 {
         buf.push(((val & 0x7f) as u8) | 0x80);
         val >>= 7;
@@ -590,20 +590,40 @@ fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
     buf.push(val as u8);
 }
 
-fn decode_varint(slice: &[u8]) -> Result<(u64, usize), CommitError> {
+pub fn decode_varint(slice: &[u8]) -> Result<(u64, usize), CommitError> {
     let mut val = 0u64;
     let mut shift = 0;
     let mut bytes_read = 0;
     for &byte in slice {
         bytes_read += 1;
+        if bytes_read > 10 {
+            return Err(CommitError::InvalidData("Varint exceeds 10 bytes".into()));
+        }
+        if bytes_read == 10 {
+            if byte & 0x80 != 0 {
+                return Err(CommitError::InvalidData(
+                    "10th varint byte has continuation bit set".into(),
+                ));
+            }
+            if byte > 0x01 {
+                return Err(CommitError::InvalidData(
+                    "10th varint byte exceeds maximum u64 value".into(),
+                ));
+            }
+        }
         val |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
+            // Verify canonical minimal encoding by re-encoding
+            let mut check_buf = Vec::with_capacity(bytes_read);
+            encode_varint(val, &mut check_buf);
+            if check_buf.as_slice() != &slice[..bytes_read] {
+                return Err(CommitError::InvalidData(
+                    "Non-minimal varint encoding".into(),
+                ));
+            }
             return Ok((val, bytes_read));
         }
         shift += 7;
-        if shift >= 64 {
-            return Err(CommitError::InvalidData("Varint overflow".into()));
-        }
     }
     Err(CommitError::InvalidData(
         "Unexpected EOF reading varint".into(),
@@ -768,9 +788,11 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         checked_section_bounds(0, header_len, varint_len, car_bytes.len())?;
 
     let header_slice = &car_bytes[header_start..header_end];
+    // Validate strict IPLD rules (rejects floats and duplicate map keys)
+    let _header_ipld: IpldValue = serde_ipld_dagcbor::from_slice(header_slice)
+        .map_err(|e| CommitError::InvalidData(format!("CAR header violates strict IPLD rules: {e}")))?;
     let header: CarHeader = serde_ipld_dagcbor::from_slice(header_slice)
         .map_err(|e| CommitError::InvalidData(format!("Failed to parse CAR header: {e}")))?;
-
     // Verify canonical DAG-CBOR header re-encode equality
     let re_encoded_header = serde_ipld_dagcbor::to_vec(&header).map_err(|e| {
         CommitError::InvalidData(format!("Failed to re-encode CAR header: {e}"))
@@ -816,9 +838,16 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
             "First block CID {b1_cid_str} does not match commit root CID {commit_root_cid_str}"
         )));
     }
+    // First validate strict IPLD rules (rejects floats and duplicate map keys in SignedCommit and extra_data)
+    let _commit_ipld: IpldValue = serde_ipld_dagcbor::from_slice(&b1_data)
+        .map_err(|e| CommitError::InvalidData(format!("SignedCommit violates strict IPLD rules: {e}")))?;
     let commit: SignedCommit = serde_ipld_dagcbor::from_slice(&b1_data)
         .map_err(|e| CommitError::InvalidData(format!("Failed to parse SignedCommit block: {e}")))?;
-
+    if commit.extra_data.as_ref().is_some_and(|extra| !extra.is_empty()) {
+        return Err(CommitError::InvalidData(
+            "SignedCommit contains unknown fields".into(),
+        ));
+    }
     // Verify canonical DAG-CBOR SignedCommit re-encode equality
     let re_encoded_commit = serde_ipld_dagcbor::to_vec(&commit).map_err(|e| {
         CommitError::InvalidData(format!("Failed to re-encode SignedCommit block: {e}"))
@@ -828,7 +857,6 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
             "Non-canonical DAG-CBOR SignedCommit block encoding".into(),
         ));
     }
-
     // Recompute blessed CIDv1 of commit block and verify against header roots[0]
     let (computed_commit_cid_bytes, computed_commit_cid_str) =
         create_cid_bytes_from_data(&b1_data);

@@ -9,7 +9,6 @@ use catbird_atproto::generated::blue_catbird::circle::{
     activate_space::ActivateSpaceOutput,
     defs::AccessState,
     get_capabilities::GetCapabilitiesOutput,
-    get_feed::{GetFeed, GetFeedOutput},
     list_circles::{ListCircles, ListCirclesOutput},
     list_notifications::{ListNotifications, ListNotificationsOutput},
 };
@@ -42,7 +41,14 @@ pub fn create_router(state: AppState) -> Router {
         );
     // Authenticated XRPC endpoints
     let authenticated_routes = Router::new()
-        .route("/xrpc/blue.catbird.circle.getFeed", get(get_feed_handler))
+        .route(
+            "/xrpc/blue.catbird.circle.getFeed",
+            get(crate::handlers::feed::get_feed_handler),
+        )
+        .route(
+            "/xrpc/blue.catbird.circle.getPostThread",
+            get(crate::handlers::thread::get_post_thread_handler),
+        )
         .route(
             "/xrpc/blue.catbird.circle.listCircles",
             get(list_circles_handler),
@@ -80,19 +86,6 @@ async fn get_capabilities() -> Json<GetCapabilitiesOutput> {
     })
 }
 
-async fn get_feed_handler(
-    Extension(_user): Extension<AuthenticatedUser>,
-    Query(_query): Query<GetFeed>,
-    State(_state): State<AppState>,
-) -> Result<Json<GetFeedOutput>, AppError> {
-    tracing::debug!("Handling getFeed request");
-
-    Ok(Json(GetFeedOutput {
-        feed: Vec::new(),
-        cursor: None,
-        extra_data: None,
-    }))
-}
 
 async fn list_circles_handler(
     Extension(_user): Extension<AuthenticatedUser>,

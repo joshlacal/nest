@@ -96,6 +96,8 @@ pub enum AppError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Access removed: {0}")]
+    AccessRemoved(String),
     #[error("Not found: {0}")]
     NotFound(String),
 
@@ -132,6 +134,10 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => {
                 tracing::warn!("Forbidden access attempt: {}", msg);
                 (StatusCode::FORBIDDEN, "Forbidden", msg.clone())
+            }
+            AppError::AccessRemoved(msg) => {
+                tracing::warn!("Access removed: {}", msg);
+                (StatusCode::FORBIDDEN, "AccessRemoved", msg.clone())
             }
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NotFound", msg.clone()),
             AppError::InvalidRequest(msg) => {

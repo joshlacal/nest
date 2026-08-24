@@ -382,11 +382,13 @@ impl SyncEngine {
         for mutation in staged_mutations {
             match mutation {
                 StagedMutation::UpsertRecord { valid, cid } => {
-                    // Clean up any existing notification generated from this record (e.g. valid update)
-                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
-                        .bind(&valid.uri)
-                        .execute(&mut *tx)
-                        .await?;
+                    let existing_rec_cid: Option<String> = sqlx::query_as::<_, (String,)>(
+                        "SELECT cid FROM circle_records WHERE uri = $1 AND deleted_at IS NULL",
+                    )
+                    .bind(&valid.uri)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|(c,)| c);
 
                     sqlx::query(
                         r#"
@@ -436,55 +438,144 @@ impl SyncEngine {
 
                         // Create notification for like
                         let post_author: Option<(String,)> =
-                            sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
+                            sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
                                 .bind(post_uri)
                                 .fetch_optional(&mut *tx)
                                 .await?;
 
                         if let Some((recipient,)) = post_author {
                             if recipient != valid.author_did {
-                                sqlx::query(
-                                    r#"
-                                    INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
-                                    VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
-                                    "#,
+                                let existing_notif: Option<(Uuid, String, String, String, String, Option<String>)> = sqlx::query_as(
+                                    "SELECT id, recipient_did, space_uri, actor_did, reason, subject_uri FROM circle_notifications WHERE source_uri = $1",
                                 )
-                                .bind(Uuid::new_v4())
-                                .bind(&recipient)
-                                .bind(space_uri)
-                                .bind(&valid.author_did)
-                                .bind(post_uri)
+                                .bind(&valid.uri)
+                                .fetch_optional(&mut *tx)
+                                .await?;
+
+                                let is_unchanged = if let Some(old_cid) = &existing_rec_cid {
+                                    if old_cid == &cid {
+                                        if let Some((_, rec, sp, act, rsn, subj)) = &existing_notif {
+                                            rec == &recipient
+                                                && sp == space_uri
+                                                && act == &valid.author_did
+                                                && rsn == "like"
+                                                && subj.as_deref() == Some(post_uri)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                                if !is_unchanged {
+                                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                                        .bind(&valid.uri)
+                                        .execute(&mut *tx)
+                                        .await?;
+
+                                    sqlx::query(
+                                        r#"
+                                        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                                        VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+                                        "#,
+                                    )
+                                    .bind(Uuid::new_v4())
+                                    .bind(&recipient)
+                                    .bind(space_uri)
+                                    .bind(&valid.author_did)
+                                    .bind(post_uri)
+                                    .bind(&valid.uri)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                }
+                            } else {
+                                sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                                    .bind(&valid.uri)
+                                    .execute(&mut *tx)
+                                    .await?;
+                            }
+                        } else {
+                            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
                                 .bind(&valid.uri)
                                 .execute(&mut *tx)
                                 .await?;
-                            }
                         }
                     } else if let Some(parent_uri) = &valid.parent_uri {
                         // Create notification for reply
                         let parent_author: Option<(String,)> =
-                            sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
+                            sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
                                 .bind(parent_uri)
                                 .fetch_optional(&mut *tx)
                                 .await?;
 
                         if let Some((recipient,)) = parent_author {
                             if recipient != valid.author_did {
-                                sqlx::query(
-                                    r#"
-                                    INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
-                                    VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
-                                    "#,
+                                let existing_notif: Option<(Uuid, String, String, String, String, Option<String>)> = sqlx::query_as(
+                                    "SELECT id, recipient_did, space_uri, actor_did, reason, subject_uri FROM circle_notifications WHERE source_uri = $1",
                                 )
-                                .bind(Uuid::new_v4())
-                                .bind(&recipient)
-                                .bind(space_uri)
-                                .bind(&valid.author_did)
                                 .bind(&valid.uri)
+                                .fetch_optional(&mut *tx)
+                                .await?;
+
+                                let is_unchanged = if let Some(old_cid) = &existing_rec_cid {
+                                    if old_cid == &cid {
+                                        if let Some((_, rec, sp, act, rsn, subj)) = &existing_notif {
+                                            rec == &recipient
+                                                && sp == space_uri
+                                                && act == &valid.author_did
+                                                && rsn == "reply"
+                                                && subj.as_deref() == Some(&valid.uri)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                                if !is_unchanged {
+                                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                                        .bind(&valid.uri)
+                                        .execute(&mut *tx)
+                                        .await?;
+
+                                    sqlx::query(
+                                        r#"
+                                        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                                        VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
+                                        "#,
+                                    )
+                                    .bind(Uuid::new_v4())
+                                    .bind(&recipient)
+                                    .bind(space_uri)
+                                    .bind(&valid.author_did)
+                                    .bind(&valid.uri)
+                                    .bind(&valid.uri)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                }
+                            } else {
+                                sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                                    .bind(&valid.uri)
+                                    .execute(&mut *tx)
+                                    .await?;
+                            }
+                        } else {
+                            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
                                 .bind(&valid.uri)
                                 .execute(&mut *tx)
                                 .await?;
-                            }
                         }
+                    } else {
+                        sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                            .bind(&valid.uri)
+                            .execute(&mut *tx)
+                            .await?;
                     }
                 }
                 StagedMutation::DeleteRecord { uri } => {
@@ -704,11 +795,13 @@ impl SyncEngine {
         for (valid, cid_str) in staged_valid_records {
             recovered_uris.insert(valid.uri.clone());
 
-            // Clean up old notifications for this source_uri before re-creating
-            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
-                .bind(&valid.uri)
-                .execute(&mut *tx)
-                .await?;
+            let existing_rec_cid: Option<String> = sqlx::query_as::<_, (String,)>(
+                "SELECT cid FROM circle_records WHERE uri = $1 AND deleted_at IS NULL",
+            )
+            .bind(&valid.uri)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|(c,)| c);
 
             sqlx::query(
                 r#"
@@ -757,54 +850,143 @@ impl SyncEngine {
                 .await?;
 
                 let post_author: Option<(String,)> =
-                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
+                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
                         .bind(post_uri)
                         .fetch_optional(&mut *tx)
                         .await?;
 
                 if let Some((recipient,)) = post_author {
                     if recipient != valid.author_did {
-                        sqlx::query(
-                            r#"
-                            INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
-                            VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
-                            "#,
+                        let existing_notif: Option<(Uuid, String, String, String, String, Option<String>)> = sqlx::query_as(
+                            "SELECT id, recipient_did, space_uri, actor_did, reason, subject_uri FROM circle_notifications WHERE source_uri = $1",
                         )
-                        .bind(Uuid::new_v4())
-                        .bind(&recipient)
-                        .bind(space_uri)
-                        .bind(&valid.author_did)
-                        .bind(post_uri)
+                        .bind(&valid.uri)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+
+                        let is_unchanged = if let Some(old_cid) = &existing_rec_cid {
+                            if old_cid == &cid_str {
+                                if let Some((_, rec, sp, act, rsn, subj)) = &existing_notif {
+                                    rec == &recipient
+                                        && sp == space_uri
+                                        && act == &valid.author_did
+                                        && rsn == "like"
+                                        && subj.as_deref() == Some(post_uri)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if !is_unchanged {
+                            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                                .bind(&valid.uri)
+                                .execute(&mut *tx)
+                                .await?;
+
+                            sqlx::query(
+                                r#"
+                                INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                                VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+                                "#,
+                            )
+                            .bind(Uuid::new_v4())
+                            .bind(&recipient)
+                            .bind(space_uri)
+                            .bind(&valid.author_did)
+                            .bind(post_uri)
+                            .bind(&valid.uri)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    } else {
+                        sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                            .bind(&valid.uri)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                } else {
+                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
                         .bind(&valid.uri)
                         .execute(&mut *tx)
                         .await?;
-                    }
                 }
             } else if let Some(parent_uri) = &valid.parent_uri {
                 let parent_author: Option<(String,)> =
-                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
+                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
                         .bind(parent_uri)
                         .fetch_optional(&mut *tx)
                         .await?;
 
                 if let Some((recipient,)) = parent_author {
                     if recipient != valid.author_did {
-                        sqlx::query(
-                            r#"
-                            INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
-                            VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
-                            "#,
+                        let existing_notif: Option<(Uuid, String, String, String, String, Option<String>)> = sqlx::query_as(
+                            "SELECT id, recipient_did, space_uri, actor_did, reason, subject_uri FROM circle_notifications WHERE source_uri = $1",
                         )
-                        .bind(Uuid::new_v4())
-                        .bind(&recipient)
-                        .bind(space_uri)
-                        .bind(&valid.author_did)
                         .bind(&valid.uri)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+
+                        let is_unchanged = if let Some(old_cid) = &existing_rec_cid {
+                            if old_cid == &cid_str {
+                                if let Some((_, rec, sp, act, rsn, subj)) = &existing_notif {
+                                    rec == &recipient
+                                        && sp == space_uri
+                                        && act == &valid.author_did
+                                        && rsn == "reply"
+                                        && subj.as_deref() == Some(&valid.uri)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if !is_unchanged {
+                            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                                .bind(&valid.uri)
+                                .execute(&mut *tx)
+                                .await?;
+
+                            sqlx::query(
+                                r#"
+                                INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                                VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
+                                "#,
+                            )
+                            .bind(Uuid::new_v4())
+                            .bind(&recipient)
+                            .bind(space_uri)
+                            .bind(&valid.author_did)
+                            .bind(&valid.uri)
+                            .bind(&valid.uri)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    } else {
+                        sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                            .bind(&valid.uri)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                } else {
+                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
                         .bind(&valid.uri)
                         .execute(&mut *tx)
                         .await?;
-                    }
                 }
+            } else {
+                sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                    .bind(&valid.uri)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
 

@@ -4,10 +4,14 @@ pub mod commit;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod feed;
+pub mod handlers;
+pub mod hydration;
 pub mod projections;
 pub mod routes;
 pub mod space_client;
 pub mod sync;
+pub mod thread;
 pub mod validator;
 pub use auth::{
     authenticate, AuthenticatedUser, DidDocument, DidResolver, PublicKeyJwk, VerificationMethod,

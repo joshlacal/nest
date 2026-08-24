@@ -23,8 +23,8 @@ use circle_appview::auth::{
 };
 use circle_appview::commit::{
     compute_commit_context, compute_commit_mac, compute_dagcbor_cid, decode_repo_car,
-    derive_commit_mac_key, json_to_ipld, mint_repo_car, mint_signed_commit, verify_commit,
-    CommitError, IpldValue, LtHash, RepoRecord,
+    derive_commit_mac_key, mint_repo_car, mint_signed_commit, verify_commit,
+    CommitError, LtHash, RepoRecord,
 };
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
@@ -38,6 +38,9 @@ const OWNER_DID: &str = "did:plc:alice-sync-test";
 const BOB_DID: &str = "did:plc:bob-sync-test";
 const DAVE_DID: &str = "did:plc:dave-sync-test";
 const SPACE_URI: &str = "at://did:plc:alice-sync-test/space/blue.catbird.circle/test-circle";
+const OWNER_POST_CID: &str = "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5z";
+const WRONG_POST_CID: &str = "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5w";
+const OTHER_POST_CID: &str = "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5y";
 
 fn owner() -> &'static str {
     OWNER_DID
@@ -78,11 +81,11 @@ fn bob_reply_to_owner_in_same_space() -> RecordCandidate {
             "reply": {
                 "root": {
                     "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                    "cid": "bafyreih327owner1"
+                    "cid": OWNER_POST_CID
                 },
                 "parent": {
                     "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                    "cid": "bafyreih327owner1"
+                    "cid": OWNER_POST_CID
                 }
             }
         }),
@@ -99,7 +102,7 @@ fn bob_like_owner_in_same_space() -> RecordCandidate {
             "$type": "app.bsky.feed.like",
             "subject": {
                 "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                "cid": "bafyreih327owner1"
+                "cid": OWNER_POST_CID
             },
             "createdAt": "2026-08-24T12:10:00.000Z"
         }),
@@ -133,11 +136,11 @@ fn dave_reply() -> RecordCandidate {
             "reply": {
                 "root": {
                     "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                    "cid": "bafyreih327owner1"
+                    "cid": OWNER_POST_CID
                 },
                 "parent": {
                     "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                    "cid": "bafyreih327owner1"
+                    "cid": OWNER_POST_CID
                 }
             }
         }),
@@ -157,11 +160,11 @@ fn cross_space_reply() -> RecordCandidate {
             "reply": {
                 "root": {
                     "uri": "at://did:plc:other/space/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
-                    "cid": "bafyreih327othercid"
+                    "cid": OTHER_POST_CID
                 },
                 "parent": {
                     "uri": "at://did:plc:other/space/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
-                    "cid": "bafyreih327othercid"
+                    "cid": OTHER_POST_CID
                 }
             }
         }),
@@ -182,7 +185,7 @@ fn quote_post() -> RecordCandidate {
                 "$type": "app.bsky.embed.record",
                 "record": {
                     "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                    "cid": "bafyreih327owner1"
+                    "cid": OWNER_POST_CID
                 }
             }
         }),
@@ -199,7 +202,7 @@ fn repost_record() -> RecordCandidate {
             "$type": "app.bsky.feed.repost",
             "subject": {
                 "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-                "cid": "bafyreih327owner1"
+                "cid": OWNER_POST_CID
             },
             "createdAt": "2026-08-24T12:35:00.000Z"
         }),
@@ -216,7 +219,7 @@ fn accepts_owner_post_and_same_space_member_reply() {
         .with_space_uri(space())
         .with_known_posts([(
             format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-            "bafyreih327owner1",
+            OWNER_POST_CID,
         )]);
 
     assert!(validate(owner_post(), &policy).is_ok());
@@ -230,7 +233,7 @@ fn rejects_nonmember_top_level_cross_space_and_quote() {
         .with_space_uri(space())
         .with_known_posts([(
             format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
-            "bafyreih327owner1",
+            OWNER_POST_CID,
         )]);
 
     assert_eq!(
@@ -446,6 +449,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: "did:web:appview.catbird.blue".into(),
         plc_directory_url: "https://plc.directory".into(),
+        public_appview_url: "https://public.api.bsky.app".into(),
         nest_client_id: "https://nest.catbird.blue/client-metadata.json".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: vec![],
@@ -1307,8 +1311,8 @@ fn author_pds_resolution_requires_exact_atproto_pds_id_and_type() {
 #[test]
 fn strong_references_require_and_verify_matching_cid() {
     let owner_post_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111");
-    let correct_cid = "bafyreih327owner1";
-    let wrong_cid = "bafyreih327wrong9";
+    let correct_cid = OWNER_POST_CID;
+    let wrong_cid = WRONG_POST_CID;
 
     let test_policy = policy(OWNER_DID, [BOB_DID])
         .with_space_uri(SPACE_URI)
@@ -2539,88 +2543,446 @@ fn strict_car_rejects_noncanonical_signed_commit_dagcbor() {
     };
 
     let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    assert!(decode_repo_car(&valid_car).is_ok());
+    let decoded = decode_repo_car(&valid_car).unwrap();
 
-    // Tamper SignedCommit block bytes with non-canonical CBOR encoding
-    // Find block 1 in CAR and modify a byte in commit data
-    let mut tampered_car = valid_car.clone();
-    // Mutate a byte in the commit payload to invalidate canonical re-encode equality or CID
-    let header_len_info = circle_appview::commit::checked_section_bounds(0, 0, 1, tampered_car.len());
-    if let Ok((_start, _end)) = header_len_info {
-        // Invalidate commit block signature byte or map key ordering
-        let last_idx = tampered_car.len() - 10;
-        tampered_car[last_idx] ^= 0xff;
-        let decode_res = decode_repo_car(&tampered_car);
-        assert!(decode_res.is_err(), "Tampered CAR must fail strict decoding");
-    }
+    // Build a SignedCommit block with non-canonical key order in DAG-CBOR
+    // Canonical keys (length 3 sorted, then length 4): ikm, mac, rev, sig, ver, hash
+    // Encode map with reversed key order: hash, ver, sig, rev, mac, ikm
+    let mut noncanonical_commit_cbor = Vec::new();
+    noncanonical_commit_cbor.push(0xa6);
+    noncanonical_commit_cbor.extend_from_slice(&[0x64, b'h', b'a', b's', b'h', 0x58, commit.hash.len() as u8]);
+    noncanonical_commit_cbor.extend_from_slice(commit.hash.as_ref());
+    noncanonical_commit_cbor.extend_from_slice(&[0x63, b'v', b'e', b'r', 0x01]);
+    noncanonical_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);
+    noncanonical_commit_cbor.extend_from_slice(commit.sig.as_ref());
+    noncanonical_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
+    noncanonical_commit_cbor.extend_from_slice(commit.rev.as_bytes());
+    noncanonical_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
+    noncanonical_commit_cbor.extend_from_slice(commit.mac.as_ref());
+    noncanonical_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
+    noncanonical_commit_cbor.extend_from_slice(commit.ikm.as_ref());
+
+    let (nc_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&noncanonical_commit_cbor);
+    let nc_cid_link = circle_appview::commit::CidLink::from_bytes(nc_cid_bytes.clone());
+    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+
+    let header = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![nc_cid_link, drisl_cid_link],
+    };
+    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
+
+    let mut tampered_car = Vec::new();
+    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&header_cbor);
+
+    circle_appview::commit::encode_varint((nc_cid_bytes.len() + noncanonical_commit_cbor.len()) as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&nc_cid_bytes);
+    tampered_car.extend_from_slice(&noncanonical_commit_cbor);
+
+    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
+    let (b1_len, b1_vlen) = circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
+    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
+    tampered_car.extend_from_slice(&valid_car[remaining_offset..]);
+
+    let res = decode_repo_car(&tampered_car);
+    assert!(res.is_err(), "Non-canonical SignedCommit block encoding must be rejected");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("Non-canonical DAG-CBOR SignedCommit") || err_msg.contains("strict IPLD"));
+}
+
+#[test]
+fn strict_car_rejects_signed_commit_with_extra_data_float() {
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
+    let rec = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7post1".to_string(),
+        cid: "bafyreih327testcid1".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Valid post",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
+
+    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
+    let decoded = decode_repo_car(&valid_car).unwrap();
+
+    // Encode SignedCommit with keys in canonical DAG-CBOR order (3-byte keys, then 4-byte key 'hash', then 11-byte key 'extra_float' containing CBOR float 0xfa 0x42 0x2a 0x00 0x00)
+    let mut float_commit_cbor = Vec::new();
+    float_commit_cbor.push(0xa7); // 7 entries
+    float_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
+    float_commit_cbor.extend_from_slice(commit.ikm.as_ref());
+    float_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
+    float_commit_cbor.extend_from_slice(commit.mac.as_ref());
+    float_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
+    float_commit_cbor.extend_from_slice(commit.rev.as_bytes());
+    float_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);
+    float_commit_cbor.extend_from_slice(commit.sig.as_ref());
+    float_commit_cbor.extend_from_slice(&[0x63, b'v', b'e', b'r', 0x01]);
+    float_commit_cbor.extend_from_slice(&[0x64, b'h', b'a', b's', b'h', 0x58, commit.hash.len() as u8]);
+    float_commit_cbor.extend_from_slice(commit.hash.as_ref());
+    float_commit_cbor.extend_from_slice(&[0x6b, b'e', b'x', b't', b'r', b'a', b'_', b'f', b'l', b'o', b'a', b't', 0xfa, 0x42, 0x2a, 0x00, 0x00]);
+    let (float_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&float_commit_cbor);
+    let float_cid_link = circle_appview::commit::CidLink::from_bytes(float_cid_bytes.clone());
+    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+
+    let header = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![float_cid_link, drisl_cid_link],
+    };
+    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
+
+    let mut tampered_car = Vec::new();
+    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&header_cbor);
+
+    circle_appview::commit::encode_varint((float_cid_bytes.len() + float_commit_cbor.len()) as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&float_cid_bytes);
+    tampered_car.extend_from_slice(&float_commit_cbor);
+
+    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
+    let (b1_len, b1_vlen) = circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
+    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
+    tampered_car.extend_from_slice(&valid_car[remaining_offset..]);
+
+    let res = decode_repo_car(&tampered_car);
+    assert!(res.is_err(), "SignedCommit containing float must be rejected by strict IPLD decoding");
+    assert!(res.unwrap_err().to_string().contains("Floating point numbers are forbidden"));
+}
+#[test]
+fn strict_car_rejects_signed_commit_with_unknown_extra_data() {
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
+    let rec = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7post1".to_string(),
+        cid: "bafyreih327testcid1".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Valid post",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
+
+    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
+    let decoded = decode_repo_car(&valid_car).unwrap();
+
+    // Canonical SignedCommit CBOR with canonical extra string field: extra_field: "value"
+    let mut extra_commit_cbor = Vec::new();
+    extra_commit_cbor.push(0xa7); // 7 entries
+    extra_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
+    extra_commit_cbor.extend_from_slice(commit.ikm.as_ref());
+    extra_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
+    extra_commit_cbor.extend_from_slice(commit.mac.as_ref());
+    extra_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
+    extra_commit_cbor.extend_from_slice(commit.rev.as_bytes());
+    extra_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);
+    extra_commit_cbor.extend_from_slice(commit.sig.as_ref());
+    extra_commit_cbor.extend_from_slice(&[0x63, b'v', b'e', b'r', 0x01]);
+    extra_commit_cbor.extend_from_slice(&[0x64, b'h', b'a', b's', b'h', 0x58, commit.hash.len() as u8]);
+    extra_commit_cbor.extend_from_slice(commit.hash.as_ref());
+    // 11-byte key 'extra_field', 5-byte string 'value' (0x65, b'v', b'a', b'l', b'u', b'e')
+    extra_commit_cbor.extend_from_slice(&[0x6b, b'e', b'x', b't', b'r', b'a', b'_', b'f', b'i', b'e', b'l', b'd', 0x65, b'v', b'a', b'l', b'u', b'e']);
+
+    let (extra_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&extra_commit_cbor);
+    let extra_cid_link = circle_appview::commit::CidLink::from_bytes(extra_cid_bytes.clone());
+    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+
+    let header = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![extra_cid_link, drisl_cid_link],
+    };
+    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
+
+    let mut tampered_car = Vec::new();
+    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&header_cbor);
+
+    circle_appview::commit::encode_varint((extra_cid_bytes.len() + extra_commit_cbor.len()) as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&extra_cid_bytes);
+    tampered_car.extend_from_slice(&extra_commit_cbor);
+
+    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
+    let (b1_len, b1_vlen) = circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
+    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
+    tampered_car.extend_from_slice(&valid_car[remaining_offset..]);
+
+    let res = decode_repo_car(&tampered_car);
+    assert!(res.is_err(), "SignedCommit containing unknown extra_data must be rejected");
+    assert!(res.unwrap_err().to_string().contains("SignedCommit contains unknown fields"));
 }
 
 #[test]
 fn strict_car_rejects_cidv0_and_unblessed_cidv1_codecs() {
-    // 1. CIDv0 bytes (starts with 0x12 0x20...) -> rejected by blessed CID parser
-    let mut cidv0_block = vec![0x12, 0x20];
-    cidv0_block.extend_from_slice(&[0xaa; 32]);
-    cidv0_block.extend_from_slice(b"payload data");
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
+    let rec = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7post1".to_string(),
+        cid: "bafyreih327testcid1".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Valid post",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
 
-    // CAR with CIDv0 block must fail decode
-    let decode_res = decode_repo_car(&cidv0_block);
-    assert!(decode_res.is_err());
+    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
+    let decoded = decode_repo_car(&valid_car).unwrap();
+    let commit_cbor = serde_ipld_dagcbor::to_vec(&commit).unwrap();
+    use sha2::Digest;
+    let commit_digest = sha2::Sha256::digest(&commit_cbor);
 
-    // 2. Unblessed CIDv1 codec (0x55 for raw binary instead of 0x71 for dag-cbor)
+    // 1. CAR with CIDv0 root (starts with 0x12, 0x20...) in block 1
+    let mut cidv0_bytes = vec![0x12, 0x20];
+    cidv0_bytes.extend_from_slice(&commit_digest);
+    let cidv0_link = circle_appview::commit::CidLink::from_bytes(cidv0_bytes.clone());
+    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+
+    let header_v0 = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![cidv0_link, drisl_cid_link.clone()],
+    };
+    let header_v0_cbor = serde_ipld_dagcbor::to_vec(&header_v0).unwrap();
+    let mut car_v0 = Vec::new();
+    circle_appview::commit::encode_varint(header_v0_cbor.len() as u64, &mut car_v0);
+    car_v0.extend_from_slice(&header_v0_cbor);
+    circle_appview::commit::encode_varint((cidv0_bytes.len() + commit_cbor.len()) as u64, &mut car_v0);
+    car_v0.extend_from_slice(&cidv0_bytes);
+    car_v0.extend_from_slice(&commit_cbor);
+
+    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
+    let (b1_len, b1_vlen) = circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
+    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
+    car_v0.extend_from_slice(&valid_car[remaining_offset..]);
+
+    let res_v0 = decode_repo_car(&car_v0);
+    assert!(res_v0.is_err(), "CIDv0 root and block in CAR must be rejected");
+
+    // 2. CAR with unblessed CIDv1 codec (0x55 raw binary instead of 0x71 dag-cbor)
     let mut unblessed_cidv1 = vec![0x01, 0x55, 0x12, 0x20];
-    unblessed_cidv1.extend_from_slice(&[0xbb; 32]);
-    unblessed_cidv1.extend_from_slice(b"payload data");
-    let decode_res2 = decode_repo_car(&unblessed_cidv1);
-    assert!(decode_res2.is_err());
+    unblessed_cidv1.extend_from_slice(&commit_digest);
+    let unblessed_link = circle_appview::commit::CidLink::from_bytes(unblessed_cidv1.clone());
+
+    let header_unblessed = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![unblessed_link, drisl_cid_link],
+    };
+    let header_unblessed_cbor = serde_ipld_dagcbor::to_vec(&header_unblessed).unwrap();
+    let mut car_unblessed = Vec::new();
+    circle_appview::commit::encode_varint(header_unblessed_cbor.len() as u64, &mut car_unblessed);
+    car_unblessed.extend_from_slice(&header_unblessed_cbor);
+    circle_appview::commit::encode_varint((unblessed_cidv1.len() + commit_cbor.len()) as u64, &mut car_unblessed);
+    car_unblessed.extend_from_slice(&unblessed_cidv1);
+    car_unblessed.extend_from_slice(&commit_cbor);
+    car_unblessed.extend_from_slice(&valid_car[remaining_offset..]);
+
+    let res_unblessed = decode_repo_car(&car_unblessed);
+    assert!(res_unblessed.is_err(), "Unblessed CIDv1 codec 0x55 must be rejected");
 }
 
 #[test]
-fn strict_car_rejects_floats_and_non_integers_in_cbor_and_json() {
-    // 1. Floats in json_to_ipld must be strictly rejected
-    let float_json = json!({
-        "text": "post with float",
-        "count": 42.5
-    });
-    let res = json_to_ipld(&float_json);
-    assert!(res.is_err(), "Floats in JSON must be rejected by json_to_ipld");
+fn strict_car_rejects_non_minimal_and_overflowing_varints() {
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
+    let rec = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7post1".to_string(),
+        cid: "bafyreih327testcid1".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Valid post",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
 
-    // 2. Whole integer in json_to_ipld must succeed
-    let int_json = json!({
-        "text": "post with int",
-        "count": 42
-    });
-    assert!(json_to_ipld(&int_json).is_ok());
+    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
+    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
 
-    // 3. Float in CBOR payload must be rejected during IpldValue deserialization
-    // CBOR major type 7 float 42.5 = 0xf9 0x51 0x50 (half precision) or 0xfa 0x42 0x2a 0x00 0x00
-    let cbor_float = vec![0xfa, 0x42, 0x2a, 0x00, 0x00];
-    let ipld_res: Result<IpldValue, _> = serde_ipld_dagcbor::from_slice(&cbor_float);
-    assert!(ipld_res.is_err(), "Floats in DAG-CBOR must be rejected by IpldVisitor");
+    // 1. Re-encode header varint with non-minimal overlong encoding
+    let mut non_minimal_car = Vec::new();
+    let val = h_len;
+    non_minimal_car.push(((val & 0x7f) as u8) | 0x80);
+    non_minimal_car.push((val >> 7) as u8); // extra byte
+    non_minimal_car.extend_from_slice(&valid_car[h_vlen..]);
+
+    let res_non_minimal = decode_repo_car(&non_minimal_car);
+    assert!(res_non_minimal.is_err(), "Non-minimal varint encoding must be rejected");
+    assert!(res_non_minimal.unwrap_err().to_string().contains("Non-minimal varint"));
+
+    // 2. 10-byte varint where 10th byte exceeds max u64 (> 0x01)
+    let mut overflow_car = Vec::new();
+    overflow_car.extend_from_slice(&[0xff; 9]);
+    overflow_car.push(0x02);
+    overflow_car.extend_from_slice(&valid_car[h_vlen..]);
+
+    let res_overflow = decode_repo_car(&overflow_car);
+    assert!(res_overflow.is_err(), "10th varint byte exceeding max u64 must be rejected");
+    assert!(res_overflow.unwrap_err().to_string().contains("10th varint byte exceeds maximum u64"));
+
+    // 3. 10-byte varint where 10th byte has continuation bit set (0x80)
+    let mut cont_car = Vec::new();
+    cont_car.extend_from_slice(&[0xff; 9]);
+    cont_car.push(0x80);
+    cont_car.extend_from_slice(&valid_car[h_vlen..]);
+
+    let res_cont = decode_repo_car(&cont_car);
+    assert!(res_cont.is_err(), "10th varint byte with continuation bit set must be rejected");
+    assert!(res_cont.unwrap_err().to_string().contains("continuation bit"));
 }
 
 #[test]
 fn strict_car_rejects_duplicate_map_keys_in_ipld_and_drisl() {
-    // Construct CBOR map with 2 entries having identical key "key":
-    // 0xa2 (map len 2), 0x63 "key" 0x01 (val 1), 0x63 "key" 0x02 (val 2)
-    let mut dup_map_cbor = vec![0xa2];
-    dup_map_cbor.extend_from_slice(&[0x63, b'k', b'e', b'y', 0x01]);
-    dup_map_cbor.extend_from_slice(&[0x63, b'k', b'e', b'y', 0x02]);
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
+    let rec = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7post1".to_string(),
+        cid: "bafyreih327testcid1".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Valid post",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
 
-    let res: Result<IpldValue, _> = serde_ipld_dagcbor::from_slice(&dup_map_cbor);
-    assert!(res.is_err(), "Duplicate map keys must be rejected by IpldVisitor");
+    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
+    let decoded = decode_repo_car(&valid_car).unwrap();
+
+    // Construct DRISL map block with duplicate map key
+    let (dummy_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(b"dummy data");
+    let link = circle_appview::commit::CidLink::from_bytes(dummy_cid_bytes);
+    let link_cbor = serde_ipld_dagcbor::to_vec(&link).unwrap();
+
+    let mut dup_drisl_cbor = Vec::new();
+    dup_drisl_cbor.push(0xa2); // 2 map entries
+    let key = "app.bsky.feed.post/3l7post1";
+    dup_drisl_cbor.push(0x78);
+    dup_drisl_cbor.push(key.len() as u8);
+    dup_drisl_cbor.extend_from_slice(key.as_bytes());
+    dup_drisl_cbor.extend_from_slice(&link_cbor);
+
+    dup_drisl_cbor.push(0x78);
+    dup_drisl_cbor.push(key.len() as u8);
+    dup_drisl_cbor.extend_from_slice(key.as_bytes());
+    dup_drisl_cbor.extend_from_slice(&link_cbor);
+
+    let (dup_drisl_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&dup_drisl_cbor);
+    let dup_drisl_cid_link = circle_appview::commit::CidLink::from_bytes(dup_drisl_cid_bytes.clone());
+    let commit_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.commit_cid).unwrap();
+
+    let header = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![commit_cid_link, dup_drisl_cid_link],
+    };
+    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
+
+    let mut tampered_car = Vec::new();
+    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&header_cbor);
+
+    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
+    let (b1_len, b1_vlen) = circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
+    let b1_start = h_vlen + h_len as usize;
+    let b1_end = b1_start + b1_vlen + b1_len as usize;
+    tampered_car.extend_from_slice(&valid_car[b1_start..b1_end]);
+
+    circle_appview::commit::encode_varint((dup_drisl_cid_bytes.len() + dup_drisl_cbor.len()) as u64, &mut tampered_car);
+    tampered_car.extend_from_slice(&dup_drisl_cid_bytes);
+    tampered_car.extend_from_slice(&dup_drisl_cbor);
+
+    let res = decode_repo_car(&tampered_car);
+    assert!(res.is_err(), "Duplicate map keys in DRISL block must be rejected");
+    assert!(res.unwrap_err().to_string().contains("Duplicate map key"));
 }
-
 #[test]
-fn strict_car_rejects_varint_overflow_and_bounds_overflow() {
-    // 1. Test checked_section_bounds with u64::MAX
-    let bounds_res = circle_appview::commit::checked_section_bounds(10, u64::MAX, 2, 1000);
-    assert!(bounds_res.is_err(), "u64::MAX length must be rejected with overflow error");
+fn strict_car_rejects_duplicate_map_keys_in_record_block() {
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-    // 2. Buffer declaring u64::MAX section length
-    let mut overflow_car = vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]; // varint for huge number
-    overflow_car.extend_from_slice(b"small body");
-    let res = decode_repo_car(&overflow_car);
-    assert!(res.is_err(), "Overflow varint length in CAR must return error without panicking");
+    // Construct a record with duplicate map keys in CBOR
+    // Canonically 3 entries (with duplicate 'text' key):
+    // 1. "text" (4) -> 0x64, b't', b'e', b'x', b't', 0x65, "hello" (5)
+    // 2. "text" (4) -> 0x64, b't', b'e', b'x', b't', 0x69, "duplicate" (9)
+    // 3. "$type" (5) -> 0x65, b'$', b't', b'y', b'p', b'e', 0x72, "app.bsky.feed.post" (18)
+    let type_key = "$type";
+    let type_val = "app.bsky.feed.post";
+    let text_key = "text";
+    let text_val1 = "hello";
+    let text_val2 = "duplicate";
+
+    let mut dup_rec_cbor = Vec::new();
+    dup_rec_cbor.push(0xa3); // 3 entries (with duplicate 'text' key)
+    dup_rec_cbor.push(0x60 + text_key.len() as u8);
+    dup_rec_cbor.extend_from_slice(text_key.as_bytes());
+    dup_rec_cbor.push(0x60 + text_val1.len() as u8);
+    dup_rec_cbor.extend_from_slice(text_val1.as_bytes());
+
+    dup_rec_cbor.push(0x60 + text_key.len() as u8);
+    dup_rec_cbor.extend_from_slice(text_key.as_bytes());
+    dup_rec_cbor.push(0x60 + text_val2.len() as u8);
+    dup_rec_cbor.extend_from_slice(text_val2.as_bytes());
+
+    dup_rec_cbor.push(0x60 + type_key.len() as u8);
+    dup_rec_cbor.extend_from_slice(type_key.as_bytes());
+    dup_rec_cbor.push(0x72); // 18 bytes
+    dup_rec_cbor.extend_from_slice(type_val.as_bytes());
+
+    let (dup_rec_cid_bytes, dup_rec_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&dup_rec_cbor);
+    let dup_rec_cid_link = circle_appview::commit::CidLink::from_bytes(dup_rec_cid_bytes.clone());
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post1", &dup_rec_cid_str);
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
+    let commit_cbor = serde_ipld_dagcbor::to_vec(&commit).unwrap();
+    let (commit_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&commit_cbor);
+    let commit_cid_link = circle_appview::commit::CidLink::from_bytes(commit_cid_bytes.clone());
+
+    // Construct valid DRISL map pointing to dup_rec_cid_link
+    let mut drisl_map = std::collections::BTreeMap::new();
+    drisl_map.insert("app.bsky.feed.post/3l7post1".to_string(), dup_rec_cid_link);
+    let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_map).unwrap();
+    let (drisl_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&drisl_cbor);
+    let drisl_cid_link = circle_appview::commit::CidLink::from_bytes(drisl_cid_bytes.clone());
+
+    let header = circle_appview::commit::CarHeader {
+        version: 1,
+        roots: vec![commit_cid_link, drisl_cid_link],
+    };
+    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
+
+    let mut car = Vec::new();
+    // Header
+    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut car);
+    car.extend_from_slice(&header_cbor);
+    // Commit block
+    circle_appview::commit::encode_varint((commit_cid_bytes.len() + commit_cbor.len()) as u64, &mut car);
+    car.extend_from_slice(&commit_cid_bytes);
+    car.extend_from_slice(&commit_cbor);
+    // DRISL block
+    circle_appview::commit::encode_varint((drisl_cid_bytes.len() + drisl_cbor.len()) as u64, &mut car);
+    car.extend_from_slice(&drisl_cid_bytes);
+    car.extend_from_slice(&drisl_cbor);
+    // Record block with duplicate keys
+    circle_appview::commit::encode_varint((dup_rec_cid_bytes.len() + dup_rec_cbor.len()) as u64, &mut car);
+    car.extend_from_slice(&dup_rec_cid_bytes);
+    car.extend_from_slice(&dup_rec_cbor);
+
+    let res = decode_repo_car(&car);
+    assert!(res.is_err(), "Duplicate map keys in record block must be rejected");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("Failed to decode record CBOR") || err_str.contains("Duplicate map key"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -3071,8 +3433,8 @@ async fn notification_provenance_source_uri_and_comprehensive_cleanup_on_update_
 #[test]
 fn unconditional_cid_equality_rejects_mismatched_or_empty_cids() {
     let p1_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p1");
-    let real_cid = "bafyreirealcid111111";
-    let wrong_cid = "bafyreifakecid222222";
+    let real_cid = OWNER_POST_CID;
+    let wrong_cid = WRONG_POST_CID;
 
     let pol = policy(owner(), active_members(&[bob()]))
         .with_space_uri(space())
@@ -3129,4 +3491,556 @@ fn unconditional_cid_equality_rejects_mismatched_or_empty_cids() {
         validate(invalid_reply, &pol),
         Err(InvalidRecord::CrossSpaceReference)
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn notification_source_identity_preserved_on_unchanged_recovery_and_replaced_on_change(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+    let sync_engine = SyncEngine::new(&setup.state);
+
+    // Step 1: Owner creates post P1
+    let p1_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post 1 for notification identity test",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
+    let mut lthash_owner = LtHash::new();
+    lthash_owner.add("app.bsky.feed.post", "3l7notifp1", &p1_cid);
+    let commit_owner = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7234567a234",
+        lthash_owner.as_bytes(),
+        &setup.owner_signing_key,
+    );
+    let rec_p1 = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7notifp1".to_string(),
+        cid: p1_cid.clone(),
+        value: p1_val,
+    };
+    let car_owner = mint_repo_car(&commit_owner, std::slice::from_ref(&rec_p1)).unwrap();
+    let owner_key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_get_repo_response(&owner_key, car_owner);
+    sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+
+    let p1_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7notifp1");
+
+    // Step 2: Bob likes P1
+    let like_val = json!({
+        "$type": "app.bsky.feed.like",
+        "subject": { "uri": &p1_uri, "cid": &p1_cid },
+        "createdAt": "2026-08-24T12:05:00.000Z"
+    });
+    let like_cid = compute_dagcbor_cid(&like_val).unwrap();
+    let mut lthash_bob = LtHash::new();
+    lthash_bob.add("app.bsky.feed.like", "3l7like1", &like_cid);
+    let commit_bob = mint_signed_commit(
+        SPACE_URI,
+        BOB_DID,
+        "3l7234567b234",
+        lthash_bob.as_bytes(),
+        &setup.bob_signing_key,
+    );
+    let rec_like = RepoRecord {
+        collection: "app.bsky.feed.like".to_string(),
+        rkey: "3l7like1".to_string(),
+        cid: like_cid.clone(),
+        value: like_val.clone(),
+    };
+    let car_bob = mint_repo_car(&commit_bob, std::slice::from_ref(&rec_like)).unwrap();
+    let bob_key = format!("{SPACE_URI}:{BOB_DID}");
+    setup.mock_transport.set_get_repo_response(&bob_key, car_bob.clone());
+    sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+
+    let like_uri = format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.like/3l7like1");
+
+    // Step 3: Fetch the created notification and mark it read
+    let initial_notif: (uuid::Uuid, bool, chrono::DateTime<Utc>) = sqlx::query_as(
+        "SELECT id, is_read, created_at FROM circle_notifications WHERE source_uri = $1",
+    )
+    .bind(&like_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!initial_notif.1, "Initial notification must be unread");
+
+    sqlx::query("UPDATE circle_notifications SET is_read = true WHERE id = $1")
+        .bind(initial_notif.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Step 4: Perform unchanged recovery of Bob's repo
+    sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+
+    // Step 5: Verify the notification is completely preserved (same ID, is_read = true, same created_at)
+    let preserved_notif: (uuid::Uuid, bool, chrono::DateTime<Utc>) = sqlx::query_as(
+        "SELECT id, is_read, created_at FROM circle_notifications WHERE source_uri = $1",
+    )
+    .bind(&like_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(preserved_notif.0, initial_notif.0, "Notification ID must be preserved across unchanged recovery");
+    assert!(preserved_notif.1, "Notification read status must remain true across unchanged recovery");
+    assert_eq!(preserved_notif.2, initial_notif.2, "Notification created_at timestamp must be preserved");
+
+    // Step 6: Bob updates his like to point to a different post P2
+    let p2_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post 2 for notification identity test",
+        "createdAt": "2026-08-24T12:10:00.000Z"
+    });
+    let p2_cid = compute_dagcbor_cid(&p2_val).unwrap();
+    lthash_owner.add("app.bsky.feed.post", "3l7notifp2", &p2_cid);
+    let commit_owner2 = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7234567a345",
+        lthash_owner.as_bytes(),
+        &setup.owner_signing_key,
+    );
+    let rec_p2 = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7notifp2".to_string(),
+        cid: p2_cid.clone(),
+        value: p2_val,
+    };
+    let car_owner2 = mint_repo_car(&commit_owner2, &[rec_p1, rec_p2]).unwrap();
+    setup.mock_transport.set_get_repo_response(&owner_key, car_owner2);
+    sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+
+    let p2_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7notifp2");
+
+    let updated_like_val = json!({
+        "$type": "app.bsky.feed.like",
+        "subject": { "uri": &p2_uri, "cid": &p2_cid },
+        "createdAt": "2026-08-24T12:15:00.000Z"
+    });
+    let updated_like_cid = compute_dagcbor_cid(&updated_like_val).unwrap();
+    lthash_bob.remove("app.bsky.feed.like", "3l7like1", &like_cid);
+    lthash_bob.add("app.bsky.feed.like", "3l7like1", &updated_like_cid);
+    let commit_bob2 = mint_signed_commit(
+        SPACE_URI,
+        BOB_DID,
+        "3l7234567b345",
+        lthash_bob.as_bytes(),
+        &setup.bob_signing_key,
+    );
+    let rec_updated_like = RepoRecord {
+        collection: "app.bsky.feed.like".to_string(),
+        rkey: "3l7like1".to_string(),
+        cid: updated_like_cid.clone(),
+        value: updated_like_val,
+    };
+    let car_bob2 = mint_repo_car(&commit_bob2, &[rec_updated_like]).unwrap();
+    setup.mock_transport.set_get_repo_response(&bob_key, car_bob2);
+    sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+
+    // Step 7: Verify changed like replaces notification (new ID, is_read = false, new subject)
+    let replaced_notif: (uuid::Uuid, bool, String) = sqlx::query_as(
+        "SELECT id, is_read, subject_uri FROM circle_notifications WHERE source_uri = $1",
+    )
+    .bind(&like_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_ne!(replaced_notif.0, initial_notif.0, "Changed source must generate a new notification ID");
+    assert!(!replaced_notif.1, "Changed source must reset is_read to false");
+    assert_eq!(replaced_notif.2, p2_uri, "Notification subject_uri must be updated to P2");
+}
+
+#[sqlx::test(migrations = false)]
+async fn alpha_migration_purges_legacy_notifications_and_enforces_source_provenance_lifecycle(pool: PgPool) {
+    // 1. Apply pre-000003 schema (migrations 1 and 2)
+    let m1 = include_str!("../migrations/20260824000001_initial.sql");
+    let m2 = include_str!("../migrations/20260824000002_generations_and_tombstones.sql");
+    sqlx::raw_sql(m1).execute(&pool).await.unwrap();
+    sqlx::raw_sql(m2).execute(&pool).await.unwrap();
+
+    // Seed circle
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Test Circle', now())
+        "#,
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2. Insert pre-000003 legacy notification (without source_uri column)
+    let legacy_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, false, now())
+        "#,
+    )
+    .bind(legacy_id)
+    .bind(OWNER_DID)
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .bind(format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7dummy"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let count_pre: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_notifications")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_pre.0, 1, "Legacy notification must exist before migration 000003");
+
+    // 3. Apply migration 000003
+    let m3 = include_str!("../migrations/20260824000003_notification_source_uri.sql");
+    sqlx::raw_sql(m3).execute(&pool).await.unwrap();
+
+    // 4. Verify legacy notifications were purged
+    let count_post: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_notifications")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_post.0, 0, "Legacy notifications must be purged during migration 000003");
+
+    // 5. Verify source_uri is NOT NULL
+    let res_null = sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, NULL, false, now())
+        "#,
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(OWNER_DID)
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .bind(format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7dummy"))
+    .execute(&pool)
+    .await;
+    assert!(res_null.is_err(), "source_uri must not allow NULL");
+
+    // 6. Verify source_uri UNIQUE constraint & lifecycle (insert, update, delete)
+    let source1 = format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.like/3l7source1");
+    let notif_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+        "#,
+    )
+    .bind(notif_id)
+    .bind(OWNER_DID)
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .bind(format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7dummy"))
+    .bind(&source1)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let res_dup = sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+        "#,
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(OWNER_DID)
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .bind(format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7dummy"))
+    .bind(&source1)
+    .execute(&pool)
+    .await;
+    assert!(res_dup.is_err(), "Duplicate source_uri must violate unique constraint");
+
+    // Update notification
+    sqlx::query("UPDATE circle_notifications SET is_read = true WHERE source_uri = $1")
+        .bind(&source1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let read_state: (bool,) = sqlx::query_as("SELECT is_read FROM circle_notifications WHERE source_uri = $1")
+        .bind(&source1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(read_state.0);
+
+    // Delete notification
+    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+        .bind(&source1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let count_final: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_notifications")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_final.0, 0);
+}
+
+#[test]
+fn validator_rejects_missing_or_mismatched_type_and_unsupported_embeds() {
+    let p1_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p1");
+    let real_cid = compute_dagcbor_cid(&json!({"test": "p1"})).unwrap();
+    let blob_cid = compute_dagcbor_cid(&json!({"test": "blob"})).unwrap();
+
+    let pol = policy(owner(), active_members(&[bob()]))
+        .with_space_uri(space())
+        .with_known_posts([(p1_uri.clone(), real_cid)]);
+
+    // 1. Missing $type -> MalformedRecord
+    let no_type = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p2"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p2".to_string(),
+        value: json!({
+            "text": "Post without $type",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
+    assert!(matches!(validate(no_type, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 2. Mismatched $type -> MalformedRecord
+    let wrong_type = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p3"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p3".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.like",
+            "text": "Post with like $type",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
+    assert!(matches!(validate(wrong_type, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 3. Post with video embed -> UnsupportedEmbed
+    let video_post = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p4"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p4".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with video",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.video",
+                "video": { "$link": &blob_cid }
+            }
+        }),
+    };
+    assert_eq!(validate(video_post, &pol), Err(InvalidRecord::UnsupportedEmbed));
+
+    // 4. Post with external embed -> UnsupportedEmbed
+    let external_post = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p5"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p5".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with external link",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.external",
+                "external": {
+                    "uri": "https://example.com",
+                    "title": "Example",
+                    "description": "Example site"
+                }
+            }
+        }),
+    };
+    assert_eq!(validate(external_post, &pol), Err(InvalidRecord::UnsupportedEmbed));
+
+    // 5. Post with images embed -> Ok
+    let images_post = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p6"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p6".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with images",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [{
+                    "alt": "An image",
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": &blob_cid },
+                        "mimeType": "image/jpeg",
+                        "size": 12345
+                    }
+                }]
+            }
+        }),
+    };
+    assert!(validate(images_post, &pol).is_ok());
+
+    // 6. Post with float -> MalformedRecord
+    let float_post = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p7"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p7".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with float",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "count": 42.5
+        }),
+    };
+    assert!(matches!(validate(float_post, &pol), Err(InvalidRecord::MalformedRecord(_))));
+    // 7. Post with > 4 images -> MalformedRecord
+    let too_many_images = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p8"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p8".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with 5 images",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    { "alt": "img1", "image": { "$type": "blob", "ref": { "$link": &blob_cid }, "mimeType": "image/jpeg", "size": 100 } },
+                    { "alt": "img2", "image": { "$type": "blob", "ref": { "$link": &blob_cid }, "mimeType": "image/jpeg", "size": 100 } },
+                    { "alt": "img3", "image": { "$type": "blob", "ref": { "$link": &blob_cid }, "mimeType": "image/jpeg", "size": 100 } },
+                    { "alt": "img4", "image": { "$type": "blob", "ref": { "$link": &blob_cid }, "mimeType": "image/jpeg", "size": 100 } },
+                    { "alt": "img5", "image": { "$type": "blob", "ref": { "$link": &blob_cid }, "mimeType": "image/jpeg", "size": 100 } }
+                ]
+            }
+        }),
+    };
+    assert!(matches!(validate(too_many_images, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 8. Post with image > 2MB (2_000_001 bytes) -> MalformedRecord
+    let oversized_image = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p9"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p9".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with oversized image",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [{
+                    "alt": "oversized",
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": &blob_cid },
+                        "mimeType": "image/jpeg",
+                        "size": 2000001
+                    }
+                }]
+            }
+        }),
+    };
+    assert!(matches!(validate(oversized_image, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 9. Post with non-image mime type -> MalformedRecord
+    let bad_mime_image = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p10"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p10".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with bad mime",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [{
+                    "alt": "bad mime",
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": &blob_cid },
+                        "mimeType": "application/pdf",
+                        "size": 50000
+                    }
+                }]
+            }
+        }),
+    };
+    assert!(matches!(validate(bad_mime_image, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 10. Post with invalid facet index (byteStart < 0) -> MalformedRecord
+    let bad_facet_index = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p11"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p11".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with bad facet",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "facets": [{
+                "index": { "byteStart": -1, "byteEnd": 5 },
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#tag",
+                    "tag": "rust"
+                }]
+            }]
+        }),
+    };
+    assert!(matches!(validate(bad_facet_index, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 11. Post with invalid mention DID -> MalformedRecord
+    let bad_mention_did = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p12"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p12".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with bad mention",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "facets": [{
+                "index": { "byteStart": 0, "byteEnd": 5 },
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#mention",
+                    "did": "not-a-valid-did"
+                }]
+            }]
+        }),
+    };
+    assert!(matches!(validate(bad_mention_did, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 12. Post with invalid link URI -> MalformedRecord
+    let bad_link_uri = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p13"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p13".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with bad link",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "facets": [{
+                "index": { "byteStart": 0, "byteEnd": 5 },
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": "not a valid uri with spaces"
+                }]
+            }]
+        }),
+    };
+    assert!(matches!(validate(bad_link_uri, &pol), Err(InvalidRecord::MalformedRecord(_))));
 }
