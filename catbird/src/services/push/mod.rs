@@ -701,6 +701,7 @@ pub(crate) async fn resolve_background_session(
             .as_ref()
             .map(|token| token.to_string())
             .unwrap_or_default(),
+        scopes: session_data.scopes.iter().map(|scope| scope.to_string()).collect(),
         access_token_expires_at: expires_at,
         created_at: Utc::now(),
         last_used_at: Utc::now(),

@@ -261,6 +261,7 @@ mod tests {
             pds_url: pds_url.to_string(),
             access_token: "mock-access-token".to_string(),
             refresh_token: "mock-refresh-token".to_string(),
+            scopes: Vec::new(),
             access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
             created_at: Utc::now(),
             last_used_at: Utc::now(),

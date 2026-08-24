@@ -253,6 +253,7 @@ async fn resolve_session_via_jacquard(
             .as_ref()
             .map(|t| t.to_string())
             .unwrap_or_default(),
+        scopes: session_data.scopes.iter().map(|scope| scope.to_string()).collect(),
         access_token_expires_at: expires_at,
         created_at: Utc::now(), // Not tracked in Jacquard session
         last_used_at: Utc::now(),
