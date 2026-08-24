@@ -76,6 +76,13 @@ pub async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "circle retry worker not ready",
             );
         }
+
+        if state.key_store.is_none() || state.jacquard_client.is_none() || state.auth_store.is_none() {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "circle auth infrastructure not ready",
+            );
+        }
     }
     (axum::http::StatusCode::OK, "ready")
 }

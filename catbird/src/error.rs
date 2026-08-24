@@ -131,7 +131,7 @@ impl IntoResponse for AppError {
                 tracing::error!("HTTP client error: {}", e);
                 (
                     StatusCode::BAD_GATEWAY,
-                    "upstream_error",
+                    "UpstreamUnavailable",
                     "Failed to communicate with upstream server".to_string(),
                 )
             }

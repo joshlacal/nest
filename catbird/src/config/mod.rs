@@ -549,6 +549,18 @@ impl AppState {
             }
         }
 
+        if state.config.circle.service_url.is_some() {
+            if state.key_store.is_none() {
+                anyhow::bail!("KeyStore failed to initialize but is mandatory when Circle capability is enabled");
+            }
+            if state.jacquard_client.is_none() || state.auth_store.is_none() {
+                anyhow::bail!("Jacquard OAuthClient failed to initialize but is mandatory when Circle capability is enabled");
+            }
+            if state.push_db.is_none() {
+                anyhow::bail!("PostgreSQL (push_db) is mandatory when Circle capability is enabled");
+            }
+        }
+
         Ok(state)
     }
 

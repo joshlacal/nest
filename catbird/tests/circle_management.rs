@@ -189,6 +189,7 @@ struct TestEnv {
     _plc: MockServer,
     service: CircleService,
     session: CatbirdSession,
+    state: Arc<AppState>,
 }
 
 async fn setup_env(pool: PgPool) -> TestEnv {
@@ -316,6 +317,7 @@ async fn setup_env(pool: PgPool) -> TestEnv {
         _plc: plc,
         service,
         session,
+        state,
     }
 }
 
@@ -519,9 +521,8 @@ async fn create_circle_initial_member_partial_failure(pool: PgPool) {
     };
 
     let op = service.create_circle(&session, input).await.unwrap();
-    assert_eq!(op.status, OperationStatus::Complete);
+    assert_eq!(op.status, OperationStatus::Failed);
     assert_eq!(op.error.as_deref(), Some("MemberAdditionPartialFailure"));
-
     // 1 circle_upsert (delivered), and 2 member_add total in outbox (Bob = delivered, Carol = failed durable terminal child)
     assert_eq!(service.get_projection_count(Some("circle_upsert")).await.unwrap(), 1);
     assert_eq!(service.get_projection_count(Some("member_add")).await.unwrap(), 2);
@@ -1027,4 +1028,220 @@ async fn service_auth_upstream_failure_returns_exact_error() {
         }
         other => panic!("Expected AtprotoResponse AuthRequired, got: {:?}", other),
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn concurrent_duplicate_member_update_claims_and_never_downgrades(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    let request = UpdateMember {
+        space: space(),
+        member_did: bob(),
+        action: MemberAction::Add,
+        extra_data: None,
+    };
+
+    // First request executes and transitions to Complete (Delivered)
+    let op1 = env.service.update_member(&env.session, request.clone()).await.unwrap();
+    assert_eq!(op1.status, OperationStatus::Complete);
+
+    // Second request is a duplicate: returns Complete idempotently without re-running mutation
+    let op2 = env.service.update_member(&env.session, request.clone()).await.unwrap();
+    assert_eq!(op2.status, OperationStatus::Complete);
+    assert_eq!(op1.id, op2.id);
+
+    // Test conditional SQL update: attempting to set state='failed' on a delivered row must be a no-op
+    let outbox_id = uuid::Uuid::parse_str(op1.id.as_str()).unwrap();
+    let _ = env.service.set_projection_state(outbox_id, catbird::models::CircleProjectionState::Failed, Some("SimulatedError")).await;
+
+    let state_after: (String,) = sqlx::query_as(
+        "SELECT state FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(outbox_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Must still be delivered (never downgraded to failed)
+    assert_eq!(state_after.0, "delivered");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn auth_unavailable_stays_retryable_in_worker_and_rebinds_session(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = CircleService::new(state);
+
+    // Enqueue an outbox projection with a missing session ID
+    let missing_session_id = uuid::Uuid::new_v4().to_string();
+    let op_id = service
+        .enqueue_projection(
+            "did:plc:alice",
+            &missing_session_id,
+            "at://did:plc:alice/space/blue.catbird.circle/test-circle-1",
+            catbird::models::CircleProjectionKind::CircleUpsert,
+            serde_json::json!({ "name": "Test" }),
+            catbird::models::CircleProjectionState::Pending,
+        )
+        .await
+        .unwrap();
+
+    // Process due projections with background worker query - session recovery will fail
+    let delivered = service.process_due_projections(10).await.unwrap();
+    assert_eq!(delivered, 0);
+
+    // Verify row is still in 'pending' state (not marked terminal failed)
+    let state_row: (String, i32) = sqlx::query_as(
+        "SELECT state, attempts FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state_row.0, "pending");
+
+    // Even if attempts are manually set to 15, auth failure must still keep it pending
+    sqlx::query("UPDATE circle_projection_outbox SET attempts = 15, next_attempt_at = now() WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let delivered2 = service.process_due_projections(10).await.unwrap();
+    assert_eq!(delivered2, 0);
+
+    let state_row2: (String,) = sqlx::query_as(
+        "SELECT state FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state_row2.0, "pending");
+
+    // An authenticated Circle request arrives -> rebinds actor's pending rows to the new session ID
+    let new_session_id = uuid::Uuid::new_v4().to_string();
+    service.rebind_actor_sessions("did:plc:alice", &new_session_id).await.unwrap();
+
+    let bound_session: (String,) = sqlx::query_as(
+        "SELECT session_id FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bound_session.0, new_session_id);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn circle_enabled_startup_requires_auth_infrastructure(_pool: PgPool) {
+    let mut config = AppConfig::load().unwrap();
+    config.circle.service_url = Some("http://localhost:9999".into());
+    config.circle.service_did = "did:web:circles.catbird.blue#atproto_circle".into();
+    config.oauth.client_id = "http://localhost:8080/client-metadata.json".into();
+
+    // AppState::new without KeyStore / Jacquard should fail
+    let res = AppState::new(config).await;
+    assert!(res.is_err());
+    let err_str = res.err().unwrap().to_string();
+    assert!(err_str.contains("mandatory when Circle capability is enabled") || err_str.contains("KeyStore"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn exact_circle_error_envelopes_across_middleware_and_transport(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+    let router = catbird::routes::atproto::create_router(env.state.clone()).with_state(env.state.clone());
+    // 1. Unauthenticated request to Circle endpoint must return 401 with error "AuthRequired"
+    let req = axum::http::Request::builder()
+        .uri("/xrpc/blue.catbird.circle.createCircle")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"name":"Test","member_dids":[]}"#))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let json_err: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(json_err["error"], "AuthRequired");
+
+    // 2. Unauthenticated GET /xrpc/blue.catbird.circle.getCapabilities
+    let req2 = axum::http::Request::builder()
+        .uri("/xrpc/blue.catbird.circle.getCapabilities")
+        .method("GET")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp2 = tower::ServiceExt::oneshot(router, req2).await.unwrap();
+    assert_eq!(resp2.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let body_bytes2 = axum::body::to_bytes(resp2.into_body(), 1024 * 1024).await.unwrap();
+    let json_err2: serde_json::Value = serde_json::from_slice(&body_bytes2).unwrap();
+    assert_eq!(json_err2["error"], "AuthRequired");
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn reconcile_stale_projections_promotes_state_to_pending(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    // Metadata getRecord returns 200 (record exists at PDS)
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self",
+            "value": { "name": "Reconciled Circle" }
+        })))
+        .mount(&env._pds)
+        .await;
+
+    // Insert a stale intent row with updated_at set to 60 seconds ago
+    let op_id = env.service
+        .enqueue_projection(
+            "did:plc:alice",
+            &env.session.id.to_string(),
+            "at://did:plc:alice/space/blue.catbird.circle/reconcile-test",
+            catbird::models::CircleProjectionKind::CircleUpsert,
+            serde_json::json!({ "name": "Reconciled Circle" }),
+            catbird::models::CircleProjectionState::Intent,
+        )
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE circle_projection_outbox SET updated_at = now() - interval '60 seconds' WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run reconciliation
+    let count = env.service.reconcile_stale_projections(10).await.unwrap();
+    assert_eq!(count, 1);
+
+    // Outbox row should now be in 'pending' state
+    let state_row: (String,) = sqlx::query_as(
+        "SELECT state FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state_row.0, "pending");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn did_web_dns_ssrf_rejects_private_domain_resolutions(pool: PgPool) {
+    let state = create_test_state(Some(pool), "http://localhost:8080", None, None).await;
+    let service = CircleService::new(state);
+
+    // 1. Private domain resolving to 127.0.0.1 or private range
+    // Use a domain that resolves or test with private IP addresses in did:web
+    let res = service.resolve_space_host_audience("did:web:127.0.0.1%3A8080").await;
+    assert!(res.is_err());
+
+    let res2 = service.resolve_space_host_audience("did:web:10.0.0.5").await;
+    assert!(res2.is_err());
 }

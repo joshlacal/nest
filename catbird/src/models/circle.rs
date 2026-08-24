@@ -69,6 +69,7 @@ impl std::str::FromStr for CircleProjectionKind {
 #[serde(rename_all = "snake_case")]
 pub enum CircleProjectionState {
     Intent,
+    Executing,
     Pending,
     Delivered,
     Failed,
@@ -78,6 +79,7 @@ impl CircleProjectionState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Intent => "intent",
+            Self::Executing => "executing",
             Self::Pending => "pending",
             Self::Delivered => "delivered",
             Self::Failed => "failed",
@@ -97,6 +99,7 @@ impl std::str::FromStr for CircleProjectionState {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "intent" => Ok(Self::Intent),
+            "executing" => Ok(Self::Executing),
             "pending" => Ok(Self::Pending),
             "delivered" => Ok(Self::Delivered),
             "failed" => Ok(Self::Failed),

@@ -11,7 +11,7 @@ CREATE TABLE circle_projection_outbox (
     space_uri TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('circle_upsert','member_add','member_remove','circle_delete')),
     payload JSONB NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('intent','pending','delivered','failed')) DEFAULT 'intent',
+    state TEXT NOT NULL CHECK (state IN ('intent','executing','pending','delivered','failed')) DEFAULT 'intent',
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error_code TEXT,

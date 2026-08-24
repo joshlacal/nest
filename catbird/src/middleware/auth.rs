@@ -37,7 +37,66 @@ fn atproto_auth_error(status: StatusCode, error: &str, message: impl Into<String
     }
 }
 
-fn classify_auth_error(error: AppError) -> AppError {
+fn is_circle_path(path: &str) -> bool {
+    path.contains("blue.catbird.circle.") || path.contains("/blue.catbird.circle")
+}
+
+fn classify_auth_error(error: AppError, is_circle: bool) -> AppError {
+    if is_circle {
+        return match error {
+            AppError::InvalidSession | AppError::SessionExpired | AppError::TokenRefresh(_) => {
+                atproto_auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "AuthRequired",
+                    "Session is invalid or expired. Please log in again.",
+                )
+            }
+            AppError::AuthTemporarilyUnavailable(message) => {
+                atproto_auth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UpstreamUnavailable",
+                    message,
+                )
+            }
+            AppError::Redis(_) | AppError::HttpClient(_) => {
+                atproto_auth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UpstreamUnavailable",
+                    "Authentication service is temporarily unavailable. Please retry.",
+                )
+            }
+            AppError::OAuth(message) => {
+                let lower = message.to_ascii_lowercase();
+                if lower.contains("invalid_grant")
+                    || lower.contains("invalid_token")
+                    || lower.contains("no refresh token")
+                    || lower.contains("no per-session oauth data")
+                {
+                    atproto_auth_error(
+                        StatusCode::UNAUTHORIZED,
+                        "AuthRequired",
+                        "Session expired. Please log in again.",
+                    )
+                } else {
+                    atproto_auth_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "UpstreamUnavailable",
+                        "Authentication service is temporarily unavailable. Please retry.",
+                    )
+                }
+            }
+            AppError::AtprotoResponse { .. } => error,
+            other => {
+                tracing::warn!("Unexpected auth failure type on Circle route: {}", other);
+                atproto_auth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UpstreamUnavailable",
+                    "Authentication service is temporarily unavailable. Please retry.",
+                )
+            }
+        };
+    }
+
     match error {
         AppError::InvalidSession => atproto_auth_error(
             StatusCode::UNAUTHORIZED,
@@ -134,19 +193,28 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
+    let is_circle = is_circle_path(req.uri().path());
     let session_id = extract_session_id(&req).ok_or_else(|| {
-        atproto_auth_error(
-            StatusCode::UNAUTHORIZED,
-            "AuthenticationRequired",
-            "Missing authentication session.",
-        )
+        if is_circle {
+            atproto_auth_error(
+                StatusCode::UNAUTHORIZED,
+                "AuthRequired",
+                "Missing authentication session.",
+            )
+        } else {
+            atproto_auth_error(
+                StatusCode::UNAUTHORIZED,
+                "AuthenticationRequired",
+                "Missing authentication session.",
+            )
+        }
     })?;
 
     let auth_store = state.auth_store.as_ref().ok_or_else(|| {
-        classify_auth_error(AppError::Internal("Auth store not configured".into()))
+        classify_auth_error(AppError::Internal("Auth store not configured".into()), is_circle)
     })?;
     let jacquard_client = state.jacquard_client.as_ref().ok_or_else(|| {
-        classify_auth_error(AppError::Internal("Jacquard client not configured".into()))
+        classify_auth_error(AppError::Internal("Jacquard client not configured".into()), is_circle)
     })?;
 
     // Try Jacquard path (new sessions + already-migrated sessions)
@@ -161,7 +229,7 @@ pub async fn auth_middleware(
             tracing::debug!(session_id = %session_id, "Jacquard session not found, attempting legacy migration");
         }
         Err(e) => {
-            return Err(classify_auth_error(e));
+            return Err(classify_auth_error(e, is_circle));
         }
     }
 
@@ -173,18 +241,18 @@ pub async fn auth_middleware(
             let (session, dpop_data) =
                 resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
                     .await
-                    .map_err(classify_auth_error)?;
+                    .map_err(|e| classify_auth_error(e, is_circle))?;
             req.extensions_mut().insert(session);
             req.extensions_mut().insert(dpop_data);
             Ok(next.run(req).await)
         }
         Ok(None) => {
             // No legacy session either
-            Err(classify_auth_error(AppError::InvalidSession))
+            Err(classify_auth_error(AppError::InvalidSession, is_circle))
         }
         Err(e) => {
             tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
-            Err(classify_auth_error(AppError::InvalidSession))
+            Err(classify_auth_error(AppError::InvalidSession, is_circle))
         }
     }
 }
@@ -292,7 +360,7 @@ mod tests {
 
     #[test]
     fn classifies_invalid_session_as_invalid_token() {
-        let mapped = classify_auth_error(AppError::InvalidSession);
+        let mapped = classify_auth_error(AppError::InvalidSession, false);
         match mapped {
             AppError::AtprotoResponse {
                 status,
@@ -304,13 +372,28 @@ mod tests {
             }
             _ => panic!("expected AtprotoResponse"),
         }
+
+        // For Circle routes, it should classify as AuthRequired
+        let circle_mapped = classify_auth_error(AppError::InvalidSession, true);
+        match circle_mapped {
+            AppError::AtprotoResponse {
+                status,
+                error,
+                message: _,
+            } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(error, "AuthRequired");
+            }
+            _ => panic!("expected AtprotoResponse"),
+        }
     }
 
     #[test]
     fn classifies_transient_auth_failure_as_temporarily_unavailable() {
-        let mapped = classify_auth_error(AppError::AuthTemporarilyUnavailable(
-            "upstream timeout".into(),
-        ));
+        let mapped = classify_auth_error(
+            AppError::AuthTemporarilyUnavailable("upstream timeout".into()),
+            false,
+        );
         match mapped {
             AppError::AtprotoResponse {
                 status,
@@ -319,6 +402,23 @@ mod tests {
             } => {
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(error, "TemporarilyUnavailable");
+            }
+            _ => panic!("expected AtprotoResponse"),
+        }
+
+        // For Circle routes, it should classify as UpstreamUnavailable
+        let circle_mapped = classify_auth_error(
+            AppError::AuthTemporarilyUnavailable("upstream timeout".into()),
+            true,
+        );
+        match circle_mapped {
+            AppError::AtprotoResponse {
+                status,
+                error,
+                message: _,
+            } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error, "UpstreamUnavailable");
             }
             _ => panic!("expected AtprotoResponse"),
         }

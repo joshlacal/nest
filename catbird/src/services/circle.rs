@@ -144,11 +144,37 @@ impl CircleService {
         let dpop_data = self.resolve_dpop_data(session).await;
 
         self.ensure_capability_and_infra(session, &dpop_data, &req_id).await?;
+        let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
 
-        // 1. Create Space at user's PDS using AllowList with configured client_id
+        // 1. Generate skey and space_uri before createSpace, and persist intent first
+        let skey = Uuid::new_v4().simple().to_string();
+        let pre_space_uri = format!("at://{}/space/blue.catbird.circle/{}", session.did, skey);
+
+        let upsert_payload = serde_json::json!({
+            "space": &pre_space_uri,
+            "authority": &session.did,
+            "name": input.name.as_str(),
+            "createdAt": Utc::now()
+        });
+        let upsert_op_id = self
+            .enqueue_projection(
+                &session.did,
+                &session.id.to_string(),
+                &pre_space_uri,
+                CircleProjectionKind::CircleUpsert,
+                upsert_payload,
+                CircleProjectionState::Intent,
+            )
+            .await?;
+
+        // Atomically claim the operation: intent -> executing
+        let _ = self.claim_projection(upsert_op_id, &session.id.to_string()).await;
+
+        // 2. Create Space at user's PDS using AllowList with configured client_id
         let client_id = self.state.config.oauth.client_id.clone();
         let create_space_payload = serde_json::json!({
             "type": "blue.catbird.circle",
+            "skey": &skey,
             "policy": {
                 "$type": "com.atproto.simplespace.defs#memberListPolicy"
             },
@@ -160,7 +186,7 @@ impl CircleService {
         let create_space_bytes = serde_json::to_vec(&create_space_payload)
             .map_err(|e| CircleError::Internal(e.to_string()))?;
 
-        let response = atproto
+        let response = match atproto
             .proxy_request(
                 session,
                 reqwest::Method::POST,
@@ -173,11 +199,30 @@ impl CircleService {
                 Some(&dpop_data),
             )
             .await
-            .map_err(|e| CircleError::Pds(e.to_string()))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self
+                    .set_projection_state(
+                        upsert_op_id,
+                        CircleProjectionState::Failed,
+                        Some(&format!("Network error creating space: {e}")),
+                    )
+                    .await;
+                return Err(CircleError::Pds(e.to_string()));
+            }
+        };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
         if status < 200 || status >= 300 {
             let err_text = String::from_utf8_lossy(&body_bytes);
+            let _ = self
+                .set_projection_state(
+                    upsert_op_id,
+                    CircleProjectionState::Failed,
+                    Some(&format!("createSpace failed ({status}): {err_text}")),
+                )
+                .await;
             return Err(CircleError::Pds(format!("createSpace failed ({status}): {err_text}")));
         }
 
@@ -186,29 +231,11 @@ impl CircleService {
         let space_uri = create_output
             .get("uri")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| CircleError::Pds("Missing uri in createSpace output".into()))?
+            .unwrap_or(&pre_space_uri)
             .to_string();
 
         let space_ref = SpaceRef::new(space_uri.clone().into())
             .map_err(|e| CircleError::InvalidRequest(e.0))?;
-
-        // 2. Persist CircleUpsert intent before metadata creation
-        let upsert_payload = serde_json::json!({
-            "space": &space_uri,
-            "authority": &session.did,
-            "name": input.name.as_str(),
-            "createdAt": Utc::now()
-        });
-        let upsert_op_id = self
-            .enqueue_projection(
-                &session.did,
-                &session.id.to_string(),
-                &space_uri,
-                CircleProjectionKind::CircleUpsert,
-                upsert_payload,
-                CircleProjectionState::Intent,
-            )
-            .await?;
 
         // 3. Put metadata record at blue.catbird.circle.metadata/self via com.atproto.space.putRecord
         let now_str = Utc::now().to_rfc3339();
@@ -291,6 +318,8 @@ impl CircleService {
                 )
                 .await?;
 
+            let _ = self.claim_projection(member_op_id, &session.id.to_string()).await;
+
             let add_member_body = serde_json::json!({
                 "space": &space_uri,
                 "did": member_did.as_ref()
@@ -361,13 +390,17 @@ impl CircleService {
 
         let is_complete = upsert_delivered && all_members_delivered;
 
+        let status = if member_partial_failure {
+            OperationStatus::Failed
+        } else if is_complete {
+            OperationStatus::Complete
+        } else {
+            OperationStatus::Pending
+        };
+
         Ok(Operation {
             id: upsert_op_id.to_string().into(),
-            status: if is_complete {
-                OperationStatus::Complete
-            } else {
-                OperationStatus::Pending
-            },
+            status,
             space: Some(space_ref),
             error: if member_partial_failure {
                 Some("MemberAdditionPartialFailure".into())
@@ -377,7 +410,6 @@ impl CircleService {
             extra_data: None,
         })
     }
-
     /// Update a Circle member (add or remove):
     /// 1. Verifies caller has Circle owner scopes and validates Space/member identifiers.
     /// 2. Verifies Circle capability and mandatory infrastructure.
@@ -402,6 +434,7 @@ impl CircleService {
         let dpop_data = self.resolve_dpop_data(session).await;
 
         self.ensure_capability_and_infra(session, &dpop_data, &req_id).await?;
+        let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
 
         let (pds_endpoint, kind) = match input.action {
             MemberAction::Add => (
@@ -477,6 +510,55 @@ impl CircleService {
                 CircleProjectionState::Intent,
             )
             .await?;
+
+        // Check if another concurrent duplicate already transitioned this to pending/delivered
+        if let Some(pool) = &self.db {
+            let current: Option<(String,)> = sqlx::query_as(
+                "SELECT state FROM circle_projection_outbox WHERE id = $1",
+            )
+            .bind(op_id)
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some((current_state,)) = current {
+                if current_state == "delivered" {
+                    return Ok(Operation {
+                        id: op_id.to_string().into(),
+                        status: OperationStatus::Complete,
+                        space: Some(input.space),
+                        error: None,
+                        extra_data: None,
+                    });
+                }
+                if current_state == "pending" {
+                    let delivered = self.deliver_projection_by_id(op_id, Some(session)).await;
+                    return Ok(Operation {
+                        id: op_id.to_string().into(),
+                        status: if delivered {
+                            OperationStatus::Complete
+                        } else {
+                            OperationStatus::Pending
+                        },
+                        space: Some(input.space),
+                        error: None,
+                        extra_data: None,
+                    });
+                }
+            }
+        }
+
+        // Atomically claim the operation (intent -> executing)
+        let claimed = self.claim_projection(op_id, &session.id.to_string()).await?;
+        if !claimed {
+            // Already claimed/in-flight by another concurrent worker
+            return Ok(Operation {
+                id: op_id.to_string().into(),
+                status: OperationStatus::Pending,
+                space: Some(input.space),
+                error: None,
+                extra_data: None,
+            });
+        }
 
         let request_body = serde_json::json!({
             "space": space_str,
@@ -565,6 +647,7 @@ impl CircleService {
         let dpop_data = self.resolve_dpop_data(session).await;
 
         self.ensure_capability_and_infra(session, &dpop_data, &req_id).await?;
+        let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
 
         // Persist delete intent before PDS mutation
         let projection_payload = serde_json::json!({
@@ -580,6 +663,55 @@ impl CircleService {
                 CircleProjectionState::Intent,
             )
             .await?;
+
+        // Check if already pending/delivered
+        if let Some(pool) = &self.db {
+            let current: Option<(String,)> = sqlx::query_as(
+                "SELECT state FROM circle_projection_outbox WHERE id = $1",
+            )
+            .bind(op_id)
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some((current_state,)) = current {
+                if current_state == "delivered" {
+                    return Ok(Operation {
+                        id: op_id.to_string().into(),
+                        status: OperationStatus::Complete,
+                        space: Some(input.space),
+                        error: None,
+                        extra_data: None,
+                    });
+                }
+                if current_state == "pending" {
+                    let delivered = self.deliver_projection_by_id(op_id, Some(session)).await;
+                    return Ok(Operation {
+                        id: op_id.to_string().into(),
+                        status: if delivered {
+                            OperationStatus::Complete
+                        } else {
+                            OperationStatus::Pending
+                        },
+                        space: Some(input.space),
+                        error: None,
+                        extra_data: None,
+                    });
+                }
+            }
+        }
+
+        // Atomically claim the operation
+        let claimed = self.claim_projection(op_id, &session.id.to_string()).await?;
+        if !claimed {
+            return Ok(Operation {
+                id: op_id.to_string().into(),
+                status: OperationStatus::Pending,
+                space: Some(input.space),
+                error: None,
+                extra_data: None,
+            });
+        }
+
         let request_body = serde_json::json!({
             "space": space_str
         });
@@ -667,6 +799,7 @@ impl CircleService {
         let dpop_data = self.resolve_dpop_data(session).await;
 
         self.ensure_capability_and_infra(session, &dpop_data, &req_id).await?;
+        let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
 
         // 1. Resolve authority DID document's Space host service identifier
         let authority_did = space_str
@@ -800,9 +933,44 @@ impl CircleService {
         crate::services::ssrf::validate_pds_url(&did_doc_url)
             .map_err(|e| CircleError::InvalidRequest(format!("DID document URL rejected by SSRF policy: {e}")))?;
 
+        let parsed_url = url::Url::parse(&did_doc_url)
+            .map_err(|e| CircleError::InvalidRequest(format!("Invalid DID document URL: {e}")))?;
+        let host = parsed_url.host_str().ok_or_else(|| {
+            CircleError::InvalidRequest("Missing host in DID document URL".into())
+        })?;
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
+
+        // Resolve DNS and reject any private, loopback, or link-local address
+        let addr_str = format!("{host}:{port}");
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(|e| CircleError::InvalidRequest(format!("DNS resolution failed for {host}: {e}")))?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(CircleError::InvalidRequest(format!(
+                "DNS resolution returned no addresses for {host}"
+            )));
+        }
+
+        for addr in &addrs {
+            #[cfg(debug_assertions)]
+            if addr.ip().is_loopback() {
+                continue;
+            }
+            if crate::services::ssrf::is_private_ip(&addr.ip()) {
+                return Err(CircleError::InvalidRequest(format!(
+                    "Host '{host}' resolved to restricted IP address: {}",
+                    addr.ip()
+                )));
+            }
+        }
+
+        // Pin the validated public resolution to reqwest to prevent DNS rebinding / TOCTOU
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))
+            .resolve_to_addrs(host, &addrs)
             .build()
             .map_err(|e| CircleError::Internal(e.to_string()))?;
 
@@ -849,7 +1017,52 @@ impl CircleService {
         ))
     }
 
-    /// Update projection state in outbox.
+    /// Atomically claim an operation for execution: transitions 'intent' -> 'executing'.
+    pub async fn claim_projection(&self, id: Uuid, session_id: &str) -> Result<bool, CircleError> {
+        if let Some(pool) = &self.db {
+            let res = sqlx::query(
+                r#"
+                UPDATE circle_projection_outbox
+                SET state = 'executing',
+                    session_id = $2,
+                    updated_at = now()
+                WHERE id = $1 AND (state = 'intent' OR (state = 'executing' AND updated_at < now() - interval '30 seconds'))
+                "#,
+            )
+            .bind(id)
+            .bind(session_id)
+            .execute(pool)
+            .await?;
+
+            Ok(res.rows_affected() > 0)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Rebind actor's non-terminal projection outbox records to the latest session ID.
+    pub async fn rebind_actor_sessions(&self, actor_did: &str, session_id: &str) -> Result<(), CircleError> {
+        if let Some(pool) = &self.db {
+            sqlx::query(
+                r#"
+                UPDATE circle_projection_outbox
+                SET session_id = $1,
+                    updated_at = now()
+                WHERE actor_did = $2
+                  AND state IN ('pending', 'intent', 'executing')
+                  AND session_id != $1
+                "#,
+            )
+            .bind(session_id)
+            .bind(actor_did)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Update projection state in outbox with conditional transitions.
+    /// Never downgrades `pending` or `delivered` to `failed` or `intent`.
     pub async fn set_projection_state(
         &self,
         id: Uuid,
@@ -857,14 +1070,77 @@ impl CircleService {
         error_code: Option<&str>,
     ) -> Result<(), CircleError> {
         if let Some(pool) = &self.db {
-            sqlx::query(
-                "UPDATE circle_projection_outbox SET state = $2, last_error_code = $3, updated_at = now() WHERE id = $1"
-            )
-            .bind(id)
-            .bind(state.as_str())
-            .bind(error_code)
-            .execute(pool)
-            .await?;
+            match state {
+                CircleProjectionState::Failed => {
+                    sqlx::query(
+                        r#"
+                        UPDATE circle_projection_outbox
+                        SET state = 'failed',
+                            last_error_code = $2,
+                            updated_at = now()
+                        WHERE id = $1 AND state IN ('intent', 'executing')
+                        "#,
+                    )
+                    .bind(id)
+                    .bind(error_code)
+                    .execute(pool)
+                    .await?;
+                }
+                CircleProjectionState::Pending => {
+                    sqlx::query(
+                        r#"
+                        UPDATE circle_projection_outbox
+                        SET state = 'pending',
+                            last_error_code = NULL,
+                            updated_at = now()
+                        WHERE id = $1 AND state IN ('intent', 'executing')
+                        "#,
+                    )
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                }
+                CircleProjectionState::Delivered => {
+                    sqlx::query(
+                        r#"
+                        UPDATE circle_projection_outbox
+                        SET state = 'delivered',
+                            last_error_code = NULL,
+                            updated_at = now()
+                        WHERE id = $1 AND state IN ('intent', 'executing', 'pending')
+                        "#,
+                    )
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                }
+                CircleProjectionState::Executing => {
+                    sqlx::query(
+                        r#"
+                        UPDATE circle_projection_outbox
+                        SET state = 'executing',
+                            updated_at = now()
+                        WHERE id = $1 AND state = 'intent'
+                        "#,
+                    )
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                }
+                CircleProjectionState::Intent => {
+                    sqlx::query(
+                        r#"
+                        UPDATE circle_projection_outbox
+                        SET state = 'intent',
+                            updated_at = now()
+                        WHERE id = $1 AND state = 'intent'
+                        "#,
+                    )
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -974,6 +1250,9 @@ impl CircleService {
             return Ok(0);
         };
 
+        // Reconcile stale intents or executing operations first
+        let _ = self.reconcile_stale_projections(batch_size).await;
+
         let mut tx = pool.begin().await?;
 
         let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
@@ -1012,7 +1291,14 @@ impl CircleService {
                         4 => 16,
                         _ => 30,
                     };
-                    let next_state = if op.attempts + 1 >= 10 {
+                    let is_auth_error = err_msg.contains("session recovery failed")
+                        || err_msg.contains("Auth store not configured")
+                        || err_msg.contains("Jacquard client not configured")
+                        || err_msg.contains("AuthRequired")
+                        || err_msg.contains("InvalidToken")
+                        || err_msg.contains("ExpiredToken");
+
+                    let next_state = if !is_auth_error && op.attempts + 1 >= 10 {
                         "failed"
                     } else {
                         "pending"
@@ -1041,6 +1327,152 @@ impl CircleService {
 
         tx.commit().await?;
         Ok(delivered_count)
+    }
+
+    /// Reconciles stale intent and executing operations by verifying or replaying deterministic PDS desired state.
+    pub async fn reconcile_stale_projections(&self, batch_size: i64) -> Result<usize, CircleError> {
+        let Some(pool) = &self.db else {
+            return Ok(0);
+        };
+
+        let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
+            r#"
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, created_at, updated_at
+            FROM circle_projection_outbox
+            WHERE state IN ('intent', 'executing') AND updated_at < now() - interval '30 seconds'
+            ORDER BY updated_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(batch_size)
+        .fetch_all(pool)
+        .await?;
+
+        let mut reconciled_count = 0;
+        for op in rows {
+            let session = match self.resolve_session_for_op(&op).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let atproto = AtProtoClient::new(self.state.clone());
+            let dpop_data = self.resolve_dpop_data(&session).await;
+
+            match op.kind {
+                CircleProjectionKind::CircleUpsert => {
+                    let query = format!(
+                        "space={}&repo={}&collection=blue.catbird.circle.metadata&rkey=self",
+                        urlencoding::encode(&op.space_uri),
+                        urlencoding::encode(&op.actor_did)
+                    );
+                    let resp = atproto.proxy_request(
+                        &session,
+                        reqwest::Method::GET,
+                        "/xrpc/com.atproto.space.getRecord",
+                        Some(&query),
+                        None,
+                        None,
+                        None,
+                        "reconcile-check-metadata",
+                        Some(&dpop_data),
+                    ).await;
+
+                    let exists = match resp {
+                        Ok(r) => {
+                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            (200..300).contains(&status)
+                        }
+                        Err(_) => false,
+                    };
+
+                    if exists {
+                        self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
+                        reconciled_count += 1;
+                    }
+                }
+                CircleProjectionKind::MemberAdd => {
+                    let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+                    let add_body = serde_json::json!({
+                        "space": &op.space_uri,
+                        "did": member_did
+                    });
+                    if let Ok(bytes) = serde_json::to_vec(&add_body) {
+                        let add_resp = atproto.proxy_request(
+                            &session,
+                            reqwest::Method::POST,
+                            "/xrpc/com.atproto.simplespace.addMember",
+                            None,
+                            Some(Bytes::from(bytes)),
+                            Some("application/json"),
+                            None,
+                            "reconcile-add-member",
+                            Some(&dpop_data),
+                        ).await;
+                        if let Ok(r) = add_resp {
+                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            if (200..300).contains(&status) {
+                                self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
+                                reconciled_count += 1;
+                            }
+                        }
+                    }
+                }
+                CircleProjectionKind::MemberRemove => {
+                    let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+                    let remove_body = serde_json::json!({
+                        "space": &op.space_uri,
+                        "did": member_did
+                    });
+                    if let Ok(bytes) = serde_json::to_vec(&remove_body) {
+                        let remove_resp = atproto.proxy_request(
+                            &session,
+                            reqwest::Method::POST,
+                            "/xrpc/com.atproto.simplespace.removeMember",
+                            None,
+                            Some(Bytes::from(bytes)),
+                            Some("application/json"),
+                            None,
+                            "reconcile-remove-member",
+                            Some(&dpop_data),
+                        ).await;
+                        if let Ok(r) = remove_resp {
+                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            if (200..300).contains(&status) {
+                                self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
+                                reconciled_count += 1;
+                            }
+                        }
+                    }
+                }
+                CircleProjectionKind::CircleDelete => {
+                    let delete_body = serde_json::json!({
+                        "space": &op.space_uri
+                    });
+                    if let Ok(bytes) = serde_json::to_vec(&delete_body) {
+                        let del_resp = atproto.proxy_request(
+                            &session,
+                            reqwest::Method::POST,
+                            "/xrpc/com.atproto.simplespace.deleteSpace",
+                            None,
+                            Some(Bytes::from(bytes)),
+                            Some("application/json"),
+                            None,
+                            "reconcile-delete-space",
+                            Some(&dpop_data),
+                        ).await;
+                        if let Ok(r) = del_resp {
+                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            if (200..300).contains(&status) {
+                                self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
+                                reconciled_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(reconciled_count)
     }
 
     /// Spawns a background task for processing due projections and monitors liveness.
@@ -1233,18 +1665,32 @@ impl CircleService {
         session: &CatbirdSession,
         lexicon: &str,
     ) -> Result<String, CircleError> {
-        if let Some(provider) = &self.service_auth_provider {
+        let result = if let Some(provider) = &self.service_auth_provider {
             provider
                 .token_for_audience(session, &self.state.config.circle.service_did, lexicon)
                 .await
-                .map_err(|e| CircleError::Internal(e.to_string()))
         } else {
             let provider = ServiceAuthProvider::new(self.state.clone());
             provider
                 .token_for_audience(session, &self.state.config.circle.service_did, lexicon)
                 .await
-                .map_err(|e| CircleError::Internal(e.to_string()))
-        }
+        };
+
+        result.map_err(|e| match e {
+            crate::error::AppError::AtprotoResponse { status: _, error, message } => {
+                match error.as_str() {
+                    "AuthRequired" => CircleError::NotAuthorized(message),
+                    "AccessRemoved" => CircleError::AccessRemoved(message),
+                    "InvalidRequest" => CircleError::InvalidRequest(message),
+                    _ => CircleError::UpstreamUnavailable(message),
+                }
+            }
+            crate::error::AppError::Upstream { message, .. } => CircleError::UpstreamUnavailable(message),
+            crate::error::AppError::HttpClient(e) => CircleError::UpstreamUnavailable(e.to_string()),
+            crate::error::AppError::Unauthorized(msg) => CircleError::NotAuthorized(msg),
+            crate::error::AppError::BadRequest(msg) => CircleError::InvalidRequest(msg),
+            other => CircleError::Internal(other.to_string()),
+        })
     }
 
     async fn resolve_dpop_data(&self, session: &CatbirdSession) -> JacquardDpopData {

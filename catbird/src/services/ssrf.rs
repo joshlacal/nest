@@ -23,7 +23,7 @@ use url::{Host, Url};
 /// * `Err(AppError::BadRequest)` if the URL is blocked
 pub fn validate_pds_url(url: &str) -> AppResult<()> {
     let parsed = Url::parse(url).map_err(|e| {
-        tracing::warn!(url = %url, error = %e, "SSRF: Invalid URL format");
+        tracing::warn!(error = %e, "SSRF: Invalid URL format");
         AppError::BadRequest(format!("Invalid PDS URL: {}", e))
     })?;
 
@@ -33,7 +33,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
     let is_https = scheme == "https";
 
     if !is_http && !is_https {
-        tracing::warn!(url = %url, scheme = %scheme, "SSRF: Blocked non-HTTP(S) scheme");
+        tracing::warn!(scheme = %scheme, "SSRF: Blocked non-HTTP(S) scheme");
         return Err(AppError::BadRequest(format!(
             "Invalid PDS URL: scheme '{}' not allowed",
             scheme
@@ -42,19 +42,21 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
 
     // Get host using url crate's proper host parsing (handles IPv4, IPv6, and domains)
     let host = parsed.host().ok_or_else(|| {
-        tracing::warn!(url = %url, "SSRF: URL has no host");
+        tracing::warn!(scheme = %scheme, "SSRF: URL has no host");
         AppError::BadRequest("Invalid PDS URL: no host specified".to_string())
     })?;
+
+    let host_str = host.to_string();
 
     match host {
         Host::Ipv4(ipv4) => {
             #[cfg(debug_assertions)]
             if ipv4.is_loopback() && is_http {
-                tracing::debug!(url = %url, "SSRF: Allowing loopback in debug mode");
+                tracing::debug!(scheme = %scheme, host = %host_str, "SSRF: Allowing loopback in debug mode");
                 return Ok(());
             }
             if is_private_ipv4(&ipv4) {
-                tracing::warn!(url = %url, ip = %ipv4, "SSRF: Blocked private/loopback IPv4");
+                tracing::warn!(scheme = %scheme, ip = %ipv4, "SSRF: Blocked private/loopback IPv4");
                 return Err(AppError::BadRequest(
                     "Invalid PDS URL: private network not allowed".to_string(),
                 ));
@@ -62,7 +64,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
         }
         Host::Ipv6(ipv6) => {
             if is_private_ipv6(&ipv6) {
-                tracing::warn!(url = %url, ip = %ipv6, "SSRF: Blocked private/loopback IPv6");
+                tracing::warn!(scheme = %scheme, ip = %ipv6, "SSRF: Blocked private/loopback IPv6");
                 return Err(AppError::BadRequest(
                     "Invalid PDS URL: private network not allowed".to_string(),
                 ));
@@ -76,7 +78,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
                 #[cfg(debug_assertions)]
                 {
                     if is_http {
-                        tracing::debug!(url = %url, "SSRF: Allowing localhost in debug mode");
+                        tracing::debug!(scheme = %scheme, host = %host_str, "SSRF: Allowing localhost in debug mode");
                         return Ok(());
                     }
                 }
@@ -84,7 +86,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
                 // In release mode, block localhost entirely
                 #[cfg(not(debug_assertions))]
                 {
-                    tracing::warn!(url = %url, "SSRF: Blocked localhost in release mode");
+                    tracing::warn!(scheme = %scheme, host = %host_str, "SSRF: Blocked localhost in release mode");
                     return Err(AppError::BadRequest(
                         "Invalid PDS URL: localhost not allowed".to_string(),
                     ));
@@ -95,7 +97,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
 
     // HTTP is only allowed for localhost (handled above for Domain case)
     if is_http {
-        tracing::warn!(url = %url, "SSRF: HTTP not allowed for non-localhost");
+        tracing::warn!(scheme = %scheme, host = %host_str, "SSRF: HTTP not allowed for non-localhost");
         return Err(AppError::BadRequest(
             "Invalid PDS URL: HTTPS required".to_string(),
         ));
@@ -105,8 +107,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
 }
 
 /// Check if an IP address is in a private, loopback, or otherwise restricted range
-#[allow(dead_code)]
-fn is_private_ip(ip: &IpAddr) -> bool {
+pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => is_private_ipv4(ipv4),
         IpAddr::V6(ipv6) => is_private_ipv6(ipv6),
@@ -114,12 +115,16 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 }
 
 /// Check if an IPv4 address is private/restricted
-fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
+pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
+    // Current network: 0.0.0.0/8
+    if ip.octets()[0] == 0 {
+        return true;
+    }
+
     // Loopback: 127.0.0.0/8
     if ip.is_loopback() {
         return true;
     }
-
     // Private ranges
     // 10.0.0.0/8
     if ip.octets()[0] == 10 {
@@ -169,7 +174,7 @@ fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
 }
 
 /// Check if an IPv6 address is private/restricted
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
+pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     // Loopback: ::1
     if ip.is_loopback() {
         return true;

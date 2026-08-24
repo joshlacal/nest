@@ -359,19 +359,31 @@ impl AtProtoClient {
                 "[BFF-UPSTREAM-RECV] Response from PDS (buffered)"
             );
 
-            // Log error response bodies for debugging
+            // Log error response bodies for debugging (excluding Circle/Space requests for privacy)
             if status >= 400 && status != 401 {
-                if let Ok(error_text) = std::str::from_utf8(&body) {
-                    let truncated = if error_text.len() > 200 {
-                        &error_text[..200]
-                    } else {
-                        error_text
-                    };
+                let is_circle = url.contains("blue.catbird.circle")
+                    || url.contains("com.atproto.space")
+                    || url.contains("com.atproto.simplespace");
+                if !is_circle {
+                    if let Ok(error_text) = std::str::from_utf8(&body) {
+                        let truncated = if error_text.len() > 200 {
+                            &error_text[..200]
+                        } else {
+                            error_text
+                        };
+                        tracing::warn!(
+                            request_id = %request_id,
+                            attempt = attempt,
+                            status = status,
+                            error_body = %truncated,
+                            "[BFF-UPSTREAM-ERR] PDS error response"
+                        );
+                    }
+                } else {
                     tracing::warn!(
                         request_id = %request_id,
                         attempt = attempt,
                         status = status,
-                        error_body = %truncated,
                         "[BFF-UPSTREAM-ERR] PDS error response"
                     );
                 }
