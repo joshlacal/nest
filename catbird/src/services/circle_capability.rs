@@ -2,6 +2,73 @@ use crate::{error::AppError, models::{require_circle_scopes, CatbirdSession, CIR
 use dashmap::DashMap;
 use serde::Serialize;
 use std::{future::Future, pin::Pin, sync::Arc, time::{Duration, Instant}};
+use crate::config::AppState;
+use crate::services::{AtProtoClient, ProxyResponse};
+use std::sync::{OnceLock, Weak};
+
+pub struct AtProtoCircleProbe {
+    state: Arc<OnceLock<Weak<AppState>>>,
+}
+
+impl AtProtoCircleProbe {
+    pub fn new() -> Self {
+        Self { state: Arc::new(OnceLock::new()) }
+    }
+
+    pub fn set_state(&self, state: Weak<AppState>) {
+        let _ = self.state.set(state);
+    }
+}
+
+impl CircleProbe for AtProtoCircleProbe {
+    fn set_state(&self, state: Weak<AppState>) {
+        let _ = self.state.set(state);
+    }
+
+    fn probe<'a>(&'a self, session: &'a CatbirdSession) -> Pin<Box<dyn Future<Output = Result<CircleProbeResult, AppError>> + Send + 'a>> {
+        self.probe_with(session, None, "circle-capability")
+    }
+    fn probe_with<'a>(
+        &'a self,
+        session: &'a CatbirdSession,
+        dpop: Option<&'a crate::middleware::JacquardDpopData>,
+        request_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CircleProbeResult, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.state.get().and_then(Weak::upgrade)
+                .ok_or_else(|| AppError::Internal("Circle capability probe unavailable".into()))?;
+            let response = AtProtoClient::new(state).proxy_request(
+                session, reqwest::Method::GET, "/xrpc/com.atproto.space.listSpaces",
+                None, None, None, None, request_id, dpop,
+            ).await?;
+            match response {
+                ProxyResponse::Buffered { status, body, .. } if (200..300).contains(&status) => {
+                    let value: serde_json::Value = serde_json::from_slice(&body)?;
+                    Ok(CircleProbeResult::Supported {
+                        supports_images: value.get("supportsImages").and_then(|v| v.as_bool()).unwrap_or(false),
+                    })
+                }
+                ProxyResponse::Buffered { status, body, .. } if status == 404 || status == 501 => {
+                    let error = serde_json::from_slice::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned));
+                    match error.as_deref() {
+                        Some("MethodNotFound" | "UnknownMethod") => Ok(CircleProbeResult::Unsupported),
+                        _ => Err(AppError::Upstream { status, message: "Malformed capability probe response".into() }),
+                    }
+                }
+                ProxyResponse::Buffered { status, .. } => Err(AppError::Upstream { status, message: "Capability probe failed".into() }),
+                ProxyResponse::Streaming { status, .. } => Err(AppError::Upstream { status, message: "Unexpected capability response".into() }),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircleProbeResult {
+    Supported { supports_images: bool },
+    Unsupported,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CircleCapability {
@@ -13,7 +80,17 @@ pub struct CircleCapability {
 }
 
 pub trait CircleProbe: Send + Sync {
-    fn probe<'a>(&'a self, session: &'a CatbirdSession) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + 'a>>;
+    fn probe<'a>(&'a self, session: &'a CatbirdSession) -> Pin<Box<dyn Future<Output = Result<CircleProbeResult, AppError>> + Send + 'a>>;
+    fn set_state(&self, _state: Weak<AppState>) {}
+
+    fn probe_with<'a>(
+        &'a self,
+        session: &'a CatbirdSession,
+        _dpop: Option<&'a crate::middleware::JacquardDpopData>,
+        _request_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CircleProbeResult, AppError>> + Send + 'a>> {
+        self.probe(session)
+    }
 }
 
 struct CachedCapability {
@@ -30,8 +107,20 @@ impl<P: CircleProbe> CircleCapabilityService<P> {
     pub fn new(probe: P) -> Self {
         Self { probe, cache: Arc::new(DashMap::new()) }
     }
+    pub fn set_state(&self, state: Weak<AppState>) {
+        self.probe.set_state(state);
+    }
 
     pub async fn get(&self, session: &CatbirdSession) -> Result<CircleCapability, AppError> {
+        self.get_with_request(session, None, "circle-capability").await
+    }
+
+    pub async fn get_with_request(
+        &self,
+        session: &CatbirdSession,
+        dpop: Option<&crate::middleware::JacquardDpopData>,
+        request_id: &str,
+    ) -> Result<CircleCapability, AppError> {
         require_circle_scopes(session)?;
         let key = format!("{}:{CIRCLE_PROTOCOL_REVISION}", session.pds_url);
         if let Some(cached) = self.cache.get(&key) {
@@ -39,13 +128,12 @@ impl<P: CircleProbe> CircleCapabilityService<P> {
                 return Ok(cached.capability.clone());
             }
         }
-
-        let supports_images = self.probe.probe(session).await.unwrap_or(false);
-        let capability = CircleCapability {
-            enabled: supports_images,
-            protocol_revision: CIRCLE_PROTOCOL_REVISION,
-            supports_images,
+        let probe_result = self.probe.probe_with(session, dpop, request_id).await?;
+        let (enabled, supports_images) = match probe_result {
+            CircleProbeResult::Supported { supports_images } => (true, supports_images),
+            CircleProbeResult::Unsupported => (false, false),
         };
+        let capability = CircleCapability { enabled, protocol_revision: CIRCLE_PROTOCOL_REVISION, supports_images };
         self.cache.insert(key, CachedCapability { checked_at: Instant::now(), capability: capability.clone() });
         Ok(capability)
     }
@@ -60,8 +148,8 @@ mod tests {
     struct StubProbe;
 
     impl CircleProbe for StubProbe {
-        fn probe<'a>(&'a self, _session: &'a CatbirdSession) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + 'a>> {
-            Box::pin(async { Ok(false) })
+        fn probe<'a>(&'a self, _session: &'a CatbirdSession) -> Pin<Box<dyn Future<Output = Result<CircleProbeResult, AppError>> + Send + 'a>> {
+            Box::pin(async { Ok(CircleProbeResult::Unsupported) })
         }
     }
 

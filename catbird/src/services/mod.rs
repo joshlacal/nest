@@ -25,7 +25,7 @@ pub use mls_auth::{
 };
 pub use push::PushServices;
 pub use redis_auth_store::RedisAuthStore;
-pub use circle_capability::{CircleCapability, CircleCapabilityService, CircleProbe};
+pub use circle_capability::{AtProtoCircleProbe, CircleCapability, CircleCapabilityService, CircleProbe, CircleProbeResult};
 pub use crate::models::require_circle_scopes;
 pub use service_auth::{ServiceAuthProvider, MLS_APPVIEW_SERVICE_REF};
 

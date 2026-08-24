@@ -53,6 +53,9 @@ pub enum Scope<'s> {
     Profile,
     /// Email scope - access to user email address
     Email,
+    /// Draft Space scope. The string is preserved exactly because Space scopes
+    /// are not yet part of the stable OAuth scope grammar.
+    Space(CowStr<'s>),
     /// Include scope for referencing permission set definitions
     Include(IncludeScope<'s>),
 }
@@ -107,6 +110,7 @@ impl IntoStatic for Scope<'_> {
             Scope::OpenId => Scope::OpenId,
             Scope::Profile => Scope::Profile,
             Scope::Email => Scope::Email,
+            Scope::Space(scope) => Scope::Space(scope.into_static()),
             Scope::Include(scope) => Scope::Include(scope.into_static()),
         }
     }
@@ -482,6 +486,7 @@ impl<'s> Scope<'s> {
             "profile",
             "email",
             "include",
+            "space",
         ];
         let mut found_prefix = None;
         let mut suffix = None;
@@ -522,6 +527,7 @@ impl<'s> Scope<'s> {
             "profile" => Self::parse_profile(suffix),
             "email" => Self::parse_email(suffix),
             "include" => Self::parse_include(suffix),
+            "space" => Ok(Scope::Space(s.into())),
             _ => Err(ParseError::UnknownPrefix(prefix.to_string())),
         }
     }
@@ -921,6 +927,7 @@ impl<'s> Scope<'s> {
             Scope::OpenId => "openid".to_string(),
             Scope::Profile => "profile".to_string(),
             Scope::Email => "email".to_string(),
+            Scope::Space(scope) => scope.to_string(),
             Scope::Include(scope) => {
                 if scope.aud.is_empty() {
                     format!("include:{}", scope.nsid)
@@ -940,16 +947,10 @@ impl<'s> Scope<'s> {
     /// Check if this scope grants the permissions of another scope
     pub fn grants(&self, other: &Scope) -> bool {
         match (self, other) {
-            // Atproto only grants itself (it's a required scope, not a permission grant)
-            (Scope::Atproto, Scope::Atproto) => true,
-            (Scope::Atproto, _) => false,
-            // Nothing else grants atproto
-            (_, Scope::Atproto) => false,
-            // Transition scopes only grant themselves
-            (Scope::Transition(a), Scope::Transition(b)) => a == b,
-            // Other scopes don't grant transition scopes
-            (_, Scope::Transition(_)) => false,
-            (Scope::Transition(_), _) => false,
+            // Draft Space scopes grant only the exact same scope.
+            (Scope::Space(a), Scope::Space(b)) => a == b,
+            (_, Scope::Space(_)) => false,
+            (Scope::Space(_), _) => false,
             // OpenID Connect scopes only grant themselves
             (Scope::OpenId, Scope::OpenId) => true,
             (Scope::OpenId, _) => false,
@@ -1311,6 +1312,13 @@ mod tests {
             let scope = Scope::parse(input).unwrap();
             assert_eq!(scope.to_string_normalized(), expected);
         }
+    }
+    #[test]
+    fn draft_space_scopes_round_trip_exactly() {
+        let input = "space:blue.catbird.circle?authority=*&action=read&action=create&action=update&action=delete&collection=app.bsky.feed.post&collection=app.bsky.feed.like";
+        let scope = Scope::parse(input).unwrap();
+        assert_eq!(scope.to_string_normalized(), input);
+        assert_eq!(Scope::serialize_multiple(&[scope]), input);
     }
 
     #[test]

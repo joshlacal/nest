@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
-
+    state.circle_capability.set_state(Arc::downgrade(&state));
     tracing::info!("Connected to Redis at {}", app_config.redis.url);
 
     // Register Prometheus metrics

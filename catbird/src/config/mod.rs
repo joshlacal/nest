@@ -381,6 +381,7 @@ pub struct AppState {
     /// a guaranteed `use_dpop_nonce` round trip. See
     /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
+    pub circle_capability: Arc<crate::services::CircleCapabilityService<crate::services::AtProtoCircleProbe>>,
     /// AES-256-GCM encryption key for Redis session records
     pub session_encryption_key: Option<[u8; 32]>,
 }
@@ -439,6 +440,7 @@ impl AppState {
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
             session_encryption_key,
         };
         // Initialize KeyStore first (needed by OAuth client)
@@ -545,8 +547,12 @@ impl AppState {
             .oauth
             .scopes
             .iter()
-            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
-            .collect();
+            .map(|s| {
+                Scope::parse(s)
+                    .map(|scope| scope.into_static())
+                    .map_err(|error| anyhow::anyhow!("Invalid configured OAuth scope {s:?}: {error:?}"))
+            })
+            .collect::<Result<_, _>>()?;
 
         let metadata = AtprotoClientMetadata::new(
             client_id,
@@ -591,8 +597,12 @@ impl AppState {
             .unwrap_or_else(|_| "atproto transition:generic".to_string());
         let scopes: Vec<Scope<'static>> = scope_str
             .split_whitespace()
-            .filter_map(|s| Scope::parse(s).ok().map(|sc| sc.into_static()))
-            .collect();
+            .map(|s| {
+                Scope::parse(s)
+                    .map(|scope| scope.into_static())
+                    .map_err(|error| anyhow::anyhow!("Invalid CATMOS_OAUTH_SCOPES value {s:?}: {error:?}"))
+            })
+            .collect::<Result<_, _>>()?;
 
         let metadata = AtprotoClientMetadata::new(
             client_id,

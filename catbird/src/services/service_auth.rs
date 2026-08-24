@@ -249,6 +249,7 @@ mod tests {
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
             session_encryption_key: None,
         })
     }

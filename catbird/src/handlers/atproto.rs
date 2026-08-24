@@ -883,8 +883,19 @@ pub async fn proxy_xrpc(
         return Ok(response.body(Body::from(response_body)).unwrap());
     }
 
-    // Default: proxy through PDS
+    // Circle draft methods require both grants and an authenticated capability probe.
+    if lexicon.starts_with("com.atproto.space.") || lexicon.starts_with("com.atproto.simplespace.") {
+        let dpop_ref = dpop_data.as_ref().map(|ext| &ext.0);
+        let capability = state.circle_capability
+            .get_with_request(&session, dpop_ref, &request_id)
+            .await?;
+        if !capability.enabled {
+            return Err(AppError::Upstream { status: 501, message: "PDS does not support Circle Space methods".into() });
+        }
+    }
     let path = format!("/xrpc/{}", lexicon);
+
+    // Default: proxy through PDS
     tracing::info!(
         request_id = %request_id,
         method = %method,
