@@ -172,13 +172,8 @@ pub fn validate_record(
                     })?;
 
                 // Parent and root must be known same-space post URIs
-                if !policy.known_post_uris.is_empty() {
-                    if !policy.known_post_uris.contains(parent_uri)
-                        || !policy.known_post_uris.contains(root_uri)
-                    {
-                        return Err(InvalidRecord::CrossSpaceReference);
-                    }
-                } else if parent_uri.contains("did:plc:other") || root_uri.contains("did:plc:other")
+                if !policy.known_post_uris.contains(parent_uri)
+                    || !policy.known_post_uris.contains(root_uri)
                 {
                     return Err(InvalidRecord::CrossSpaceReference);
                 }
@@ -232,13 +227,9 @@ pub fn validate_record(
                     InvalidRecord::MalformedRecord("Missing subject.uri in like".into())
                 })?;
 
-            if !policy.known_post_uris.is_empty() {
                 if !policy.known_post_uris.contains(subject_uri) {
                     return Err(InvalidRecord::CrossSpaceReference);
                 }
-            } else if subject_uri.contains("did:plc:other") {
-                return Err(InvalidRecord::CrossSpaceReference);
-            }
 
             Ok(ValidatedRecord {
                 uri: candidate.uri.clone(),

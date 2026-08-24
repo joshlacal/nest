@@ -35,6 +35,7 @@ pub trait SpaceHostTransport: Send + Sync {
         _space_credential: &'a str,
         _dpop_proof: &'a str,
         _space_uri: &'a str,
+        _cursor: Option<&'a str>,
     ) -> Pin<
         Box<
             dyn Future<
@@ -52,7 +53,7 @@ pub trait SpaceHostTransport: Send + Sync {
             ))
         })
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn list_repo_ops<'a>(
         &'a self,
         _target_url: &'a url::Url,
@@ -61,6 +62,7 @@ pub trait SpaceHostTransport: Send + Sync {
         _space_uri: &'a str,
         _repo_did: &'a str,
         _since: Option<&'a str>,
+        _cursor: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>>{
         Box::pin(async move {
             Err(AppError::NotFound(
@@ -202,6 +204,67 @@ impl DefaultSpaceHostTransport {
             allow_loopback_for_test: allow_loopback,
         }
     }
+
+    pub async fn build_pinned_client(&self, target_url: &url::Url) -> Result<reqwest::Client, AppError> {
+        if target_url.scheme() != "https" {
+            return Err(AppError::InvalidRequest(
+                "Space host endpoint must use HTTPS".into(),
+            ));
+        }
+
+        let host = target_url
+            .host_str()
+            .ok_or_else(|| AppError::InvalidRequest("Missing host in Space host URL".into()))?;
+
+        if !self.allow_loopback_for_test {
+            if host.is_empty() || is_localhost_hostname(host) {
+                return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+            }
+
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if is_private_ip(&ip) {
+                    return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+                }
+            }
+        }
+
+        let port = target_url.port().unwrap_or(443);
+
+        // DNS resolution
+        let addrs = self
+            .dns_resolver
+            .resolve_dns(host, port)
+            .await
+            .map_err(AppError::Unauthorized)?;
+
+        if addrs.is_empty() {
+            return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+        }
+
+        if !self.allow_loopback_for_test {
+            // Reject every non-global/special-purpose address
+            for addr in &addrs {
+                if is_private_ip(&addr.ip()) {
+                    return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+                }
+            }
+        }
+        let pinned_addr = addrs[0];
+
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .resolve(host, pinned_addr);
+
+        if let Some(cert) = &self.test_root_cert {
+            builder = builder.add_root_certificate(cert.clone());
+        }
+
+        builder.build().map_err(|e| {
+            AppError::Internal(format!("Failed to build pinned HTTPS client: {e}"))
+        })
+    }
 }
 
 impl SpaceHostTransport for DefaultSpaceHostTransport {
@@ -218,63 +281,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         let dpop_proof = dpop_proof.to_string();
         let space_uri = space_uri.to_string();
         let client_attestation = client_attestation.to_string();
-        let test_cert = self.test_root_cert.clone();
 
         Box::pin(async move {
-            if target_url.scheme() != "https" {
-                return Err(AppError::InvalidRequest(
-                    "Space host endpoint must use HTTPS".into(),
-                ));
-            }
-
-            let host = target_url
-                .host_str()
-                .ok_or_else(|| AppError::InvalidRequest("Missing host in Space host URL".into()))?;
-
-            if !self.allow_loopback_for_test {
-                if host.is_empty() || is_localhost_hostname(host) {
-                    return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
-                }
-
-                if let Ok(ip) = host.parse::<IpAddr>() {
-                    if is_private_ip(&ip) {
-                        return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
-                    }
-                }
-            }
-
-            let port = target_url.port().unwrap_or(443);
-
-            // DNS resolution
-            let addrs = self
-                .dns_resolver
-                .resolve_dns(host, port)
-                .await
-                .map_err(AppError::Unauthorized)?;
-
-            if !self.allow_loopback_for_test {
-                // Reject every non-global/special-purpose address
-                for addr in &addrs {
-                    if is_private_ip(&addr.ip()) {
-                        return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
-                    }
-                }
-            }
-            let pinned_addr = addrs[0];
-
-            let mut builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(5))
-                .resolve(host, pinned_addr);
-
-            if let Some(cert) = test_cert {
-                builder = builder.add_root_certificate(cert);
-            }
-
-            let client = builder.build().map_err(|e| {
-                AppError::Internal(format!("Failed to build pinned HTTPS client: {e}"))
-            })?;
+            let client = self.build_pinned_client(&target_url).await?;
 
             let req_body = serde_json::json!({
                 "space": space_uri,
@@ -322,6 +331,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         space_credential: &'a str,
         dpop_proof: &'a str,
         space_uri: &'a str,
+        cursor: Option<&'a str>,
     ) -> Pin<
         Box<
             dyn Future<
@@ -337,34 +347,19 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         let space_credential = space_credential.to_string();
         let dpop_proof = dpop_proof.to_string();
         let space_uri = space_uri.to_string();
-        let test_cert = self.test_root_cert.clone();
+        let cursor = cursor.map(|c| c.to_string());
 
         Box::pin(async move {
-            let host = target_url
-                .host_str()
-                .ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
-            let port = target_url.port().unwrap_or(443);
-            let addrs = self
-                .dns_resolver
-                .resolve_dns(host, port)
-                .await
-                .map_err(AppError::Unauthorized)?;
-            let pinned_addr = addrs[0];
-
-            let mut builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(5))
-                .resolve(host, pinned_addr);
-            if let Some(cert) = test_cert {
-                builder = builder.add_root_certificate(cert);
-            }
-            let client = builder
-                .build()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let client = self.build_pinned_client(&target_url).await?;
 
             let mut req_url = target_url.clone();
-            req_url.query_pairs_mut().append_pair("space", &space_uri);
+            {
+                let mut query = req_url.query_pairs_mut();
+                query.append_pair("space", &space_uri);
+                if let Some(c) = &cursor {
+                    query.append_pair("cursor", c);
+                }
+            }
 
             let response = client
                 .get(req_url.as_str())
@@ -390,7 +385,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             Ok(output)
         })
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn list_repo_ops<'a>(
         &'a self,
         target_url: &'a url::Url,
@@ -399,6 +394,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         space_uri: &'a str,
         repo_did: &'a str,
         since: Option<&'a str>,
+        cursor: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>>{
         let target_url = target_url.clone();
         let space_credential = space_credential.to_string();
@@ -406,31 +402,10 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         let space_uri = space_uri.to_string();
         let repo_did = repo_did.to_string();
         let since = since.map(|s| s.to_string());
-        let test_cert = self.test_root_cert.clone();
+        let cursor = cursor.map(|c| c.to_string());
 
         Box::pin(async move {
-            let host = target_url
-                .host_str()
-                .ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
-            let port = target_url.port().unwrap_or(443);
-            let addrs = self
-                .dns_resolver
-                .resolve_dns(host, port)
-                .await
-                .map_err(AppError::Unauthorized)?;
-            let pinned_addr = addrs[0];
-
-            let mut builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(5))
-                .resolve(host, pinned_addr);
-            if let Some(cert) = test_cert {
-                builder = builder.add_root_certificate(cert);
-            }
-            let client = builder
-                .build()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let client = self.build_pinned_client(&target_url).await?;
 
             let mut req_url = target_url.clone();
             {
@@ -439,6 +414,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 query.append_pair("repo", &repo_did);
                 if let Some(s) = &since {
                     query.append_pair("since", s);
+                }
+                if let Some(c) = &cursor {
+                    query.append_pair("cursor", c);
                 }
             }
 
@@ -482,31 +460,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         let space_uri = space_uri.to_string();
         let repo_did = repo_did.to_string();
         let since = since.map(|s| s.to_string());
-        let test_cert = self.test_root_cert.clone();
 
         Box::pin(async move {
-            let host = target_url
-                .host_str()
-                .ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
-            let port = target_url.port().unwrap_or(443);
-            let addrs = self
-                .dns_resolver
-                .resolve_dns(host, port)
-                .await
-                .map_err(AppError::Unauthorized)?;
-            let pinned_addr = addrs[0];
-
-            let mut builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(5))
-                .resolve(host, pinned_addr);
-            if let Some(cert) = test_cert {
-                builder = builder.add_root_certificate(cert);
-            }
-            let client = builder
-                .build()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let client = self.build_pinned_client(&target_url).await?;
 
             let mut req_url = target_url.clone();
             {
@@ -566,31 +522,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         let dpop_proof = dpop_proof.to_string();
         let space_uri = space_uri.to_string();
         let repo_did = repo_did.to_string();
-        let test_cert = self.test_root_cert.clone();
 
         Box::pin(async move {
-            let host = target_url
-                .host_str()
-                .ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
-            let port = target_url.port().unwrap_or(443);
-            let addrs = self
-                .dns_resolver
-                .resolve_dns(host, port)
-                .await
-                .map_err(AppError::Unauthorized)?;
-            let pinned_addr = addrs[0];
-
-            let mut builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(5))
-                .resolve(host, pinned_addr);
-            if let Some(cert) = test_cert {
-                builder = builder.add_root_certificate(cert);
-            }
-            let client = builder
-                .build()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let client = self.build_pinned_client(&target_url).await?;
 
             let mut req_url = target_url.clone();
             req_url
@@ -747,6 +681,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         _space_credential: &'a str,
         _dpop_proof: &'a str,
         space_uri: &'a str,
+        cursor: Option<&'a str>,
     ) -> Pin<
         Box<
             dyn Future<
@@ -758,17 +693,21 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 + 'a,
         >,
     > {
-        let res = self
-            .list_repos_responses
-            .lock()
-            .unwrap()
-            .get(space_uri)
+        let key_with_cursor = match cursor {
+            Some(c) => format!("{space_uri}:{c}"),
+            None => space_uri.to_string(),
+        };
+        let key_base = space_uri.to_string();
+        let lock = self.list_repos_responses.lock().unwrap();
+        let res = lock
+            .get(&key_with_cursor)
+            .or_else(|| lock.get(&key_base))
             .cloned();
         Box::pin(async move {
             res.ok_or_else(|| AppError::NotFound("No mock list_repos configured for space".into()))
         })
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn list_repo_ops<'a>(
         &'a self,
         _target_url: &'a url::Url,
@@ -777,17 +716,31 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         space_uri: &'a str,
         repo_did: &'a str,
         since: Option<&'a str>,
+        cursor: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>>{
-        let key_with_since = match since {
-            Some(s) => format!("{space_uri}:{repo_did}:{s}"),
-            None => format!("{space_uri}:{repo_did}"),
-        };
-        let key_base = format!("{space_uri}:{repo_did}");
+        let mut candidates = Vec::new();
+        if let (Some(s), Some(c)) = (since, cursor) {
+            candidates.push(format!("{space_uri}:{repo_did}:{s}:{c}"));
+        }
+        if let Some(c) = cursor {
+            candidates.push(format!("{space_uri}:{repo_did}:{c}"));
+            candidates.push(format!("{space_uri}:{repo_did}::cursor:{c}"));
+        }
+        if let Some(s) = since {
+            candidates.push(format!("{space_uri}:{repo_did}:{s}"));
+        }
+        if cursor.is_none() {
+            candidates.push(format!("{space_uri}:{repo_did}"));
+        }
         let lock = self.list_repo_ops_responses.lock().unwrap();
-        let res = lock
-            .get(&key_with_since)
-            .or_else(|| lock.get(&key_base))
-            .cloned();
+        let mut res = None;
+        for cand in &candidates {
+            if let Some(r) = lock.get(cand) {
+                res = Some(r.clone());
+                break;
+            }
+        }
+        let key_base = format!("{space_uri}:{repo_did}");
         Box::pin(async move {
             res.ok_or_else(|| {
                 AppError::NotFound(format!("No mock list_repo_ops configured for {key_base}"))
@@ -893,7 +846,7 @@ impl SpaceClient {
 
         let ephemeral_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let verifying_key = ephemeral_key.verifying_key();
-        let expected_jkt = calculate_rfc7638_jkt(&verifying_key);
+        let expected_jkt = calculate_rfc7638_jkt(verifying_key);
 
         let dpop_proof = create_dpop_proof(&ephemeral_key, "POST", xrpc_url.as_str());
 
@@ -924,6 +877,7 @@ impl SpaceClient {
         &self,
         service_endpoint: &str,
         space_uri: &str,
+        cursor: Option<&str>,
         space_credential: &str,
         dpop_key: &p256::ecdsa::SigningKey,
     ) -> Result<catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput, AppError>
@@ -932,16 +886,17 @@ impl SpaceClient {
         let dpop_proof =
             create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
         self.transport
-            .list_repos(&xrpc_url, space_credential, &dpop_proof, space_uri)
+            .list_repos(&xrpc_url, space_credential, &dpop_proof, space_uri, cursor)
             .await
     }
-
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_repo_ops(
         &self,
         service_endpoint: &str,
         space_uri: &str,
         repo_did: &str,
         since: Option<&str>,
+        cursor: Option<&str>,
         space_credential: &str,
         dpop_key: &p256::ecdsa::SigningKey,
     ) -> Result<
@@ -959,6 +914,7 @@ impl SpaceClient {
                 space_uri,
                 repo_did,
                 since,
+                cursor,
             )
             .await
     }

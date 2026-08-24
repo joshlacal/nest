@@ -168,10 +168,10 @@ pub fn resolve_space_host_endpoint(
 
     // 1. Try exact #atproto_space_host first
     for svc in &doc.service {
-        if svc.id == expected_short_id || svc.id == expected_full_id {
-            if !svc.service_endpoint.is_empty() {
-                return Ok((svc.service_endpoint.clone(), expected_full_id));
-            }
+        if (svc.id == expected_short_id || svc.id == expected_full_id)
+            && !svc.service_endpoint.is_empty()
+        {
+            return Ok((svc.service_endpoint.clone(), expected_full_id));
         }
     }
 
@@ -179,15 +179,47 @@ pub fn resolve_space_host_endpoint(
     let pds_full_id = format!("{authority_did}#atproto_pds");
     let pds_short_id = "#atproto_pds";
     for svc in &doc.service {
-        if svc.id == pds_short_id || svc.id == pds_full_id {
-            if !svc.service_endpoint.is_empty() {
-                return Ok((svc.service_endpoint.clone(), pds_full_id));
-            }
+        if (svc.id == pds_short_id || svc.id == pds_full_id) && !svc.service_endpoint.is_empty() {
+            return Ok((svc.service_endpoint.clone(), pds_full_id));
         }
     }
 
     Err(AppError::InvalidRequest(
         "No #atproto_space_host or #atproto_pds service found in authority DID document".into(),
+    ))
+}
+
+pub fn resolve_pds_endpoint(
+    doc: &DidDocument,
+    author_did: &str,
+) -> Result<(String, String), AppError> {
+    if doc.id != author_did {
+        return Err(AppError::Unauthorized(AuthReason::IdMismatch));
+    }
+
+    let pds_full_id = format!("{author_did}#atproto_pds");
+    let pds_short_id = "#atproto_pds";
+    for svc in &doc.service {
+        if (svc.id == pds_short_id || svc.id == pds_full_id || svc.r#type == "AtprotoPersonalDataServer")
+            && !svc.service_endpoint.is_empty()
+        {
+            return Ok((svc.service_endpoint.clone(), pds_full_id));
+        }
+    }
+
+    // Fallback to space host if author is authority and only space host defined
+    let space_host_full_id = format!("{author_did}#atproto_space_host");
+    let space_host_short_id = "#atproto_space_host";
+    for svc in &doc.service {
+        if (svc.id == space_host_short_id || svc.id == space_host_full_id)
+            && !svc.service_endpoint.is_empty()
+        {
+            return Ok((svc.service_endpoint.clone(), space_host_full_id));
+        }
+    }
+
+    Err(AppError::InvalidRequest(
+        "No #atproto_pds service found in author DID document".into(),
     ))
 }
 

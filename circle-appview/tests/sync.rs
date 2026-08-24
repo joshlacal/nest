@@ -457,15 +457,30 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         &did_resolver,
         OWNER_DID,
         &owner_key,
-        Some(vec![DidService {
-            id: "#atproto_space_host".into(),
-            r#type: "AtprotoSpaceHost".into(),
-            service_endpoint: "https://space.catbird.blue".into(),
-        }]),
+        Some(vec![
+            DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: "https://space.catbird.blue".into(),
+            },
+            DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: "https://pds.alice.blue".into(),
+            },
+        ]),
     );
 
-    register_did_doc(&did_resolver, BOB_DID, &bob_key, None);
-
+    register_did_doc(
+        &did_resolver,
+        BOB_DID,
+        &bob_key,
+        Some(vec![DidService {
+            id: "#atproto_pds".into(),
+            r#type: "AtprotoPersonalDataServer".into(),
+            service_endpoint: "https://pds.bob.blue".into(),
+        }]),
+    );
     let mock_transport = Arc::new(MockSpaceHostTransport::new());
     let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
     let credential_store = Arc::new(CredentialStore::new());
@@ -985,16 +1000,15 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
         },
     );
 
-    // Space host returns listRepos with updated revision
+    // Space host returns listRepos with updated revision and 32-byte SHA256 digest
     let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
         did: Did::from(String::from(OWNER_DID)),
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            lthash.as_bytes(),
+            &lthash.digest(),
         ),
         rev: Tid::from(String::from(rev)),
         extra_data: None,
     };
-
     setup.mock_transport.set_list_repos_response(
         SPACE_URI,
         catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
@@ -1032,9 +1046,13 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
 // New Direct Tests for Reviewer Verification
 // ---------------------------------------------------------------------------------------
 
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[test]
 fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
-    // 1. Exact Context Encoding with uint16be length prefixes
+    // 1. Exact Context Encoding with raw protocol tag + uint16be length prefixes
     let ikm = [0x42u8; 32];
     let ctx = compute_commit_context(
         "at://did:plc:alice/space/blue.catbird.circle/1",
@@ -1043,23 +1061,36 @@ fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
         &ikm,
     );
 
-    // Check uint16be fields
+    // Check raw protocol tag (no len prefix) and uint16be fields
     let tag = b"atproto-space-v1";
-    assert_eq!(&ctx[0..2], &(tag.len() as u16).to_be_bytes());
-    assert_eq!(&ctx[2..2 + tag.len()], tag);
+    assert_eq!(&ctx[0..tag.len()], tag);
+    assert_eq!(ctx.len(), 124);
+    assert_eq!(
+        to_hex(&ctx),
+        "617470726f746f2d73706163652d7631002e61743a2f2f6469643a706c633a616c6963652f73706163652f626c75652e636174626972642e636972636c652f31000d6469643a706c633a616c6963650009336c3772657631323300204242424242424242424242424242424242424242424242424242424242424242"
+    );
 
     // 2. Exact HKDF-Expand from 32-byte IKM directly (PRK = ikm)
     let mac_key = derive_commit_mac_key(&ikm, &ctx).expect("HKDF expand must succeed");
     assert_eq!(mac_key.len(), 32);
+    assert_eq!(
+        to_hex(&mac_key),
+        "ed363ae3aa4d3dbcb6413e86db3692eaf4a1713d578cd72b508b3b6ccfa5215c"
+    );
 
     let lthash_digest = [0x55u8; 32];
     let mac = compute_commit_mac(&mac_key, &lthash_digest).expect("HMAC must succeed");
     assert_eq!(mac.len(), 32);
-
-    // 3. LtHash item formatting: BLAKE3 XOF over exact {collection}/{rkey}/{cid}
+    assert_eq!(
+        to_hex(&mac),
+        "6842083d790cee0c14f392372f95dffb9fc2c2e8a37807211febca0c729cbe65"
+    );
+    // 3. LtHash item formatting: direct BLAKE3 XOF over exact {collection}/{rkey}/{cid}
     let mut h1 = LtHash::new();
     h1.add("app.bsky.feed.post", "3l7post1", "bafyreih327owner1");
     assert_ne!(h1.as_bytes(), &[0u8; 2048]);
+    assert_eq!(h1.as_bytes().len(), 2048);
+    assert_eq!(h1.digest().len(), 32);
 }
 
 #[test]
@@ -1076,6 +1107,12 @@ fn dagcbor_cid_computation_and_mismatch_rejection() {
         "DAG-CBOR CIDv1 base32 must start with bafyre, got {cid_str}"
     );
 
+    // Direct serialization of Jacquard Data with link and raw bytes preserves DAG-CBOR tags
+    let data_with_link: catbird_atproto::jacquard_common::types::value::Data =
+        serde_json::from_value(post_val).unwrap();
+    let direct_cid = compute_dagcbor_cid(&data_with_link).expect("Direct Data CID computation must succeed");
+    assert_eq!(cid_str, direct_cid);
+
     // Tampering changes computed CID
     let tampered_val = json!({
         "$type": "app.bsky.feed.post",
@@ -1085,7 +1122,6 @@ fn dagcbor_cid_computation_and_mismatch_rejection() {
     let tampered_cid = compute_dagcbor_cid(&tampered_val).unwrap();
     assert_ne!(cid_str, tampered_cid);
 }
-
 #[sqlx::test(migrations = "./migrations")]
 async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
@@ -1240,7 +1276,6 @@ async fn two_root_car_full_recovery_and_tampered_car_rejection(pool: PgPool) {
     tampered_car[last_idx] ^= 0xff; // corrupt a record block
     assert!(decode_repo_car(&tampered_car).is_err());
 }
-
 #[sqlx::test(migrations = "./migrations")]
 async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
@@ -1342,4 +1377,517 @@ fn typed_integer_generations_in_projections() {
         }
         _ => panic!("Expected CircleUpsert"),
     }
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn full_recovery_verifies_against_authority_expected_hash_and_rejects_mismatch(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post in full recovery for expected hash check",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7hashpost1", &post_cid);
+
+    let rev = "3l7hashrevaaa";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let records = vec![RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7hashpost1".to_string(),
+        cid: post_cid.clone(),
+        value: post_val,
+    }];
+
+    let car_bytes = mint_repo_car(&commit, &records).unwrap();
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_get_repo_response(&key, car_bytes);
+
+    // Setup list_repo_ops to fail so sync falls back to full recovery
+    let sync_engine = SyncEngine::new(&setup.state);
+
+    // 1. Full recovery with correct expected hash succeeds
+    let expected_hash = commit.hash.as_ref();
+    let result = sync_engine
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(expected_hash))
+        .await
+        .unwrap();
+    assert_eq!(result.mode, SyncMode::FullRecovery);
+    assert!(result.commit_verified);
+
+    // 2. Full recovery with mismatched expected authority hash is rejected!
+    let bad_expected_hash = [0x99u8; 32];
+    let err_result = sync_engine
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(&bad_expected_hash))
+        .await;
+    assert!(err_result.is_err(), "Must reject full recovery when authority expected hash mismatches");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn federated_repo_sync_routes_to_member_pds_endpoint(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    // Setup owner post first so Bob can reply
+    let owner_post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Owner post on Alice PDS",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let owner_cid = compute_dagcbor_cid(&owner_post_val).unwrap();
+    let owner_post_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7ownerroot");
+
+    sqlx::query(
+        "INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7ownerroot', $5, now(), now())",
+    )
+    .bind(&owner_post_uri)
+    .bind(&owner_cid)
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .bind(&owner_post_val)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Bob's federated reply on Bob's PDS (https://pds.bob.blue)
+    let bob_reply_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Bob replying from his federated PDS",
+        "createdAt": "2026-08-24T12:05:00.000Z",
+        "reply": {
+            "root": {
+                "uri": owner_post_uri.clone(),
+                "cid": owner_cid.clone()
+            },
+            "parent": {
+                "uri": owner_post_uri.clone(),
+                "cid": owner_cid.clone()
+            }
+        }
+    });
+    let bob_reply_cid = compute_dagcbor_cid(&bob_reply_val).unwrap();
+
+    let mut bob_lthash = LtHash::new();
+    bob_lthash.add("app.bsky.feed.post", "3l7bobreplyfed", &bob_reply_cid);
+
+    let rev = "3l7bobfedreva";
+    let bob_commit = mint_signed_commit(
+        SPACE_URI,
+        BOB_DID,
+        rev,
+        bob_lthash.as_bytes(),
+        &setup.bob_signing_key,
+    );
+
+    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(bob_reply_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7bobreplyfed"))),
+        value: Some(serde_json::from_value(bob_reply_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key = format!("{SPACE_URI}:{BOB_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(bob_commit),
+            cursor: None,
+            ops: vec![op_entry],
+            extra_data: None,
+        },
+    );
+
+    let sync_engine = SyncEngine::new(&setup.state);
+    let result = sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+
+    assert_eq!(result.mode, SyncMode::Incremental);
+    assert!(result.commit_verified);
+    assert_eq!(result.records_accepted, 1);
+
+    // Bob's reply indexed successfully!
+    let record: (String, String) = sqlx::query_as(
+        "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        record.0,
+        format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.post/3l7bobreplyfed")
+    );
+    assert_eq!(record.1, bob_reply_cid);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ordered_operations_preserve_delete_then_recreate_on_same_path(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let original_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Original post that will be deleted and recreated",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let original_cid = compute_dagcbor_cid(&original_val).unwrap();
+
+    let new_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Recreated post at same rkey with new content",
+        "createdAt": "2026-08-24T12:05:00.000Z"
+    });
+    let new_cid = compute_dagcbor_cid(&new_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    // 1. Created original
+    lthash.add("app.bsky.feed.post", "3l7samepath", &original_cid);
+    // 2. Deleted original
+    lthash.remove("app.bsky.feed.post", "3l7samepath", &original_cid);
+    // 3. Recreated with new CID
+    lthash.add("app.bsky.feed.post", "3l7samepath", &new_cid);
+
+    let rev = "3l7recreateaa";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let op_create_1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(original_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from("3l7stepaaaaaa")),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7samepath"))),
+        value: Some(serde_json::from_value(original_val).unwrap()),
+        extra_data: None,
+    };
+
+    let op_delete = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: None,
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: Some(Cid::from(original_cid)),
+        rev: Tid::from(String::from("3l7stepbbbbbb")),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7samepath"))),
+        value: None,
+        extra_data: None,
+    };
+
+    let op_create_2 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(new_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7samepath"))),
+        value: Some(serde_json::from_value(new_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_create_1, op_delete, op_create_2],
+            extra_data: None,
+        },
+    );
+
+    let sync_engine = SyncEngine::new(&setup.state);
+    let result = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+
+    assert_eq!(result.mode, SyncMode::Incremental);
+    assert!(result.commit_verified);
+
+    // The final state in circle_records must NOT be marked deleted!
+    let record: (String, String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT uri, cid, deleted_at FROM circle_records WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(record.1, new_cid);
+    assert_eq!(record.2, None, "Recreated record must be active, not deleted!");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn strong_reference_validation_rejects_without_fail_open_and_ignores_non_posts(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    // 1. In an empty circle, reply to arbitrary URI is strictly rejected (no fail-open)
+    let random_reply_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Reply to non-existent post",
+        "createdAt": "2026-08-24T12:00:00.000Z",
+        "reply": {
+            "root": {
+                "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/nonexistent"),
+                "cid": "bafynonexistent"
+            },
+            "parent": {
+                "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/nonexistent"),
+                "cid": "bafynonexistent"
+            }
+        }
+    });
+    let random_reply_cid = compute_dagcbor_cid(&random_reply_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7randomrep", &random_reply_cid);
+
+    let rev = "3l7failopenra";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        BOB_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.bob_signing_key,
+    );
+
+    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(random_reply_cid)),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7randomrep"))),
+        value: Some(serde_json::from_value(random_reply_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key = format!("{SPACE_URI}:{BOB_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_entry],
+            extra_data: None,
+        },
+    );
+
+    let sync_engine = SyncEngine::new(&setup.state);
+    let result = sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+    assert_eq!(result.records_accepted, 0);
+    assert_eq!(result.records_rejected, 1);
+
+    // Rejection recorded in diagnostics
+    let rejections_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circle_rejections")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rejections_count.0, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn like_reconciliation_updates_in_place_and_preserves_cross_user_likes_on_recovery(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    // 1. Owner creates post
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Owner post to receive likes",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+    let post_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7likedpost");
+
+    sqlx::query(
+        "INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7likedpost', $5, now(), now())",
+    )
+    .bind(&post_uri)
+    .bind(&post_cid)
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .bind(&post_val)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2. Bob creates a like on Owner's post
+    let bob_like_uri = format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.like/3l7boblike1");
+    sqlx::query(
+        "INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at) VALUES ($1, 'bafylikecid', $2, $3, 'app.bsky.feed.like', '3l7boblike1', '{}', now(), now())",
+    )
+    .bind(&bob_like_uri)
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO circle_likes (uri, space_uri, post_uri, author_did, created_at) VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(&bob_like_uri)
+    .bind(SPACE_URI)
+    .bind(&post_uri)
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 3. Owner triggers full recovery with updated post
+    let mut full_lthash = LtHash::new();
+    full_lthash.add("app.bsky.feed.post", "3l7likedpost", &post_cid);
+
+    let full_commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7fullrecova",
+        full_lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let records = vec![RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7likedpost".to_string(),
+        cid: post_cid,
+        value: post_val,
+    }];
+
+    let car_bytes = mint_repo_car(&full_commit, &records).unwrap();
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_get_repo_response(&key, car_bytes);
+
+    let sync_engine = SyncEngine::new(&setup.state);
+    let result = sync_engine
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(full_commit.hash.as_ref()))
+        .await
+        .unwrap();
+    assert_eq!(result.mode, SyncMode::FullRecovery);
+
+    // 4. Bob's like on Owner's post MUST STILL EXIST in circle_likes (not cascade-deleted!)
+    let bob_like_in_db: Option<(String,)> = sqlx::query_as("SELECT uri FROM circle_likes WHERE uri = $1")
+        .bind(&bob_like_uri)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        bob_like_in_db.is_some(),
+        "Bob's like on Owner's post must be preserved after Owner full recovery"
+    );
+}
+
+#[tokio::test]
+async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
+    use circle_appview::space_client::DefaultSpaceHostTransport;
+    use circle_appview::space_client::SpaceHostTransport;
+
+    let transport = DefaultSpaceHostTransport::new(); // production transport (allow_loopback = false)
+
+    // 1. list_repos to 127.0.0.1 -> blocked
+    let loopback_url = url::Url::parse("https://127.0.0.1/xrpc/com.atproto.space.listRepos").unwrap();
+    let res1 = transport.list_repos(&loopback_url, "cred", "dpop", SPACE_URI, None).await;
+    assert!(matches!(res1, Err(circle_appview::error::AppError::Unauthorized(_))));
+
+    // 2. list_repo_ops to private IP -> blocked
+    let private_url = url::Url::parse("https://10.0.0.1/xrpc/com.atproto.space.listRepoOps").unwrap();
+    let res2 = transport.list_repo_ops(&private_url, "cred", "dpop", SPACE_URI, OWNER_DID, None, None).await;
+    assert!(matches!(res2, Err(circle_appview::error::AppError::Unauthorized(_))));
+
+    // 3. get_repo to localhost -> blocked
+    let localhost_url = url::Url::parse("https://localhost/xrpc/com.atproto.space.getRepo").unwrap();
+    let res3 = transport.get_repo(&localhost_url, "cred", "dpop", SPACE_URI, OWNER_DID, None).await;
+    assert!(matches!(res3, Err(circle_appview::error::AppError::Unauthorized(_))));
+
+    // 4. get_latest_commit to non-HTTPS -> blocked
+    let http_url = url::Url::parse("http://space.example.com/xrpc/com.atproto.space.getLatestCommit").unwrap();
+    let res4 = transport.get_latest_commit(&http_url, "cred", "dpop", SPACE_URI, OWNER_DID).await;
+    assert!(matches!(res4, Err(circle_appview::error::AppError::InvalidRequest(_))));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post for multi-page sweep discovery",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7sweepp2", &post_cid);
+    let rev = "3l7page2revbb";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(post_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7sweepp2"))),
+        value: Some(serde_json::from_value(post_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_entry],
+            extra_data: None,
+        },
+    );
+
+    // Page 1 of listRepos returns cursor="page2_cur" with no matching repo
+    setup.mock_transport.set_list_repos_response(
+        SPACE_URI,
+        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+            cursor: Some("page2_cur".into()),
+            repos: vec![],
+            extra_data: None,
+        },
+    );
+
+    // Page 2 of listRepos returns OWNER_DID repo
+    let page2_key = format!("{SPACE_URI}:page2_cur");
+    let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
+        did: Did::from(String::from(OWNER_DID)),
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            &lthash.digest(),
+        ),
+        rev: Tid::from(String::from(rev)),
+        extra_data: None,
+    };
+    setup.mock_transport.set_list_repos_response(
+        &page2_key,
+        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+            cursor: None,
+            repos: vec![repo_item],
+            extra_data: None,
+        },
+    );
+
+    let summary = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(summary.repos_checked, 1);
+    assert_eq!(summary.repos_synced, 1);
 }

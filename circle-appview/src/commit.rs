@@ -4,7 +4,6 @@ use p256::ecdsa::signature::Signer;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 
 use crate::auth::ParsedVerifyingKey;
 
@@ -105,8 +104,8 @@ impl LtHash {
 
 pub fn compute_commit_context(space: &str, author: &str, rev: &str, ikm: &[u8]) -> Vec<u8> {
     let mut ctx = Vec::new();
+    ctx.extend_from_slice(PROTOCOL_TAG.as_bytes());
     for field in [
-        PROTOCOL_TAG.as_bytes(),
         space.as_bytes(),
         author.as_bytes(),
         rev.as_bytes(),
@@ -135,7 +134,7 @@ pub fn compute_commit_mac(mac_key: &[u8; 32], hash: &[u8]) -> Result<[u8; 32], C
     Ok(mac.finalize().into_bytes().into())
 }
 
-pub fn compute_dagcbor_cid(value: &serde_json::Value) -> Result<String, CommitError> {
+pub fn compute_dagcbor_cid<T: Serialize + ?Sized>(value: &T) -> Result<String, CommitError> {
     let dagcbor_bytes = serde_ipld_dagcbor::to_vec(value)
         .map_err(|e| CommitError::InvalidData(format!("DAG-CBOR serialization failed: {e}")))?;
     let mut hasher = Sha256::new();
@@ -295,7 +294,67 @@ fn decode_varint(slice: &[u8]) -> Result<(u64, usize), CommitError> {
     ))
 }
 
-fn create_cid_bytes_from_data(data: &[u8]) -> (Vec<u8>, String) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidLink(pub Vec<u8>);
+
+impl CidLink {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn to_cid_string(&self) -> String {
+        multibase::encode(multibase::Base::Base32Lower, &self.0)
+    }
+}
+
+impl Serialize for CidLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            "$serde_ipld_dagcbor::cid",
+            serde_bytes::Bytes::new(&self.0),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for CidLink {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CidVisitor;
+        impl<'de> serde::de::Visitor<'de> for CidVisitor {
+            type Value = CidLink;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a DAG-CBOR CID link")
+            }
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let bytes: serde_bytes::ByteBuf = serde::Deserialize::deserialize(deserializer)?;
+                Ok(CidLink(bytes.into_vec()))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(CidLink(v.to_vec()))
+            }
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(CidLink(v))
+            }
+        }
+        deserializer.deserialize_newtype_struct("$serde_ipld_dagcbor::cid", CidVisitor)
+    }
+}
+
+pub fn create_cid_bytes_from_data(data: &[u8]) -> (Vec<u8>, String) {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let digest = hasher.finalize();
@@ -309,76 +368,67 @@ fn create_cid_bytes_from_data(data: &[u8]) -> (Vec<u8>, String) {
     (cid_bytes, cid_str)
 }
 
-#[derive(Serialize, Deserialize)]
-struct CarHeader {
-    version: u64,
-    roots: Vec<serde_bytes::ByteBuf>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarHeader {
+    pub version: u64,
+    pub roots: Vec<CidLink>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct DrislEntry {
-    k: String,
-    v: String,
+pub fn is_canonical_drisl_key_order(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        a.len() < b.len()
+    } else {
+        a.as_bytes() < b.as_bytes()
+    }
 }
 
 pub fn mint_repo_car(
     commit: &SignedCommit,
     records: &[RepoRecord],
 ) -> Result<Vec<u8>, CommitError> {
-    // 1. Sort records in canonical DRISL order: collection ascending, then rkey ascending
-    let mut sorted_records = records.to_vec();
-    sorted_records.sort_by(|a, b| {
-        a.collection
-            .cmp(&b.collection)
-            .then_with(|| a.rkey.cmp(&b.rkey))
-    });
-
-    // 2. Serialize SignedCommit to DAG-CBOR and compute its CID
+    // 1. Serialize SignedCommit to DAG-CBOR and compute its CID
     let commit_cbor = serde_ipld_dagcbor::to_vec(commit).map_err(|e| {
         CommitError::InvalidData(format!("SignedCommit DAG-CBOR serialization failed: {e}"))
     })?;
     let (commit_cid_bytes, _commit_cid_str) = create_cid_bytes_from_data(&commit_cbor);
+    let commit_cid_link = CidLink::from_bytes(commit_cid_bytes.clone());
 
-    // 3. Serialize each record to DAG-CBOR and compute its CID
-    let mut record_blocks = Vec::new();
-    let mut drisl_entries = Vec::new();
+    // 2. Build DRISL index map and record blocks
+    let mut drisl_map = std::collections::BTreeMap::new();
+    let mut record_map = std::collections::HashMap::new();
 
-    for rec in &sorted_records {
+    for rec in records {
         let rec_cbor = serde_ipld_dagcbor::to_vec(&rec.value).map_err(|e| {
             CommitError::InvalidData(format!("Record DAG-CBOR serialization failed: {e}"))
         })?;
-        let (cid_bytes, cid_str) = create_cid_bytes_from_data(&rec_cbor);
-        drisl_entries.push(DrislEntry {
-            k: format!("{}/{}", rec.collection, rec.rkey),
-            v: cid_str,
-        });
-        record_blocks.push((cid_bytes, rec_cbor));
+        let (cid_bytes, _cid_str) = create_cid_bytes_from_data(&rec_cbor);
+        let path_key = format!("{}/{}", rec.collection, rec.rkey);
+        drisl_map.insert(path_key.clone(), CidLink::from_bytes(cid_bytes.clone()));
+        record_map.insert(path_key, (cid_bytes, rec_cbor));
     }
 
-    // 4. Serialize DRISL index to DAG-CBOR and compute its CID
-    let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_entries).map_err(|e| {
+    // 3. Serialize DRISL map to DAG-CBOR and compute its CID
+    let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_map).map_err(|e| {
         CommitError::InvalidData(format!("DRISL index DAG-CBOR serialization failed: {e}"))
     })?;
     let (drisl_cid_bytes, _drisl_cid_str) = create_cid_bytes_from_data(&drisl_cbor);
+    let drisl_cid_link = CidLink::from_bytes(drisl_cid_bytes.clone());
 
-    // 5. Create CAR header with two roots: [commit_cid, data_root_cid]
+    // 4. Create CAR header with two roots: [commit_cid, drisl_cid]
     let header = CarHeader {
         version: 1,
-        roots: vec![
-            serde_bytes::ByteBuf::from(commit_cid_bytes.clone()),
-            serde_bytes::ByteBuf::from(drisl_cid_bytes.clone()),
-        ],
+        roots: vec![commit_cid_link, drisl_cid_link],
     };
     let header_cbor = serde_ipld_dagcbor::to_vec(&header).map_err(|e| {
         CommitError::InvalidData(format!("CAR header DAG-CBOR serialization failed: {e}"))
     })?;
 
-    // 6. Assemble CAR stream
+    // 5. Assemble CAR stream
     let mut car_bytes = Vec::new();
     encode_varint(header_cbor.len() as u64, &mut car_bytes);
     car_bytes.extend_from_slice(&header_cbor);
 
-    // Commit block
+    // Block 1: Commit block
     encode_varint(
         (commit_cid_bytes.len() + commit_cbor.len()) as u64,
         &mut car_bytes,
@@ -386,27 +436,35 @@ pub fn mint_repo_car(
     car_bytes.extend_from_slice(&commit_cid_bytes);
     car_bytes.extend_from_slice(&commit_cbor);
 
-    // DRISL index block
+    // Block 2: DRISL map block
     encode_varint(
         (drisl_cid_bytes.len() + drisl_cbor.len()) as u64,
         &mut car_bytes,
     );
     car_bytes.extend_from_slice(&drisl_cid_bytes);
     car_bytes.extend_from_slice(&drisl_cbor);
-
-    // Record blocks
-    for (cid_bytes, rec_cbor) in record_blocks {
-        encode_varint((cid_bytes.len() + rec_cbor.len()) as u64, &mut car_bytes);
-        car_bytes.extend_from_slice(&cid_bytes);
-        car_bytes.extend_from_slice(&rec_cbor);
+    // Blocks 3..N: Record blocks in DRISL map order
+    for path in drisl_map.keys() {
+        if let Some((cid_bytes, rec_cbor)) = record_map.get(path) {
+            encode_varint((cid_bytes.len() + rec_cbor.len()) as u64, &mut car_bytes);
+            car_bytes.extend_from_slice(cid_bytes);
+            car_bytes.extend_from_slice(rec_cbor);
+        }
     }
 
     Ok(car_bytes)
 }
 
+pub const MAX_CAR_BYTES: usize = 50 * 1024 * 1024; // 50MB bounded limit
+
 pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> {
     if car_bytes.is_empty() {
         return Err(CommitError::InvalidData("Empty CAR file".into()));
+    }
+    if car_bytes.len() > MAX_CAR_BYTES {
+        return Err(CommitError::InvalidData(format!(
+            "CAR file exceeds maximum size limit of {MAX_CAR_BYTES} bytes"
+        )));
     }
 
     let (header_len, varint_len) = decode_varint(car_bytes)?;
@@ -416,8 +474,19 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         return Err(CommitError::InvalidData("Truncated CAR header".into()));
     }
 
-    let header: CarHeader = serde_ipld_dagcbor::from_slice(&car_bytes[header_start..header_end])
+    let header_slice = &car_bytes[header_start..header_end];
+    let header: CarHeader = serde_ipld_dagcbor::from_slice(header_slice)
         .map_err(|e| CommitError::InvalidData(format!("Failed to parse CAR header: {e}")))?;
+
+    // Verify canonical DAG-CBOR header re-encode equality
+    let re_encoded_header = serde_ipld_dagcbor::to_vec(&header).map_err(|e| {
+        CommitError::InvalidData(format!("Failed to re-encode CAR header: {e}"))
+    })?;
+    if re_encoded_header != header_slice {
+        return Err(CommitError::InvalidData(
+            "Non-canonical DAG-CBOR CAR header encoding".into(),
+        ));
+    }
 
     if header.version != 1 {
         return Err(CommitError::InvalidData(format!(
@@ -433,90 +502,138 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         )));
     }
 
-    let commit_root_cid_str = multibase::encode(multibase::Base::Base32Lower, &header.roots[0]);
-    let drisl_root_cid_str = multibase::encode(multibase::Base::Base32Lower, &header.roots[1]);
+    let commit_root_cid = &header.roots[0].0;
+    let drisl_root_cid = &header.roots[1].0;
+    let commit_root_cid_str = header.roots[0].to_cid_string();
+    let drisl_root_cid_str = header.roots[1].to_cid_string();
 
-    // Stream blocks
-    let mut blocks = HashMap::new();
     let mut offset = header_end;
 
-    while offset < car_bytes.len() {
-        let (block_len, v_len) = decode_varint(&car_bytes[offset..])?;
-        offset += v_len;
-        let block_end = offset + block_len as usize;
-        if car_bytes.len() < block_end {
-            return Err(CommitError::InvalidData("Truncated block in CAR".into()));
-        }
-        let block_slice = &car_bytes[offset..block_end];
+    // Stream Block 1: SignedCommit block (must match root[0])
+    if offset >= car_bytes.len() {
+        return Err(CommitError::InvalidData("Missing commit root block in CAR".into()));
+    }
+    let (b1_len, b1_vlen) = decode_varint(&car_bytes[offset..])?;
+    offset += b1_vlen;
+    let b1_end = offset + b1_len as usize;
+    if car_bytes.len() < b1_end {
+        return Err(CommitError::InvalidData("Truncated commit block in CAR".into()));
+    }
+    let (b1_cid_bytes, b1_cid_str, b1_data) = parse_cid_and_data_raw(&car_bytes[offset..b1_end])?;
+    offset = b1_end;
 
-        // Parse CID and data from block
-        let (cid_str, data) = parse_cid_and_data(block_slice)?;
-        blocks.insert(cid_str, data);
-        offset = block_end;
+    if &b1_cid_bytes != commit_root_cid {
+        return Err(CommitError::InvalidData(format!(
+            "First block CID {b1_cid_str} does not match commit root CID {commit_root_cid_str}"
+        )));
+    }
+    let commit: SignedCommit = serde_ipld_dagcbor::from_slice(&b1_data)
+        .map_err(|e| CommitError::InvalidData(format!("Failed to parse SignedCommit block: {e}")))?;
+
+    // Stream Block 2: DRISL map block (must match root[1])
+    if offset >= car_bytes.len() {
+        return Err(CommitError::InvalidData("Missing DRISL root block in CAR".into()));
+    }
+    let (b2_len, b2_vlen) = decode_varint(&car_bytes[offset..])?;
+    offset += b2_vlen;
+    let b2_end = offset + b2_len as usize;
+    if car_bytes.len() < b2_end {
+        return Err(CommitError::InvalidData("Truncated DRISL block in CAR".into()));
+    }
+    let (b2_cid_bytes, b2_cid_str, b2_data) = parse_cid_and_data_raw(&car_bytes[offset..b2_end])?;
+    offset = b2_end;
+
+    if &b2_cid_bytes != drisl_root_cid {
+        return Err(CommitError::InvalidData(format!(
+            "Second block CID {b2_cid_str} does not match DRISL root CID {drisl_root_cid_str}"
+        )));
+    }
+    let drisl_map: std::collections::BTreeMap<String, CidLink> =
+        serde_ipld_dagcbor::from_slice(&b2_data).map_err(|e| {
+            CommitError::InvalidData(format!("Failed to parse DRISL index map: {e}"))
+        })?;
+
+    // Verify canonical DAG-CBOR DRISL map re-encode equality
+    let re_encoded_drisl = serde_ipld_dagcbor::to_vec(&drisl_map).map_err(|e| {
+        CommitError::InvalidData(format!("Failed to re-encode DRISL map: {e}"))
+    })?;
+    if re_encoded_drisl != b2_data {
+        return Err(CommitError::InvalidData(
+            "Non-canonical DAG-CBOR DRISL map encoding".into(),
+        ));
     }
 
-    // 1. Extract commit root block
-    let commit_data = blocks.get(&commit_root_cid_str).ok_or_else(|| {
-        CommitError::InvalidData(format!("Missing commit root block {commit_root_cid_str}"))
-    })?;
-    let commit: SignedCommit = serde_ipld_dagcbor::from_slice(commit_data).map_err(|e| {
-        CommitError::InvalidData(format!("Failed to parse SignedCommit block: {e}"))
-    })?;
+    // Stream Blocks 3..N: Record blocks in exact DRISL map order
+    let mut records = Vec::with_capacity(drisl_map.len());
+    let mut prev_key: Option<&str> = None;
 
-    // 2. Extract DRISL index block
-    let drisl_data = blocks.get(&drisl_root_cid_str).ok_or_else(|| {
-        CommitError::InvalidData(format!("Missing DRISL index block {drisl_root_cid_str}"))
-    })?;
-    let drisl_entries: Vec<DrislEntry> = serde_ipld_dagcbor::from_slice(drisl_data)
-        .map_err(|e| CommitError::InvalidData(format!("Failed to parse DRISL index block: {e}")))?;
-
-    // 3. Verify DRISL index ordering and decode record blocks
-    let mut records = Vec::new();
-    let mut last_key: Option<String> = None;
-
-    for entry in drisl_entries {
-        if let Some(prev) = &last_key {
-            if &entry.k <= prev {
+    for (path_key, expected_cid_link) in &drisl_map {
+        // Verify canonical key ordering (length first, then bytewise)
+        if let Some(pk) = prev_key {
+            if !is_canonical_drisl_key_order(pk, path_key) {
                 return Err(CommitError::InvalidData(format!(
-                    "DRISL index out of canonical order: '{}' <= '{}'",
-                    entry.k, prev
+                    "DRISL map key out of canonical order: '{path_key}' follows '{pk}'"
                 )));
             }
         }
-        last_key = Some(entry.k.clone());
+        prev_key = Some(path_key.as_str());
 
-        let parts: Vec<&str> = entry.k.splitn(2, '/').collect();
-        if parts.len() != 2 {
+        let parts: Vec<&str> = path_key.splitn(2, '/').collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(CommitError::InvalidData(format!(
-                "Invalid DRISL key format: {}",
-                entry.k
+                "Invalid DRISL record key format: {path_key}"
             )));
         }
         let collection = parts[0].to_string();
         let rkey = parts[1].to_string();
 
-        let rec_data = blocks
-            .get(&entry.v)
-            .ok_or_else(|| CommitError::InvalidData(format!("Missing record block {}", entry.v)))?;
-
-        let val: serde_json::Value = serde_ipld_dagcbor::from_slice(rec_data)
-            .map_err(|e| CommitError::InvalidData(format!("Failed to decode record CBOR: {e}")))?;
-
-        // Verify computed DAG-CBOR CID of decoded value matches entry.v
-        let computed_cid = compute_dagcbor_cid(&val)?;
-        if computed_cid != entry.v {
+        if offset >= car_bytes.len() {
             return Err(CommitError::InvalidData(format!(
-                "Record value CID mismatch: computed {computed_cid} != DRISL index CID {}",
-                entry.v
+                "Missing record block for DRISL entry {path_key}"
+            )));
+        }
+        let (rec_len, rec_vlen) = decode_varint(&car_bytes[offset..])?;
+        offset += rec_vlen;
+        let rec_end = offset + rec_len as usize;
+        if car_bytes.len() < rec_end {
+            return Err(CommitError::InvalidData(format!(
+                "Truncated record block for {path_key}"
+            )));
+        }
+        let (rec_cid_bytes, rec_cid_str, rec_data) =
+            parse_cid_and_data_raw(&car_bytes[offset..rec_end])?;
+        offset = rec_end;
+        if rec_cid_bytes != expected_cid_link.0 {
+            return Err(CommitError::InvalidData(format!(
+                "Record block CID {rec_cid_str} does not match DRISL expected CID {}",
+                expected_cid_link.to_cid_string()
+            )));
+        }
+
+        let val: serde_json::Value = serde_ipld_dagcbor::from_slice(&rec_data).map_err(|e| {
+            CommitError::InvalidData(format!("Failed to decode record CBOR for {path_key}: {e}"))
+        })?;
+
+        let computed_cid = compute_dagcbor_cid(&val)?;
+        if computed_cid != rec_cid_str {
+            return Err(CommitError::InvalidData(format!(
+                "Record value CID mismatch: computed {computed_cid} != block CID {rec_cid_str}"
             )));
         }
 
         records.push(RepoRecord {
             collection,
             rkey,
-            cid: entry.v,
+            cid: rec_cid_str,
             value: val,
         });
+    }
+
+    if offset != car_bytes.len() {
+        return Err(CommitError::InvalidData(format!(
+            "Unexpected trailing data in CAR stream: {} bytes remaining",
+            car_bytes.len() - offset
+        )));
     }
 
     Ok(DecodedRepoCar {
@@ -527,7 +644,7 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
     })
 }
 
-fn parse_cid_and_data(block_slice: &[u8]) -> Result<(String, Vec<u8>), CommitError> {
+fn parse_cid_and_data_raw(block_slice: &[u8]) -> Result<(Vec<u8>, String, Vec<u8>), CommitError> {
     if block_slice.is_empty() {
         return Err(CommitError::InvalidData("Empty block in CAR".into()));
     }
@@ -570,5 +687,5 @@ fn parse_cid_and_data(block_slice: &[u8]) -> Result<(String, Vec<u8>), CommitErr
         )));
     }
 
-    Ok((cid_str, data))
+    Ok((cid_bytes.to_vec(), cid_str, data))
 }
