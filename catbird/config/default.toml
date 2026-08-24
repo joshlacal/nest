@@ -26,3 +26,6 @@ redirect_uri = "http://localhost:3000/auth/callback"
 # active_key_id = "catbird-key-2"  # Which key to use for signing
 
 scopes = ["atproto", "transition:generic", "transition:chat.bsky", "space:blue.catbird.circle?authority=*&action=read&action=create&action=update&action=delete&collection=app.bsky.feed.post&collection=app.bsky.feed.like", "space:blue.catbird.circle?authority=self&action=create&action=update&action=delete&manage=create&manage=update&manage=delete&collection=blue.catbird.circle.metadata"]
+
+[circle]
+service_did = "did:web:circles.catbird.blue#atproto_circle"

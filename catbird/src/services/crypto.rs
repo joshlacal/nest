@@ -79,6 +79,17 @@ impl KeyStore {
         })
     }
 
+    /// Create a KeyStore from a single key (primarily for tests or dynamic initialization)
+    pub fn from_key(kid: impl Into<String>, secret_key: SecretKey) -> Self {
+        let kid = kid.into();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), secret_key);
+        Self {
+            keys,
+            active_key_id: kid,
+        }
+    }
+
     /// Get the active signing key (used for signing new JWTs)
     pub fn active_key(&self) -> SigningKey {
         SigningKey {

@@ -23,6 +23,22 @@ use chrono::Utc;
 use std::sync::Arc;
 
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
+pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circle";
+
+pub const CIRCLE_ENDPOINTS: &[&str] = &[
+    "blue.catbird.circle.getCapabilities",
+    "blue.catbird.circle.createCircle",
+    "blue.catbird.circle.updateMember",
+    "blue.catbird.circle.deleteCircle",
+    "blue.catbird.circle.updatePreferences",
+    "blue.catbird.circle.reportRecord",
+    "blue.catbird.circle.activateSpace",
+    "blue.catbird.circle.listCircles",
+    "blue.catbird.circle.getFeed",
+    "blue.catbird.circle.getPostThread",
+    "blue.catbird.circle.listNotifications",
+    "blue.catbird.circle.getMedia",
+];
 
 pub struct ServiceAuthProvider {
     state: Arc<AppState>,
@@ -34,6 +50,7 @@ impl ServiceAuthProvider {
     }
 
 
+    /// MLS helper: delegates directly to `token_for_audience` with the MLS audience.
     /// PDS-issued service-auth JWT: `iss` is the user's own bare DID, `aud` is
     /// MLS_APPVIEW_SERVICE_REF, `lxm` is exactly `lexicon`. Returned verbatim —
     /// never re-signed or re-wrapped. Minted fresh on every call because the
@@ -43,12 +60,65 @@ impl ServiceAuthProvider {
         session: &CatbirdSession,
         lexicon: &str,
     ) -> AppResult<String> {
-        self.fetch_service_auth_from_pds(session, lexicon).await
+        self.token_for_audience(session, MLS_APPVIEW_SERVICE_REF, lexicon).await
     }
 
+    /// Parameterized service-auth token fetcher for allowed audiences (MLS and Circle AppViews).
+    /// Validates that `audience` is a configured service identifier and `lexicon` is an exact allowed NSID.
+    pub async fn token_for_audience(
+        &self,
+        session: &CatbirdSession,
+        audience: &str,
+        lexicon: &str,
+    ) -> AppResult<String> {
+        self.validate_audience_and_lexicon(audience, lexicon)?;
+        self.fetch_service_auth_from_pds(session, audience, lexicon).await
+    }
+
+    fn validate_audience_and_lexicon(&self, audience: &str, lexicon: &str) -> AppResult<()> {
+        let trimmed_aud = audience.trim();
+        let trimmed_lxm = lexicon.trim();
+
+        if trimmed_aud.is_empty() || trimmed_aud.contains('*') || trimmed_aud.contains(char::is_whitespace) {
+            return Err(AppError::BadRequest(format!("Invalid service auth audience: {audience:?}")));
+        }
+        if trimmed_lxm.is_empty() || trimmed_lxm.contains('*') || trimmed_lxm.contains(char::is_whitespace) {
+            return Err(AppError::BadRequest(format!("Invalid service auth lexicon: {lexicon:?}")));
+        }
+
+        let is_mls_aud = trimmed_aud == MLS_APPVIEW_SERVICE_REF
+            || (!self.state.config.mls.service_did.is_empty() && trimmed_aud == self.state.config.mls.service_did);
+        let is_circle_aud = trimmed_aud == CIRCLE_APPVIEW_SERVICE_REF
+            || (!self.state.config.circle.service_did.is_empty() && trimmed_aud == self.state.config.circle.service_did);
+
+        if is_mls_aud {
+            let is_allowed_lxm = crate::services::CHAT_ENDPOINTS.contains(&trimmed_lxm);
+            if !is_allowed_lxm {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported MLS service auth lexicon: {lexicon}"
+                )));
+            }
+            return Ok(());
+        }
+
+        if is_circle_aud {
+            let is_allowed_lxm = CIRCLE_ENDPOINTS.contains(&trimmed_lxm);
+            if !is_allowed_lxm {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported Circle service auth lexicon: {lexicon}"
+                )));
+            }
+            return Ok(());
+        }
+
+        Err(AppError::BadRequest(format!(
+            "Unsupported service auth audience: {audience}"
+        )))
+    }
     async fn fetch_service_auth_from_pds(
         &self,
         session: &CatbirdSession,
+        audience: &str,
         lexicon: &str,
     ) -> AppResult<String> {
         let client = AtProtoClient::new(self.state.clone());
@@ -57,11 +127,10 @@ impl ServiceAuthProvider {
 
         let query = format!(
             "aud={}&lxm={}&exp={}",
-            urlencoding::encode(MLS_APPVIEW_SERVICE_REF),
+            urlencoding::encode(audience),
             urlencoding::encode(lexicon),
             requested_exp
         );
-
         let dpop_data = self.resolve_dpop_data(session).await;
 
         let response = client
@@ -171,9 +240,13 @@ mod tests {
             }
 
             impl wiremock::Respond for ServiceAuthResponder {
-                fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+                fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
                     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
                     use base64::Engine;
+
+                    let query: HashMap<String, String> = request.url.query_pairs().into_owned().collect();
+                    let aud = query.get("aud").cloned().unwrap_or_else(|| MLS_APPVIEW_SERVICE_REF.to_string());
+                    let lxm = query.get("lxm").cloned().unwrap_or_default();
 
                     let now = Utc::now().timestamp();
                     let lifetime = self.lifetime_secs.load(Ordering::SeqCst);
@@ -185,12 +258,12 @@ mod tests {
                     });
                     let payload = serde_json::json!({
                         "iss": "did:plc:alice",
-                        "aud": MLS_APPVIEW_SERVICE_REF,
+                        "aud": aud,
+                        "lxm": lxm,
                         "exp": exp,
                         "iat": now,
                         "jti": Uuid::new_v4().to_string()
                     });
-
                     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
                     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
                     let token = format!("{}.{}.mock-signature", header_b64, payload_b64);
@@ -271,15 +344,18 @@ mod tests {
 
     /// Read the `jti` from an unverified JWT payload. mls-ds keys its replay
     /// protection on this claim, so distinctness per call is the invariant.
-    fn jti_of(token: &str) -> String {
+    fn decode_claim(token: &str, claim: &str) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         let payload = token.split('.').nth(1).expect("jwt payload segment");
         let bytes = URL_SAFE_NO_PAD.decode(payload).expect("payload decodes");
         let claims: serde_json::Value = serde_json::from_slice(&bytes).expect("payload is json");
-        claims["jti"].as_str().expect("jti claim present").to_string()
+        claims[claim].as_str().unwrap_or_default().to_string()
     }
 
+    fn jti_of(token: &str) -> String {
+        decode_claim(token, "jti")
+    }
     #[tokio::test]
     async fn requests_a_pds_token_audienced_to_the_mls_appview_and_bound_to_one_nsid() {
         let pds = MockPds::new().await;
@@ -368,5 +444,66 @@ mod tests {
         // lxm is single-endpoint by mls-ds contract and tokens are per-account:
         // three distinct cache keys, three distinct PDS calls.
         assert_eq!(pds.call_count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn circle_token_uses_exact_audience_and_lxm() {
+        let pds = MockPds::new().await;
+        let provider = ServiceAuthProvider::new(test_state().await);
+        let session = test_session("did:plc:alice-circle", &pds.uri());
+
+        let token = provider
+            .token_for_audience(
+                &session,
+                "did:web:circles.catbird.blue#atproto_circle",
+                "blue.catbird.circle.getFeed",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(decode_claim(&token, "aud"), "did:web:circles.catbird.blue#atproto_circle");
+        assert_eq!(decode_claim(&token, "lxm"), "blue.catbird.circle.getFeed");
+
+        let call = pds.single_call().await;
+        assert_eq!(call.nsid, "com.atproto.server.getServiceAuth");
+        assert_eq!(call.query("aud"), Some("did:web:circles.catbird.blue#atproto_circle"));
+        assert_eq!(call.query("lxm"), Some("blue.catbird.circle.getFeed"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_audience_or_wildcards() {
+        let pds = MockPds::new().await;
+        let provider = ServiceAuthProvider::new(test_state().await);
+        let session = test_session("did:plc:alice-reject", &pds.uri());
+
+        // Unsupported audience
+        let res = provider
+            .token_for_audience(&session, "did:web:evil.com", "blue.catbird.circle.getFeed")
+            .await;
+        assert!(res.is_err());
+
+        // Wildcard audience
+        let res = provider
+            .token_for_audience(&session, "*", "blue.catbird.circle.getFeed")
+            .await;
+        assert!(res.is_err());
+
+        // Wildcard lexicon
+        let res = provider
+            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.circle.*")
+            .await;
+        assert!(res.is_err());
+
+        // Unallowed lexicon for circle audience
+        let res = provider
+            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.chat.getConversations")
+            .await;
+        assert!(res.is_err());
+
+        // Unallowed lexicon for MLS audience
+        let res = provider
+            .token_for_audience(&session, MLS_APPVIEW_SERVICE_REF, "blue.catbird.circle.getFeed")
+            .await;
+        assert!(res.is_err());
     }
 }

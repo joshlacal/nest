@@ -25,6 +25,9 @@ pub struct AppConfig {
     /// Clean-chat configuration (blue.catbird.chat.*)
     #[serde(default)]
     pub chat: ChatConfig,
+    /// Circle AppView configuration (optional)
+    #[serde(default)]
+    pub circle: CircleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +121,20 @@ pub struct MlsConfig {
 
 fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CircleConfig {
+    /// URL of the Circle AppView service (e.g., http://127.0.0.1:3002)
+    #[serde(default)]
+    pub service_url: Option<String>,
+    /// DID of the Circle AppView service (e.g., did:web:circles.catbird.blue#atproto_circle)
+    #[serde(default = "default_circle_service_did")]
+    pub service_did: String,
+}
+
+fn default_circle_service_did() -> String {
+    "did:web:circles.catbird.blue#atproto_circle".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
