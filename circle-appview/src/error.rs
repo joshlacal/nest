@@ -42,6 +42,7 @@ pub enum AuthReason {
     ControllerMismatch,
     IdMismatch,
     SsrfBlocked,
+    AlgKeyMismatch,
 }
 
 impl std::fmt::Display for AuthReason {
@@ -81,6 +82,7 @@ impl std::fmt::Display for AuthReason {
             Self::ControllerMismatch => "controller_mismatch",
             Self::IdMismatch => "id_mismatch",
             Self::SsrfBlocked => "ssrf_blocked",
+            Self::AlgKeyMismatch => "alg_key_mismatch",
         };
         write!(f, "{s}")
     }

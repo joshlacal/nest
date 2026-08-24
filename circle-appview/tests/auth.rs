@@ -8,9 +8,13 @@ use base64::Engine;
 use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
 use chrono::Utc;
 use circle_appview::{
-    auth::{DidDocument, PublicKeyJwk, VerificationMethod},
+    auth::{
+        is_private_ipv6, DefaultDidWebTransport, DidDocument, DidResolver, DidWebTransport,
+        PublicKeyJwk, VerificationMethod,
+    },
     config::{AppState, Config},
     db,
+    error::AuthReason,
     routes::create_router,
 };
 use p256::ecdsa::signature::Signer;
@@ -19,6 +23,10 @@ use p256::elliptic_curve::rand_core::OsRng;
 use p256::EncodedPoint;
 use serde_json::json;
 use sqlx::PgPool;
+use std::future::Future;
+use std::net::{Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 pub const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
@@ -61,26 +69,23 @@ async fn setup_test(pool: PgPool) -> TestSetup {
     let p256_sec1 = p256_verifying_key.to_encoded_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
-    let p256_multikey =
-        multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
+    let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
 
-    // Register DID document with both Multikey and JWK
+    // Register DID document with Multikey and JsonWebKey2020
     let did_doc = DidDocument {
         id: ALICE_DID.into(),
-        verification_method: vec![
-            VerificationMethod {
-                id: format!("{}#atproto", ALICE_DID),
-                r#type: "Multikey".into(),
-                controller: ALICE_DID.into(),
-                public_key_jwk: Some(PublicKeyJwk {
-                    kty: "EC".into(),
-                    crv: "P-256".into(),
-                    x,
-                    y: Some(y),
-                }),
-                public_key_multibase: Some(p256_multikey),
-            },
-        ],
+        verification_method: vec![VerificationMethod {
+            id: format!("{}#atproto", ALICE_DID),
+            r#type: "Multikey".into(),
+            controller: ALICE_DID.into(),
+            public_key_jwk: Some(PublicKeyJwk {
+                kty: "EC".into(),
+                crv: "P-256".into(),
+                x,
+                y: Some(y),
+            }),
+            public_key_multibase: Some(p256_multikey),
+        }],
     };
 
     state.did_resolver.insert_cached(ALICE_DID.into(), did_doc);
@@ -175,6 +180,59 @@ async fn request_feed(app: &axum::Router, token: &str) -> Response {
         .unwrap();
 
     app.clone().oneshot(request).await.unwrap()
+}
+
+#[derive(Clone)]
+struct MockDidWebTransport {
+    dns_result: Result<Vec<SocketAddr>, AuthReason>,
+    fetched_doc: Result<DidDocument, AuthReason>,
+    captured_fetches: Arc<Mutex<Vec<(String, String, SocketAddr)>>>,
+}
+
+impl DidWebTransport for MockDidWebTransport {
+    fn resolve_dns<'a>(
+        &'a self,
+        _host: &'a str,
+        _port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+        let res = self.dns_result.clone();
+        Box::pin(async move { res })
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+        host: &'a str,
+        pinned_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>> {
+        self.captured_fetches.lock().unwrap().push((
+            url.to_string(),
+            host.to_string(),
+            pinned_addr,
+        ));
+        let res = self.fetched_doc.clone();
+        Box::pin(async move { res })
+    }
+}
+
+#[derive(Clone)]
+struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for BufferWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+    type Writer = BufferWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -412,11 +470,11 @@ async fn kid_binding_and_verification_method_selection(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn enforces_iat_exp_and_lifetime_constraints(pool: PgPool) {
+async fn enforces_exact_iat_exp_and_lifetime_bounds(pool: PgPool) {
     let setup = setup_test(pool).await;
     let now = Utc::now().timestamp();
 
-    // 1. Missing iat
+    // 1. Missing iat -> rejected
     let header = json!({ "typ": "JWT", "alg": "ES256", "kid": "#atproto" });
     let claims_no_iat = json!({
         "iss": ALICE_DID,
@@ -435,22 +493,52 @@ async fn enforces_iat_exp_and_lifetime_constraints(pool: PgPool) {
         StatusCode::UNAUTHORIZED
     );
 
-    // 2. Future iat (iat > now + 5)
-    let token_future_iat = create_custom_service_token(
+    // 2. Future iat: exactly +1s in the future -> rejected (strictly iat <= now)
+    let token_future_1s = create_custom_service_token(
         &setup.p256_signing_key,
         TokenOptions {
-            iat: Some(now + 60),
-            exp: Some(now + 120),
-            jti: Some("jti-future-iat"),
+            iat: Some(now + 1),
+            exp: Some(now + 60),
+            jti: Some("jti-future-1s"),
             ..Default::default()
         },
     );
     assert_eq!(
-        request_feed(&setup.app, &token_future_iat).await.status(),
+        request_feed(&setup.app, &token_future_1s).await.status(),
         StatusCode::UNAUTHORIZED
     );
 
-    // 3. Expired token (exp < now)
+    // 3. Exactly now iat and 60s lifetime -> succeeds
+    let token_exact_60s = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(now),
+            exp: Some(now + 60),
+            jti: Some("jti-exact-60s"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_exact_60s).await.status(),
+        StatusCode::OK
+    );
+
+    // 4. Overlong lifetime: exactly 61s lifetime -> rejected (strictly <= 60s)
+    let token_lifetime_61s = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(now),
+            exp: Some(now + 61),
+            jti: Some("jti-lifetime-61s"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_lifetime_61s).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 5. Expired token (exp < now) -> rejected
     let token_past_exp = create_custom_service_token(
         &setup.p256_signing_key,
         TokenOptions {
@@ -465,7 +553,7 @@ async fn enforces_iat_exp_and_lifetime_constraints(pool: PgPool) {
         StatusCode::UNAUTHORIZED
     );
 
-    // 4. exp == now (boundary case - rejected!)
+    // 6. exp == now boundary case -> rejected (strictly now < exp)
     let token_exp_at_now = create_custom_service_token(
         &setup.p256_signing_key,
         TokenOptions {
@@ -479,51 +567,36 @@ async fn enforces_iat_exp_and_lifetime_constraints(pool: PgPool) {
         request_feed(&setup.app, &token_exp_at_now).await.status(),
         StatusCode::UNAUTHORIZED
     );
-
-    // 5. Overlong lifetime (exp - iat > 120s)
-    let token_overlong = create_custom_service_token(
-        &setup.p256_signing_key,
-        TokenOptions {
-            iat: Some(now),
-            exp: Some(now + 300),
-            jti: Some("jti-overlong"),
-            ..Default::default()
-        },
-    );
-    assert_eq!(
-        request_feed(&setup.app, &token_overlong).await.status(),
-        StatusCode::UNAUTHORIZED
-    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn supports_real_multikey_p256_and_secp256k1(pool: PgPool) {
+async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: PgPool) {
     let setup = setup_test(pool).await;
 
-    // 1. P-256 Multikey was registered in setup_test for ALICE_DID -> verifies successfully
-    let p256_token = create_custom_service_token(
+    // 1. Mismatch: Token signed by P-256 key with alg: "ES256K" -> rejected
+    let token_p256_with_es256k = create_custom_service_token(
         &setup.p256_signing_key,
         TokenOptions {
             iss: Some(ALICE_DID),
-            jti: Some("jti-multikey-p256"),
+            alg: Some("ES256K"),
+            jti: Some("jti-p256-es256k-mismatch"),
             ..Default::default()
         },
     );
     assert_eq!(
-        request_feed(&setup.app, &p256_token).await.status(),
-        StatusCode::OK
+        request_feed(&setup.app, &token_p256_with_es256k)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
 
-    // 2. Register a new user BOB_DID with secp256k1 Multikey
+    // 2. Register BOB with secp256k1 Multikey
     let bob_did = "did:plc:bob-secp256k1";
     let secp_vk = setup.secp_signing_key.verifying_key();
     let secp_sec1 = secp_vk.to_encoded_point(true);
-
-    // Secp256k1 multicodec prefix: 0xe7 -> varint [0xe7, 0x01]
     let mut secp_multikey_bytes = vec![0xe7, 0x01];
     secp_multikey_bytes.extend_from_slice(secp_sec1.as_bytes());
-    let secp_multikey =
-        multibase::encode(multibase::Base::Base58Btc, &secp_multikey_bytes);
+    let secp_multikey = multibase::encode(multibase::Base::Base58Btc, &secp_multikey_bytes);
 
     let bob_doc = DidDocument {
         id: bob_did.into(),
@@ -537,30 +610,86 @@ async fn supports_real_multikey_p256_and_secp256k1(pool: PgPool) {
     };
     setup.state.did_resolver.insert_cached(bob_did.into(), bob_doc);
 
-    // Sign with secp256k1 (ES256K)
+    // 3. Mismatch: Token signed by secp256k1 key with alg: "ES256" -> rejected
     let now = Utc::now().timestamp();
-    let header_secp = json!({
+    let header_secp_wrong_alg = json!({
         "typ": "JWT",
-        "alg": "ES256K",
+        "alg": "ES256",
         "kid": "#atproto"
     });
     let claims_secp = json!({
         "iss": bob_did,
         "aud": CIRCLE_AUDIENCE,
         "lxm": "blue.catbird.circle.getFeed",
-        "jti": "jti-secp256k1-1",
+        "jti": "jti-secp-es256-mismatch",
         "iat": now,
         "exp": now + 60
     });
-    let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_secp).unwrap());
+    let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_secp_wrong_alg).unwrap());
     let c_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_secp).unwrap());
     let input = format!("{h_b64}.{c_b64}");
     let sig: k256::ecdsa::Signature = setup.secp_signing_key.sign(input.as_bytes());
-    let secp_token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+    let secp_wrong_alg_token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
     assert_eq!(
-        request_feed(&setup.app, &secp_token).await.status(),
+        request_feed(&setup.app, &secp_wrong_alg_token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 4. Valid: secp256k1 with ES256K -> succeeds
+    let header_secp_correct = json!({
+        "typ": "JWT",
+        "alg": "ES256K",
+        "kid": "#atproto"
+    });
+    let h_b64_ok = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_secp_correct).unwrap());
+    let input_ok = format!("{h_b64_ok}.{c_b64}");
+    let sig_ok: k256::ecdsa::Signature = setup.secp_signing_key.sign(input_ok.as_bytes());
+    let secp_ok_token = format!("{input_ok}.{}", URL_SAFE_NO_PAD.encode(sig_ok.to_bytes()));
+
+    assert_eq!(
+        request_feed(&setup.app, &secp_ok_token).await.status(),
         StatusCode::OK
+    );
+
+    // 5. Invalid verification method type: arbitrary type carrying P-256 key -> rejected
+    let charlie_did = "did:plc:charlie-invalid-type";
+    let p256_vk = setup.p256_signing_key.verifying_key();
+    let point = EncodedPoint::from(p256_vk);
+    let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+    let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+
+    let charlie_doc = DidDocument {
+        id: charlie_did.into(),
+        verification_method: vec![VerificationMethod {
+            id: format!("{charlie_did}#atproto"),
+            r#type: "RsaVerificationKey2018".into(),
+            controller: charlie_did.into(),
+            public_key_jwk: Some(PublicKeyJwk {
+                kty: "EC".into(),
+                crv: "P-256".into(),
+                x,
+                y: Some(y),
+            }),
+            public_key_multibase: None,
+        }],
+    };
+    setup
+        .state
+        .did_resolver
+        .insert_cached(charlie_did.into(), charlie_doc);
+
+    let charlie_token = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iss: Some(charlie_did),
+            jti: Some("jti-charlie-invalid-vm-type"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &charlie_token).await.status(),
+        StatusCode::UNAUTHORIZED
     );
 }
 
@@ -606,67 +735,62 @@ async fn rejects_wrong_lxm(pool: PgPool) {
     );
 }
 
+#[test]
+fn complete_ipv6_and_ipv4_non_global_policy_coverage() {
+    // 1. IETF Protocol Assignments 2001::/23 remainder (e.g. 2001:5::1, 2001:2::1, 2001:20::1)
+    assert!(is_private_ipv6(&"2001:5::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:2::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:20::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:0000::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"2001:01ff:ffff:ffff:ffff:ffff:ffff:ffff".parse::<Ipv6Addr>().unwrap()));
+
+    // 2. Documentation ranges (2001:db8::/32 and 3fff::/20)
+    assert!(is_private_ipv6(&"2001:db8::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"3fff:0::1".parse::<Ipv6Addr>().unwrap()));
+
+    // 3. Discard and Dummy prefixes (100::/64, 100:0:0:1::/64)
+    assert!(is_private_ipv6(&"100::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"100:0:0:1::1".parse::<Ipv6Addr>().unwrap()));
+
+    // 4. SRv6 SIDs (5f00::/16)
+    assert!(is_private_ipv6(&"5f00::1".parse::<Ipv6Addr>().unwrap()));
+
+    // 5. ULA (fc00::/7), Link-Local (fe80::/10), Site-Local (fec0::/10)
+    assert!(is_private_ipv6(&"fc00::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"fd12:3456:789a::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"fe80::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"fec0::1".parse::<Ipv6Addr>().unwrap()));
+
+    // 6. Loopback and Unspecified
+    assert!(is_private_ipv6(&"::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"::".parse::<Ipv6Addr>().unwrap()));
+
+    // 7. IPv4-mapped private
+    assert!(is_private_ipv6(&"::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(&"::ffff:192.168.1.1".parse::<Ipv6Addr>().unwrap()));
+
+    // 8. Public globally reachable IPv6 addresses are permitted
+    assert!(!is_private_ipv6(&"2600::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(!is_private_ipv6(&"2001:0200::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(!is_private_ipv6(&"2a00:1450:4009:81f::200e".parse::<Ipv6Addr>().unwrap()));
+}
+
 #[sqlx::test(migrations = "./migrations")]
-async fn handles_did_web_ssrf_and_public_resolution(pool: PgPool) {
+async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
     let setup = setup_test(pool).await;
 
-    // 1. Direct private IP: 127.0.0.1
-    let ssrf_token_127 = create_service_token(
-        &setup.p256_signing_key,
-        "did:web:127.0.0.1",
-        CIRCLE_AUDIENCE,
-        "blue.catbird.circle.getFeed",
-        "jti-ssrf-127",
-        60,
-        None,
-    );
-    assert_eq!(
-        request_feed(&setup.app, &ssrf_token_127).await.status(),
-        StatusCode::UNAUTHORIZED
-    );
-
-    // 2. Direct private IP: 10.0.0.1
-    let ssrf_token_10 = create_service_token(
-        &setup.p256_signing_key,
-        "did:web:10.0.0.1",
-        CIRCLE_AUDIENCE,
-        "blue.catbird.circle.getFeed",
-        "jti-ssrf-10",
-        60,
-        None,
-    );
-    assert_eq!(
-        request_feed(&setup.app, &ssrf_token_10).await.status(),
-        StatusCode::UNAUTHORIZED
-    );
-
-    // 3. Localhost hostname
-    let ssrf_token_local = create_service_token(
-        &setup.p256_signing_key,
-        "did:web:localhost",
-        CIRCLE_AUDIENCE,
-        "blue.catbird.circle.getFeed",
-        "jti-ssrf-local",
-        60,
-        None,
-    );
-    assert_eq!(
-        request_feed(&setup.app, &ssrf_token_local).await.status(),
-        StatusCode::UNAUTHORIZED
-    );
-
-    // 4. Successful public did:web resolution (using cached public web did doc)
-    let public_web_did = "did:web:example.com:users:alice";
+    // 1. Successful public resolution through injected transport (NO cache pre-insertion)
+    let public_did = "did:web:bluecatbird.io";
     let point = EncodedPoint::from(setup.p256_signing_key.verifying_key());
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let web_doc = DidDocument {
-        id: public_web_did.into(),
+    let public_doc = DidDocument {
+        id: public_did.into(),
         verification_method: vec![VerificationMethod {
-            id: format!("{public_web_did}#atproto"),
+            id: format!("{public_did}#atproto"),
             r#type: "JsonWebKey2020".into(),
-            controller: public_web_did.into(),
+            controller: public_did.into(),
             public_key_jwk: Some(PublicKeyJwk {
                 kty: "EC".into(),
                 crv: "P-256".into(),
@@ -676,26 +800,189 @@ async fn handles_did_web_ssrf_and_public_resolution(pool: PgPool) {
             public_key_multibase: None,
         }],
     };
-    setup.state.did_resolver.insert_cached(public_web_did.into(), web_doc);
 
-    let public_web_token = create_service_token(
+    let public_socket: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+
+    let mock_transport = Arc::new(MockDidWebTransport {
+        dns_result: Ok(vec![public_socket]),
+        fetched_doc: Ok(public_doc),
+        captured_fetches: captured.clone(),
+    });
+
+    let resolver = Arc::new(DidResolver::with_transport(
+        "https://plc.directory".into(),
+        reqwest::Client::new(),
+        mock_transport,
+    ));
+
+    let config = Config {
+        host: "127.0.0.1".into(),
+        port: 3002,
+        database_url: "postgres://localhost/postgres".into(),
+        service_did: CIRCLE_AUDIENCE.into(),
+        plc_directory_url: "https://plc.directory".into(),
+    };
+    let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
+    let app = create_router(app_state);
+
+    let public_token = create_service_token(
         &setup.p256_signing_key,
-        public_web_did,
+        public_did,
         CIRCLE_AUDIENCE,
         "blue.catbird.circle.getFeed",
-        "jti-web-public",
+        "jti-public-transport-1",
+        60,
+        None,
+    );
+
+    // Verify successful 200 OK without cache shortcut
+    assert_eq!(request_feed(&app, &public_token).await.status(), StatusCode::OK);
+
+    // Verify transport was actually invoked with correct URL, host, and pinned socket
+    let fetches = captured.lock().unwrap().clone();
+    assert_eq!(fetches.len(), 1);
+    assert_eq!(fetches[0].0, "https://bluecatbird.io:443/.well-known/did.json");
+    assert_eq!(fetches[0].1, "bluecatbird.io");
+    assert_eq!(fetches[0].2, public_socket);
+
+    // 2. Private-only DNS answer -> rejected as SSRF (401)
+    let private_socket: SocketAddr = "10.0.0.1:443".parse().unwrap();
+    let mock_private = Arc::new(MockDidWebTransport {
+        dns_result: Ok(vec![private_socket]),
+        fetched_doc: Err(AuthReason::DidResolutionFailed),
+        captured_fetches: Arc::new(Mutex::new(Vec::new())),
+    });
+    let resolver_private = Arc::new(DidResolver::with_transport(
+        "https://plc.directory".into(),
+        reqwest::Client::new(),
+        mock_private,
+    ));
+    let app_state_private = AppState::with_did_resolver(
+        Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: CIRCLE_AUDIENCE.into(),
+            plc_directory_url: "https://plc.directory".into(),
+        },
+        setup.pool.clone(),
+        resolver_private,
+    );
+    let app_private = create_router(app_state_private);
+
+    let private_dns_token = create_service_token(
+        &setup.p256_signing_key,
+        "did:web:private-dns.catbird.blue",
+        CIRCLE_AUDIENCE,
+        "blue.catbird.circle.getFeed",
+        "jti-private-dns",
         60,
         None,
     );
     assert_eq!(
-        request_feed(&setup.app, &public_web_token).await.status(),
-        StatusCode::OK
+        request_feed(&app_private, &private_dns_token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 3. Mixed DNS answers (public + private) -> rejected as SSRF (401)
+    let mixed_sockets = vec![public_socket, "192.168.1.1:443".parse().unwrap()];
+    let mock_mixed = Arc::new(MockDidWebTransport {
+        dns_result: Ok(mixed_sockets),
+        fetched_doc: Err(AuthReason::DidResolutionFailed),
+        captured_fetches: Arc::new(Mutex::new(Vec::new())),
+    });
+    let resolver_mixed = Arc::new(DidResolver::with_transport(
+        "https://plc.directory".into(),
+        reqwest::Client::new(),
+        mock_mixed,
+    ));
+    let app_state_mixed = AppState::with_did_resolver(
+        Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: CIRCLE_AUDIENCE.into(),
+            plc_directory_url: "https://plc.directory".into(),
+        },
+        setup.pool.clone(),
+        resolver_mixed,
+    );
+    let app_mixed = create_router(app_state_mixed);
+
+    let mixed_dns_token = create_service_token(
+        &setup.p256_signing_key,
+        "did:web:mixed-dns.catbird.blue",
+        CIRCLE_AUDIENCE,
+        "blue.catbird.circle.getFeed",
+        "jti-mixed-dns",
+        60,
+        None,
+    );
+    assert_eq!(
+        request_feed(&app_mixed, &mixed_dns_token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 4. Literal IPv6 non-global (e.g. 2001:5::1) -> rejected as SSRF (401)
+    let ssrf_token_ipv6 = create_service_token(
+        &setup.p256_signing_key,
+        "did:web:2001%3A5%3A%3A1",
+        CIRCLE_AUDIENCE,
+        "blue.catbird.circle.getFeed",
+        "jti-ssrf-ipv6-2001-5",
+        60,
+        None,
+    );
+    assert_eq!(
+        request_feed(&setup.app, &ssrf_token_ipv6).await.status(),
+        StatusCode::UNAUTHORIZED
     );
 }
 
+#[tokio::test]
+async fn default_web_transport_policy_rejects_redirects() {
+    // Start local server that responds with a 302 redirect
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let redirect_app = axum::Router::new().route(
+        "/.well-known/did.json",
+        axum::routing::get(|| async {
+            (
+                StatusCode::FOUND,
+                [(header::LOCATION, "https://example.com/other/did.json")],
+                "",
+            )
+        }),
+    );
+
+    tokio::spawn(async move {
+        axum::serve(listener, redirect_app).await.unwrap();
+    });
+
+    let transport = DefaultDidWebTransport;
+    let url = format!("http://{addr}/.well-known/did.json");
+    let result = transport.fetch(&url, "127.0.0.1", addr).await;
+
+    // Must fail because Policy::none() does not follow redirect and 302 is not a 2xx success
+    assert!(result.is_err());
+    assert_eq!(result.err().unwrap(), AuthReason::DidResolutionFailed);
+}
+
 #[sqlx::test(migrations = "./migrations")]
-async fn privacy_safe_auth_errors_contain_no_canaries(pool: PgPool) {
+async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
     let setup = setup_test(pool).await;
+
+    // Set up in-memory tracing subscriber to capture log outputs
+    let log_buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = BufferWriter(log_buffer.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+
+    let _guard = tracing::subscriber::set_default(subscriber);
 
     let iss_canary = "did:plc:alice-secret-canary-42";
     let space_canary = "at://did:plc:alice/space/circle/canary99";
@@ -719,6 +1006,7 @@ async fn privacy_safe_auth_errors_contain_no_canaries(pool: PgPool) {
     let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let body_str = String::from_utf8_lossy(&body_bytes);
 
+    // Assert HTTP response body contains zero canaries
     assert!(
         !body_str.contains(iss_canary),
         "Response body must not contain issuer DID canary"
@@ -744,5 +1032,28 @@ async fn privacy_safe_auth_errors_contain_no_canaries(pool: PgPool) {
     assert_eq!(
         error_json["message"], "Authentication required",
         "Error message must be generic content-free"
+    );
+
+    // Assert captured tracing logs contain zero canaries or raw tokens
+    let logs = String::from_utf8_lossy(&log_buffer.lock().unwrap()).to_string();
+    assert!(
+        !logs.contains(iss_canary),
+        "Captured logs must not contain issuer DID canary"
+    );
+    assert!(
+        !logs.contains(space_canary),
+        "Captured logs must not contain space canary"
+    );
+    assert!(
+        !logs.contains(jti_canary),
+        "Captured logs must not contain JTI canary"
+    );
+    assert!(
+        !logs.contains(lxm_canary),
+        "Captured logs must not contain LXM canary"
+    );
+    assert!(
+        !logs.contains(&bad_sig_token),
+        "Captured logs must not contain raw auth token"
     );
 }

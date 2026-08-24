@@ -10,13 +10,14 @@ use chrono::{DateTime, Utc};
 use p256::ecdsa::signature::Verifier;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::RwLock;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
 use crate::config::AppState;
 use crate::db;
 use crate::error::{AppError, AuthReason};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
     pub did: String,
@@ -98,6 +99,10 @@ impl ParsedVerifyingKey {
 
 pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifyingKey, AuthReason> {
     if let Some(multibase_str) = &vm.public_key_multibase {
+        if vm.r#type != "Multikey" {
+            return Err(AuthReason::InvalidKeyType);
+        }
+
         let (_base, decoded) =
             multibase::decode(multibase_str).map_err(|_| AuthReason::InvalidMultikey)?;
 
@@ -121,6 +126,10 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
     }
 
     if let Some(jwk) = &vm.public_key_jwk {
+        if vm.r#type != "JsonWebKey2020" && vm.r#type != "EcdsaSecp256k1VerificationKey2019" {
+            return Err(AuthReason::InvalidKeyType);
+        }
+
         if jwk.kty != "EC" {
             return Err(AuthReason::InvalidKeyType);
         }
@@ -138,6 +147,9 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
         }
 
         if jwk.crv.eq_ignore_ascii_case("P-256") {
+            if vm.r#type != "JsonWebKey2020" {
+                return Err(AuthReason::InvalidKeyType);
+            }
             let mut x_bytes = p256::FieldBytes::default();
             x_bytes.copy_from_slice(&x);
             let mut y_bytes = p256::FieldBytes::default();
@@ -165,9 +177,80 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
     Err(AuthReason::NoVerificationMethod)
 }
 
+pub trait DidWebTransport: Send + Sync {
+    fn resolve_dns<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>>;
+
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+        host: &'a str,
+        pinned_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>>;
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DefaultDidWebTransport;
+
+impl DidWebTransport for DefaultDidWebTransport {
+    fn resolve_dns<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+        let host = host.to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|_| AuthReason::DidResolutionFailed)?
+                .collect();
+            if addrs.is_empty() {
+                return Err(AuthReason::DidResolutionFailed);
+            }
+            Ok(addrs)
+        })
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+        host: &'a str,
+        pinned_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>> {
+        let url = url.to_string();
+        let host = host.to_string();
+        Box::pin(async move {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(5))
+                .resolve(&host, pinned_addr)
+                .build()
+                .map_err(|_| AuthReason::DidResolutionFailed)?;
+
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|_| AuthReason::DidResolutionFailed)?;
+
+            if !resp.status().is_success() {
+                return Err(AuthReason::DidResolutionFailed);
+            }
+
+            resp.json::<DidDocument>()
+                .await
+                .map_err(|_| AuthReason::DidDocumentInvalid)
+        })
+    }
+}
 pub struct DidResolver {
     plc_directory_url: String,
     http_client: reqwest::Client,
+    web_transport: Arc<dyn DidWebTransport>,
     cache: RwLock<HashMap<String, (DidDocument, DateTime<Utc>)>>,
 }
 
@@ -176,6 +259,20 @@ impl DidResolver {
         Self {
             plc_directory_url,
             http_client,
+            web_transport: Arc::new(DefaultDidWebTransport),
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_transport(
+        plc_directory_url: String,
+        http_client: reqwest::Client,
+        web_transport: Arc<dyn DidWebTransport>,
+    ) -> Self {
+        Self {
+            plc_directory_url,
+            http_client,
+            web_transport,
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -186,6 +283,7 @@ impl DidResolver {
             cache.insert(did, (doc, Utc::now() + chrono::Duration::hours(24)));
         }
     }
+
 
     pub async fn resolve(&self, did: &str) -> Result<DidDocument, AuthReason> {
         // Check in-memory cache
@@ -273,12 +371,8 @@ impl DidResolver {
             }
         }
 
-        // DNS resolution of all addresses
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((hostname.as_str(), port))
-            .await
-            .map_err(|_| AuthReason::DidResolutionFailed)?
-            .collect();
-
+        // DNS resolution via injected web_transport
+        let addrs = self.web_transport.resolve_dns(&hostname, port).await?;
         if addrs.is_empty() {
             return Err(AuthReason::DidResolutionFailed);
         }
@@ -304,28 +398,9 @@ impl DidResolver {
 
         let url = format!("https://{hostname}:{port}{url_path}");
 
-        // Build dedicated client with no proxy, no redirects, and pinned DNS mapping
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(5))
-            .resolve(&hostname, pinned_addr)
-            .build()
-            .map_err(|_| AuthReason::DidResolutionFailed)?;
-
-        let resp = client
-            .get(&url)
-            .send()
+        self.web_transport
+            .fetch(&url, &hostname, pinned_addr)
             .await
-            .map_err(|_| AuthReason::DidResolutionFailed)?;
-
-        if !resp.status().is_success() {
-            return Err(AuthReason::DidResolutionFailed);
-        }
-
-        resp.json::<DidDocument>()
-            .await
-            .map_err(|_| AuthReason::DidDocumentInvalid)
     }
 }
 
@@ -404,8 +479,8 @@ pub async fn verify_service_jwt(
 
     let now = Utc::now().timestamp();
 
-    // iat <= now (allow 5s clock skew)
-    if iat > now + 5 {
+    // iat <= now (strictly now or past; no future clock skew allowed)
+    if iat > now {
         return Err(AppError::Unauthorized(AuthReason::FutureIat));
     }
 
@@ -414,11 +489,11 @@ pub async fn verify_service_jwt(
         return Err(AppError::Unauthorized(AuthReason::Expired));
     }
 
-    // Lifetime checks: exp > iat and exp - iat <= 120s
+    // Lifetime checks: exp > iat and exp - iat <= 60s
     if exp <= iat {
         return Err(AppError::Unauthorized(AuthReason::Expired));
     }
-    if (exp - iat) > 120 {
+    if (exp - iat) > 60 {
         return Err(AppError::Unauthorized(AuthReason::LifetimeExceeded));
     }
 
@@ -455,6 +530,12 @@ pub async fn verify_service_jwt(
 
     let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
 
+    // Verify algorithm matches key curve
+    match (&key, header.alg.as_str()) {
+        (ParsedVerifyingKey::P256(_), "ES256") => {}
+        (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
+        _ => return Err(AppError::Unauthorized(AuthReason::AlgKeyMismatch)),
+    }
     // 8. Verify cryptographic signature
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
@@ -643,12 +724,12 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     if (segments[0] & 0xffc0) == 0xfec0 {
         return true;
     }
-    // Documentation: 2001:db8::/32
-    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+    // IETF Protocol Assignments: 2001::/23 (covers 2001::/32, 2001:2::/48, 2001:5::/32, 2001:10::/28, 2001:20::/28, etc.)
+    if segments[0] == 0x2001 && segments[1] <= 0x01ff {
         return true;
     }
-    // Benchmarking: 2001:2::/48
-    if segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000 {
+    // Documentation: 2001:db8::/32
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         return true;
     }
     // Documentation: 3fff::/20

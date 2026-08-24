@@ -43,7 +43,6 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub did_resolver: Arc<DidResolver>,
 }
-
 impl AppState {
     pub fn new(config: Config, db: PgPool) -> Self {
         let config = Arc::new(config);
@@ -55,6 +54,21 @@ impl AppState {
             config.plc_directory_url.clone(),
             http_client.clone(),
         ));
+
+        Self {
+            config,
+            db,
+            http_client,
+            did_resolver,
+        }
+    }
+
+    pub fn with_did_resolver(config: Config, db: PgPool, did_resolver: Arc<DidResolver>) -> Self {
+        let config = Arc::new(config);
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
 
         Self {
             config,
