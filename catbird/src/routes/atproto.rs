@@ -104,6 +104,7 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/blue.catbird.bskychat.updateMuteStatus",
             post(crate::handlers::chat_poll::update_mute_status),
         )
+        .merge(crate::routes::circle::create_routes())
         .route(
             "/*lexicon",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),

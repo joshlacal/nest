@@ -4,3 +4,4 @@
 
 pub mod atproto;
 pub mod health;
+pub mod circle;

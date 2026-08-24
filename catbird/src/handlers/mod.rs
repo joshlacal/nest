@@ -3,3 +3,4 @@
 pub mod atproto;
 pub mod chat_poll;
 pub mod push;
+pub mod circle;
