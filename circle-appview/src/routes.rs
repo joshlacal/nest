@@ -35,8 +35,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/xrpc/blue.catbird.circle.getCapabilities",
             get(get_capabilities),
+        )
+        .route(
+            "/xrpc/com.atproto.space.notifyWrite",
+            post(notify_write_handler),
         );
-
     // Authenticated XRPC endpoints
     let authenticated_routes = Router::new()
         .route(
@@ -256,6 +259,19 @@ async fn sync_projections_handler(
         &payload_digest,
     )
     .await?;
+
+    Ok(StatusCode::OK)
+}
+
+pub async fn notify_write_handler(
+    State(state): State<AppState>,
+    Json(input): Json<catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite>,
+) -> Result<StatusCode, AppError> {
+    let space_uri = input.space.to_string();
+    let repo_did = input.repo.to_string();
+
+    let sync_engine = crate::sync::SyncEngine::new(&state);
+    sync_engine.sync_repo(&space_uri, &repo_did).await?;
 
     Ok(StatusCode::OK)
 }

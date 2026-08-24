@@ -86,9 +86,15 @@ impl CredentialStore {
     }
 }
 
+#[derive(Clone)]
+struct SpaceLockEntry {
+    mutex: Arc<Mutex<()>>,
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 #[derive(Clone, Default)]
 pub struct SpaceLockManager {
-    locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+    locks: Arc<RwLock<HashMap<String, SpaceLockEntry>>>,
 }
 
 impl SpaceLockManager {
@@ -99,13 +105,27 @@ impl SpaceLockManager {
     }
 
     pub async fn acquire(&self, space: &str) -> OwnedMutexGuard<()> {
-        let lock = {
+        let (mutex, waiters) = {
             let mut map = self.locks.write().await;
-            map.entry(space.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            let entry = map.entry(space.to_string()).or_insert_with(|| SpaceLockEntry {
+                mutex: Arc::new(Mutex::new(())),
+                waiters: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+            (entry.mutex.clone(), entry.waiters.clone())
         };
-        lock.lock_owned().await
+        waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = mutex.lock_owned().await;
+        waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
+
+    pub async fn waiter_count(&self, space: &str) -> usize {
+        let map = self.locks.read().await;
+        if let Some(entry) = map.get(space) {
+            entry.waiters.load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        }
     }
 }
 

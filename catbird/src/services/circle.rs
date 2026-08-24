@@ -410,8 +410,7 @@ impl CircleService {
                 "space": &space_uri,
                 "member": member_did.as_ref(),
                 "circleGeneration": 1,
-                "memberGeneration": 1,
-                "generation": 1
+                "memberGeneration": 1
             });
             let member_op_id = self
                 .enqueue_projection(
@@ -660,8 +659,7 @@ impl CircleService {
             "space": space_str,
             "member": member_str,
             "circleGeneration": circle_generation,
-            "memberGeneration": member_generation,
-            "generation": member_generation
+            "memberGeneration": member_generation
         });
         let op_id = self
             .enqueue_projection(

@@ -76,6 +76,24 @@ pub fn compute_payload_digest(
     hasher.finalize().to_vec()
 }
 
+fn validate_equal_generations(gens: &[(Option<i64>, &str)], context: &str) -> Result<i64, AppError> {
+    let mut found: Option<i64> = None;
+    for (gen, name) in gens {
+        if let Some(val) = gen {
+            if let Some(existing) = found {
+                if existing != *val {
+                    return Err(AppError::InvalidRequest(format!(
+                        "Conflicting {context} values: {name} ({val}) != existing ({existing})"
+                    )));
+                }
+            } else {
+                found = Some(*val);
+            }
+        }
+    }
+    found.ok_or_else(|| AppError::InvalidRequest(format!("Missing {context}")))
+}
+
 impl SyncProjectionInput {
     pub fn to_projection(&self) -> Result<Projection, AppError> {
         // Enforce top-level space URI binding
@@ -91,25 +109,16 @@ impl SyncProjectionInput {
 
         match self.kind.as_str() {
             "circle_upsert" | "CircleUpsert" => {
-                let top_gen = self.circle_generation.or(self.generation);
-                let payload_gen = self
-                    .payload
-                    .get("circleGeneration")
-                    .or_else(|| self.payload.get("circle_generation"))
-                    .or_else(|| self.payload.get("generation"))
-                    .and_then(|v| v.as_i64());
-
-                if let (Some(t), Some(p)) = (top_gen, payload_gen) {
-                    if t != p {
-                        return Err(AppError::InvalidRequest(
-                            "Conflicting generation values in CircleUpsert".into(),
-                        ));
-                    }
-                }
-
-                let circle_gen = top_gen
-                    .or(payload_gen)
-                    .ok_or_else(|| AppError::InvalidRequest("Missing generation in CircleUpsert".into()))?;
+                let circle_gen = validate_equal_generations(
+                    &[
+                        (self.circle_generation, "top-level circle_generation"),
+                        (self.generation, "top-level generation"),
+                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
+                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
+                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                    ],
+                    "CircleUpsert",
+                )?;
 
                 let name = self
                     .payload
@@ -145,44 +154,25 @@ impl SyncProjectionInput {
                 })
             }
             "member_add" | "MemberAdd" => {
-                let top_circle_gen = self.circle_generation;
-                let payload_circle_gen = self
-                    .payload
-                    .get("circleGeneration")
-                    .or_else(|| self.payload.get("circle_generation"))
-                    .and_then(|v| v.as_i64());
+                let circle_gen = validate_equal_generations(
+                    &[
+                        (self.circle_generation, "top-level circle_generation"),
+                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
+                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
+                    ],
+                    "circleGeneration for MemberAdd",
+                )?;
 
-                if let (Some(t), Some(p)) = (top_circle_gen, payload_circle_gen) {
-                    if t != p {
-                        return Err(AppError::InvalidRequest(
-                            "Conflicting circleGeneration values in MemberAdd".into(),
-                        ));
-                    }
-                }
-
-                let circle_gen = top_circle_gen
-                    .or(payload_circle_gen)
-                    .ok_or_else(|| AppError::InvalidRequest("Missing circleGeneration for MemberAdd".into()))?;
-
-                let top_member_gen = self.member_generation;
-                let payload_member_gen = self
-                    .payload
-                    .get("memberGeneration")
-                    .or_else(|| self.payload.get("member_generation"))
-                    .and_then(|v| v.as_i64());
-
-                if let (Some(t), Some(p)) = (top_member_gen, payload_member_gen) {
-                    if t != p {
-                        return Err(AppError::InvalidRequest(
-                            "Conflicting memberGeneration values in MemberAdd".into(),
-                        ));
-                    }
-                }
-
-                let member_gen = top_member_gen
-                    .or(payload_member_gen)
-                    .ok_or_else(|| AppError::InvalidRequest("Missing memberGeneration for MemberAdd".into()))?;
-
+                let member_gen = validate_equal_generations(
+                    &[
+                        (self.member_generation, "top-level member_generation"),
+                        (self.payload.get("memberGeneration").and_then(|v| v.as_i64()), "payload.memberGeneration"),
+                        (self.payload.get("member_generation").and_then(|v| v.as_i64()), "payload.member_generation"),
+                        (self.generation, "top-level generation"),
+                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                    ],
+                    "memberGeneration for MemberAdd",
+                )?;
                 let member = self
                     .payload
                     .get("member")
@@ -199,44 +189,25 @@ impl SyncProjectionInput {
                 })
             }
             "member_remove" | "MemberRemove" => {
-                let top_circle_gen = self.circle_generation;
-                let payload_circle_gen = self
-                    .payload
-                    .get("circleGeneration")
-                    .or_else(|| self.payload.get("circle_generation"))
-                    .and_then(|v| v.as_i64());
+                let circle_gen = validate_equal_generations(
+                    &[
+                        (self.circle_generation, "top-level circle_generation"),
+                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
+                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
+                    ],
+                    "circleGeneration for MemberRemove",
+                )?;
 
-                if let (Some(t), Some(p)) = (top_circle_gen, payload_circle_gen) {
-                    if t != p {
-                        return Err(AppError::InvalidRequest(
-                            "Conflicting circleGeneration values in MemberRemove".into(),
-                        ));
-                    }
-                }
-
-                let circle_gen = top_circle_gen
-                    .or(payload_circle_gen)
-                    .ok_or_else(|| AppError::InvalidRequest("Missing circleGeneration for MemberRemove".into()))?;
-
-                let top_member_gen = self.member_generation;
-                let payload_member_gen = self
-                    .payload
-                    .get("memberGeneration")
-                    .or_else(|| self.payload.get("member_generation"))
-                    .and_then(|v| v.as_i64());
-
-                if let (Some(t), Some(p)) = (top_member_gen, payload_member_gen) {
-                    if t != p {
-                        return Err(AppError::InvalidRequest(
-                            "Conflicting memberGeneration values in MemberRemove".into(),
-                        ));
-                    }
-                }
-
-                let member_gen = top_member_gen
-                    .or(payload_member_gen)
-                    .ok_or_else(|| AppError::InvalidRequest("Missing memberGeneration for MemberRemove".into()))?;
-
+                let member_gen = validate_equal_generations(
+                    &[
+                        (self.member_generation, "top-level member_generation"),
+                        (self.payload.get("memberGeneration").and_then(|v| v.as_i64()), "payload.memberGeneration"),
+                        (self.payload.get("member_generation").and_then(|v| v.as_i64()), "payload.member_generation"),
+                        (self.generation, "top-level generation"),
+                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                    ],
+                    "memberGeneration for MemberRemove",
+                )?;
                 let member = self
                     .payload
                     .get("member")
@@ -253,25 +224,16 @@ impl SyncProjectionInput {
                 })
             }
             "circle_delete" | "CircleDelete" => {
-                let top_gen = self.circle_generation.or(self.generation);
-                let payload_gen = self
-                    .payload
-                    .get("circleGeneration")
-                    .or_else(|| self.payload.get("circle_generation"))
-                    .or_else(|| self.payload.get("generation"))
-                    .and_then(|v| v.as_i64());
-
-                if let (Some(t), Some(p)) = (top_gen, payload_gen) {
-                    if t != p {
-                        return Err(AppError::InvalidRequest(
-                            "Conflicting generation values in CircleDelete".into(),
-                        ));
-                    }
-                }
-
-                let circle_gen = top_gen
-                    .or(payload_gen)
-                    .ok_or_else(|| AppError::InvalidRequest("Missing generation in CircleDelete".into()))?;
+                let circle_gen = validate_equal_generations(
+                    &[
+                        (self.circle_generation, "top-level circle_generation"),
+                        (self.generation, "top-level generation"),
+                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
+                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
+                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                    ],
+                    "CircleDelete",
+                )?;
 
                 Ok(Projection::CircleDelete {
                     space: self.space_uri.clone(),

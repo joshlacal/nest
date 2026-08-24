@@ -1,0 +1,112 @@
+{
+  "owner_did": "did:plc:alice",
+  "bob_did": "did:plc:bob",
+  "carol_did": "did:plc:carol",
+  "dave_did": "did:plc:dave",
+  "space_uri": "at://did:plc:alice/space/blue.catbird.circle/test-circle",
+  "other_space_uri": "at://did:plc:other/space/blue.catbird.circle/other-circle",
+  "records": {
+    "owner_post": {
+      "$type": "app.bsky.feed.post",
+      "text": "Hello, welcome to my private circle!",
+      "createdAt": "2026-08-24T12:00:00.000Z"
+    },
+    "owner_post_with_images": {
+      "$type": "app.bsky.feed.post",
+      "text": "Check out these photos in our circle",
+      "createdAt": "2026-08-24T12:05:00.000Z",
+      "embed": {
+        "$type": "app.bsky.embed.images",
+        "images": [
+          {
+            "alt": "Photo 1",
+            "image": {
+              "$type": "blob",
+              "ref": { "$link": "bafkreifh327w4vshsfy" },
+              "mimeType": "image/jpeg",
+              "size": 1024
+            }
+          }
+        ]
+      }
+    },
+    "bob_reply_to_owner": {
+      "$type": "app.bsky.feed.post",
+      "text": "Thanks Alice, happy to be here!",
+      "createdAt": "2026-08-24T12:10:00.000Z",
+      "reply": {
+        "root": {
+          "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+          "cid": "bafyreih327ownerpostcid1"
+        },
+        "parent": {
+          "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+          "cid": "bafyreih327ownerpostcid1"
+        }
+      }
+    },
+    "bob_like_owner_post": {
+      "$type": "app.bsky.feed.like",
+      "subject": {
+        "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+        "cid": "bafyreih327ownerpostcid1"
+      },
+      "createdAt": "2026-08-24T12:15:00.000Z"
+    },
+    "bob_top_level": {
+      "$type": "app.bsky.feed.post",
+      "text": "I am not the owner but trying to author top level",
+      "createdAt": "2026-08-24T12:20:00.000Z"
+    },
+    "dave_reply": {
+      "$type": "app.bsky.feed.post",
+      "text": "Dave does not have an active access lease",
+      "createdAt": "2026-08-24T12:25:00.000Z",
+      "reply": {
+        "root": {
+          "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+          "cid": "bafyreih327ownerpostcid1"
+        },
+        "parent": {
+          "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+          "cid": "bafyreih327ownerpostcid1"
+        }
+      }
+    },
+    "cross_space_reply": {
+      "$type": "app.bsky.feed.post",
+      "text": "Replying to a post from another space",
+      "createdAt": "2026-08-24T12:30:00.000Z",
+      "reply": {
+        "root": {
+          "uri": "at://did:plc:other/app.bsky.feed.post/3l7otherpost1",
+          "cid": "bafyreih327otherpostcid1"
+        },
+        "parent": {
+          "uri": "at://did:plc:other/app.bsky.feed.post/3l7otherpost1",
+          "cid": "bafyreih327otherpostcid1"
+        }
+      }
+    },
+    "quote_post": {
+      "$type": "app.bsky.feed.post",
+      "text": "Quoting another post is unsupported in circle alpha",
+      "createdAt": "2026-08-24T12:35:00.000Z",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+          "cid": "bafyreih327ownerpostcid1"
+        }
+      }
+    },
+    "repost_record": {
+      "$type": "app.bsky.feed.repost",
+      "subject": {
+        "uri": "at://did:plc:alice/app.bsky.feed.post/3l7ownerpost1",
+        "cid": "bafyreih327ownerpostcid1"
+      },
+      "createdAt": "2026-08-24T12:40:00.000Z"
+    }
+  }
+}

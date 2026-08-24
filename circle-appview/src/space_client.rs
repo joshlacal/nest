@@ -28,6 +28,59 @@ pub trait SpaceHostTransport: Send + Sync {
         space_uri: &'a str,
         client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>>;
+
+    fn list_repos<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        _space_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound("list_repos not implemented on transport".into()))
+        })
+    }
+
+    fn list_repo_ops<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        _space_uri: &'a str,
+        _repo_did: &'a str,
+        _since: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound("list_repo_ops not implemented on transport".into()))
+        })
+    }
+
+    fn get_repo<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        _space_uri: &'a str,
+        _repo_did: &'a str,
+        _since: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry>, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound("get_repo not implemented on transport".into()))
+        })
+    }
+
+    fn get_latest_commit<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        _space_uri: &'a str,
+        _repo_did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::SignedCommit, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound("get_latest_commit not implemented on transport".into()))
+        })
+    }
 }
 
 pub trait SpaceHostDnsResolver: Send + Sync {
@@ -221,13 +274,228 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .json()
                 .await
                 .map_err(|e| AppError::Internal(format!("Invalid JSON from Space host: {e}")))?;
-
             let credential = body
                 .get("credential")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AppError::Internal("Missing credential in Space host response".into()))?;
 
             Ok(credential.to_string())
+        })
+    }
+
+    fn list_repos<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_credential: &'a str,
+        dpop_proof: &'a str,
+        space_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput, AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_credential = space_credential.to_string();
+        let dpop_proof = dpop_proof.to_string();
+        let space_uri = space_uri.to_string();
+        let test_cert = self.test_root_cert.clone();
+
+        Box::pin(async move {
+            let host = target_url.host_str().ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
+            let port = target_url.port().unwrap_or(443);
+            let addrs = self.dns_resolver.resolve_dns(host, port).await.map_err(AppError::Unauthorized)?;
+            let pinned_addr = addrs[0];
+
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(5))
+                .resolve(host, pinned_addr);
+            if let Some(cert) = test_cert {
+                builder = builder.add_root_certificate(cert);
+            }
+            let client = builder.build().map_err(|e| AppError::Internal(e.to_string()))?;
+
+            let mut req_url = target_url.clone();
+            req_url.query_pairs_mut().append_pair("space", &space_uri);
+
+            let response = client
+                .get(req_url.as_str())
+                .header(reqwest::header::AUTHORIZATION, format!("DPoP {space_credential}"))
+                .header("DPoP", dpop_proof)
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!("Space host listRepos returned {}", response.status())));
+            }
+            let output = response.json().await.map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(output)
+        })
+    }
+
+    fn list_repo_ops<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_credential: &'a str,
+        dpop_proof: &'a str,
+        space_uri: &'a str,
+        repo_did: &'a str,
+        since: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_credential = space_credential.to_string();
+        let dpop_proof = dpop_proof.to_string();
+        let space_uri = space_uri.to_string();
+        let repo_did = repo_did.to_string();
+        let since = since.map(|s| s.to_string());
+        let test_cert = self.test_root_cert.clone();
+
+        Box::pin(async move {
+            let host = target_url.host_str().ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
+            let port = target_url.port().unwrap_or(443);
+            let addrs = self.dns_resolver.resolve_dns(host, port).await.map_err(AppError::Unauthorized)?;
+            let pinned_addr = addrs[0];
+
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(5))
+                .resolve(host, pinned_addr);
+            if let Some(cert) = test_cert {
+                builder = builder.add_root_certificate(cert);
+            }
+            let client = builder.build().map_err(|e| AppError::Internal(e.to_string()))?;
+
+            let mut req_url = target_url.clone();
+            {
+                let mut query = req_url.query_pairs_mut();
+                query.append_pair("space", &space_uri);
+                query.append_pair("repo", &repo_did);
+                if let Some(s) = &since {
+                    query.append_pair("since", s);
+                }
+            }
+
+            let response = client
+                .get(req_url.as_str())
+                .header(reqwest::header::AUTHORIZATION, format!("DPoP {space_credential}"))
+                .header("DPoP", dpop_proof)
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!("Space host listRepoOps returned {}", response.status())));
+            }
+            let output = response.json().await.map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(output)
+        })
+    }
+
+    fn get_repo<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_credential: &'a str,
+        dpop_proof: &'a str,
+        space_uri: &'a str,
+        repo_did: &'a str,
+        since: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry>, AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_credential = space_credential.to_string();
+        let dpop_proof = dpop_proof.to_string();
+        let space_uri = space_uri.to_string();
+        let repo_did = repo_did.to_string();
+        let since = since.map(|s| s.to_string());
+        let test_cert = self.test_root_cert.clone();
+
+        Box::pin(async move {
+            let host = target_url.host_str().ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
+            let port = target_url.port().unwrap_or(443);
+            let addrs = self.dns_resolver.resolve_dns(host, port).await.map_err(AppError::Unauthorized)?;
+            let pinned_addr = addrs[0];
+
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(5))
+                .resolve(host, pinned_addr);
+            if let Some(cert) = test_cert {
+                builder = builder.add_root_certificate(cert);
+            }
+            let client = builder.build().map_err(|e| AppError::Internal(e.to_string()))?;
+
+            let mut req_url = target_url.clone();
+            {
+                let mut query = req_url.query_pairs_mut();
+                query.append_pair("space", &space_uri);
+                query.append_pair("repo", &repo_did);
+                if let Some(s) = &since {
+                    query.append_pair("since", s);
+                }
+            }
+
+            let response = client
+                .get(req_url.as_str())
+                .header(reqwest::header::AUTHORIZATION, format!("DPoP {space_credential}"))
+                .header("DPoP", dpop_proof)
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!("Space host getRepo returned {}", response.status())));
+            }
+            let output = response.json().await.map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(output)
+        })
+    }
+
+    fn get_latest_commit<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_credential: &'a str,
+        dpop_proof: &'a str,
+        space_uri: &'a str,
+        repo_did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::SignedCommit, AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_credential = space_credential.to_string();
+        let dpop_proof = dpop_proof.to_string();
+        let space_uri = space_uri.to_string();
+        let repo_did = repo_did.to_string();
+        let test_cert = self.test_root_cert.clone();
+
+        Box::pin(async move {
+            let host = target_url.host_str().ok_or_else(|| AppError::InvalidRequest("Missing host in URL".into()))?;
+            let port = target_url.port().unwrap_or(443);
+            let addrs = self.dns_resolver.resolve_dns(host, port).await.map_err(AppError::Unauthorized)?;
+            let pinned_addr = addrs[0];
+
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(5))
+                .resolve(host, pinned_addr);
+            if let Some(cert) = test_cert {
+                builder = builder.add_root_certificate(cert);
+            }
+            let client = builder.build().map_err(|e| AppError::Internal(e.to_string()))?;
+
+            let mut req_url = target_url.clone();
+            req_url.query_pairs_mut().append_pair("space", &space_uri).append_pair("repo", &repo_did);
+
+            let response = client
+                .get(req_url.as_str())
+                .header(reqwest::header::AUTHORIZATION, format!("DPoP {space_credential}"))
+                .header("DPoP", dpop_proof)
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!("Space host getLatestCommit returned {}", response.status())));
+            }
+            let output: catbird_atproto::generated::com_atproto::space::get_latest_commit::GetLatestCommitOutput = response.json().await.map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(output.commit)
         })
     }
 }
@@ -241,16 +509,29 @@ pub struct RecordedSpaceHostCall {
     pub client_attestation: String,
 }
 
-#[derive(Default)]
 pub struct MockSpaceHostTransport {
     responses: Mutex<HashMap<String, Result<String, String>>>,
+    list_repos_responses: Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput>>,
+    list_repo_ops_responses: Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput>>,
+    get_repo_responses: Mutex<HashMap<String, Vec<catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry>>>,
+    latest_commits: Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::SignedCommit>>,
     calls: Mutex<Vec<RecordedSpaceHostCall>>,
+}
+
+impl Default for MockSpaceHostTransport {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MockSpaceHostTransport {
     pub fn new() -> Self {
         Self {
             responses: Mutex::new(HashMap::new()),
+            list_repos_responses: Mutex::new(HashMap::new()),
+            list_repo_ops_responses: Mutex::new(HashMap::new()),
+            get_repo_responses: Mutex::new(HashMap::new()),
+            latest_commits: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -258,6 +539,26 @@ impl MockSpaceHostTransport {
     pub fn set_credential_response(&self, space: &str, result: Result<String, String>) {
         let mut lock = self.responses.lock().unwrap();
         lock.insert(space.to_string(), result);
+    }
+
+    pub fn set_list_repos_response(&self, space: &str, output: catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput) {
+        let mut lock = self.list_repos_responses.lock().unwrap();
+        lock.insert(space.to_string(), output);
+    }
+
+    pub fn set_list_repo_ops_response(&self, space_and_repo: &str, output: catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput) {
+        let mut lock = self.list_repo_ops_responses.lock().unwrap();
+        lock.insert(space_and_repo.to_string(), output);
+    }
+
+    pub fn set_get_repo_response(&self, space_and_repo: &str, output: Vec<catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry>) {
+        let mut lock = self.get_repo_responses.lock().unwrap();
+        lock.insert(space_and_repo.to_string(), output);
+    }
+
+    pub fn set_latest_commit(&self, space_and_repo: &str, commit: catbird_atproto::generated::com_atproto::space::SignedCommit) {
+        let mut lock = self.latest_commits.lock().unwrap();
+        lock.insert(space_and_repo.to_string(), commit);
     }
 
     pub fn recorded_calls(&self) -> Vec<RecordedSpaceHostCall> {
@@ -282,24 +583,75 @@ impl SpaceHostTransport for MockSpaceHostTransport {
             space_uri: space_uri.to_string(),
             client_attestation: client_attestation.to_string(),
         };
+        self.calls.lock().unwrap().push(call);
 
-        {
-            let mut calls = self.calls.lock().unwrap();
-            calls.push(call);
-        }
-
-        let space_uri = space_uri.to_string();
-        let res = {
-            let lock = self.responses.lock().unwrap();
-            lock.get(&space_uri).cloned()
-        };
-
+        let res = self.responses.lock().unwrap().get(space_uri).cloned();
         Box::pin(async move {
             match res {
                 Some(Ok(token)) => Ok(token),
                 Some(Err(err)) => Err(AppError::Internal(err)),
                 None => Err(AppError::NotFound("No mock credential configured for space".into())),
             }
+        })
+    }
+
+    fn list_repos<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        space_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput, AppError>> + Send + 'a>> {
+        let res = self.list_repos_responses.lock().unwrap().get(space_uri).cloned();
+        Box::pin(async move {
+            res.ok_or_else(|| AppError::NotFound("No mock list_repos configured for space".into()))
+        })
+    }
+
+    fn list_repo_ops<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        space_uri: &'a str,
+        repo_did: &'a str,
+        _since: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>> {
+        let key = format!("{space_uri}:{repo_did}");
+        let res = self.list_repo_ops_responses.lock().unwrap().get(&key).cloned();
+        Box::pin(async move {
+            res.ok_or_else(|| AppError::NotFound(format!("No mock list_repo_ops configured for {key}")))
+        })
+    }
+
+    fn get_repo<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        space_uri: &'a str,
+        repo_did: &'a str,
+        _since: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry>, AppError>> + Send + 'a>> {
+        let key = format!("{space_uri}:{repo_did}");
+        let res = self.get_repo_responses.lock().unwrap().get(&key).cloned();
+        Box::pin(async move {
+            res.ok_or_else(|| AppError::NotFound(format!("No mock get_repo configured for {key}")))
+        })
+    }
+
+    fn get_latest_commit<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        space_uri: &'a str,
+        repo_did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::SignedCommit, AppError>> + Send + 'a>> {
+        let key = format!("{space_uri}:{repo_did}");
+        let res = self.latest_commits.lock().unwrap().get(&key).cloned();
+        Box::pin(async move {
+            res.ok_or_else(|| AppError::NotFound(format!("No mock get_latest_commit configured for {key}")))
         })
     }
 }
@@ -384,6 +736,59 @@ impl SpaceClient {
 
         Ok((credential_jwt, ephemeral_key, expires_at))
     }
+
+    pub async fn list_repos(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+        space_credential: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+    ) -> Result<catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput, AppError> {
+        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.listRepos")?;
+        let dpop_proof = create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        self.transport.list_repos(&xrpc_url, space_credential, &dpop_proof, space_uri).await
+    }
+
+    pub async fn list_repo_ops(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+        repo_did: &str,
+        since: Option<&str>,
+        space_credential: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+    ) -> Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError> {
+        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.listRepoOps")?;
+        let dpop_proof = create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        self.transport.list_repo_ops(&xrpc_url, space_credential, &dpop_proof, space_uri, repo_did, since).await
+    }
+
+    pub async fn get_repo(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+        repo_did: &str,
+        since: Option<&str>,
+        space_credential: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+    ) -> Result<Vec<catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry>, AppError> {
+        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getRepo")?;
+        let dpop_proof = create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        self.transport.get_repo(&xrpc_url, space_credential, &dpop_proof, space_uri, repo_did, since).await
+    }
+
+    pub async fn get_latest_commit(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+        repo_did: &str,
+        space_credential: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+    ) -> Result<catbird_atproto::generated::com_atproto::space::SignedCommit, AppError> {
+        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getLatestCommit")?;
+        let dpop_proof = create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        self.transport.get_latest_commit(&xrpc_url, space_credential, &dpop_proof, space_uri, repo_did).await
+    }
 }
 
 impl Default for SpaceClient {
@@ -440,10 +845,84 @@ pub fn create_dpop_proof(
 
     let sig: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    format!("{signing_input}.{sig_b64}")
+}
+
+pub fn create_dpop_proof_with_ath(
+    signing_key: &p256::ecdsa::SigningKey,
+    htm: &str,
+    htu: &str,
+    access_token: Option<&str>,
+) -> String {
+    let now = Utc::now().timestamp();
+    let verifying_key = signing_key.verifying_key();
+    let point = EncodedPoint::from(verifying_key);
+    let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+    let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+
+    let header = json!({
+        "typ": "dpop+jwt",
+        "alg": "ES256",
+        "jwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": x,
+            "y": y,
+        }
+    });
+
+    let mut payload = json!({
+        "jti": Uuid::new_v4().to_string(),
+        "htm": htm,
+        "htu": htu,
+        "iat": now,
+    });
+
+    if let Some(token) = access_token {
+        let ath = URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()));
+        payload["ath"] = json!(ath);
+    }
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let sig: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
 
     format!("{signing_input}.{sig_b64}")
 }
 
+pub fn construct_xrpc_url(service_endpoint: &str, method_nsid: &str) -> Result<url::Url, AppError> {
+    let parsed_endpoint = url::Url::parse(service_endpoint)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid service endpoint URL: {e}")))?;
+
+    if parsed_endpoint.scheme() != "https" {
+        return Err(AppError::InvalidRequest(
+            "Service endpoint must use HTTPS".into(),
+        ));
+    }
+    if !parsed_endpoint.username().is_empty() || parsed_endpoint.password().is_some() {
+        return Err(AppError::InvalidRequest(
+            "Service endpoint must not contain userinfo".into(),
+        ));
+    }
+    if parsed_endpoint.query().is_some() || parsed_endpoint.fragment().is_some() {
+        return Err(AppError::InvalidRequest(
+            "Service endpoint must not contain query or fragment".into(),
+        ));
+    }
+
+    let path = parsed_endpoint.path().trim_end_matches('/');
+    let xrpc_path = if path.is_empty() {
+        format!("/xrpc/{method_nsid}")
+    } else {
+        format!("{path}/xrpc/{method_nsid}")
+    };
+    let mut xrpc_url = parsed_endpoint;
+    xrpc_url.set_path(&xrpc_path);
+    Ok(xrpc_url)
+}
 pub fn validate_space_credential(
     credential_jwt: &str,
     expected_authority_did: &str,

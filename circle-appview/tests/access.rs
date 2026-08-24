@@ -2319,7 +2319,7 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
     let store_clone = setup.state.credential_store.clone();
     let locks_clone = setup.state.space_locks.clone();
     let space_for_del = space.clone();
-    let mut projection_handle = tokio::spawn(async move {
+    let projection_handle = tokio::spawn(async move {
         projections::apply_projection(
             &pool_clone,
             Some(&store_clone),
@@ -2334,10 +2334,17 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
         .await
     });
 
-    // Assert that projection is BLOCKED on _space_lock while activation is in exchange
-    let check_blocked = tokio::time::timeout(std::time::Duration::from_millis(50), &mut projection_handle).await;
-    assert!(check_blocked.is_err(), "CircleDelete projection must block while activation holds _space_lock");
-
+    // Assert that projection is BLOCKED on SpaceLockManager while activation holds lock
+    let mut waited = 0;
+    while setup.state.space_locks.waiter_count(&space).await == 0 && waited < 100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+    }
+    assert_eq!(
+        setup.state.space_locks.waiter_count(&space).await,
+        1,
+        "CircleDelete projection must be queued on SpaceLockManager while activation holds lock"
+    );
     // Release activation exchange: activation finishes lease commit, CredentialStore insert, and releases _space_lock
     exchange_release.notify_one();
 
@@ -2388,7 +2395,6 @@ async fn concurrent_circle_deletion_blocks_and_rejects_activation(pool: PgPool) 
     .await
     .unwrap();
 
-    // CircleDelete executes first and commits deletion + tombstone
     let del_op = Uuid::new_v4();
     let del_payload = json!({"space": space, "generation": 1, "circleGeneration": 1});
     let del_digest = projections::compute_payload_digest(
@@ -2403,21 +2409,6 @@ async fn concurrent_circle_deletion_blocks_and_rejects_activation(pool: PgPool) 
         None,
     );
 
-    projections::apply_projection(
-        &pool,
-        Some(&setup.state.credential_store),
-        Some(&setup.state.space_locks),
-        del_op,
-        Projection::CircleDelete {
-            space: space.clone(),
-            generation: 1,
-        },
-        &del_digest,
-    )
-    .await
-    .unwrap();
-
-    // Activation runs afterwards -> acquires lock, checks DB, sees tombstone, strictly rejected
     let dyn_transport = Arc::new(DynamicMockTransport {
         authority_key: setup.authority_signing_key.clone(),
         authority_did: AUTHORITY_DID.to_string(),
@@ -2441,7 +2432,51 @@ async fn concurrent_circle_deletion_blocks_and_rejects_activation(pool: PgPool) 
         now,
     );
 
-    let act_res = access::activate_space(&state, ALICE_DID, &space, &delegation_token, "attestation").await;
+    let pool_clone = pool.clone();
+    let store_clone = setup.state.credential_store.clone();
+    let _locks_clone = setup.state.space_locks.clone();
+    let space_clone = space.clone();
+
+    // Acquire space lock to serialize deletion ahead of activation
+    let del_lock_guard = setup.state.space_locks.acquire(&space).await;
+
+    // Spawn activation which must block on the space lock held by deletion
+    let state_clone = state.clone();
+    let space_for_act = space.clone();
+    let dt_clone = delegation_token.clone();
+    let activation_handle = tokio::spawn(async move {
+        access::activate_space(&state_clone, ALICE_DID, &space_for_act, &dt_clone, "attestation").await
+    });
+
+    // Wait until activation is observed waiting on the lock
+    let mut waited = 0;
+    while setup.state.space_locks.waiter_count(&space).await == 0 && waited < 100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+    }
+    assert_eq!(
+        setup.state.space_locks.waiter_count(&space).await,
+        1,
+        "Activation must block on SpaceLockManager while deletion holds lock"
+    );
+
+    projections::apply_projection(
+        &pool_clone,
+        Some(&store_clone),
+        None,
+        del_op,
+        Projection::CircleDelete {
+            space: space_clone,
+            generation: 1,
+        },
+        &del_digest,
+    )
+    .await
+    .unwrap();
+    drop(del_lock_guard);
+
+    // Activation unblocks, acquires lock, queries DB, sees tombstone, strictly rejected
+    let act_res = activation_handle.await.unwrap();
     assert!(matches!(act_res, Err(circle_appview::error::AppError::Forbidden(_))));
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
@@ -2593,7 +2628,7 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
     let store_clone = setup.state.credential_store.clone();
     let locks_clone = setup.state.space_locks.clone();
     let space_for_rem = space.clone();
-    let mut projection_handle = tokio::spawn(async move {
+    let projection_handle = tokio::spawn(async move {
         projections::apply_projection(
             &pool_clone,
             Some(&store_clone),
@@ -2610,10 +2645,17 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
         .await
     });
 
-    // Assert that MemberRemove blocks while activation holds _space_lock
-    let check_blocked = tokio::time::timeout(std::time::Duration::from_millis(50), &mut projection_handle).await;
-    assert!(check_blocked.is_err(), "MemberRemove must block while activation holds _space_lock");
-
+    // Assert that MemberRemove blocks on SpaceLockManager while activation holds lock
+    let mut waited = 0;
+    while setup.state.space_locks.waiter_count(&space).await == 0 && waited < 100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+    }
+    assert_eq!(
+        setup.state.space_locks.waiter_count(&space).await,
+        1,
+        "MemberRemove must block on SpaceLockManager while activation holds lock"
+    );
     // Release activation exchange
     exchange_release.notify_one();
 
@@ -2663,7 +2705,6 @@ async fn concurrent_member_removal_blocks_and_rejects_activation(pool: PgPool) {
     .await
     .unwrap();
 
-    // MemberRemove executes first
     let rem_op = Uuid::new_v4();
     let rem_payload = json!({"member": ALICE_DID, "circleGeneration": 1, "memberGeneration": 2});
     let rem_digest = projections::compute_payload_digest(
@@ -2677,22 +2718,6 @@ async fn concurrent_member_removal_blocks_and_rejects_activation(pool: PgPool) {
         Some(1),
         Some(2),
     );
-
-    projections::apply_projection(
-        &pool,
-        Some(&setup.state.credential_store),
-        Some(&setup.state.space_locks),
-        rem_op,
-        Projection::MemberRemove {
-            space: space.clone(),
-            member: ALICE_DID.into(),
-            circle_generation: 1,
-            member_generation: 2,
-        },
-        &rem_digest,
-    )
-    .await
-    .unwrap();
 
     let dyn_transport = Arc::new(DynamicMockTransport {
         authority_key: setup.authority_signing_key.clone(),
@@ -2717,7 +2742,44 @@ async fn concurrent_member_removal_blocks_and_rejects_activation(pool: PgPool) {
         now,
     );
 
-    let act_res = access::activate_space(&state, ALICE_DID, &space, &delegation_token, "attestation").await;
+    let rem_lock_guard = setup.state.space_locks.acquire(&space).await;
+
+    let state_clone = state.clone();
+    let space_for_act = space.clone();
+    let dt_clone = delegation_token.clone();
+    let activation_handle = tokio::spawn(async move {
+        access::activate_space(&state_clone, ALICE_DID, &space_for_act, &dt_clone, "attestation").await
+    });
+
+    let mut waited = 0;
+    while setup.state.space_locks.waiter_count(&space).await == 0 && waited < 100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+    }
+    assert_eq!(
+        setup.state.space_locks.waiter_count(&space).await,
+        1,
+        "Activation must block on SpaceLockManager while removal holds lock"
+    );
+
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        None,
+        rem_op,
+        Projection::MemberRemove {
+            space: space.clone(),
+            member: ALICE_DID.into(),
+            circle_generation: 1,
+            member_generation: 2,
+        },
+        &rem_digest,
+    )
+    .await
+    .unwrap();
+    drop(rem_lock_guard);
+
+    let act_res = activation_handle.await.unwrap();
     assert!(matches!(act_res, Err(circle_appview::error::AppError::Forbidden(_))));
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
@@ -3527,8 +3589,9 @@ async fn run_production_space_host_transport_tls_fixture() {
                     return;
                 };
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
-                    let has_auth = req_str.contains("authorization: Bearer test-delegation-token")
+                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") || req_str.starts_with("GET /xrpc/com.atproto.space.getSpaceCredential") {
+                    let has_auth = req_str.contains("Bearer test-delegation-token")
+                        || req_str.contains("authorization: Bearer test-delegation-token")
                         || req_str.contains("Authorization: Bearer test-delegation-token");
                     let has_dpop = req_str.contains("dpop: test-dpop-proof")
                         || req_str.contains("DPoP: test-dpop-proof");
@@ -3552,7 +3615,7 @@ async fn run_production_space_host_transport_tls_fixture() {
                 } else if req_str.starts_with("POST /redirect") {
                     // Redirect to the valid credential endpoint on the same TLS fixture.
                     // If Policy::none() is active, redirect is rejected and returns error.
-                    let response = "HTTP/1.1 302 Found\r\nLocation: /xrpc/com.atproto.space.getSpaceCredential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /xrpc/com.atproto.space.getSpaceCredential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else {
                     let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -3645,6 +3708,8 @@ const POISONED_SPACE_HOST_PROXY_URL: &str = "http://invalid-unreachable-proxy.ex
 #[tokio::test]
 #[ignore = "Subprocess helper executed exclusively by production_space_host_transport_enforces_tls_pinning_no_proxy_and_rejects_redirects"]
 async fn space_host_transport_proxy_subprocess_helper() {
+    assert!(std::env::var("NO_PROXY").is_err(), "NO_PROXY must not be set in subprocess");
+    assert!(std::env::var("no_proxy").is_err(), "no_proxy must not be set in subprocess");
     assert_eq!(
         std::env::var("HTTPS_PROXY").ok().as_deref(),
         Some(POISONED_SPACE_HOST_PROXY_URL),
@@ -3685,9 +3750,10 @@ async fn production_space_host_transport_enforces_tls_pinning_no_proxy_and_rejec
         .env("https_proxy", POISONED_SPACE_HOST_PROXY_URL)
         .env("http_proxy", POISONED_SPACE_HOST_PROXY_URL)
         .env("all_proxy", POISONED_SPACE_HOST_PROXY_URL)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         .output()
         .expect("Failed to execute space host proxy isolation test subprocess");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
