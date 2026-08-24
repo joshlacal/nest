@@ -1,6 +1,6 @@
 use axum::{
     extract::{Extension, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware,
     routing::{get, post},
     Json, Router,
@@ -53,10 +53,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/xrpc/blue.catbird.circle.activateSpace",
-            post(activate_space_handler),
-        )
-        .route(
-            "/blue.catbird.circle.activateSpace",
             post(activate_space_handler),
         )
         .route(
@@ -165,6 +161,7 @@ async fn activate_space_handler(
 }
 
 async fn sync_projections_handler(
+    headers: HeaderMap,
     Extension(user): Extension<AuthenticatedUser>,
     State(state): State<AppState>,
     Json(input): Json<SyncProjectionInput>,
@@ -175,12 +172,85 @@ async fn sync_projections_handler(
         "Handling syncProjection request"
     );
 
+    // 1. Validate service auth lxm
     if user.lxm != "blue.catbird.circle.syncProjection" {
         return Err(AppError::Unauthorized(AuthReason::LxmMismatch));
     }
 
+    // 2. Validate authenticated actor binding
+    if user.did != input.actor_did {
+        return Err(AppError::Forbidden(
+            "Authenticated actor does not match input actor_did".into(),
+        ));
+    }
+
+    // 3. Validate actor authority binding
+    let authority_did = access::extract_authority_did(&input.space_uri)?;
+    match input.kind.as_str() {
+        "circle_upsert" | "CircleUpsert" | "circle_delete" | "CircleDelete" | "member_add"
+        | "MemberAdd" => {
+            if input.actor_did != authority_did {
+                return Err(AppError::Forbidden(
+                    "Actor is not authorized for Circle operation: must be authority".into(),
+                ));
+            }
+        }
+        "member_remove" | "MemberRemove" => {
+            let member = input
+                .payload
+                .get("member")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if input.actor_did != authority_did && input.actor_did != member {
+                return Err(AppError::Forbidden(
+                    "Actor is not authorized for member removal: must be authority or member self-removing".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    // 4. Verify Nest client attestation
+    let attestation_opt = headers
+        .get("x-nest-client-attestation")
+        .or_else(|| headers.get("nest-attestation"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            input
+                .payload
+                .get("clientAttestation")
+                .or_else(|| input.payload.get("client_attestation"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+
+    if let Some(attestation) = attestation_opt {
+        auth::verify_nest_client_attestation(&state, &attestation, &state.config.service_did)
+            .await?;
+    } else if !state.config.nest_verifying_keys.is_empty()
+        || state.config.nest_client_id.is_some()
+    {
+        return Err(AppError::Unauthorized(AuthReason::MissingHeader));
+    }
+
+    let payload_digest = projections::compute_payload_digest(
+        &input.operation_id,
+        &input.actor_did,
+        &input.space_uri,
+        &input.kind,
+        &input.payload,
+    );
+
     let projection = input.to_projection()?;
-    projections::apply_projection(&state.db, input.operation_id, projection).await?;
+    projections::apply_projection(
+        &state.db,
+        Some(&state.credential_store),
+        input.operation_id,
+        projection,
+        &payload_digest,
+    )
+    .await?;
 
     Ok(StatusCode::OK)
 }

@@ -2050,18 +2050,30 @@ impl CircleService {
             "payload": op.payload
         });
 
-        let resp = self
+        let attestation = if let Some(provider) = &self.attestation_provider {
+            let appview_aud = "did:web:circles.catbird.blue#atproto_circle";
+            provider.mint(appview_aud).ok()
+        } else {
+            None
+        };
+
+        let mut req = self
             .state
             .http_client
             .post(&projection_url)
             .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json");
+
+        if let Some(att) = &attestation {
+            req = req.header("X-Nest-Client-Attestation", att);
+        }
+
+        let resp = req
             .json(&body)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
             .map_err(|e| ProjectionDeliveryError::Http(e.without_url().to_string()))?;
-
         if resp.status().is_success() {
             Ok(())
         } else {

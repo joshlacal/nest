@@ -51,6 +51,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        nest_client_id: None,
+        nest_verifying_keys: Vec::new(),
     };
 
     let state = AppState::new(config, pool.clone());
@@ -913,6 +915,8 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        nest_client_id: None,
+        nest_verifying_keys: Vec::new(),
     };
     let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
     let app = create_router(app_state);
@@ -956,6 +960,8 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             database_url: "postgres://localhost/postgres".into(),
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
+            nest_client_id: None,
+            nest_verifying_keys: Vec::new(),
         },
         setup.pool.clone(),
         resolver_private,
@@ -995,6 +1001,8 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             database_url: "postgres://localhost/postgres".into(),
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
+            nest_client_id: None,
+            nest_verifying_keys: Vec::new(),
         },
         setup.pool.clone(),
         resolver_mixed,

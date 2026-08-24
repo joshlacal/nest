@@ -82,6 +82,7 @@ pub struct PublicKeyJwk {
     pub y: Option<String>,
 }
 
+#[derive(Debug, Clone)]
 pub enum ParsedVerifyingKey {
     P256(p256::ecdsa::VerifyingKey),
     Secp256k1(k256::ecdsa::VerifyingKey),
@@ -475,6 +476,182 @@ pub fn select_verification_method<'a>(
     }
 
     Err(AuthReason::NoVerificationMethod)
+}
+
+pub fn select_authority_verification_method<'a>(
+    doc: &'a DidDocument,
+    authority_did: &str,
+    kid: Option<&str>,
+) -> Result<&'a VerificationMethod, AuthReason> {
+    if doc.id != authority_did {
+        return Err(AuthReason::IdMismatch);
+    }
+
+    if doc.verification_method.is_empty() {
+        return Err(AuthReason::NoVerificationMethod);
+    }
+
+    let expected_full_space = format!("{authority_did}#atproto_space");
+    let expected_full_atproto = format!("{authority_did}#atproto");
+
+    if let Some(target_kid) = kid {
+        for vm in &doc.verification_method {
+            if (vm.id == target_kid
+                || vm.id.ends_with(target_kid)
+                || (target_kid == "#atproto_space" && vm.id == expected_full_space)
+                || (target_kid == "#atproto" && vm.id == expected_full_atproto))
+                && vm.controller == authority_did
+            {
+                return Ok(vm);
+            }
+        }
+    }
+
+    // Look for #atproto_space first
+    for vm in &doc.verification_method {
+        if (vm.id == "#atproto_space" || vm.id == expected_full_space)
+            && vm.controller == authority_did
+        {
+            return Ok(vm);
+        }
+    }
+
+    // Fallback to #atproto
+    for vm in &doc.verification_method {
+        if (vm.id == "#atproto" || vm.id == expected_full_atproto)
+            && vm.controller == authority_did
+        {
+            return Ok(vm);
+        }
+    }
+
+    Err(AuthReason::NoVerificationMethod)
+}
+
+pub async fn verify_nest_client_attestation(
+    state: &AppState,
+    token: &str,
+    expected_aud: &str,
+) -> Result<String, AppError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Unauthorized(AuthReason::InvalidJwtFormat));
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderEncoding))?;
+    let header: JwtHeader = serde_json::from_slice(&header_bytes)
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
+
+    match &header.typ {
+        Some(t) if t == "JWT" => {}
+        _ => return Err(AppError::Unauthorized(AuthReason::InvalidTyp)),
+    }
+
+    if header.alg != "ES256" {
+        return Err(AppError::Unauthorized(AuthReason::UnsupportedAlg));
+    }
+
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsEncoding))?;
+    let claims: serde_json::Value = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
+
+    let iss = claims
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
+    let sub = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
+    let aud = claims
+        .get("aud")
+        .and_then(|v| v.as_str())
+        .ok_or(AppError::Unauthorized(AuthReason::AudienceMismatch))?;
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .ok_or(AppError::Unauthorized(AuthReason::MissingExp))?;
+    let iat = claims
+        .get("iat")
+        .and_then(|v| v.as_i64())
+        .ok_or(AppError::Unauthorized(AuthReason::MissingIat))?;
+    let jti = claims
+        .get("jti")
+        .and_then(|v| v.as_str())
+        .ok_or(AppError::Unauthorized(AuthReason::MissingJti))?;
+
+    if iss != sub {
+        return Err(AppError::Unauthorized(AuthReason::IdMismatch));
+    }
+
+    if let Some(configured_client_id) = &state.config.nest_client_id {
+        if iss != configured_client_id {
+            return Err(AppError::Unauthorized(AuthReason::IdMismatch));
+        }
+    }
+
+    if aud != expected_aud && aud != state.config.service_did {
+        return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
+    }
+
+    let now = Utc::now().timestamp();
+    if iat > now + 300 {
+        return Err(AppError::Unauthorized(AuthReason::FutureIat));
+    }
+    if exp <= now {
+        return Err(AppError::Unauthorized(AuthReason::Expired));
+    }
+    if exp - iat > 300 {
+        return Err(AppError::Unauthorized(AuthReason::LifetimeExceeded));
+    }
+
+    let exp_dt = DateTime::from_timestamp(exp, 0)
+        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
+
+    // Single-use JTI nonce consumption
+    let is_new = crate::db::consume_jti_nonce(&state.db, jti, iss, aud, exp_dt)
+        .await
+        .map_err(AppError::Database)?;
+    if !is_new {
+        return Err(AppError::Unauthorized(AuthReason::ReplayedJti));
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidSignatureFormat))?;
+
+    let mut verified = false;
+    if !state.config.nest_verifying_keys.is_empty() {
+        for key in &state.config.nest_verifying_keys {
+            if key.verify(signing_input.as_bytes(), &sig_bytes).is_ok() {
+                verified = true;
+                break;
+            }
+        }
+    } else if iss.starts_with("did:") {
+        let doc = state
+            .did_resolver
+            .resolve(iss)
+            .await
+            .map_err(AppError::Unauthorized)?;
+        let vm = select_verification_method(&doc, iss, header.kid.as_deref())
+            .map_err(AppError::Unauthorized)?;
+        let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
+        if key.verify(signing_input.as_bytes(), &sig_bytes).is_ok() {
+            verified = true;
+        }
+    }
+
+    if !verified {
+        return Err(AppError::Unauthorized(AuthReason::BadSignature));
+    }
+
+    Ok(iss.to_string())
 }
 
 pub async fn verify_service_jwt(

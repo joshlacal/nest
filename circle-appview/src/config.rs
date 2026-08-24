@@ -12,6 +12,8 @@ pub struct Config {
     pub database_url: String,
     pub service_did: String,
     pub plc_directory_url: String,
+    pub nest_client_id: Option<String>,
+    pub nest_verifying_keys: Vec<crate::auth::ParsedVerifyingKey>,
 }
 
 impl Config {
@@ -27,6 +29,7 @@ impl Config {
             .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circle".to_string());
         let plc_directory_url = env::var("PLC_DIRECTORY_URL")
             .unwrap_or_else(|_| "https://plc.directory".to_string());
+        let nest_client_id = env::var("NEST_CLIENT_ID").ok();
 
         Ok(Self {
             host,
@@ -34,6 +37,8 @@ impl Config {
             database_url,
             service_did,
             plc_directory_url,
+            nest_client_id,
+            nest_verifying_keys: Vec::new(),
         })
     }
 }
@@ -60,7 +65,7 @@ impl AppState {
             http_client.clone(),
         ));
         let credential_store = Arc::new(CredentialStore::new());
-        let space_client = Arc::new(SpaceClient::new(http_client.clone()));
+        let space_client = Arc::new(SpaceClient::new());
 
         Self {
             config,
@@ -79,7 +84,7 @@ impl AppState {
             .build()
             .unwrap_or_default();
         let credential_store = Arc::new(CredentialStore::new());
-        let space_client = Arc::new(SpaceClient::new(http_client.clone()));
+        let space_client = Arc::new(SpaceClient::new());
 
         Self {
             config,
