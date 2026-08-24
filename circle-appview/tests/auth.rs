@@ -1165,8 +1165,29 @@ async fn run_production_pinned_client_tls_fixture() {
     assert_eq!(direct_resp.status(), StatusCode::OK);
 }
 
+const PROXY_SUBPROCESS_CANARY: &str = "CANARY_PROXY_SUBPROCESS_EXECUTED_89f7a2d1";
+const POISONED_PROXY_URL: &str = "http://invalid-unreachable-proxy.example.local:9999";
+
 #[tokio::test]
+#[ignore = "Subprocess helper executed exclusively by production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_rejects_redirects"]
 async fn production_pinned_client_builder_proxy_subprocess_helper() {
+    assert_eq!(
+        std::env::var("HTTPS_PROXY").ok().as_deref(),
+        Some(POISONED_PROXY_URL),
+        "HTTPS_PROXY must be poisoned in subprocess"
+    );
+    assert_eq!(
+        std::env::var("HTTP_PROXY").ok().as_deref(),
+        Some(POISONED_PROXY_URL),
+        "HTTP_PROXY must be poisoned in subprocess"
+    );
+    assert_eq!(
+        std::env::var("ALL_PROXY").ok().as_deref(),
+        Some(POISONED_PROXY_URL),
+        "ALL_PROXY must be poisoned in subprocess"
+    );
+
+    println!("{}", PROXY_SUBPROCESS_CANARY);
     run_production_pinned_client_tls_fixture().await;
 }
 
@@ -1182,27 +1203,27 @@ async fn production_pinned_client_builder_enforces_tls_pinning_no_proxy_and_reje
     let output = std::process::Command::new(current_exe)
         .arg("production_pinned_client_builder_proxy_subprocess_helper")
         .arg("--exact")
+        .arg("--ignored")
         .arg("--nocapture")
-        .env(
-            "HTTPS_PROXY",
-            "http://invalid-unreachable-proxy.example.local:9999",
-        )
-        .env(
-            "HTTP_PROXY",
-            "http://invalid-unreachable-proxy.example.local:9999",
-        )
-        .env(
-            "ALL_PROXY",
-            "http://invalid-unreachable-proxy.example.local:9999",
-        )
+        .env("HTTPS_PROXY", POISONED_PROXY_URL)
+        .env("HTTP_PROXY", POISONED_PROXY_URL)
+        .env("ALL_PROXY", POISONED_PROXY_URL)
         .output()
         .expect("Failed to execute proxy isolation test subprocess");
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
         "Subprocess failed to run with invalid proxy env (no_proxy must bypass invalid proxies):\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains(PROXY_SUBPROCESS_CANARY),
+        "Subprocess did not emit the required execution canary (filter did not run helper):\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
     );
 
     // 3. Verify parent process environment was never mutated
