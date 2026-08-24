@@ -67,6 +67,11 @@ impl ProjectionDeliveryError {
         }
     }
 }
+
+/// Check if an HTTP status code represents a retryable / indeterminate XRPC error.
+pub fn is_retryable_status(status: u16) -> bool {
+    status >= 500 || status == 408 || status == 425 || status == 429
+}
 /// Circle orchestration service.
 #[derive(Clone)]
 pub struct CircleService {
@@ -202,6 +207,14 @@ impl CircleService {
                 "Initial members count must not exceed 150".into(),
             ));
         }
+        let mut seen_members = std::collections::HashSet::with_capacity(input.member_dids.len());
+        for member_did in &input.member_dids {
+            if !seen_members.insert(member_did.as_str()) {
+                return Err(CircleError::InvalidRequest(
+                    format!("Duplicate member DID in initial members list: {}", member_did),
+                ));
+            }
+        }
 
         let req_id = Uuid::new_v4().to_string();
         let atproto = AtProtoClient::new(self.state.clone());
@@ -277,11 +290,11 @@ impl CircleService {
         };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
-        if status >= 500 {
+        if is_retryable_status(status) {
             let err_text = String::from_utf8_lossy(&body_bytes);
             self.record_indeterminate_transport_error(
                 upsert_op_id,
-                &format!("createSpace returned server error ({status}): {err_text}"),
+                &format!("createSpace returned server/retryable error ({status}): {err_text}"),
                 upsert_claim_token,
             )
             .await;
@@ -355,11 +368,11 @@ impl CircleService {
         };
 
         let (meta_status, meta_body) = self.extract_response_body(meta_resp).await?;
-        if meta_status >= 500 {
+        if is_retryable_status(meta_status) {
             let err_text = String::from_utf8_lossy(&meta_body);
             self.record_indeterminate_transport_error(
                 upsert_op_id,
-                &format!("putRecord metadata returned server error ({meta_status}): {err_text}"),
+                &format!("putRecord metadata returned server/retryable error ({meta_status}): {err_text}"),
                 upsert_claim_token,
             )
             .await;
@@ -383,7 +396,8 @@ impl CircleService {
 
         // 4. Add initial members to Space at PDS, tracking each outcome durably
         let mut successful_member_ops = Vec::new();
-        let mut member_partial_failure = false;
+        let mut has_terminal_member_failure = false;
+        let mut has_indeterminate_member = false;
 
         for member_did in &input.member_dids {
             let member_payload = serde_json::json!({
@@ -402,7 +416,30 @@ impl CircleService {
                 )
                 .await?;
 
-            let member_claim_token = self.claim_projection(member_op_id, &session.id.to_string()).await?;
+            let maybe_claim = self.claim_projection(member_op_id, &session.id.to_string()).await?;
+            let member_claim_token = match maybe_claim {
+                Some(token) => token,
+                None => {
+                    // Re-use persisted state without executing unfenced PDS mutations
+                    let (claimed_state, _): (String, Option<String>) = if let Some(pool) = &self.db {
+                        sqlx::query_as("SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1")
+                            .bind(member_op_id)
+                            .fetch_one(pool)
+                            .await
+                            .unwrap_or_else(|_| ("executing".into(), None))
+                    } else {
+                        ("executing".into(), None)
+                    };
+                    if claimed_state == "pending" || claimed_state == "delivered" {
+                        successful_member_ops.push(member_op_id);
+                    } else if claimed_state == "failed" {
+                        has_terminal_member_failure = true;
+                    } else {
+                        has_indeterminate_member = true;
+                    }
+                    continue;
+                }
+            };
 
             let add_member_body = serde_json::json!({
                 "space": &space_uri,
@@ -425,21 +462,21 @@ impl CircleService {
                 )
                 .await;
 
-            let add_succeeded = match add_resp {
+            match add_resp {
                 Ok(resp) => {
                     let (add_status, body) = self.extract_response_body(resp).await?;
                     if (200..300).contains(&add_status) {
-                        self.set_projection_state(member_op_id, CircleProjectionState::Pending, None, member_claim_token).await?;
-                        true
-                    } else if add_status >= 500 {
+                        self.set_projection_state(member_op_id, CircleProjectionState::Pending, None, Some(member_claim_token)).await?;
+                        successful_member_ops.push(member_op_id);
+                    } else if is_retryable_status(add_status) {
                         let err_text = String::from_utf8_lossy(&body);
                         self.record_indeterminate_transport_error(
                             member_op_id,
-                            &format!("PDS server error ({add_status}): {err_text}"),
-                            member_claim_token,
+                            &format!("PDS server/retryable error ({add_status}): {err_text}"),
+                            Some(member_claim_token),
                         )
                         .await;
-                        false
+                        has_indeterminate_member = true;
                     } else {
                         let err_text = String::from_utf8_lossy(&body);
                         let _ = self
@@ -447,41 +484,36 @@ impl CircleService {
                                 member_op_id,
                                 CircleProjectionState::Failed,
                                 Some(&format!("PDS error ({add_status}): {err_text}")),
-                                member_claim_token,
+                                Some(member_claim_token),
                             )
                             .await;
-                        false
+                        has_terminal_member_failure = true;
+                        tracing::warn!(request_id = %req_id, "Initial member addition deterministically failed at PDS");
                     }
                 }
                 Err(e) => {
                     self.record_indeterminate_transport_error(
                         member_op_id,
                         &format!("Network error: {e}"),
-                        member_claim_token,
+                        Some(member_claim_token),
                     )
                     .await;
-                    false
+                    has_indeterminate_member = true;
                 }
-            };
-            if add_succeeded {
-                successful_member_ops.push(member_op_id);
-            } else {
-                member_partial_failure = true;
-                tracing::warn!(request_id = %req_id, "Initial member addition failed at PDS");
             }
         }
         // 5. Try immediate delivery of all due projections
         let upsert_delivered = self.deliver_projection_by_id(upsert_op_id, Some(session)).await;
         let mut all_members_delivered = true;
-        for member_op_id in successful_member_ops {
-            if !self.deliver_projection_by_id(member_op_id, Some(session)).await {
+        for member_op_id in &successful_member_ops {
+            if !self.deliver_projection_by_id(*member_op_id, Some(session)).await {
                 all_members_delivered = false;
             }
         }
 
-        let is_complete = upsert_delivered && all_members_delivered;
+        let is_complete = upsert_delivered && all_members_delivered && !has_indeterminate_member && !has_terminal_member_failure;
 
-        let status = if member_partial_failure {
+        let status = if has_terminal_member_failure {
             OperationStatus::Failed
         } else if is_complete {
             OperationStatus::Complete
@@ -493,7 +525,7 @@ impl CircleService {
             id: upsert_op_id.to_string().into(),
             status,
             space: Some(space_ref),
-            error: if member_partial_failure {
+            error: if has_terminal_member_failure {
                 Some("MemberAdditionPartialFailure".into())
             } else {
                 None
@@ -713,11 +745,11 @@ impl CircleService {
         };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
-        if status >= 500 {
+        if is_retryable_status(status) {
             let err_text = String::from_utf8_lossy(&body_bytes);
             self.record_indeterminate_transport_error(
                 op_id,
-                &format!("PDS operation returned server error ({status}): {err_text}"),
+                &format!("PDS operation returned server/retryable error ({status}): {err_text}"),
                 Some(claim_token),
             )
             .await;
@@ -903,11 +935,11 @@ impl CircleService {
         };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
-        if status >= 500 {
+        if is_retryable_status(status) {
             let err_text = String::from_utf8_lossy(&body_bytes);
             self.record_indeterminate_transport_error(
                 op_id,
-                &format!("deleteSpace returned server error ({status}): {err_text}"),
+                &format!("deleteSpace returned server/retryable error ({status}): {err_text}"),
                 Some(claim_token),
             )
             .await;
@@ -1661,18 +1693,18 @@ impl CircleService {
                                     let err_text = String::from_utf8_lossy(&body);
                                     if err_text.to_lowercase().contains("already exists") || status == 409 {
                                         true
-                                    } else if (400..500).contains(&status) {
-                                        let _ = self.set_projection_state(
+                                    } else if is_retryable_status(status) {
+                                        self.record_indeterminate_transport_error(
                                             op.id,
-                                            CircleProjectionState::Failed,
-                                            Some(&format!("Reconciliation createSpace error ({status}): {err_text}")),
+                                            &format!("Reconciliation createSpace server/retryable error ({status}): {err_text}"),
                                             Some(claim_token),
                                         ).await;
                                         false
                                     } else {
-                                        self.record_indeterminate_transport_error(
+                                        let _ = self.set_projection_state(
                                             op.id,
-                                            &format!("Reconciliation createSpace server error ({status}): {err_text}"),
+                                            CircleProjectionState::Failed,
+                                            Some(&format!("Reconciliation createSpace error ({status}): {err_text}")),
                                             Some(claim_token),
                                         ).await;
                                         false
@@ -1723,19 +1755,19 @@ impl CircleService {
                                             if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
                                                 reconciled_count += 1;
                                             }
-                                        } else if (400..500).contains(&status) {
+                                        } else if is_retryable_status(status) {
+                                            let err_text = String::from_utf8_lossy(&body);
+                                            self.record_indeterminate_transport_error(
+                                                op.id,
+                                                &format!("Reconciliation putRecord server/retryable error ({status}): {err_text}"),
+                                                Some(claim_token),
+                                            ).await;
+                                        } else {
                                             let err_text = String::from_utf8_lossy(&body);
                                             let _ = self.set_projection_state(
                                                 op.id,
                                                 CircleProjectionState::Failed,
                                                 Some(&format!("Reconciliation putRecord error ({status}): {err_text}")),
-                                                Some(claim_token),
-                                            ).await;
-                                        } else {
-                                            let err_text = String::from_utf8_lossy(&body);
-                                            self.record_indeterminate_transport_error(
-                                                op.id,
-                                                &format!("Reconciliation putRecord server error ({status}): {err_text}"),
                                                 Some(claim_token),
                                             ).await;
                                         }
@@ -1778,17 +1810,17 @@ impl CircleService {
                                     if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
                                         reconciled_count += 1;
                                     }
-                                } else if (400..500).contains(&status) {
+                                } else if is_retryable_status(status) {
+                                    self.record_indeterminate_transport_error(
+                                        op.id,
+                                        &format!("Reconciliation addMember server/retryable error ({status}): {body_text}"),
+                                        Some(claim_token),
+                                    ).await;
+                                } else {
                                     let _ = self.set_projection_state(
                                         op.id,
                                         CircleProjectionState::Failed,
                                         Some(&format!("Reconciliation addMember error ({status}): {body_text}")),
-                                        Some(claim_token),
-                                    ).await;
-                                } else {
-                                    self.record_indeterminate_transport_error(
-                                        op.id,
-                                        &format!("Reconciliation addMember server error ({status}): {body_text}"),
                                         Some(claim_token),
                                     ).await;
                                 }
@@ -1829,17 +1861,17 @@ impl CircleService {
                                     if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
                                         reconciled_count += 1;
                                     }
-                                } else if (400..500).contains(&status) {
+                                } else if is_retryable_status(status) {
+                                    self.record_indeterminate_transport_error(
+                                        op.id,
+                                        &format!("Reconciliation removeMember server/retryable error ({status}): {body_text}"),
+                                        Some(claim_token),
+                                    ).await;
+                                } else {
                                     let _ = self.set_projection_state(
                                         op.id,
                                         CircleProjectionState::Failed,
                                         Some(&format!("Reconciliation removeMember error ({status}): {body_text}")),
-                                        Some(claim_token),
-                                    ).await;
-                                } else {
-                                    self.record_indeterminate_transport_error(
-                                        op.id,
-                                        &format!("Reconciliation removeMember server error ({status}): {body_text}"),
                                         Some(claim_token),
                                     ).await;
                                 }
@@ -1878,17 +1910,17 @@ impl CircleService {
                                     if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
                                         reconciled_count += 1;
                                     }
-                                } else if (400..500).contains(&status) {
+                                } else if is_retryable_status(status) {
+                                    self.record_indeterminate_transport_error(
+                                        op.id,
+                                        &format!("Reconciliation deleteSpace server/retryable error ({status}): {body_text}"),
+                                        Some(claim_token),
+                                    ).await;
+                                } else {
                                     let _ = self.set_projection_state(
                                         op.id,
                                         CircleProjectionState::Failed,
                                         Some(&format!("Reconciliation deleteSpace error ({status}): {body_text}")),
-                                        Some(claim_token),
-                                    ).await;
-                                } else {
-                                    self.record_indeterminate_transport_error(
-                                        op.id,
-                                        &format!("Reconciliation deleteSpace server error ({status}): {body_text}"),
                                         Some(claim_token),
                                     ).await;
                                 }

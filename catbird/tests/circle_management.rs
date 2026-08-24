@@ -694,6 +694,15 @@ async fn bounds_validation_rejects_oversized_inputs(pool: PgPool) {
     };
     let res = env.service.create_circle(&env.session, too_many).await;
     assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
+
+    // 4. Duplicate initial member DIDs
+    let duplicate_members = CreateCircle {
+        name: "Duplicates".into(),
+        member_dids: vec![bob(), bob()],
+        extra_data: None,
+    };
+    let res = env.service.create_circle(&env.session, duplicate_members).await;
+    assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1684,6 +1693,119 @@ async fn initial_member_mutation_5xx_stays_executing_4xx_marks_failed(pool: PgPo
     .unwrap();
     assert_eq!(carol_row.0, "failed");
     assert!(carol_row.1.unwrap().contains("400"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn initial_member_indeterminate_503_returns_pending_status(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    env._pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/blue.catbird.circle.getCapabilities"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "enabled": true,
+            "protocolRevision": 1
+        })))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-members-pending"
+        })))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self"
+        })))
+        .mount(&env._pds)
+        .await;
+
+    // Member (bob): 503 Service Unavailable (indeterminate server error)
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:bob"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("PDS Overloaded"))
+        .mount(&env._pds)
+        .await;
+
+    let req = catbird_atproto::generated::blue_catbird::circle::create_circle::CreateCircle {
+        name: "Pending Member Circle".into(),
+        member_dids: vec![bob()],
+        extra_data: Default::default(),
+    };
+
+    let res = env.service.create_circle(&env.session, req).await;
+    assert!(res.is_ok());
+    let op = res.unwrap();
+    // Crucial: Indeterminate outcome means parent status is Pending, NOT Failed!
+    assert_eq!(op.status, catbird_atproto::generated::blue_catbird::circle::defs::OperationStatus::Pending);
+    assert!(op.error.is_none());
+
+    let bob_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error_code FROM circle_projection_outbox WHERE payload->>'member' = 'did:plc:bob'"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bob_row.0, "executing");
+    assert!(bob_row.1.unwrap().contains("503"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciliation_treats_408_425_429_as_retryable_stays_executing(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    let add_op_id = env.service
+        .enqueue_projection(
+            "did:plc:alice",
+            &env.session.id.to_string(),
+            space().as_str(),
+            catbird::models::CircleProjectionKind::MemberAdd,
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            catbird::models::CircleProjectionState::Intent,
+        )
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE circle_projection_outbox SET state = 'executing', execution_started_at = now() - interval '60 seconds' WHERE id = $1"
+    )
+    .bind(add_op_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Mock PDS to return 429 Too Many Requests
+    env._pds.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("Rate Limit Exceeded"))
+        .mount(&env._pds)
+        .await;
+
+    let reconciled = env.service.reconcile_stale_projections(10).await.unwrap();
+    assert_eq!(reconciled, 0);
+
+    // Verify row stays in 'executing' and records retryable error, NOT transitioned to 'failed'
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(add_op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "executing");
+    assert!(row.1.unwrap().contains("429"));
 }
 
 #[sqlx::test(migrations = "./migrations")]

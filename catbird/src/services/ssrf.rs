@@ -232,7 +232,7 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     }
 
     // Benchmarking: 2001:2::/48 (RFC 5180, RFC 8218)
-    if segments[0] == 0x2001 && segments[1] == 0x0002 {
+    if segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000 {
         return true;
     }
 
@@ -241,8 +241,8 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
         return true;
     }
 
-    // Discard-Only Address Block: 100::/64 (RFC 6666)
-    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+    // Discard-Only Address Block: 100::/64 (RFC 6666) and Dummy IPv6 Prefix: 100:0:0:1::/64 (RFC 8504)
+    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && (segments[3] == 0 || segments[3] == 1) {
         return true;
     }
 
@@ -264,6 +264,11 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
 
     // 6to4: 2002::/16
     if segments[0] == 0x2002 {
+        return true;
+    }
+
+    // Segment Routing over IPv6 (SRv6) SIDs: 5f00::/16 (RFC 9602)
+    if segments[0] == 0x5f00 {
         return true;
     }
 
@@ -360,9 +365,10 @@ mod tests {
         // IPv6 Documentation: 2001:db8::/32
         assert!(validate_pds_url("https://[2001:db8::1]").is_err());
 
-        // IPv6 Discard prefix: 100::/64
+        // IPv6 Discard prefix: 100::/64 and Dummy IPv6 prefix: 100:0:0:1::/64
         assert!(validate_pds_url("https://[100::1]").is_err());
-
+        assert!(validate_pds_url("https://[100:0:0:1::1]").is_err());
+        assert!(validate_pds_url("https://[100:0:0:2::1]").is_ok());
         // IPv6 IPv4-translated: 64:ff9b::/96
         assert!(validate_pds_url("https://[64:ff9b::1]").is_err());
 
@@ -374,10 +380,15 @@ mod tests {
 
         // IPv6 Benchmarking: 2001:2::/48 (RFC 5180)
         assert!(validate_pds_url("https://[2001:2::]").is_err()); // start
-        assert!(validate_pds_url("https://[2001:2:ffff:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
+        assert!(validate_pds_url("https://[2001:2:0:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
+        assert!(validate_pds_url("https://[2001:2:1::]").is_ok()); // outside
         assert!(validate_pds_url("https://[2001:1:ffff:ffff:ffff:ffff:ffff:ffff]").is_ok()); // outside
         assert!(validate_pds_url("https://[2001:3::]").is_ok()); // outside
 
+        // IPv6 SRv6 SIDs: 5f00::/16 (RFC 9602)
+        assert!(validate_pds_url("https://[5f00::1]").is_err());
+        assert!(validate_pds_url("https://[5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff]").is_err());
+        assert!(validate_pds_url("https://[5f01::1]").is_ok());
         // IPv6 Deprecated Site-Local: fec0::/10 (RFC 3879)
         assert!(validate_pds_url("https://[fec0::]").is_err()); // start
         assert!(validate_pds_url("https://[feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
