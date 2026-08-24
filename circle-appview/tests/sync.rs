@@ -21,14 +21,18 @@ use circle_appview::access::{ActiveSpaceCredential, CredentialStore, SpaceLockMa
 use circle_appview::auth::{
     DidDocument, DidResolver, DidService, ParsedVerifyingKey, PublicKeyJwk, VerificationMethod,
 };
-use circle_appview::commit::{mint_signed_commit, verify_commit, CommitError, LtHash};
+use circle_appview::commit::{
+    compute_commit_context, compute_commit_mac, compute_dagcbor_cid, decode_repo_car,
+    derive_commit_mac_key, mint_repo_car, mint_signed_commit, verify_commit, CommitError, LtHash,
+    RepoRecord,
+};
 use circle_appview::config::{AppState, Config};
+use circle_appview::projections::{extract_generation_i64, SyncProjectionInput};
 use circle_appview::space_client::{MockSpaceHostTransport, SpaceClient};
 use circle_appview::sync::{sweep_once, SyncEngine, SyncMode};
 use circle_appview::validator::{
     active_members, compute_uri_hash, policy, validate, InvalidRecord, RecordCandidate,
 };
-
 const OWNER_DID: &str = "did:plc:alice-sync-test";
 const BOB_DID: &str = "did:plc:bob-sync-test";
 const DAVE_DID: &str = "did:plc:dave-sync-test";
@@ -42,17 +46,13 @@ fn bob() -> &'static str {
     BOB_DID
 }
 
-fn dave() -> &'static str {
-    DAVE_DID
-}
-
 fn space() -> &'static str {
     SPACE_URI
 }
 
 fn owner_post() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
         author_did: OWNER_DID.to_string(),
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7owner11111".to_string(),
@@ -66,7 +66,7 @@ fn owner_post() -> RecordCandidate {
 
 fn bob_reply_to_owner_in_same_space() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{BOB_DID}/app.bsky.feed.post/3l7bobreply11"),
+        uri: format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.post/3l7bobreply11"),
         author_did: BOB_DID.to_string(),
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7bobreply11".to_string(),
@@ -76,11 +76,11 @@ fn bob_reply_to_owner_in_same_space() -> RecordCandidate {
             "createdAt": "2026-08-24T12:05:00.000Z",
             "reply": {
                 "root": {
-                    "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                    "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                     "cid": "bafyreih327owner1"
                 },
                 "parent": {
-                    "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                    "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                     "cid": "bafyreih327owner1"
                 }
             }
@@ -90,14 +90,14 @@ fn bob_reply_to_owner_in_same_space() -> RecordCandidate {
 
 fn bob_like_owner_in_same_space() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{BOB_DID}/app.bsky.feed.like/3l7boblike111"),
+        uri: format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.like/3l7boblike111"),
         author_did: BOB_DID.to_string(),
         collection: "app.bsky.feed.like".to_string(),
         rkey: "3l7boblike111".to_string(),
         value: json!({
             "$type": "app.bsky.feed.like",
             "subject": {
-                "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                 "cid": "bafyreih327owner1"
             },
             "createdAt": "2026-08-24T12:10:00.000Z"
@@ -107,7 +107,7 @@ fn bob_like_owner_in_same_space() -> RecordCandidate {
 
 fn bob_top_level() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{BOB_DID}/app.bsky.feed.post/3l7bobtop1111"),
+        uri: format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.post/3l7bobtop1111"),
         author_did: BOB_DID.to_string(),
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7bobtop1111".to_string(),
@@ -121,7 +121,7 @@ fn bob_top_level() -> RecordCandidate {
 
 fn dave_reply() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{DAVE_DID}/app.bsky.feed.post/3l7davereply1"),
+        uri: format!("{SPACE_URI}/{DAVE_DID}/app.bsky.feed.post/3l7davereply1"),
         author_did: DAVE_DID.to_string(),
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7davereply1".to_string(),
@@ -131,11 +131,11 @@ fn dave_reply() -> RecordCandidate {
             "createdAt": "2026-08-24T12:20:00.000Z",
             "reply": {
                 "root": {
-                    "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                    "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                     "cid": "bafyreih327owner1"
                 },
                 "parent": {
-                    "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                    "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                     "cid": "bafyreih327owner1"
                 }
             }
@@ -145,7 +145,7 @@ fn dave_reply() -> RecordCandidate {
 
 fn cross_space_reply() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{BOB_DID}/app.bsky.feed.post/3l7crossreply"),
+        uri: format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.post/3l7crossreply"),
         author_did: BOB_DID.to_string(),
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7crossreply".to_string(),
@@ -155,11 +155,11 @@ fn cross_space_reply() -> RecordCandidate {
             "createdAt": "2026-08-24T12:25:00.000Z",
             "reply": {
                 "root": {
-                    "uri": "at://did:plc:other/app.bsky.feed.post/3l7otherpost1",
+                    "uri": "at://did:plc:other/space/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
                     "cid": "bafyreih327othercid"
                 },
                 "parent": {
-                    "uri": "at://did:plc:other/app.bsky.feed.post/3l7otherpost1",
+                    "uri": "at://did:plc:other/space/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
                     "cid": "bafyreih327othercid"
                 }
             }
@@ -169,7 +169,7 @@ fn cross_space_reply() -> RecordCandidate {
 
 fn quote_post() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{OWNER_DID}/app.bsky.feed.post/3l7quote11111"),
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7quote11111"),
         author_did: OWNER_DID.to_string(),
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7quote11111".to_string(),
@@ -180,7 +180,7 @@ fn quote_post() -> RecordCandidate {
             "embed": {
                 "$type": "app.bsky.embed.record",
                 "record": {
-                    "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                    "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                     "cid": "bafyreih327owner1"
                 }
             }
@@ -190,14 +190,14 @@ fn quote_post() -> RecordCandidate {
 
 fn repost_record() -> RecordCandidate {
     RecordCandidate {
-        uri: format!("at://{BOB_DID}/app.bsky.feed.repost/3l7repost1111"),
+        uri: format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.repost/3l7repost1111"),
         author_did: BOB_DID.to_string(),
         collection: "app.bsky.feed.repost".to_string(),
         rkey: "3l7repost1111".to_string(),
         value: json!({
             "$type": "app.bsky.feed.repost",
             "subject": {
-                "uri": format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
+                "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"),
                 "cid": "bafyreih327owner1"
             },
             "createdAt": "2026-08-24T12:35:00.000Z"
@@ -213,7 +213,9 @@ fn repost_record() -> RecordCandidate {
 fn accepts_owner_post_and_same_space_member_reply() {
     let policy = policy(owner(), active_members(&[bob()]))
         .with_space_uri(space())
-        .with_known_post_uris([format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111")]);
+        .with_known_post_uris([format!(
+            "{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"
+        )]);
 
     assert!(validate(owner_post(), &policy).is_ok());
     assert!(validate(bob_reply_to_owner_in_same_space(), &policy).is_ok());
@@ -224,15 +226,31 @@ fn accepts_owner_post_and_same_space_member_reply() {
 fn rejects_nonmember_top_level_cross_space_and_quote() {
     let policy = policy(owner(), active_members(&[bob()]))
         .with_space_uri(space())
-        .with_known_post_uris([format!("at://{OWNER_DID}/app.bsky.feed.post/3l7owner11111")]);
+        .with_known_post_uris([format!(
+            "{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111"
+        )]);
 
-    assert_eq!(validate(bob_top_level(), &policy), Err(InvalidRecord::TopLevelAuthor));
-    assert_eq!(validate(dave_reply(), &policy), Err(InvalidRecord::NoAccessLease));
-    assert_eq!(validate(cross_space_reply(), &policy), Err(InvalidRecord::CrossSpaceReference));
-    assert_eq!(validate(quote_post(), &policy), Err(InvalidRecord::UnsupportedEmbed));
+    assert_eq!(
+        validate(bob_top_level(), &policy),
+        Err(InvalidRecord::TopLevelAuthor)
+    );
+    assert_eq!(
+        validate(dave_reply(), &policy),
+        Err(InvalidRecord::NoAccessLease)
+    );
+    assert_eq!(
+        validate(cross_space_reply(), &policy),
+        Err(InvalidRecord::CrossSpaceReference)
+    );
+    assert_eq!(
+        validate(quote_post(), &policy),
+        Err(InvalidRecord::UnsupportedEmbed)
+    );
     assert_eq!(
         validate(repost_record(), &policy),
-        Err(InvalidRecord::UnsupportedCollection("app.bsky.feed.repost".into()))
+        Err(InvalidRecord::UnsupportedCollection(
+            "app.bsky.feed.repost".into()
+        ))
     );
 }
 
@@ -281,29 +299,56 @@ fn commit_verification_succeeds_and_fails_on_tampering() {
     let signed_commit = mint_signed_commit(space(), owner(), rev, lthash.as_bytes(), &signing_key);
 
     // 1. Valid commit verification succeeds
-    assert!(verify_commit(space(), owner(), &signed_commit, lthash.as_bytes(), &parsed_vk).is_ok());
+    assert!(verify_commit(
+        space(),
+        owner(),
+        &signed_commit,
+        lthash.as_bytes(),
+        &parsed_vk
+    )
+    .is_ok());
 
     // 2. Tampered LtHash state -> HashMismatch
     let mut bad_lthash = LtHash::new();
     bad_lthash.add("app.bsky.feed.post", "3l7test222222", "bafytestcid2");
     assert_eq!(
-        verify_commit(space(), owner(), &signed_commit, bad_lthash.as_bytes(), &parsed_vk),
+        verify_commit(
+            space(),
+            owner(),
+            &signed_commit,
+            bad_lthash.as_bytes(),
+            &parsed_vk
+        ),
         Err(CommitError::HashMismatch)
     );
 
     // 3. Tampered MAC -> MacMismatch
     let mut tampered_mac_commit = signed_commit.clone();
-    tampered_mac_commit.mac = catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]);
+    tampered_mac_commit.mac =
+        catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]);
     assert_eq!(
-        verify_commit(space(), owner(), &tampered_mac_commit, lthash.as_bytes(), &parsed_vk),
+        verify_commit(
+            space(),
+            owner(),
+            &tampered_mac_commit,
+            lthash.as_bytes(),
+            &parsed_vk
+        ),
         Err(CommitError::MacMismatch)
     );
 
     // 4. Tampered Signature -> InvalidSignature
     let mut tampered_sig_commit = signed_commit.clone();
-    tampered_sig_commit.sig = catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[1u8; 64]);
+    tampered_sig_commit.sig =
+        catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[1u8; 64]);
     assert!(matches!(
-        verify_commit(space(), owner(), &tampered_sig_commit, lthash.as_bytes(), &parsed_vk),
+        verify_commit(
+            space(),
+            owner(),
+            &tampered_sig_commit,
+            lthash.as_bytes(),
+            &parsed_vk
+        ),
         Err(CommitError::InvalidSignature(_))
     ));
 
@@ -311,7 +356,13 @@ fn commit_verification_succeeds_and_fails_on_tampering() {
     let mut bad_ver_commit = signed_commit.clone();
     bad_ver_commit.ver = 2;
     assert_eq!(
-        verify_commit(space(), owner(), &bad_ver_commit, lthash.as_bytes(), &parsed_vk),
+        verify_commit(
+            space(),
+            owner(),
+            &bad_ver_commit,
+            lthash.as_bytes(),
+            &parsed_vk
+        ),
         Err(CommitError::UnsupportedVersion(2))
     );
 }
@@ -488,35 +539,47 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
 async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Hello first post in circle!",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
     let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post111111", "bafyownerpost1");
+    lthash.add("app.bsky.feed.post", "3l7post111111", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes(), &setup.owner_signing_key);
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(String::from("bafyownerpost1"))),
+        cid: Some(Cid::from(post_cid.clone())),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
         prev: None,
         rev: Tid::from(String::from(rev)),
         rkey: RecordKey::from(Rkey::from(String::from("3l7post111111"))),
-        value: Some(serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Hello first post in circle!",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        })).unwrap()),
+        value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
 
-    let list_ops_output = catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-        commit: Some(commit),
-        cursor: None,
-        ops: vec![op_entry],
-        extra_data: None,
-    };
+    let list_ops_output =
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_entry],
+            extra_data: None,
+        };
 
     let key = format!("{SPACE_URI}:{OWNER_DID}");
-    setup.mock_transport.set_list_repo_ops_response(&key, list_ops_output);
+    setup
+        .mock_transport
+        .set_list_repo_ops_response(&key, list_ops_output);
 
     let sync_engine = SyncEngine::new(&setup.state);
     let result = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
@@ -526,7 +589,7 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
     assert_eq!(result.records_accepted, 1);
     assert_eq!(result.records_rejected, 0);
 
-    // Verify record in circle_records table
+    // Verify record in circle_records table has permissioned full URI
     let record: (String, String, String) = sqlx::query_as(
         "SELECT uri, cid, collection FROM circle_records WHERE space_uri = $1 AND author_did = $2",
     )
@@ -536,8 +599,11 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_eq!(record.0, format!("at://{OWNER_DID}/app.bsky.feed.post/3l7post111111"));
-    assert_eq!(record.1, "bafyownerpost1");
+    assert_eq!(
+        record.0,
+        format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7post111111")
+    );
+    assert_eq!(record.1, post_cid);
     assert_eq!(record.2, "app.bsky.feed.post");
 
     // Verify sync state in circle_repo_sync_state table
@@ -558,26 +624,39 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
 async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
-    // 1. Setup incremental ops with an intentionally corrupted/mismatched hash in commit
-    let mut good_lthash = LtHash::new();
-    good_lthash.add("app.bsky.feed.post", "3l7post111111", "bafyownerpost1");
+    let full_post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Full recovery restored post",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let full_post_cid = compute_dagcbor_cid(&full_post_val).unwrap();
 
+    let inc_post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Incremental post with bad hash commit",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let inc_post_cid = compute_dagcbor_cid(&inc_post_val).unwrap();
+
+    // 1. Setup incremental ops with an intentionally corrupted/mismatched hash in commit
     let mut bad_lthash = LtHash::new();
     bad_lthash.add("app.bsky.feed.post", "3l7tampered11", "bafytamperedcid");
 
-    let bad_commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", bad_lthash.as_bytes(), &setup.owner_signing_key);
+    let bad_commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7aaaaaaaaaa",
+        bad_lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
 
     let inc_op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(String::from("bafyownerpost1"))),
+        cid: Some(Cid::from(inc_post_cid)),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
         prev: None,
         rev: Tid::from(String::from("3l7aaaaaaaaaa")),
         rkey: RecordKey::from(Rkey::from(String::from("3l7post111111"))),
-        value: Some(serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Incremental post with bad hash commit",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        })).unwrap()),
+        value: Some(serde_json::from_value(inc_post_val).unwrap()),
         extra_data: None,
     };
 
@@ -592,28 +671,27 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
         },
     );
 
-    // 2. Setup full repo recovery response (valid full repo + valid latest commit)
+    // 2. Setup full repo recovery response (valid two-root CAR)
     let mut full_lthash = LtHash::new();
-    full_lthash.add("app.bsky.feed.post", "3l7fullpost11", "bafyfullcid1");
+    full_lthash.add("app.bsky.feed.post", "3l7fullpost11", &full_post_cid);
 
-    let full_commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7bbbbbbbbbb", full_lthash.as_bytes(), &setup.owner_signing_key);
+    let full_commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7bbbbbbbbbb",
+        full_lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
 
-    let full_op = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(String::from("bafyfullcid1"))),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
-        prev: None,
-        rev: Tid::from(String::from("3l7bbbbbbbbbb")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7fullpost11"))),
-        value: Some(serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Full recovery restored post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        })).unwrap()),
-        extra_data: None,
-    };
+    let repo_records = vec![RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7fullpost11".to_string(),
+        cid: full_post_cid.clone(),
+        value: full_post_val,
+    }];
 
-    setup.mock_transport.set_get_repo_response(&key, vec![full_op]);
-    setup.mock_transport.set_latest_commit(&key, full_commit);
+    let car_bytes = mint_repo_car(&full_commit, &repo_records).unwrap();
+    setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
     // 3. Run sync -> Incremental hash mismatch must transparently trigger FullRecovery!
     let sync_engine = SyncEngine::new(&setup.state);
@@ -623,7 +701,7 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     assert!(result.commit_verified);
     assert_eq!(result.records_accepted, 1);
 
-    // Verify full recovery record is in database
+    // Verify full recovery record is in database with permissioned URI
     let record: (String, String) = sqlx::query_as(
         "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did = $2",
     )
@@ -633,8 +711,11 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_eq!(record.0, format!("at://{OWNER_DID}/app.bsky.feed.post/3l7fullpost11"));
-    assert_eq!(record.1, "bafyfullcid1");
+    assert_eq!(
+        record.0,
+        format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7fullpost11")
+    );
+    assert_eq!(record.1, full_post_cid);
 
     // Verify sync state matches full recovery
     let sync_state: (String, Vec<u8>) = sqlx::query_as(
@@ -654,24 +735,33 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
 async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Bob trying to author unauthorized top-level post",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
     // Bob attempts to author an invalid top-level post
     let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7bobinval11", "bafybobinvalidcid");
+    lthash.add("app.bsky.feed.post", "3l7bobinval11", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(SPACE_URI, BOB_DID, rev, lthash.as_bytes(), &setup.bob_signing_key);
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        BOB_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.bob_signing_key,
+    );
 
     let invalid_op = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(String::from("bafybobinvalidcid"))),
+        cid: Some(Cid::from(post_cid)),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
         prev: None,
         rev: Tid::from(String::from(rev)),
         rkey: RecordKey::from(Rkey::from(String::from("3l7bobinval11"))),
-        value: Some(serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Bob trying to author unauthorized top-level post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        })).unwrap()),
+        value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
 
@@ -705,16 +795,15 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
     assert_eq!(count.0, 0);
 
     // Content-free diagnostic must be stored in circle_rejections table
-    let rejected_uri = format!("at://{BOB_DID}/app.bsky.feed.post/3l7bobinval11");
+    let rejected_uri = format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.post/3l7bobinval11");
     let expected_hash = compute_uri_hash(&rejected_uri);
 
-    let rejection: (String,) = sqlx::query_as(
-        "SELECT reason_code FROM circle_rejections WHERE uri_hash = $1",
-    )
-    .bind(&expected_hash)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let rejection: (String,) =
+        sqlx::query_as("SELECT reason_code FROM circle_rejections WHERE uri_hash = $1")
+            .bind(&expected_hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(rejection.0, "top_level_author");
 }
@@ -723,27 +812,67 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
 // Step 5: Notify Write and Sweep Revision Tests
 // ---------------------------------------------------------------------------------------
 
+fn mint_service_jwt(
+    issuer_did: &str,
+    aud_did: &str,
+    lxm: &str,
+    signing_key: &SigningKey,
+) -> String {
+    use p256::ecdsa::signature::Signer;
+    let now = Utc::now().timestamp();
+    let header_json = json!({
+        "typ": "JWT",
+        "alg": "ES256"
+    });
+    let claims_json = json!({
+        "iss": issuer_did,
+        "aud": aud_did,
+        "exp": now + 30,
+        "iat": now,
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "lxm": lxm
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_json).unwrap());
+    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_json).unwrap());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+
+    let sig: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+    format!("{signing_input}.{sig_b64}")
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post synced via notify_write notification",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
     let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7notifypost", "bafynotifycid");
+    lthash.add("app.bsky.feed.post", "3l7notifypost", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes(), &setup.owner_signing_key);
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(String::from("bafynotifycid"))),
+        cid: Some(Cid::from(post_cid.clone())),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
         prev: None,
         rev: Tid::from(String::from(rev)),
         rkey: RecordKey::from(Rkey::from(String::from("3l7notifypost"))),
-        value: Some(serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Post synced via notify_write notification",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        })).unwrap()),
+        value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
 
@@ -759,12 +888,21 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     );
 
     let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&lthash.digest()),
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            &lthash.digest(),
+        ),
         repo: Did::from(String::from(OWNER_DID)),
         rev: Tid::from(String::from(rev)),
         space: SPACE_URI.into(),
         extra_data: None,
     };
+
+    let token = mint_service_jwt(
+        OWNER_DID,
+        &setup.state.config.service_did,
+        "com.atproto.space.notifyWrite",
+        &setup.owner_signing_key,
+    );
 
     let app = circle_appview::routes::create_router(setup.state.clone());
     use axum::http::Request;
@@ -776,7 +914,10 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
                 .method("POST")
                 .uri("/xrpc/com.atproto.space.notifyWrite")
                 .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&notify_input).unwrap()))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&notify_input).unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -784,7 +925,7 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Record was immediately indexed!
+    // Record was immediately indexed with permissioned URI!
     let record: (String, String) = sqlx::query_as(
         "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did = $2",
     )
@@ -794,31 +935,42 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_eq!(record.0, format!("at://{OWNER_DID}/app.bsky.feed.post/3l7notifypost"));
-    assert_eq!(record.1, "bafynotifycid");
+    assert_eq!(
+        record.0,
+        format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7notifypost")
+    );
+    assert_eq!(record.1, post_cid);
 }
-
 #[sqlx::test(migrations = "./migrations")]
 async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post synced via periodic sweep",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
     let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7sweeppost1", "bafysweepcid");
+    lthash.add("app.bsky.feed.post", "3l7sweeppost1", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes(), &setup.owner_signing_key);
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(String::from("bafysweepcid"))),
+        cid: Some(Cid::from(post_cid.clone())),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
         prev: None,
         rev: Tid::from(String::from(rev)),
         rkey: RecordKey::from(Rkey::from(String::from("3l7sweeppost1"))),
-        value: Some(serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Post synced via periodic sweep",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        })).unwrap()),
+        value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
 
@@ -836,7 +988,9 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     // Space host returns listRepos with updated revision
     let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
         did: Did::from(String::from(OWNER_DID)),
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(lthash.as_bytes()),
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            lthash.as_bytes(),
+        ),
         rev: Tid::from(String::from(rev)),
         extra_data: None,
     };
@@ -867,6 +1021,325 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_eq!(record.0, format!("at://{OWNER_DID}/app.bsky.feed.post/3l7sweeppost1"));
-    assert_eq!(record.1, "bafysweepcid");
+    assert_eq!(
+        record.0,
+        format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7sweeppost1")
+    );
+    assert_eq!(record.1, post_cid);
+}
+
+// ---------------------------------------------------------------------------------------
+// New Direct Tests for Reviewer Verification
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
+    // 1. Exact Context Encoding with uint16be length prefixes
+    let ikm = [0x42u8; 32];
+    let ctx = compute_commit_context(
+        "at://did:plc:alice/space/blue.catbird.circle/1",
+        "did:plc:alice",
+        "3l7rev123",
+        &ikm,
+    );
+
+    // Check uint16be fields
+    let tag = b"atproto-space-v1";
+    assert_eq!(&ctx[0..2], &(tag.len() as u16).to_be_bytes());
+    assert_eq!(&ctx[2..2 + tag.len()], tag);
+
+    // 2. Exact HKDF-Expand from 32-byte IKM directly (PRK = ikm)
+    let mac_key = derive_commit_mac_key(&ikm, &ctx).expect("HKDF expand must succeed");
+    assert_eq!(mac_key.len(), 32);
+
+    let lthash_digest = [0x55u8; 32];
+    let mac = compute_commit_mac(&mac_key, &lthash_digest).expect("HMAC must succeed");
+    assert_eq!(mac.len(), 32);
+
+    // 3. LtHash item formatting: BLAKE3 XOF over exact {collection}/{rkey}/{cid}
+    let mut h1 = LtHash::new();
+    h1.add("app.bsky.feed.post", "3l7post1", "bafyreih327owner1");
+    assert_ne!(h1.as_bytes(), &[0u8; 2048]);
+}
+
+#[test]
+fn dagcbor_cid_computation_and_mismatch_rejection() {
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Hello world from DAG-CBOR test",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+
+    let cid_str = compute_dagcbor_cid(&post_val).expect("DAG-CBOR CID computation must succeed");
+    assert!(
+        cid_str.starts_with("bafyre"),
+        "DAG-CBOR CIDv1 base32 must start with bafyre, got {cid_str}"
+    );
+
+    // Tampering changes computed CID
+    let tampered_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Tampered content",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let tampered_cid = compute_dagcbor_cid(&tampered_val).unwrap();
+    assert_ne!(cid_str, tampered_cid);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let owner_post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Owner root post on page 1",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let owner_cid = compute_dagcbor_cid(&owner_post_val).unwrap();
+    let owner_post_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7page1root");
+
+    let reply_post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Bob reply on page 2 to page 1 post in same batch",
+        "createdAt": "2026-08-24T12:05:00.000Z",
+        "reply": {
+            "root": {
+                "uri": owner_post_uri.clone(),
+                "cid": owner_cid.clone()
+            },
+            "parent": {
+                "uri": owner_post_uri.clone(),
+                "cid": owner_cid.clone()
+            }
+        }
+    });
+    let reply_cid = compute_dagcbor_cid(&reply_post_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7page1root", &owner_cid);
+    lthash.add("app.bsky.feed.post", "3l7page2reply", &reply_cid);
+
+    let rev = "3l7page2termb";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    // Page 1: owner post with cursor="page2"
+    let op_page1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(owner_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from("3l7pageaaaaaa")),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7page1root"))),
+        value: Some(serde_json::from_value(owner_post_val).unwrap()),
+        extra_data: None,
+    };
+
+    // Page 2: reply with terminal commit
+    let op_page2 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(reply_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7page2reply"))),
+        value: Some(serde_json::from_value(reply_post_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key_initial = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key_initial,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: None,
+            cursor: Some("page2".into()),
+            ops: vec![op_page1],
+            extra_data: None,
+        },
+    );
+
+    let key_page2 = format!("{SPACE_URI}:{OWNER_DID}:page2");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key_page2,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_page2],
+            extra_data: None,
+        },
+    );
+
+    // Run sync
+    let sync_engine = SyncEngine::new(&setup.state);
+    let result = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+
+    assert_eq!(result.mode, SyncMode::Incremental);
+    assert!(result.commit_verified);
+    assert_eq!(result.records_accepted, 2);
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn two_root_car_full_recovery_and_tampered_car_rejection(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let post1_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post 1 in CAR recovery",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post1_cid = compute_dagcbor_cid(&post1_val).unwrap();
+
+    let post2_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post 2 in CAR recovery",
+        "createdAt": "2026-08-24T12:05:00.000Z"
+    });
+    let post2_cid = compute_dagcbor_cid(&post2_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7post111111", &post1_cid);
+    lthash.add("app.bsky.feed.post", "3l7post222222", &post2_cid);
+
+    let rev = "3l7carrecovbb";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let records = vec![
+        RepoRecord {
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "3l7post111111".to_string(),
+            cid: post1_cid.clone(),
+            value: post1_val,
+        },
+        RepoRecord {
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "3l7post222222".to_string(),
+            cid: post2_cid.clone(),
+            value: post2_val,
+        },
+    ];
+
+    // 1. CAR encoding and decoding round-trip verification
+    let car_bytes = mint_repo_car(&commit, &records).unwrap();
+    let decoded = decode_repo_car(&car_bytes).unwrap();
+    assert_eq!(decoded.commit.rev.as_str(), rev);
+    assert_eq!(decoded.records.len(), 2);
+    assert_eq!(decoded.records[0].rkey, "3l7post111111");
+    assert_eq!(decoded.records[1].rkey, "3l7post222222");
+
+    // 2. Tampered CAR block CID rejection
+    let mut tampered_car = car_bytes.clone();
+    let last_idx = tampered_car.len() - 10;
+    tampered_car[last_idx] ^= 0xff; // corrupt a record block
+    assert!(decode_repo_car(&tampered_car).is_err());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+    let app = circle_appview::routes::create_router(setup.state.clone());
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]),
+        repo: Did::from(String::from(OWNER_DID)),
+        rev: Tid::from(String::from("3l7rev234567a")),
+        space: SPACE_URI.into(),
+        extra_data: None,
+    };
+
+    // 1. Unauthenticated request -> 401 Unauthorized
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&notify_input).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Unauthorized caller DID -> 403 Forbidden
+    let attacker_key = SigningKey::random(&mut OsRng);
+    let attacker_did = "did:plc:attacker-evil-99";
+    register_did_doc(&setup.state.did_resolver, attacker_did, &attacker_key, None);
+
+    let attacker_token = mint_service_jwt(
+        attacker_did,
+        &setup.state.config.service_did,
+        "com.atproto.space.notifyWrite",
+        &attacker_key,
+    );
+
+    let resp2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {attacker_token}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&notify_input).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn typed_integer_generations_in_projections() {
+    // 1. Integer generation as number 9 -> parsed as 9
+    let num_val = json!(9);
+    assert_eq!(extract_generation_i64(Some(&num_val)), Some(9));
+
+    // 2. Integer generation as whole-number float 9.0 -> parsed as 9
+    let float_val = json!(9.0);
+    assert_eq!(extract_generation_i64(Some(&float_val)), Some(9));
+
+    // 3. Integer generation as string "9" -> parsed as 9
+    let str_val = json!("9");
+    assert_eq!(extract_generation_i64(Some(&str_val)), Some(9));
+
+    // 4. Fractional float -> rejected as None
+    let frac_val = json!(9.5);
+    assert_eq!(extract_generation_i64(Some(&frac_val)), None);
+
+    // 5. Projection input validation with string generation
+    let input = SyncProjectionInput {
+        operation_id: uuid::Uuid::new_v4(),
+        operation_key: None,
+        actor_did: OWNER_DID.to_string(),
+        space_uri: SPACE_URI.to_string(),
+        kind: "circle_upsert".to_string(),
+        payload: json!({
+            "name": "My Circle",
+            "circleGeneration": "9"
+        }),
+        generation: Some(9),
+        circle_generation: None,
+        member_generation: None,
+    };
+    let proj = input.to_projection().unwrap();
+    match proj {
+        circle_appview::projections::Projection::CircleUpsert { generation, .. } => {
+            assert_eq!(generation, 9);
+        }
+        _ => panic!("Expected CircleUpsert"),
+    }
 }

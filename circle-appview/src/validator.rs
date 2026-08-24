@@ -44,7 +44,10 @@ pub struct ValidationPolicy {
 }
 
 impl ValidationPolicy {
-    pub fn new(owner_did: impl Into<String>, active_members: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn new(
+        owner_did: impl Into<String>,
+        active_members: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         let owner = owner_did.into();
         let mut members = HashSet::new();
         members.insert(owner.clone());
@@ -64,7 +67,10 @@ impl ValidationPolicy {
         self
     }
 
-    pub fn with_known_post_uris(mut self, uris: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn with_known_post_uris(
+        mut self,
+        uris: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         for u in uris {
             self.known_post_uris.insert(u.into());
         }
@@ -153,13 +159,17 @@ pub fn validate_record(
                     .get("parent")
                     .and_then(|p| p.get("uri"))
                     .and_then(|u| u.as_str())
-                    .ok_or_else(|| InvalidRecord::MalformedRecord("Missing parent.uri in reply".into()))?;
+                    .ok_or_else(|| {
+                        InvalidRecord::MalformedRecord("Missing parent.uri in reply".into())
+                    })?;
 
                 let root_uri = reply
                     .get("root")
                     .and_then(|r| r.get("uri"))
                     .and_then(|u| u.as_str())
-                    .ok_or_else(|| InvalidRecord::MalformedRecord("Missing root.uri in reply".into()))?;
+                    .ok_or_else(|| {
+                        InvalidRecord::MalformedRecord("Missing root.uri in reply".into())
+                    })?;
 
                 // Parent and root must be known same-space post URIs
                 if !policy.known_post_uris.is_empty() {
@@ -168,7 +178,8 @@ pub fn validate_record(
                     {
                         return Err(InvalidRecord::CrossSpaceReference);
                     }
-                } else if parent_uri.contains("did:plc:other") || root_uri.contains("did:plc:other") {
+                } else if parent_uri.contains("did:plc:other") || root_uri.contains("did:plc:other")
+                {
                     return Err(InvalidRecord::CrossSpaceReference);
                 }
 
@@ -217,7 +228,9 @@ pub fn validate_record(
                 .get("subject")
                 .and_then(|s| s.get("uri"))
                 .and_then(|u| u.as_str())
-                .ok_or_else(|| InvalidRecord::MalformedRecord("Missing subject.uri in like".into()))?;
+                .ok_or_else(|| {
+                    InvalidRecord::MalformedRecord("Missing subject.uri in like".into())
+                })?;
 
             if !policy.known_post_uris.is_empty() {
                 if !policy.known_post_uris.contains(subject_uri) {

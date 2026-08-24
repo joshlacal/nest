@@ -133,15 +133,11 @@ impl IntoResponse for AppError {
                 tracing::warn!("Forbidden access attempt: {}", msg);
                 (StatusCode::FORBIDDEN, "Forbidden", msg.clone())
             }
-            AppError::NotFound(msg) => {
-                (StatusCode::NOT_FOUND, "NotFound", msg.clone())
-            }
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NotFound", msg.clone()),
             AppError::InvalidRequest(msg) => {
                 (StatusCode::BAD_REQUEST, "InvalidRequest", msg.clone())
             }
-            AppError::Conflict(msg) => {
-                (StatusCode::CONFLICT, "Conflict", msg.clone())
-            }
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone()),
             AppError::Database(err) => {
                 tracing::error!("Database query error: {:?}", err);
                 (

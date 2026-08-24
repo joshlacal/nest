@@ -473,9 +473,7 @@ impl DidResolver {
 
         let url = format!("https://{hostname}:{port}{url_path}");
 
-        self.web_transport
-            .fetch(&url, &hostname, pinned_addr)
-            .await
+        self.web_transport.fetch(&url, &hostname, pinned_addr).await
     }
 }
 
@@ -512,7 +510,11 @@ pub async fn fetch_https_jwks(
         }
     }
     let pinned_addr = addrs[0];
-    let client = build_did_web_client(host, pinned_addr, resolver.web_transport.test_root_certificate())?;
+    let client = build_did_web_client(
+        host,
+        pinned_addr,
+        resolver.web_transport.test_root_certificate(),
+    )?;
     let resp = client
         .get(parsed.as_str())
         .send()
@@ -882,7 +884,8 @@ pub async fn authenticate(
     let expected_lxm = if path == "/internal/projections" {
         Some("blue.catbird.circle.syncProjection")
     } else {
-        path.strip_prefix("/xrpc/").map(|s| s.trim_start_matches('/'))
+        path.strip_prefix("/xrpc/")
+            .map(|s| s.trim_start_matches('/'))
     };
     let user = verify_service_jwt(&state, token, &state.config.service_did, expected_lxm).await?;
 

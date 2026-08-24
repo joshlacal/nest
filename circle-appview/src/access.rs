@@ -1,3 +1,8 @@
+use crate::auth::{
+    parse_verification_key, select_verification_method, DidDocument, JwtHeader, ParsedVerifyingKey,
+};
+use crate::config::AppState;
+use crate::error::{AppError, AuthReason};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -5,12 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use crate::auth::{
-    parse_verification_key, select_verification_method, DidDocument, JwtHeader,
-    ParsedVerifyingKey,
-};
-use crate::config::AppState;
-use crate::error::{AppError, AuthReason};
 
 #[derive(Clone)]
 pub struct ActiveSpaceCredential {
@@ -107,10 +106,12 @@ impl SpaceLockManager {
     pub async fn acquire(&self, space: &str) -> OwnedMutexGuard<()> {
         let (mutex, waiters) = {
             let mut map = self.locks.write().await;
-            let entry = map.entry(space.to_string()).or_insert_with(|| SpaceLockEntry {
-                mutex: Arc::new(Mutex::new(())),
-                waiters: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            });
+            let entry = map
+                .entry(space.to_string())
+                .or_insert_with(|| SpaceLockEntry {
+                    mutex: Arc::new(Mutex::new(())),
+                    waiters: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                });
             (entry.mutex.clone(), entry.waiters.clone())
         };
         waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -140,15 +141,16 @@ pub struct DelegationTokenClaims {
 }
 
 pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
-    let stripped = space_uri
-        .strip_prefix("at://")
-        .ok_or_else(|| AppError::InvalidRequest("Invalid Space URI: must start with at://".into()))?;
-    let did = stripped
-        .split('/')
-        .next()
-        .ok_or_else(|| AppError::InvalidRequest("Invalid Space URI: missing authority DID".into()))?;
+    let stripped = space_uri.strip_prefix("at://").ok_or_else(|| {
+        AppError::InvalidRequest("Invalid Space URI: must start with at://".into())
+    })?;
+    let did = stripped.split('/').next().ok_or_else(|| {
+        AppError::InvalidRequest("Invalid Space URI: missing authority DID".into())
+    })?;
     if did.is_empty() {
-        return Err(AppError::InvalidRequest("Invalid Space URI: empty authority DID".into()));
+        return Err(AppError::InvalidRequest(
+            "Invalid Space URI: empty authority DID".into(),
+        ));
     }
     Ok(did.to_string())
 }
@@ -198,7 +200,9 @@ pub fn parse_and_validate_delegation_token(
 ) -> Result<DelegationTokenClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(AppError::InvalidRequest("Invalid delegation token format".into()));
+        return Err(AppError::InvalidRequest(
+            "Invalid delegation token format".into(),
+        ));
     }
 
     let header_bytes = URL_SAFE_NO_PAD
@@ -216,9 +220,9 @@ pub fn parse_and_validate_delegation_token(
         return Err(AppError::Unauthorized(AuthReason::UnsupportedAlg));
     }
 
-    let claims_bytes = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|_| AppError::InvalidRequest("Invalid delegation token payload encoding".into()))?;
+    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| {
+        AppError::InvalidRequest("Invalid delegation token payload encoding".into())
+    })?;
     let claims: serde_json::Value = serde_json::from_slice(&claims_bytes)
         .map_err(|_| AppError::InvalidRequest("Invalid delegation token claims JSON".into()))?;
 
@@ -340,13 +344,7 @@ pub async fn activate_space(
         resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
     // 5. Parse and validate delegation token claims and signature
-    parse_and_validate_delegation_token(
-        delegation_token,
-        user_did,
-        space,
-        &service_id,
-        &user_doc,
-    )?;
+    parse_and_validate_delegation_token(delegation_token, user_did, space, &service_id, &user_doc)?;
 
     // Acquire per-Space async lock spanning exchange, DB check, lease insertion, and credential store insertion
     let _space_lock = state.space_locks.acquire(space).await;
@@ -376,13 +374,12 @@ pub async fn activate_space(
     .await
     .map_err(AppError::Database)?;
 
-    let circle_gen: Option<(i64,)> = sqlx::query_as(
-        "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
-    )
-    .bind(space)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(AppError::Database)?;
+    let circle_gen: Option<(i64,)> =
+        sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE")
+            .bind(space)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
 
     if let Some((t_gen,)) = tombstone {
         if let Some((c_gen,)) = circle_gen {
@@ -439,13 +436,12 @@ pub async fn activate_space(
                 .await
                 .map_err(AppError::Database)?;
             } else {
-                let circle_exists: Option<(String,)> = sqlx::query_as(
-                    "SELECT space_uri FROM circles WHERE space_uri = $1",
-                )
-                .bind(space)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(AppError::Database)?;
+                let circle_exists: Option<(String,)> =
+                    sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
+                        .bind(space)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(AppError::Database)?;
 
                 if circle_exists.is_some() {
                     return Err(AppError::Forbidden(
@@ -524,7 +520,10 @@ pub async fn activate_space(
             dpop_key,
             expires_at,
         };
-        state.credential_store.insert(space.to_string(), active_cred).await;
+        state
+            .credential_store
+            .insert(space.to_string(), active_cred)
+            .await;
     }
     Ok(expires_at)
 }

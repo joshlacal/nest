@@ -76,7 +76,30 @@ pub fn compute_payload_digest(
     hasher.finalize().to_vec()
 }
 
-fn validate_equal_generations(gens: &[(Option<i64>, &str)], context: &str) -> Result<i64, AppError> {
+pub fn extract_generation_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(i)
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                    Some(f as i64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn validate_equal_generations(
+    gens: &[(Option<i64>, &str)],
+    context: &str,
+) -> Result<i64, AppError> {
     let mut found: Option<i64> = None;
     for (gen, name) in gens {
         if let Some(val) = gen {
@@ -113,9 +136,18 @@ impl SyncProjectionInput {
                     &[
                         (self.circle_generation, "top-level circle_generation"),
                         (self.generation, "top-level generation"),
-                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
-                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
-                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                        (
+                            extract_generation_i64(self.payload.get("circleGeneration")),
+                            "payload.circleGeneration",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("circle_generation")),
+                            "payload.circle_generation",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("generation")),
+                            "payload.generation",
+                        ),
                     ],
                     "CircleUpsert",
                 )?;
@@ -157,8 +189,14 @@ impl SyncProjectionInput {
                 let circle_gen = validate_equal_generations(
                     &[
                         (self.circle_generation, "top-level circle_generation"),
-                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
-                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
+                        (
+                            extract_generation_i64(self.payload.get("circleGeneration")),
+                            "payload.circleGeneration",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("circle_generation")),
+                            "payload.circle_generation",
+                        ),
                     ],
                     "circleGeneration for MemberAdd",
                 )?;
@@ -166,10 +204,19 @@ impl SyncProjectionInput {
                 let member_gen = validate_equal_generations(
                     &[
                         (self.member_generation, "top-level member_generation"),
-                        (self.payload.get("memberGeneration").and_then(|v| v.as_i64()), "payload.memberGeneration"),
-                        (self.payload.get("member_generation").and_then(|v| v.as_i64()), "payload.member_generation"),
+                        (
+                            extract_generation_i64(self.payload.get("memberGeneration")),
+                            "payload.memberGeneration",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("member_generation")),
+                            "payload.member_generation",
+                        ),
                         (self.generation, "top-level generation"),
-                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                        (
+                            extract_generation_i64(self.payload.get("generation")),
+                            "payload.generation",
+                        ),
                     ],
                     "memberGeneration for MemberAdd",
                 )?;
@@ -192,8 +239,14 @@ impl SyncProjectionInput {
                 let circle_gen = validate_equal_generations(
                     &[
                         (self.circle_generation, "top-level circle_generation"),
-                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
-                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
+                        (
+                            extract_generation_i64(self.payload.get("circleGeneration")),
+                            "payload.circleGeneration",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("circle_generation")),
+                            "payload.circle_generation",
+                        ),
                     ],
                     "circleGeneration for MemberRemove",
                 )?;
@@ -201,10 +254,19 @@ impl SyncProjectionInput {
                 let member_gen = validate_equal_generations(
                     &[
                         (self.member_generation, "top-level member_generation"),
-                        (self.payload.get("memberGeneration").and_then(|v| v.as_i64()), "payload.memberGeneration"),
-                        (self.payload.get("member_generation").and_then(|v| v.as_i64()), "payload.member_generation"),
+                        (
+                            extract_generation_i64(self.payload.get("memberGeneration")),
+                            "payload.memberGeneration",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("member_generation")),
+                            "payload.member_generation",
+                        ),
                         (self.generation, "top-level generation"),
-                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                        (
+                            extract_generation_i64(self.payload.get("generation")),
+                            "payload.generation",
+                        ),
                     ],
                     "memberGeneration for MemberRemove",
                 )?;
@@ -228,9 +290,18 @@ impl SyncProjectionInput {
                     &[
                         (self.circle_generation, "top-level circle_generation"),
                         (self.generation, "top-level generation"),
-                        (self.payload.get("circleGeneration").and_then(|v| v.as_i64()), "payload.circleGeneration"),
-                        (self.payload.get("circle_generation").and_then(|v| v.as_i64()), "payload.circle_generation"),
-                        (self.payload.get("generation").and_then(|v| v.as_i64()), "payload.generation"),
+                        (
+                            extract_generation_i64(self.payload.get("circleGeneration")),
+                            "payload.circleGeneration",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("circle_generation")),
+                            "payload.circle_generation",
+                        ),
+                        (
+                            extract_generation_i64(self.payload.get("generation")),
+                            "payload.generation",
+                        ),
                     ],
                     "CircleDelete",
                 )?;
@@ -312,8 +383,12 @@ pub async fn apply_projection(
     // 2. Check deletion tombstones against circle epoch
     let target_circle_generation = match &projection {
         Projection::CircleUpsert { generation, .. } => *generation,
-        Projection::MemberAdd { circle_generation, .. } => *circle_generation,
-        Projection::MemberRemove { circle_generation, .. } => *circle_generation,
+        Projection::MemberAdd {
+            circle_generation, ..
+        } => *circle_generation,
+        Projection::MemberRemove {
+            circle_generation, ..
+        } => *circle_generation,
         Projection::CircleDelete { generation, .. } => *generation,
     };
 
@@ -339,7 +414,10 @@ pub async fn apply_projection(
         }
     }
 
-    let is_purging_op = matches!(&projection, Projection::CircleDelete { .. } | Projection::MemberRemove { .. });
+    let is_purging_op = matches!(
+        &projection,
+        Projection::CircleDelete { .. } | Projection::MemberRemove { .. }
+    );
     let deleted_space = if is_purging_op {
         Some(target_space.to_string())
     } else {
@@ -370,13 +448,12 @@ pub async fn apply_projection(
             }
 
             // Check existing circle generation
-            let existing_gen: Option<(i64,)> = sqlx::query_as(
-                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
-            )
-            .bind(&space)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+            let existing_gen: Option<(i64,)> =
+                sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE")
+                    .bind(&space)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(AppError::Database)?;
 
             if let Some((prev_gen,)) = existing_gen {
                 if prev_gen >= generation {
@@ -413,13 +490,12 @@ pub async fn apply_projection(
             member_generation,
         } => {
             // Check existing circle generation
-            let existing_circle: Option<(i64,)> = sqlx::query_as(
-                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
-            )
-            .bind(&space)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+            let existing_circle: Option<(i64,)> =
+                sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE")
+                    .bind(&space)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(AppError::Database)?;
 
             if let Some((existing_c_gen,)) = existing_circle {
                 if existing_c_gen > circle_generation {
@@ -484,13 +560,12 @@ pub async fn apply_projection(
             member_generation,
         } => {
             // Check existing circle generation
-            let existing_circle: Option<(i64,)> = sqlx::query_as(
-                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
-            )
-            .bind(&space)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+            let existing_circle: Option<(i64,)> =
+                sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE")
+                    .bind(&space)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(AppError::Database)?;
 
             if let Some((existing_c_gen,)) = existing_circle {
                 if existing_c_gen > circle_generation {
@@ -568,13 +643,12 @@ pub async fn apply_projection(
         }
         Projection::CircleDelete { space, generation } => {
             // Check existing circle generation
-            let existing_gen: Option<(i64,)> = sqlx::query_as(
-                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
-            )
-            .bind(&space)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+            let existing_gen: Option<(i64,)> =
+                sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE")
+                    .bind(&space)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(AppError::Database)?;
 
             if let Some((curr_gen,)) = existing_gen {
                 if curr_gen > generation {

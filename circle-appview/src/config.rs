@@ -1,9 +1,9 @@
-use std::env;
-use std::sync::Arc;
-use sqlx::PgPool;
 use crate::access::CredentialStore;
 use crate::auth::DidResolver;
 use crate::space_client::SpaceClient;
+use sqlx::PgPool;
+use std::env;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -28,8 +28,8 @@ impl Config {
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_string());
         let service_did = env::var("SERVICE_DID")
             .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circle".to_string());
-        let plc_directory_url = env::var("PLC_DIRECTORY_URL")
-            .unwrap_or_else(|_| "https://plc.directory".to_string());
+        let plc_directory_url =
+            env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let nest_client_id = env::var("NEST_CLIENT_ID")
             .map_err(|_| anyhow::anyhow!("NEST_CLIENT_ID environment variable is required"))?;
         let nest_jwks_url = env::var("NEST_JWKS_URL")

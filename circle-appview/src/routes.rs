@@ -42,10 +42,7 @@ pub fn create_router(state: AppState) -> Router {
         );
     // Authenticated XRPC endpoints
     let authenticated_routes = Router::new()
-        .route(
-            "/xrpc/blue.catbird.circle.getFeed",
-            get(get_feed_handler),
-        )
+        .route("/xrpc/blue.catbird.circle.getFeed", get(get_feed_handler))
         .route(
             "/xrpc/blue.catbird.circle.listCircles",
             get(list_circles_handler),
@@ -58,10 +55,7 @@ pub fn create_router(state: AppState) -> Router {
             "/xrpc/blue.catbird.circle.activateSpace",
             post(activate_space_handler),
         )
-        .route(
-            "/internal/projections",
-            post(sync_projections_handler),
-        )
+        .route("/internal/projections", post(sync_projections_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -234,8 +228,7 @@ async fn sync_projections_handler(
         })
         .ok_or(AppError::Unauthorized(AuthReason::MissingHeader))?;
 
-    auth::verify_nest_client_attestation(&state, &attestation, &state.config.service_did)
-        .await?;
+    auth::verify_nest_client_attestation(&state, &attestation, &state.config.service_did).await?;
 
     let payload_digest = projections::compute_payload_digest(
         &input.operation_id,
@@ -265,10 +258,48 @@ async fn sync_projections_handler(
 
 pub async fn notify_write_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite>,
 ) -> Result<StatusCode, AppError> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized(AuthReason::MissingHeader))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_header.strip_prefix("bearer "))
+        .ok_or(AppError::Unauthorized(AuthReason::InvalidHeader))?;
+    let user = auth::verify_service_jwt(
+        &state,
+        token,
+        &state.config.service_did,
+        Some("com.atproto.space.notifyWrite"),
+    )
+    .await?;
+
     let space_uri = input.space.to_string();
     let repo_did = input.repo.to_string();
+
+    let authority_did = crate::access::extract_authority_did(&space_uri)?;
+    if user.did != repo_did && user.did != authority_did {
+        let authority_doc = state
+            .did_resolver
+            .resolve(&authority_did)
+            .await
+            .map_err(AppError::Unauthorized)?;
+        let host_matches = authority_doc.service.iter().any(|svc| {
+            (svc.id == "#atproto_pds"
+                || svc.id == "#space_host"
+                || svc.id.ends_with("#atproto_pds"))
+                && svc.service_endpoint.contains(&user.did)
+        });
+        if !host_matches {
+            return Err(AppError::Forbidden(
+                "Service auth caller is not authorized for this Space or repo".into(),
+            ));
+        }
+    }
 
     let sync_engine = crate::sync::SyncEngine::new(&state);
     sync_engine.sync_repo(&space_uri, &repo_did).await?;

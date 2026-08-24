@@ -2,14 +2,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::access::{extract_authority_did, resolve_space_host_endpoint, CredentialStore, SpaceLockManager};
-use crate::auth::{select_authority_verification_method, DidResolver};
-use crate::commit::{verify_commit, LtHash, LTHASH_SIZE};
+use crate::access::{
+    extract_authority_did, resolve_space_host_endpoint, CredentialStore, SpaceLockManager,
+};
+use crate::auth::{select_verification_method, DidResolver};
+use crate::commit::{compute_dagcbor_cid, decode_repo_car, verify_commit, LtHash, LTHASH_SIZE};
 use crate::config::AppState;
 use crate::error::AppError;
 use crate::space_client::SpaceClient;
 use crate::validator::{validate_record, RecordCandidate, ValidationPolicy};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Incremental,
@@ -69,23 +70,34 @@ impl SyncEngine {
         }
     }
 
-    pub async fn sync_repo(&self, space_uri: &str, author_did: &str) -> Result<SyncResult, AppError> {
+    pub async fn sync_repo(
+        &self,
+        space_uri: &str,
+        author_did: &str,
+    ) -> Result<SyncResult, AppError> {
         let _lock_guard = self.space_locks.acquire(space_uri).await;
 
-        let cred = self
-            .credential_store
-            .get(space_uri)
-            .await
-            .ok_or_else(|| AppError::Forbidden("No active Space credential in store for Space".into()))?;
+        let cred = self.credential_store.get(space_uri).await.ok_or_else(|| {
+            AppError::Forbidden("No active Space credential in store for Space".into())
+        })?;
 
         let authority_did = extract_authority_did(space_uri)?;
-        let authority_doc = self.did_resolver.resolve(&authority_did).await.map_err(AppError::Unauthorized)?;
+        let authority_doc = self
+            .did_resolver
+            .resolve(&authority_did)
+            .await
+            .map_err(AppError::Unauthorized)?;
         let (service_endpoint, _) = resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
-        let author_doc = self.did_resolver.resolve(author_did).await.map_err(AppError::Unauthorized)?;
-        let author_vm = select_authority_verification_method(&author_doc, author_did, None).map_err(AppError::Unauthorized)?;
-        let author_signing_key = crate::auth::parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
-
+        let author_doc = self
+            .did_resolver
+            .resolve(author_did)
+            .await
+            .map_err(AppError::Unauthorized)?;
+        let author_vm = select_verification_method(&author_doc, author_did, None)
+            .map_err(AppError::Unauthorized)?;
+        let author_signing_key =
+            crate::auth::parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
         // Load active members and known post URIs to build ValidationPolicy
         let active_member_rows: Vec<(String,)> = sqlx::query_as(
             r#"
@@ -99,7 +111,8 @@ impl SyncEngine {
         .fetch_all(&self.db)
         .await?;
 
-        let active_members_set: HashSet<String> = active_member_rows.into_iter().map(|(m,)| m).collect();
+        let active_members_set: HashSet<String> =
+            active_member_rows.into_iter().map(|(m,)| m).collect();
 
         let known_post_rows: Vec<(String,)> = sqlx::query_as(
             "SELECT uri FROM circle_records WHERE space_uri = $1 AND deleted_at IS NULL",
@@ -132,129 +145,183 @@ impl SyncEngine {
             _ => (None, LtHash::new()),
         };
 
-        // Try incremental sync
-        let list_ops_res = self
-            .space_client
-            .list_repo_ops(
-                &service_endpoint,
+        // Try incremental sync with pagination and DAG-CBOR CID verification
+        let mut ops_applied = 0;
+        let mut records_accepted = 0;
+        let mut records_rejected = 0;
+        let mut latest_rev = last_rev.clone().unwrap_or_default();
+
+        let mut staged_valid_records = Vec::new();
+        let mut staged_rejections = Vec::new();
+        let mut staged_deletes = Vec::new();
+        let mut current_policy = policy.clone();
+
+        let mut cursor: Option<String> = None;
+        let mut terminal_commit = None;
+        let mut fetch_failed = false;
+
+        loop {
+            let since_param = cursor.as_deref().or(last_rev.as_deref());
+            let page_res = self
+                .space_client
+                .list_repo_ops(
+                    &service_endpoint,
+                    space_uri,
+                    author_did,
+                    since_param,
+                    &cred.token,
+                    &cred.dpop_key,
+                )
+                .await;
+
+            let page = match page_res {
+                Ok(p) => p,
+                Err(_) => {
+                    fetch_failed = true;
+                    break;
+                }
+            };
+
+            for op in &page.ops {
+                ops_applied += 1;
+                latest_rev = op.rev.to_string();
+
+                let collection_str = op.collection.as_str();
+                let rkey_str = op.rkey.0.as_str();
+                let uri = format!("{space_uri}/{author_did}/{collection_str}/{rkey_str}");
+
+                if let Some(cid) = &op.cid {
+                    let cid_str = cid.as_str();
+                    if let Some(prev) = &op.prev {
+                        lthash.remove(collection_str, rkey_str, prev.as_str());
+                    }
+                    lthash.add(collection_str, rkey_str, cid_str);
+
+                    let candidate_val = op
+                        .value
+                        .as_ref()
+                        .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
+                        .unwrap_or(serde_json::Value::Null);
+
+                    if !candidate_val.is_null() {
+                        let computed_cid = compute_dagcbor_cid(&candidate_val);
+                        match computed_cid {
+                            Ok(c) if c == cid_str => {}
+                            _ => {
+                                fetch_failed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    let candidate = RecordCandidate {
+                        uri: uri.clone(),
+                        author_did: author_did.to_string(),
+                        collection: collection_str.to_string(),
+                        rkey: rkey_str.to_string(),
+                        value: candidate_val,
+                    };
+
+                    match validate_record(&candidate, &current_policy) {
+                        Ok(valid) => {
+                            records_accepted += 1;
+                            current_policy.known_post_uris.insert(valid.uri.clone());
+                            staged_valid_records.push((valid, cid_str.to_string()));
+                        }
+                        Err(invalid) => {
+                            records_rejected += 1;
+                            staged_rejections.push((uri, invalid));
+                        }
+                    }
+                } else {
+                    // Deletion op
+                    if let Some(prev) = &op.prev {
+                        lthash.remove(collection_str, rkey_str, prev.as_str());
+                    }
+                    current_policy.known_post_uris.remove(&uri);
+                    staged_deletes.push(uri);
+                }
+            }
+
+            if fetch_failed {
+                break;
+            }
+
+            if let Some(c) = page.commit {
+                terminal_commit = Some(c);
+            }
+
+            if let Some(next_cur) = page.cursor {
+                if Some(&next_cur.to_string()) == cursor.as_ref() {
+                    break;
+                }
+                cursor = Some(next_cur.to_string());
+            } else {
+                break;
+            }
+        }
+
+        if fetch_failed {
+            return self
+                .full_recovery(
+                    space_uri,
+                    author_did,
+                    &service_endpoint,
+                    &cred.token,
+                    &cred.dpop_key,
+                    &author_signing_key,
+                    &policy,
+                )
+                .await;
+        }
+
+        let commit_to_verify = match terminal_commit {
+            Some(c) => Some(c),
+            None => self
+                .space_client
+                .get_latest_commit(
+                    &service_endpoint,
+                    space_uri,
+                    author_did,
+                    &cred.token,
+                    &cred.dpop_key,
+                )
+                .await
+                .ok(),
+        };
+
+        let commit_verified = if let Some(commit) = &commit_to_verify {
+            latest_rev = commit.rev.to_string();
+            verify_commit(
                 space_uri,
                 author_did,
-                last_rev.as_deref(),
-                &cred.token,
-                &cred.dpop_key,
+                commit,
+                lthash.as_bytes(),
+                &author_signing_key,
             )
-            .await;
+            .is_ok()
+        } else {
+            ops_applied == 0
+        };
 
-        match list_ops_res {
-            Ok(output) => {
-                let mut ops_applied = 0;
-                let mut records_accepted = 0;
-                let mut records_rejected = 0;
-                let mut latest_rev = last_rev.clone().unwrap_or_default();
+        if !commit_verified {
+            return self
+                .full_recovery(
+                    space_uri,
+                    author_did,
+                    &service_endpoint,
+                    &cred.token,
+                    &cred.dpop_key,
+                    &author_signing_key,
+                    &policy,
+                )
+                .await;
+        }
+        // Transactional apply
+        let mut tx = self.db.begin().await?;
 
-                let mut staged_valid_records = Vec::new();
-                let mut staged_rejections = Vec::new();
-                let mut staged_deletes = Vec::new();
-
-                for op in &output.ops {
-                    ops_applied += 1;
-                    latest_rev = op.rev.to_string();
-
-                    let collection_str = op.collection.as_str();
-                    let rkey_str = op.rkey.0.as_str();
-                    let uri = format!("at://{author_did}/{collection_str}/{rkey_str}");
-
-                    if let Some(cid) = &op.cid {
-                        let cid_str = cid.as_str();
-                        if let Some(prev) = &op.prev {
-                            lthash.remove(collection_str, rkey_str, prev.as_str());
-                        }
-                        lthash.add(collection_str, rkey_str, cid_str);
-
-                        let candidate_val = op
-                            .value
-                            .as_ref()
-                            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
-                            .unwrap_or(serde_json::Value::Null);
-
-                        let candidate = RecordCandidate {
-                            uri: uri.clone(),
-                            author_did: author_did.to_string(),
-                            collection: collection_str.to_string(),
-                            rkey: rkey_str.to_string(),
-                            value: candidate_val,
-                        };
-
-                        match validate_record(&candidate, &policy) {
-                            Ok(valid) => {
-                                records_accepted += 1;
-                                staged_valid_records.push((valid, cid_str.to_string()));
-                            }
-                            Err(invalid) => {
-                                records_rejected += 1;
-                                staged_rejections.push((uri, invalid));
-                            }
-                        }
-                    } else {
-                        // Deletion op
-                        if let Some(prev) = &op.prev {
-                            lthash.remove(collection_str, rkey_str, prev.as_str());
-                        }
-                        staged_deletes.push(uri);
-                    }
-                }
-
-                // Verify commit
-                let commit_to_verify = match output.commit {
-                    Some(c) => Some(c),
-                    None => {
-                        self.space_client
-                            .get_latest_commit(
-                                &service_endpoint,
-                                space_uri,
-                                author_did,
-                                &cred.token,
-                                &cred.dpop_key,
-                            )
-                            .await
-                            .ok()
-                    }
-                };
-
-                let commit_verified = if let Some(commit) = &commit_to_verify {
-                    latest_rev = commit.rev.to_string();
-                    verify_commit(
-                        space_uri,
-                        author_did,
-                        commit,
-                        lthash.as_bytes(),
-                        &author_signing_key,
-                    )
-                    .is_ok()
-                } else {
-                    ops_applied == 0
-                };
-
-                if !commit_verified {
-                    // Hash mismatch or invalid commit -> Fall back to full recovery
-                    return self
-                        .full_recovery(
-                            space_uri,
-                            author_did,
-                            &service_endpoint,
-                            &cred.token,
-                            &cred.dpop_key,
-                            &author_signing_key,
-                            &policy,
-                        )
-                        .await;
-                }
-
-                // Transactional apply
-                let mut tx = self.db.begin().await?;
-
-                for (valid, cid_str) in staged_valid_records {
-                    sqlx::query(
+        for (valid, cid_str) in staged_valid_records {
+            sqlx::query(
                         r#"
                         INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at, parent_uri, root_uri)
                         VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)
@@ -280,8 +347,8 @@ impl SyncEngine {
                     .execute(&mut *tx)
                     .await?;
 
-                    if let Some(post_uri) = &valid.post_uri {
-                        sqlx::query(
+            if let Some(post_uri) = &valid.post_uri {
+                sqlx::query(
                             r#"
                             INSERT INTO circle_likes (uri, space_uri, post_uri, author_did, created_at)
                             VALUES ($1, $2, $3, $4, $5)
@@ -296,17 +363,16 @@ impl SyncEngine {
                         .execute(&mut *tx)
                         .await?;
 
-                        // Create notification for like
-                        let post_author: Option<(String,)> = sqlx::query_as(
-                            "SELECT author_did FROM circle_records WHERE uri = $1",
-                        )
+                // Create notification for like
+                let post_author: Option<(String,)> =
+                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
                         .bind(post_uri)
                         .fetch_optional(&mut *tx)
                         .await?;
 
-                        if let Some((recipient,)) = post_author {
-                            if recipient != valid.author_did {
-                                sqlx::query(
+                if let Some((recipient,)) = post_author {
+                    if recipient != valid.author_did {
+                        sqlx::query(
                                     r#"
                                     INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, is_read, created_at)
                                     VALUES ($1, $2, $3, $4, 'like', $5, false, now())
@@ -319,20 +385,19 @@ impl SyncEngine {
                                 .bind(post_uri)
                                 .execute(&mut *tx)
                                 .await?;
-                            }
-                        }
-                    } else if let Some(parent_uri) = &valid.parent_uri {
-                        // Create notification for reply
-                        let parent_author: Option<(String,)> = sqlx::query_as(
-                            "SELECT author_did FROM circle_records WHERE uri = $1",
-                        )
+                    }
+                }
+            } else if let Some(parent_uri) = &valid.parent_uri {
+                // Create notification for reply
+                let parent_author: Option<(String,)> =
+                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
                         .bind(parent_uri)
                         .fetch_optional(&mut *tx)
                         .await?;
 
-                        if let Some((recipient,)) = parent_author {
-                            if recipient != valid.author_did {
-                                sqlx::query(
+                if let Some((recipient,)) = parent_author {
+                    if recipient != valid.author_did {
+                        sqlx::query(
                                     r#"
                                     INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, is_read, created_at)
                                     VALUES ($1, $2, $3, $4, 'reply', $5, false, now())
@@ -345,35 +410,35 @@ impl SyncEngine {
                                 .bind(&valid.uri)
                                 .execute(&mut *tx)
                                 .await?;
-                            }
-                        }
                     }
                 }
+            }
+        }
 
-                for uri in staged_deletes {
-                    sqlx::query("UPDATE circle_records SET deleted_at = now() WHERE uri = $1")
-                        .bind(&uri)
-                        .execute(&mut *tx)
-                        .await?;
-                }
+        for uri in staged_deletes {
+            sqlx::query("UPDATE circle_records SET deleted_at = now() WHERE uri = $1")
+                .bind(&uri)
+                .execute(&mut *tx)
+                .await?;
+        }
 
-                for (uri, reason) in staged_rejections {
-                    let uri_hash = crate::validator::compute_uri_hash(&uri);
-                    sqlx::query(
-                        r#"
+        for (uri, reason) in staged_rejections {
+            let uri_hash = crate::validator::compute_uri_hash(&uri);
+            sqlx::query(
+                r#"
                         INSERT INTO circle_rejections (uri_hash, reason_code, observed_at)
                         VALUES ($1, $2, now())
                         ON CONFLICT (uri_hash) DO NOTHING
                         "#,
-                    )
-                    .bind(&uri_hash)
-                    .bind(reason.reason_code())
-                    .execute(&mut *tx)
-                    .await?;
-                }
+            )
+            .bind(&uri_hash)
+            .bind(reason.reason_code())
+            .execute(&mut *tx)
+            .await?;
+        }
 
-                // Update sync state
-                sqlx::query(
+        // Update sync state
+        sqlx::query(
                     r#"
                     INSERT INTO circle_repo_sync_state (space_uri, author_did, last_rev, last_hash, last_synced_at)
                     VALUES ($1, $2, $3, $4, now())
@@ -390,31 +455,16 @@ impl SyncEngine {
                 .execute(&mut *tx)
                 .await?;
 
-                tx.commit().await?;
+        tx.commit().await?;
 
-                Ok(SyncResult {
-                    mode: SyncMode::Incremental,
-                    commit_verified: true,
-                    ops_applied,
-                    records_accepted,
-                    records_rejected,
-                    latest_rev,
-                })
-            }
-            Err(_) => {
-                // Incremental fetch error (e.g. compacted oplog) -> Fall back to full recovery
-                self.full_recovery(
-                    space_uri,
-                    author_did,
-                    &service_endpoint,
-                    &cred.token,
-                    &cred.dpop_key,
-                    &author_signing_key,
-                    &policy,
-                )
-                .await
-            }
-        }
+        Ok(SyncResult {
+            mode: SyncMode::Incremental,
+            commit_verified: true,
+            ops_applied,
+            records_accepted,
+            records_rejected,
+            latest_rev,
+        })
     }
 
     async fn full_recovery(
@@ -427,9 +477,7 @@ impl SyncEngine {
         author_signing_key: &crate::auth::ParsedVerifyingKey,
         policy: &ValidationPolicy,
     ) -> Result<SyncResult, AppError> {
-        let mut lthash = LtHash::new();
-
-        let repo_ops = self
+        let car_bytes = self
             .space_client
             .get_repo(
                 service_endpoint,
@@ -441,70 +489,57 @@ impl SyncEngine {
             )
             .await?;
 
-        let latest_commit = self
-            .space_client
-            .get_latest_commit(
-                service_endpoint,
-                space_uri,
-                author_did,
-                space_credential,
-                dpop_key,
-            )
-            .await?;
+        let decoded_car = decode_repo_car(&car_bytes)
+            .map_err(|e| AppError::Internal(format!("CAR decoding failed: {e}")))?;
 
+        let mut lthash = LtHash::new();
         let mut staged_valid_records = Vec::new();
         let mut staged_rejections = Vec::new();
+        let mut current_policy = policy.clone();
         let mut ops_applied = 0;
         let mut records_accepted = 0;
         let mut records_rejected = 0;
 
-        for op in repo_ops {
+        for rec in decoded_car.records {
             ops_applied += 1;
-            let collection_str = op.collection.as_str();
-            let rkey_str = op.rkey.0.as_str();
-            let uri = format!("at://{author_did}/{collection_str}/{rkey_str}");
+            let collection_str = rec.collection.as_str();
+            let rkey_str = rec.rkey.as_str();
+            let uri = format!("{space_uri}/{author_did}/{collection_str}/{rkey_str}");
 
-            if let Some(cid) = &op.cid {
-                let cid_str = cid.as_str();
-                lthash.add(collection_str, rkey_str, cid_str);
+            lthash.add(collection_str, rkey_str, &rec.cid);
 
-                let candidate_val = op
-                    .value
-                    .as_ref()
-                    .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
-                    .unwrap_or(serde_json::Value::Null);
+            let candidate = RecordCandidate {
+                uri: uri.clone(),
+                author_did: author_did.to_string(),
+                collection: collection_str.to_string(),
+                rkey: rkey_str.to_string(),
+                value: rec.value,
+            };
 
-                let candidate = RecordCandidate {
-                    uri: uri.clone(),
-                    author_did: author_did.to_string(),
-                    collection: collection_str.to_string(),
-                    rkey: rkey_str.to_string(),
-                    value: candidate_val,
-                };
-
-                match validate_record(&candidate, policy) {
-                    Ok(valid) => {
-                        records_accepted += 1;
-                        staged_valid_records.push((valid, cid_str.to_string()));
-                    }
-                    Err(invalid) => {
-                        records_rejected += 1;
-                        staged_rejections.push((uri, invalid));
-                    }
+            match validate_record(&candidate, &current_policy) {
+                Ok(valid) => {
+                    records_accepted += 1;
+                    current_policy.known_post_uris.insert(valid.uri.clone());
+                    staged_valid_records.push((valid, rec.cid));
+                }
+                Err(invalid) => {
+                    records_rejected += 1;
+                    staged_rejections.push((uri, invalid));
                 }
             }
         }
 
+        // Verify root commit embedded in CAR
         verify_commit(
             space_uri,
             author_did,
-            &latest_commit,
+            &decoded_car.commit,
             lthash.as_bytes(),
             author_signing_key,
         )
-        .map_err(|e| AppError::Internal(format!("Commit verification failed during full recovery: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Commit verification failed on CAR: {e}")))?;
 
-        let latest_rev = latest_commit.rev.to_string();
+        let latest_rev = decoded_car.commit.rev.to_string();
 
         let mut tx = self.db.begin().await?;
 
@@ -610,11 +645,10 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
     let sync_engine = SyncEngine::new(state);
     let mut summary = SweepSummary::default();
 
-    let active_spaces: Vec<(String,)> = sqlx::query_as(
-        "SELECT space_uri FROM circles WHERE deleted_at IS NULL",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let active_spaces: Vec<(String,)> =
+        sqlx::query_as("SELECT space_uri FROM circles WHERE deleted_at IS NULL")
+            .fetch_all(&state.db)
+            .await?;
 
     for (space_uri,) in active_spaces {
         summary.spaces_checked += 1;
@@ -632,10 +666,11 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
             Err(_) => continue,
         };
 
-        let (service_endpoint, _) = match resolve_space_host_endpoint(&authority_doc, &authority_did) {
-            Ok(ep) => ep,
-            Err(_) => continue,
-        };
+        let (service_endpoint, _) =
+            match resolve_space_host_endpoint(&authority_doc, &authority_did) {
+                Ok(ep) => ep,
+                Err(_) => continue,
+            };
 
         let list_repos_res = state
             .space_client

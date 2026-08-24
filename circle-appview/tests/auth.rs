@@ -136,9 +136,15 @@ fn create_custom_service_token(
     });
 
     if let Some(iat) = opts.iat {
-        claims.as_object_mut().unwrap().insert("iat".into(), json!(iat));
+        claims
+            .as_object_mut()
+            .unwrap()
+            .insert("iat".into(), json!(iat));
     } else {
-        claims.as_object_mut().unwrap().insert("iat".into(), json!(now));
+        claims
+            .as_object_mut()
+            .unwrap()
+            .insert("iat".into(), json!(now));
     }
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -601,7 +607,9 @@ async fn enforces_exact_iat_exp_and_lifetime_bounds(pool: PgPool) {
         },
     );
     assert_eq!(
-        request_feed(&setup.app, &token_iat_min_exp_max).await.status(),
+        request_feed(&setup.app, &token_iat_min_exp_max)
+            .await
+            .status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -676,7 +684,10 @@ async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: P
         }],
         service: vec![],
     };
-    setup.state.did_resolver.insert_cached(bob_did.into(), bob_doc);
+    setup
+        .state
+        .did_resolver
+        .insert_cached(bob_did.into(), bob_doc);
     // 3. Mismatch: Token signed by secp256k1 key with alg: "ES256" -> rejected
     let now = Utc::now().timestamp();
     let header_secp_wrong_alg = json!({
@@ -699,7 +710,9 @@ async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: P
     let secp_wrong_alg_token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
     assert_eq!(
-        request_feed(&setup.app, &secp_wrong_alg_token).await.status(),
+        request_feed(&setup.app, &secp_wrong_alg_token)
+            .await
+            .status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -812,7 +825,7 @@ fn complete_ipv6_and_ipv4_non_global_policy_coverage() {
     // IPv4: IANA globally reachable exceptions in 192.0.0.0/24
     assert!(!is_private_ipv4(&"192.0.0.9".parse::<Ipv4Addr>().unwrap())); // PCP Anycast (RFC 7723)
     assert!(!is_private_ipv4(&"192.0.0.10".parse::<Ipv4Addr>().unwrap())); // TURN Anycast (RFC 8155)
-    // IPv4: Non-global remainder of 192.0.0.0/24
+                                                                           // IPv4: Non-global remainder of 192.0.0.0/24
     assert!(is_private_ipv4(&"192.0.0.1".parse::<Ipv4Addr>().unwrap()));
     assert!(is_private_ipv4(&"192.0.0.8".parse::<Ipv4Addr>().unwrap()));
     assert!(is_private_ipv4(&"192.0.0.11".parse::<Ipv4Addr>().unwrap()));
@@ -823,22 +836,36 @@ fn complete_ipv6_and_ipv4_non_global_policy_coverage() {
     assert!(!is_private_ipv6(&"2001:1::2".parse::<Ipv6Addr>().unwrap())); // TURN Anycast (RFC 8155)
     assert!(!is_private_ipv6(&"2001:1::3".parse::<Ipv6Addr>().unwrap())); // DNS-SD Anycast
     assert!(!is_private_ipv6(&"2001:3::1".parse::<Ipv6Addr>().unwrap())); // AMT (RFC 7450)
-    assert!(!is_private_ipv6(&"2001:4:112::1".parse::<Ipv6Addr>().unwrap())); // AS112-v6 (RFC 7535)
+    assert!(!is_private_ipv6(
+        &"2001:4:112::1".parse::<Ipv6Addr>().unwrap()
+    )); // AS112-v6 (RFC 7535)
     assert!(!is_private_ipv6(&"2001:20::1".parse::<Ipv6Addr>().unwrap())); // ORCHIDv2 (RFC 7343)
-    assert!(!is_private_ipv6(&"2001:2f:ffff::1".parse::<Ipv6Addr>().unwrap())); // ORCHIDv2 end of /28
+    assert!(!is_private_ipv6(
+        &"2001:2f:ffff::1".parse::<Ipv6Addr>().unwrap()
+    )); // ORCHIDv2 end of /28
     assert!(!is_private_ipv6(&"2001:30::1".parse::<Ipv6Addr>().unwrap())); // Drone Remote ID DETs (RFC 9374)
-    assert!(!is_private_ipv6(&"2001:3f:ffff::1".parse::<Ipv6Addr>().unwrap())); // Drone Remote ID end of /28
+    assert!(!is_private_ipv6(
+        &"2001:3f:ffff::1".parse::<Ipv6Addr>().unwrap()
+    )); // Drone Remote ID end of /28
 
     // IPv6: Non-global remainder inside 2001::/23
-    assert!(is_private_ipv6(&"2001:0000::1".parse::<Ipv6Addr>().unwrap())); // TEREDO (RFC 4380)
+    assert!(is_private_ipv6(
+        &"2001:0000::1".parse::<Ipv6Addr>().unwrap()
+    )); // TEREDO (RFC 4380)
     assert!(is_private_ipv6(&"2001:1::4".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"2001:2::1".parse::<Ipv6Addr>().unwrap())); // Benchmarking (RFC 5180)
-    assert!(is_private_ipv6(&"2001:4:113::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(
+        &"2001:4:113::1".parse::<Ipv6Addr>().unwrap()
+    ));
     assert!(is_private_ipv6(&"2001:5::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"2001:10::1".parse::<Ipv6Addr>().unwrap())); // Deprecated ORCHID (RFC 4843)
     assert!(is_private_ipv6(&"2001:1f::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"2001:40::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"2001:01ff:ffff:ffff:ffff:ffff:ffff:ffff".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(
+        &"2001:01ff:ffff:ffff:ffff:ffff:ffff:ffff"
+            .parse::<Ipv6Addr>()
+            .unwrap()
+    ));
 
     // Documentation ranges (2001:db8::/32 and 3fff::/20)
     assert!(is_private_ipv6(&"2001:db8::1".parse::<Ipv6Addr>().unwrap()));
@@ -846,14 +873,18 @@ fn complete_ipv6_and_ipv4_non_global_policy_coverage() {
 
     // Discard and Dummy prefixes (100::/64, 100:0:0:1::/64)
     assert!(is_private_ipv6(&"100::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"100:0:0:1::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(
+        &"100:0:0:1::1".parse::<Ipv6Addr>().unwrap()
+    ));
 
     // SRv6 SIDs (5f00::/16)
     assert!(is_private_ipv6(&"5f00::1".parse::<Ipv6Addr>().unwrap()));
 
     // ULA (fc00::/7), Link-Local (fe80::/10), Site-Local (fec0::/10)
     assert!(is_private_ipv6(&"fc00::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"fd12:3456:789a::1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(
+        &"fd12:3456:789a::1".parse::<Ipv6Addr>().unwrap()
+    ));
     assert!(is_private_ipv6(&"fe80::1".parse::<Ipv6Addr>().unwrap()));
     assert!(is_private_ipv6(&"fec0::1".parse::<Ipv6Addr>().unwrap()));
 
@@ -862,13 +893,21 @@ fn complete_ipv6_and_ipv4_non_global_policy_coverage() {
     assert!(is_private_ipv6(&"::".parse::<Ipv6Addr>().unwrap()));
 
     // IPv4-mapped private
-    assert!(is_private_ipv6(&"::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()));
-    assert!(is_private_ipv6(&"::ffff:192.168.1.1".parse::<Ipv6Addr>().unwrap()));
+    assert!(is_private_ipv6(
+        &"::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()
+    ));
+    assert!(is_private_ipv6(
+        &"::ffff:192.168.1.1".parse::<Ipv6Addr>().unwrap()
+    ));
 
     // Public globally reachable IPv6 addresses outside 2001::/23
     assert!(!is_private_ipv6(&"2600::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(!is_private_ipv6(&"2001:0200::1".parse::<Ipv6Addr>().unwrap()));
-    assert!(!is_private_ipv6(&"2a00:1450:4009:81f::200e".parse::<Ipv6Addr>().unwrap()));
+    assert!(!is_private_ipv6(
+        &"2001:0200::1".parse::<Ipv6Addr>().unwrap()
+    ));
+    assert!(!is_private_ipv6(
+        &"2a00:1450:4009:81f::200e".parse::<Ipv6Addr>().unwrap()
+    ));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -937,12 +976,18 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
     );
 
     // Verify successful 200 OK without cache shortcut
-    assert_eq!(request_feed(&app, &public_token).await.status(), StatusCode::OK);
+    assert_eq!(
+        request_feed(&app, &public_token).await.status(),
+        StatusCode::OK
+    );
 
     // Verify transport was actually invoked with correct URL, host, and pinned socket
     let fetches = captured.lock().unwrap().clone();
     assert_eq!(fetches.len(), 1);
-    assert_eq!(fetches[0].0, "https://bluecatbird.io:443/.well-known/did.json");
+    assert_eq!(
+        fetches[0].0,
+        "https://bluecatbird.io:443/.well-known/did.json"
+    );
     assert_eq!(fetches[0].1, "bluecatbird.io");
     assert_eq!(fetches[0].2, public_socket);
 
@@ -984,7 +1029,9 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         None,
     );
     assert_eq!(
-        request_feed(&app_private, &private_dns_token).await.status(),
+        request_feed(&app_private, &private_dns_token)
+            .await
+            .status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -1109,7 +1156,8 @@ async fn run_production_pinned_client_tls_fixture() {
                     let response = "HTTP/1.1 302 Found\r\nLocation: /.well-known/did.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else {
-                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 }
                 let _ = tls_stream.shutdown().await;
@@ -1164,7 +1212,10 @@ async fn run_production_pinned_client_tls_fixture() {
         wrong_pin_res.is_err(),
         "Connecting to non-listening pinned address must fail immediately"
     );
-    assert_eq!(wrong_pin_res.err().unwrap(), AuthReason::DidResolutionFailed);
+    assert_eq!(
+        wrong_pin_res.err().unwrap(),
+        AuthReason::DidResolutionFailed
+    );
 
     // 8. Direct build_did_web_client verification (production builder function)
     let client = build_did_web_client(

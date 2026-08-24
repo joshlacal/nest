@@ -5,8 +5,7 @@ use axum::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use catbird_atproto::generated::blue_catbird::circle::{
-    activate_space::ActivateSpaceOutput,
-    defs::AccessState,
+    activate_space::ActivateSpaceOutput, defs::AccessState,
 };
 use chrono::{DateTime, Utc};
 use circle_appview::{
@@ -21,8 +20,8 @@ use circle_appview::{
     projections::{self, Projection},
     routes::create_router,
     space_client::{
-        calculate_rfc7638_jkt, DefaultSpaceHostTransport, MockSpaceHostTransport,
-        SpaceClient, SpaceHostDnsResolver, SpaceHostTransport,
+        calculate_rfc7638_jkt, DefaultSpaceHostTransport, MockSpaceHostTransport, SpaceClient,
+        SpaceHostDnsResolver, SpaceHostTransport,
     },
 };
 use p256::ecdsa::signature::{Signer, Verifier};
@@ -341,7 +340,8 @@ impl SpaceHostTransport for DynamicMockTransport {
         dpop_proof: &'a str,
         space_uri: &'a str,
         client_attestation: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>>
+    {
         let call = circle_appview::space_client::RecordedSpaceHostCall {
             endpoint_url: target_url.to_string(),
             delegation_token: delegation_token.to_string(),
@@ -355,43 +355,91 @@ impl SpaceHostTransport for DynamicMockTransport {
         let parts: Vec<&str> = dpop_proof.split('.').collect();
         if parts.len() != 3 {
             return Box::pin(async {
-                Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP proof format".into()))
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP proof format".into(),
+                ))
             });
         }
 
         let header_bytes = match URL_SAFE_NO_PAD.decode(parts[0]) {
             Ok(b) => b,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP header".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP header".into(),
+                    ))
+                })
+            }
         };
         let header: serde_json::Value = match serde_json::from_slice(&header_bytes) {
             Ok(h) => h,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP header JSON".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP header JSON".into(),
+                    ))
+                })
+            }
         };
 
         if header.get("typ").and_then(|v| v.as_str()) != Some("dpop+jwt") {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP typ".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP typ".into(),
+                ))
+            });
         }
         if header.get("alg").and_then(|v| v.as_str()) != Some("ES256") {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP alg".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP alg".into(),
+                ))
+            });
         }
 
         let jwk = match header.get("jwk") {
             Some(j) => j,
-            None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP jwk".into())) }),
+            None => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Missing DPoP jwk".into(),
+                    ))
+                })
+            }
         };
         if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC") {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP jwk kty".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP jwk kty".into(),
+                ))
+            });
         }
         if jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256") {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP jwk crv".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP jwk crv".into(),
+                ))
+            });
         }
         let x = match jwk.get("x").and_then(|v| v.as_str()) {
             Some(x) => x,
-            None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP x".into())) }),
+            None => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Missing DPoP x".into(),
+                    ))
+                })
+            }
         };
         let y = match jwk.get("y").and_then(|v| v.as_str()) {
             Some(y) => y,
-            None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP y".into())) }),
+            None => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Missing DPoP y".into(),
+                    ))
+                })
+            }
         };
         let x_bytes = URL_SAFE_NO_PAD.decode(x).unwrap();
         let y_bytes = URL_SAFE_NO_PAD.decode(y).unwrap();
@@ -402,48 +450,109 @@ impl SpaceHostTransport for DynamicMockTransport {
         let ep = p256::EncodedPoint::from_affine_coordinates(&xb, &yb, false);
         let verifying_key = match p256::ecdsa::VerifyingKey::from_encoded_point(&ep) {
             Ok(vk) => vk,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP key point".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP key point".into(),
+                    ))
+                })
+            }
         };
 
         let payload_bytes = match URL_SAFE_NO_PAD.decode(parts[1]) {
             Ok(b) => b,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP payload".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP payload".into(),
+                    ))
+                })
+            }
         };
         let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
             Ok(p) => p,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP payload JSON".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP payload JSON".into(),
+                    ))
+                })
+            }
         };
 
         if payload.get("htm").and_then(|v| v.as_str()) != Some("POST") {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP htm".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP htm".into(),
+                ))
+            });
         }
         if payload.get("htu").and_then(|v| v.as_str()) != Some(target_url.as_str()) {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP htu".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "Invalid DPoP htu".into(),
+                ))
+            });
         }
         let iat = match payload.get("iat").and_then(|v| v.as_i64()) {
             Some(i) => i,
-            None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP iat".into())) }),
+            None => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Missing DPoP iat".into(),
+                    ))
+                })
+            }
         };
         let now_epoch = Utc::now().timestamp();
         if iat > now_epoch + 300 || iat < now_epoch - 300 {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("DPoP iat out of range".into())) });
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "DPoP iat out of range".into(),
+                ))
+            });
         }
         let _jti = match payload.get("jti").and_then(|v| v.as_str()) {
             Some(j) if !j.is_empty() => j,
-            _ => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing or empty DPoP jti".into())) }),
+            _ => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Missing or empty DPoP jti".into(),
+                    ))
+                })
+            }
         };
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         let sig_bytes = match URL_SAFE_NO_PAD.decode(parts[2]) {
             Ok(b) => b,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP sig encoding".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP sig encoding".into(),
+                    ))
+                })
+            }
         };
         let sig = match p256::ecdsa::Signature::from_slice(&sig_bytes) {
             Ok(s) => s,
-            Err(_) => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP sig format".into())) }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(circle_appview::error::AppError::InvalidRequest(
+                        "Invalid DPoP sig format".into(),
+                    ))
+                })
+            }
         };
 
-        if verifying_key.verify(signing_input.as_bytes(), &sig).is_err() {
-            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("DPoP signature verification failed".into())) });
+        if verifying_key
+            .verify(signing_input.as_bytes(), &sig)
+            .is_err()
+        {
+            return Box::pin(async {
+                Err(circle_appview::error::AppError::InvalidRequest(
+                    "DPoP signature verification failed".into(),
+                ))
+            });
         }
 
         let jkt = calculate_rfc7638_jkt(&verifying_key);
@@ -543,7 +652,10 @@ async fn successful_exchange_creates_lease_for_token_issuer(pool: PgPool) {
     let calls = dyn_transport.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].client_attestation, "nest-attestation-mock");
-    assert_eq!(calls[0].endpoint_url, format!("{SPACE_HOST_ENDPOINT}/xrpc/com.atproto.space.getSpaceCredential"));
+    assert_eq!(
+        calls[0].endpoint_url,
+        format!("{SPACE_HOST_ENDPOINT}/xrpc/com.atproto.space.getSpaceCredential")
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -816,7 +928,9 @@ async fn rejects_space_credential_with_alg_key_curve_mismatch(pool: PgPool) {
             dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let parts: Vec<&str> = dpop_proof.split('.').collect();
             let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
             let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
@@ -854,10 +968,12 @@ async fn rejects_space_credential_with_alg_key_curve_mismatch(pool: PgPool) {
         }
     }
 
-    let custom_space_client = Arc::new(SpaceClient::with_transport(Arc::new(MismatchedAlgTransport {
-        authority_key: setup.authority_signing_key.clone(),
-        authority_did: AUTHORITY_DID.to_string(),
-    })));
+    let custom_space_client = Arc::new(SpaceClient::with_transport(Arc::new(
+        MismatchedAlgTransport {
+            authority_key: setup.authority_signing_key.clone(),
+            authority_did: AUTHORITY_DID.to_string(),
+        },
+    )));
 
     let state = AppState::with_services(
         (*setup.state.config).clone(),
@@ -925,7 +1041,9 @@ async fn rejects_space_credential_with_wrong_signature(pool: PgPool) {
             dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let parts: Vec<&str> = dpop_proof.split('.').collect();
             let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
             let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
@@ -955,10 +1073,12 @@ async fn rejects_space_credential_with_wrong_signature(pool: PgPool) {
         }
     }
 
-    let custom_space_client = Arc::new(SpaceClient::with_transport(Arc::new(AttackerSignedTransport {
-        attacker_key,
-        authority_did: AUTHORITY_DID.to_string(),
-    })));
+    let custom_space_client = Arc::new(SpaceClient::with_transport(Arc::new(
+        AttackerSignedTransport {
+            attacker_key,
+            authority_did: AUTHORITY_DID.to_string(),
+        },
+    )));
 
     let state = AppState::with_services(
         (*setup.state.config).clone(),
@@ -1023,7 +1143,9 @@ async fn rejects_space_credential_with_mismatched_jkt(pool: PgPool) {
             _dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let now = Utc::now().timestamp();
             let cred = mint_space_credential(
                 &self.authority_key,
@@ -1108,7 +1230,9 @@ async fn rejects_space_credential_with_expired_time(pool: PgPool) {
             dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let parts: Vec<&str> = dpop_proof.split('.').collect();
             let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
             let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
@@ -1138,10 +1262,12 @@ async fn rejects_space_credential_with_expired_time(pool: PgPool) {
         }
     }
 
-    let custom_space_client = Arc::new(SpaceClient::with_transport(Arc::new(ExpiredCredTransport {
-        authority_key: setup.authority_signing_key.clone(),
-        authority_did: AUTHORITY_DID.to_string(),
-    })));
+    let custom_space_client = Arc::new(SpaceClient::with_transport(Arc::new(
+        ExpiredCredTransport {
+            authority_key: setup.authority_signing_key.clone(),
+            authority_did: AUTHORITY_DID.to_string(),
+        },
+    )));
 
     let state = AppState::with_services(
         (*setup.state.config).clone(),
@@ -1214,7 +1340,12 @@ async fn space_host_resolution_falls_back_to_atproto_pds(pool: PgPool) {
         .insert_cached(AUTHORITY_DID.into(), pds_doc);
 
     let (endpoint, service_id) = access::resolve_space_host_endpoint(
-        &setup.state.did_resolver.resolve(AUTHORITY_DID).await.unwrap(),
+        &setup
+            .state
+            .did_resolver
+            .resolve(AUTHORITY_DID)
+            .await
+            .unwrap(),
         AUTHORITY_DID,
     )
     .unwrap();
@@ -1317,11 +1448,12 @@ async fn removal_invalidates_lease_without_deleting_circle_records(pool: PgPool)
     assert!(lease_exists.is_none());
 
     // 4. Verify circle records were NOT deleted
-    let record_count: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_records WHERE space_uri = $1")
-        .bind(&space)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let record_count: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM circle_records WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(record_count.0, 1);
 }
 
@@ -1379,14 +1511,18 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     .await;
     assert!(res2.is_ok());
     // Populate active credential in in-memory store
-    setup.state.credential_store.insert(
-        space.clone(),
-        ActiveSpaceCredential {
-            token: "tok_secret".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
-            expires_at: Utc::now() + chrono::Duration::hours(1),
-        },
-    ).await;
+    setup
+        .state
+        .credential_store
+        .insert(
+            space.clone(),
+            ActiveSpaceCredential {
+                token: "tok_secret".into(),
+                dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await;
     assert!(setup.state.credential_store.get(&space).await.is_some());
 
     // CircleDelete -> cascades DB and purges in-memory CredentialStore
@@ -1421,13 +1557,12 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     assert!(setup.state.credential_store.get(&space).await.is_none());
 
     // Verify deletion tombstone exists
-    let tombstone: Option<(i64,)> = sqlx::query_as(
-        "SELECT generation FROM circle_tombstones WHERE space_uri = $1",
-    )
-    .bind(&space)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let tombstone: Option<(i64,)> =
+        sqlx::query_as("SELECT generation FROM circle_tombstones WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
     assert!(tombstone.is_some());
 
     // Stale upsert with older/equal generation on tombstoned Circle does NOT resurrect
@@ -1460,13 +1595,12 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     .await;
     assert!(stale_res.is_ok());
 
-    let circle_row: Option<(String,)> = sqlx::query_as(
-        "SELECT space_uri FROM circles WHERE space_uri = $1",
-    )
-    .bind(&space)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let circle_row: Option<(String,)> =
+        sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
     assert!(circle_row.is_none());
 }
 
@@ -1483,11 +1617,8 @@ async fn projection_route_dual_auth_and_actor_binding(pool: PgPool) {
         "blue.catbird.circle.syncProjection",
     );
 
-    let nest_attestation = mint_nest_attestation(
-        &setup.nest_signing_key,
-        NEST_CLIENT_ID,
-        CIRCLE_AUDIENCE,
-    );
+    let nest_attestation =
+        mint_nest_attestation(&setup.nest_signing_key, NEST_CLIENT_ID, CIRCLE_AUDIENCE);
 
     let body = json!({
         "operationId": op_id,
@@ -1539,7 +1670,10 @@ async fn projection_route_dual_auth_and_actor_binding(pool: PgPool) {
     let req_no_att = Request::builder()
         .uri("/internal/projections")
         .method("POST")
-        .header(header::AUTHORIZATION, format!("Bearer {service_auth_no_att}"))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {service_auth_no_att}"),
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&body_no_att).unwrap()))
         .unwrap();
@@ -1587,11 +1721,8 @@ async fn projection_route_dual_auth_and_actor_binding(pool: PgPool) {
         CIRCLE_AUDIENCE,
         "blue.catbird.circle.syncProjection",
     );
-    let fresh_nest_att = mint_nest_attestation(
-        &setup.nest_signing_key,
-        NEST_CLIENT_ID,
-        CIRCLE_AUDIENCE,
-    );
+    let fresh_nest_att =
+        mint_nest_attestation(&setup.nest_signing_key, NEST_CLIENT_ID, CIRCLE_AUDIENCE);
 
     let op_id3 = Uuid::new_v4();
     let body3 = json!({
@@ -1969,7 +2100,10 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
         &digest_diff_gen,
     )
     .await;
-    assert!(matches!(res2, Err(circle_appview::error::AppError::Conflict(_))));
+    assert!(matches!(
+        res2,
+        Err(circle_appview::error::AppError::Conflict(_))
+    ));
 
     // Replay with digest_diff_c_gen -> 409 Conflict
     let res3 = projections::apply_projection(
@@ -1981,7 +2115,10 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
         &digest_diff_c_gen,
     )
     .await;
-    assert!(matches!(res3, Err(circle_appview::error::AppError::Conflict(_))));
+    assert!(matches!(
+        res3,
+        Err(circle_appview::error::AppError::Conflict(_))
+    ));
 
     // Replay with digest_diff_m_gen -> 409 Conflict
     let res4 = projections::apply_projection(
@@ -1993,7 +2130,10 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
         &digest_diff_m_gen,
     )
     .await;
-    assert!(matches!(res4, Err(circle_appview::error::AppError::Conflict(_))));
+    assert!(matches!(
+        res4,
+        Err(circle_appview::error::AppError::Conflict(_))
+    ));
 
     // Replay with digest_diff_key -> 409 Conflict
     let res5 = projections::apply_projection(
@@ -2005,7 +2145,10 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
         &digest_diff_key,
     )
     .await;
-    assert!(matches!(res5, Err(circle_appview::error::AppError::Conflict(_))));
+    assert!(matches!(
+        res5,
+        Err(circle_appview::error::AppError::Conflict(_))
+    ));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -2026,7 +2169,9 @@ async fn member_projection_requires_explicit_circle_and_member_generation(pool: 
         member_generation: None,
     };
     let err1 = input_missing_c_gen.to_projection();
-    assert!(matches!(err1, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing circleGeneration")));
+    assert!(
+        matches!(err1, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing circleGeneration"))
+    );
 
     // 2. MemberAdd with legacy generation only -> rejected (no legacy fallback)
     let input_legacy_only = projections::SyncProjectionInput {
@@ -2041,7 +2186,9 @@ async fn member_projection_requires_explicit_circle_and_member_generation(pool: 
         member_generation: None,
     };
     let err2 = input_legacy_only.to_projection();
-    assert!(matches!(err2, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing circleGeneration")));
+    assert!(
+        matches!(err2, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing circleGeneration"))
+    );
 
     // 3. MemberAdd missing memberGeneration -> rejected
     let input_missing_m_gen = projections::SyncProjectionInput {
@@ -2056,7 +2203,9 @@ async fn member_projection_requires_explicit_circle_and_member_generation(pool: 
         member_generation: None,
     };
     let err3 = input_missing_m_gen.to_projection();
-    assert!(matches!(err3, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing memberGeneration")));
+    assert!(
+        matches!(err3, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing memberGeneration"))
+    );
 
     // 4. Conflicting top-level vs payload circleGeneration -> rejected
     let input_conflicting_c_gen = projections::SyncProjectionInput {
@@ -2071,7 +2220,9 @@ async fn member_projection_requires_explicit_circle_and_member_generation(pool: 
         member_generation: Some(1),
     };
     let err4 = input_conflicting_c_gen.to_projection();
-    assert!(matches!(err4, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Conflicting circleGeneration")));
+    assert!(
+        matches!(err4, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Conflicting circleGeneration"))
+    );
 
     // 5. Conflicting top-level vs payload memberGeneration -> rejected
     let input_conflicting_m_gen = projections::SyncProjectionInput {
@@ -2086,7 +2237,9 @@ async fn member_projection_requires_explicit_circle_and_member_generation(pool: 
         member_generation: Some(2), // Conflicting!
     };
     let err5 = input_conflicting_m_gen.to_projection();
-    assert!(matches!(err5, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Conflicting memberGeneration")));
+    assert!(
+        matches!(err5, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Conflicting memberGeneration"))
+    );
 
     // 6. Fully explicit valid MemberAdd -> succeeds
     let input_valid = projections::SyncProjectionInput {
@@ -2101,12 +2254,15 @@ async fn member_projection_requires_explicit_circle_and_member_generation(pool: 
         member_generation: Some(1),
     };
     let proj = input_valid.to_projection().unwrap();
-    assert_eq!(proj, Projection::MemberAdd {
-        space,
-        member: BOB_DID.to_string(),
-        circle_generation: 1,
-        member_generation: 1,
-    });
+    assert_eq!(
+        proj,
+        Projection::MemberAdd {
+            space,
+            member: BOB_DID.to_string(),
+            circle_generation: 1,
+            member_generation: 1,
+        }
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -2150,7 +2306,8 @@ async fn concurrent_receipt_claims_under_race(pool: PgPool) {
         let upsert = upsert.clone();
         let digest = digest.clone();
         handles.push(tokio::spawn(async move {
-            projections::apply_projection(&pool, Some(&store), Some(&locks), op_id, upsert, &digest).await
+            projections::apply_projection(&pool, Some(&store), Some(&locks), op_id, upsert, &digest)
+                .await
         }));
     }
 
@@ -2160,11 +2317,12 @@ async fn concurrent_receipt_claims_under_race(pool: PgPool) {
     }
 
     // Verify only ONE receipt row exists in database
-    let count: (i64,) = sqlx::query_as("SELECT count(*) FROM projection_receipts WHERE operation_id = $1")
-        .bind(op_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM projection_receipts WHERE operation_id = $1")
+            .bind(op_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count.0, 1);
 }
 
@@ -2208,7 +2366,9 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
             dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let auth_key = self.authority_key.clone();
             let auth_did = self.authority_did.clone();
             let space = space_uri.to_string();
@@ -2349,11 +2509,17 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
     exchange_release.notify_one();
 
     let activation_res = activation_handle.await.unwrap();
-    assert!(activation_res.is_ok(), "Activation must succeed while holding lock first");
+    assert!(
+        activation_res.is_ok(),
+        "Activation must succeed while holding lock first"
+    );
 
     // Now projection unblocks, acquires _space_lock, deletes circle & lease, and purges CredentialStore
     let projection_res = projection_handle.await.unwrap();
-    assert!(projection_res.is_ok(), "Projection must succeed after acquiring released lock");
+    assert!(
+        projection_res.is_ok(),
+        "Projection must succeed after acquiring released lock"
+    );
 
     // In-memory store must be purged by the deletion projection
     assert!(setup.state.credential_store.get(&space).await.is_none());
@@ -2445,7 +2611,14 @@ async fn concurrent_circle_deletion_blocks_and_rejects_activation(pool: PgPool) 
     let space_for_act = space.clone();
     let dt_clone = delegation_token.clone();
     let activation_handle = tokio::spawn(async move {
-        access::activate_space(&state_clone, ALICE_DID, &space_for_act, &dt_clone, "attestation").await
+        access::activate_space(
+            &state_clone,
+            ALICE_DID,
+            &space_for_act,
+            &dt_clone,
+            "attestation",
+        )
+        .await
     });
 
     // Wait until activation is observed waiting on the lock
@@ -2477,7 +2650,10 @@ async fn concurrent_circle_deletion_blocks_and_rejects_activation(pool: PgPool) 
 
     // Activation unblocks, acquires lock, queries DB, sees tombstone, strictly rejected
     let act_res = activation_handle.await.unwrap();
-    assert!(matches!(act_res, Err(circle_appview::error::AppError::Forbidden(_))));
+    assert!(matches!(
+        act_res,
+        Err(circle_appview::error::AppError::Forbidden(_))
+    ));
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
 
@@ -2521,7 +2697,9 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
             dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let auth_key = self.authority_key.clone();
             let auth_did = self.authority_did.clone();
             let space = space_uri.to_string();
@@ -2660,11 +2838,17 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
     exchange_release.notify_one();
 
     let activation_res = activation_handle.await.unwrap();
-    assert!(activation_res.is_ok(), "Activation must succeed when holding lock first");
+    assert!(
+        activation_res.is_ok(),
+        "Activation must succeed when holding lock first"
+    );
 
     // Now MemberRemove unblocks, acquires lock, updates member status, and purges CredentialStore
     let projection_res = projection_handle.await.unwrap();
-    assert!(projection_res.is_ok(), "MemberRemove must succeed after acquiring released lock");
+    assert!(
+        projection_res.is_ok(),
+        "MemberRemove must succeed after acquiring released lock"
+    );
 
     assert!(setup.state.credential_store.get(&space).await.is_none());
 
@@ -2748,7 +2932,14 @@ async fn concurrent_member_removal_blocks_and_rejects_activation(pool: PgPool) {
     let space_for_act = space.clone();
     let dt_clone = delegation_token.clone();
     let activation_handle = tokio::spawn(async move {
-        access::activate_space(&state_clone, ALICE_DID, &space_for_act, &dt_clone, "attestation").await
+        access::activate_space(
+            &state_clone,
+            ALICE_DID,
+            &space_for_act,
+            &dt_clone,
+            "attestation",
+        )
+        .await
     });
 
     let mut waited = 0;
@@ -2780,7 +2971,10 @@ async fn concurrent_member_removal_blocks_and_rejects_activation(pool: PgPool) {
     drop(rem_lock_guard);
 
     let act_res = activation_handle.await.unwrap();
-    assert!(matches!(act_res, Err(circle_appview::error::AppError::Forbidden(_))));
+    assert!(matches!(
+        act_res,
+        Err(circle_appview::error::AppError::Forbidden(_))
+    ));
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
 
@@ -2824,7 +3018,9 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
             dpop_proof: &'a str,
             space_uri: &'a str,
             _client_attestation: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>,
+        > {
             let auth_key = self.authority_key.clone();
             let auth_did = self.authority_did.clone();
             let space = space_uri.to_string();
@@ -3071,11 +3267,12 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
     .unwrap();
 
     // Verify Circle and members are deleted
-    let circle_row: Option<(String,)> = sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
-        .bind(&space)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+    let circle_row: Option<(String,)> =
+        sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
     assert!(circle_row.is_none());
 
     // 5. Delayed pre-delete MemberAdd (circle_generation: 1, member_generation: 3) arrives
@@ -3109,19 +3306,27 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
     assert!(delayed_res.is_ok());
 
     // CRITICAL: Delayed MemberAdd for deleted circle epoch must NOT resurrect circle or create member!
-    let resurrected_circle: Option<(String,)> = sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
-        .bind(&space)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-    assert!(resurrected_circle.is_none(), "Stale MemberAdd must not recreate parent circle");
+    let resurrected_circle: Option<(String,)> =
+        sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(
+        resurrected_circle.is_none(),
+        "Stale MemberAdd must not recreate parent circle"
+    );
 
-    let resurrected_member: Option<(String,)> = sqlx::query_as("SELECT member_did FROM circle_members WHERE space_uri = $1")
-        .bind(&space)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-    assert!(resurrected_member.is_none(), "Stale MemberAdd must not recreate member row");
+    let resurrected_member: Option<(String,)> =
+        sqlx::query_as("SELECT member_did FROM circle_members WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(
+        resurrected_member.is_none(),
+        "Stale MemberAdd must not recreate member row"
+    );
 
     // 6. Newer legitimate Circle epoch (generation 3) is created
     let upsert_op2 = Uuid::new_v4();
@@ -3154,11 +3359,12 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
     .await
     .unwrap();
 
-    let new_circle: Option<(String, i64)> = sqlx::query_as("SELECT space_uri, generation FROM circles WHERE space_uri = $1")
-        .bind(&space)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+    let new_circle: Option<(String, i64)> =
+        sqlx::query_as("SELECT space_uri, generation FROM circles WHERE space_uri = $1")
+            .bind(&space)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
     assert!(new_circle.is_some());
     assert_eq!(new_circle.unwrap().1, 3);
 
@@ -3229,10 +3435,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 1. Generate TLS self-signed cert for space.example.org
-    let params = rcgen::CertificateParams::new(vec![
-        "space.example.org".to_string(),
-    ])
-    .unwrap();
+    let params = rcgen::CertificateParams::new(vec!["space.example.org".to_string()]).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_pem = cert.pem();
@@ -3289,11 +3492,20 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                         );
                         let _ = tls_stream.write_all(response.as_bytes()).await;
                     }
+                } else if req_str.starts_with("POST /redirect-target") {
+                    let body = r#"{"credential":"test.space.credential.jwt"}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else if req_str.starts_with("POST /redirect") {
-                    let response = "HTTP/1.1 302 Found\r\nLocation: /xrpc/com.atproto.space.getSpaceCredential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else {
-                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 }
                 let _ = tls_stream.shutdown().await;
@@ -3345,7 +3557,10 @@ async fn ssrf_safe_transport_dns_seam_validations() {
             "test-attestation",
         )
         .await;
-    assert!(redirect_res.is_err(), "Redirect must be rejected by Policy::none()");
+    assert!(
+        redirect_res.is_err(),
+        "Redirect must be rejected by Policy::none()"
+    );
 
     // 3. Mixed DNS answers (one public, one private) -> strictly rejected in production mode
     let mixed_resolver = Arc::new(MockDnsResolver {
@@ -3358,7 +3573,12 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     let err_mixed = transport_mixed
         .get_space_credential(&target_url, "token", "dpop", "space", "attestation")
         .await;
-    assert!(matches!(err_mixed, Err(circle_appview::error::AppError::Unauthorized(AuthReason::SsrfBlocked))));
+    assert!(matches!(
+        err_mixed,
+        Err(circle_appview::error::AppError::Unauthorized(
+            AuthReason::SsrfBlocked
+        ))
+    ));
 
     // 4. Private-only DNS answers -> strictly rejected in production mode
     let private_resolver = Arc::new(MockDnsResolver {
@@ -3368,7 +3588,12 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     let err_private = transport_private
         .get_space_credential(&target_url, "token", "dpop", "space", "attestation")
         .await;
-    assert!(matches!(err_private, Err(circle_appview::error::AppError::Unauthorized(AuthReason::SsrfBlocked))));
+    assert!(matches!(
+        err_private,
+        Err(circle_appview::error::AppError::Unauthorized(
+            AuthReason::SsrfBlocked
+        ))
+    ));
 
     // 5. DNS resolution failure -> DidResolutionFailed
     let fail_resolver = Arc::new(MockDnsResolver {
@@ -3378,7 +3603,12 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     let err_fail = transport_fail
         .get_space_credential(&target_url, "token", "dpop", "space", "attestation")
         .await;
-    assert!(matches!(err_fail, Err(circle_appview::error::AppError::Unauthorized(AuthReason::DidResolutionFailed))));
+    assert!(matches!(
+        err_fail,
+        Err(circle_appview::error::AppError::Unauthorized(
+            AuthReason::DidResolutionFailed
+        ))
+    ));
 }
 
 #[tokio::test]
@@ -3388,10 +3618,7 @@ async fn startup_jwks_loader_and_verifier_tests() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 1. Generate TLS self-signed cert for nest.catbird.blue
-    let params = rcgen::CertificateParams::new(vec![
-        "nest.catbird.blue".to_string(),
-    ])
-    .unwrap();
+    let params = rcgen::CertificateParams::new(vec!["nest.catbird.blue".to_string()]).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_pem = cert.pem();
@@ -3466,7 +3693,8 @@ async fn startup_jwks_loader_and_verifier_tests() {
                     );
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else {
-                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 }
                 let _ = tls_stream.shutdown().await;
@@ -3487,7 +3715,8 @@ async fn startup_jwks_loader_and_verifier_tests() {
             &'a self,
             _host: &'a str,
             _port: u16,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>>
+        {
             let addr = self.fixture_addr;
             Box::pin(async move { Ok(vec![addr]) })
         }
@@ -3520,8 +3749,12 @@ async fn startup_jwks_loader_and_verifier_tests() {
         web_transport,
     );
 
-    let jwks_url = format!("https://nest.catbird.blue:{}/.well-known/jwks.json", fixture_addr.port());
-    let keys = auth::fetch_https_jwks(&resolver, &jwks_url).await
+    let jwks_url = format!(
+        "https://nest.catbird.blue:{}/.well-known/jwks.json",
+        fixture_addr.port()
+    );
+    let keys = auth::fetch_https_jwks(&resolver, &jwks_url)
+        .await
         .expect("fetch_https_jwks must successfully load and parse keys");
     assert_eq!(keys.len(), 2);
     assert!(matches!(keys[0], ParsedVerifyingKey::P256(_)));
@@ -3535,10 +3768,12 @@ async fn startup_jwks_loader_and_verifier_tests() {
         default_transport,
     );
 
-    let http_res = auth::fetch_https_jwks(&prod_resolver, "http://nest.catbird.blue/jwks.json").await;
+    let http_res =
+        auth::fetch_https_jwks(&prod_resolver, "http://nest.catbird.blue/jwks.json").await;
     assert_eq!(http_res.unwrap_err(), AuthReason::SsrfBlocked);
 
-    let localhost_res = auth::fetch_https_jwks(&prod_resolver, "https://localhost:8443/jwks.json").await;
+    let localhost_res =
+        auth::fetch_https_jwks(&prod_resolver, "https://localhost:8443/jwks.json").await;
     assert_eq!(localhost_res.unwrap_err(), AuthReason::SsrfBlocked);
 
     let private_res = auth::fetch_https_jwks(&prod_resolver, "https://10.0.0.1/jwks.json").await;
@@ -3551,10 +3786,7 @@ async fn run_production_space_host_transport_tls_fixture() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 1. Generate TLS self-signed cert for public hostname space.example.org
-    let params = rcgen::CertificateParams::new(vec![
-        "space.example.org".to_string(),
-    ])
-    .unwrap();
+    let params = rcgen::CertificateParams::new(vec!["space.example.org".to_string()]).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_pem = cert.pem();
@@ -3589,7 +3821,9 @@ async fn run_production_space_host_transport_tls_fixture() {
                     return;
                 };
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") || req_str.starts_with("GET /xrpc/com.atproto.space.getSpaceCredential") {
+                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential")
+                    || req_str.starts_with("GET /xrpc/com.atproto.space.getSpaceCredential")
+                {
                     let has_auth = req_str.contains("Bearer test-delegation-token")
                         || req_str.contains("authorization: Bearer test-delegation-token")
                         || req_str.contains("Authorization: Bearer test-delegation-token");
@@ -3618,7 +3852,8 @@ async fn run_production_space_host_transport_tls_fixture() {
                     let response = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /xrpc/com.atproto.space.getSpaceCredential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 } else {
-                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = tls_stream.write_all(response.as_bytes()).await;
                 }
                 let _ = tls_stream.shutdown().await;
@@ -3670,7 +3905,10 @@ async fn run_production_space_host_transport_tls_fixture() {
             "test-attestation",
         )
         .await;
-    assert!(redirect_res.is_err(), "Redirect must be rejected by Policy::none()");
+    assert!(
+        redirect_res.is_err(),
+        "Redirect must be rejected by Policy::none()"
+    );
 
     // 3. Pinned destination failure: connecting to closed port fails immediately
     let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3680,11 +3918,8 @@ async fn run_production_space_host_transport_tls_fixture() {
     let closed_resolver = Arc::new(MockDnsResolver {
         addrs: Ok(vec![closed_addr]),
     });
-    let transport_closed = DefaultSpaceHostTransport::with_test_fixture(
-        closed_resolver,
-        Some(reqwest_cert),
-        true,
-    );
+    let transport_closed =
+        DefaultSpaceHostTransport::with_test_fixture(closed_resolver, Some(reqwest_cert), true);
     let closed_url = url::Url::parse(&format!(
         "https://space.example.org:{}/xrpc/com.atproto.space.getSpaceCredential",
         closed_addr.port()
@@ -3699,7 +3934,10 @@ async fn run_production_space_host_transport_tls_fixture() {
             "test-attestation",
         )
         .await;
-    assert!(closed_res.is_err(), "Connecting to closed pinned address must fail immediately");
+    assert!(
+        closed_res.is_err(),
+        "Connecting to closed pinned address must fail immediately"
+    );
 }
 
 const SPACE_HOST_PROXY_CANARY: &str = "CANARY_SPACE_HOST_PROXY_SUBPROCESS_EXECUTED_d9a8c7b6";
@@ -3708,8 +3946,14 @@ const POISONED_SPACE_HOST_PROXY_URL: &str = "http://invalid-unreachable-proxy.ex
 #[tokio::test]
 #[ignore = "Subprocess helper executed exclusively by production_space_host_transport_enforces_tls_pinning_no_proxy_and_rejects_redirects"]
 async fn space_host_transport_proxy_subprocess_helper() {
-    assert!(std::env::var("NO_PROXY").is_err(), "NO_PROXY must not be set in subprocess");
-    assert!(std::env::var("no_proxy").is_err(), "no_proxy must not be set in subprocess");
+    assert!(
+        std::env::var("NO_PROXY").is_err(),
+        "NO_PROXY must not be set in subprocess"
+    );
+    assert!(
+        std::env::var("no_proxy").is_err(),
+        "no_proxy must not be set in subprocess"
+    );
     assert_eq!(
         std::env::var("HTTPS_PROXY").ok().as_deref(),
         Some(POISONED_SPACE_HOST_PROXY_URL),
@@ -3758,7 +4002,7 @@ async fn production_space_host_transport_enforces_tls_pinning_no_proxy_and_rejec
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "Subprocess failed to run with poisoned proxy env (no_proxy must bypass invalid proxies):\nstdout:\n{}\nstderr:\n{}",
+        "Subprocess failed to run with poisoned proxy env (transport with no_proxy() must bypass invalid proxies):\nstdout:\n{}\nstderr:\n{}",
         stdout,
         stderr
     );

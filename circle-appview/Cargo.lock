@@ -505,6 +505,8 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_bytes",
+ "serde_ipld_dagcbor",
  "serde_json",
  "sha2",
  "sqlx",
