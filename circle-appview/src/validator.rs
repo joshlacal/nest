@@ -72,15 +72,6 @@ impl ValidationPolicy {
         self
     }
 
-    pub fn with_known_post_uris(
-        mut self,
-        uris: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        for u in uris {
-            self.known_posts.insert(u.into(), String::new());
-        }
-        self
-    }
 
     pub fn known_post_uris(&self) -> HashSet<String> {
         self.known_posts.keys().cloned().collect()
@@ -220,9 +211,7 @@ pub fn validate_record(
                 let known_root_cid = policy.known_posts.get(root_uri);
                 match (known_parent_cid, known_root_cid) {
                     (Some(expected_parent_cid), Some(expected_root_cid)) => {
-                        if (!expected_parent_cid.is_empty() && expected_parent_cid != parent_cid)
-                            || (!expected_root_cid.is_empty() && expected_root_cid != root_cid)
-                        {
+                        if expected_parent_cid != parent_cid || expected_root_cid != root_cid {
                             return Err(InvalidRecord::CrossSpaceReference);
                         }
                     }
@@ -292,7 +281,7 @@ pub fn validate_record(
 
             match policy.known_posts.get(subject_uri) {
                 Some(expected_cid) => {
-                    if !expected_cid.is_empty() && expected_cid != subject_cid {
+                    if expected_cid != subject_cid {
                         return Err(InvalidRecord::CrossSpaceReference);
                     }
                 }

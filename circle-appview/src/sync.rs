@@ -91,7 +91,7 @@ impl SyncEngine {
         space_uri: &str,
         author_did: &str,
     ) -> Result<SyncResult, AppError> {
-        self.sync_repo_with_expected_hash(space_uri, author_did, None).await
+        self.sync_repo_with_expected_commit(space_uri, author_did, None, None).await
     }
 
     pub async fn sync_repo_with_expected_hash(
@@ -99,6 +99,16 @@ impl SyncEngine {
         space_uri: &str,
         author_did: &str,
         expected_authority_hash: Option<&[u8]>,
+    ) -> Result<SyncResult, AppError> {
+        self.sync_repo_with_expected_commit(space_uri, author_did, expected_authority_hash, None).await
+    }
+
+    pub async fn sync_repo_with_expected_commit(
+        &self,
+        space_uri: &str,
+        author_did: &str,
+        expected_authority_hash: Option<&[u8]>,
+        expected_authority_rev: Option<&str>,
     ) -> Result<SyncResult, AppError> {
         let _lock_guard = self.space_locks.acquire(space_uri).await;
 
@@ -253,6 +263,7 @@ impl SyncEngine {
                         }
                         Err(invalid) => {
                             records_rejected += 1;
+                            current_policy.remove_post(&uri);
                             staged_mutations.push(StagedMutation::Rejection {
                                 uri,
                                 reason: invalid,
@@ -301,6 +312,7 @@ impl SyncEngine {
                     &author_signing_key,
                     &policy,
                     expected_authority_hash,
+                    expected_authority_rev,
                 )
                 .await;
         }
@@ -332,11 +344,15 @@ impl SyncEngine {
             .is_ok();
 
             if verified {
-                if let Some(expected_hash) = expected_authority_hash {
-                    commit.hash.as_ref() == expected_hash
-                } else {
-                    true
-                }
+                let hash_ok = match expected_authority_hash {
+                    Some(expected_hash) => commit.hash.as_ref() == expected_hash,
+                    None => true,
+                };
+                let rev_ok = match expected_authority_rev {
+                    Some(expected_rev) => commit.rev.as_str() == expected_rev,
+                    None => true,
+                };
+                hash_ok && rev_ok
             } else {
                 false
             }
@@ -355,6 +371,7 @@ impl SyncEngine {
                     &author_signing_key,
                     &policy,
                     expected_authority_hash,
+                    expected_authority_rev,
                 )
                 .await;
         }
@@ -365,6 +382,12 @@ impl SyncEngine {
         for mutation in staged_mutations {
             match mutation {
                 StagedMutation::UpsertRecord { valid, cid } => {
+                    // Clean up any existing notification generated from this record (e.g. valid update)
+                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                        .bind(&valid.uri)
+                        .execute(&mut *tx)
+                        .await?;
+
                     sqlx::query(
                         r#"
                         INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at, parent_uri, root_uri)
@@ -422,8 +445,8 @@ impl SyncEngine {
                             if recipient != valid.author_did {
                                 sqlx::query(
                                     r#"
-                                    INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, is_read, created_at)
-                                    VALUES ($1, $2, $3, $4, 'like', $5, false, now())
+                                    INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                                    VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
                                     "#,
                                 )
                                 .bind(Uuid::new_v4())
@@ -431,6 +454,7 @@ impl SyncEngine {
                                 .bind(space_uri)
                                 .bind(&valid.author_did)
                                 .bind(post_uri)
+                                .bind(&valid.uri)
                                 .execute(&mut *tx)
                                 .await?;
                             }
@@ -447,14 +471,15 @@ impl SyncEngine {
                             if recipient != valid.author_did {
                                 sqlx::query(
                                     r#"
-                                    INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, is_read, created_at)
-                                    VALUES ($1, $2, $3, $4, 'reply', $5, false, now())
+                                    INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                                    VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
                                     "#,
                                 )
                                 .bind(Uuid::new_v4())
                                 .bind(&recipient)
                                 .bind(space_uri)
                                 .bind(&valid.author_did)
+                                .bind(&valid.uri)
                                 .bind(&valid.uri)
                                 .execute(&mut *tx)
                                 .await?;
@@ -475,7 +500,7 @@ impl SyncEngine {
                         .bind(&uri)
                         .execute(&mut *tx)
                         .await?;
-                    sqlx::query("DELETE FROM circle_notifications WHERE subject_uri = $1")
+                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1 OR subject_uri = $1")
                         .bind(&uri)
                         .execute(&mut *tx)
                         .await?;
@@ -493,7 +518,7 @@ impl SyncEngine {
                         .bind(&uri)
                         .execute(&mut *tx)
                         .await?;
-                    sqlx::query("DELETE FROM circle_notifications WHERE subject_uri = $1")
+                    sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1 OR subject_uri = $1")
                         .bind(&uri)
                         .execute(&mut *tx)
                         .await?;
@@ -512,7 +537,6 @@ impl SyncEngine {
                 }
             }
         }
-
         // Update sync state
         sqlx::query(
             r#"
@@ -553,6 +577,7 @@ impl SyncEngine {
         author_signing_key: &crate::auth::ParsedVerifyingKey,
         policy: &ValidationPolicy,
         expected_authority_hash: Option<&[u8]>,
+        expected_authority_rev: Option<&str>,
     ) -> Result<SyncResult, AppError> {
         let car_bytes = self
             .space_client
@@ -573,10 +598,20 @@ impl SyncEngine {
         let mut staged_valid_records = Vec::new();
         let mut staged_rejections = Vec::new();
         let mut current_policy = policy.clone();
-        // Exclude prior recovered author posts from initial reference policy
-        current_policy
-            .known_posts
-            .retain(|uri, _| !uri.contains(author_did));
+        
+        // Exact query of other authors' active posts directly from DB (no substring matching)
+        let other_authors_posts: Vec<(String, String)> = sqlx::query_as(
+            "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did != $2 AND collection = 'app.bsky.feed.post' AND deleted_at IS NULL",
+        )
+        .bind(space_uri)
+        .bind(author_did)
+        .fetch_all(&self.db)
+        .await?;
+
+        current_policy.known_posts.clear();
+        for (u, c) in other_authors_posts {
+            current_policy.known_posts.insert(u, c);
+        }
         let mut lthash = LtHash::new();
         let ops_applied = pending_records.len();
         let mut records_accepted = 0;
@@ -643,11 +678,18 @@ impl SyncEngine {
         )
         .map_err(|e| AppError::Internal(format!("Commit verification failed on CAR: {e}")))?;
 
-        // Verify against expected authority hash if provided
+        // Verify against expected authority hash and rev if provided
         if let Some(expected_hash) = expected_authority_hash {
             if decoded_car.commit.hash.as_ref() != expected_hash {
                 return Err(AppError::Internal(
                     "CAR commit hash does not match expected authority hash".into(),
+                ));
+            }
+        }
+        if let Some(expected_rev) = expected_authority_rev {
+            if decoded_car.commit.rev.as_str() != expected_rev {
+                return Err(AppError::Internal(
+                    "CAR commit revision does not match expected authority revision".into(),
                 ));
             }
         }
@@ -661,6 +703,13 @@ impl SyncEngine {
 
         for (valid, cid_str) in staged_valid_records {
             recovered_uris.insert(valid.uri.clone());
+
+            // Clean up old notifications for this source_uri before re-creating
+            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
+                .bind(&valid.uri)
+                .execute(&mut *tx)
+                .await?;
+
             sqlx::query(
                 r#"
                 INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at, parent_uri, root_uri)
@@ -706,6 +755,56 @@ impl SyncEngine {
                 .bind(valid.created_at)
                 .execute(&mut *tx)
                 .await?;
+
+                let post_author: Option<(String,)> =
+                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
+                        .bind(post_uri)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+
+                if let Some((recipient,)) = post_author {
+                    if recipient != valid.author_did {
+                        sqlx::query(
+                            r#"
+                            INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                            VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+                            "#,
+                        )
+                        .bind(Uuid::new_v4())
+                        .bind(&recipient)
+                        .bind(space_uri)
+                        .bind(&valid.author_did)
+                        .bind(post_uri)
+                        .bind(&valid.uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            } else if let Some(parent_uri) = &valid.parent_uri {
+                let parent_author: Option<(String,)> =
+                    sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1")
+                        .bind(parent_uri)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+
+                if let Some((recipient,)) = parent_author {
+                    if recipient != valid.author_did {
+                        sqlx::query(
+                            r#"
+                            INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+                            VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
+                            "#,
+                        )
+                        .bind(Uuid::new_v4())
+                        .bind(&recipient)
+                        .bind(space_uri)
+                        .bind(&valid.author_did)
+                        .bind(&valid.uri)
+                        .bind(&valid.uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -732,7 +831,7 @@ impl SyncEngine {
                     .bind(&existing_uri)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("DELETE FROM circle_notifications WHERE subject_uri = $1")
+                sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1 OR subject_uri = $1")
                     .bind(&existing_uri)
                     .execute(&mut *tx)
                     .await?;
@@ -740,6 +839,22 @@ impl SyncEngine {
         }
 
         for (uri, reason) in staged_rejections {
+            sqlx::query("UPDATE circle_records SET deleted_at = now() WHERE uri = $1")
+                .bind(&uri)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM circle_likes WHERE uri = $1")
+                .bind(&uri)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM circle_likes WHERE post_uri = $1")
+                .bind(&uri)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1 OR subject_uri = $1")
+                .bind(&uri)
+                .execute(&mut *tx)
+                .await?;
             let uri_hash = crate::validator::compute_uri_hash(&uri);
             sqlx::query(
                 r#"
@@ -753,7 +868,6 @@ impl SyncEngine {
             .execute(&mut *tx)
             .await?;
         }
-
         // Upsert sync state
         sqlx::query(
             r#"
@@ -858,7 +972,7 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
 
                 if needs_sync {
                     match sync_engine
-                        .sync_repo_with_expected_hash(&space_uri, repo_did, Some(repo.hash.as_ref()))
+                        .sync_repo_with_expected_commit(&space_uri, repo_did, Some(repo.hash.as_ref()), Some(repo.rev.as_str()))
                         .await
                     {
                         Ok(_) => summary.repos_synced += 1,

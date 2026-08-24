@@ -301,14 +301,21 @@ pub async fn notify_write_handler(
         }
     }
 
-    let expected_hash = if input.hash.is_empty() {
-        None
-    } else {
-        Some(input.hash.as_ref())
-    };
+    if input.hash.len() != 32 {
+        return Err(AppError::InvalidRequest(
+            "NotifyWrite requires a 32-byte commit hash".into(),
+        ));
+    }
+    let rev_str = input.rev.as_str().trim();
+    if rev_str.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "NotifyWrite requires a non-empty commit revision".into(),
+        ));
+    }
+
     let sync_engine = crate::sync::SyncEngine::new(&state);
     sync_engine
-        .sync_repo_with_expected_hash(&space_uri, &repo_did, expected_hash)
+        .sync_repo_with_expected_commit(&space_uri, &repo_did, Some(input.hash.as_ref()), Some(rev_str))
         .await?;
     Ok(StatusCode::OK)
 }

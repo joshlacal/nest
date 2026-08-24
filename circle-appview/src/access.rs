@@ -53,12 +53,9 @@ impl CredentialStore {
         let now = Utc::now();
         {
             let lock = self.values.read().await;
-            if let Some(cred) = lock.get(space) {
-                if cred.expires_at > now {
-                    return Some(cred.clone());
-                }
-            } else {
-                return None;
+            let cred = lock.get(space)?;
+            if cred.expires_at > now {
+                return Some(cred.clone());
             }
         }
 

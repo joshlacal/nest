@@ -228,7 +228,6 @@ pub enum IpldValue {
     Null,
     Bool(bool),
     Integer(i128),
-    Float(f64),
     String(String),
     Bytes(Vec<u8>),
     Link(CidLink),
@@ -242,7 +241,6 @@ impl IpldValue {
             IpldValue::Null => serde_json::Value::Null,
             IpldValue::Bool(b) => serde_json::Value::Bool(*b),
             IpldValue::Integer(i) => serde_json::json!(*i),
-            IpldValue::Float(f) => serde_json::json!(*f),
             IpldValue::String(s) => serde_json::Value::String(s.clone()),
             IpldValue::Bytes(b) => {
                 use base64::Engine;
@@ -278,10 +276,8 @@ pub fn json_to_ipld(val: &serde_json::Value) -> Result<IpldValue, CommitError> {
                 Ok(IpldValue::Integer(i as i128))
             } else if let Some(u) = num.as_u64() {
                 Ok(IpldValue::Integer(u as i128))
-            } else if let Some(f) = num.as_f64() {
-                Ok(IpldValue::Float(f))
             } else {
-                Err(CommitError::InvalidData("Invalid number".into()))
+                Err(CommitError::InvalidData("Floats/non-integer numbers are forbidden in ATProto IPLD".into()))
             }
         }
         serde_json::Value::String(s) => Ok(IpldValue::String(s.clone())),
@@ -338,7 +334,6 @@ impl Serialize for IpldValue {
                     serializer.serialize_i64(*i as i64)
                 }
             }
-            IpldValue::Float(f) => serializer.serialize_f64(*f),
             IpldValue::String(s) => serializer.serialize_str(s),
             IpldValue::Bytes(b) => serializer.serialize_bytes(b),
             IpldValue::Link(link) => link.serialize(serializer),
@@ -383,10 +378,19 @@ impl<'de> serde::de::Visitor<'de> for IpldVisitor {
         Ok(IpldValue::Integer(v as i128))
     }
 
-    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
-        Ok(IpldValue::Float(v))
+    fn visit_f32<E>(self, _v: f32) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Err(E::custom("Floating point numbers are forbidden in ATProto IPLD"))
     }
 
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Err(E::custom("Floating point numbers are forbidden in ATProto IPLD"))
+    }
     fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
         Ok(IpldValue::String(v.to_string()))
     }
@@ -442,7 +446,13 @@ impl<'de> serde::de::Visitor<'de> for IpldVisitor {
         A: serde::de::MapAccess<'de>,
     {
         let mut entries = Vec::new();
-        while let Some((k, v)) = map.next_entry()? {
+        let mut seen_keys = std::collections::HashSet::new();
+        while let Some((k, v)) = map.next_entry::<String, IpldValue>()? {
+            if !seen_keys.insert(k.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "Duplicate map key forbidden in IPLD: '{k}'"
+                )));
+            }
             entries.push((k, v));
         }
         Ok(IpldValue::Map(entries))
@@ -599,6 +609,27 @@ fn decode_varint(slice: &[u8]) -> Result<(u64, usize), CommitError> {
         "Unexpected EOF reading varint".into(),
     ))
 }
+pub fn checked_section_bounds(
+    offset: usize,
+    length: u64,
+    varint_len: usize,
+    total_len: usize,
+) -> Result<(usize, usize), CommitError> {
+    let len_usize = usize::try_from(length).map_err(|_| {
+        CommitError::InvalidData("Section length exceeds platform address space".into())
+    })?;
+    let start = offset
+        .checked_add(varint_len)
+        .ok_or_else(|| CommitError::InvalidData("Offset overflow".into()))?;
+    let end = start
+        .checked_add(len_usize)
+        .ok_or_else(|| CommitError::InvalidData("Section end offset overflow".into()))?;
+    if end > total_len {
+        return Err(CommitError::InvalidData("Truncated CAR section".into()));
+    }
+    Ok((start, end))
+}
+
 
 
 pub fn create_cid_bytes_from_data(data: &[u8]) -> (Vec<u8>, String) {
@@ -733,11 +764,8 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
     }
 
     let (header_len, varint_len) = decode_varint(car_bytes)?;
-    let header_start = varint_len;
-    let header_end = header_start + header_len as usize;
-    if car_bytes.len() < header_end {
-        return Err(CommitError::InvalidData("Truncated CAR header".into()));
-    }
+    let (header_start, header_end) =
+        checked_section_bounds(0, header_len, varint_len, car_bytes.len())?;
 
     let header_slice = &car_bytes[header_start..header_end];
     let header: CarHeader = serde_ipld_dagcbor::from_slice(header_slice)
@@ -777,12 +805,10 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         return Err(CommitError::InvalidData("Missing commit root block in CAR".into()));
     }
     let (b1_len, b1_vlen) = decode_varint(&car_bytes[offset..])?;
-    offset += b1_vlen;
-    let b1_end = offset + b1_len as usize;
-    if car_bytes.len() < b1_end {
-        return Err(CommitError::InvalidData("Truncated commit block in CAR".into()));
-    }
-    let (b1_cid_bytes, b1_cid_str, b1_data) = parse_cid_and_data_raw(&car_bytes[offset..b1_end])?;
+    let (b1_start, b1_end) =
+        checked_section_bounds(offset, b1_len, b1_vlen, car_bytes.len())?;
+    let (b1_cid_bytes, b1_cid_str, b1_data) =
+        parse_cid_and_data_raw(&car_bytes[b1_start..b1_end])?;
     offset = b1_end;
 
     if !header.roots[0].matches_cid_bytes(&b1_cid_bytes) {
@@ -793,17 +819,39 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
     let commit: SignedCommit = serde_ipld_dagcbor::from_slice(&b1_data)
         .map_err(|e| CommitError::InvalidData(format!("Failed to parse SignedCommit block: {e}")))?;
 
+    // Verify canonical DAG-CBOR SignedCommit re-encode equality
+    let re_encoded_commit = serde_ipld_dagcbor::to_vec(&commit).map_err(|e| {
+        CommitError::InvalidData(format!("Failed to re-encode SignedCommit block: {e}"))
+    })?;
+    if re_encoded_commit != b1_data {
+        return Err(CommitError::InvalidData(
+            "Non-canonical DAG-CBOR SignedCommit block encoding".into(),
+        ));
+    }
+
+    // Recompute blessed CIDv1 of commit block and verify against header roots[0]
+    let (computed_commit_cid_bytes, computed_commit_cid_str) =
+        create_cid_bytes_from_data(&b1_data);
+    if computed_commit_cid_str != b1_cid_str {
+        return Err(CommitError::InvalidData(format!(
+            "Commit block CID mismatch: computed {computed_commit_cid_str} != block CID {b1_cid_str}"
+        )));
+    }
+    if !header.roots[0].matches_cid_bytes(&computed_commit_cid_bytes) {
+        return Err(CommitError::InvalidData(format!(
+            "Computed commit CID {computed_commit_cid_str} does not match header root[0] CID {commit_root_cid_str}"
+        )));
+    }
+
     // Stream Block 2: DRISL map block (must match root[1])
     if offset >= car_bytes.len() {
         return Err(CommitError::InvalidData("Missing DRISL root block in CAR".into()));
     }
     let (b2_len, b2_vlen) = decode_varint(&car_bytes[offset..])?;
-    offset += b2_vlen;
-    let b2_end = offset + b2_len as usize;
-    if car_bytes.len() < b2_end {
-        return Err(CommitError::InvalidData("Truncated DRISL block in CAR".into()));
-    }
-    let (b2_cid_bytes, b2_cid_str, b2_data) = parse_cid_and_data_raw(&car_bytes[offset..b2_end])?;
+    let (b2_start, b2_end) =
+        checked_section_bounds(offset, b2_len, b2_vlen, car_bytes.len())?;
+    let (b2_cid_bytes, b2_cid_str, b2_data) =
+        parse_cid_and_data_raw(&car_bytes[b2_start..b2_end])?;
     offset = b2_end;
 
     if !header.roots[1].matches_cid_bytes(&b2_cid_bytes) {
@@ -828,6 +876,20 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         return Err(CommitError::InvalidData(
             "Non-canonical DAG-CBOR DRISL map encoding".into(),
         ));
+    }
+
+    // Recompute blessed CIDv1 of DRISL block and verify against header roots[1]
+    let (computed_drisl_cid_bytes, computed_drisl_cid_str) =
+        create_cid_bytes_from_data(&b2_data);
+    if computed_drisl_cid_str != b2_cid_str {
+        return Err(CommitError::InvalidData(format!(
+            "DRISL block CID mismatch: computed {computed_drisl_cid_str} != block CID {b2_cid_str}"
+        )));
+    }
+    if !header.roots[1].matches_cid_bytes(&computed_drisl_cid_bytes) {
+        return Err(CommitError::InvalidData(format!(
+            "Computed DRISL CID {computed_drisl_cid_str} does not match header root[1] CID {drisl_root_cid_str}"
+        )));
     }
 
     // Stream Blocks 3..N: Record blocks in exact DRISL map order
@@ -865,15 +927,10 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
             )));
         }
         let (rec_len, rec_vlen) = decode_varint(&car_bytes[offset..])?;
-        offset += rec_vlen;
-        let rec_end = offset + rec_len as usize;
-        if car_bytes.len() < rec_end {
-            return Err(CommitError::InvalidData(format!(
-                "Truncated record block for {path_key}"
-            )));
-        }
+        let (rec_start, rec_end) =
+            checked_section_bounds(offset, rec_len, rec_vlen, car_bytes.len())?;
         let (rec_cid_bytes, rec_cid_str, rec_data) =
-            parse_cid_and_data_raw(&car_bytes[offset..rec_end])?;
+            parse_cid_and_data_raw(&car_bytes[rec_start..rec_end])?;
         offset = rec_end;
         if !expected_cid_link.matches_cid_bytes(&rec_cid_bytes) {
             return Err(CommitError::InvalidData(format!(
@@ -895,10 +952,16 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
             )));
         }
 
-        let (_, computed_cid) = create_cid_bytes_from_data(&rec_data);
+        let (computed_rec_cid_bytes, computed_cid) = create_cid_bytes_from_data(&rec_data);
         if computed_cid != rec_cid_str {
             return Err(CommitError::InvalidData(format!(
                 "Record value CID mismatch: computed {computed_cid} != block CID {rec_cid_str}"
+            )));
+        }
+        if !expected_cid_link.matches_cid_bytes(&computed_rec_cid_bytes) {
+            return Err(CommitError::InvalidData(format!(
+                "Computed record CID {computed_cid} does not match DRISL expected CID {}",
+                expected_cid_link.to_cid_string()
             )));
         }
 
@@ -926,33 +989,17 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
 }
 
 fn parse_cid_and_data_raw(block_slice: &[u8]) -> Result<(Vec<u8>, String, Vec<u8>), CommitError> {
-    if block_slice.is_empty() {
-        return Err(CommitError::InvalidData("Empty block in CAR".into()));
+    if block_slice.len() < 36 {
+        return Err(CommitError::InvalidData("Block in CAR is too short for blessed CIDv1".into()));
     }
-    let (cid_len, cid_bytes) = if block_slice[0] == 0x01 {
-        if block_slice.len() < 4 {
-            return Err(CommitError::InvalidData("Truncated CIDv1 in block".into()));
-        }
-        let hash_len = block_slice[3] as usize;
-        let total_cid_len = 4 + hash_len;
-        if block_slice.len() < total_cid_len {
-            return Err(CommitError::InvalidData(
-                "Truncated CIDv1 multihash in block".into(),
-            ));
-        }
-        (total_cid_len, &block_slice[..total_cid_len])
-    } else if block_slice[0] == 0x12 && block_slice.get(1) == Some(&0x20) {
-        let total_cid_len = 34;
-        if block_slice.len() < total_cid_len {
-            return Err(CommitError::InvalidData("Truncated CIDv0 in block".into()));
-        }
-        (total_cid_len, &block_slice[..total_cid_len])
-    } else {
+    // Blessed CIDv1: 0x01 (CIDv1), 0x71 (dag-cbor), 0x12 (sha2-256), 0x20 (32 bytes digest length)
+    if block_slice[0] != 0x01 || block_slice[1] != 0x71 || block_slice[2] != 0x12 || block_slice[3] != 0x20 {
         return Err(CommitError::InvalidData(
-            "Unsupported CID format in CAR block".into(),
+            "Unsupported or unblessed CID in CAR block: must be CIDv1 dag-cbor sha2-256 (01 71 12 20)".into(),
         ));
-    };
-
+    }
+    let cid_len = 36;
+    let cid_bytes = &block_slice[..cid_len];
     let cid_str = multibase::encode(multibase::Base::Base32Lower, cid_bytes);
     let data = block_slice[cid_len..].to_vec();
 
@@ -961,7 +1008,7 @@ fn parse_cid_and_data_raw(block_slice: &[u8]) -> Result<(Vec<u8>, String, Vec<u8
     hasher.update(&data);
     let computed_digest = hasher.finalize();
 
-    let digest_in_cid = &cid_bytes[cid_bytes.len() - 32..];
+    let digest_in_cid = &cid_bytes[4..36];
     if &computed_digest[..] != digest_in_cid {
         return Err(CommitError::InvalidData(format!(
             "Block CID mismatch: computed SHA256 does not match CID {cid_str}"
