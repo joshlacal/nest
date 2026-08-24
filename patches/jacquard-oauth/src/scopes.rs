@@ -557,72 +557,81 @@ impl<'s> Scope<'s> {
                 return Err(ParseError::InvalidResource(original.to_string()));
             }
 
-            let mut authority: Option<&str> = None;
-            let mut skey: Option<&str> = None;
-            let mut collections: BTreeSet<&str> = BTreeSet::new();
-            let mut actions: BTreeSet<&str> = BTreeSet::new();
-            let mut manages: BTreeSet<&str> = BTreeSet::new();
+            let mut has_authority = false;
+            let mut has_skey = false;
+            let mut collections: BTreeSet<String> = BTreeSet::new();
+            let mut actions: BTreeSet<String> = BTreeSet::new();
+            let mut manages: BTreeSet<String> = BTreeSet::new();
 
             for parameter in query.split('&') {
-                let (key, value) = parameter
+                let (raw_key, raw_value) = parameter
                     .split_once('=')
                     .ok_or_else(|| ParseError::InvalidResource(original.to_string()))?;
+                if raw_key.is_empty() || raw_value.is_empty() {
+                    return Err(ParseError::InvalidResource(original.to_string()));
+                }
+
+                let key = percent_decode(raw_key)
+                    .map_err(|_| ParseError::InvalidResource(original.to_string()))?;
+                let value = percent_decode(raw_value)
+                    .map_err(|_| ParseError::InvalidResource(original.to_string()))?;
+
                 if key.is_empty() || value.is_empty() {
                     return Err(ParseError::InvalidResource(original.to_string()));
                 }
-                if !is_valid_percent_encoding(key) || !is_valid_percent_encoding(value) {
-                    return Err(ParseError::InvalidResource(original.to_string()));
-                }
 
-                match key {
+                match key.as_ref() {
                     "authority" => {
-                        if authority.is_some() {
+                        if has_authority {
                             return Err(ParseError::InvalidResource(
                                 "duplicate authority parameter".to_string(),
                             ));
                         }
-                        authority = Some(value);
+                        has_authority = true;
                         if value != "self" && value != "*" {
-                            Did::new(value)
+                            Did::new(value.as_ref())
                                 .map_err(|_| ParseError::InvalidResource(value.to_string()))?;
                         }
                     }
                     "skey" => {
-                        if skey.is_some() {
+                        if has_skey {
                             return Err(ParseError::InvalidResource(
                                 "duplicate skey parameter".to_string(),
                             ));
                         }
-                        skey = Some(value);
-                        if value != "*" && !is_valid_record_key(value) {
+                        has_skey = true;
+                        if value != "*" && !is_valid_record_key(value.as_ref()) {
                             return Err(ParseError::InvalidResource(value.to_string()));
                         }
                     }
                     "collection" => {
                         if value != "*" {
-                            Nsid::new(value)?;
+                            Nsid::new(value.as_ref())?;
                         }
-                        if !collections.insert(value) {
+                        if !collections.insert(value.into_owned()) {
                             return Err(ParseError::InvalidResource(
                                 "duplicate collection value".to_string(),
                             ));
                         }
                     }
                     "action" => {
-                        if !matches!(value, "read" | "read_self" | "create" | "update" | "delete") {
+                        if !matches!(
+                            value.as_ref(),
+                            "read" | "read_self" | "create" | "update" | "delete"
+                        ) {
                             return Err(ParseError::InvalidAction(value.to_string()));
                         }
-                        if !actions.insert(value) {
+                        if !actions.insert(value.into_owned()) {
                             return Err(ParseError::InvalidAction(
                                 "duplicate action value".to_string(),
                             ));
                         }
                     }
                     "manage" => {
-                        if !matches!(value, "create" | "update" | "delete") {
+                        if !matches!(value.as_ref(), "create" | "update" | "delete") {
                             return Err(ParseError::InvalidResource(value.to_string()));
                         }
-                        if !manages.insert(value) {
+                        if !manages.insert(value.into_owned()) {
                             return Err(ParseError::InvalidResource(
                                 "duplicate manage value".to_string(),
                             ));
@@ -1217,23 +1226,29 @@ fn parse_query_string(query: &str) -> BTreeMap<SmolStr, Vec<CowStr<'static>>> {
     params
 }
 
-fn is_valid_percent_encoding(s: &str) -> bool {
+fn percent_decode(s: &str) -> Result<std::borrow::Cow<'_, str>, ()> {
+    if !s.as_bytes().contains(&b'%') {
+        return Ok(std::borrow::Cow::Borrowed(s));
+    }
     let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            if i + 2 >= bytes.len()
-                || !bytes[i + 1].is_ascii_hexdigit()
-                || !bytes[i + 2].is_ascii_hexdigit()
-            {
-                return false;
+            if i + 2 >= bytes.len() {
+                return Err(());
             }
+            let h1 = (bytes[i + 1] as char).to_digit(16).ok_or(())? as u8;
+            let h2 = (bytes[i + 2] as char).to_digit(16).ok_or(())? as u8;
+            out.push((h1 << 4) | h2);
             i += 3;
         } else {
+            out.push(bytes[i]);
             i += 1;
         }
     }
-    true
+    let decoded = String::from_utf8(out).map_err(|_| ())?;
+    Ok(std::borrow::Cow::Owned(decoded))
 }
 
 fn is_valid_record_key(s: &str) -> bool {
@@ -1586,10 +1601,21 @@ mod tests {
         )
         .is_ok());
 
-        // Exact roundtrip normalization
+        // Percent-encoded query parameters
+        assert!(Scope::parse("space:com.example.bookmarks?authority=did%3Aplc%3Aabc123").is_ok());
+        assert!(Scope::parse(
+            "space:blue.catbird.circle?authority=did%3Aplc%3Aabc123&skey=my%2Drkey&collection=app%2Ebsky%2Efeed%2Epost&action=%72%65%61%64&manage=%63%72%65%61%74%65"
+        )
+        .is_ok());
+
+        // Exact roundtrip normalization (including percent-encoded values)
         let exact = "space:blue.catbird.circle?authority=self&action=read_self&skey=self";
         assert_eq!(Scope::parse(exact).unwrap().to_string_normalized(), exact);
-
+        let encoded_exact = "space:com.example.bookmarks?authority=did%3Aplc%3Aabc123";
+        assert_eq!(
+            Scope::parse(encoded_exact).unwrap().to_string_normalized(),
+            encoded_exact
+        );
         // Invalid syntax & constraints
         assert!(Scope::parse("space").is_err());
         assert!(Scope::parse("space:").is_err());
@@ -1618,6 +1644,19 @@ mod tests {
         assert!(Scope::parse("space:blue.catbird.circle?action").is_err());
         assert!(Scope::parse("space:blue.catbird.circle?action=read%2").is_err());
         assert!(Scope::parse("space:blue.catbird.circle?action=read%2G").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?skey=%2E").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?skey=%2E%2E").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?authority=did%3Aplc%3Aabc123&authority=did:plc:abc123").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?collection=app%2Ebsky%2Efeed%2Epost&collection=app.bsky.feed.post").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?action=%72%65%61%64&action=read").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?manage=%63%72%65%61%74%65&manage=create").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?authority=did%").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?authority=did%3").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?authority=did%3Z").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?skey=key%").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?collection=app%").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?action=read%").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?manage=create%").is_err());
     }
 
     #[test]
