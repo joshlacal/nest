@@ -456,9 +456,9 @@ impl DidResolver {
 
 pub async fn fetch_https_jwks(
     resolver: &DidResolver,
-    base_url: &str,
+    jwks_url: &str,
 ) -> Result<Vec<ParsedVerifyingKey>, AuthReason> {
-    let parsed = url::Url::parse(base_url).map_err(|_| AuthReason::DidResolutionFailed)?;
+    let parsed = url::Url::parse(jwks_url).map_err(|_| AuthReason::DidResolutionFailed)?;
     if parsed.scheme() != "https" {
         return Err(AuthReason::SsrfBlocked);
     }
@@ -483,9 +483,8 @@ pub async fn fetch_https_jwks(
     }
     let pinned_addr = addrs[0];
     let client = build_did_web_client(host, pinned_addr, None)?;
-    let jwks_url = format!("{}/.well-known/jwks.json", base_url.trim_end_matches('/'));
     let resp = client
-        .get(&jwks_url)
+        .get(parsed.as_str())
         .send()
         .await
         .map_err(|_| AuthReason::DidResolutionFailed)?;
@@ -685,41 +684,17 @@ pub async fn verify_nest_client_attestation(
         .decode(parts[2])
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidSignatureFormat))?;
 
+    if state.config.nest_verifying_keys.is_empty() {
+        return Err(AppError::Unauthorized(AuthReason::NoVerificationMethod));
+    }
+
     let mut verified = false;
-    if !state.config.nest_verifying_keys.is_empty() {
-        for key in &state.config.nest_verifying_keys {
-            if matches!(key, ParsedVerifyingKey::P256(_))
-                && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
-            {
-                verified = true;
-                break;
-            }
-        }
-    } else if iss.starts_with("did:") {
-        let doc = state
-            .did_resolver
-            .resolve(iss)
-            .await
-            .map_err(AppError::Unauthorized)?;
-        let vm = select_verification_method(&doc, iss, header.kid.as_deref())
-            .map_err(AppError::Unauthorized)?;
-        let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
+    for key in &state.config.nest_verifying_keys {
         if matches!(key, ParsedVerifyingKey::P256(_))
             && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
         {
             verified = true;
-        }
-    } else if iss.starts_with("https://") {
-        let keys = fetch_https_jwks(&state.did_resolver, iss)
-            .await
-            .map_err(AppError::Unauthorized)?;
-        for key in keys {
-            if matches!(key, ParsedVerifyingKey::P256(_))
-                && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
-            {
-                verified = true;
-                break;
-            }
+            break;
         }
     }
 

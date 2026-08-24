@@ -13,6 +13,7 @@ pub struct Config {
     pub service_did: String,
     pub plc_directory_url: String,
     pub nest_client_id: String,
+    pub nest_jwks_url: String,
     pub nest_verifying_keys: Vec<crate::auth::ParsedVerifyingKey>,
 }
 
@@ -30,7 +31,9 @@ impl Config {
         let plc_directory_url = env::var("PLC_DIRECTORY_URL")
             .unwrap_or_else(|_| "https://plc.directory".to_string());
         let nest_client_id = env::var("NEST_CLIENT_ID")
-            .unwrap_or_else(|_| "https://nest.catbird.blue".to_string());
+            .map_err(|_| anyhow::anyhow!("NEST_CLIENT_ID environment variable is required"))?;
+        let nest_jwks_url = env::var("NEST_JWKS_URL")
+            .map_err(|_| anyhow::anyhow!("NEST_JWKS_URL environment variable is required"))?;
 
         Ok(Self {
             host,
@@ -39,6 +42,7 @@ impl Config {
             service_did,
             plc_directory_url,
             nest_client_id,
+            nest_jwks_url,
             nest_verifying_keys: Vec::new(),
         })
     }
@@ -52,8 +56,8 @@ pub struct AppState {
     pub did_resolver: Arc<DidResolver>,
     pub credential_store: Arc<CredentialStore>,
     pub space_client: Arc<SpaceClient>,
+    pub space_locks: Arc<crate::access::SpaceLockManager>,
 }
-
 impl AppState {
     pub fn new(config: Config, db: PgPool) -> Self {
         let config = Arc::new(config);
@@ -67,6 +71,7 @@ impl AppState {
         ));
         let credential_store = Arc::new(CredentialStore::new());
         let space_client = Arc::new(SpaceClient::new());
+        let space_locks = Arc::new(crate::access::SpaceLockManager::new());
 
         Self {
             config,
@@ -75,9 +80,9 @@ impl AppState {
             did_resolver,
             credential_store,
             space_client,
+            space_locks,
         }
     }
-
     pub fn with_did_resolver(config: Config, db: PgPool, did_resolver: Arc<DidResolver>) -> Self {
         let config = Arc::new(config);
         let http_client = reqwest::Client::builder()
@@ -86,6 +91,7 @@ impl AppState {
             .unwrap_or_default();
         let credential_store = Arc::new(CredentialStore::new());
         let space_client = Arc::new(SpaceClient::new());
+        let space_locks = Arc::new(crate::access::SpaceLockManager::new());
 
         Self {
             config,
@@ -94,6 +100,7 @@ impl AppState {
             did_resolver,
             credential_store,
             space_client,
+            space_locks,
         }
     }
 
@@ -109,6 +116,7 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        let space_locks = Arc::new(crate::access::SpaceLockManager::new());
 
         Self {
             config,
@@ -117,6 +125,7 @@ impl AppState {
             did_resolver,
             credential_store,
             space_client,
+            space_locks,
         }
     }
 }

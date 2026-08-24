@@ -248,6 +248,7 @@ async fn sync_projections_handler(
     projections::apply_projection(
         &state.db,
         Some(&state.credential_store),
+        Some(&state.space_locks),
         input.operation_id,
         projection,
         &payload_digest,

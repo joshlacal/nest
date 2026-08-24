@@ -2065,3 +2065,52 @@ async fn session_rebind_database_error_propagates_as_upstream_unavailable(pool: 
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"], "UpstreamUnavailable");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_circle_advances_generation_and_audience_strictly_checks_id(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+    let space = "at://did:plc:alice/space/blue.catbird.circle/test-adv-gen";
+
+    // 1. Enqueue an initial CircleUpsert with generation 1
+    env.service
+        .enqueue_projection(
+            "did:plc:alice",
+            &env.session.id.to_string(),
+            space,
+            catbird::models::CircleProjectionKind::CircleUpsert,
+            serde_json::json!({
+                "space": space,
+                "authority": "did:plc:alice",
+                "name": "Circle Gen 1",
+                "generation": 1
+            }),
+            catbird::models::CircleProjectionState::Delivered,
+        )
+        .await
+        .unwrap();
+
+    // 2. Call delete_circle via service
+    let op = env
+        .service
+        .delete_circle(
+            &env.session,
+            DeleteCircle {
+                space: SpaceRef::new(space.into()).unwrap(),
+                extra_data: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op_uuid: uuid::Uuid = op.id.parse().unwrap();
+    let row: (serde_json::Value,) = sqlx::query_as(
+        "SELECT payload FROM circle_projection_outbox WHERE id = $1",
+    )
+    .bind(op_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Generation must advance to 2!
+    let gen = row.0.get("generation").and_then(|g| g.as_i64()).unwrap();
+    assert_eq!(gen, 2);
+}

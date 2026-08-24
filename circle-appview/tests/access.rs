@@ -12,16 +12,17 @@ use chrono::{DateTime, Utc};
 use circle_appview::{
     access::{self, ActiveSpaceCredential},
     auth::{
-        DidDocument, DidResolver, DidService, ParsedVerifyingKey, PublicKeyJwk,
+        self, DidDocument, DidResolver, DidService, ParsedVerifyingKey, PublicKeyJwk,
         VerificationMethod,
     },
     config::{AppState, Config},
     db,
+    error::AuthReason,
     projections::{self, Projection},
     routes::create_router,
     space_client::{
         calculate_rfc7638_jkt, DefaultSpaceHostTransport, MockSpaceHostTransport,
-        SpaceClient, SpaceHostTransport,
+        SpaceClient, SpaceHostDnsResolver, SpaceHostTransport,
     },
 };
 use p256::ecdsa::signature::{Signer, Verifier};
@@ -30,6 +31,7 @@ use p256::EncodedPoint;
 use serde_json::json;
 use sqlx::PgPool;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -89,9 +91,9 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         nest_client_id: NEST_CLIENT_ID.into(),
+        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: vec![nest_verifying_key],
     };
-
     // Keys
     let alice_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let bob_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
@@ -376,6 +378,12 @@ impl SpaceHostTransport for DynamicMockTransport {
             Some(j) => j,
             None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP jwk".into())) }),
         };
+        if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC") {
+            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP jwk kty".into())) });
+        }
+        if jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256") {
+            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP jwk crv".into())) });
+        }
         let x = match jwk.get("x").and_then(|v| v.as_str()) {
             Some(x) => x,
             None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP x".into())) }),
@@ -384,7 +392,6 @@ impl SpaceHostTransport for DynamicMockTransport {
             Some(y) => y,
             None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP y".into())) }),
         };
-
         let x_bytes = URL_SAFE_NO_PAD.decode(x).unwrap();
         let y_bytes = URL_SAFE_NO_PAD.decode(y).unwrap();
         let mut xb = p256::FieldBytes::default();
@@ -412,7 +419,18 @@ impl SpaceHostTransport for DynamicMockTransport {
         if payload.get("htu").and_then(|v| v.as_str()) != Some(target_url.as_str()) {
             return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Invalid DPoP htu".into())) });
         }
-
+        let iat = match payload.get("iat").and_then(|v| v.as_i64()) {
+            Some(i) => i,
+            None => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing DPoP iat".into())) }),
+        };
+        let now_epoch = Utc::now().timestamp();
+        if iat > now_epoch + 300 || iat < now_epoch - 300 {
+            return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("DPoP iat out of range".into())) });
+        }
+        let _jti = match payload.get("jti").and_then(|v| v.as_str()) {
+            Some(j) if !j.is_empty() => j,
+            _ => return Box::pin(async { Err(circle_appview::error::AppError::InvalidRequest("Missing or empty DPoP jti".into())) }),
+        };
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         let sig_bytes = match URL_SAFE_NO_PAD.decode(parts[2]) {
             Ok(b) => b,
@@ -470,7 +488,7 @@ async fn successful_exchange_creates_lease_for_token_issuer(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -536,7 +554,7 @@ async fn rejects_activate_space_without_client_attestation(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -624,7 +642,7 @@ async fn rejects_expired_delegation_token(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now - 10,
         now - 300,
     );
@@ -665,7 +683,7 @@ async fn rejects_delegation_token_with_mismatched_issuer(pool: PgPool) {
         &setup.bob_signing_key,
         BOB_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -706,7 +724,7 @@ async fn rejects_delegation_token_with_mismatched_space_sub(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         other_space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -852,7 +870,7 @@ async fn rejects_space_credential_with_alg_key_curve_mismatch(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -952,7 +970,7 @@ async fn rejects_space_credential_with_wrong_signature(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -1036,7 +1054,7 @@ async fn rejects_space_credential_with_mismatched_jkt(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -1133,7 +1151,7 @@ async fn rejects_space_credential_with_expired_time(pool: PgPool) {
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -1269,6 +1287,7 @@ async fn removal_invalidates_lease_without_deleting_circle_records(pool: PgPool)
     projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         Uuid::new_v4(),
         remove_projection,
         &digest,
@@ -1309,7 +1328,6 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
         created_at: Utc::now(),
         generation: 1,
     };
-
     let payload = json!({
         "name": "Test Circle",
         "authority": AUTHORITY_DID,
@@ -1330,6 +1348,7 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     let res1 = projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         op_id,
         upsert.clone(),
         &digest,
@@ -1341,13 +1360,13 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     let res2 = projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         op_id,
         upsert,
         &digest,
     )
     .await;
     assert!(res2.is_ok());
-
     // Populate active credential in in-memory store
     setup.state.credential_store.insert(
         space.clone(),
@@ -1374,6 +1393,7 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         del_op,
         Projection::CircleDelete {
             space: space.clone(),
@@ -1383,7 +1403,6 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     )
     .await
     .unwrap();
-
     // Verify in-memory store purged
     assert!(setup.state.credential_store.get(&space).await.is_none());
 
@@ -1411,6 +1430,7 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
     let stale_res = projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         stale_op,
         Projection::CircleUpsert {
             space: space.clone(),
@@ -1612,6 +1632,7 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
     projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         remove_op,
         Projection::MemberRemove {
             space: space.clone(),
@@ -1622,7 +1643,6 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
     )
     .await
     .unwrap();
-
     let status1: (String, i64) = sqlx::query_as(
         "SELECT status, generation FROM circle_members WHERE space_uri = $1 AND member_did = $2",
     )
@@ -1649,6 +1669,7 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
     projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         add_op,
         Projection::MemberAdd {
             space: space.clone(),
@@ -1659,7 +1680,6 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
     )
     .await
     .unwrap();
-
     // Status MUST still be removed with generation 2
     let status2: (String, i64) = sqlx::query_as(
         "SELECT status, generation FROM circle_members WHERE space_uri = $1 AND member_did = $2",
@@ -1718,7 +1738,7 @@ async fn activation_fails_if_member_removed_or_circle_deleted(pool: PgPool) {
         &setup.bob_signing_key,
         BOB_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -1766,7 +1786,7 @@ async fn privacy_safe_activation_contains_no_jwt_or_key_canaries_in_db_or_logs(p
         &setup.alice_signing_key,
         ALICE_DID,
         &space,
-        "#atproto_space_host",
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
         now + 300,
         now,
     );
@@ -1862,6 +1882,7 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
     let res1 = projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         op_id,
         upsert.clone(),
         &digest1,
@@ -1873,6 +1894,7 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
     let res2 = projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         op_id,
         upsert,
         &digest2,
@@ -1916,10 +1938,11 @@ async fn concurrent_receipt_claims_under_race(pool: PgPool) {
     for _ in 0..10 {
         let pool = pool.clone();
         let store = setup.state.credential_store.clone();
+        let locks = setup.state.space_locks.clone();
         let upsert = upsert.clone();
         let digest = digest.clone();
         handles.push(tokio::spawn(async move {
-            projections::apply_projection(&pool, Some(&store), op_id, upsert, &digest).await
+            projections::apply_projection(&pool, Some(&store), Some(&locks), op_id, upsert, &digest).await
         }));
     }
 
@@ -1941,8 +1964,135 @@ async fn concurrent_receipt_claims_under_race(pool: PgPool) {
 async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
     let space = space_uri();
+    let now = Utc::now().timestamp();
 
-    // 1. Circle is deleted (tombstone inserted)
+    // 1. Setup initial circle and member in DB
+    sqlx::query(
+        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Circle', now(), 1)",
+    )
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 1, now())",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    struct BarrierTransport {
+        authority_key: p256::ecdsa::SigningKey,
+        authority_did: String,
+        dpop_started: Arc<tokio::sync::Notify>,
+        delete_done: Arc<tokio::sync::Notify>,
+    }
+
+    impl SpaceHostTransport for BarrierTransport {
+        fn get_space_credential<'a>(
+            &'a self,
+            _target_url: &'a url::Url,
+            _delegation_token: &'a str,
+            dpop_proof: &'a str,
+            space_uri: &'a str,
+            _client_attestation: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+            let auth_key = self.authority_key.clone();
+            let auth_did = self.authority_did.clone();
+            let space = space_uri.to_string();
+            let dpop_started = self.dpop_started.clone();
+            let delete_done = self.delete_done.clone();
+            let dpop = dpop_proof.to_string();
+
+            Box::pin(async move {
+                let parts: Vec<&str> = dpop.split('.').collect();
+                let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+                let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+                let jwk = header.get("jwk").unwrap();
+                let x = jwk.get("x").and_then(|v| v.as_str()).unwrap();
+                let y = jwk.get("y").and_then(|v| v.as_str()).unwrap();
+                let x_bytes = URL_SAFE_NO_PAD.decode(x).unwrap();
+                let y_bytes = URL_SAFE_NO_PAD.decode(y).unwrap();
+                let mut xb = p256::FieldBytes::default();
+                let mut yb = p256::FieldBytes::default();
+                xb.copy_from_slice(&x_bytes);
+                yb.copy_from_slice(&y_bytes);
+                let ep = p256::EncodedPoint::from_affine_coordinates(&xb, &yb, false);
+                let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&ep).unwrap();
+                let jkt = calculate_rfc7638_jkt(&vk);
+                let now = Utc::now().timestamp();
+                let cred = mint_space_credential(
+                    &auth_key,
+                    &auth_did,
+                    &space,
+                    &jkt,
+                    now + 3600,
+                    now,
+                    None,
+                    Some("#atproto_space"),
+                );
+
+                // Signal main thread that DPoP exchange reached Space host
+                dpop_started.notify_one();
+
+                // Wait for CircleDelete projection to commit
+                delete_done.notified().await;
+
+                Ok(cred)
+            })
+        }
+    }
+
+    let dpop_started = Arc::new(tokio::sync::Notify::new());
+    let delete_done = Arc::new(tokio::sync::Notify::new());
+    let transport = Arc::new(BarrierTransport {
+        authority_key: setup.authority_signing_key.clone(),
+        authority_did: AUTHORITY_DID.to_string(),
+        dpop_started: dpop_started.clone(),
+        delete_done: delete_done.clone(),
+    });
+
+    let custom_space_client = Arc::new(SpaceClient::with_transport(transport));
+    let state = AppState::with_services(
+        (*setup.state.config).clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        custom_space_client,
+    );
+
+    let delegation_token = mint_delegation_token(
+        &setup.alice_signing_key,
+        ALICE_DID,
+        &space,
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
+        now + 300,
+        now,
+    );
+
+    // Spawn activation task
+    let state_clone = state.clone();
+    let space_clone = space.clone();
+    let del_tok_clone = delegation_token.clone();
+    let activation_handle = tokio::spawn(async move {
+        access::activate_space(
+            &state_clone,
+            ALICE_DID,
+            &space_clone,
+            &del_tok_clone,
+            "attestation",
+        )
+        .await
+    });
+
+    // Wait for activation to reach DPoP exchange
+    dpop_started.notified().await;
+
+    // While activation is in-flight, execute CircleDelete projection
     let del_op = Uuid::new_v4();
     let del_digest = projections::compute_payload_digest(
         &del_op,
@@ -1950,13 +2100,14 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
         AUTHORITY_DID,
         &space,
         "circle_delete",
-        &json!({"space": space}),
+        &json!({"space": space, "generation": 1}),
         Some(1),
     );
 
     projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
         del_op,
         Projection::CircleDelete {
             space: space.clone(),
@@ -1967,54 +2118,28 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
     .await
     .unwrap();
 
-    // 2. In-flight activation attempt after deletion MUST fail
-    let dyn_transport = Arc::new(DynamicMockTransport {
-        authority_key: setup.authority_signing_key.clone(),
-        authority_did: AUTHORITY_DID.to_string(),
-        calls: Mutex::new(Vec::new()),
-    });
+    // Let activation DPoP exchange complete and attempt space_lock & DB txn
+    delete_done.notify_one();
 
-    let custom_space_client = Arc::new(SpaceClient::with_transport(dyn_transport));
-    let state = AppState::with_services(
-        (*setup.state.config).clone(),
-        pool.clone(),
-        setup.state.did_resolver.clone(),
-        setup.state.credential_store.clone(),
-        custom_space_client,
-    );
+    // Activation task finishes
+    let activation_res = activation_handle.await.unwrap();
 
-    let now = Utc::now().timestamp();
-    let delegation_token = mint_delegation_token(
-        &setup.alice_signing_key,
-        ALICE_DID,
-        &space,
-        "#atproto_space_host",
-        now + 300,
-        now,
-    );
+    // Activation must be rejected due to deletion tombstone and lock serialization
+    assert!(activation_res.is_err());
 
-    let res = access::activate_space(
-        &state,
-        ALICE_DID,
-        &space,
-        &delegation_token,
-        "attestation",
-    )
-    .await;
-
-    assert!(res.is_err());
-    // In-memory store must remain empty
+    // In-memory store must remain completely empty (no leaked secret material)
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgPool) {
-    let _setup = setup_test(pool.clone()).await;
+async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
     let space = space_uri();
+    let now = Utc::now().timestamp();
 
-    // Create circle and member
+    // Setup initial circle and member in DB
     sqlx::query(
-        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Circle', now(), 0)",
+        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Circle', now(), 1)",
     )
     .bind(&space)
     .bind(AUTHORITY_DID)
@@ -2023,7 +2148,7 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 0, now())",
+        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 1, now())",
     )
     .bind(&space)
     .bind(ALICE_DID)
@@ -2031,41 +2156,278 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
     .await
     .unwrap();
 
-    // Insert lease with 2 hours expiry
-    let longer_exp = Utc::now() + chrono::Duration::hours(2);
+    struct BarrierTransport {
+        authority_key: p256::ecdsa::SigningKey,
+        authority_did: String,
+        dpop_started: Arc<tokio::sync::Notify>,
+        remove_done: Arc<tokio::sync::Notify>,
+    }
+
+    impl SpaceHostTransport for BarrierTransport {
+        fn get_space_credential<'a>(
+            &'a self,
+            _target_url: &'a url::Url,
+            _delegation_token: &'a str,
+            dpop_proof: &'a str,
+            space_uri: &'a str,
+            _client_attestation: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+            let auth_key = self.authority_key.clone();
+            let auth_did = self.authority_did.clone();
+            let space = space_uri.to_string();
+            let dpop_started = self.dpop_started.clone();
+            let remove_done = self.remove_done.clone();
+            let dpop = dpop_proof.to_string();
+
+            Box::pin(async move {
+                let parts: Vec<&str> = dpop.split('.').collect();
+                let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+                let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+                let jwk = header.get("jwk").unwrap();
+                let x = jwk.get("x").and_then(|v| v.as_str()).unwrap();
+                let y = jwk.get("y").and_then(|v| v.as_str()).unwrap();
+                let x_bytes = URL_SAFE_NO_PAD.decode(x).unwrap();
+                let y_bytes = URL_SAFE_NO_PAD.decode(y).unwrap();
+                let mut xb = p256::FieldBytes::default();
+                let mut yb = p256::FieldBytes::default();
+                xb.copy_from_slice(&x_bytes);
+                yb.copy_from_slice(&y_bytes);
+                let ep = p256::EncodedPoint::from_affine_coordinates(&xb, &yb, false);
+                let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&ep).unwrap();
+                let jkt = calculate_rfc7638_jkt(&vk);
+                let now = Utc::now().timestamp();
+                let cred = mint_space_credential(
+                    &auth_key,
+                    &auth_did,
+                    &space,
+                    &jkt,
+                    now + 3600,
+                    now,
+                    None,
+                    Some("#atproto_space"),
+                );
+
+                dpop_started.notify_one();
+                remove_done.notified().await;
+                Ok(cred)
+            })
+        }
+    }
+
+    let dpop_started = Arc::new(tokio::sync::Notify::new());
+    let remove_done = Arc::new(tokio::sync::Notify::new());
+    let transport = Arc::new(BarrierTransport {
+        authority_key: setup.authority_signing_key.clone(),
+        authority_did: AUTHORITY_DID.to_string(),
+        dpop_started: dpop_started.clone(),
+        remove_done: remove_done.clone(),
+    });
+
+    let custom_space_client = Arc::new(SpaceClient::with_transport(transport));
+    let state = AppState::with_services(
+        (*setup.state.config).clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        custom_space_client,
+    );
+
+    let delegation_token = mint_delegation_token(
+        &setup.alice_signing_key,
+        ALICE_DID,
+        &space,
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
+        now + 300,
+        now,
+    );
+
+    let state_clone = state.clone();
+    let space_clone = space.clone();
+    let del_tok_clone = delegation_token.clone();
+    let activation_handle = tokio::spawn(async move {
+        access::activate_space(
+            &state_clone,
+            ALICE_DID,
+            &space_clone,
+            &del_tok_clone,
+            "attestation",
+        )
+        .await
+    });
+
+    // Wait for activation to reach DPoP exchange
+    dpop_started.notified().await;
+
+    // While activation is in-flight, execute MemberRemove projection
+    let rem_op = Uuid::new_v4();
+    let rem_digest = projections::compute_payload_digest(
+        &rem_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "member_remove",
+        &json!({"member": ALICE_DID, "generation": 2}),
+        Some(2),
+    );
+
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        rem_op,
+        Projection::MemberRemove {
+            space: space.clone(),
+            member: ALICE_DID.into(),
+            generation: 2,
+        },
+        &rem_digest,
+    )
+    .await
+    .unwrap();
+
+    // Let activation complete DPoP exchange and proceed to space lock
+    remove_done.notify_one();
+
+    let activation_res = activation_handle.await.unwrap();
+
+    // Must fail with forbidden (member removed)
+    assert!(activation_res.is_err());
+    assert!(setup.state.credential_store.get(&space).await.is_none());
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    let now = Utc::now().timestamp();
+
+    // Create circle and member
     sqlx::query(
-        r#"
-        INSERT INTO access_leases (space_uri, member_did, expires_at)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET expires_at = GREATEST(access_leases.expires_at, EXCLUDED.expires_at)
-        "#,
+        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Circle', now(), 1)",
     )
     .bind(&space)
-    .bind(ALICE_DID)
-    .bind(longer_exp)
+    .bind(AUTHORITY_DID)
     .execute(&pool)
     .await
     .unwrap();
 
-    // Concurrent slower activation with 1 hour expiry attempts overwrite
-    let shorter_exp = Utc::now() + chrono::Duration::hours(1);
     sqlx::query(
-        r#"
-        INSERT INTO access_leases (space_uri, member_did, expires_at)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET expires_at = GREATEST(access_leases.expires_at, EXCLUDED.expires_at)
-        "#,
+        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 1, now())",
     )
     .bind(&space)
     .bind(ALICE_DID)
-    .bind(shorter_exp)
     .execute(&pool)
     .await
     .unwrap();
 
-    // Verify lease remains at longer_exp
+    // Custom transport with dynamic expiry
+    struct ExpiryTransport {
+        authority_key: p256::ecdsa::SigningKey,
+        authority_did: String,
+        expiry_secs: std::sync::atomic::AtomicI64,
+    }
+
+    impl SpaceHostTransport for ExpiryTransport {
+        fn get_space_credential<'a>(
+            &'a self,
+            _target_url: &'a url::Url,
+            _delegation_token: &'a str,
+            dpop_proof: &'a str,
+            space_uri: &'a str,
+            _client_attestation: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, circle_appview::error::AppError>> + Send + 'a>> {
+            let auth_key = self.authority_key.clone();
+            let auth_did = self.authority_did.clone();
+            let space = space_uri.to_string();
+            let exp = self.expiry_secs.load(std::sync::atomic::Ordering::SeqCst);
+            let dpop = dpop_proof.to_string();
+
+            Box::pin(async move {
+                let parts: Vec<&str> = dpop.split('.').collect();
+                let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+                let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+                let jwk = header.get("jwk").unwrap();
+                let x = jwk.get("x").and_then(|v| v.as_str()).unwrap();
+                let y = jwk.get("y").and_then(|v| v.as_str()).unwrap();
+                let x_bytes = URL_SAFE_NO_PAD.decode(x).unwrap();
+                let y_bytes = URL_SAFE_NO_PAD.decode(y).unwrap();
+                let mut xb = p256::FieldBytes::default();
+                let mut yb = p256::FieldBytes::default();
+                xb.copy_from_slice(&x_bytes);
+                yb.copy_from_slice(&y_bytes);
+                let ep = p256::EncodedPoint::from_affine_coordinates(&xb, &yb, false);
+                let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&ep).unwrap();
+                let jkt = calculate_rfc7638_jkt(&vk);
+                let now = Utc::now().timestamp();
+                let cred = mint_space_credential(
+                    &auth_key,
+                    &auth_did,
+                    &space,
+                    &jkt,
+                    exp,
+                    now,
+                    None,
+                    Some("#atproto_space"),
+                );
+                Ok(cred)
+            })
+        }
+    }
+
+    let longer_exp = now + 7200; // 2 hours
+    let shorter_exp = now + 3600; // 1 hour
+
+    let transport = Arc::new(ExpiryTransport {
+        authority_key: setup.authority_signing_key.clone(),
+        authority_did: AUTHORITY_DID.to_string(),
+        expiry_secs: std::sync::atomic::AtomicI64::new(longer_exp),
+    });
+
+    let custom_space_client = Arc::new(SpaceClient::with_transport(transport.clone()));
+    let state = AppState::with_services(
+        (*setup.state.config).clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        custom_space_client,
+    );
+
+    let delegation_token = mint_delegation_token(
+        &setup.alice_signing_key,
+        ALICE_DID,
+        &space,
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
+        now + 300,
+        now,
+    );
+
+    // 1. Activate with longer expiry (2 hours)
+    let exp1 = access::activate_space(
+        &state,
+        ALICE_DID,
+        &space,
+        &delegation_token,
+        "attestation",
+    )
+    .await
+    .unwrap();
+    assert_eq!(exp1.timestamp(), longer_exp);
+
+    // 2. Set transport to return shorter expiry (1 hour)
+    transport.expiry_secs.store(shorter_exp, std::sync::atomic::Ordering::SeqCst);
+
+    // 3. Concurrent/subsequent activation returns shorter credential from host
+    let exp2 = access::activate_space(
+        &state,
+        ALICE_DID,
+        &space,
+        &delegation_token,
+        "attestation",
+    )
+    .await
+    .unwrap();
+    assert_eq!(exp2.timestamp(), shorter_exp);
+
+    // 4. Verify DB lease remains at longer_exp (monotonic max)
     let stored_exp: (DateTime<Utc>,) = sqlx::query_as(
         "SELECT expires_at FROM access_leases WHERE space_uri = $1 AND member_did = $2",
     )
@@ -2074,39 +2436,82 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
     .fetch_one(&pool)
     .await
     .unwrap();
+    assert_eq!(stored_exp.0.timestamp(), longer_exp);
 
-    // Stored expiry must equal longer_exp, not shorter_exp
-    assert_eq!(stored_exp.0.timestamp(), longer_exp.timestamp());
+    // 5. Verify in-memory CredentialStore remains at longer_exp
+    let in_memory_cred = setup.state.credential_store.get(&space).await.unwrap();
+    assert_eq!(in_memory_cred.expires_at.timestamp(), longer_exp);
+}
+
+struct MockDnsResolver {
+    addrs: Result<Vec<SocketAddr>, AuthReason>,
+}
+
+impl SpaceHostDnsResolver for MockDnsResolver {
+    fn resolve_dns<'a>(
+        &'a self,
+        _host: &'a str,
+        _port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+        let res = self.addrs.clone();
+        Box::pin(async move { res })
+    }
 }
 
 #[tokio::test]
-async fn ssrf_safe_transport_rejects_private_and_http_endpoints() {
-    let transport = DefaultSpaceHostTransport::new();
+async fn ssrf_safe_transport_dns_seam_validations() {
+    let target_url = url::Url::parse("https://space.example.com/xrpc/com.atproto.space.getSpaceCredential").unwrap();
 
-    // 1. HTTP endpoint rejected
-    let res1 = url::Url::parse("http://example.com").unwrap();
-    let err1 = transport
-        .get_space_credential(&res1, "token", "dpop", "space", "attestation")
+    // 1. Mixed DNS answers (one public, one private) -> strictly rejected
+    let mixed_resolver = Arc::new(MockDnsResolver {
+        addrs: Ok(vec![
+            "93.184.216.34:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ]),
+    });
+    let transport_mixed = DefaultSpaceHostTransport::with_dns_resolver(mixed_resolver);
+    let err_mixed = transport_mixed
+        .get_space_credential(&target_url, "token", "dpop", "space", "attestation")
         .await;
-    assert!(err1.is_err());
+    assert!(matches!(err_mixed, Err(circle_appview::error::AppError::Unauthorized(AuthReason::SsrfBlocked))));
 
-    // 2. Localhost rejected
-    let res2 = url::Url::parse("https://localhost:8443").unwrap();
-    let err2 = transport
-        .get_space_credential(&res2, "token", "dpop", "space", "attestation")
+    // 2. Private-only DNS answers -> strictly rejected
+    let private_resolver = Arc::new(MockDnsResolver {
+        addrs: Ok(vec!["10.0.0.1:443".parse().unwrap()]),
+    });
+    let transport_private = DefaultSpaceHostTransport::with_dns_resolver(private_resolver);
+    let err_private = transport_private
+        .get_space_credential(&target_url, "token", "dpop", "space", "attestation")
         .await;
-    assert!(err2.is_err());
+    assert!(matches!(err_private, Err(circle_appview::error::AppError::Unauthorized(AuthReason::SsrfBlocked))));
 
-    // 3. Private IP rejected
-    let res3 = url::Url::parse("https://127.0.0.1:8443").unwrap();
-    let err3 = transport
-        .get_space_credential(&res3, "token", "dpop", "space", "attestation")
+    // 3. DNS resolution failure -> DidResolutionFailed
+    let fail_resolver = Arc::new(MockDnsResolver {
+        addrs: Err(AuthReason::DidResolutionFailed),
+    });
+    let transport_fail = DefaultSpaceHostTransport::with_dns_resolver(fail_resolver);
+    let err_fail = transport_fail
+        .get_space_credential(&target_url, "token", "dpop", "space", "attestation")
         .await;
-    assert!(err3.is_err());
+    assert!(matches!(err_fail, Err(circle_appview::error::AppError::Unauthorized(AuthReason::DidResolutionFailed))));
+}
 
-    let res4 = url::Url::parse("https://10.0.0.1:8443").unwrap();
-    let err4 = transport
-        .get_space_credential(&res4, "token", "dpop", "space", "attestation")
-        .await;
-    assert!(err4.is_err());
+#[tokio::test]
+async fn startup_jwks_loader_and_verifier_tests() {
+    // 1. SSRF tests for fetch_https_jwks: reject HTTP, localhost, private IP
+    let mock_web_transport = Arc::new(auth::DefaultDidWebTransport::new());
+    let resolver = auth::DidResolver::with_transport(
+        "https://plc.directory".into(),
+        reqwest::Client::new(),
+        mock_web_transport,
+    );
+
+    let http_res = auth::fetch_https_jwks(&resolver, "http://nest.catbird.blue/jwks.json").await;
+    assert_eq!(http_res.unwrap_err(), AuthReason::SsrfBlocked);
+
+    let localhost_res = auth::fetch_https_jwks(&resolver, "https://localhost:8443/jwks.json").await;
+    assert_eq!(localhost_res.unwrap_err(), AuthReason::SsrfBlocked);
+
+    let private_res = auth::fetch_https_jwks(&resolver, "https://10.0.0.1/jwks.json").await;
+    assert_eq!(private_res.unwrap_err(), AuthReason::SsrfBlocked);
 }

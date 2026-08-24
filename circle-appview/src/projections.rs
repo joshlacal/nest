@@ -165,10 +165,24 @@ impl SyncProjectionInput {
 pub async fn apply_projection(
     pool: &PgPool,
     credential_store: Option<&CredentialStore>,
+    space_locks: Option<&crate::access::SpaceLockManager>,
     operation_id: Uuid,
     projection: Projection,
     payload_digest: &[u8],
 ) -> Result<(), AppError> {
+    let target_space = match &projection {
+        Projection::CircleUpsert { space, .. } => space.as_str(),
+        Projection::MemberAdd { space, .. } => space.as_str(),
+        Projection::MemberRemove { space, .. } => space.as_str(),
+        Projection::CircleDelete { space, .. } => space.as_str(),
+    };
+
+    // Acquire per-Space async lock spanning DB mutations and in-memory credential store removal
+    let _space_lock = if let Some(locks) = space_locks {
+        Some(locks.acquire(target_space).await)
+    } else {
+        None
+    };
     // 1. Begin transaction first for atomic receipt claim
     let mut tx = pool.begin().await.map_err(AppError::Database)?;
 
@@ -211,13 +225,6 @@ pub async fn apply_projection(
     }
 
     // 2. Check deletion tombstones
-    let target_space = match &projection {
-        Projection::CircleUpsert { space, .. } => space.as_str(),
-        Projection::MemberAdd { space, .. } => space.as_str(),
-        Projection::MemberRemove { space, .. } => space.as_str(),
-        Projection::CircleDelete { space, .. } => space.as_str(),
-    };
-
     let target_generation = match &projection {
         Projection::CircleUpsert { generation, .. } => *generation,
         Projection::MemberAdd { generation, .. } => *generation,
@@ -437,6 +444,39 @@ pub async fn apply_projection(
             .map_err(AppError::Database)?;
         }
         Projection::CircleDelete { space, generation } => {
+            // Check existing circle generation
+            let existing_gen: Option<(i64,)> = sqlx::query_as(
+                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
+            )
+            .bind(&space)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
+            if let Some((curr_gen,)) = existing_gen {
+                if curr_gen > generation {
+                    // Stale delete for an older generation; a newer circle exists.
+                    // Do NOT delete the newer circle or insert a tombstone that would delete it.
+                    tx.commit().await.map_err(AppError::Database)?;
+                    return Ok(());
+                }
+            }
+
+            // Check if a higher tombstone already exists
+            let higher_tombstone: Option<(i64,)> = sqlx::query_as(
+                "SELECT generation FROM circle_tombstones WHERE space_uri = $1 AND generation > $2",
+            )
+            .bind(&space)
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
+            if higher_tombstone.is_some() {
+                tx.commit().await.map_err(AppError::Database)?;
+                return Ok(());
+            }
+
             // 1. Insert deletion tombstone with generation
             sqlx::query(
                 r#"
@@ -451,9 +491,10 @@ pub async fn apply_projection(
             .await
             .map_err(AppError::Database)?;
 
-            // 2. Cascade delete from circles
-            sqlx::query("DELETE FROM circles WHERE space_uri = $1")
+            // 2. Cascade delete from circles where generation <= $2
+            sqlx::query("DELETE FROM circles WHERE space_uri = $1 AND generation <= $2")
                 .bind(&space)
+                .bind(generation)
                 .execute(&mut *tx)
                 .await
                 .map_err(AppError::Database)?;

@@ -815,10 +815,36 @@ impl CircleService {
         self.ensure_capability_and_infra(session, &dpop_data, &req_id).await?;
         let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
 
+        // Determine delete generation: advance previous generation if known, else default to 1
+        let latest_gen: Option<(serde_json::Value,)> = if let Some(pool) = &self.db {
+            sqlx::query_as(
+                r#"
+                SELECT payload
+                FROM circle_projection_outbox
+                WHERE space_uri = $1 AND kind IN ('circle_upsert', 'circle_delete')
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(space_str)
+            .fetch_optional(pool)
+            .await?
+        } else {
+            None
+        };
+
+        let delete_generation = match latest_gen {
+            Some((payload,)) => {
+                let prev_gen = payload.get("generation").and_then(|g| g.as_i64()).unwrap_or(1);
+                prev_gen + 1
+            }
+            None => 1,
+        };
+
         // Persist delete intent before PDS mutation
         let projection_payload = serde_json::json!({
             "space": space_str,
-            "generation": 1
+            "generation": delete_generation
         });
         let op_id = self
             .enqueue_projection(
@@ -1205,28 +1231,20 @@ impl CircleService {
         let expected_short_pds = "#atproto_pds";
         let expected_full_pds = format!("{did}#atproto_pds");
 
-        // 1. Try exact #atproto_space_host first
+        // 1. Try exact #atproto_space_host first (exact ID match only)
         for svc in services {
             let id = svc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let svc_type = svc.get("type").and_then(|v| v.as_str()).unwrap_or_default();
 
-            if id == expected_short_space
-                || id == expected_full_space
-                || svc_type == "AtprotoSpaceHost"
-            {
+            if id == expected_short_space || id == expected_full_space {
                 return Ok(expected_full_space);
             }
         }
 
-        // 2. Fallback to exact #atproto_pds
+        // 2. Fallback to exact #atproto_pds (exact ID match only)
         for svc in services {
             let id = svc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let svc_type = svc.get("type").and_then(|v| v.as_str()).unwrap_or_default();
 
-            if id == expected_short_pds
-                || id == expected_full_pds
-                || svc_type == "AtprotoPersonalDataServer"
-            {
+            if id == expected_short_pds || id == expected_full_pds {
                 return Ok(expected_full_pds);
             }
         }

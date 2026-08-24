@@ -30,21 +30,78 @@ pub trait SpaceHostTransport: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>>;
 }
 
-#[derive(Clone, Default)]
+pub trait SpaceHostDnsResolver: Send + Sync {
+    fn resolve_dns<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>>;
+}
+
+#[derive(Default, Clone)]
+pub struct DefaultSpaceHostDnsResolver;
+
+impl SpaceHostDnsResolver for DefaultSpaceHostDnsResolver {
+    fn resolve_dns<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+        let host = host.to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|_| AuthReason::DidResolutionFailed)?
+                .collect();
+            if addrs.is_empty() {
+                return Err(AuthReason::DidResolutionFailed);
+            }
+            Ok(addrs)
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct DefaultSpaceHostTransport {
     test_root_cert: Option<reqwest::Certificate>,
+    dns_resolver: Arc<dyn SpaceHostDnsResolver>,
+}
+
+impl Default for DefaultSpaceHostTransport {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DefaultSpaceHostTransport {
     pub fn new() -> Self {
         Self {
             test_root_cert: None,
+            dns_resolver: Arc::new(DefaultSpaceHostDnsResolver),
         }
     }
 
     pub fn with_test_root_certificate(cert: reqwest::Certificate) -> Self {
         Self {
             test_root_cert: Some(cert),
+            dns_resolver: Arc::new(DefaultSpaceHostDnsResolver),
+        }
+    }
+
+    pub fn with_dns_resolver(dns_resolver: Arc<dyn SpaceHostDnsResolver>) -> Self {
+        Self {
+            test_root_cert: None,
+            dns_resolver,
+        }
+    }
+
+    pub fn with_resolver_and_cert(
+        dns_resolver: Arc<dyn SpaceHostDnsResolver>,
+        cert: Option<reqwest::Certificate>,
+    ) -> Self {
+        Self {
+            test_root_cert: cert,
+            dns_resolver,
         }
     }
 }
@@ -89,14 +146,11 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             let port = target_url.port().unwrap_or(443);
 
             // DNS resolution
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+            let addrs = self
+                .dns_resolver
+                .resolve_dns(host, port)
                 .await
-                .map_err(|_| AppError::Unauthorized(AuthReason::DidResolutionFailed))?
-                .collect();
-
-            if addrs.is_empty() {
-                return Err(AppError::Unauthorized(AuthReason::DidResolutionFailed));
-            }
+                .map_err(AppError::Unauthorized)?;
 
             // Reject every non-global/special-purpose address
             for addr in &addrs {

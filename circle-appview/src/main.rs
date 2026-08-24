@@ -16,16 +16,31 @@ async fn main() -> Result<(), anyhow::Error> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
     tracing::info!(host = %config.host, port = config.port, "Starting Circle AppView");
 
     let pool = db::init_pool(&config.database_url).await?;
     tracing::info!("Running database migrations");
     db::run_migrations(&pool).await?;
 
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let did_resolver = circle_appview::auth::DidResolver::new(
+        config.plc_directory_url.clone(),
+        http_client,
+    );
+
+    if config.nest_verifying_keys.is_empty() {
+        tracing::info!(url = %config.nest_jwks_url, "Loading Nest JWKS at startup");
+        let keys = circle_appview::auth::fetch_https_jwks(&did_resolver, &config.nest_jwks_url).await
+            .map_err(|e| anyhow::anyhow!("Failed to load Nest JWKS from {}: {:?}", config.nest_jwks_url, e))?;
+        config.nest_verifying_keys = keys;
+    }
+
     let state = AppState::new(config.clone(), pool);
     let app = routes::create_router(state);
-
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on {}", addr);

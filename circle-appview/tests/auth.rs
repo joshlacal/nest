@@ -52,6 +52,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         nest_client_id: "https://nest.catbird.blue".into(),
+        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
     };
 
@@ -919,6 +920,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         nest_client_id: "https://nest.catbird.blue".into(),
+        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
     };
     let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
@@ -964,6 +966,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
             nest_client_id: "https://nest.catbird.blue".into(),
+            nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
             nest_verifying_keys: Vec::new(),
         },
         setup.pool.clone(),
@@ -1005,6 +1008,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
             nest_client_id: "https://nest.catbird.blue".into(),
+            nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
             nest_verifying_keys: Vec::new(),
         },
         setup.pool.clone(),

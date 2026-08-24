@@ -3,8 +3,8 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::sync::RwLock;
-
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use crate::auth::{
     parse_verification_key, select_verification_method, DidDocument, JwtHeader,
     ParsedVerifyingKey,
@@ -83,6 +83,29 @@ impl CredentialStore {
         let now = Utc::now();
         lock.retain(|_, v| v.expires_at > now);
         lock.len()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct SpaceLockManager {
+    locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+impl SpaceLockManager {
+    pub fn new() -> Self {
+        Self {
+            locks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn acquire(&self, space: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.locks.write().await;
+            map.entry(space.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 }
 
@@ -204,14 +227,9 @@ pub fn parse_and_validate_delegation_token(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Unauthorized(AuthReason::AudienceMismatch))?;
 
-    let aud_matches = aud == expected_audience
-        || (expected_audience.ends_with("#atproto_space_host") && aud == "#atproto_space_host")
-        || (expected_audience.ends_with("#atproto_pds") && aud == "#atproto_pds");
-
-    if !aud_matches {
+    if aud != expected_audience {
         return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
     }
-
     let exp = claims
         .get("exp")
         .and_then(|v| v.as_i64())
@@ -323,22 +341,38 @@ pub async fn activate_space(
         )
         .await?;
 
+    // Acquire per-Space async lock spanning DB check, lease insertion, and credential store insertion
+    let _space_lock = state.space_locks.acquire(space).await;
+
     // 7. Atomic transaction for lease creation: locks and verifies circle and member state
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
 
     // Check if Circle was deleted (tombstone)
     let tombstone: Option<(i64,)> = sqlx::query_as(
-        "SELECT generation FROM circle_tombstones WHERE space_uri = $1",
+        "SELECT generation FROM circle_tombstones WHERE space_uri = $1 ORDER BY generation DESC LIMIT 1",
     )
     .bind(space)
     .fetch_optional(&mut *tx)
     .await
     .map_err(AppError::Database)?;
 
-    if tombstone.is_some() {
-        return Err(AppError::Forbidden("Circle is deleted".into()));
-    }
+    let circle_gen: Option<(i64,)> = sqlx::query_as(
+        "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
+    )
+    .bind(space)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
 
+    if let Some((t_gen,)) = tombstone {
+        if let Some((c_gen,)) = circle_gen {
+            if t_gen >= c_gen {
+                return Err(AppError::Forbidden("Circle is deleted".into()));
+            }
+        } else {
+            return Err(AppError::Forbidden("Circle is deleted".into()));
+        }
+    }
     // Check member status
     let member_row: Option<(String, i64)> = sqlx::query_as(
         "SELECT status, generation FROM circle_members WHERE space_uri = $1 AND member_did = $2 FOR UPDATE",
@@ -449,14 +483,22 @@ pub async fn activate_space(
 
     // 8. Verify tombstone does not exist post-commit before inserting into in-memory store
     let post_tombstone: Option<(i64,)> = sqlx::query_as(
-        "SELECT generation FROM circle_tombstones WHERE space_uri = $1",
+        "SELECT generation FROM circle_tombstones WHERE space_uri = $1 ORDER BY generation DESC LIMIT 1",
     )
     .bind(space)
     .fetch_optional(&state.db)
     .await
     .map_err(AppError::Database)?;
 
-    if post_tombstone.is_none() {
+    let can_insert = match post_tombstone {
+        None => true,
+        Some((t_gen,)) => match circle_gen {
+            Some((c_gen,)) => c_gen > t_gen,
+            None => false,
+        },
+    };
+
+    if can_insert {
         let active_cred = ActiveSpaceCredential {
             token: credential_jwt,
             dpop_key,
@@ -464,6 +506,5 @@ pub async fn activate_space(
         };
         state.credential_store.insert(space.to_string(), active_cred).await;
     }
-
     Ok(expires_at)
 }
