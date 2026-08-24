@@ -18,6 +18,7 @@ pub struct CircleProjectionOperation {
     pub attempts: i32,
     pub next_attempt_at: DateTime<Utc>,
     pub last_error_code: Option<String>,
+    pub execution_started_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

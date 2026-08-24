@@ -116,57 +116,74 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
 
 /// Check if an IPv4 address is private/restricted
 pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    // Current network: 0.0.0.0/8
-    if ip.octets()[0] == 0 {
+    let octets = ip.octets();
+
+    // Current network ("this host"): 0.0.0.0/8
+    if octets[0] == 0 {
         return true;
     }
 
     // Loopback: 127.0.0.0/8
-    if ip.is_loopback() {
-        return true;
-    }
-    // Private ranges
-    // 10.0.0.0/8
-    if ip.octets()[0] == 10 {
+    if ip.is_loopback() || octets[0] == 127 {
         return true;
     }
 
-    // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-    if ip.octets()[0] == 172 && (ip.octets()[1] >= 16 && ip.octets()[1] <= 31) {
+    // Private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    if octets[0] == 10 {
+        return true;
+    }
+    if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
+        return true;
+    }
+    if octets[0] == 192 && octets[1] == 168 {
         return true;
     }
 
-    // 192.168.0.0/16
-    if ip.octets()[0] == 192 && ip.octets()[1] == 168 {
+    // Carrier-grade NAT / Shared address space: 100.64.0.0/10
+    if octets[0] == 100 && (octets[1] >= 64 && octets[1] <= 127) {
         return true;
     }
 
     // Link-local: 169.254.0.0/16
-    if ip.is_link_local() {
+    if ip.is_link_local() || (octets[0] == 169 && octets[1] == 254) {
         return true;
     }
 
-    // Broadcast: 255.255.255.255
-    if ip.is_broadcast() {
+    // IETF Protocol Assignments: 192.0.0.0/24
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
         return true;
     }
 
-    // Unspecified: 0.0.0.0
-    if ip.is_unspecified() {
-        return true;
-    }
-
-    // Documentation ranges (TEST-NET)
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-    if (ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 2)
-        || (ip.octets()[0] == 198 && ip.octets()[1] == 51 && ip.octets()[2] == 100)
-        || (ip.octets()[0] == 203 && ip.octets()[1] == 0 && ip.octets()[2] == 113)
+    // Documentation ranges: 192.0.2.0/24 (TEST-NET-1), 198.51.100.0/24 (TEST-NET-2), 203.0.113.0/24 (TEST-NET-3)
+    if (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
     {
         return true;
     }
 
-    // Carrier-grade NAT: 100.64.0.0/10
-    if ip.octets()[0] == 100 && (ip.octets()[1] >= 64 && ip.octets()[1] <= 127) {
+    // 6to4 relay anycast: 192.88.99.0/24
+    if octets[0] == 192 && octets[1] == 88 && octets[2] == 99 {
+        return true;
+    }
+
+    // RFC 2544 Benchmarking: 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return true;
+    }
+
+    // Multicast: 224.0.0.0/4 (224.0.0.0 - 239.255.255.255)
+    if ip.is_multicast() || (octets[0] >= 224 && octets[0] <= 239) {
+        return true;
+    }
+
+    // Reserved for future use / Broadcast: 240.0.0.0/4 (240.0.0.0 - 255.255.255.255)
+    if octets[0] >= 240 {
+        return true;
+    }
+
+    // Broadcast
+    if ip.is_broadcast() {
         return true;
     }
 
@@ -185,21 +202,69 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
         return true;
     }
 
-    // Unique local addresses: fc00::/7 (fc00:: - fdff::)
+    // Multicast: ff00::/8
+    if ip.is_multicast() {
+        return true;
+    }
     let segments = ip.segments();
+    if (segments[0] & 0xff00) == 0xff00 {
+        return true;
+    }
+
+    // Unique local addresses: fc00::/7 (fc00:: - fdff::)
     if (segments[0] & 0xfe00) == 0xfc00 {
         return true;
     }
 
-    // Link-local: fe80::/10
+    // Link-local: fe80::/10 (fe80:: - febf::)
     if (segments[0] & 0xffc0) == 0xfe80 {
         return true;
     }
 
+    // Documentation: 2001:db8::/32
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+
+    // Discard-Only Address Block: 100::/64 (RFC 6666)
+    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+        return true;
+    }
+
+    // IPv4/IPv6 translation: 64:ff9b::/96 (RFC 6052)
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        return true;
+    }
+
+    // 6to4: 2002::/16
+    if segments[0] == 0x2002 {
+        return true;
+    }
+
     // IPv4-mapped addresses: ::ffff:0:0/96
-    // Check the underlying IPv4 address
     if let Some(ipv4) = ip.to_ipv4_mapped() {
         return is_private_ipv4(&ipv4);
+    }
+
+    // IPv4-translated (SIIT): ::ffff:0:0:0/96
+    if segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0xffff
+    {
+        let octet0 = (segments[6] >> 8) as u8;
+        let octet1 = (segments[6] & 0xff) as u8;
+        let octet2 = (segments[7] >> 8) as u8;
+        let octet3 = (segments[7] & 0xff) as u8;
+        return is_private_ipv4(&Ipv4Addr::new(octet0, octet1, octet2, octet3));
     }
 
     false
@@ -252,6 +317,34 @@ mod tests {
 
         // Link-local
         assert!(validate_pds_url("https://[fe80::1]").is_err());
+    }
+    #[test]
+    fn test_blocks_special_and_non_global_ranges() {
+        // RFC 2544 benchmarking: 198.18.0.0/15
+        assert!(validate_pds_url("https://198.18.0.1").is_err());
+        assert!(validate_pds_url("https://198.19.255.254").is_err());
+
+        // IPv4 Multicast: 224.0.0.0/4
+        assert!(validate_pds_url("https://224.0.0.1").is_err());
+        assert!(validate_pds_url("https://239.255.255.250").is_err());
+
+        // IPv4 Reserved: 240.0.0.0/4
+        assert!(validate_pds_url("https://240.0.0.1").is_err());
+        assert!(validate_pds_url("https://255.255.255.255").is_err());
+
+        // IPv6 Multicast: ff00::/8
+        assert!(validate_pds_url("https://[ff00::1]").is_err());
+        assert!(validate_pds_url("https://[ff02::1]").is_err());
+        assert!(validate_pds_url("https://[ff0e::1]").is_err());
+
+        // IPv6 Documentation: 2001:db8::/32
+        assert!(validate_pds_url("https://[2001:db8::1]").is_err());
+
+        // IPv6 Discard prefix: 100::/64
+        assert!(validate_pds_url("https://[100::1]").is_err());
+
+        // IPv6 IPv4-translated: 64:ff9b::/96
+        assert!(validate_pds_url("https://[64:ff9b::1]").is_err());
     }
 
     #[test]

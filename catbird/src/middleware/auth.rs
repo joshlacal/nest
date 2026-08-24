@@ -218,43 +218,54 @@ pub async fn auth_middleware(
     })?;
 
     // Try Jacquard path (new sessions + already-migrated sessions)
-    match resolve_session_via_jacquard(auth_store, jacquard_client, &session_id).await {
-        Ok((session, dpop_data)) => {
-            req.extensions_mut().insert(session);
-            req.extensions_mut().insert(dpop_data);
-            return Ok(next.run(req).await);
-        }
+    let (session, dpop_data) = match resolve_session_via_jacquard(auth_store, jacquard_client, &session_id).await {
+        Ok((session, dpop_data)) => (session, dpop_data),
         Err(AppError::InvalidSession) => {
             // Session not found — attempt legacy migration
             tracing::debug!(session_id = %session_id, "Jacquard session not found, attempting legacy migration");
+            match auth_store.try_migrate_legacy_session(&session_id).await {
+                Ok(Some(_)) => {
+                    tracing::info!(session_id = %session_id, "Legacy session migrated, retrying Jacquard lookup");
+                    resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
+                        .await
+                        .map_err(|e| classify_auth_error(e, is_circle))?
+                }
+                Ok(None) => return Err(classify_auth_error(AppError::InvalidSession, is_circle)),
+                Err(e) => {
+                    tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
+                    return Err(classify_auth_error(AppError::InvalidSession, is_circle));
+                }
+            }
         }
         Err(e) => {
             return Err(classify_auth_error(e, is_circle));
         }
+    };
+
+    // Rebind actor's projection outbox records on every authenticated Circle request
+    if is_circle {
+        if let Some(pool) = &state.push_db {
+            let actor_did = session.did.clone();
+            let session_id_str = session.id.to_string();
+            let _ = sqlx::query(
+                r#"
+                UPDATE circle_projection_outbox
+                SET session_id = $1
+                WHERE actor_did = $2
+                  AND state IN ('pending', 'intent', 'executing')
+                  AND session_id != $1
+                "#,
+            )
+            .bind(&session_id_str)
+            .bind(&actor_did)
+            .execute(pool)
+            .await;
+        }
     }
 
-    // Attempt to migrate a legacy (pre-Jacquard) session
-    match auth_store.try_migrate_legacy_session(&session_id).await {
-        Ok(Some(_)) => {
-            tracing::info!(session_id = %session_id, "Legacy session migrated, retrying Jacquard lookup");
-            // Migration succeeded — retry Jacquard lookup
-            let (session, dpop_data) =
-                resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
-                    .await
-                    .map_err(|e| classify_auth_error(e, is_circle))?;
-            req.extensions_mut().insert(session);
-            req.extensions_mut().insert(dpop_data);
-            Ok(next.run(req).await)
-        }
-        Ok(None) => {
-            // No legacy session either
-            Err(classify_auth_error(AppError::InvalidSession, is_circle))
-        }
-        Err(e) => {
-            tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
-            Err(classify_auth_error(AppError::InvalidSession, is_circle))
-        }
-    }
+    req.extensions_mut().insert(session);
+    req.extensions_mut().insert(dpop_data);
+    Ok(next.run(req).await)
 }
 
 /// Resolve a session via Jacquard's SessionRegistry with automatic token refresh.

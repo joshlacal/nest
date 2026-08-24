@@ -28,6 +28,45 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
+
+/// Error occurred during projection delivery to Circle AppView.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectionDeliveryError {
+    #[error("Session recovery unavailable: {0}")]
+    SessionUnavailable(String),
+    #[error("Service auth failed: {0}")]
+    ServiceAuth(#[from] CircleError),
+    #[error("HTTP request to AppView failed: {0}")]
+    Http(String),
+    #[error("AppView returned error ({status}): {message}")]
+    AppView { status: u16, message: String },
+    #[error("Circle service URL is not configured")]
+    NotConfigured,
+}
+
+impl ProjectionDeliveryError {
+    /// Returns true if this error is an authentication or session-unavailable error that must NEVER be terminalized.
+    pub fn is_never_terminal_auth_error(&self) -> bool {
+        match self {
+            Self::SessionUnavailable(_) => true,
+            Self::ServiceAuth(CircleError::NotAuthorized(_)) => true,
+            Self::ServiceAuth(CircleError::AccessRemoved(_)) => true,
+            Self::ServiceAuth(CircleError::UpstreamUnavailable(_)) => true,
+            Self::AppView { status, .. }
+                if *status == 401
+                    || *status == 403
+                    || *status == 503
+                    || *status == 502
+                    || *status == 504
+                    || *status == 429 =>
+            {
+                true
+            }
+            Self::Http(_) => true,
+            _ => false,
+        }
+    }
+}
 /// Circle orchestration service.
 #[derive(Clone)]
 pub struct CircleService {
@@ -104,6 +143,20 @@ impl CircleService {
         }
 
         Ok(())
+    }
+
+    /// Records an indeterminate transport/network error without marking the row as terminal failed.
+    /// The projection remains in 'executing' state so crash reconciliation can pick it up.
+    async fn record_indeterminate_transport_error(&self, id: Uuid, err: &str) {
+        if let Some(pool) = &self.db {
+            let _ = sqlx::query(
+                "UPDATE circle_projection_outbox SET last_error_code = $2, updated_at = now() WHERE id = $1 AND state = 'executing'"
+            )
+            .bind(id)
+            .bind(err)
+            .execute(pool)
+            .await;
+        }
     }
 
     /// Create a Circle:
@@ -202,18 +255,25 @@ impl CircleService {
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = self
-                    .set_projection_state(
-                        upsert_op_id,
-                        CircleProjectionState::Failed,
-                        Some(&format!("Network error creating space: {e}")),
-                    )
-                    .await;
+                self.record_indeterminate_transport_error(
+                    upsert_op_id,
+                    &format!("Network error creating space: {e}"),
+                )
+                .await;
                 return Err(CircleError::Pds(e.to_string()));
             }
         };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
+        if status >= 500 {
+            let err_text = String::from_utf8_lossy(&body_bytes);
+            self.record_indeterminate_transport_error(
+                upsert_op_id,
+                &format!("createSpace returned server error ({status}): {err_text}"),
+            )
+            .await;
+            return Err(CircleError::UpstreamUnavailable(format!("createSpace returned {status}: {err_text}")));
+        }
         if status < 200 || status >= 300 {
             let err_text = String::from_utf8_lossy(&body_bytes);
             let _ = self
@@ -270,18 +330,25 @@ impl CircleService {
         let meta_resp = match meta_response {
             Ok(resp) => resp,
             Err(e) => {
-                let _ = self
-                    .set_projection_state(
-                        upsert_op_id,
-                        CircleProjectionState::Failed,
-                        Some(&format!("Network error: {e}")),
-                    )
-                    .await;
+                self.record_indeterminate_transport_error(
+                    upsert_op_id,
+                    &format!("Network error creating metadata: {e}"),
+                )
+                .await;
                 return Err(CircleError::Pds(e.to_string()));
             }
         };
 
         let (meta_status, meta_body) = self.extract_response_body(meta_resp).await?;
+        if meta_status >= 500 {
+            let err_text = String::from_utf8_lossy(&meta_body);
+            self.record_indeterminate_transport_error(
+                upsert_op_id,
+                &format!("putRecord metadata returned server error ({meta_status}): {err_text}"),
+            )
+            .await;
+            return Err(CircleError::UpstreamUnavailable(format!("putRecord metadata returned {meta_status}: {err_text}")));
+        }
         if meta_status < 200 || meta_status >= 300 {
             let err_text = String::from_utf8_lossy(&meta_body);
             let _ = self
@@ -369,7 +436,6 @@ impl CircleService {
                     false
                 }
             };
-
             if add_succeeded {
                 self.set_projection_state(member_op_id, CircleProjectionState::Pending, None).await?;
                 successful_member_ops.push(member_op_id);
@@ -547,10 +613,38 @@ impl CircleService {
             }
         }
 
-        // Atomically claim the operation (intent -> executing)
+        // Atomically claim the operation (intent/failed/stale -> executing)
         let claimed = self.claim_projection(op_id, &session.id.to_string()).await?;
         if !claimed {
-            // Already claimed/in-flight by another concurrent worker
+            if let Some(pool) = &self.db {
+                let current: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1",
+                )
+                .bind(op_id)
+                .fetch_optional(pool)
+                .await?;
+
+                if let Some((current_state, last_err)) = current {
+                    if current_state == "failed" {
+                        return Ok(Operation {
+                            id: op_id.to_string().into(),
+                            status: OperationStatus::Failed,
+                            space: Some(input.space),
+                            error: last_err.map(|s| s.into()).or_else(|| Some("OperationFailed".into())),
+                            extra_data: None,
+                        });
+                    }
+                    if current_state == "delivered" {
+                        return Ok(Operation {
+                            id: op_id.to_string().into(),
+                            status: OperationStatus::Complete,
+                            space: Some(input.space),
+                            error: None,
+                            extra_data: None,
+                        });
+                    }
+                }
+            }
             return Ok(Operation {
                 id: op_id.to_string().into(),
                 status: OperationStatus::Pending,
@@ -583,18 +677,25 @@ impl CircleService {
         {
             Ok(resp) => resp,
             Err(e) => {
-                let _ = self
-                    .set_projection_state(
-                        op_id,
-                        CircleProjectionState::Failed,
-                        Some(&format!("Network error: {e}")),
-                    )
-                    .await;
+                self.record_indeterminate_transport_error(
+                    op_id,
+                    &format!("Network error: {e}"),
+                )
+                .await;
                 return Err(CircleError::Pds(e.to_string()));
             }
         };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
+        if status >= 500 {
+            let err_text = String::from_utf8_lossy(&body_bytes);
+            self.record_indeterminate_transport_error(
+                op_id,
+                &format!("PDS operation returned server error ({status}): {err_text}"),
+            )
+            .await;
+            return Err(CircleError::UpstreamUnavailable(format!("PDS operation returned {status}: {err_text}")));
+        }
         if status < 200 || status >= 300 {
             let err_text = String::from_utf8_lossy(&body_bytes);
             let _ = self
@@ -703,6 +804,35 @@ impl CircleService {
         // Atomically claim the operation
         let claimed = self.claim_projection(op_id, &session.id.to_string()).await?;
         if !claimed {
+            if let Some(pool) = &self.db {
+                let current: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1",
+                )
+                .bind(op_id)
+                .fetch_optional(pool)
+                .await?;
+
+                if let Some((current_state, last_err)) = current {
+                    if current_state == "failed" {
+                        return Ok(Operation {
+                            id: op_id.to_string().into(),
+                            status: OperationStatus::Failed,
+                            space: Some(input.space),
+                            error: last_err.map(|s| s.into()).or_else(|| Some("OperationFailed".into())),
+                            extra_data: None,
+                        });
+                    }
+                    if current_state == "delivered" {
+                        return Ok(Operation {
+                            id: op_id.to_string().into(),
+                            status: OperationStatus::Complete,
+                            space: Some(input.space),
+                            error: None,
+                            extra_data: None,
+                        });
+                    }
+                }
+            }
             return Ok(Operation {
                 id: op_id.to_string().into(),
                 status: OperationStatus::Pending,
@@ -734,18 +864,25 @@ impl CircleService {
         {
             Ok(resp) => resp,
             Err(e) => {
-                let _ = self
-                    .set_projection_state(
-                        op_id,
-                        CircleProjectionState::Failed,
-                        Some(&format!("Network error: {e}")),
-                    )
-                    .await;
+                self.record_indeterminate_transport_error(
+                    op_id,
+                    &format!("Network error: {e}"),
+                )
+                .await;
                 return Err(CircleError::Pds(e.to_string()));
             }
         };
 
         let (status, body_bytes) = self.extract_response_body(response).await?;
+        if status >= 500 {
+            let err_text = String::from_utf8_lossy(&body_bytes);
+            self.record_indeterminate_transport_error(
+                op_id,
+                &format!("deleteSpace returned server error ({status}): {err_text}"),
+            )
+            .await;
+            return Err(CircleError::UpstreamUnavailable(format!("deleteSpace returned {status}: {err_text}")));
+        }
         if status < 200 || status >= 300 {
             let err_text = String::from_utf8_lossy(&body_bytes);
             let _ = self
@@ -1017,7 +1154,8 @@ impl CircleService {
         ))
     }
 
-    /// Atomically claim an operation for execution: transitions 'intent' -> 'executing'.
+    /// Atomically claim an operation for execution: transitions 'intent' or 'failed' or expired 'executing' -> 'executing'.
+    /// Resets attempts to 0, clears last_error_code, and sets execution_started_at to now().
     pub async fn claim_projection(&self, id: Uuid, session_id: &str) -> Result<bool, CircleError> {
         if let Some(pool) = &self.db {
             let res = sqlx::query(
@@ -1025,8 +1163,15 @@ impl CircleService {
                 UPDATE circle_projection_outbox
                 SET state = 'executing',
                     session_id = $2,
+                    attempts = 0,
+                    last_error_code = NULL,
+                    execution_started_at = now(),
                     updated_at = now()
-                WHERE id = $1 AND (state = 'intent' OR (state = 'executing' AND updated_at < now() - interval '30 seconds'))
+                WHERE id = $1 AND (
+                    state = 'intent'
+                    OR state = 'failed'
+                    OR (state = 'executing' AND (execution_started_at IS NULL OR execution_started_at < now() - interval '30 seconds'))
+                )
                 "#,
             )
             .bind(id)
@@ -1041,13 +1186,13 @@ impl CircleService {
     }
 
     /// Rebind actor's non-terminal projection outbox records to the latest session ID.
+    /// Does not modify execution lease or updated_at timestamps.
     pub async fn rebind_actor_sessions(&self, actor_did: &str, session_id: &str) -> Result<(), CircleError> {
         if let Some(pool) = &self.db {
             sqlx::query(
                 r#"
                 UPDATE circle_projection_outbox
-                SET session_id = $1,
-                    updated_at = now()
+                SET session_id = $1
                 WHERE actor_did = $2
                   AND state IN ('pending', 'intent', 'executing')
                   AND session_id != $1
@@ -1119,8 +1264,9 @@ impl CircleService {
                         r#"
                         UPDATE circle_projection_outbox
                         SET state = 'executing',
+                            execution_started_at = now(),
                             updated_at = now()
-                        WHERE id = $1 AND state = 'intent'
+                        WHERE id = $1 AND state IN ('intent', 'failed')
                         "#,
                     )
                     .bind(id)
@@ -1168,8 +1314,7 @@ impl CircleService {
                     $1, $2, $3, $4, $5, $6, $7, $8, 0, now(), now(), now()
                 )
                 ON CONFLICT (operation_key) DO UPDATE
-                    SET session_id = EXCLUDED.session_id,
-                        updated_at = now()
+                    SET session_id = EXCLUDED.session_id
                 RETURNING id
                 "#,
             )
@@ -1203,7 +1348,7 @@ impl CircleService {
         };
 
         let row: Option<CircleProjectionOperation> = match sqlx::query_as(
-            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, created_at, updated_at FROM circle_projection_outbox WHERE id = $1"
+            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, created_at, updated_at FROM circle_projection_outbox WHERE id = $1"
         )
         .bind(id)
         .fetch_optional(pool)
@@ -1231,11 +1376,12 @@ impl CircleService {
                 true
             }
             Err(err) => {
+                let err_msg = err.to_string();
                 let _ = sqlx::query(
                     "UPDATE circle_projection_outbox SET attempts = attempts + 1, next_attempt_at = now() + interval '1 second', last_error_code = $2, updated_at = now() WHERE id = $1"
                 )
                 .bind(id)
-                .bind(err)
+                .bind(&err_msg)
                 .execute(pool)
                 .await;
                 false
@@ -1256,14 +1402,7 @@ impl CircleService {
         let mut tx = pool.begin().await?;
 
         let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
-            r#"
-            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, created_at, updated_at
-            FROM circle_projection_outbox
-            WHERE state = 'pending' AND next_attempt_at <= now()
-            ORDER BY next_attempt_at ASC
-            LIMIT $1
-            FOR UPDATE SKIP LOCKED
-            "#,
+            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, created_at, updated_at FROM circle_projection_outbox WHERE state = 'pending' AND next_attempt_at <= now() ORDER BY next_attempt_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED"
         )
         .bind(batch_size)
         .fetch_all(&mut *tx)
@@ -1282,7 +1421,7 @@ impl CircleService {
                     .await?;
                     delivered_count += 1;
                 }
-                Err(err_msg) => {
+                Err(delivery_err) => {
                     let delay_secs = match op.attempts {
                         0 => 1,
                         1 => 2,
@@ -1291,18 +1430,13 @@ impl CircleService {
                         4 => 16,
                         _ => 30,
                     };
-                    let is_auth_error = err_msg.contains("session recovery failed")
-                        || err_msg.contains("Auth store not configured")
-                        || err_msg.contains("Jacquard client not configured")
-                        || err_msg.contains("AuthRequired")
-                        || err_msg.contains("InvalidToken")
-                        || err_msg.contains("ExpiredToken");
-
+                    let is_auth_error = delivery_err.is_never_terminal_auth_error();
                     let next_state = if !is_auth_error && op.attempts + 1 >= 10 {
                         "failed"
                     } else {
                         "pending"
                     };
+                    let err_msg = delivery_err.to_string();
 
                     sqlx::query(
                         r#"
@@ -1334,20 +1468,45 @@ impl CircleService {
         let Some(pool) = &self.db else {
             return Ok(0);
         };
+        // 1. Transactionally claim stale rows using FOR UPDATE SKIP LOCKED
+        let mut tx = pool.begin().await?;
 
         let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
             r#"
-            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, created_at, updated_at
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, created_at, updated_at
             FROM circle_projection_outbox
-            WHERE state IN ('intent', 'executing') AND updated_at < now() - interval '30 seconds'
-            ORDER BY updated_at ASC
+            WHERE (state = 'intent' AND (created_at < now() - interval '30 seconds' OR updated_at < now() - interval '30 seconds'))
+               OR (state = 'executing' AND (execution_started_at IS NULL OR execution_started_at < now() - interval '30 seconds'))
+            ORDER BY created_at ASC
             LIMIT $1
             FOR UPDATE SKIP LOCKED
             "#,
         )
         .bind(batch_size)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
+
+        if rows.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        for op in &rows {
+            sqlx::query(
+                r#"
+                UPDATE circle_projection_outbox
+                SET state = 'executing',
+                    execution_started_at = now(),
+                    updated_at = now()
+                WHERE id = $1
+                "#,
+            )
+            .bind(op.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         let mut reconciled_count = 0;
         for op in rows {
@@ -1377,7 +1536,7 @@ impl CircleService {
                         Some(&dpop_data),
                     ).await;
 
-                    let exists = match resp {
+                    let metadata_exists = match resp {
                         Ok(r) => {
                             let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
                             (200..300).contains(&status)
@@ -1385,9 +1544,88 @@ impl CircleService {
                         Err(_) => false,
                     };
 
-                    if exists {
+                    if metadata_exists {
                         self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
                         reconciled_count += 1;
+                        continue;
+                    }
+
+                    let skey = op.space_uri.rsplit('/').next().unwrap_or("circle");
+                    let client_id = self.state.config.oauth.client_id.clone();
+                    let create_space_payload = serde_json::json!({
+                        "type": "blue.catbird.circle",
+                        "skey": skey,
+                        "policy": {
+                            "$type": "com.atproto.simplespace.defs#memberListPolicy"
+                        },
+                        "appAccess": {
+                            "$type": "com.atproto.simplespace.defs#allowList",
+                            "allowed": [client_id]
+                        }
+                    });
+
+                    if let Ok(create_bytes) = serde_json::to_vec(&create_space_payload) {
+                        let create_resp = atproto.proxy_request(
+                            &session,
+                            reqwest::Method::POST,
+                            "/xrpc/com.atproto.simplespace.createSpace",
+                            None,
+                            Some(Bytes::from(create_bytes)),
+                            Some("application/json"),
+                            None,
+                            "reconcile-create-space",
+                            Some(&dpop_data),
+                        ).await;
+
+                        let space_created = match create_resp {
+                            Ok(r) => {
+                                let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                                if (200..300).contains(&status) {
+                                    true
+                                } else {
+                                    let err_text = String::from_utf8_lossy(&body);
+                                    err_text.to_lowercase().contains("already exists") || status == 409
+                                }
+                            }
+                            Err(_) => false,
+                        };
+
+                        if space_created {
+                            let circle_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
+                            let now_str = Utc::now().to_rfc3339();
+                            let put_record_body = serde_json::json!({
+                                "space": &op.space_uri,
+                                "repo": session.did,
+                                "collection": "blue.catbird.circle.metadata",
+                                "rkey": "self",
+                                "record": {
+                                    "$type": "blue.catbird.circle.metadata",
+                                    "name": circle_name,
+                                    "createdAt": now_str
+                                }
+                            });
+                            if let Ok(put_bytes) = serde_json::to_vec(&put_record_body) {
+                                let put_resp = atproto.proxy_request(
+                                    &session,
+                                    reqwest::Method::POST,
+                                    "/xrpc/com.atproto.space.putRecord",
+                                    None,
+                                    Some(Bytes::from(put_bytes)),
+                                    Some("application/json"),
+                                    None,
+                                    "reconcile-create-metadata",
+                                    Some(&dpop_data),
+                                ).await;
+
+                                if let Ok(r) = put_resp {
+                                    let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                                    if (200..300).contains(&status) {
+                                        self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
+                                        reconciled_count += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 CircleProjectionKind::MemberAdd => {
@@ -1409,8 +1647,9 @@ impl CircleService {
                             Some(&dpop_data),
                         ).await;
                         if let Ok(r) = add_resp {
-                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                            if (200..300).contains(&status) {
+                            let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            let body_text = String::from_utf8_lossy(&body);
+                            if (200..300).contains(&status) || body_text.to_lowercase().contains("already") {
                                 self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
                                 reconciled_count += 1;
                             }
@@ -1436,8 +1675,9 @@ impl CircleService {
                             Some(&dpop_data),
                         ).await;
                         if let Ok(r) = remove_resp {
-                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                            if (200..300).contains(&status) {
+                            let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            let body_text = String::from_utf8_lossy(&body);
+                            if (200..300).contains(&status) || status == 404 || body_text.to_lowercase().contains("not found") {
                                 self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
                                 reconciled_count += 1;
                             }
@@ -1461,8 +1701,9 @@ impl CircleService {
                             Some(&dpop_data),
                         ).await;
                         if let Ok(r) = del_resp {
-                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                            if (200..300).contains(&status) {
+                            let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            let body_text = String::from_utf8_lossy(&body);
+                            if (200..300).contains(&status) || status == 404 || body_text.to_lowercase().contains("not found") {
                                 self.set_projection_state(op.id, CircleProjectionState::Pending, None).await?;
                                 reconciled_count += 1;
                             }
@@ -1549,14 +1790,15 @@ impl CircleService {
         Ok(count.0)
     }
 
+
     /// Sends internal projection to AppView using dedicated `blue.catbird.circle.syncProjection` service auth.
     async fn send_projection_to_appview(
         &self,
         op: &CircleProjectionOperation,
         session_override: Option<&CatbirdSession>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ProjectionDeliveryError> {
         let Some(service_url) = &self.state.config.circle.service_url else {
-            return Err("Circle service URL is not configured".into());
+            return Err(ProjectionDeliveryError::NotConfigured);
         };
 
         let appview_base = service_url.trim_end_matches('/');
@@ -1564,13 +1806,14 @@ impl CircleService {
 
         let token = if let Some(session) = session_override {
             self.get_service_auth_token(session, "blue.catbird.circle.syncProjection")
-                .await
-                .map_err(|e| format!("Failed to get service auth token for projection: {e}"))?
+                .await?
         } else {
-            let session = self.resolve_session_for_op(op).await?;
-            self.get_service_auth_token(&session, "blue.catbird.circle.syncProjection")
+            let session = self
+                .resolve_session_for_op(op)
                 .await
-                .map_err(|e| format!("Failed to get service auth token for projection: {e}"))?
+                .map_err(ProjectionDeliveryError::SessionUnavailable)?;
+            self.get_service_auth_token(&session, "blue.catbird.circle.syncProjection")
+                .await?
         };
 
         let body = serde_json::json!({
@@ -1592,14 +1835,17 @@ impl CircleService {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| format!("HTTP request to AppView failed: {}", e.without_url()))?;
+            .map_err(|e| ProjectionDeliveryError::Http(e.without_url().to_string()))?;
 
         if resp.status().is_success() {
             Ok(())
         } else {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            Err(format!("AppView returned error ({status}): {text}"))
+            Err(ProjectionDeliveryError::AppView {
+                status,
+                message: text,
+            })
         }
     }
 
