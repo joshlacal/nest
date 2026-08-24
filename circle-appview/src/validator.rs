@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum InvalidRecord {
@@ -40,7 +40,7 @@ pub struct ValidationPolicy {
     pub space_uri: String,
     pub owner_did: String,
     pub active_members: HashSet<String>,
-    pub known_post_uris: HashSet<String>,
+    pub known_posts: HashMap<String, String>,
 }
 
 impl ValidationPolicy {
@@ -58,12 +58,17 @@ impl ValidationPolicy {
             space_uri: String::new(),
             owner_did: owner,
             active_members: members,
-            known_post_uris: HashSet::new(),
+            known_posts: HashMap::new(),
         }
     }
 
-    pub fn with_space_uri(mut self, uri: impl Into<String>) -> Self {
-        self.space_uri = uri.into();
+    pub fn with_known_posts(
+        mut self,
+        posts: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        for (u, c) in posts {
+            self.known_posts.insert(u.into(), c.into());
+        }
         self
     }
 
@@ -72,8 +77,25 @@ impl ValidationPolicy {
         uris: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         for u in uris {
-            self.known_post_uris.insert(u.into());
+            self.known_posts.insert(u.into(), String::new());
         }
+        self
+    }
+
+    pub fn known_post_uris(&self) -> HashSet<String> {
+        self.known_posts.keys().cloned().collect()
+    }
+
+    pub fn add_post(&mut self, uri: impl Into<String>, cid: impl Into<String>) {
+        self.known_posts.insert(uri.into(), cid.into());
+    }
+
+    pub fn remove_post(&mut self, uri: &str) {
+        self.known_posts.remove(uri);
+    }
+
+    pub fn with_space_uri(mut self, uri: impl Into<String>) -> Self {
+        self.space_uri = uri.into();
         self
     }
 
@@ -155,29 +177,59 @@ pub fn validate_record(
                     return Err(InvalidRecord::NoAccessLease);
                 }
 
-                let parent_uri = reply
+                let parent_obj = reply
                     .get("parent")
-                    .and_then(|p| p.get("uri"))
+                    .and_then(|p| p.as_object())
+                    .ok_or_else(|| {
+                        InvalidRecord::MalformedRecord("Missing parent object in reply".into())
+                    })?;
+                let parent_uri = parent_obj
+                    .get("uri")
                     .and_then(|u| u.as_str())
                     .ok_or_else(|| {
                         InvalidRecord::MalformedRecord("Missing parent.uri in reply".into())
                     })?;
+                let parent_cid = parent_obj
+                    .get("cid")
+                    .and_then(|c| c.as_str())
+                    .ok_or_else(|| {
+                        InvalidRecord::MalformedRecord("Missing parent.cid in reply".into())
+                    })?;
 
-                let root_uri = reply
+                let root_obj = reply
                     .get("root")
-                    .and_then(|r| r.get("uri"))
+                    .and_then(|r| r.as_object())
+                    .ok_or_else(|| {
+                        InvalidRecord::MalformedRecord("Missing root object in reply".into())
+                    })?;
+                let root_uri = root_obj
+                    .get("uri")
                     .and_then(|u| u.as_str())
                     .ok_or_else(|| {
                         InvalidRecord::MalformedRecord("Missing root.uri in reply".into())
                     })?;
+                let root_cid = root_obj
+                    .get("cid")
+                    .and_then(|c| c.as_str())
+                    .ok_or_else(|| {
+                        InvalidRecord::MalformedRecord("Missing root.cid in reply".into())
+                    })?;
 
-                // Parent and root must be known same-space post URIs
-                if !policy.known_post_uris.contains(parent_uri)
-                    || !policy.known_post_uris.contains(root_uri)
-                {
-                    return Err(InvalidRecord::CrossSpaceReference);
+                // Parent and root must be known same-space post URIs with matching CIDs
+                let known_parent_cid = policy.known_posts.get(parent_uri);
+                let known_root_cid = policy.known_posts.get(root_uri);
+                match (known_parent_cid, known_root_cid) {
+                    (Some(expected_parent_cid), Some(expected_root_cid)) => {
+                        if (!expected_parent_cid.is_empty() && expected_parent_cid != parent_cid)
+                            || (!expected_root_cid.is_empty() && expected_root_cid != root_cid)
+                        {
+                            return Err(InvalidRecord::CrossSpaceReference);
+                        }
+                    }
+                    _ => {
+                        return Err(InvalidRecord::CrossSpaceReference);
+                    }
                 }
-
                 Ok(ValidatedRecord {
                     uri: candidate.uri.clone(),
                     author_did: candidate.author_did.clone(),
@@ -218,19 +270,36 @@ pub fn validate_record(
                 return Err(InvalidRecord::NoAccessLease);
             }
 
-            let subject_uri = candidate
+            let subject_obj = candidate
                 .value
                 .get("subject")
-                .and_then(|s| s.get("uri"))
+                .and_then(|s| s.as_object())
+                .ok_or_else(|| {
+                    InvalidRecord::MalformedRecord("Missing subject object in like".into())
+                })?;
+            let subject_uri = subject_obj
+                .get("uri")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| {
                     InvalidRecord::MalformedRecord("Missing subject.uri in like".into())
                 })?;
+            let subject_cid = subject_obj
+                .get("cid")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| {
+                    InvalidRecord::MalformedRecord("Missing subject.cid in like".into())
+                })?;
 
-                if !policy.known_post_uris.contains(subject_uri) {
+            match policy.known_posts.get(subject_uri) {
+                Some(expected_cid) => {
+                    if !expected_cid.is_empty() && expected_cid != subject_cid {
+                        return Err(InvalidRecord::CrossSpaceReference);
+                    }
+                }
+                None => {
                     return Err(InvalidRecord::CrossSpaceReference);
                 }
-
+            }
             Ok(ValidatedRecord {
                 uri: candidate.uri.clone(),
                 author_did: candidate.author_did.clone(),

@@ -474,7 +474,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 }
             }
 
-            let response = client
+            let mut response = client
                 .get(req_url.as_str())
                 .header(
                     reqwest::header::AUTHORIZATION,
@@ -491,11 +491,22 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                     response.status()
                 )));
             }
-            let bytes = response
-                .bytes()
+
+            let max_car_bytes = crate::commit::MAX_CAR_BYTES;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            Ok(bytes.to_vec())
+                .map_err(|e| AppError::Internal(format!("Failed reading getRepo stream: {e}")))?
+            {
+                if bytes.len() + chunk.len() > max_car_bytes {
+                    return Err(AppError::Internal(format!(
+                        "Repo CAR stream exceeds maximum size limit of {max_car_bytes} bytes"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
         })
     }
 

@@ -301,8 +301,14 @@ pub async fn notify_write_handler(
         }
     }
 
+    let expected_hash = if input.hash.is_empty() {
+        None
+    } else {
+        Some(input.hash.as_ref())
+    };
     let sync_engine = crate::sync::SyncEngine::new(&state);
-    sync_engine.sync_repo(&space_uri, &repo_did).await?;
-
+    sync_engine
+        .sync_repo_with_expected_hash(&space_uri, &repo_did, expected_hash)
+        .await?;
     Ok(StatusCode::OK)
 }

@@ -134,18 +134,16 @@ impl SyncEngine {
         let active_members_set: HashSet<String> =
             active_member_rows.into_iter().map(|(m,)| m).collect();
 
-        let known_post_rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT uri FROM circle_records WHERE space_uri = $1 AND collection = 'app.bsky.feed.post' AND deleted_at IS NULL",
+        let known_post_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND collection = 'app.bsky.feed.post' AND deleted_at IS NULL",
         )
         .bind(space_uri)
         .fetch_all(&self.db)
         .await?;
 
-        let known_posts_set: HashSet<String> = known_post_rows.into_iter().map(|(u,)| u).collect();
-
         let policy = ValidationPolicy::new(&authority_did, active_members_set)
             .with_space_uri(space_uri)
-            .with_known_post_uris(known_posts_set);
+            .with_known_posts(known_post_rows);
 
         // Load previous sync state
         let existing_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
@@ -174,6 +172,7 @@ impl SyncEngine {
         let mut staged_mutations = Vec::new();
         let mut current_policy = policy.clone();
 
+        let mut seen_cursors: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
         let mut terminal_commit = None;
         let mut fetch_failed = false;
@@ -245,7 +244,7 @@ impl SyncEngine {
                         Ok(valid) => {
                             records_accepted += 1;
                             if valid.collection == "app.bsky.feed.post" {
-                                current_policy.known_post_uris.insert(valid.uri.clone());
+                                current_policy.add_post(valid.uri.clone(), cid_str.to_string());
                             }
                             staged_mutations.push(StagedMutation::UpsertRecord {
                                 valid,
@@ -265,7 +264,7 @@ impl SyncEngine {
                     if let Some(prev) = &op.prev {
                         lthash.remove(collection_str, rkey_str, prev.as_str());
                     }
-                    current_policy.known_post_uris.remove(&uri);
+                    current_policy.remove_post(&uri);
                     staged_mutations.push(StagedMutation::DeleteRecord { uri });
                 }
             }
@@ -279,10 +278,13 @@ impl SyncEngine {
             }
 
             if let Some(next_cur) = page.cursor {
-                if Some(&next_cur.to_string()) == cursor.as_ref() {
+                let cur_str = next_cur.to_string();
+                if seen_cursors.contains(&cur_str) {
+                    fetch_failed = true;
                     break;
                 }
-                cursor = Some(next_cur.to_string());
+                seen_cursors.insert(cur_str.clone());
+                cursor = Some(cur_str);
             } else {
                 break;
             }
@@ -469,8 +471,32 @@ impl SyncEngine {
                         .bind(&uri)
                         .execute(&mut *tx)
                         .await?;
+                    sqlx::query("DELETE FROM circle_likes WHERE post_uri = $1")
+                        .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM circle_notifications WHERE subject_uri = $1")
+                        .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
                 }
                 StagedMutation::Rejection { uri, reason } => {
+                    sqlx::query("UPDATE circle_records SET deleted_at = now() WHERE uri = $1")
+                        .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM circle_likes WHERE uri = $1")
+                        .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM circle_likes WHERE post_uri = $1")
+                        .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM circle_notifications WHERE subject_uri = $1")
+                        .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
                     let uri_hash = crate::validator::compute_uri_hash(&uri);
                     sqlx::query(
                         r#"
@@ -547,6 +573,10 @@ impl SyncEngine {
         let mut staged_valid_records = Vec::new();
         let mut staged_rejections = Vec::new();
         let mut current_policy = policy.clone();
+        // Exclude prior recovered author posts from initial reference policy
+        current_policy
+            .known_posts
+            .retain(|uri, _| !uri.contains(author_did));
         let mut lthash = LtHash::new();
         let ops_applied = pending_records.len();
         let mut records_accepted = 0;
@@ -578,7 +608,7 @@ impl SyncEngine {
                     Ok(valid) => {
                         records_accepted += 1;
                         if valid.collection == "app.bsky.feed.post" {
-                            current_policy.known_post_uris.insert(valid.uri.clone());
+                            current_policy.add_post(valid.uri.clone(), rec.cid.clone());
                         }
                         staged_valid_records.push((valid, rec.cid));
                         progress = true;
@@ -695,6 +725,14 @@ impl SyncEngine {
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query("DELETE FROM circle_likes WHERE uri = $1")
+                    .bind(&existing_uri)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM circle_likes WHERE post_uri = $1")
+                    .bind(&existing_uri)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM circle_notifications WHERE subject_uri = $1")
                     .bind(&existing_uri)
                     .execute(&mut *tx)
                     .await?;

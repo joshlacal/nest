@@ -134,22 +134,328 @@ pub fn compute_commit_mac(mac_key: &[u8; 32], hash: &[u8]) -> Result<[u8; 32], C
     Ok(mac.finalize().into_bytes().into())
 }
 
+pub const CID_SERDE_PRIVATE_IDENTIFIER: &str = "$__private__serde__identifier__for__cid";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidLink(pub Vec<u8>);
+
+impl CidLink {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_cid_str(s: &str) -> Result<Self, CommitError> {
+        let (_, raw_bytes) = multibase::decode(s)
+            .map_err(|e| CommitError::InvalidData(format!("Invalid CID string {s}: {e}")))?;
+        Ok(Self(raw_bytes))
+    }
+
+    pub fn raw_cid_bytes(&self) -> &[u8] {
+        if self.0.starts_with(&[0x00]) {
+            &self.0[1..]
+        } else {
+            &self.0[..]
+        }
+    }
+
+    pub fn matches_cid_bytes(&self, bytes: &[u8]) -> bool {
+        self.raw_cid_bytes() == bytes
+    }
+
+    pub fn to_cid_string(&self) -> String {
+        multibase::encode(multibase::Base::Base32Lower, self.raw_cid_bytes())
+    }
+}
+
+impl Serialize for CidLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            CID_SERDE_PRIVATE_IDENTIFIER,
+            serde_bytes::Bytes::new(self.raw_cid_bytes()),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for CidLink {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CidVisitor;
+        impl<'de> serde::de::Visitor<'de> for CidVisitor {
+            type Value = CidLink;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a DAG-CBOR CID link")
+            }
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let bytes: serde_bytes::ByteBuf = serde::Deserialize::deserialize(deserializer)?;
+                Ok(CidLink(bytes.into_vec()))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(CidLink(v.to_vec()))
+            }
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(CidLink(v))
+            }
+        }
+        deserializer.deserialize_newtype_struct(CID_SERDE_PRIVATE_IDENTIFIER, CidVisitor)
+    }
+}
 pub fn compute_dagcbor_cid<T: Serialize + ?Sized>(value: &T) -> Result<String, CommitError> {
-    let dagcbor_bytes = serde_ipld_dagcbor::to_vec(value)
+    let json_val = serde_json::to_value(value)
+        .map_err(|e| CommitError::InvalidData(format!("JSON serialization failed: {e}")))?;
+    let ipld = json_to_ipld(&json_val)?;
+    let dagcbor_bytes = serde_ipld_dagcbor::to_vec(&ipld)
         .map_err(|e| CommitError::InvalidData(format!("DAG-CBOR serialization failed: {e}")))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&dagcbor_bytes);
-    let digest = hasher.finalize();
+    let (_, cid_str) = create_cid_bytes_from_data(&dagcbor_bytes);
+    Ok(cid_str)
+}
 
-    // CIDv1: 0x01 (cidv1) + 0x71 (dag-cbor) + 0x12 (sha2-256) + 0x20 (32 bytes) + digest
-    let mut cid_bytes = Vec::with_capacity(4 + 32);
-    cid_bytes.push(0x01);
-    cid_bytes.push(0x71);
-    cid_bytes.push(0x12);
-    cid_bytes.push(0x20);
-    cid_bytes.extend_from_slice(&digest);
+#[derive(Debug, Clone, PartialEq)]
+pub enum IpldValue {
+    Null,
+    Bool(bool),
+    Integer(i128),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Link(CidLink),
+    List(Vec<IpldValue>),
+    Map(Vec<(String, IpldValue)>),
+}
 
-    Ok(multibase::encode(multibase::Base::Base32Lower, &cid_bytes))
+impl IpldValue {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            IpldValue::Null => serde_json::Value::Null,
+            IpldValue::Bool(b) => serde_json::Value::Bool(*b),
+            IpldValue::Integer(i) => serde_json::json!(*i),
+            IpldValue::Float(f) => serde_json::json!(*f),
+            IpldValue::String(s) => serde_json::Value::String(s.clone()),
+            IpldValue::Bytes(b) => {
+                use base64::Engine;
+                serde_json::json!({
+                    "$bytes": base64::engine::general_purpose::STANDARD.encode(b)
+                })
+            }
+            IpldValue::Link(link) => {
+                serde_json::json!({
+                    "$link": link.to_cid_string()
+                })
+            }
+            IpldValue::List(list) => {
+                serde_json::Value::Array(list.iter().map(|item| item.to_json()).collect())
+            }
+            IpldValue::Map(entries) => {
+                let mut map = serde_json::Map::with_capacity(entries.len());
+                for (k, v) in entries {
+                    map.insert(k.clone(), v.to_json());
+                }
+                serde_json::Value::Object(map)
+            }
+        }
+    }
+}
+
+pub fn json_to_ipld(val: &serde_json::Value) -> Result<IpldValue, CommitError> {
+    match val {
+        serde_json::Value::Null => Ok(IpldValue::Null),
+        serde_json::Value::Bool(b) => Ok(IpldValue::Bool(*b)),
+        serde_json::Value::Number(num) => {
+            if let Some(i) = num.as_i64() {
+                Ok(IpldValue::Integer(i as i128))
+            } else if let Some(u) = num.as_u64() {
+                Ok(IpldValue::Integer(u as i128))
+            } else if let Some(f) = num.as_f64() {
+                Ok(IpldValue::Float(f))
+            } else {
+                Err(CommitError::InvalidData("Invalid number".into()))
+            }
+        }
+        serde_json::Value::String(s) => Ok(IpldValue::String(s.clone())),
+        serde_json::Value::Array(arr) => {
+            let mut list = Vec::with_capacity(arr.len());
+            for item in arr {
+                list.push(json_to_ipld(item)?);
+            }
+            Ok(IpldValue::List(list))
+        }
+        serde_json::Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(serde_json::Value::String(link_str)) = map.get("$link") {
+                    let link = CidLink::from_cid_str(link_str)?;
+                    return Ok(IpldValue::Link(link));
+                }
+                if let Some(serde_json::Value::String(bytes_str)) = map.get("$bytes") {
+                    use base64::Engine;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(bytes_str)
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(bytes_str))
+                        .map_err(|e| CommitError::InvalidData(format!("Invalid $bytes base64: {e}")))?;
+                    return Ok(IpldValue::Bytes(decoded));
+                }
+            }
+            let mut entries = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                entries.push((k.clone(), json_to_ipld(v)?));
+            }
+            entries.sort_by(|(a, _), (b, _)| {
+                if a.len() != b.len() {
+                    a.len().cmp(&b.len())
+                } else {
+                    a.as_bytes().cmp(b.as_bytes())
+                }
+            });
+            Ok(IpldValue::Map(entries))
+        }
+    }
+}
+
+impl Serialize for IpldValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            IpldValue::Null => serializer.serialize_unit(),
+            IpldValue::Bool(b) => serializer.serialize_bool(*b),
+            IpldValue::Integer(i) => {
+                if *i >= 0 {
+                    serializer.serialize_u64(*i as u64)
+                } else {
+                    serializer.serialize_i64(*i as i64)
+                }
+            }
+            IpldValue::Float(f) => serializer.serialize_f64(*f),
+            IpldValue::String(s) => serializer.serialize_str(s),
+            IpldValue::Bytes(b) => serializer.serialize_bytes(b),
+            IpldValue::Link(link) => link.serialize(serializer),
+            IpldValue::List(list) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(list.len()))?;
+                for item in list {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            IpldValue::Map(entries) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (k, v) in entries {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+struct IpldVisitor;
+
+impl<'de> serde::de::Visitor<'de> for IpldVisitor {
+    type Value = IpldValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any IPLD value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(IpldValue::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(IpldValue::Integer(v as i128))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(IpldValue::Integer(v as i128))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(IpldValue::Float(v))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(IpldValue::String(v.to_string()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(IpldValue::String(v))
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E> {
+        Ok(IpldValue::Bytes(v.to_vec()))
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(IpldValue::Bytes(v))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(IpldValue::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(IpldValue::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::Deserialize::deserialize(deserializer)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: serde_bytes::ByteBuf = serde::Deserialize::deserialize(deserializer)?;
+        Ok(IpldValue::Link(CidLink(bytes.into_vec())))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut list = Vec::new();
+        while let Some(elem) = seq.next_element()? {
+            list.push(elem);
+        }
+        Ok(IpldValue::List(list))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut entries = Vec::new();
+        while let Some((k, v)) = map.next_entry()? {
+            entries.push((k, v));
+        }
+        Ok(IpldValue::Map(entries))
+    }
+}
+
+impl<'de> Deserialize<'de> for IpldValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(IpldVisitor)
+    }
 }
 
 pub fn verify_commit(
@@ -294,65 +600,6 @@ fn decode_varint(slice: &[u8]) -> Result<(u64, usize), CommitError> {
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CidLink(pub Vec<u8>);
-
-impl CidLink {
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    pub fn to_cid_string(&self) -> String {
-        multibase::encode(multibase::Base::Base32Lower, &self.0)
-    }
-}
-
-impl Serialize for CidLink {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_newtype_struct(
-            "$serde_ipld_dagcbor::cid",
-            serde_bytes::Bytes::new(&self.0),
-        )
-    }
-}
-
-impl<'de> Deserialize<'de> for CidLink {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct CidVisitor;
-        impl<'de> serde::de::Visitor<'de> for CidVisitor {
-            type Value = CidLink;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a DAG-CBOR CID link")
-            }
-            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                let bytes: serde_bytes::ByteBuf = serde::Deserialize::deserialize(deserializer)?;
-                Ok(CidLink(bytes.into_vec()))
-            }
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(CidLink(v.to_vec()))
-            }
-            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(CidLink(v))
-            }
-        }
-        deserializer.deserialize_newtype_struct("$serde_ipld_dagcbor::cid", CidVisitor)
-    }
-}
 
 pub fn create_cid_bytes_from_data(data: &[u8]) -> (Vec<u8>, String) {
     let mut hasher = Sha256::new();
@@ -393,22 +640,39 @@ pub fn mint_repo_car(
     let (commit_cid_bytes, _commit_cid_str) = create_cid_bytes_from_data(&commit_cbor);
     let commit_cid_link = CidLink::from_bytes(commit_cid_bytes.clone());
 
-    // 2. Build DRISL index map and record blocks
-    let mut drisl_map = std::collections::BTreeMap::new();
+    // 2. Build DRISL index entries and record blocks
+    let mut drisl_entries = Vec::with_capacity(records.len());
     let mut record_map = std::collections::HashMap::new();
 
     for rec in records {
-        let rec_cbor = serde_ipld_dagcbor::to_vec(&rec.value).map_err(|e| {
+        let ipld = json_to_ipld(&rec.value)?;
+        let rec_cbor = serde_ipld_dagcbor::to_vec(&ipld).map_err(|e| {
             CommitError::InvalidData(format!("Record DAG-CBOR serialization failed: {e}"))
         })?;
         let (cid_bytes, _cid_str) = create_cid_bytes_from_data(&rec_cbor);
         let path_key = format!("{}/{}", rec.collection, rec.rkey);
-        drisl_map.insert(path_key.clone(), CidLink::from_bytes(cid_bytes.clone()));
+        let cid_link = CidLink::from_bytes(cid_bytes.clone());
+        drisl_entries.push((path_key.clone(), cid_link));
         record_map.insert(path_key, (cid_bytes, rec_cbor));
     }
 
+    // Sort DRISL entries in canonical shortest-key-first, then byte-wise order
+    drisl_entries.sort_by(|(a, _), (b, _)| {
+        if a.len() != b.len() {
+            a.len().cmp(&b.len())
+        } else {
+            a.as_bytes().cmp(b.as_bytes())
+        }
+    });
+
     // 3. Serialize DRISL map to DAG-CBOR and compute its CID
-    let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_map).map_err(|e| {
+    let drisl_ipld = IpldValue::Map(
+        drisl_entries
+            .iter()
+            .map(|(k, v)| (k.clone(), IpldValue::Link(v.clone())))
+            .collect(),
+    );
+    let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_ipld).map_err(|e| {
         CommitError::InvalidData(format!("DRISL index DAG-CBOR serialization failed: {e}"))
     })?;
     let (drisl_cid_bytes, _drisl_cid_str) = create_cid_bytes_from_data(&drisl_cbor);
@@ -443,8 +707,9 @@ pub fn mint_repo_car(
     );
     car_bytes.extend_from_slice(&drisl_cid_bytes);
     car_bytes.extend_from_slice(&drisl_cbor);
+
     // Blocks 3..N: Record blocks in DRISL map order
-    for path in drisl_map.keys() {
+    for (path, _) in &drisl_entries {
         if let Some((cid_bytes, rec_cbor)) = record_map.get(path) {
             encode_varint((cid_bytes.len() + rec_cbor.len()) as u64, &mut car_bytes);
             car_bytes.extend_from_slice(cid_bytes);
@@ -502,8 +767,6 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         )));
     }
 
-    let commit_root_cid = &header.roots[0].0;
-    let drisl_root_cid = &header.roots[1].0;
     let commit_root_cid_str = header.roots[0].to_cid_string();
     let drisl_root_cid_str = header.roots[1].to_cid_string();
 
@@ -522,7 +785,7 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
     let (b1_cid_bytes, b1_cid_str, b1_data) = parse_cid_and_data_raw(&car_bytes[offset..b1_end])?;
     offset = b1_end;
 
-    if &b1_cid_bytes != commit_root_cid {
+    if !header.roots[0].matches_cid_bytes(&b1_cid_bytes) {
         return Err(CommitError::InvalidData(format!(
             "First block CID {b1_cid_str} does not match commit root CID {commit_root_cid_str}"
         )));
@@ -543,18 +806,22 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
     let (b2_cid_bytes, b2_cid_str, b2_data) = parse_cid_and_data_raw(&car_bytes[offset..b2_end])?;
     offset = b2_end;
 
-    if &b2_cid_bytes != drisl_root_cid {
+    if !header.roots[1].matches_cid_bytes(&b2_cid_bytes) {
         return Err(CommitError::InvalidData(format!(
             "Second block CID {b2_cid_str} does not match DRISL root CID {drisl_root_cid_str}"
         )));
     }
-    let drisl_map: std::collections::BTreeMap<String, CidLink> =
-        serde_ipld_dagcbor::from_slice(&b2_data).map_err(|e| {
-            CommitError::InvalidData(format!("Failed to parse DRISL index map: {e}"))
-        })?;
+    let drisl_ipld: IpldValue = serde_ipld_dagcbor::from_slice(&b2_data).map_err(|e| {
+        CommitError::InvalidData(format!("Failed to parse DRISL index map: {e}"))
+    })?;
+
+    let drisl_entries = match drisl_ipld {
+        IpldValue::Map(entries) => entries,
+        _ => return Err(CommitError::InvalidData("DRISL block must be a DAG-CBOR map".into())),
+    };
 
     // Verify canonical DAG-CBOR DRISL map re-encode equality
-    let re_encoded_drisl = serde_ipld_dagcbor::to_vec(&drisl_map).map_err(|e| {
+    let re_encoded_drisl = serde_ipld_dagcbor::to_vec(&IpldValue::Map(drisl_entries.clone())).map_err(|e| {
         CommitError::InvalidData(format!("Failed to re-encode DRISL map: {e}"))
     })?;
     if re_encoded_drisl != b2_data {
@@ -564,10 +831,15 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
     }
 
     // Stream Blocks 3..N: Record blocks in exact DRISL map order
-    let mut records = Vec::with_capacity(drisl_map.len());
+    let mut records = Vec::with_capacity(drisl_entries.len());
     let mut prev_key: Option<&str> = None;
 
-    for (path_key, expected_cid_link) in &drisl_map {
+    for (path_key, expected_val) in &drisl_entries {
+        let expected_cid_link = match expected_val {
+            IpldValue::Link(l) => l,
+            _ => return Err(CommitError::InvalidData(format!("DRISL value for {path_key} must be a CID link"))),
+        };
+
         // Verify canonical key ordering (length first, then bytewise)
         if let Some(pk) = prev_key {
             if !is_canonical_drisl_key_order(pk, path_key) {
@@ -603,18 +875,27 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
         let (rec_cid_bytes, rec_cid_str, rec_data) =
             parse_cid_and_data_raw(&car_bytes[offset..rec_end])?;
         offset = rec_end;
-        if rec_cid_bytes != expected_cid_link.0 {
+        if !expected_cid_link.matches_cid_bytes(&rec_cid_bytes) {
             return Err(CommitError::InvalidData(format!(
                 "Record block CID {rec_cid_str} does not match DRISL expected CID {}",
                 expected_cid_link.to_cid_string()
             )));
         }
 
-        let val: serde_json::Value = serde_ipld_dagcbor::from_slice(&rec_data).map_err(|e| {
+        let rec_ipld: IpldValue = serde_ipld_dagcbor::from_slice(&rec_data).map_err(|e| {
             CommitError::InvalidData(format!("Failed to decode record CBOR for {path_key}: {e}"))
         })?;
 
-        let computed_cid = compute_dagcbor_cid(&val)?;
+        let re_encoded_rec = serde_ipld_dagcbor::to_vec(&rec_ipld).map_err(|e| {
+            CommitError::InvalidData(format!("Failed to re-encode record CBOR for {path_key}: {e}"))
+        })?;
+        if re_encoded_rec != rec_data {
+            return Err(CommitError::InvalidData(format!(
+                "Non-canonical DAG-CBOR record block encoding for {path_key}"
+            )));
+        }
+
+        let (_, computed_cid) = create_cid_bytes_from_data(&rec_data);
         if computed_cid != rec_cid_str {
             return Err(CommitError::InvalidData(format!(
                 "Record value CID mismatch: computed {computed_cid} != block CID {rec_cid_str}"
@@ -625,7 +906,7 @@ pub fn decode_repo_car(car_bytes: &[u8]) -> Result<DecodedRepoCar, CommitError> 
             collection,
             rkey,
             cid: rec_cid_str,
-            value: val,
+            value: rec_ipld.to_json(),
         });
     }
 

@@ -200,24 +200,13 @@ pub fn resolve_pds_endpoint(
     let pds_full_id = format!("{author_did}#atproto_pds");
     let pds_short_id = "#atproto_pds";
     for svc in &doc.service {
-        if (svc.id == pds_short_id || svc.id == pds_full_id || svc.r#type == "AtprotoPersonalDataServer")
+        if (svc.id == pds_short_id || svc.id == pds_full_id)
+            && svc.r#type == "AtprotoPersonalDataServer"
             && !svc.service_endpoint.is_empty()
         {
             return Ok((svc.service_endpoint.clone(), pds_full_id));
         }
     }
-
-    // Fallback to space host if author is authority and only space host defined
-    let space_host_full_id = format!("{author_did}#atproto_space_host");
-    let space_host_short_id = "#atproto_space_host";
-    for svc in &doc.service {
-        if (svc.id == space_host_short_id || svc.id == space_host_full_id)
-            && !svc.service_endpoint.is_empty()
-        {
-            return Ok((svc.service_endpoint.clone(), space_host_full_id));
-        }
-    }
-
     Err(AppError::InvalidRequest(
         "No #atproto_pds service found in author DID document".into(),
     ))

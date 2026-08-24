@@ -1091,6 +1091,10 @@ fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
     assert_ne!(h1.as_bytes(), &[0u8; 2048]);
     assert_eq!(h1.as_bytes().len(), 2048);
     assert_eq!(h1.digest().len(), 32);
+    assert_eq!(
+        to_hex(&h1.digest()),
+        "ded1c592c7a508e343df92cdbffa74120f51a1af508d8a21ca657238fe0e9a3d"
+    );
 }
 
 #[test]
@@ -1121,6 +1125,223 @@ fn dagcbor_cid_computation_and_mismatch_rejection() {
     });
     let tampered_cid = compute_dagcbor_cid(&tampered_val).unwrap();
     assert_ne!(cid_str, tampered_cid);
+}
+#[test]
+fn exact_fixed_lthash_vector_and_homomorphic_properties() {
+    let h0 = LtHash::new();
+    assert_eq!(h0.as_bytes(), &[0u8; 2048]);
+    assert_eq!(
+        to_hex(&h0.digest()),
+        "e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad"
+    );
+
+    let mut h1 = LtHash::new();
+    h1.add("app.bsky.feed.post", "3l7post1", "bafyreih327owner1");
+    let h1_digest = h1.digest();
+    assert_ne!(h1.as_bytes(), &[0u8; 2048]);
+    assert_eq!(
+        to_hex(&h1_digest),
+        "ded1c592c7a508e343df92cdbffa74120f51a1af508d8a21ca657238fe0e9a3d"
+    );
+
+    let mut h2 = LtHash::new();
+    h2.add("app.bsky.feed.like", "3l7like1", "bafyreih327like1");
+    let h2_digest = h2.digest();
+    assert_ne!(h2_digest, h1_digest);
+    assert_eq!(
+        to_hex(&h2_digest),
+        "d69fb2031356dd0662a510779dc5ba8a38c5d469cbe44c11a3b767e93cf8df12"
+    );
+
+    // Both added to h1
+    h1.add("app.bsky.feed.like", "3l7like1", "bafyreih327like1");
+    let combined_digest = h1.digest();
+    assert_ne!(combined_digest, h1_digest);
+    assert_ne!(combined_digest, h2_digest);
+    assert_eq!(
+        to_hex(&combined_digest),
+        "6f85d6d7c5af968c298f1723dcc2c0948f9b5301942f892511a6ce3ec44bf6f4"
+    );
+
+    // Remove first item -> equals h2 exactly (homomorphic property)
+    h1.remove("app.bsky.feed.post", "3l7post1", "bafyreih327owner1");
+    assert_eq!(h1.as_bytes(), h2.as_bytes());
+    assert_eq!(h1.digest(), h2_digest);
+}
+
+#[test]
+fn dagcbor_cid_with_nested_links_and_raw_bytes() {
+    let blob_cid_str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post with embedded blob link and binary bytes",
+        "embed": {
+            "$type": "app.bsky.embed.images",
+            "images": [{
+                "image": {
+                    "$type": "blob",
+                    "ref": {
+                        "$link": blob_cid_str
+                    },
+                    "mimeType": "image/jpeg",
+                    "size": 12345
+                },
+                "alt": "an image"
+            }]
+        },
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+
+    let cid_str = compute_dagcbor_cid(&post_val).expect("CID computation must succeed");
+    assert!(cid_str.starts_with("bafyre"));
+
+    let ipld = circle_appview::commit::json_to_ipld(&post_val).unwrap();
+    let json_back = ipld.to_json();
+    assert_eq!(
+        json_back["embed"]["images"][0]["image"]["ref"]["$link"],
+        blob_cid_str
+    );
+}
+
+#[test]
+fn drisl_canonical_shortest_key_first_and_reorder_rejection() {
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+    let rec_z = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "z".to_string(),
+        cid: "bafyreiz11111111111111111111111111111111111111111111111".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "z",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
+    let rec_aa = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "aa".to_string(),
+        cid: "bafyreiaa1111111111111111111111111111111111111111111111".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "aa",
+            "createdAt": "2026-08-24T12:00:00.000Z"
+        }),
+    };
+
+    let rec_z_cid = compute_dagcbor_cid(&rec_z.value).unwrap();
+    let rec_aa_cid = compute_dagcbor_cid(&rec_aa.value).unwrap();
+    let rec_z = RepoRecord { cid: rec_z_cid, ..rec_z };
+    let rec_aa = RepoRecord { cid: rec_aa_cid, ..rec_aa };
+
+    let mut lthash = LtHash::new();
+    lthash.add(&rec_z.collection, &rec_z.rkey, &rec_z.cid);
+    lthash.add(&rec_aa.collection, &rec_aa.rkey, &rec_aa.cid);
+
+    let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7rev234567a", lthash.as_bytes(), &signing_key);
+    let car_bytes = mint_repo_car(&commit, &[rec_aa.clone(), rec_z.clone()]).unwrap();
+    let decoded = decode_repo_car(&car_bytes).unwrap();
+    assert_eq!(decoded.records.len(), 2);
+    assert_eq!(decoded.records[0].rkey, "z");
+    assert_eq!(decoded.records[1].rkey, "aa");
+}
+
+#[test]
+fn author_pds_resolution_requires_exact_atproto_pds_id_and_type() {
+    use circle_appview::access::resolve_pds_endpoint;
+    use circle_appview::auth::{DidDocument, DidService};
+
+    // 1. Wrong id -> rejected
+    let doc_wrong_id = DidDocument {
+        id: BOB_DID.to_string(),
+        verification_method: vec![],
+        service: vec![DidService {
+            id: "#custom_pds".to_string(),
+            r#type: "AtprotoPersonalDataServer".to_string(),
+            service_endpoint: "https://pds.example.com".to_string(),
+        }],
+    };
+    assert!(resolve_pds_endpoint(&doc_wrong_id, BOB_DID).is_err());
+
+    // 2. Wrong type -> rejected
+    let doc_wrong_type = DidDocument {
+        id: BOB_DID.to_string(),
+        verification_method: vec![],
+        service: vec![DidService {
+            id: "#atproto_pds".to_string(),
+            r#type: "SomeOtherService".to_string(),
+            service_endpoint: "https://pds.example.com".to_string(),
+        }],
+    };
+    assert!(resolve_pds_endpoint(&doc_wrong_type, BOB_DID).is_err());
+
+    // 3. Fallback to space host rejected for author
+    let doc_space_host_only = DidDocument {
+        id: BOB_DID.to_string(),
+        verification_method: vec![],
+        service: vec![DidService {
+            id: "#atproto_space_host".to_string(),
+            r#type: "AtprotoSpaceHost".to_string(),
+            service_endpoint: "https://space.example.com".to_string(),
+        }],
+    };
+    assert!(resolve_pds_endpoint(&doc_space_host_only, BOB_DID).is_err());
+
+    // 4. Exact #atproto_pds and AtprotoPersonalDataServer accepted
+    let doc_valid = DidDocument {
+        id: BOB_DID.to_string(),
+        verification_method: vec![],
+        service: vec![DidService {
+            id: "#atproto_pds".to_string(),
+            r#type: "AtprotoPersonalDataServer".to_string(),
+            service_endpoint: "https://pds.bob.example.com".to_string(),
+        }],
+    };
+    let (endpoint, id) = resolve_pds_endpoint(&doc_valid, BOB_DID).unwrap();
+    assert_eq!(endpoint, "https://pds.bob.example.com");
+    assert_eq!(id, format!("{BOB_DID}#atproto_pds"));
+}
+
+#[test]
+fn strong_references_require_and_verify_matching_cid() {
+    let owner_post_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7owner11111");
+    let correct_cid = "bafyreih327owner1";
+    let wrong_cid = "bafyreih327wrong9";
+
+    let test_policy = policy(OWNER_DID, [BOB_DID])
+        .with_space_uri(SPACE_URI)
+        .with_known_posts([(owner_post_uri.clone(), correct_cid.to_string())]);
+
+    // 1. Reply with matching CID -> Accepted
+    let valid_reply = bob_reply_to_owner_in_same_space();
+    assert!(validate(valid_reply.clone(), &test_policy).is_ok());
+
+    // 2. Reply with wrong CID -> Rejected CrossSpaceReference
+    let mut wrong_reply = valid_reply.clone();
+    wrong_reply.value["reply"]["parent"]["cid"] = json!(wrong_cid);
+    assert_eq!(
+        validate(wrong_reply, &test_policy).unwrap_err(),
+        InvalidRecord::CrossSpaceReference
+    );
+
+    // 3. Reply with missing CID -> Rejected MalformedRecord
+    let mut missing_cid_reply = valid_reply.clone();
+    missing_cid_reply.value["reply"]["parent"]["cid"] = json!(null);
+    assert!(matches!(
+        validate(missing_cid_reply, &test_policy).unwrap_err(),
+        InvalidRecord::MalformedRecord(_)
+    ));
+
+    // 4. Like with matching CID -> Accepted
+    let valid_like = bob_like_owner_in_same_space();
+    assert!(validate(valid_like.clone(), &test_policy).is_ok());
+
+    // 5. Like with wrong CID -> Rejected CrossSpaceReference
+    let mut wrong_like = valid_like.clone();
+    wrong_like.value["subject"]["cid"] = json!(wrong_cid);
+    assert_eq!(
+        validate(wrong_like, &test_policy).unwrap_err(),
+        InvalidRecord::CrossSpaceReference
+    );
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPool) {
@@ -1890,4 +2111,405 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     let summary = sweep_once(&setup.state).await.unwrap();
     assert_eq!(summary.repos_checked, 1);
     assert_eq!(summary.repos_synced, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post for notifyWrite hash check",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7postnotify1", &post_cid);
+    let rev = "3l7notifysync";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(post_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7postnotify1"))),
+        value: Some(serde_json::from_value(post_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_entry],
+            extra_data: None,
+        },
+    );
+
+    let token = mint_service_jwt(
+        OWNER_DID,
+        &setup.state.config.service_did,
+        "com.atproto.space.notifyWrite",
+        &setup.owner_signing_key,
+    );
+
+    // 1. Mismatched notify hash -> Rejected
+    let wrong_hash = [0x99u8; 32];
+    let notify_input_mismatched = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&wrong_hash),
+        repo: Did::from(String::from(OWNER_DID)),
+        rev: Tid::from(String::from(rev)),
+        space: SPACE_URI.into(),
+        extra_data: None,
+    };
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+
+    let res_mismatch = circle_appview::routes::notify_write_handler(
+        axum::extract::State(setup.state.clone()),
+        headers.clone(),
+        axum::Json(notify_input_mismatched),
+    )
+    .await;
+    assert!(res_mismatch.is_err(), "Mismatched notify hash must be rejected");
+
+    // 2. Correct notify hash -> Accepted
+    let notify_input_correct = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&lthash.digest()),
+        repo: Did::from(String::from(OWNER_DID)),
+        rev: Tid::from(String::from(rev)),
+        space: SPACE_URI.into(),
+        extra_data: None,
+    };
+
+    let token2 = mint_service_jwt(
+        OWNER_DID,
+        &setup.state.config.service_did,
+        "com.atproto.space.notifyWrite",
+        &setup.owner_signing_key,
+    );
+    let mut headers2 = axum::http::HeaderMap::new();
+    headers2.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token2}").parse().unwrap(),
+    );
+
+    let res_correct = circle_appview::routes::notify_write_handler(
+        axum::extract::State(setup.state.clone()),
+        headers2,
+        axum::Json(notify_input_correct),
+    )
+    .await;
+    assert!(res_correct.is_ok(), "Matching notify hash must succeed");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    // Step 1: Owner syncs post P1
+    let p1_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Initial Owner Post P1",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
+    let p1_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7postp11111");
+
+    let mut lthash1 = LtHash::new();
+    lthash1.add("app.bsky.feed.post", "3l7postp11111", &p1_cid);
+    let commit1 = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7rev234567a",
+        lthash1.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit1),
+            cursor: None,
+            ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                cid: Some(Cid::from(p1_cid.clone())),
+                collection: Nsid::from(String::from("app.bsky.feed.post")),
+                prev: None,
+                rev: Tid::from(String::from("3l7rev234567a")),
+                rkey: RecordKey::from(Rkey::from(String::from("3l7postp11111"))),
+                value: Some(serde_json::from_value(p1_val).unwrap()),
+                extra_data: None,
+            }],
+            extra_data: None,
+        },
+    );
+
+    let sync_engine = SyncEngine::new(&setup.state);
+    let res1 = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+    assert_eq!(res1.records_accepted, 1);
+
+    // Step 2: Full recovery from a CAR that contains only a reply referencing P1, but CAR itself does not contain P1.
+    let reply_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Reply to deleted P1",
+        "createdAt": "2026-08-24T12:05:00.000Z",
+        "reply": {
+            "root": { "uri": p1_uri.clone(), "cid": p1_cid.clone() },
+            "parent": { "uri": p1_uri.clone(), "cid": p1_cid.clone() }
+        }
+    });
+    let reply_cid = compute_dagcbor_cid(&reply_val).unwrap();
+
+    let mut lthash2 = LtHash::new();
+    lthash2.add("app.bsky.feed.post", "3l7replyonly1", &reply_cid);
+    let commit2 = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7rev234567b",
+        lthash2.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let rec_reply = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7replyonly1".to_string(),
+        cid: reply_cid,
+        value: reply_val,
+    };
+    let car_bytes = mint_repo_car(&commit2, &[rec_reply]).unwrap();
+    setup.mock_transport.set_get_repo_response(&key, car_bytes);
+
+    let res2 = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+    assert_eq!(res2.mode, SyncMode::FullRecovery);
+    assert_eq!(res2.records_rejected, 1, "Reply referencing absent P1 must be rejected");
+    assert_eq!(res2.records_accepted, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+    let sync_engine = SyncEngine::new(&setup.state);
+
+    // 1. Alice creates post P1
+    let p1_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Target post P1 for likes",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
+    let p1_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7targetp111");
+
+    let mut lthash_a = LtHash::new();
+    lthash_a.add("app.bsky.feed.post", "3l7targetp111", &p1_cid);
+    let commit_a1 = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7234567a234", lthash_a.as_bytes(), &setup.owner_signing_key);
+
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{SPACE_URI}:{OWNER_DID}"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit_a1),
+            cursor: None,
+            ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                cid: Some(Cid::from(p1_cid.clone())),
+                collection: Nsid::from(String::from("app.bsky.feed.post")),
+                prev: None,
+                rev: Tid::from(String::from("3l7234567a234")),
+                rkey: RecordKey::from(Rkey::from(String::from("3l7targetp111"))),
+                value: Some(serde_json::from_value(p1_val).unwrap()),
+                extra_data: None,
+            }],
+            extra_data: None,
+        },
+    );
+    sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+
+    // 2. Bob creates like L1 pointing to P1
+    let l1_val = json!({
+        "$type": "app.bsky.feed.like",
+        "subject": { "uri": p1_uri.clone(), "cid": p1_cid.clone() },
+        "createdAt": "2026-08-24T12:05:00.000Z"
+    });
+    let l1_cid = compute_dagcbor_cid(&l1_val).unwrap();
+    let l1_uri = format!("{SPACE_URI}/{BOB_DID}/app.bsky.feed.like/3l7like111111");
+
+    let mut lthash_b = LtHash::new();
+    lthash_b.add("app.bsky.feed.like", "3l7like111111", &l1_cid);
+    let commit_b1 = mint_signed_commit(SPACE_URI, BOB_DID, "3l7234567b234", lthash_b.as_bytes(), &setup.bob_signing_key);
+
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{SPACE_URI}:{BOB_DID}"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit_b1),
+            cursor: None,
+            ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                cid: Some(Cid::from(l1_cid.clone())),
+                collection: Nsid::from(String::from("app.bsky.feed.like")),
+                prev: None,
+                rev: Tid::from(String::from("3l7234567b234")),
+                rkey: RecordKey::from(Rkey::from(String::from("3l7like111111"))),
+                value: Some(serde_json::from_value(l1_val).unwrap()),
+                extra_data: None,
+            }],
+            extra_data: None,
+        },
+    );
+    sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+
+    // Check like exists
+    let likes_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circle_likes WHERE post_uri = $1")
+        .bind(&p1_uri)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(likes_count.0, 1);
+
+    // 3. Bob updates like L1 to an invalid non-existent target -> Rejected mutation removes existing circle_likes row!
+    let l1_invalid_val = json!({
+        "$type": "app.bsky.feed.like",
+        "subject": { "uri": format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7nonexistent"), "cid": "bafyreih327none1" },
+        "createdAt": "2026-08-24T12:10:00.000Z"
+    });
+    let l1_invalid_cid = compute_dagcbor_cid(&l1_invalid_val).unwrap();
+
+    lthash_b.remove("app.bsky.feed.like", "3l7like111111", &l1_cid);
+    lthash_b.add("app.bsky.feed.like", "3l7like111111", &l1_invalid_cid);
+    let commit_b2 = mint_signed_commit(SPACE_URI, BOB_DID, "3l7234567c234", lthash_b.as_bytes(), &setup.bob_signing_key);
+
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{SPACE_URI}:{BOB_DID}"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit_b2),
+            cursor: None,
+            ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                cid: Some(Cid::from(l1_invalid_cid.clone())),
+                collection: Nsid::from(String::from("app.bsky.feed.like")),
+                prev: Some(Cid::from(l1_cid.clone())),
+                rev: Tid::from(String::from("3l7234567c234")),
+                rkey: RecordKey::from(Rkey::from(String::from("3l7like111111"))),
+                value: Some(serde_json::from_value(l1_invalid_val).unwrap()),
+                extra_data: None,
+            }],
+            extra_data: None,
+        },
+    );
+    let res_b2 = sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
+    assert_eq!(res_b2.records_rejected, 1);
+
+    // Invalid update invalidated previous like row
+    let likes_after_rejection: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circle_likes WHERE uri = $1")
+        .bind(&l1_uri)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(likes_after_rejection.0, 0, "Invalid update must remove prior circle_likes row");
+
+    // 4. Alice deletes post P1 -> circle_likes pointing to P1 and notifications are deleted
+    let mut lthash_a2 = lthash_a.clone();
+    lthash_a2.remove("app.bsky.feed.post", "3l7targetp111", &p1_cid);
+    let commit_a2 = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7234567d234", lthash_a2.as_bytes(), &setup.owner_signing_key);
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{SPACE_URI}:{OWNER_DID}"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit_a2),
+            cursor: None,
+            ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                cid: None,
+                collection: Nsid::from(String::from("app.bsky.feed.post")),
+                prev: Some(Cid::from(p1_cid.clone())),
+                rev: Tid::from(String::from("3l7234567d234")),
+                rkey: RecordKey::from(Rkey::from(String::from("3l7targetp111"))),
+                value: None,
+                extra_data: None,
+            }],
+            extra_data: None,
+        },
+    );
+    sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+
+    let remaining_likes: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circle_likes WHERE post_uri = $1")
+        .bind(&p1_uri)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining_likes.0, 0, "Deleting post must remove all circle_likes pointing to it");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+    let sync_engine = SyncEngine::new(&setup.state);
+
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post recovered after cursor cycle",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7cyclepost1", &post_cid);
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        "3l7cyclerev22",
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: None,
+            cursor: Some("cursor_A".into()),
+            ops: vec![],
+            extra_data: None,
+        },
+    );
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{key}:cursor_A"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: None,
+            cursor: Some("cursor_B".into()),
+            ops: vec![],
+            extra_data: None,
+        },
+    );
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{key}:cursor_B"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: None,
+            cursor: Some("cursor_A".into()), // Cycle!
+            ops: vec![],
+            extra_data: None,
+        },
+    );
+
+    let rec = RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7cyclepost1".to_string(),
+        cid: post_cid,
+        value: post_val,
+    };
+    let car_bytes = mint_repo_car(&commit, &[rec]).unwrap();
+    setup.mock_transport.set_get_repo_response(&key, car_bytes);
+
+    let res = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
+    assert_eq!(res.mode, SyncMode::FullRecovery, "Cursor cycle must enter full recovery");
+    assert_eq!(res.records_accepted, 1);
 }
