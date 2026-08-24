@@ -61,7 +61,8 @@ pub fn build_post_view(
     viewer_like_uri: Option<&str>,
     space_uri: &str,
     author_profile: catbird_atproto::generated::app_bsky::actor::ProfileViewBasic,
-) -> PostView {
+    media_base_url: &str,
+) -> Result<PostView, AppError> {
     let embed = record_json.get("embed").and_then(|e| {
         let type_str = e.get("$type").and_then(|t| t.as_str())?;
         if type_str == "app.bsky.embed.images" {
@@ -81,17 +82,30 @@ pub fn build_post_view(
                     })
                     .unwrap_or("");
 
+                let base = media_base_url.trim_end_matches('/');
                 let media_url = format!(
-                    "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
-                    space_uri, author_did, blob_cid
+                    "{}/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+                    base, space_uri, author_did, blob_cid
                 );
-                let uri_val = UriValue::new(SmolStr::new(&media_url)).unwrap_or_else(|_| {
-                    UriValue::new(SmolStr::new("https://example.com/invalid")).unwrap()
+                let uri_val = UriValue::new(SmolStr::new(&media_url)).ok()?;
+
+                let aspect_ratio = img.get("aspectRatio").and_then(|ar| {
+                    let width = ar.get("width")?.as_i64()?;
+                    let height = ar.get("height")?.as_i64()?;
+                    if width >= 1 && height >= 1 {
+                        Some(catbird_atproto::generated::app_bsky::embed::AspectRatio {
+                            width,
+                            height,
+                            extra_data: None,
+                        })
+                    } else {
+                        None
+                    }
                 });
 
                 view_images.push(ViewImage {
                     alt: SmolStr::new(&alt),
-                    aspect_ratio: None,
+                    aspect_ratio,
                     fullsize: uri_val.clone(),
                     thumb: uri_val,
                     extra_data: None,
@@ -122,16 +136,15 @@ pub fn build_post_view(
     });
 
     let record_data: Data =
-        serde_json::from_value(record_json.clone()).unwrap_or_else(|_| serde_json::from_str("{}").unwrap());
+        serde_json::from_value(record_json.clone()).map_err(|e| AppError::Internal(format!("Invalid record data: {e}")))?;
 
     let std_uri = normalize_uri_to_standard_aturi(uri);
-    let aturi = AtUri::new(SmolStr::new(std_uri)).unwrap_or_else(|_| {
-        AtUri::new(SmolStr::new(format!("at://{author_did}/app.bsky.feed.post/unknown"))).unwrap()
-    });
+    let aturi = AtUri::new(SmolStr::new(std_uri)).map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
+    let cid_val = Cid::new(cid.as_bytes()).map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
 
-    PostView {
+    Ok(PostView {
         uri: aturi,
-        cid: Cid::new(cid.as_bytes()).unwrap_or_else(|_| Cid::new(b"bafyreih327dummycid").unwrap()),
+        cid: cid_val,
         author: author_profile,
         record: record_data,
         indexed_at: Datetime::new(indexed_at.into()),
@@ -146,7 +159,7 @@ pub fn build_post_view(
         viewer,
         debug: None,
         extra_data: None,
-    }
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -157,6 +170,7 @@ pub async fn get_feed(
     space_filter: Option<&str>,
     limit: Option<i64>,
     cursor_str: Option<&str>,
+    media_base_url: &str,
 ) -> Result<GetFeedOutput, AppError> {
     let limit = limit.unwrap_or(50).clamp(1, 100) as usize;
 
@@ -165,32 +179,88 @@ pub async fn get_feed(
         _ => None,
     };
 
-    // If a specific space is filtered, verify access lease first
+    // If a specific space is filtered, verify access lease and membership
     if let Some(space_uri) = space_filter {
-        let space_exists: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
-            "SELECT deleted_at FROM circles WHERE space_uri = $1",
-        )
-        .bind(space_uri)
-        .fetch_optional(pool)
-        .await?;
-
-        match space_exists {
-            None => return Err(AppError::NotFound("Space not found".into())),
-            Some((Some(_deleted),)) => return Err(AppError::NotFound("Space deleted".into())),
-            Some((None,)) => {}
-        }
-
-        let has_lease: Option<(DateTime<Utc>,)> = sqlx::query_as(
-            "SELECT expires_at FROM access_leases WHERE space_uri = $1 AND member_did = $2 AND expires_at > now()",
+        let space_info: Option<(Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            r#"
+            SELECT c.deleted_at, m.status, a.expires_at
+            FROM circles c
+            LEFT JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $2
+            LEFT JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $2
+            WHERE c.space_uri = $1
+            "#,
         )
         .bind(space_uri)
         .bind(user_did)
         .fetch_optional(pool)
         .await?;
 
-        if has_lease.is_none() {
+        match space_info {
+            None => return Err(AppError::NotFound("Space not found".into())),
+            Some((Some(_), _, _)) => return Err(AppError::NotFound("Space deleted".into())),
+            Some((None, member_status, expires_at)) => {
+                let is_active_member = member_status.as_deref() == Some("active");
+                let has_valid_lease = expires_at.is_some_and(|exp| exp > Utc::now());
+                if !is_active_member || !has_valid_lease {
+                    return Err(AppError::AccessRemoved(
+                        "No active access lease for this Circle".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Authorize cursor Space if cursor provided
+    if let Some(ref c) = cursor {
+        let alt_cursor_uri = if c.uri.contains("/space/") {
+            normalize_uri_to_standard_aturi(&c.uri)
+        } else if let Some(rest) = c.uri.strip_prefix("at://") {
+            format!("at://{rest}")
+        } else {
+            c.uri.clone()
+        };
+
+        let cursor_space: Option<(String,)> = sqlx::query_as(
+            "SELECT space_uri FROM circle_records WHERE uri = $1 OR uri = $2 LIMIT 1",
+        )
+        .bind(&c.uri)
+        .bind(&alt_cursor_uri)
+        .fetch_optional(pool)
+        .await?;
+
+        let cursor_space_uri = match cursor_space {
+            Some((sp,)) => sp,
+            None => {
+                if c.uri.contains("/space/") {
+                    let parts: Vec<&str> = c.uri.split("/app.bsky.feed.post/").collect();
+                    if let Some(prefix) = parts.first() {
+                        prefix.to_string()
+                    } else {
+                        return Err(AppError::InvalidRequest("Invalid cursor URI".into()));
+                    }
+                } else {
+                    return Err(AppError::InvalidRequest("Invalid cursor URI".into()));
+                }
+            }
+        };
+
+        let cursor_lease: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT 1
+            FROM circles c
+            JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $1 AND a.expires_at > now()
+            JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
+            WHERE c.space_uri = $2 AND c.deleted_at IS NULL
+            "#,
+        )
+        .bind(user_did)
+        .bind(&cursor_space_uri)
+        .fetch_optional(pool)
+        .await?;
+
+        if cursor_lease.is_none() {
             return Err(AppError::AccessRemoved(
-                "No active access lease for this Circle".into(),
+                "Access removed for cursor Space".into(),
             ));
         }
     }
@@ -227,22 +297,39 @@ pub async fn get_feed(
             c.display_name AS circle_name,
             c.authority_did AS circle_owner,
             COALESCE(pref.muted, false) AS circle_muted,
-            (SELECT count(*) FROM circle_likes l WHERE l.post_uri = r.uri) AS like_count,
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri) AS like_count,
             (
                 SELECT count(*)
                 FROM circle_records rep
                 WHERE rep.parent_uri = r.uri
+                  AND rep.space_uri = r.space_uri
                   AND rep.deleted_at IS NULL
-                  AND (rep.root_uri IS NULL OR EXISTS (SELECT 1 FROM circle_records root WHERE root.uri = rep.root_uri AND root.deleted_at IS NULL))
-            ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l WHERE l.post_uri = r.uri AND l.author_did = $1) AS viewer_like_uri
+                  AND (
+                      rep.root_uri IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM circle_records root
+                          WHERE (root.uri = rep.root_uri OR root.uri = (
+                              CASE
+                                   WHEN rep.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.root_uri, '/space/', 2)
+                                   ELSE rep.root_uri
+                               END
+                           ))
+                             AND root.space_uri = r.space_uri
+                             AND root.deleted_at IS NULL
+                       )
+                   )
+             ) AS reply_count,
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
         JOIN access_leases a ON a.space_uri = r.space_uri AND a.member_did = $1 AND a.expires_at > now()
+        JOIN circle_members m ON m.space_uri = r.space_uri AND m.member_did = $1 AND m.status = 'active'
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
         WHERE r.collection = 'app.bsky.feed.post'
           AND r.deleted_at IS NULL
+          AND r.parent_uri IS NULL
           AND ($2::TEXT IS NULL OR r.space_uri = $2)
+          AND ($2::TEXT IS NOT NULL OR COALESCE(pref.muted, false) = false)
           AND (
               $3::TIMESTAMPTZ IS NULL
               OR (r.indexed_at, r.uri) < ($3, $4)
@@ -262,6 +349,9 @@ pub async fn get_feed(
     let has_more = rows.len() > limit;
     let page_rows = if has_more { &rows[..limit] } else { &rows[..] };
 
+    let author_dids: Vec<&str> = page_rows.iter().map(|r| r.3.as_str()).collect();
+    let profiles_map = hydrator.get_profiles(&author_dids).await;
+
     let mut feed_items = Vec::with_capacity(page_rows.len());
 
     for row in page_rows {
@@ -278,7 +368,10 @@ pub async fn get_feed(
         let reply_count = row.10;
         let viewer_like_uri = row.11.as_deref();
 
-        let author_profile = hydrator.get_profile(author_did).await;
+        let author_profile = profiles_map
+            .get(author_did)
+            .cloned()
+            .unwrap_or_else(|| ProfileHydrator::unavailable_profile(author_did));
 
         let post_view = build_post_view(
             uri,
@@ -291,7 +384,8 @@ pub async fn get_feed(
             viewer_like_uri,
             space_uri,
             author_profile,
-        );
+            media_base_url,
+        )?;
 
         let feed_view_post = FeedViewPost {
             post: post_view,

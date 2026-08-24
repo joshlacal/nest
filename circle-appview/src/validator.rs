@@ -209,6 +209,29 @@ pub fn validate_record(
             // Run generated Lexicon constraint validation
             post.validate()
                 .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for post: {e}")))?;
+            if let Some(labels) = &post.labels {
+                labels.validate()
+                    .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for labels: {e}")))?;
+                for label in &labels.values {
+                    label.validate()
+                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for label: {e}")))?;
+                    if label.val.is_empty() || label.val.len() > 128 {
+                        return Err(InvalidRecord::MalformedRecord("SelfLabel val must be 1..128 characters".into()));
+                    }
+                }
+            }
+
+            if let Some(entities) = &post.entities {
+                for entity in entities {
+                    entity.validate()
+                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for entity: {e}")))?;
+                    entity.index.validate()
+                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for entity index: {e}")))?;
+                    if entity.index.start < 0 || entity.index.end < entity.index.start {
+                        return Err(InvalidRecord::MalformedRecord("Invalid entity text slice index range".into()));
+                    }
+                }
+            }
 
             if let Some(facets) = &post.facets {
                 for facet in facets {
@@ -216,6 +239,9 @@ pub fn validate_record(
                         .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for facet: {e}")))?;
                     facet.index.validate()
                         .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for facet index: {e}")))?;
+                    if facet.index.byte_start < 0 || facet.index.byte_end < facet.index.byte_start {
+                        return Err(InvalidRecord::MalformedRecord("Invalid facet byte slice index range".into()));
+                    }
                     for feature in &facet.features {
                         match feature {
                             catbird_atproto::generated::app_bsky::richtext::facet::FacetFeaturesItem::Mention(m) => {
@@ -232,11 +258,24 @@ pub fn validate_record(
                             }
                             catbird_atproto::generated::app_bsky::richtext::facet::FacetFeaturesItem::Tag(t) => {
                                 t.validate().map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for tag: {e}")))?;
+                                let tag_str = t.tag.as_str();
+                                if tag_str.is_empty() || tag_str.len() > 640 || catbird_atproto::jacquard_common::deps::codegen::unicode_segmentation::UnicodeSegmentation::graphemes(tag_str, true).count() > 64 {
+                                    return Err(InvalidRecord::MalformedRecord(format!("Invalid tag length/graphemes: {tag_str}")));
+                                }
                             }
                             _ => {
                                 return Err(InvalidRecord::MalformedRecord("Unrecognized or malformed facet feature".into()));
                             }
                         }
+                    }
+                }
+            }
+
+            if let Some(tags) = &post.tags {
+                for tag in tags {
+                    let tag_str = tag.as_str();
+                    if tag_str.is_empty() || tag_str.len() > 640 || catbird_atproto::jacquard_common::deps::codegen::unicode_segmentation::UnicodeSegmentation::graphemes(tag_str, true).count() > 64 {
+                        return Err(InvalidRecord::MalformedRecord(format!("Invalid tag item length/graphemes: {tag_str}")));
                     }
                 }
             }
@@ -249,12 +288,15 @@ pub fn validate_record(
                         for img in &images.images {
                             img.validate()
                                 .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for embed image: {e}")))?;
+                            if let Some(ar) = &img.aspect_ratio {
+                                ar.validate()
+                                    .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for aspect ratio: {e}")))?;
+                            }
                         }
                     }
                     _ => return Err(InvalidRecord::UnsupportedEmbed),
                 }
             }
-
             let created_at = post.created_at.as_ref().with_timezone(&Utc);
 
             if let Some(reply) = &post.reply {

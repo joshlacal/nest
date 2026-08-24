@@ -13,6 +13,7 @@ pub struct Config {
     pub service_did: String,
     pub plc_directory_url: String,
     pub public_appview_url: String,
+    pub circle_media_base_url: String,
     pub nest_client_id: String,
     pub nest_jwks_url: String,
     pub nest_verifying_keys: Vec<crate::auth::ParsedVerifyingKey>,
@@ -33,11 +34,12 @@ impl Config {
             env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let public_appview_url =
             env::var("PUBLIC_APPVIEW_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
+        let circle_media_base_url = env::var("CIRCLE_MEDIA_BASE_URL")
+            .map_err(|_| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL environment variable is required"))?;
         let nest_client_id = env::var("NEST_CLIENT_ID")
             .map_err(|_| anyhow::anyhow!("NEST_CLIENT_ID environment variable is required"))?;
         let nest_jwks_url = env::var("NEST_JWKS_URL")
             .map_err(|_| anyhow::anyhow!("NEST_JWKS_URL environment variable is required"))?;
-
         Ok(Self {
             host,
             port,
@@ -45,6 +47,7 @@ impl Config {
             service_did,
             plc_directory_url,
             public_appview_url,
+            circle_media_base_url,
             nest_client_id,
             nest_jwks_url,
             nest_verifying_keys: Vec::new(),

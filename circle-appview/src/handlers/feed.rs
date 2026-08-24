@@ -20,6 +20,7 @@ pub async fn get_feed_handler(
         space_filter,
         query.limit,
         query.cursor.as_deref(),
+        &state.config.circle_media_base_url,
     )
     .await?;
 

@@ -450,6 +450,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         service_did: "did:web:appview.catbird.blue".into(),
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
+        circle_media_base_url: "https://media.catbird.blue".into(),
         nest_client_id: "https://nest.catbird.blue/client-metadata.json".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: vec![],
@@ -4043,4 +4044,100 @@ fn validator_rejects_missing_or_mismatched_type_and_unsupported_embeds() {
         }),
     };
     assert!(matches!(validate(bad_link_uri, &pol), Err(InvalidRecord::MalformedRecord(_))));
+    // 13. Post with invalid aspect ratio (width < 1 or height < 1) -> MalformedRecord
+    let bad_aspect_ratio = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p14"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p14".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with bad aspect ratio",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [{
+                    "alt": "bad aspect",
+                    "aspectRatio": { "width": 0, "height": 100 },
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": &blob_cid },
+                        "mimeType": "image/jpeg",
+                        "size": 50000
+                    }
+                }]
+            }
+        }),
+    };
+    assert!(matches!(validate(bad_aspect_ratio, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 14. Post with SelfLabels having > 10 values -> MalformedRecord
+    let too_many_labels = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p15"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p15".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with too many labels",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "labels": {
+                "$type": "com.atproto.label.defs#selfLabels",
+                "values": (0..11).map(|i| json!({"val": format!("label{i}")})).collect::<Vec<_>>()
+            }
+        }),
+    };
+    assert!(matches!(validate(too_many_labels, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 15. Post with SelfLabel having empty val -> MalformedRecord
+    let empty_label = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p16"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p16".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with empty label",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "labels": {
+                "$type": "com.atproto.label.defs#selfLabels",
+                "values": [{ "val": "" }]
+            }
+        }),
+    };
+    assert!(matches!(validate(empty_label, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 16. Post with entity having negative index range -> MalformedRecord
+    let bad_entity_index = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p17"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p17".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with bad entity index",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "entities": [{
+                "index": { "start": 5, "end": 2 },
+                "type": "mention",
+                "value": "did:plc:alice"
+            }]
+        }),
+    };
+    assert!(matches!(validate(bad_entity_index, &pol), Err(InvalidRecord::MalformedRecord(_))));
+
+    // 17. Post with tag having empty string -> MalformedRecord
+    let empty_tag = RecordCandidate {
+        uri: format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p18"),
+        author_did: OWNER_DID.to_string(),
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3l7p18".to_string(),
+        value: json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Post with empty tag",
+            "createdAt": "2026-08-24T12:00:00.000Z",
+            "tags": [""]
+        }),
+    };
+    assert!(matches!(validate(empty_tag, &pol), Err(InvalidRecord::MalformedRecord(_))));
 }

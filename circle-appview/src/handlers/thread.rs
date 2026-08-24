@@ -22,6 +22,7 @@ pub async fn get_post_thread_handler(
         query.space.as_str(),
         query.depth,
         query.parent_height,
+        &state.config.circle_media_base_url,
     )
     .await?;
 
