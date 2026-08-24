@@ -90,6 +90,23 @@ impl KeyStore {
         }
     }
 
+    /// Create a KeyStore from multiple keys with a specified active key ID (for tests or dynamic initialization)
+    pub fn from_keys(
+        keys: impl IntoIterator<Item = (String, SecretKey)>,
+        active_key_id: impl Into<String>,
+    ) -> Self {
+        let active_key_id = active_key_id.into();
+        let keys_map: HashMap<String, SecretKey> = keys.into_iter().collect();
+        assert!(
+            keys_map.contains_key(&active_key_id),
+            "active_key_id must exist in keys"
+        );
+        Self {
+            keys: keys_map,
+            active_key_id,
+        }
+    }
+
     /// Get the active signing key (used for signing new JWTs)
     pub fn active_key(&self) -> SigningKey {
         SigningKey {

@@ -123,7 +123,7 @@ fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CircleConfig {
     /// URL of the Circle AppView service (e.g., http://127.0.0.1:3002)
     #[serde(default)]
@@ -135,6 +135,15 @@ pub struct CircleConfig {
 
 fn default_circle_service_did() -> String {
     "did:web:circles.catbird.blue#atproto_circle".to_string()
+}
+
+impl Default for CircleConfig {
+    fn default() -> Self {
+        Self {
+            service_url: None,
+            service_did: default_circle_service_did(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -699,5 +708,22 @@ mod tests {
     #[test]
     fn unrelated_oauth_initialization_failures_remain_degraded() {
         assert!(validate_configured_oauth_scopes(&["atproto".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn circle_config_defaults_when_section_is_absent() {
+        let default_circle = CircleConfig::default();
+        assert_eq!(default_circle.service_did, default_circle_service_did());
+        assert_eq!(default_circle.service_did, "did:web:circles.catbird.blue#atproto_circle");
+        assert!(default_circle.service_url.is_none());
+
+        #[derive(Deserialize)]
+        struct PartialApp {
+            #[serde(default)]
+            circle: CircleConfig,
+        }
+        let partial: PartialApp = serde_json::from_str("{}").expect("deserializes");
+        assert_eq!(partial.circle.service_did, "did:web:circles.catbird.blue#atproto_circle");
+        assert!(partial.circle.service_url.is_none());
     }
 }

@@ -88,8 +88,11 @@ impl ClientAttestationProvider {
     ///
     /// Never stores or logs the minted JWT.
     pub fn mint(&self, space_host_audience: &str) -> Result<String, ClientAttestationError> {
-        let trimmed_aud = space_host_audience.trim();
-        if trimmed_aud.is_empty() || trimmed_aud.contains('*') || trimmed_aud.contains(char::is_whitespace) {
+        if space_host_audience.is_empty()
+            || space_host_audience != space_host_audience.trim()
+            || space_host_audience.contains('*')
+            || space_host_audience.contains(char::is_whitespace)
+        {
             return Err(ClientAttestationError::InvalidAudience(
                 format!("Invalid space host audience: {space_host_audience:?}")
             ));
@@ -109,7 +112,7 @@ impl ClientAttestationProvider {
         let claims = AttestationClaims {
             iss: self.client_id.clone(),
             sub: self.client_id.clone(),
-            aud: trimmed_aud.to_string(),
+            aud: space_host_audience.to_string(),
             iat: now,
             exp,
             jti,
@@ -143,9 +146,26 @@ mod tests {
         "https://api.catbird.blue".to_string()
     }
 
-    fn test_key_store() -> KeyStore {
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
-        KeyStore::from_key("catbird-key-1", secret_key)
+    fn test_multi_key_store() -> (KeyStore, String, String) {
+        let legacy_key_id = "catbird-legacy-key-1".to_string();
+        let active_key_id = "catbird-active-key-2".to_string();
+        let legacy_secret = p256::SecretKey::random(&mut rand::thread_rng());
+        let active_secret = p256::SecretKey::random(&mut rand::thread_rng());
+
+        let store = KeyStore::from_keys(
+            vec![
+                (legacy_key_id.clone(), legacy_secret),
+                (active_key_id.clone(), active_secret),
+            ],
+            &active_key_id,
+        );
+        (store, legacy_key_id, active_key_id)
+    }
+
+    fn decode_header(token: &str) -> serde_json::Value {
+        let header_b64 = token.split('.').next().expect("jwt header segment");
+        let bytes = URL_SAFE_NO_PAD.decode(header_b64).expect("header decodes");
+        serde_json::from_slice(&bytes).expect("header is json")
     }
 
     fn decode_claim(token: &str, claim: &str) -> String {
@@ -164,9 +184,20 @@ mod tests {
 
     #[test]
     fn client_attestation_is_single_use_and_addressed_to_space_host() {
-        let key_store = Arc::new(test_key_store());
+        let (key_store_raw, legacy_key_id, active_key_id) = test_multi_key_store();
+        let key_store = Arc::new(key_store_raw);
         let attestation_provider = ClientAttestationProvider::new(key_store.clone(), configured_client_id());
         let jwt = attestation_provider.mint("did:plc:owner#atproto_space_host").unwrap();
+
+        // JOSE protected header assertions
+        let header = decode_header(&jwt);
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["kid"], active_key_id.as_str());
+        assert_eq!(header["kid"], key_store.active_key().kid.as_str());
+        assert_ne!(header["kid"], legacy_key_id.as_str());
+
+        // Payload assertions
         assert_eq!(decode_claim(&jwt, "iss"), configured_client_id());
         assert_eq!(decode_claim(&jwt, "sub"), configured_client_id());
         assert_eq!(decode_claim(&jwt, "aud"), "did:plc:owner#atproto_space_host");
@@ -176,15 +207,21 @@ mod tests {
         let exp = decode_num_claim(&jwt, "exp");
         assert_eq!(exp - iat, 60, "attestation exp must be iat + 60s");
 
-        // Verify ES256 signature
+        // Verify ES256 signature with active key
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         let signature_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         let signature = Signature::from_bytes(signature_bytes.as_slice().into()).unwrap();
-        let signing_key = SigningKey::from(key_store.active_key().secret_key);
-        let verifying_key = signing_key.verifying_key();
-        assert!(verifying_key.verify(signing_input.as_bytes(), &signature).is_ok());
+        let active_signing_key = SigningKey::from(key_store.active_key().secret_key);
+        let active_verifying_key = active_signing_key.verifying_key();
+        assert!(active_verifying_key.verify(signing_input.as_bytes(), &signature).is_ok());
+
+        // Verify signature check fails with legacy/inactive key
+        let legacy_key = key_store.get_key(&legacy_key_id).unwrap();
+        let legacy_signing_key = SigningKey::from(legacy_key.secret_key);
+        let legacy_verifying_key = legacy_signing_key.verifying_key();
+        assert!(legacy_verifying_key.verify(signing_input.as_bytes(), &signature).is_err());
 
         // Single-use: minting twice produces different jti and signatures
         let jwt2 = attestation_provider.mint("did:plc:owner#atproto_space_host").unwrap();
@@ -194,11 +231,15 @@ mod tests {
 
     #[test]
     fn rejects_invalid_audiences() {
-        let key_store = Arc::new(test_key_store());
+        let (key_store_raw, _, _) = test_multi_key_store();
+        let key_store = Arc::new(key_store_raw);
         let attestation_provider = ClientAttestationProvider::new(key_store, configured_client_id());
         assert!(attestation_provider.mint("").is_err());
         assert!(attestation_provider.mint("   ").is_err());
         assert!(attestation_provider.mint("did:plc:owner#*").is_err());
         assert!(attestation_provider.mint("did:plc:owner with spaces").is_err());
+        assert!(attestation_provider.mint(" did:plc:owner#atproto_space_host").is_err());
+        assert!(attestation_provider.mint("did:plc:owner#atproto_space_host ").is_err());
+        assert!(attestation_provider.mint("did:plc:owner#atproto_space_host\n").is_err());
     }
 }
