@@ -671,6 +671,12 @@ mod tests {
     fn invalid_configured_space_scope_fails_before_startup() {
         let error = validate_configured_oauth_scopes(&["space".to_string()]).unwrap_err();
         assert!(error.to_string().contains("Invalid configured OAuth scope"));
+
+        let error = validate_configured_oauth_scopes(&[
+            "space:blue.catbird.circle?authority=*&authority=self&action=read".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("Invalid configured OAuth scope"));
     }
 
     #[test]
