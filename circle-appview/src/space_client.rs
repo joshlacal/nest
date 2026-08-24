@@ -65,6 +65,7 @@ impl SpaceHostDnsResolver for DefaultSpaceHostDnsResolver {
 pub struct DefaultSpaceHostTransport {
     test_root_cert: Option<reqwest::Certificate>,
     dns_resolver: Arc<dyn SpaceHostDnsResolver>,
+    allow_loopback_for_test: bool,
 }
 
 impl Default for DefaultSpaceHostTransport {
@@ -78,6 +79,7 @@ impl DefaultSpaceHostTransport {
         Self {
             test_root_cert: None,
             dns_resolver: Arc::new(DefaultSpaceHostDnsResolver),
+            allow_loopback_for_test: false,
         }
     }
 
@@ -85,6 +87,7 @@ impl DefaultSpaceHostTransport {
         Self {
             test_root_cert: Some(cert),
             dns_resolver: Arc::new(DefaultSpaceHostDnsResolver),
+            allow_loopback_for_test: false,
         }
     }
 
@@ -92,6 +95,7 @@ impl DefaultSpaceHostTransport {
         Self {
             test_root_cert: None,
             dns_resolver,
+            allow_loopback_for_test: false,
         }
     }
 
@@ -102,6 +106,19 @@ impl DefaultSpaceHostTransport {
         Self {
             test_root_cert: cert,
             dns_resolver,
+            allow_loopback_for_test: false,
+        }
+    }
+
+    pub fn with_test_fixture(
+        dns_resolver: Arc<dyn SpaceHostDnsResolver>,
+        cert: Option<reqwest::Certificate>,
+        allow_loopback: bool,
+    ) -> Self {
+        Self {
+            test_root_cert: cert,
+            dns_resolver,
+            allow_loopback_for_test: allow_loopback,
         }
     }
 }
@@ -133,13 +150,15 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 AppError::InvalidRequest("Missing host in Space host URL".into())
             })?;
 
-            if host.is_empty() || is_localhost_hostname(host) {
-                return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
-            }
-
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                if is_private_ip(&ip) {
+            if !self.allow_loopback_for_test {
+                if host.is_empty() || is_localhost_hostname(host) {
                     return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+                }
+
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    if is_private_ip(&ip) {
+                        return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+                    }
                 }
             }
 
@@ -152,13 +171,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .await
                 .map_err(AppError::Unauthorized)?;
 
-            // Reject every non-global/special-purpose address
-            for addr in &addrs {
-                if is_private_ip(&addr.ip()) {
-                    return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+            if !self.allow_loopback_for_test {
+                // Reject every non-global/special-purpose address
+                for addr in &addrs {
+                    if is_private_ip(&addr.ip()) {
+                        return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+                    }
                 }
             }
-
             let pinned_addr = addrs[0];
 
             let mut builder = reqwest::Client::builder()

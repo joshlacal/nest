@@ -209,23 +209,40 @@ pub trait DidWebTransport: Send + Sync {
         host: &'a str,
         pinned_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>>;
-}
 
+    fn test_root_certificate(&self) -> Option<reqwest::Certificate> {
+        None
+    }
+
+    fn allows_loopback_for_test(&self) -> bool {
+        false
+    }
+}
 #[derive(Debug, Default, Clone)]
 pub struct DefaultDidWebTransport {
     test_root_cert: Option<reqwest::Certificate>,
+    allow_loopback_for_test: bool,
 }
 
 impl DefaultDidWebTransport {
     pub fn new() -> Self {
         Self {
             test_root_cert: None,
+            allow_loopback_for_test: false,
         }
     }
 
     pub fn with_test_root_certificate(cert: reqwest::Certificate) -> Self {
         Self {
             test_root_cert: Some(cert),
+            allow_loopback_for_test: false,
+        }
+    }
+
+    pub fn with_test_fixture(cert: reqwest::Certificate, allow_loopback: bool) -> Self {
+        Self {
+            test_root_cert: Some(cert),
+            allow_loopback_for_test: allow_loopback,
         }
     }
 }
@@ -251,6 +268,14 @@ pub fn build_did_web_client(
 }
 
 impl DidWebTransport for DefaultDidWebTransport {
+    fn test_root_certificate(&self) -> Option<reqwest::Certificate> {
+        self.test_root_cert.clone()
+    }
+
+    fn allows_loopback_for_test(&self) -> bool {
+        self.allow_loopback_for_test
+    }
+
     fn resolve_dns<'a>(
         &'a self,
         host: &'a str,
@@ -463,12 +488,15 @@ pub async fn fetch_https_jwks(
         return Err(AuthReason::SsrfBlocked);
     }
     let host = parsed.host_str().ok_or(AuthReason::DidResolutionFailed)?;
-    if host.is_empty() || is_localhost_hostname(host) {
-        return Err(AuthReason::SsrfBlocked);
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
+    let allow_loopback = resolver.web_transport.allows_loopback_for_test();
+    if !allow_loopback {
+        if host.is_empty() || is_localhost_hostname(host) {
             return Err(AuthReason::SsrfBlocked);
+        }
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_private_ip(&ip) {
+                return Err(AuthReason::SsrfBlocked);
+            }
         }
     }
     let port = parsed.port().unwrap_or(443);
@@ -476,13 +504,15 @@ pub async fn fetch_https_jwks(
     if addrs.is_empty() {
         return Err(AuthReason::DidResolutionFailed);
     }
-    for addr in &addrs {
-        if is_private_ip(&addr.ip()) {
-            return Err(AuthReason::SsrfBlocked);
+    if !allow_loopback {
+        for addr in &addrs {
+            if is_private_ip(&addr.ip()) {
+                return Err(AuthReason::SsrfBlocked);
+            }
         }
     }
     let pinned_addr = addrs[0];
-    let client = build_did_web_client(host, pinned_addr, None)?;
+    let client = build_did_web_client(host, pinned_addr, resolver.web_transport.test_root_certificate())?;
     let resp = client
         .get(parsed.as_str())
         .send()

@@ -1276,7 +1276,7 @@ async fn outbox_execution_lease_independent_of_rebinding_and_conflict_retries(po
             &env.session.id.to_string(),
             "at://did:plc:alice/space/blue.catbird.circle/lease-test",
             catbird::models::CircleProjectionKind::MemberAdd,
-            serde_json::json!({ "space": "at://did:plc:alice/space/blue.catbird.circle/lease-test", "member": "did:plc:bob", "generation": 1 }),
+            serde_json::json!({ "space": "at://did:plc:alice/space/blue.catbird.circle/lease-test", "member": "did:plc:bob", "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -1325,7 +1325,7 @@ async fn outbox_execution_lease_independent_of_rebinding_and_conflict_retries(po
             &new_session_id,
             "at://did:plc:alice/space/blue.catbird.circle/lease-test",
             catbird::models::CircleProjectionKind::MemberAdd,
-            serde_json::json!({ "space": "at://did:plc:alice/space/blue.catbird.circle/lease-test", "member": "did:plc:bob", "generation": 1 }),
+            serde_json::json!({ "space": "at://did:plc:alice/space/blue.catbird.circle/lease-test", "member": "did:plc:bob", "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -1378,7 +1378,7 @@ async fn failed_member_and_delete_retry_claims_via_cas_and_succeeds(pool: PgPool
             &env.session.id.to_string(),
             space().as_str(),
             catbird::models::CircleProjectionKind::MemberAdd,
-            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -1779,7 +1779,7 @@ async fn reconciliation_treats_408_425_429_as_retryable_stays_executing(pool: Pg
                 &env.session.id.to_string(),
                 space().as_str(),
                 catbird::models::CircleProjectionKind::MemberAdd,
-                serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+                serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
                 catbird::models::CircleProjectionState::Intent,
             )
             .await
@@ -1829,7 +1829,7 @@ async fn claimed_row_contention_bypasses_pds_mutation(pool: PgPool) {
             &env.session.id.to_string(),
             space().as_str(),
             catbird::models::CircleProjectionKind::MemberAdd,
-            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -1902,7 +1902,7 @@ async fn reconciliation_transitions_explicit_4xx_to_failed(pool: PgPool) {
             &env.session.id.to_string(),
             space().as_str(),
             catbird::models::CircleProjectionKind::MemberAdd,
-            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -1914,7 +1914,7 @@ async fn reconciliation_transitions_explicit_4xx_to_failed(pool: PgPool) {
             &env.session.id.to_string(),
             space().as_str(),
             catbird::models::CircleProjectionKind::MemberRemove,
-            serde_json::json!({ "space": space().as_str(), "member": carol().as_str(), "generation": 1 }),
+            serde_json::json!({ "space": space().as_str(), "member": carol().as_str(), "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -1978,7 +1978,7 @@ async fn claim_token_fencing_prevents_stale_executor_completion_overwrite(pool: 
             &env.session.id.to_string(),
             space().as_str(),
             catbird::models::CircleProjectionKind::MemberAdd,
-            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "circleGeneration": 1, "memberGeneration": 1, "generation": 1 }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await

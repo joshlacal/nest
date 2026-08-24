@@ -19,12 +19,14 @@ pub enum Projection {
     MemberAdd {
         space: String,
         member: String,
-        generation: i64,
+        circle_generation: i64,
+        member_generation: i64,
     },
     MemberRemove {
         space: String,
         member: String,
-        generation: i64,
+        circle_generation: i64,
+        member_generation: i64,
     },
     CircleDelete {
         space: String,
@@ -44,6 +46,10 @@ pub struct SyncProjectionInput {
     pub payload: serde_json::Value,
     #[serde(default)]
     pub generation: Option<i64>,
+    #[serde(default)]
+    pub circle_generation: Option<i64>,
+    #[serde(default)]
+    pub member_generation: Option<i64>,
 }
 
 pub fn compute_payload_digest(
@@ -79,13 +85,25 @@ impl SyncProjectionInput {
             }
         }
 
-        let generation = self
+        let circle_gen = self
             .payload
-            .get("generation")
+            .get("circleGeneration")
+            .or_else(|| self.payload.get("circle_generation"))
+            .or_else(|| self.payload.get("generation"))
             .and_then(|v| v.as_i64())
+            .or(self.circle_generation)
             .or(self.generation)
             .unwrap_or(0);
 
+        let member_gen = self
+            .payload
+            .get("memberGeneration")
+            .or_else(|| self.payload.get("member_generation"))
+            .or_else(|| self.payload.get("generation"))
+            .and_then(|v| v.as_i64())
+            .or(self.member_generation)
+            .or(self.generation)
+            .unwrap_or(0);
         match self.kind.as_str() {
             "circle_upsert" | "CircleUpsert" => {
                 let name = self
@@ -118,7 +136,7 @@ impl SyncProjectionInput {
                     authority: authority_did,
                     name: name.to_string(),
                     created_at,
-                    generation,
+                    generation: circle_gen,
                 })
             }
             "member_add" | "MemberAdd" => {
@@ -133,7 +151,8 @@ impl SyncProjectionInput {
                 Ok(Projection::MemberAdd {
                     space: self.space_uri.clone(),
                     member: member.to_string(),
-                    generation,
+                    circle_generation: circle_gen,
+                    member_generation: member_gen,
                 })
             }
             "member_remove" | "MemberRemove" => {
@@ -148,12 +167,13 @@ impl SyncProjectionInput {
                 Ok(Projection::MemberRemove {
                     space: self.space_uri.clone(),
                     member: member.to_string(),
-                    generation,
+                    circle_generation: circle_gen,
+                    member_generation: member_gen,
                 })
             }
             "circle_delete" | "CircleDelete" => Ok(Projection::CircleDelete {
                 space: self.space_uri.clone(),
-                generation,
+                generation: circle_gen,
             }),
             other => Err(AppError::InvalidRequest(format!(
                 "Unknown projection kind: {other}"
@@ -224,11 +244,11 @@ pub async fn apply_projection(
         return Ok(());
     }
 
-    // 2. Check deletion tombstones
-    let target_generation = match &projection {
+    // 2. Check deletion tombstones against circle epoch
+    let target_circle_generation = match &projection {
         Projection::CircleUpsert { generation, .. } => *generation,
-        Projection::MemberAdd { generation, .. } => *generation,
-        Projection::MemberRemove { generation, .. } => *generation,
+        Projection::MemberAdd { circle_generation, .. } => *circle_generation,
+        Projection::MemberRemove { circle_generation, .. } => *circle_generation,
         Projection::CircleDelete { generation, .. } => *generation,
     };
 
@@ -236,7 +256,7 @@ pub async fn apply_projection(
         "SELECT generation FROM circle_tombstones WHERE space_uri = $1 AND generation >= $2",
     )
     .bind(target_space)
-    .bind(target_generation)
+    .bind(target_circle_generation)
     .fetch_optional(&mut *tx)
     .await
     .map_err(AppError::Database)?;
@@ -309,7 +329,7 @@ pub async fn apply_projection(
                     display_name = EXCLUDED.display_name,
                     generation = EXCLUDED.generation,
                     deleted_at = NULL
-                WHERE circles.generation < EXCLUDED.generation
+                WHERE circles.generation <= EXCLUDED.generation
                 "#,
             )
             .bind(&space)
@@ -324,21 +344,40 @@ pub async fn apply_projection(
         Projection::MemberAdd {
             space,
             member,
-            generation,
+            circle_generation,
+            member_generation,
         } => {
-            let authority = extract_authority_did(&space).unwrap_or_else(|_| member.clone());
-            sqlx::query(
-                r#"
-                INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
-                VALUES ($1, $2, 'Circle', now(), 0)
-                ON CONFLICT (space_uri) DO NOTHING
-                "#,
+            // Check existing circle generation
+            let existing_circle: Option<(i64,)> = sqlx::query_as(
+                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
             )
             .bind(&space)
-            .bind(&authority)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(AppError::Database)?;
+
+            if let Some((existing_c_gen,)) = existing_circle {
+                if existing_c_gen > circle_generation {
+                    // Stale member projection for older circle epoch
+                    tx.commit().await.map_err(AppError::Database)?;
+                    return Ok(());
+                }
+            } else {
+                let authority = extract_authority_did(&space).unwrap_or_else(|_| member.clone());
+                sqlx::query(
+                    r#"
+                    INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
+                    VALUES ($1, $2, 'Circle', now(), $3)
+                    ON CONFLICT (space_uri) DO NOTHING
+                    "#,
+                )
+                .bind(&space)
+                .bind(&authority)
+                .bind(circle_generation)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+            }
 
             // Check existing member generation to prevent out-of-order deliveries from overwriting newer state
             let existing_gen: Option<(i64,)> = sqlx::query_as(
@@ -351,7 +390,7 @@ pub async fn apply_projection(
             .map_err(AppError::Database)?;
 
             if let Some((prev_gen,)) = existing_gen {
-                if prev_gen >= generation {
+                if prev_gen >= member_generation {
                     // Ignore stale/older projection
                     tx.commit().await.map_err(AppError::Database)?;
                     return Ok(());
@@ -368,7 +407,7 @@ pub async fn apply_projection(
             )
             .bind(&space)
             .bind(&member)
-            .bind(generation)
+            .bind(member_generation)
             .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
@@ -376,21 +415,40 @@ pub async fn apply_projection(
         Projection::MemberRemove {
             space,
             member,
-            generation,
+            circle_generation,
+            member_generation,
         } => {
-            let authority = extract_authority_did(&space).unwrap_or_else(|_| member.clone());
-            sqlx::query(
-                r#"
-                INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
-                VALUES ($1, $2, 'Circle', now(), 0)
-                ON CONFLICT (space_uri) DO NOTHING
-                "#,
+            // Check existing circle generation
+            let existing_circle: Option<(i64,)> = sqlx::query_as(
+                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
             )
             .bind(&space)
-            .bind(&authority)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(AppError::Database)?;
+
+            if let Some((existing_c_gen,)) = existing_circle {
+                if existing_c_gen > circle_generation {
+                    // Stale member projection for older circle epoch
+                    tx.commit().await.map_err(AppError::Database)?;
+                    return Ok(());
+                }
+            } else {
+                let authority = extract_authority_did(&space).unwrap_or_else(|_| member.clone());
+                sqlx::query(
+                    r#"
+                    INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
+                    VALUES ($1, $2, 'Circle', now(), $3)
+                    ON CONFLICT (space_uri) DO NOTHING
+                    "#,
+                )
+                .bind(&space)
+                .bind(&authority)
+                .bind(circle_generation)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+            }
 
             // Check existing member generation
             let existing_gen: Option<(i64,)> = sqlx::query_as(
@@ -403,7 +461,7 @@ pub async fn apply_projection(
             .map_err(AppError::Database)?;
 
             if let Some((prev_gen,)) = existing_gen {
-                if prev_gen >= generation {
+                if prev_gen >= member_generation {
                     // Ignore stale/older projection
                     tx.commit().await.map_err(AppError::Database)?;
                     return Ok(());
@@ -420,7 +478,7 @@ pub async fn apply_projection(
             )
             .bind(&space)
             .bind(&member)
-            .bind(generation)
+            .bind(member_generation)
             .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;

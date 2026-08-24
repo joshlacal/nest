@@ -236,7 +236,8 @@ impl CircleService {
             "authority": &session.did,
             "name": input.name.as_str(),
             "createdAt": Utc::now(),
-            "generation": 1
+            "generation": 1,
+            "circleGeneration": 1
         });
         let upsert_op_id = self
             .enqueue_projection(
@@ -408,6 +409,8 @@ impl CircleService {
             let member_payload = serde_json::json!({
                 "space": &space_uri,
                 "member": member_did.as_ref(),
+                "circleGeneration": 1,
+                "memberGeneration": 1,
                 "generation": 1
             });
             let member_op_id = self
@@ -575,7 +578,35 @@ impl CircleService {
             ),
         };
 
-        // Determine state transition generation
+        // Determine Circle generation from latest circle_upsert / circle_delete
+        let latest_circle_gen: Option<(serde_json::Value,)> = if let Some(pool) = &self.db {
+            sqlx::query_as(
+                r#"
+                SELECT payload
+                FROM circle_projection_outbox
+                WHERE space_uri = $1 AND kind IN ('circle_upsert', 'circle_delete')
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(space_str)
+            .fetch_optional(pool)
+            .await?
+        } else {
+            None
+        };
+
+        let circle_generation = match latest_circle_gen {
+            Some((payload,)) => payload
+                .get("circleGeneration")
+                .or_else(|| payload.get("circle_generation"))
+                .or_else(|| payload.get("generation"))
+                .and_then(|g| g.as_i64())
+                .unwrap_or(1),
+            None => 1,
+        };
+
+        // Determine member state transition generation
         let prev_transition: Option<(String, serde_json::Value, String, Uuid)> = if let Some(pool) = &self.db {
             sqlx::query_as(
                 r#"
@@ -594,10 +625,12 @@ impl CircleService {
             None
         };
 
-        let (generation, is_same_transition, prev_op_id, prev_state) = match prev_transition {
+        let (member_generation, is_same_transition, prev_op_id, prev_state) = match prev_transition {
             Some((prev_kind, prev_payload, prev_state, prev_id)) => {
                 let prev_gen = prev_payload
-                    .get("generation")
+                    .get("memberGeneration")
+                    .or_else(|| prev_payload.get("member_generation"))
+                    .or_else(|| prev_payload.get("generation"))
                     .and_then(|g| g.as_i64())
                     .unwrap_or(1);
                 if prev_kind == kind.as_str() {
@@ -626,7 +659,9 @@ impl CircleService {
         let projection_payload = serde_json::json!({
             "space": space_str,
             "member": member_str,
-            "generation": generation
+            "circleGeneration": circle_generation,
+            "memberGeneration": member_generation,
+            "generation": member_generation
         });
         let op_id = self
             .enqueue_projection(
@@ -835,7 +870,12 @@ impl CircleService {
 
         let delete_generation = match latest_gen {
             Some((payload,)) => {
-                let prev_gen = payload.get("generation").and_then(|g| g.as_i64()).unwrap_or(1);
+                let prev_gen = payload
+                    .get("circleGeneration")
+                    .or_else(|| payload.get("circle_generation"))
+                    .or_else(|| payload.get("generation"))
+                    .and_then(|g| g.as_i64())
+                    .unwrap_or(1);
                 prev_gen + 1
             }
             None => 1,
@@ -844,7 +884,8 @@ impl CircleService {
         // Persist delete intent before PDS mutation
         let projection_payload = serde_json::json!({
             "space": space_str,
-            "generation": delete_generation
+            "generation": delete_generation,
+            "circleGeneration": delete_generation
         });
         let op_id = self
             .enqueue_projection(

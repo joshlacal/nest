@@ -110,13 +110,13 @@ impl AppState {
         did_resolver: Arc<DidResolver>,
         credential_store: Arc<CredentialStore>,
         space_client: Arc<SpaceClient>,
+        space_locks: Arc<crate::access::SpaceLockManager>,
     ) -> Self {
         let config = Arc::new(config);
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
-        let space_locks = Arc::new(crate::access::SpaceLockManager::new());
 
         Self {
             config,

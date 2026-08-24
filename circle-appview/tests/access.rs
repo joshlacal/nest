@@ -124,6 +124,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         state.did_resolver.clone(),
         state.credential_store.clone(),
         space_client,
+        state.space_locks.clone(),
     );
     let app = create_router(state.clone());
 
@@ -481,6 +482,7 @@ async fn successful_exchange_creates_lease_for_token_issuer(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -863,6 +865,7 @@ async fn rejects_space_credential_with_alg_key_curve_mismatch(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -963,6 +966,7 @@ async fn rejects_space_credential_with_wrong_signature(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -1047,6 +1051,7 @@ async fn rejects_space_credential_with_mismatched_jkt(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -1144,6 +1149,7 @@ async fn rejects_space_credential_with_expired_time(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -1271,7 +1277,8 @@ async fn removal_invalidates_lease_without_deleting_circle_records(pool: PgPool)
     let remove_projection = Projection::MemberRemove {
         space: space.clone(),
         member: BOB_DID.into(),
-        generation: 2,
+        circle_generation: 1,
+        member_generation: 2,
     };
 
     let digest = projections::compute_payload_digest(
@@ -1637,7 +1644,8 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
         Projection::MemberRemove {
             space: space.clone(),
             member: BOB_DID.into(),
-            generation: 2,
+            circle_generation: 1,
+            member_generation: 2,
         },
         &remove_digest,
     )
@@ -1674,7 +1682,8 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
         Projection::MemberAdd {
             space: space.clone(),
             member: BOB_DID.into(),
-            generation: 1,
+            circle_generation: 1,
+            member_generation: 1,
         },
         &add_digest,
     )
@@ -1731,6 +1740,7 @@ async fn activation_fails_if_member_removed_or_circle_deleted(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -1804,6 +1814,7 @@ async fn privacy_safe_activation_contains_no_jwt_or_key_canaries_in_db_or_logs(p
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
     let app = create_router(state);
 
@@ -2063,8 +2074,8 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
-
     let delegation_token = mint_delegation_token(
         &setup.alice_signing_key,
         ALICE_DID,
@@ -2230,8 +2241,8 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
         custom_space_client,
+        setup.state.space_locks.clone(),
     );
-
     let delegation_token = mint_delegation_token(
         &setup.alice_signing_key,
         ALICE_DID,
@@ -2278,7 +2289,8 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
         Projection::MemberRemove {
             space: space.clone(),
             member: ALICE_DID.into(),
-            generation: 2,
+            circle_generation: 1,
+            member_generation: 2,
         },
         &rem_digest,
     )
@@ -2319,14 +2331,14 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
     .await
     .unwrap();
 
-    // Custom transport with dynamic expiry
-    struct ExpiryTransport {
+    // Dynamic transport with configurable expiry
+    struct BarrierDynamicTransport {
         authority_key: p256::ecdsa::SigningKey,
         authority_did: String,
-        expiry_secs: std::sync::atomic::AtomicI64,
+        expiry: i64,
     }
 
-    impl SpaceHostTransport for ExpiryTransport {
+    impl SpaceHostTransport for BarrierDynamicTransport {
         fn get_space_credential<'a>(
             &'a self,
             _target_url: &'a url::Url,
@@ -2338,7 +2350,7 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
             let auth_key = self.authority_key.clone();
             let auth_did = self.authority_did.clone();
             let space = space_uri.to_string();
-            let exp = self.expiry_secs.load(std::sync::atomic::Ordering::SeqCst);
+            let exp = self.expiry;
             let dpop = dpop_proof.to_string();
 
             Box::pin(async move {
@@ -2376,19 +2388,38 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
     let longer_exp = now + 7200; // 2 hours
     let shorter_exp = now + 3600; // 1 hour
 
-    let transport = Arc::new(ExpiryTransport {
-        authority_key: setup.authority_signing_key.clone(),
+    let auth_key1 = setup.authority_signing_key.clone();
+    let auth_key2 = setup.authority_signing_key.clone();
+
+    let transport1 = Arc::new(BarrierDynamicTransport {
+        authority_key: auth_key1,
         authority_did: AUTHORITY_DID.to_string(),
-        expiry_secs: std::sync::atomic::AtomicI64::new(longer_exp),
+        expiry: longer_exp,
+    });
+    let transport2 = Arc::new(BarrierDynamicTransport {
+        authority_key: auth_key2,
+        authority_did: AUTHORITY_DID.to_string(),
+        expiry: shorter_exp,
     });
 
-    let custom_space_client = Arc::new(SpaceClient::with_transport(transport.clone()));
-    let state = AppState::with_services(
+    let client1 = Arc::new(SpaceClient::with_transport(transport1));
+    let client2 = Arc::new(SpaceClient::with_transport(transport2));
+
+    let state1 = AppState::with_services(
         (*setup.state.config).clone(),
         pool.clone(),
         setup.state.did_resolver.clone(),
         setup.state.credential_store.clone(),
-        custom_space_client,
+        client1,
+        setup.state.space_locks.clone(),
+    );
+    let state2 = AppState::with_services(
+        (*setup.state.config).clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        client2,
+        setup.state.space_locks.clone(),
     );
 
     let delegation_token = mint_delegation_token(
@@ -2400,34 +2431,25 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
         now,
     );
 
-    // 1. Activate with longer expiry (2 hours)
-    let exp1 = access::activate_space(
-        &state,
-        ALICE_DID,
-        &space,
-        &delegation_token,
-        "attestation",
-    )
-    .await
-    .unwrap();
-    assert_eq!(exp1.timestamp(), longer_exp);
+    let s1 = state1.clone();
+    let sp1 = space.clone();
+    let dt1 = delegation_token.clone();
+    let h1 = tokio::spawn(async move {
+        access::activate_space(&s1, ALICE_DID, &sp1, &dt1, "attestation").await
+    });
 
-    // 2. Set transport to return shorter expiry (1 hour)
-    transport.expiry_secs.store(shorter_exp, std::sync::atomic::Ordering::SeqCst);
+    let s2 = state2.clone();
+    let sp2 = space.clone();
+    let dt2 = delegation_token.clone();
+    let h2 = tokio::spawn(async move {
+        access::activate_space(&s2, ALICE_DID, &sp2, &dt2, "attestation").await
+    });
 
-    // 3. Concurrent/subsequent activation returns shorter credential from host
-    let exp2 = access::activate_space(
-        &state,
-        ALICE_DID,
-        &space,
-        &delegation_token,
-        "attestation",
-    )
-    .await
-    .unwrap();
-    assert_eq!(exp2.timestamp(), shorter_exp);
+    let (res1, res2) = tokio::join!(h1, h2);
+    assert!(res1.unwrap().is_ok());
+    assert!(res2.unwrap().is_ok());
 
-    // 4. Verify DB lease remains at longer_exp (monotonic max)
+    // Verify DB lease remains at longer_exp (monotonic max)
     let stored_exp: (DateTime<Utc>,) = sqlx::query_as(
         "SELECT expires_at FROM access_leases WHERE space_uri = $1 AND member_did = $2",
     )
@@ -2438,9 +2460,249 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
     .unwrap();
     assert_eq!(stored_exp.0.timestamp(), longer_exp);
 
-    // 5. Verify in-memory CredentialStore remains at longer_exp
+    // Verify in-memory CredentialStore remains at longer_exp
     let in_memory_cred = setup.state.credential_store.get(&space).await.unwrap();
     assert_eq!(in_memory_cred.expires_at.timestamp(), longer_exp);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+
+    // 1. Initial Circle creation (generation 1)
+    let upsert_op = Uuid::new_v4();
+    let upsert_digest = projections::compute_payload_digest(
+        &upsert_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "circle_upsert",
+        &json!({"name": "Circle Epoch 1", "generation": 1}),
+        Some(1),
+    );
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        upsert_op,
+        Projection::CircleUpsert {
+            space: space.clone(),
+            authority: AUTHORITY_DID.into(),
+            name: "Circle Epoch 1".into(),
+            created_at: Utc::now(),
+            generation: 1,
+        },
+        &upsert_digest,
+    )
+    .await
+    .unwrap();
+
+    // 2. Add Bob (circle_generation: 1, member_generation: 1)
+    let add_op1 = Uuid::new_v4();
+    let add_digest1 = projections::compute_payload_digest(
+        &add_op1,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "member_add",
+        &json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1}),
+        Some(1),
+    );
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        add_op1,
+        Projection::MemberAdd {
+            space: space.clone(),
+            member: BOB_DID.into(),
+            circle_generation: 1,
+            member_generation: 1,
+        },
+        &add_digest1,
+    )
+    .await
+    .unwrap();
+
+    // 3. Remove Bob (circle_generation: 1, member_generation: 2)
+    let rem_op = Uuid::new_v4();
+    let rem_digest = projections::compute_payload_digest(
+        &rem_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "member_remove",
+        &json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 2}),
+        Some(2),
+    );
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        rem_op,
+        Projection::MemberRemove {
+            space: space.clone(),
+            member: BOB_DID.into(),
+            circle_generation: 1,
+            member_generation: 2,
+        },
+        &rem_digest,
+    )
+    .await
+    .unwrap();
+
+    // 4. CircleDelete at generation 2 -> deletes circles and inserts tombstone (generation 2)
+    let del_op = Uuid::new_v4();
+    let del_digest = projections::compute_payload_digest(
+        &del_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "circle_delete",
+        &json!({"space": space, "generation": 2}),
+        Some(2),
+    );
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        del_op,
+        Projection::CircleDelete {
+            space: space.clone(),
+            generation: 2,
+        },
+        &del_digest,
+    )
+    .await
+    .unwrap();
+
+    // Verify Circle and members are deleted
+    let circle_row: Option<(String,)> = sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
+        .bind(&space)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(circle_row.is_none());
+
+    // 5. Delayed pre-delete MemberAdd (circle_generation: 1, member_generation: 3) arrives
+    let delayed_op = Uuid::new_v4();
+    let delayed_digest = projections::compute_payload_digest(
+        &delayed_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "member_add",
+        &json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 3}),
+        Some(3),
+    );
+    let delayed_res = projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        delayed_op,
+        Projection::MemberAdd {
+            space: space.clone(),
+            member: BOB_DID.into(),
+            circle_generation: 1,
+            member_generation: 3,
+        },
+        &delayed_digest,
+    )
+    .await;
+    assert!(delayed_res.is_ok());
+
+    // CRITICAL: Delayed MemberAdd for deleted circle epoch must NOT resurrect circle or create member!
+    let resurrected_circle: Option<(String,)> = sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
+        .bind(&space)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(resurrected_circle.is_none(), "Stale MemberAdd must not recreate parent circle");
+
+    let resurrected_member: Option<(String,)> = sqlx::query_as("SELECT member_did FROM circle_members WHERE space_uri = $1")
+        .bind(&space)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(resurrected_member.is_none(), "Stale MemberAdd must not recreate member row");
+
+    // 6. Newer legitimate Circle epoch (generation 3) is created
+    let upsert_op2 = Uuid::new_v4();
+    let upsert_digest2 = projections::compute_payload_digest(
+        &upsert_op2,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "circle_upsert",
+        &json!({"name": "Circle Epoch 3", "generation": 3}),
+        Some(3),
+    );
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        upsert_op2,
+        Projection::CircleUpsert {
+            space: space.clone(),
+            authority: AUTHORITY_DID.into(),
+            name: "Circle Epoch 3".into(),
+            created_at: Utc::now(),
+            generation: 3,
+        },
+        &upsert_digest2,
+    )
+    .await
+    .unwrap();
+
+    let new_circle: Option<(String, i64)> = sqlx::query_as("SELECT space_uri, generation FROM circles WHERE space_uri = $1")
+        .bind(&space)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(new_circle.is_some());
+    assert_eq!(new_circle.unwrap().1, 3);
+
+    // 7. Legitimate member add in new epoch (circle_generation: 3, member_generation: 1) succeeds
+    let add_op2 = Uuid::new_v4();
+    let add_digest2 = projections::compute_payload_digest(
+        &add_op2,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "member_add",
+        &json!({"member": BOB_DID, "circleGeneration": 3, "memberGeneration": 1}),
+        Some(1),
+    );
+    projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        add_op2,
+        Projection::MemberAdd {
+            space: space.clone(),
+            member: BOB_DID.into(),
+            circle_generation: 3,
+            member_generation: 1,
+        },
+        &add_digest2,
+    )
+    .await
+    .unwrap();
+
+    let member_row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT member_did, status, generation FROM circle_members WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(&space)
+    .bind(BOB_DID)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(member_row.is_some());
+    let (m_did, m_status, m_gen) = member_row.unwrap();
+    assert_eq!(m_did, BOB_DID);
+    assert_eq!(m_status, "active");
+    assert_eq!(m_gen, 1);
 }
 
 struct MockDnsResolver {
@@ -2460,9 +2722,130 @@ impl SpaceHostDnsResolver for MockDnsResolver {
 
 #[tokio::test]
 async fn ssrf_safe_transport_dns_seam_validations() {
-    let target_url = url::Url::parse("https://space.example.com/xrpc/com.atproto.space.getSpaceCredential").unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // 1. Mixed DNS answers (one public, one private) -> strictly rejected
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 1. Generate TLS self-signed cert for space.example.org
+    let params = rcgen::CertificateParams::new(vec![
+        "space.example.org".to_string(),
+    ])
+    .unwrap();
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
+
+    let rustls_cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let rustls_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![rustls_cert], rustls_key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let Ok(n) = tls_stream.read(&mut buf).await else {
+                    return;
+                };
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
+                    let has_auth = req_str.contains("authorization: Bearer test-delegation-token")
+                        || req_str.contains("Authorization: Bearer test-delegation-token");
+                    let has_dpop = req_str.contains("dpop: test-dpop-proof")
+                        || req_str.contains("DPoP: test-dpop-proof");
+                    if has_auth && has_dpop {
+                        let body = r#"{"credential":"test.space.credential.jwt"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls_stream.write_all(response.as_bytes()).await;
+                    } else {
+                        let body = r#"{"error":"Unauthorized"}"#;
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls_stream.write_all(response.as_bytes()).await;
+                    }
+                } else if req_str.starts_with("POST /redirect") {
+                    let response = "HTTP/1.1 302 Found\r\nLocation: /xrpc/com.atproto.space.getSpaceCredential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                } else {
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                }
+                let _ = tls_stream.shutdown().await;
+            });
+        }
+    });
+
+    let reqwest_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+
+    // 1. Successful pinned HTTPS transport exchange over real TLS
+    let fixture_resolver = Arc::new(MockDnsResolver {
+        addrs: Ok(vec![fixture_addr]),
+    });
+    let transport_success = DefaultSpaceHostTransport::with_test_fixture(
+        fixture_resolver,
+        Some(reqwest_cert.clone()),
+        true,
+    );
+    let target_url = url::Url::parse(&format!(
+        "https://space.example.org:{}/xrpc/com.atproto.space.getSpaceCredential",
+        fixture_addr.port()
+    ))
+    .unwrap();
+
+    let cred = transport_success
+        .get_space_credential(
+            &target_url,
+            "test-delegation-token",
+            "test-dpop-proof",
+            "at://did:plc:auth/space/1",
+            "test-attestation",
+        )
+        .await
+        .expect("Space host credential exchange over TLS must succeed");
+    assert_eq!(cred, "test.space.credential.jwt");
+
+    // 2. Redirect rejection (Policy::none())
+    let redirect_url = url::Url::parse(&format!(
+        "https://space.example.org:{}/redirect",
+        fixture_addr.port()
+    ))
+    .unwrap();
+    let redirect_res = transport_success
+        .get_space_credential(
+            &redirect_url,
+            "test-delegation-token",
+            "test-dpop-proof",
+            "at://did:plc:auth/space/1",
+            "test-attestation",
+        )
+        .await;
+    assert!(redirect_res.is_err(), "Redirect must be rejected by Policy::none()");
+
+    // 3. Mixed DNS answers (one public, one private) -> strictly rejected in production mode
     let mixed_resolver = Arc::new(MockDnsResolver {
         addrs: Ok(vec![
             "93.184.216.34:443".parse().unwrap(),
@@ -2475,7 +2858,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
         .await;
     assert!(matches!(err_mixed, Err(circle_appview::error::AppError::Unauthorized(AuthReason::SsrfBlocked))));
 
-    // 2. Private-only DNS answers -> strictly rejected
+    // 4. Private-only DNS answers -> strictly rejected in production mode
     let private_resolver = Arc::new(MockDnsResolver {
         addrs: Ok(vec!["10.0.0.1:443".parse().unwrap()]),
     });
@@ -2485,7 +2868,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
         .await;
     assert!(matches!(err_private, Err(circle_appview::error::AppError::Unauthorized(AuthReason::SsrfBlocked))));
 
-    // 3. DNS resolution failure -> DidResolutionFailed
+    // 5. DNS resolution failure -> DidResolutionFailed
     let fail_resolver = Arc::new(MockDnsResolver {
         addrs: Err(AuthReason::DidResolutionFailed),
     });
@@ -2498,20 +2881,164 @@ async fn ssrf_safe_transport_dns_seam_validations() {
 
 #[tokio::test]
 async fn startup_jwks_loader_and_verifier_tests() {
-    // 1. SSRF tests for fetch_https_jwks: reject HTTP, localhost, private IP
-    let mock_web_transport = Arc::new(auth::DefaultDidWebTransport::new());
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 1. Generate TLS self-signed cert for nest.catbird.blue
+    let params = rcgen::CertificateParams::new(vec![
+        "nest.catbird.blue".to_string(),
+    ])
+    .unwrap();
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
+
+    let rustls_cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let rustls_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![rustls_cert], rustls_key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_addr = listener.local_addr().unwrap();
+
+    // Generate real P-256 and secp256k1 keys for JWKS
+    let p256_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let p256_encoded = p256_signing_key.verifying_key().to_encoded_point(false);
+    let p256_x = URL_SAFE_NO_PAD.encode(p256_encoded.x().unwrap());
+    let p256_y = URL_SAFE_NO_PAD.encode(p256_encoded.y().unwrap());
+
+    let k256_signing_key = k256::ecdsa::SigningKey::random(&mut OsRng);
+    let k256_encoded = k256_signing_key.verifying_key().to_encoded_point(false);
+    let k256_x = URL_SAFE_NO_PAD.encode(k256_encoded.x().unwrap());
+    let k256_y = URL_SAFE_NO_PAD.encode(k256_encoded.y().unwrap());
+
+    let jwks_json = serde_json::json!({
+        "keys": [
+            {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": p256_x,
+                "y": p256_y,
+                "kid": "key-p256"
+            },
+            {
+                "kty": "EC",
+                "crv": "secp256k1",
+                "x": k256_x,
+                "y": k256_y,
+                "kid": "key-k256"
+            }
+        ]
+    });
+    let jwks_body = serde_json::to_string(&jwks_json).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let body = jwks_body.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let Ok(n) = tls_stream.read(&mut buf).await else {
+                    return;
+                };
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                if req_str.starts_with("GET /.well-known/jwks.json") {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                } else {
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                }
+                let _ = tls_stream.shutdown().await;
+            });
+        }
+    });
+
+    let reqwest_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+
+    // 1. Successful safe-fetch & parse of real JWKS keys via production fetch_https_jwks
+    struct MockWebTransport {
+        fixture_addr: SocketAddr,
+        cert: reqwest::Certificate,
+    }
+
+    impl auth::DidWebTransport for MockWebTransport {
+        fn resolve_dns<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+            let addr = self.fixture_addr;
+            Box::pin(async move { Ok(vec![addr]) })
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+            _host: &'a str,
+            _pinned_addr: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>> {
+            Box::pin(async move { Err(AuthReason::DidResolutionFailed) })
+        }
+
+        fn test_root_certificate(&self) -> Option<reqwest::Certificate> {
+            Some(self.cert.clone())
+        }
+
+        fn allows_loopback_for_test(&self) -> bool {
+            true
+        }
+    }
+
+    let web_transport = Arc::new(MockWebTransport {
+        fixture_addr,
+        cert: reqwest_cert,
+    });
     let resolver = auth::DidResolver::with_transport(
         "https://plc.directory".into(),
         reqwest::Client::new(),
-        mock_web_transport,
+        web_transport,
     );
 
-    let http_res = auth::fetch_https_jwks(&resolver, "http://nest.catbird.blue/jwks.json").await;
+    let jwks_url = format!("https://nest.catbird.blue:{}/.well-known/jwks.json", fixture_addr.port());
+    let keys = auth::fetch_https_jwks(&resolver, &jwks_url).await
+        .expect("fetch_https_jwks must successfully load and parse keys");
+    assert_eq!(keys.len(), 2);
+    assert!(matches!(keys[0], ParsedVerifyingKey::P256(_)));
+    assert!(matches!(keys[1], ParsedVerifyingKey::Secp256k1(_)));
+
+    // 2. SSRF negative tests for fetch_https_jwks: reject HTTP, localhost, private IP
+    let default_transport = Arc::new(auth::DefaultDidWebTransport::new());
+    let prod_resolver = auth::DidResolver::with_transport(
+        "https://plc.directory".into(),
+        reqwest::Client::new(),
+        default_transport,
+    );
+
+    let http_res = auth::fetch_https_jwks(&prod_resolver, "http://nest.catbird.blue/jwks.json").await;
     assert_eq!(http_res.unwrap_err(), AuthReason::SsrfBlocked);
 
-    let localhost_res = auth::fetch_https_jwks(&resolver, "https://localhost:8443/jwks.json").await;
+    let localhost_res = auth::fetch_https_jwks(&prod_resolver, "https://localhost:8443/jwks.json").await;
     assert_eq!(localhost_res.unwrap_err(), AuthReason::SsrfBlocked);
 
-    let private_res = auth::fetch_https_jwks(&resolver, "https://10.0.0.1/jwks.json").await;
+    let private_res = auth::fetch_https_jwks(&prod_resolver, "https://10.0.0.1/jwks.json").await;
     assert_eq!(private_res.unwrap_err(), AuthReason::SsrfBlocked);
 }
