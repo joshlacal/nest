@@ -128,6 +128,14 @@ pub fn calculate_operation_key(
 pub enum CircleError {
     #[error("Not authorized: {0}")]
     NotAuthorized(String),
+    #[error("Access removed: {0}")]
+    AccessRemoved(String),
+    #[error("Unsupported PDS: {0}")]
+    UnsupportedPds(String),
+    #[error("Protocol revision mismatch: {0}")]
+    ProtocolRevisionMismatch(String),
+    #[error("Upstream unavailable: {0}")]
+    UpstreamUnavailable(String),
     #[error("Space not found: {0}")]
     SpaceNotFound(String),
     #[error("Space already exists: {0}")]
@@ -154,7 +162,24 @@ impl From<sqlx::Error> for CircleError {
 
 impl From<crate::error::AppError> for CircleError {
     fn from(err: crate::error::AppError) -> Self {
-        CircleError::Internal(err.to_string())
+        match err {
+            crate::error::AppError::Unauthorized(msg) => CircleError::NotAuthorized(msg),
+            crate::error::AppError::BadRequest(msg) => CircleError::InvalidRequest(msg),
+            crate::error::AppError::NotFound(msg) => CircleError::SpaceNotFound(msg),
+            crate::error::AppError::AtprotoResponse { status, error, message } => {
+                match error.as_str() {
+                    "AuthRequired" => CircleError::NotAuthorized(message),
+                    "AccessRemoved" => CircleError::AccessRemoved(message),
+                    "UnsupportedPDS" => CircleError::UnsupportedPds(message),
+                    "ProtocolRevisionMismatch" => CircleError::ProtocolRevisionMismatch(message),
+                    "UpstreamUnavailable" => CircleError::UpstreamUnavailable(message),
+                    "SpaceNotFound" => CircleError::SpaceNotFound(message),
+                    "SpaceAlreadyExists" => CircleError::SpaceAlreadyExists(message),
+                    _ => CircleError::Internal(format!("{status} - {error}: {message}")),
+                }
+            }
+            other => CircleError::Internal(other.to_string()),
+        }
     }
 }
 
@@ -166,22 +191,73 @@ impl From<crate::services::ClientAttestationError> for CircleError {
 
 impl From<CircleError> for crate::error::AppError {
     fn from(err: CircleError) -> Self {
+        use axum::http::StatusCode;
         match err {
-            CircleError::NotAuthorized(msg) => crate::error::AppError::Unauthorized(msg),
-            CircleError::InvalidRequest(msg) => crate::error::AppError::BadRequest(msg),
-            CircleError::SpaceNotFound(msg) => crate::error::AppError::NotFound(msg),
-            CircleError::SpaceAlreadyExists(msg) => crate::error::AppError::BadRequest(msg),
-            CircleError::Pds(msg) => crate::error::AppError::Upstream {
-                status: 502,
+            CircleError::NotAuthorized(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::UNAUTHORIZED,
+                error: "AuthRequired".into(),
+                message: msg,
+            },
+            CircleError::AccessRemoved(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::FORBIDDEN,
+                error: "AccessRemoved".into(),
+                message: msg,
+            },
+            CircleError::UnsupportedPds(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "UnsupportedPDS".into(),
+                message: msg,
+            },
+            CircleError::ProtocolRevisionMismatch(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "ProtocolRevisionMismatch".into(),
+                message: msg,
+            },
+            CircleError::UpstreamUnavailable(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "UpstreamUnavailable".into(),
+                message: msg,
+            },
+            CircleError::InvalidRequest(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: msg,
+            },
+            CircleError::SpaceNotFound(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::NOT_FOUND,
+                error: "SpaceNotFound".into(),
+                message: msg,
+            },
+            CircleError::SpaceAlreadyExists(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "SpaceAlreadyExists".into(),
+                message: msg,
+            },
+            CircleError::Pds(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::BAD_GATEWAY,
+                error: "UpstreamUnavailable".into(),
                 message: format!("PDS error: {msg}"),
             },
-            CircleError::AppView(msg) => crate::error::AppError::Upstream {
-                status: 502,
+            CircleError::AppView(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::BAD_GATEWAY,
+                error: "UpstreamUnavailable".into(),
                 message: format!("AppView error: {msg}"),
             },
-            CircleError::Database(msg) => crate::error::AppError::Internal(msg),
-            CircleError::Attestation(msg) => crate::error::AppError::Internal(msg),
-            CircleError::Internal(msg) => crate::error::AppError::Internal(msg),
+            CircleError::Database(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "UpstreamUnavailable".into(),
+                message: format!("Database temporarily unavailable: {msg}"),
+            },
+            CircleError::Attestation(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error: "InternalServerError".into(),
+                message: format!("Attestation error: {msg}"),
+            },
+            CircleError::Internal(msg) => crate::error::AppError::AtprotoResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error: "InternalServerError".into(),
+                message: msg,
+            },
         }
     }
 }

@@ -131,6 +131,9 @@ pub struct CircleConfig {
     /// DID of the Circle AppView service (e.g., did:web:circles.catbird.blue#atproto_circle)
     #[serde(default = "default_circle_service_did")]
     pub service_did: String,
+    /// PLC directory base URL (defaults to https://plc.directory)
+    #[serde(default)]
+    pub plc_directory_url: Option<String>,
 }
 
 fn default_circle_service_did() -> String {
@@ -142,6 +145,7 @@ impl Default for CircleConfig {
         Self {
             service_url: None,
             service_did: default_circle_service_did(),
+            plc_directory_url: None,
         }
     }
 }
@@ -425,6 +429,14 @@ fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Err
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         validate_configured_oauth_scopes(&config.oauth.scopes)?;
+        if config.circle.service_url.is_some() {
+            if config.oauth.client_id.trim().is_empty() {
+                anyhow::bail!("Catbird OAuth client_id must be configured when Circle capability is enabled");
+            }
+            if config.circle.service_did.trim().is_empty() {
+                anyhow::bail!("Circle service_did must be configured when Circle capability is enabled");
+            }
+        }
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
                 let pool = PgPoolOptions::new()

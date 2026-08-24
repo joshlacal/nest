@@ -1,6 +1,6 @@
 //! Circle XRPC handlers
 //!
-//! Exposes Circle management procedures and AppView proxy routes.
+//! Exposes Circle management procedures and typed AppView proxy routes.
 
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
@@ -9,12 +9,11 @@ use crate::models::CatbirdSession;
 use crate::services::{CircleService, ServiceAuthProvider};
 use axum::{
     body::Body,
-    extract::State,
-    http::{header, Method, StatusCode, Uri},
+    extract::{Query, State},
+    http::{header, StatusCode},
     response::Response,
     Extension, Json,
 };
-use bytes::Bytes;
 use catbird_atproto::generated::blue_catbird::circle::activate_space::{
     ActivateSpace, ActivateSpaceOutput,
 };
@@ -25,9 +24,16 @@ use catbird_atproto::generated::blue_catbird::circle::delete_circle::{
     DeleteCircle, DeleteCircleOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
+use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeed;
+use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
+use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThread;
+use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCircles;
+use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotifications;
+use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecord;
 use catbird_atproto::generated::blue_catbird::circle::update_member::{
     UpdateMember, UpdateMemberOutput,
 };
+use catbird_atproto::generated::blue_catbird::circle::update_preferences::UpdatePreferences;
 use std::sync::Arc;
 
 /// GET /xrpc/blue.catbird.circle.getCapabilities
@@ -118,114 +124,301 @@ pub async fn activate_space(
     Ok(Json(out))
 }
 
-/// Proxies read and action requests to the Circle AppView.
-/// Obtains a fresh service-auth token for the authenticated DID and exact `lxm`,
-/// strips inbound client authorization/cookies, and forwards only typed parameters and body.
-pub async fn proxy_circle_appview(
+/// GET /xrpc/blue.catbird.circle.listCircles
+pub async fn list_circles(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    method: Method,
-    uri: Uri,
-    body: Option<Bytes>,
+    Query(query): Query<ListCircles>,
 ) -> AppResult<Response> {
-    let nsid = extract_nsid_from_path(uri.path())?;
-    let req_id_str = request_id
-        .map(|r| r.0.0.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let service_auth = ServiceAuthProvider::new(state.clone());
-    let token = service_auth
-        .token_for_audience(&session, &state.config.circle.service_did, &nsid)
-        .await?;
-
-    let service_url = state
-        .config
-        .circle
-        .service_url
-        .as_deref()
-        .ok_or_else(|| AppError::Config("Circle AppView service URL is not configured".into()))?;
-
-    let base = service_url.trim_end_matches('/');
-    let target_url = if let Some(query) = uri.query() {
-        format!("{base}/xrpc/{nsid}?{query}")
-    } else {
-        format!("{base}/xrpc/{nsid}")
-    };
-
-    let mut req_builder = state
-        .http_client
-        .request(method, &target_url)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header("X-Request-Id", req_id_str);
-
-    if let Some(b) = body {
-        if !b.is_empty() {
-            req_builder = req_builder
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(b);
+    if let Some(limit) = query.limit {
+        if !(1..=100).contains(&limit) {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: "Limit must be between 1 and 100".into(),
+            });
         }
     }
 
-    let upstream_resp = req_builder
-        .send()
-        .await
-        .map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("Circle AppView request failed: {e}"),
-        })?;
-    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-    let mut response_builder = Response::builder().status(status);
-
-    if let Some(content_type) = upstream_resp.headers().get(header::CONTENT_TYPE) {
-        response_builder = response_builder.header(header::CONTENT_TYPE, content_type);
+    let mut params = Vec::new();
+    if let Some(cursor) = &query.cursor {
+        params.push(format!("cursor={}", urlencoding::encode(cursor)));
     }
+    if let Some(limit) = query.limit {
+        params.push(format!("limit={limit}"));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
 
-    let body_bytes = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("Failed to read AppView response: {e}"),
-        })?;
-    response_builder
-        .body(Body::from(body_bytes))
-        .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")))
+    forward_get_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.listCircles",
+        &qs,
+        request_id,
+    )
+    .await
 }
 
-/// Proxies media stream requests to the Circle AppView.
-pub async fn proxy_circle_media(
+/// POST /xrpc/blue.catbird.circle.updatePreferences
+pub async fn update_preferences(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     request_id: Option<Extension<RequestId>>,
-    uri: Uri,
+    Json(input): Json<UpdatePreferences>,
+) -> AppResult<Response> {
+    let body = serde_json::json!({
+        "space": input.space.as_str(),
+        "muted": input.muted
+    });
+
+    forward_post_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.updatePreferences",
+        body,
+        request_id,
+    )
+    .await
+}
+
+/// POST /xrpc/blue.catbird.circle.reportRecord
+pub async fn report_record(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    request_id: Option<Extension<RequestId>>,
+    Json(input): Json<ReportRecord>,
+) -> AppResult<Response> {
+    if let Some(details) = &input.details {
+        if details.chars().count() > 2000 {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: "Report details must not exceed 2000 characters".into(),
+            });
+        }
+    }
+
+    let reason_val = serde_json::to_value(&input.reason).map_err(|e| AppError::AtprotoResponse {
+        status: StatusCode::BAD_REQUEST,
+        error: "InvalidRequest".into(),
+        message: format!("Invalid report reason: {e}"),
+    })?;
+
+    let mut body_map = serde_json::Map::new();
+    body_map.insert(
+        "space".into(),
+        serde_json::Value::String(input.space.as_str().to_string()),
+    );
+    body_map.insert(
+        "uri".into(),
+        serde_json::Value::String(input.uri.as_str().to_string()),
+    );
+    body_map.insert("reason".into(), reason_val);
+    if let Some(details) = &input.details {
+        body_map.insert(
+            "details".into(),
+            serde_json::Value::String(details.to_string()),
+        );
+    }
+
+    forward_post_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.reportRecord",
+        serde_json::Value::Object(body_map),
+        request_id,
+    )
+    .await
+}
+
+/// GET /xrpc/blue.catbird.circle.getFeed
+pub async fn get_feed(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    request_id: Option<Extension<RequestId>>,
+    Query(query): Query<GetFeed>,
+) -> AppResult<Response> {
+    if let Some(limit) = query.limit {
+        if !(1..=100).contains(&limit) {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: "Limit must be between 1 and 100".into(),
+            });
+        }
+    }
+
+    let mut params = Vec::new();
+    if let Some(space) = &query.space {
+        params.push(format!("space={}", urlencoding::encode(space.as_str())));
+    }
+    if let Some(cursor) = &query.cursor {
+        params.push(format!("cursor={}", urlencoding::encode(cursor)));
+    }
+    if let Some(limit) = query.limit {
+        params.push(format!("limit={limit}"));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+
+    forward_get_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.getFeed",
+        &qs,
+        request_id,
+    )
+    .await
+}
+
+/// GET /xrpc/blue.catbird.circle.getPostThread
+pub async fn get_post_thread(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    request_id: Option<Extension<RequestId>>,
+    Query(query): Query<GetPostThread>,
+) -> AppResult<Response> {
+    if let Some(depth) = query.depth {
+        if !(0..=10).contains(&depth) {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: "Depth must be between 0 and 10".into(),
+            });
+        }
+    }
+    if let Some(parent_height) = query.parent_height {
+        if !(0..=10).contains(&parent_height) {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: "Parent height must be between 0 and 10".into(),
+            });
+        }
+    }
+
+    let mut params = Vec::new();
+    params.push(format!("space={}", urlencoding::encode(query.space.as_str())));
+    params.push(format!("uri={}", urlencoding::encode(query.uri.as_str())));
+    if let Some(depth) = query.depth {
+        params.push(format!("depth={depth}"));
+    }
+    if let Some(ph) = query.parent_height {
+        params.push(format!("parentHeight={ph}"));
+    }
+    let qs = format!("?{}", params.join("&"));
+
+    forward_get_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.getPostThread",
+        &qs,
+        request_id,
+    )
+    .await
+}
+
+/// GET /xrpc/blue.catbird.circle.listNotifications
+pub async fn list_notifications(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    request_id: Option<Extension<RequestId>>,
+    Query(query): Query<ListNotifications>,
+) -> AppResult<Response> {
+    if let Some(limit) = query.limit {
+        if !(1..=100).contains(&limit) {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::BAD_REQUEST,
+                error: "InvalidRequest".into(),
+                message: "Limit must be between 1 and 100".into(),
+            });
+        }
+    }
+
+    let mut params = Vec::new();
+    if let Some(cursor) = &query.cursor {
+        params.push(format!("cursor={}", urlencoding::encode(cursor)));
+    }
+    if let Some(limit) = query.limit {
+        params.push(format!("limit={limit}"));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+
+    forward_get_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.listNotifications",
+        &qs,
+        request_id,
+    )
+    .await
+}
+
+/// GET /xrpc/blue.catbird.circle.getMedia
+pub async fn get_media(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    request_id: Option<Extension<RequestId>>,
+    Query(query): Query<GetMedia>,
+) -> AppResult<Response> {
+    let qs = format!(
+        "?space={}&did={}&cid={}",
+        urlencoding::encode(query.space.as_str()),
+        urlencoding::encode(query.did.as_str()),
+        urlencoding::encode(query.cid.as_str())
+    );
+
+    forward_get_to_appview(
+        &state,
+        &session,
+        "blue.catbird.circle.getMedia",
+        &qs,
+        request_id,
+    )
+    .await
+}
+
+async fn forward_get_to_appview(
+    state: &AppState,
+    session: &CatbirdSession,
+    nsid: &str,
+    qs: &str,
+    request_id: Option<Extension<RequestId>>,
 ) -> AppResult<Response> {
     let req_id_str = request_id
         .map(|r| r.0.0.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let service_auth = ServiceAuthProvider::new(state.clone());
-    let token = service_auth
-        .token_for_audience(
-            &session,
-            &state.config.circle.service_did,
-            "blue.catbird.circle.getMedia",
-        )
-        .await?;
 
     let service_url = state
         .config
         .circle
         .service_url
         .as_deref()
-        .ok_or_else(|| AppError::Config("Circle AppView service URL is not configured".into()))?;
+        .ok_or_else(|| AppError::AtprotoResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: "UpstreamUnavailable".into(),
+            message: "Circle AppView service URL is not configured".into(),
+        })?;
+
+    let service_auth = ServiceAuthProvider::new(Arc::new(state.clone()));
+    let token = service_auth
+        .token_for_audience(session, &state.config.circle.service_did, nsid)
+        .await?;
 
     let base = service_url.trim_end_matches('/');
-    let target_url = if let Some(query) = uri.query() {
-        format!("{base}/xrpc/blue.catbird.circle.getMedia?{query}")
-    } else {
-        format!("{base}/xrpc/blue.catbird.circle.getMedia")
-    };
+    let target_url = format!("{base}/xrpc/{nsid}{qs}");
 
     let upstream_resp = state
         .http_client
@@ -234,9 +427,10 @@ pub async fn proxy_circle_media(
         .header("X-Request-Id", req_id_str)
         .send()
         .await
-        .map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("Circle media request failed: {e}"),
+        .map_err(|e| AppError::AtprotoResponse {
+            status: StatusCode::BAD_GATEWAY,
+            error: "UpstreamUnavailable".into(),
+            message: format!("Circle AppView request failed: {e}"),
         })?;
 
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
@@ -254,9 +448,78 @@ pub async fn proxy_circle_media(
     let body_bytes = upstream_resp
         .bytes()
         .await
-        .map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("Failed to read media response: {e}"),
+        .map_err(|e| AppError::AtprotoResponse {
+            status: StatusCode::BAD_GATEWAY,
+            error: "UpstreamUnavailable".into(),
+            message: format!("Failed to read AppView response: {e}"),
+        })?;
+
+    response_builder
+        .body(Body::from(body_bytes))
+        .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")))
+}
+
+async fn forward_post_to_appview(
+    state: &AppState,
+    session: &CatbirdSession,
+    nsid: &str,
+    body: serde_json::Value,
+    request_id: Option<Extension<RequestId>>,
+) -> AppResult<Response> {
+    let req_id_str = request_id
+        .map(|r| r.0.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let service_url = state
+        .config
+        .circle
+        .service_url
+        .as_deref()
+        .ok_or_else(|| AppError::AtprotoResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: "UpstreamUnavailable".into(),
+            message: "Circle AppView service URL is not configured".into(),
+        })?;
+
+    let service_auth = ServiceAuthProvider::new(Arc::new(state.clone()));
+    let token = service_auth
+        .token_for_audience(session, &state.config.circle.service_did, nsid)
+        .await?;
+
+    let base = service_url.trim_end_matches('/');
+    let target_url = format!("{base}/xrpc/{nsid}");
+
+    let upstream_resp = state
+        .http_client
+        .post(&target_url)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Request-Id", req_id_str)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::AtprotoResponse {
+            status: StatusCode::BAD_GATEWAY,
+            error: "UpstreamUnavailable".into(),
+            message: format!("Circle AppView request failed: {e}"),
+        })?;
+
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    let mut response_builder = Response::builder().status(status);
+
+    if let Some(content_type) = upstream_resp.headers().get(header::CONTENT_TYPE) {
+        response_builder = response_builder.header(header::CONTENT_TYPE, content_type);
+    }
+
+    let body_bytes = upstream_resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::AtprotoResponse {
+            status: StatusCode::BAD_GATEWAY,
+            error: "UpstreamUnavailable".into(),
+            message: format!("Failed to read AppView response: {e}"),
         })?;
 
     response_builder
@@ -287,15 +550,4 @@ async fn resolve_dpop_data(state: &AppState, session: &CatbirdSession) -> Jacqua
         dpop_key,
         dpop_host_nonce: String::new(),
     }
-}
-
-fn extract_nsid_from_path(path: &str) -> AppResult<String> {
-    let clean_path = path.trim_start_matches('/');
-    let nsid = clean_path
-        .strip_prefix("xrpc/")
-        .unwrap_or(clean_path);
-    if nsid.is_empty() {
-        return Err(AppError::BadRequest("Missing NSID in request path".into()));
-    }
-    Ok(nsid.to_string())
 }

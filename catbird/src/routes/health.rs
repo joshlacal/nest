@@ -48,11 +48,27 @@ pub async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRes
         .await
         .is_ok();
 
-    if redis_ok {
-        (axum::http::StatusCode::OK, "ready")
-    } else {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    if !redis_ok {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "redis not ready");
     }
+
+    if state.config.circle.service_url.is_some() {
+        if let Some(pool) = &state.push_db {
+            if sqlx::query("SELECT 1").execute(pool).await.is_err() {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "circle database not ready",
+                );
+            }
+        } else {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "circle enabled but database not configured",
+            );
+        }
+    }
+
+    (axum::http::StatusCode::OK, "ready")
 }
 
 /// Liveness check endpoint

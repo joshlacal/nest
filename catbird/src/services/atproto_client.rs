@@ -103,9 +103,10 @@ impl AtProtoClient {
             .and_then(|o| self.state.dpop_nonce_cache.get(o));
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let safe_url = sanitize_url_for_logging(&url);
         tracing::debug!(
             request_id = %request_id,
-            url = %url,
+            url = %safe_url,
             method = %method,
             body_size = body_size,
             has_cached_nonce = cached_nonce.is_some(),
@@ -243,10 +244,11 @@ impl AtProtoClient {
         }
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let safe_url = sanitize_url_for_logging(url);
         tracing::debug!(
             request_id = %request_id,
             attempt = attempt,
-            url = %url,
+            url = %safe_url,
             method = %method,
             body_size = body_size,
             has_nonce = has_nonce,
@@ -263,10 +265,11 @@ impl AtProtoClient {
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
+                let safe_url = sanitize_url_for_logging(url);
                 tracing::error!(
                     request_id = %request_id,
                     attempt = attempt,
-                    url = %url,
+                    url = %safe_url,
                     error = %e,
                     is_builder = e.is_builder(),
                     is_request = e.is_request(),
@@ -444,10 +447,11 @@ impl AtProtoClient {
         }
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let safe_url = sanitize_url_for_logging(url);
         tracing::debug!(
             request_id = %request_id,
             attempt = attempt,
-            url = %url,
+            url = %safe_url,
             method = %method,
             body_size = body_size,
             has_nonce = has_nonce,
@@ -464,10 +468,11 @@ impl AtProtoClient {
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
+                let safe_url = sanitize_url_for_logging(url);
                 tracing::error!(
                     request_id = %request_id,
                     attempt = attempt,
-                    url = %url,
+                    url = %safe_url,
                     error = %e,
                     is_builder = e.is_builder(),
                     is_request = e.is_request(),
@@ -640,4 +645,9 @@ impl AtProtoClient {
 
     // Token refresh is now handled by Jacquard's SessionRegistry.
     // AtProtoClient is for proxying requests only.
+}
+
+/// Redacts query parameters from URLs for privacy-safe tracing.
+fn sanitize_url_for_logging(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }

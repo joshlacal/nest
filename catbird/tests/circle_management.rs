@@ -2,10 +2,10 @@
 
 use catbird::config::{AppConfig, AppState};
 use catbird::models::{
-    CatbirdSession, CIRCLE_MEMBER_SCOPE, CIRCLE_OWNER_SCOPE,
+    CatbirdSession, CircleError, CIRCLE_MEMBER_SCOPE, CIRCLE_OWNER_SCOPE,
 };
 use catbird::services::{
-    AtProtoCircleProbe, CircleCapabilityService, CircleProbe, CircleService,
+    AtProtoCircleProbe, CircleCapabilityService, CircleService,
     ClientAttestationProvider, DpopNonceCache, KeyStore, ServiceAuthProvider,
 };
 use catbird_atproto::generated::blue_catbird::circle::activate_space::ActivateSpace;
@@ -20,7 +20,7 @@ use chrono::Utc;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn alice_session(pds_url: &str) -> CatbirdSession {
@@ -59,10 +59,28 @@ async fn create_test_state(
     pool: Option<PgPool>,
     _pds_url: &str,
     appview_url: Option<String>,
+    plc_url: Option<String>,
 ) -> Arc<AppState> {
     let mut config = AppConfig::load().unwrap();
     config.circle.service_url = appview_url;
     config.circle.service_did = "did:web:circles.catbird.blue#atproto_circle".into();
+    config.circle.plc_directory_url = plc_url;
+    config.oauth.client_id = "https://api.catbird.blue".into();
+
+    if let Some(p) = &pool {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO push_accounts (account_did, session_id, pds_url, created_at, updated_at)
+            VALUES ($1, $2, $3, now(), now())
+            ON CONFLICT (account_did) DO UPDATE SET session_id = EXCLUDED.session_id, pds_url = EXCLUDED.pds_url, updated_at = now()
+            "#,
+        )
+        .bind("did:plc:alice")
+        .bind(Uuid::new_v4().to_string())
+        .bind(_pds_url)
+        .execute(p)
+        .await;
+    }
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -101,6 +119,7 @@ async fn create_test_state(
 struct TestEnv {
     _pds: MockServer,
     _appview: MockServer,
+    _plc: MockServer,
     service: CircleService,
     session: CatbirdSession,
 }
@@ -108,8 +127,22 @@ struct TestEnv {
 async fn setup_env(pool: PgPool) -> TestEnv {
     let pds = MockServer::start().await;
     let appview = MockServer::start().await;
+    let plc = MockServer::start().await;
+
     let pds_url = pds.uri().replace("127.0.0.1", "localhost");
     let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+    let plc_url = plc.uri().replace("127.0.0.1", "localhost");
+
+    std::env::set_var("PLC_DIRECTORY_URL", &plc_url);
+
+    // Capability probe mock
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&pds)
+        .await;
 
     // Standard PDS mocks
     Mock::given(method("POST"))
@@ -133,7 +166,7 @@ async fn setup_env(pool: PgPool) -> TestEnv {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/xrpc/com.atproto.repo.putRecord"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self",
             "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
@@ -163,9 +196,26 @@ async fn setup_env(pool: PgPool) -> TestEnv {
         .mount(&pds)
         .await;
 
-    // Standard AppView projection mock
+    // PLC DID Document mock for Space Host resolution
+    Mock::given(method("GET"))
+        .and(path("/did:plc:alice"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "did:plc:alice",
+            "service": [
+                {
+                    "id": "#atproto_space_host",
+                    "type": "AtprotoSpaceHost",
+                    "serviceEndpoint": "https://space.catbird.blue"
+                }
+            ]
+        })))
+        .mount(&plc)
+        .await;
+
+    // Standard AppView projection mock (verifies Bearer authorization header)
     Mock::given(method("POST"))
         .and(path("/internal/projections"))
+        .and(header("authorization", "Bearer mock-pds-service-auth-jwt"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "accepted" })))
         .mount(&appview)
         .await;
@@ -180,7 +230,7 @@ async fn setup_env(pool: PgPool) -> TestEnv {
         .mount(&appview)
         .await;
 
-    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url)).await;
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), Some(plc_url)).await;
     let attestation_provider = Some(Arc::new(ClientAttestationProvider::from_state(&state).unwrap()));
     let service_auth_provider = Some(Arc::new(ServiceAuthProvider::new(state.clone())));
 
@@ -196,6 +246,7 @@ async fn setup_env(pool: PgPool) -> TestEnv {
     TestEnv {
         _pds: pds,
         _appview: appview,
+        _plc: plc,
         service,
         session,
     }
@@ -220,15 +271,69 @@ async fn duplicate_member_update_creates_one_projection(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn member_transition_generation_advancement(pool: PgPool) {
+    let env = setup_env(pool).await;
+
+    // 1. Add Bob (generation 1)
+    let add_req = UpdateMember {
+        space: space(),
+        member_did: bob(),
+        action: MemberAction::Add,
+        extra_data: None,
+    };
+    let op1 = env.service.update_member(&env.session, add_req.clone()).await.unwrap();
+    assert_eq!(op1.status, OperationStatus::Complete);
+    assert_eq!(env.service.get_projection_count(Some("member_add")).await.unwrap(), 1);
+
+    // 2. Remove Bob (generation 2 - opposite transition advances generation)
+    let remove_req = UpdateMember {
+        space: space(),
+        member_did: bob(),
+        action: MemberAction::Remove,
+        extra_data: None,
+    };
+    let op2 = env.service.update_member(&env.session, remove_req).await.unwrap();
+    assert_eq!(op2.status, OperationStatus::Complete);
+    assert_eq!(env.service.get_projection_count(Some("member_remove")).await.unwrap(), 1);
+
+    // 3. Add Bob again (generation 3 - opposite transition advances generation)
+    let op3 = env.service.update_member(&env.session, add_req.clone()).await.unwrap();
+    assert_eq!(op3.status, OperationStatus::Complete);
+    assert_ne!(op1.id, op3.id);
+    assert_eq!(env.service.get_projection_count(Some("member_add")).await.unwrap(), 2);
+
+    // 4. Duplicate Add Bob retry (generation 3 - same transition reuses generation)
+    let op4 = env.service.update_member(&env.session, add_req).await.unwrap();
+    assert_eq!(op3.id, op4.id);
+    assert_eq!(env.service.get_projection_count(Some("member_add")).await.unwrap(), 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn appview_failure_keeps_pds_success_pending(pool: PgPool) {
     let pds = MockServer::start().await;
     let appview = MockServer::start().await;
     let pds_url = pds.uri().replace("127.0.0.1", "localhost");
     let appview_url = appview.uri().replace("127.0.0.1", "localhost");
 
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&pds)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.simplespace.addMember"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "mock-pds-service-auth-jwt"
+        })))
         .mount(&pds)
         .await;
 
@@ -239,7 +344,7 @@ async fn appview_failure_keeps_pds_success_pending(pool: PgPool) {
         .mount(&appview)
         .await;
 
-    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url)).await;
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
     let service = CircleService::new(state);
     let session = alice_session(&pds_url);
 
@@ -253,64 +358,6 @@ async fn appview_failure_keeps_pds_success_pending(pool: PgPool) {
     let result = service.update_member(&session, request).await.unwrap();
     assert_eq!(result.status, OperationStatus::Pending);
     assert_eq!(service.get_pending_projection_count().await.unwrap(), 1);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn activation_does_not_store_delegation_token(pool: PgPool) {
-    let secret_token = "ultra-secret-delegation-token-98765";
-    let pds = MockServer::start().await;
-    let appview = MockServer::start().await;
-    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
-    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
-
-    Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.space.getDelegationToken"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "token": secret_token
-        })))
-        .mount(&pds)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "token": "service-auth-jwt"
-        })))
-        .mount(&pds)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/xrpc/blue.catbird.circle.activateSpace"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "accessState": "active",
-            "expiresAt": "2026-08-25T00:00:00Z"
-        })))
-        .mount(&appview)
-        .await;
-
-    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url)).await;
-    let service = CircleService::new(state);
-    let session = alice_session(&pds_url);
-
-    let request = ActivateSpace {
-        space: space(),
-        extra_data: None,
-    };
-
-    let output = service.activate_space(&session, request).await.unwrap();
-    assert_eq!(output.access_state, AccessState::Active);
-
-    // Verify database dump does NOT contain the secret token anywhere
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT payload::text FROM circle_projection_outbox"
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    for row in rows {
-        assert!(!row.0.contains(secret_token), "Database leaked delegation token!");
-    }
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -330,6 +377,114 @@ async fn create_circle_and_outbox_projections(pool: PgPool) {
     // Expect 1 circle_upsert and 2 member_add
     assert_eq!(env.service.get_projection_count(Some("circle_upsert")).await.unwrap(), 1);
     assert_eq!(env.service.get_projection_count(Some("member_add")).await.unwrap(), 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_circle_initial_member_partial_failure(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-circle-1"
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self",
+            "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        })))
+        .mount(&pds)
+        .await;
+
+    // Add Bob succeeds
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:bob"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&pds)
+        .await;
+
+    // Add Carol fails at PDS
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:carol"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("PDS Internal Error"))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "mock-pds-service-auth-jwt"
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/internal/projections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "accepted" })))
+        .mount(&appview)
+        .await;
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = CircleService::new(state);
+    let session = alice_session(&pds_url);
+
+    let input = CreateCircle {
+        name: "Partial Failure Circle".into(),
+        member_dids: vec![bob(), carol()],
+        extra_data: None,
+    };
+
+    let op = service.create_circle(&session, input).await.unwrap();
+    // Must return Pending with partial failure error
+    assert_eq!(op.status, OperationStatus::Pending);
+    assert_eq!(op.error.as_deref(), Some("MemberAdditionPartialFailure"));
+
+    // Crucial: only 1 member_add projection enqueued for Bob, NOT Carol!
+    assert_eq!(service.get_projection_count(Some("circle_upsert")).await.unwrap(), 1);
+    assert_eq!(service.get_projection_count(Some("member_add")).await.unwrap(), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn activation_does_not_store_delegation_token(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    let request = ActivateSpace {
+        space: space(),
+        extra_data: None,
+    };
+
+    let output = env.service.activate_space(&env.session, request).await.unwrap();
+    assert_eq!(output.access_state, AccessState::Active);
+
+    // Verify database dump does NOT contain the secret token anywhere
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload::text FROM circle_projection_outbox"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let secret_token = "secret-delegation-token-xyz-123";
+    for row in rows {
+        assert!(!row.0.contains(secret_token), "Database leaked delegation token!");
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -354,9 +509,25 @@ async fn retry_worker_delivers_due_projections(pool: PgPool) {
     let pds_url = pds.uri().replace("127.0.0.1", "localhost");
     let appview_url = appview.uri().replace("127.0.0.1", "localhost");
 
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&pds)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.simplespace.addMember"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "mock-pds-service-auth-jwt"
+        })))
         .mount(&pds)
         .await;
 
@@ -375,7 +546,7 @@ async fn retry_worker_delivers_due_projections(pool: PgPool) {
         .mount(&appview)
         .await;
 
-    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url)).await;
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
     let service = CircleService::new(state);
     let session = alice_session(&pds_url);
 
@@ -403,6 +574,41 @@ async fn retry_worker_delivers_due_projections(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn bounds_validation_rejects_oversized_inputs(pool: PgPool) {
+    let env = setup_env(pool).await;
+
+    // 1. Empty name
+    let empty_name = CreateCircle {
+        name: "   ".into(),
+        member_dids: vec![],
+        extra_data: None,
+    };
+    let res = env.service.create_circle(&env.session, empty_name).await;
+    assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
+
+    // 2. Oversized name (> 64 chars)
+    let long_name = CreateCircle {
+        name: ("a".repeat(65)).into(),
+        member_dids: vec![],
+        extra_data: None,
+    };
+    let res = env.service.create_circle(&env.session, long_name).await;
+    assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
+
+    // 3. Oversized initial members (> 150 members)
+    let many_members = (0..151)
+        .map(|i| Did::new(format!("did:plc:user{i}").into()).unwrap())
+        .collect::<Vec<_>>();
+    let too_many = CreateCircle {
+        name: "Crowd".into(),
+        member_dids: many_members,
+        extra_data: None,
+    };
+    let res = env.service.create_circle(&env.session, too_many).await;
+    assert!(matches!(res, Err(CircleError::InvalidRequest(_))));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn standalone_circle_routes_and_capabilities(pool: PgPool) {
     use tower::ServiceExt;
 
@@ -417,7 +623,7 @@ async fn standalone_circle_routes_and_capabilities(pool: PgPool) {
         .mount(&pds)
         .await;
 
-    let state = create_test_state(Some(pool), &pds_url, None).await;
+    let state = create_test_state(Some(pool), &pds_url, None, None).await;
     let app = catbird::routes::circle::routes((*state).clone());
 
     let req = axum::http::Request::builder()

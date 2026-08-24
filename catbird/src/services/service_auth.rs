@@ -38,6 +38,7 @@ pub const CIRCLE_ENDPOINTS: &[&str] = &[
     "blue.catbird.circle.getPostThread",
     "blue.catbird.circle.listNotifications",
     "blue.catbird.circle.getMedia",
+    "blue.catbird.circle.syncProjection",
 ];
 
 pub struct ServiceAuthProvider {
