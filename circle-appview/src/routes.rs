@@ -242,6 +242,8 @@ async fn sync_projections_handler(
         &input.kind,
         &input.payload,
         input.generation,
+        input.circle_generation,
+        input.member_generation,
     );
 
     let projection = input.to_projection()?;

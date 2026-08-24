@@ -880,8 +880,8 @@ async fn retry_worker_queries_only_pending_and_not_intent(pool: PgPool) {
         INSERT INTO circle_projection_outbox (
             id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, created_at, updated_at
         ) VALUES
-            ($1, 'key-intent-1', 'did:plc:alice', 'sess-1', 'at://did:plc:alice/space/1', 'member_add', '{"member":"bob"}'::jsonb, 'intent', 0, now() - interval '10 seconds', now(), now()),
-            ($2, 'key-pending-1', 'did:plc:alice', 'sess-1', 'at://did:plc:alice/space/1', 'member_add', '{"member":"carol"}'::jsonb, 'pending', 0, now() - interval '10 seconds', now(), now())
+            ($1, 'key-intent-1', 'did:plc:alice', 'sess-1', 'at://did:plc:alice/space/1', 'member_add', '{"member":"bob","circleGeneration":1,"memberGeneration":1}'::jsonb, 'intent', 0, now() - interval '10 seconds', now(), now()),
+            ($2, 'key-pending-1', 'did:plc:alice', 'sess-1', 'at://did:plc:alice/space/1', 'member_add', '{"member":"carol","circleGeneration":1,"memberGeneration":1}'::jsonb, 'pending', 0, now() - interval '10 seconds', now(), now())
         "#
     )
     .bind(intent_id)

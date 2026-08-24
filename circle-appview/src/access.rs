@@ -328,6 +328,9 @@ pub async fn activate_space(
         &user_doc,
     )?;
 
+    // Acquire per-Space async lock spanning exchange, DB check, lease insertion, and credential store insertion
+    let _space_lock = state.space_locks.acquire(space).await;
+
     // 6. Exchange credential with Space host via DPoP
     let (credential_jwt, dpop_key, expires_at) = state
         .space_client
@@ -340,9 +343,6 @@ pub async fn activate_space(
             &authority_doc,
         )
         .await?;
-
-    // Acquire per-Space async lock spanning DB check, lease insertion, and credential store insertion
-    let _space_lock = state.space_locks.acquire(space).await;
 
     // 7. Atomic transaction for lease creation: locks and verifies circle and member state
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;

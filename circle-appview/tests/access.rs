@@ -1281,13 +1281,16 @@ async fn removal_invalidates_lease_without_deleting_circle_records(pool: PgPool)
         member_generation: 2,
     };
 
+    let remove_payload = json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 2});
     let digest = projections::compute_payload_digest(
         &Uuid::new_v4(),
         None,
         AUTHORITY_DID,
         &space,
         "member_remove",
-        &json!({"member": BOB_DID, "generation": 2}),
+        &remove_payload,
+        None,
+        Some(1),
         Some(2),
     );
 
@@ -1349,8 +1352,9 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
         "circle_upsert",
         &payload,
         Some(1),
+        Some(1),
+        None,
     );
-
     // First delivery -> mutates
     let res1 = projections::apply_projection(
         &pool,
@@ -1387,14 +1391,17 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
 
     // CircleDelete -> cascades DB and purges in-memory CredentialStore
     let del_op = Uuid::new_v4();
+    let del_payload = json!({"space": space, "generation": 2, "circleGeneration": 2});
     let del_digest = projections::compute_payload_digest(
         &del_op,
         None,
         AUTHORITY_DID,
         &space,
         "circle_delete",
-        &json!({"space": space}),
+        &del_payload,
         Some(2),
+        Some(2),
+        None,
     );
 
     projections::apply_projection(
@@ -1433,6 +1440,8 @@ async fn projection_receipt_idempotency_and_cascade_delete(pool: PgPool) {
         "circle_upsert",
         &payload,
         Some(1),
+        Some(1),
+        None,
     );
     let stale_res = projections::apply_projection(
         &pool,
@@ -1624,15 +1633,18 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
     .await
     .unwrap();
 
-    // 2. Deliver MemberRemove (generation 2)
+    // 2. Deliver MemberRemove (circle_generation 1, member_generation 2)
     let remove_op = Uuid::new_v4();
+    let remove_payload = json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 2});
     let remove_digest = projections::compute_payload_digest(
         &remove_op,
         None,
         AUTHORITY_DID,
         &space,
         "member_remove",
-        &json!({"member": BOB_DID, "generation": 2}),
+        &remove_payload,
+        None,
+        Some(1),
         Some(2),
     );
 
@@ -1662,15 +1674,18 @@ async fn member_generations_prevent_out_of_order_overwrites(pool: PgPool) {
     assert_eq!(status1.0, "removed");
     assert_eq!(status1.1, 2);
 
-    // 3. Delayed delivery of older MemberAdd (generation 1) -> ignored
+    // 3. Delayed delivery of older MemberAdd (circle_generation 1, member_generation 1) -> ignored
     let add_op = Uuid::new_v4();
+    let add_payload = json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1});
     let add_digest = projections::compute_payload_digest(
         &add_op,
         None,
         AUTHORITY_DID,
         &space,
         "member_add",
-        &json!({"member": BOB_DID, "generation": 1}),
+        &add_payload,
+        None,
+        Some(1),
         Some(1),
     );
 
@@ -1867,9 +1882,11 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
         "circle_upsert",
         &payload,
         Some(1),
+        Some(1),
+        None,
     );
 
-    let digest2 = projections::compute_payload_digest(
+    let digest_diff_gen = projections::compute_payload_digest(
         &op_id,
         Some("key-1"),
         AUTHORITY_DID,
@@ -1877,9 +1894,50 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
         "circle_upsert",
         &payload,
         Some(2), // Different generation!
+        Some(2),
+        None,
     );
 
-    assert_ne!(digest1, digest2);
+    let digest_diff_c_gen = projections::compute_payload_digest(
+        &op_id,
+        Some("key-1"),
+        AUTHORITY_DID,
+        &space,
+        "circle_upsert",
+        &payload,
+        Some(1),
+        Some(2), // Different circle_generation!
+        None,
+    );
+
+    let digest_diff_m_gen = projections::compute_payload_digest(
+        &op_id,
+        Some("key-1"),
+        AUTHORITY_DID,
+        &space,
+        "circle_upsert",
+        &payload,
+        Some(1),
+        Some(1),
+        Some(2), // Different member_generation!
+    );
+
+    let digest_diff_key = projections::compute_payload_digest(
+        &op_id,
+        Some("key-2"), // Different operation key!
+        AUTHORITY_DID,
+        &space,
+        "circle_upsert",
+        &payload,
+        Some(1),
+        Some(1),
+        None,
+    );
+
+    assert_ne!(digest1, digest_diff_gen);
+    assert_ne!(digest1, digest_diff_c_gen);
+    assert_ne!(digest1, digest_diff_m_gen);
+    assert_ne!(digest1, digest_diff_key);
 
     // Apply with digest1
     let upsert = Projection::CircleUpsert {
@@ -1901,17 +1959,154 @@ async fn receipt_digest_includes_generation_and_operation_key_conflict(pool: PgP
     .await;
     assert!(res1.is_ok());
 
-    // Replay with digest2 (different generation) -> 409 Conflict
+    // Replay with digest_diff_gen -> 409 Conflict
     let res2 = projections::apply_projection(
         &pool,
         Some(&setup.state.credential_store),
         Some(&setup.state.space_locks),
         op_id,
-        upsert,
-        &digest2,
+        upsert.clone(),
+        &digest_diff_gen,
     )
     .await;
-    assert!(res2.is_err());
+    assert!(matches!(res2, Err(circle_appview::error::AppError::Conflict(_))));
+
+    // Replay with digest_diff_c_gen -> 409 Conflict
+    let res3 = projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        op_id,
+        upsert.clone(),
+        &digest_diff_c_gen,
+    )
+    .await;
+    assert!(matches!(res3, Err(circle_appview::error::AppError::Conflict(_))));
+
+    // Replay with digest_diff_m_gen -> 409 Conflict
+    let res4 = projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        op_id,
+        upsert.clone(),
+        &digest_diff_m_gen,
+    )
+    .await;
+    assert!(matches!(res4, Err(circle_appview::error::AppError::Conflict(_))));
+
+    // Replay with digest_diff_key -> 409 Conflict
+    let res5 = projections::apply_projection(
+        &pool,
+        Some(&setup.state.credential_store),
+        Some(&setup.state.space_locks),
+        op_id,
+        upsert,
+        &digest_diff_key,
+    )
+    .await;
+    assert!(matches!(res5, Err(circle_appview::error::AppError::Conflict(_))));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn member_projection_requires_explicit_circle_and_member_generation(pool: PgPool) {
+    let _setup = setup_test(pool).await;
+    let space = space_uri();
+
+    // 1. MemberAdd missing circleGeneration -> rejected
+    let input_missing_c_gen = projections::SyncProjectionInput {
+        operation_id: Uuid::new_v4(),
+        operation_key: None,
+        actor_did: AUTHORITY_DID.to_string(),
+        space_uri: space.clone(),
+        kind: "member_add".to_string(),
+        payload: json!({ "member": BOB_DID, "memberGeneration": 1 }),
+        generation: None,
+        circle_generation: None,
+        member_generation: None,
+    };
+    let err1 = input_missing_c_gen.to_projection();
+    assert!(matches!(err1, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing circleGeneration")));
+
+    // 2. MemberAdd with legacy generation only -> rejected (no legacy fallback)
+    let input_legacy_only = projections::SyncProjectionInput {
+        operation_id: Uuid::new_v4(),
+        operation_key: None,
+        actor_did: AUTHORITY_DID.to_string(),
+        space_uri: space.clone(),
+        kind: "member_add".to_string(),
+        payload: json!({ "member": BOB_DID, "generation": 3 }),
+        generation: Some(3),
+        circle_generation: None,
+        member_generation: None,
+    };
+    let err2 = input_legacy_only.to_projection();
+    assert!(matches!(err2, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing circleGeneration")));
+
+    // 3. MemberAdd missing memberGeneration -> rejected
+    let input_missing_m_gen = projections::SyncProjectionInput {
+        operation_id: Uuid::new_v4(),
+        operation_key: None,
+        actor_did: AUTHORITY_DID.to_string(),
+        space_uri: space.clone(),
+        kind: "member_add".to_string(),
+        payload: json!({ "member": BOB_DID, "circleGeneration": 1 }),
+        generation: None,
+        circle_generation: None,
+        member_generation: None,
+    };
+    let err3 = input_missing_m_gen.to_projection();
+    assert!(matches!(err3, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Missing memberGeneration")));
+
+    // 4. Conflicting top-level vs payload circleGeneration -> rejected
+    let input_conflicting_c_gen = projections::SyncProjectionInput {
+        operation_id: Uuid::new_v4(),
+        operation_key: None,
+        actor_did: AUTHORITY_DID.to_string(),
+        space_uri: space.clone(),
+        kind: "member_add".to_string(),
+        payload: json!({ "member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1 }),
+        generation: None,
+        circle_generation: Some(2), // Conflicting!
+        member_generation: Some(1),
+    };
+    let err4 = input_conflicting_c_gen.to_projection();
+    assert!(matches!(err4, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Conflicting circleGeneration")));
+
+    // 5. Conflicting top-level vs payload memberGeneration -> rejected
+    let input_conflicting_m_gen = projections::SyncProjectionInput {
+        operation_id: Uuid::new_v4(),
+        operation_key: None,
+        actor_did: AUTHORITY_DID.to_string(),
+        space_uri: space.clone(),
+        kind: "member_remove".to_string(),
+        payload: json!({ "member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1 }),
+        generation: None,
+        circle_generation: Some(1),
+        member_generation: Some(2), // Conflicting!
+    };
+    let err5 = input_conflicting_m_gen.to_projection();
+    assert!(matches!(err5, Err(circle_appview::error::AppError::InvalidRequest(msg)) if msg.contains("Conflicting memberGeneration")));
+
+    // 6. Fully explicit valid MemberAdd -> succeeds
+    let input_valid = projections::SyncProjectionInput {
+        operation_id: Uuid::new_v4(),
+        operation_key: None,
+        actor_did: AUTHORITY_DID.to_string(),
+        space_uri: space.clone(),
+        kind: "member_add".to_string(),
+        payload: json!({ "member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1 }),
+        generation: None,
+        circle_generation: Some(1),
+        member_generation: Some(1),
+    };
+    let proj = input_valid.to_projection().unwrap();
+    assert_eq!(proj, Projection::MemberAdd {
+        space,
+        member: BOB_DID.to_string(),
+        circle_generation: 1,
+        member_generation: 1,
+    });
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1934,6 +2129,8 @@ async fn concurrent_receipt_claims_under_race(pool: PgPool) {
         "circle_upsert",
         &payload,
         Some(1),
+        Some(1),
+        None,
     );
 
     let upsert = Projection::CircleUpsert {
@@ -2000,7 +2197,7 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
         authority_key: p256::ecdsa::SigningKey,
         authority_did: String,
         dpop_started: Arc<tokio::sync::Notify>,
-        delete_done: Arc<tokio::sync::Notify>,
+        exchange_release: Arc<tokio::sync::Notify>,
     }
 
     impl SpaceHostTransport for BarrierTransport {
@@ -2016,7 +2213,7 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
             let auth_did = self.authority_did.clone();
             let space = space_uri.to_string();
             let dpop_started = self.dpop_started.clone();
-            let delete_done = self.delete_done.clone();
+            let exchange_release = self.exchange_release.clone();
             let dpop = dpop_proof.to_string();
 
             Box::pin(async move {
@@ -2047,11 +2244,11 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
                     Some("#atproto_space"),
                 );
 
-                // Signal main thread that DPoP exchange reached Space host
+                // Signal that activation holds _space_lock and is in exchange
                 dpop_started.notify_one();
 
-                // Wait for CircleDelete projection to commit
-                delete_done.notified().await;
+                // Wait for test to verify lock contention before finishing exchange
+                exchange_release.notified().await;
 
                 Ok(cred)
             })
@@ -2059,12 +2256,12 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
     }
 
     let dpop_started = Arc::new(tokio::sync::Notify::new());
-    let delete_done = Arc::new(tokio::sync::Notify::new());
+    let exchange_release = Arc::new(tokio::sync::Notify::new());
     let transport = Arc::new(BarrierTransport {
         authority_key: setup.authority_signing_key.clone(),
         authority_did: AUTHORITY_DID.to_string(),
         dpop_started: dpop_started.clone(),
-        delete_done: delete_done.clone(),
+        exchange_release: exchange_release.clone(),
     });
 
     let custom_space_client = Arc::new(SpaceClient::with_transport(transport));
@@ -2085,7 +2282,7 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
         now,
     );
 
-    // Spawn activation task
+    // Spawn activation task (acquires _space_lock before exchange)
     let state_clone = state.clone();
     let space_clone = space.clone();
     let del_tok_clone = delegation_token.clone();
@@ -2100,19 +2297,110 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
         .await
     });
 
-    // Wait for activation to reach DPoP exchange
+    // Wait for activation to acquire _space_lock and reach DPoP exchange
     dpop_started.notified().await;
 
-    // While activation is in-flight, execute CircleDelete projection
+    // While activation holds _space_lock, spawn CircleDelete projection
     let del_op = Uuid::new_v4();
+    let del_payload = json!({"space": space, "generation": 1, "circleGeneration": 1});
     let del_digest = projections::compute_payload_digest(
         &del_op,
         None,
         AUTHORITY_DID,
         &space,
         "circle_delete",
-        &json!({"space": space, "generation": 1}),
+        &del_payload,
         Some(1),
+        Some(1),
+        None,
+    );
+
+    let pool_clone = pool.clone();
+    let store_clone = setup.state.credential_store.clone();
+    let locks_clone = setup.state.space_locks.clone();
+    let space_for_del = space.clone();
+    let mut projection_handle = tokio::spawn(async move {
+        projections::apply_projection(
+            &pool_clone,
+            Some(&store_clone),
+            Some(&locks_clone),
+            del_op,
+            Projection::CircleDelete {
+                space: space_for_del,
+                generation: 1,
+            },
+            &del_digest,
+        )
+        .await
+    });
+
+    // Assert that projection is BLOCKED on _space_lock while activation is in exchange
+    let check_blocked = tokio::time::timeout(std::time::Duration::from_millis(50), &mut projection_handle).await;
+    assert!(check_blocked.is_err(), "CircleDelete projection must block while activation holds _space_lock");
+
+    // Release activation exchange: activation finishes lease commit, CredentialStore insert, and releases _space_lock
+    exchange_release.notify_one();
+
+    let activation_res = activation_handle.await.unwrap();
+    assert!(activation_res.is_ok(), "Activation must succeed while holding lock first");
+
+    // Now projection unblocks, acquires _space_lock, deletes circle & lease, and purges CredentialStore
+    let projection_res = projection_handle.await.unwrap();
+    assert!(projection_res.is_ok(), "Projection must succeed after acquiring released lock");
+
+    // In-memory store must be purged by the deletion projection
+    assert!(setup.state.credential_store.get(&space).await.is_none());
+
+    // Database lease must be cascade-deleted
+    let lease_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT space_uri FROM access_leases WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(lease_exists.is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn concurrent_circle_deletion_blocks_and_rejects_activation(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    let now = Utc::now().timestamp();
+
+    // 1. Setup initial circle and member in DB
+    sqlx::query(
+        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Circle', now(), 1)",
+    )
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 1, now())",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // CircleDelete executes first and commits deletion + tombstone
+    let del_op = Uuid::new_v4();
+    let del_payload = json!({"space": space, "generation": 1, "circleGeneration": 1});
+    let del_digest = projections::compute_payload_digest(
+        &del_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "circle_delete",
+        &del_payload,
+        Some(1),
+        Some(1),
+        None,
     );
 
     projections::apply_projection(
@@ -2129,16 +2417,32 @@ async fn concurrent_activation_vs_circle_deletion_race(pool: PgPool) {
     .await
     .unwrap();
 
-    // Let activation DPoP exchange complete and attempt space_lock & DB txn
-    delete_done.notify_one();
+    // Activation runs afterwards -> acquires lock, checks DB, sees tombstone, strictly rejected
+    let dyn_transport = Arc::new(DynamicMockTransport {
+        authority_key: setup.authority_signing_key.clone(),
+        authority_did: AUTHORITY_DID.to_string(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let custom_space_client = Arc::new(SpaceClient::with_transport(dyn_transport));
+    let state = AppState::with_services(
+        (*setup.state.config).clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        custom_space_client,
+        setup.state.space_locks.clone(),
+    );
+    let delegation_token = mint_delegation_token(
+        &setup.alice_signing_key,
+        ALICE_DID,
+        &space,
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
+        now + 300,
+        now,
+    );
 
-    // Activation task finishes
-    let activation_res = activation_handle.await.unwrap();
-
-    // Activation must be rejected due to deletion tombstone and lock serialization
-    assert!(activation_res.is_err());
-
-    // In-memory store must remain completely empty (no leaked secret material)
+    let act_res = access::activate_space(&state, ALICE_DID, &space, &delegation_token, "attestation").await;
+    assert!(matches!(act_res, Err(circle_appview::error::AppError::Forbidden(_))));
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
 
@@ -2171,7 +2475,7 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
         authority_key: p256::ecdsa::SigningKey,
         authority_did: String,
         dpop_started: Arc<tokio::sync::Notify>,
-        remove_done: Arc<tokio::sync::Notify>,
+        exchange_release: Arc<tokio::sync::Notify>,
     }
 
     impl SpaceHostTransport for BarrierTransport {
@@ -2187,7 +2491,7 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
             let auth_did = self.authority_did.clone();
             let space = space_uri.to_string();
             let dpop_started = self.dpop_started.clone();
-            let remove_done = self.remove_done.clone();
+            let exchange_release = self.exchange_release.clone();
             let dpop = dpop_proof.to_string();
 
             Box::pin(async move {
@@ -2218,20 +2522,21 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
                     Some("#atproto_space"),
                 );
 
+                // Signal that activation holds _space_lock and is in exchange
                 dpop_started.notify_one();
-                remove_done.notified().await;
+                exchange_release.notified().await;
                 Ok(cred)
             })
         }
     }
 
     let dpop_started = Arc::new(tokio::sync::Notify::new());
-    let remove_done = Arc::new(tokio::sync::Notify::new());
+    let exchange_release = Arc::new(tokio::sync::Notify::new());
     let transport = Arc::new(BarrierTransport {
         authority_key: setup.authority_signing_key.clone(),
         authority_did: AUTHORITY_DID.to_string(),
         dpop_started: dpop_started.clone(),
-        remove_done: remove_done.clone(),
+        exchange_release: exchange_release.clone(),
     });
 
     let custom_space_client = Arc::new(SpaceClient::with_transport(transport));
@@ -2266,18 +2571,110 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
         .await
     });
 
-    // Wait for activation to reach DPoP exchange
+    // Wait for activation to acquire _space_lock and reach DPoP exchange
     dpop_started.notified().await;
 
-    // While activation is in-flight, execute MemberRemove projection
+    // While activation holds _space_lock, spawn MemberRemove projection
     let rem_op = Uuid::new_v4();
+    let rem_payload = json!({"member": ALICE_DID, "circleGeneration": 1, "memberGeneration": 2});
     let rem_digest = projections::compute_payload_digest(
         &rem_op,
         None,
         AUTHORITY_DID,
         &space,
         "member_remove",
-        &json!({"member": ALICE_DID, "generation": 2}),
+        &rem_payload,
+        None,
+        Some(1),
+        Some(2),
+    );
+
+    let pool_clone = pool.clone();
+    let store_clone = setup.state.credential_store.clone();
+    let locks_clone = setup.state.space_locks.clone();
+    let space_for_rem = space.clone();
+    let mut projection_handle = tokio::spawn(async move {
+        projections::apply_projection(
+            &pool_clone,
+            Some(&store_clone),
+            Some(&locks_clone),
+            rem_op,
+            Projection::MemberRemove {
+                space: space_for_rem,
+                member: ALICE_DID.into(),
+                circle_generation: 1,
+                member_generation: 2,
+            },
+            &rem_digest,
+        )
+        .await
+    });
+
+    // Assert that MemberRemove blocks while activation holds _space_lock
+    let check_blocked = tokio::time::timeout(std::time::Duration::from_millis(50), &mut projection_handle).await;
+    assert!(check_blocked.is_err(), "MemberRemove must block while activation holds _space_lock");
+
+    // Release activation exchange
+    exchange_release.notify_one();
+
+    let activation_res = activation_handle.await.unwrap();
+    assert!(activation_res.is_ok(), "Activation must succeed when holding lock first");
+
+    // Now MemberRemove unblocks, acquires lock, updates member status, and purges CredentialStore
+    let projection_res = projection_handle.await.unwrap();
+    assert!(projection_res.is_ok(), "MemberRemove must succeed after acquiring released lock");
+
+    assert!(setup.state.credential_store.get(&space).await.is_none());
+
+    // Lease was deleted
+    let lease_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT space_uri FROM access_leases WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(lease_exists.is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn concurrent_member_removal_blocks_and_rejects_activation(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    let now = Utc::now().timestamp();
+
+    // Setup initial circle and member in DB
+    sqlx::query(
+        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Circle', now(), 1)",
+    )
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 1, now())",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // MemberRemove executes first
+    let rem_op = Uuid::new_v4();
+    let rem_payload = json!({"member": ALICE_DID, "circleGeneration": 1, "memberGeneration": 2});
+    let rem_digest = projections::compute_payload_digest(
+        &rem_op,
+        None,
+        AUTHORITY_DID,
+        &space,
+        "member_remove",
+        &rem_payload,
+        None,
+        Some(1),
         Some(2),
     );
 
@@ -2297,15 +2694,34 @@ async fn concurrent_activation_vs_member_removal_race(pool: PgPool) {
     .await
     .unwrap();
 
-    // Let activation complete DPoP exchange and proceed to space lock
-    remove_done.notify_one();
+    let dyn_transport = Arc::new(DynamicMockTransport {
+        authority_key: setup.authority_signing_key.clone(),
+        authority_did: AUTHORITY_DID.to_string(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let custom_space_client = Arc::new(SpaceClient::with_transport(dyn_transport));
+    let state = AppState::with_services(
+        (*setup.state.config).clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        custom_space_client,
+        setup.state.space_locks.clone(),
+    );
+    let delegation_token = mint_delegation_token(
+        &setup.alice_signing_key,
+        ALICE_DID,
+        &space,
+        &format!("{AUTHORITY_DID}#atproto_space_host"),
+        now + 300,
+        now,
+    );
 
-    let activation_res = activation_handle.await.unwrap();
-
-    // Must fail with forbidden (member removed)
-    assert!(activation_res.is_err());
+    let act_res = access::activate_space(&state, ALICE_DID, &space, &delegation_token, "attestation").await;
+    assert!(matches!(act_res, Err(circle_appview::error::AppError::Forbidden(_))));
     assert!(setup.state.credential_store.get(&space).await.is_none());
 }
+
 #[sqlx::test(migrations = "./migrations")]
 async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
@@ -2390,7 +2806,6 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
 
     let auth_key1 = setup.authority_signing_key.clone();
     let auth_key2 = setup.authority_signing_key.clone();
-
     let transport1 = Arc::new(BarrierDynamicTransport {
         authority_key: auth_key1,
         authority_did: AUTHORITY_DID.to_string(),
@@ -2430,26 +2845,30 @@ async fn persisted_lease_is_monotonic_max_under_concurrent_activations(pool: PgP
         now + 300,
         now,
     );
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(2));
 
     let s1 = state1.clone();
     let sp1 = space.clone();
     let dt1 = delegation_token.clone();
+    let b1 = start_barrier.clone();
     let h1 = tokio::spawn(async move {
+        b1.wait().await;
         access::activate_space(&s1, ALICE_DID, &sp1, &dt1, "attestation").await
     });
 
     let s2 = state2.clone();
     let sp2 = space.clone();
     let dt2 = delegation_token.clone();
+    let b2 = start_barrier.clone();
     let h2 = tokio::spawn(async move {
+        b2.wait().await;
         access::activate_space(&s2, ALICE_DID, &sp2, &dt2, "attestation").await
     });
-
     let (res1, res2) = tokio::join!(h1, h2);
     assert!(res1.unwrap().is_ok());
     assert!(res2.unwrap().is_ok());
 
-    // Verify DB lease remains at longer_exp (monotonic max)
+    // Verify DB lease remains at longer_exp (monotonic max under serialization)
     let stored_exp: (DateTime<Utc>,) = sqlx::query_as(
         "SELECT expires_at FROM access_leases WHERE space_uri = $1 AND member_did = $2",
     )
@@ -2472,14 +2891,17 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 1. Initial Circle creation (generation 1)
     let upsert_op = Uuid::new_v4();
+    let upsert_payload = json!({"name": "Circle Epoch 1", "generation": 1, "circleGeneration": 1});
     let upsert_digest = projections::compute_payload_digest(
         &upsert_op,
         None,
         AUTHORITY_DID,
         &space,
         "circle_upsert",
-        &json!({"name": "Circle Epoch 1", "generation": 1}),
+        &upsert_payload,
         Some(1),
+        Some(1),
+        None,
     );
     projections::apply_projection(
         &pool,
@@ -2500,13 +2922,16 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 2. Add Bob (circle_generation: 1, member_generation: 1)
     let add_op1 = Uuid::new_v4();
+    let add_payload1 = json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1});
     let add_digest1 = projections::compute_payload_digest(
         &add_op1,
         None,
         AUTHORITY_DID,
         &space,
         "member_add",
-        &json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 1}),
+        &add_payload1,
+        None,
+        Some(1),
         Some(1),
     );
     projections::apply_projection(
@@ -2527,13 +2952,16 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 3. Remove Bob (circle_generation: 1, member_generation: 2)
     let rem_op = Uuid::new_v4();
+    let rem_payload = json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 2});
     let rem_digest = projections::compute_payload_digest(
         &rem_op,
         None,
         AUTHORITY_DID,
         &space,
         "member_remove",
-        &json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 2}),
+        &rem_payload,
+        None,
+        Some(1),
         Some(2),
     );
     projections::apply_projection(
@@ -2554,14 +2982,17 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 4. CircleDelete at generation 2 -> deletes circles and inserts tombstone (generation 2)
     let del_op = Uuid::new_v4();
+    let del_payload = json!({"space": space, "generation": 2, "circleGeneration": 2});
     let del_digest = projections::compute_payload_digest(
         &del_op,
         None,
         AUTHORITY_DID,
         &space,
         "circle_delete",
-        &json!({"space": space, "generation": 2}),
+        &del_payload,
         Some(2),
+        Some(2),
+        None,
     );
     projections::apply_projection(
         &pool,
@@ -2587,13 +3018,16 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 5. Delayed pre-delete MemberAdd (circle_generation: 1, member_generation: 3) arrives
     let delayed_op = Uuid::new_v4();
+    let delayed_payload = json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 3});
     let delayed_digest = projections::compute_payload_digest(
         &delayed_op,
         None,
         AUTHORITY_DID,
         &space,
         "member_add",
-        &json!({"member": BOB_DID, "circleGeneration": 1, "memberGeneration": 3}),
+        &delayed_payload,
+        None,
+        Some(1),
         Some(3),
     );
     let delayed_res = projections::apply_projection(
@@ -2629,14 +3063,17 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 6. Newer legitimate Circle epoch (generation 3) is created
     let upsert_op2 = Uuid::new_v4();
+    let upsert_payload2 = json!({"name": "Circle Epoch 3", "generation": 3, "circleGeneration": 3});
     let upsert_digest2 = projections::compute_payload_digest(
         &upsert_op2,
         None,
         AUTHORITY_DID,
         &space,
         "circle_upsert",
-        &json!({"name": "Circle Epoch 3", "generation": 3}),
+        &upsert_payload2,
         Some(3),
+        Some(3),
+        None,
     );
     projections::apply_projection(
         &pool,
@@ -2665,13 +3102,16 @@ async fn stale_pre_delete_member_projection_cannot_resurrect_deleted_circle(pool
 
     // 7. Legitimate member add in new epoch (circle_generation: 3, member_generation: 1) succeeds
     let add_op2 = Uuid::new_v4();
+    let add_payload2 = json!({"member": BOB_DID, "circleGeneration": 3, "memberGeneration": 1});
     let add_digest2 = projections::compute_payload_digest(
         &add_op2,
         None,
         AUTHORITY_DID,
         &space,
         "member_add",
-        &json!({"member": BOB_DID, "circleGeneration": 3, "memberGeneration": 1}),
+        &add_payload2,
+        None,
+        Some(3),
         Some(1),
     );
     projections::apply_projection(
@@ -3041,4 +3481,230 @@ async fn startup_jwks_loader_and_verifier_tests() {
 
     let private_res = auth::fetch_https_jwks(&prod_resolver, "https://10.0.0.1/jwks.json").await;
     assert_eq!(private_res.unwrap_err(), AuthReason::SsrfBlocked);
+}
+
+async fn run_production_space_host_transport_tls_fixture() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 1. Generate TLS self-signed cert for public hostname space.example.org
+    let params = rcgen::CertificateParams::new(vec![
+        "space.example.org".to_string(),
+    ])
+    .unwrap();
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
+
+    let rustls_cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let rustls_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![rustls_cert], rustls_key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let Ok(n) = tls_stream.read(&mut buf).await else {
+                    return;
+                };
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
+                    let has_auth = req_str.contains("authorization: Bearer test-delegation-token")
+                        || req_str.contains("Authorization: Bearer test-delegation-token");
+                    let has_dpop = req_str.contains("dpop: test-dpop-proof")
+                        || req_str.contains("DPoP: test-dpop-proof");
+                    if has_auth && has_dpop {
+                        let body = r#"{"credential":"test.space.credential.jwt"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls_stream.write_all(response.as_bytes()).await;
+                    } else {
+                        let body = r#"{"error":"Unauthorized"}"#;
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls_stream.write_all(response.as_bytes()).await;
+                    }
+                } else if req_str.starts_with("POST /redirect") {
+                    // Redirect to the valid credential endpoint on the same TLS fixture.
+                    // If Policy::none() is active, redirect is rejected and returns error.
+                    let response = "HTTP/1.1 302 Found\r\nLocation: /xrpc/com.atproto.space.getSpaceCredential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                } else {
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                }
+                let _ = tls_stream.shutdown().await;
+            });
+        }
+    });
+
+    let reqwest_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+
+    // 1. Successful pinned HTTPS transport exchange over real TLS (bypassing poisoned proxy env via .no_proxy())
+    let fixture_resolver = Arc::new(MockDnsResolver {
+        addrs: Ok(vec![fixture_addr]),
+    });
+    let transport_success = DefaultSpaceHostTransport::with_test_fixture(
+        fixture_resolver,
+        Some(reqwest_cert.clone()),
+        true,
+    );
+    let target_url = url::Url::parse(&format!(
+        "https://space.example.org:{}/xrpc/com.atproto.space.getSpaceCredential",
+        fixture_addr.port()
+    ))
+    .unwrap();
+
+    let cred = transport_success
+        .get_space_credential(
+            &target_url,
+            "test-delegation-token",
+            "test-dpop-proof",
+            "at://did:plc:auth/space/1",
+            "test-attestation",
+        )
+        .await
+        .expect("Space host credential exchange over TLS must succeed through .no_proxy()");
+    assert_eq!(cred, "test.space.credential.jwt");
+
+    // 2. Same-fixture redirect discrimination (Policy::none() must reject 302 Found)
+    let redirect_url = url::Url::parse(&format!(
+        "https://space.example.org:{}/redirect",
+        fixture_addr.port()
+    ))
+    .unwrap();
+    let redirect_res = transport_success
+        .get_space_credential(
+            &redirect_url,
+            "test-delegation-token",
+            "test-dpop-proof",
+            "at://did:plc:auth/space/1",
+            "test-attestation",
+        )
+        .await;
+    assert!(redirect_res.is_err(), "Redirect must be rejected by Policy::none()");
+
+    // 3. Pinned destination failure: connecting to closed port fails immediately
+    let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+
+    let closed_resolver = Arc::new(MockDnsResolver {
+        addrs: Ok(vec![closed_addr]),
+    });
+    let transport_closed = DefaultSpaceHostTransport::with_test_fixture(
+        closed_resolver,
+        Some(reqwest_cert),
+        true,
+    );
+    let closed_url = url::Url::parse(&format!(
+        "https://space.example.org:{}/xrpc/com.atproto.space.getSpaceCredential",
+        closed_addr.port()
+    ))
+    .unwrap();
+    let closed_res = transport_closed
+        .get_space_credential(
+            &closed_url,
+            "test-delegation-token",
+            "test-dpop-proof",
+            "at://did:plc:auth/space/1",
+            "test-attestation",
+        )
+        .await;
+    assert!(closed_res.is_err(), "Connecting to closed pinned address must fail immediately");
+}
+
+const SPACE_HOST_PROXY_CANARY: &str = "CANARY_SPACE_HOST_PROXY_SUBPROCESS_EXECUTED_d9a8c7b6";
+const POISONED_SPACE_HOST_PROXY_URL: &str = "http://invalid-unreachable-proxy.example.local:9999";
+
+#[tokio::test]
+#[ignore = "Subprocess helper executed exclusively by production_space_host_transport_enforces_tls_pinning_no_proxy_and_rejects_redirects"]
+async fn space_host_transport_proxy_subprocess_helper() {
+    assert_eq!(
+        std::env::var("HTTPS_PROXY").ok().as_deref(),
+        Some(POISONED_SPACE_HOST_PROXY_URL),
+        "HTTPS_PROXY must be poisoned in subprocess"
+    );
+    assert_eq!(
+        std::env::var("HTTP_PROXY").ok().as_deref(),
+        Some(POISONED_SPACE_HOST_PROXY_URL),
+        "HTTP_PROXY must be poisoned in subprocess"
+    );
+    assert_eq!(
+        std::env::var("ALL_PROXY").ok().as_deref(),
+        Some(POISONED_SPACE_HOST_PROXY_URL),
+        "ALL_PROXY must be poisoned in subprocess"
+    );
+
+    println!("{}", SPACE_HOST_PROXY_CANARY);
+    run_production_space_host_transport_tls_fixture().await;
+}
+
+#[tokio::test]
+async fn production_space_host_transport_enforces_tls_pinning_no_proxy_and_rejects_redirects() {
+    // 1. Capture parent environment
+    let orig_https_proxy = std::env::var_os("HTTPS_PROXY");
+    let orig_http_proxy = std::env::var_os("HTTP_PROXY");
+    let orig_all_proxy = std::env::var_os("ALL_PROXY");
+
+    // 2. Execute subprocess helper with poisoned proxy environment variables
+    let current_exe = std::env::current_exe().expect("Must get current test executable");
+    let output = std::process::Command::new(current_exe)
+        .arg("space_host_transport_proxy_subprocess_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("HTTPS_PROXY", POISONED_SPACE_HOST_PROXY_URL)
+        .env("HTTP_PROXY", POISONED_SPACE_HOST_PROXY_URL)
+        .env("ALL_PROXY", POISONED_SPACE_HOST_PROXY_URL)
+        .env("https_proxy", POISONED_SPACE_HOST_PROXY_URL)
+        .env("http_proxy", POISONED_SPACE_HOST_PROXY_URL)
+        .env("all_proxy", POISONED_SPACE_HOST_PROXY_URL)
+        .output()
+        .expect("Failed to execute space host proxy isolation test subprocess");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Subprocess failed to run with poisoned proxy env (no_proxy must bypass invalid proxies):\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains(SPACE_HOST_PROXY_CANARY),
+        "Subprocess did not emit the required execution canary (filter did not run helper):\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+
+    // 3. Verify parent environment was never mutated
+    assert_eq!(std::env::var_os("HTTPS_PROXY"), orig_https_proxy);
+    assert_eq!(std::env::var_os("HTTP_PROXY"), orig_http_proxy);
+    assert_eq!(std::env::var_os("ALL_PROXY"), orig_all_proxy);
 }
