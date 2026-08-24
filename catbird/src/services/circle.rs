@@ -27,8 +27,6 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
-
-
 /// Error occurred during projection delivery to Circle AppView.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionDeliveryError {
@@ -40,6 +38,10 @@ pub enum ProjectionDeliveryError {
     Http(String),
     #[error("AppView returned error ({status}): {message}")]
     AppView { status: u16, message: String },
+    #[error("Client attestation minting failed: {0}")]
+    ClientAttestation(String),
+    #[error("Missing client attestation provider")]
+    MissingAttestationProvider,
     #[error("Circle service URL is not configured")]
     NotConfigured,
 }
@@ -62,6 +64,8 @@ impl ProjectionDeliveryError {
             {
                 true
             }
+            Self::ClientAttestation(_) => true,
+            Self::MissingAttestationProvider => true,
             Self::Http(_) => true,
             _ => false,
         }
@@ -231,7 +235,8 @@ impl CircleService {
             "space": &pre_space_uri,
             "authority": &session.did,
             "name": input.name.as_str(),
-            "createdAt": Utc::now()
+            "createdAt": Utc::now(),
+            "generation": 1
         });
         let upsert_op_id = self
             .enqueue_projection(
@@ -812,7 +817,8 @@ impl CircleService {
 
         // Persist delete intent before PDS mutation
         let projection_payload = serde_json::json!({
-            "space": space_str
+            "space": space_str,
+            "generation": 1
         });
         let op_id = self
             .enqueue_projection(
@@ -1189,34 +1195,46 @@ impl CircleService {
             .json()
             .await
             .map_err(|e| CircleError::Pds(format!("Invalid DID document JSON: {e}")))?;
-
         let services = doc
             .get("service")
             .and_then(|v| v.as_array())
             .ok_or_else(|| CircleError::InvalidRequest("DID document contains no services".into()))?;
 
+        let expected_short_space = "#atproto_space_host";
+        let expected_full_space = format!("{did}#atproto_space_host");
+        let expected_short_pds = "#atproto_pds";
+        let expected_full_pds = format!("{did}#atproto_pds");
+
+        // 1. Try exact #atproto_space_host first
         for svc in services {
             let id = svc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             let svc_type = svc.get("type").and_then(|v| v.as_str()).unwrap_or_default();
 
-            if svc_type == "AtprotoSpaceHost"
-                || svc_type == "AtprotoSpace"
-                || id.ends_with("#atproto_space_host")
-                || id.ends_with("#atproto_space")
+            if id == expected_short_space
+                || id == expected_full_space
+                || svc_type == "AtprotoSpaceHost"
             {
-                if id.starts_with('#') {
-                    return Ok(format!("{did}{id}"));
-                } else {
-                    return Ok(id.to_string());
-                }
+                return Ok(expected_full_space);
+            }
+        }
+
+        // 2. Fallback to exact #atproto_pds
+        for svc in services {
+            let id = svc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let svc_type = svc.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+
+            if id == expected_short_pds
+                || id == expected_full_pds
+                || svc_type == "AtprotoPersonalDataServer"
+            {
+                return Ok(expected_full_pds);
             }
         }
 
         Err(CircleError::InvalidRequest(
-            "No AtprotoSpaceHost service found in DID document".into(),
+            "No #atproto_space_host or #atproto_pds service found in authority DID document".into(),
         ))
     }
-
     /// Atomically claim an operation for execution: transitions 'intent' or 'failed' or expired 'executing' -> 'executing'.
     /// Resets attempts to 0, clears last_error_code, generates a fresh claim_token UUID, and sets execution_started_at to now().
     pub async fn claim_projection(&self, id: Uuid, session_id: &str) -> Result<Option<Uuid>, CircleError> {
@@ -2050,24 +2068,22 @@ impl CircleService {
             "payload": op.payload
         });
 
+        let appview_aud = &self.state.config.circle.service_did;
         let attestation = if let Some(provider) = &self.attestation_provider {
-            let appview_aud = "did:web:circles.catbird.blue#atproto_circle";
-            provider.mint(appview_aud).ok()
+            provider
+                .mint(appview_aud)
+                .map_err(|e| ProjectionDeliveryError::ClientAttestation(e.to_string()))?
         } else {
-            None
+            return Err(ProjectionDeliveryError::MissingAttestationProvider);
         };
 
-        let mut req = self
+        let req = self
             .state
             .http_client
             .post(&projection_url)
             .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(CONTENT_TYPE, "application/json");
-
-        if let Some(att) = &attestation {
-            req = req.header("X-Nest-Client-Attestation", att);
-        }
-
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-Nest-Client-Attestation", attestation);
         let resp = req
             .json(&body)
             .timeout(std::time::Duration::from_secs(5))

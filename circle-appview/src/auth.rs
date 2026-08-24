@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::AppState;
 use crate::db;
 use crate::error::{AppError, AuthReason};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
     pub did: String,
@@ -62,6 +63,7 @@ pub struct DidService {
     #[serde(rename = "serviceEndpoint")]
     pub service_endpoint: String,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationMethod {
     pub id: String,
@@ -80,6 +82,13 @@ pub struct PublicKeyJwk {
     pub x: String,
     #[serde(default)]
     pub y: Option<String>,
+    #[serde(default)]
+    pub kid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwksDocument {
+    pub keys: Vec<PublicKeyJwk>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +116,48 @@ impl ParsedVerifyingKey {
     }
 }
 
+pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, AuthReason> {
+    if jwk.kty != "EC" {
+        return Err(AuthReason::InvalidKeyType);
+    }
+
+    let x = URL_SAFE_NO_PAD
+        .decode(&jwk.x)
+        .map_err(|_| AuthReason::InvalidCoordinates)?;
+    let y_str = jwk.y.as_deref().ok_or(AuthReason::InvalidCoordinates)?;
+    let y = URL_SAFE_NO_PAD
+        .decode(y_str)
+        .map_err(|_| AuthReason::InvalidCoordinates)?;
+
+    if x.len() != 32 || y.len() != 32 {
+        return Err(AuthReason::InvalidCoordinates);
+    }
+
+    if jwk.crv.eq_ignore_ascii_case("P-256") {
+        let mut x_bytes = p256::FieldBytes::default();
+        x_bytes.copy_from_slice(&x);
+        let mut y_bytes = p256::FieldBytes::default();
+        y_bytes.copy_from_slice(&y);
+        let ep = p256::EncodedPoint::from_affine_coordinates(&x_bytes, &y_bytes, false);
+        let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&ep)
+            .map_err(|_| AuthReason::InvalidCoordinates)?;
+        return Ok(ParsedVerifyingKey::P256(vk));
+    }
+
+    if jwk.crv.eq_ignore_ascii_case("secp256k1") || jwk.crv.eq_ignore_ascii_case("P-256K") {
+        let mut x_bytes = k256::FieldBytes::default();
+        x_bytes.copy_from_slice(&x);
+        let mut y_bytes = k256::FieldBytes::default();
+        y_bytes.copy_from_slice(&y);
+        let ep = k256::EncodedPoint::from_affine_coordinates(&x_bytes, &y_bytes, false);
+        let vk = k256::ecdsa::VerifyingKey::from_encoded_point(&ep)
+            .map_err(|_| AuthReason::InvalidCoordinates)?;
+        return Ok(ParsedVerifyingKey::Secp256k1(vk));
+    }
+
+    Err(AuthReason::InvalidCurve)
+}
+
 pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifyingKey, AuthReason> {
     if let Some(multibase_str) = &vm.public_key_multibase {
         if vm.r#type != "Multikey" {
@@ -118,16 +169,16 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
 
         // P-256 multicodec prefix: 0x1200 -> varint [0x80, 0x24]
         if decoded.starts_with(&[0x80, 0x24]) {
-            let raw_key = &decoded[2..];
-            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(raw_key)
+            let key_bytes = &decoded[2..];
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes)
                 .map_err(|_| AuthReason::InvalidCoordinates)?;
             return Ok(ParsedVerifyingKey::P256(vk));
         }
 
         // Secp256k1 multicodec prefix: 0xe7 -> varint [0xe7, 0x01]
         if decoded.starts_with(&[0xe7, 0x01]) {
-            let raw_key = &decoded[2..];
-            let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(raw_key)
+            let key_bytes = &decoded[2..];
+            let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes)
                 .map_err(|_| AuthReason::InvalidCoordinates)?;
             return Ok(ParsedVerifyingKey::Secp256k1(vk));
         }
@@ -136,52 +187,10 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
     }
 
     if let Some(jwk) = &vm.public_key_jwk {
-        if vm.r#type != "JsonWebKey2020" && vm.r#type != "EcdsaSecp256k1VerificationKey2019" {
+        if vm.r#type != "JsonWebKey2020" {
             return Err(AuthReason::InvalidKeyType);
         }
-
-        if jwk.kty != "EC" {
-            return Err(AuthReason::InvalidKeyType);
-        }
-
-        let x = URL_SAFE_NO_PAD
-            .decode(&jwk.x)
-            .map_err(|_| AuthReason::InvalidCoordinates)?;
-        let y_str = jwk.y.as_deref().ok_or(AuthReason::InvalidCoordinates)?;
-        let y = URL_SAFE_NO_PAD
-            .decode(y_str)
-            .map_err(|_| AuthReason::InvalidCoordinates)?;
-
-        if x.len() != 32 || y.len() != 32 {
-            return Err(AuthReason::InvalidCoordinates);
-        }
-
-        if jwk.crv.eq_ignore_ascii_case("P-256") {
-            if vm.r#type != "JsonWebKey2020" {
-                return Err(AuthReason::InvalidKeyType);
-            }
-            let mut x_bytes = p256::FieldBytes::default();
-            x_bytes.copy_from_slice(&x);
-            let mut y_bytes = p256::FieldBytes::default();
-            y_bytes.copy_from_slice(&y);
-            let ep = p256::EncodedPoint::from_affine_coordinates(&x_bytes, &y_bytes, false);
-            let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&ep)
-                .map_err(|_| AuthReason::InvalidCoordinates)?;
-            return Ok(ParsedVerifyingKey::P256(vk));
-        }
-
-        if jwk.crv.eq_ignore_ascii_case("secp256k1") || jwk.crv.eq_ignore_ascii_case("P-256K") {
-            let mut x_bytes = k256::FieldBytes::default();
-            x_bytes.copy_from_slice(&x);
-            let mut y_bytes = k256::FieldBytes::default();
-            y_bytes.copy_from_slice(&y);
-            let ep = k256::EncodedPoint::from_affine_coordinates(&x_bytes, &y_bytes, false);
-            let vk = k256::ecdsa::VerifyingKey::from_encoded_point(&ep)
-                .map_err(|_| AuthReason::InvalidCoordinates)?;
-            return Ok(ParsedVerifyingKey::Secp256k1(vk));
-        }
-
-        return Err(AuthReason::InvalidCurve);
+        return parse_public_key_jwk(jwk);
     }
 
     Err(AuthReason::NoVerificationMethod)
@@ -288,10 +297,11 @@ impl DidWebTransport for DefaultDidWebTransport {
         })
     }
 }
+
 pub struct DidResolver {
     plc_directory_url: String,
     http_client: reqwest::Client,
-    web_transport: Arc<dyn DidWebTransport>,
+    pub web_transport: Arc<dyn DidWebTransport>,
     cache: RwLock<HashMap<String, (DidDocument, DateTime<Utc>)>>,
 }
 
@@ -325,12 +335,11 @@ impl DidResolver {
         }
     }
 
-
     pub async fn resolve(&self, did: &str) -> Result<DidDocument, AuthReason> {
         // Check in-memory cache
         if let Ok(cache) = self.cache.read() {
-            if let Some((doc, expires_at)) = cache.get(did) {
-                if *expires_at > Utc::now() {
+            if let Some((doc, exp)) = cache.get(did) {
+                if *exp > Utc::now() {
                     return Ok(doc.clone());
                 }
             }
@@ -344,7 +353,7 @@ impl DidResolver {
             return Err(AuthReason::UnsupportedDidMethod);
         };
 
-        // Cache for 1 hour
+        // Cache resolved document
         if let Ok(mut cache) = self.cache.write() {
             cache.insert(
                 did.to_string(),
@@ -445,6 +454,60 @@ impl DidResolver {
     }
 }
 
+pub async fn fetch_https_jwks(
+    resolver: &DidResolver,
+    base_url: &str,
+) -> Result<Vec<ParsedVerifyingKey>, AuthReason> {
+    let parsed = url::Url::parse(base_url).map_err(|_| AuthReason::DidResolutionFailed)?;
+    if parsed.scheme() != "https" {
+        return Err(AuthReason::SsrfBlocked);
+    }
+    let host = parsed.host_str().ok_or(AuthReason::DidResolutionFailed)?;
+    if host.is_empty() || is_localhost_hostname(host) {
+        return Err(AuthReason::SsrfBlocked);
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(&ip) {
+            return Err(AuthReason::SsrfBlocked);
+        }
+    }
+    let port = parsed.port().unwrap_or(443);
+    let addrs = resolver.web_transport.resolve_dns(host, port).await?;
+    if addrs.is_empty() {
+        return Err(AuthReason::DidResolutionFailed);
+    }
+    for addr in &addrs {
+        if is_private_ip(&addr.ip()) {
+            return Err(AuthReason::SsrfBlocked);
+        }
+    }
+    let pinned_addr = addrs[0];
+    let client = build_did_web_client(host, pinned_addr, None)?;
+    let jwks_url = format!("{}/.well-known/jwks.json", base_url.trim_end_matches('/'));
+    let resp = client
+        .get(&jwks_url)
+        .send()
+        .await
+        .map_err(|_| AuthReason::DidResolutionFailed)?;
+    if !resp.status().is_success() {
+        return Err(AuthReason::DidResolutionFailed);
+    }
+    let jwks: JwksDocument = resp
+        .json()
+        .await
+        .map_err(|_| AuthReason::DidDocumentInvalid)?;
+    let mut parsed_keys = Vec::new();
+    for jwk in &jwks.keys {
+        if let Ok(k) = parse_public_key_jwk(jwk) {
+            parsed_keys.push(k);
+        }
+    }
+    if parsed_keys.is_empty() {
+        return Err(AuthReason::NoVerificationMethod);
+    }
+    Ok(parsed_keys)
+}
+
 pub fn select_verification_method<'a>(
     doc: &'a DidDocument,
     iss: &str,
@@ -494,38 +557,37 @@ pub fn select_authority_verification_method<'a>(
     let expected_full_space = format!("{authority_did}#atproto_space");
     let expected_full_atproto = format!("{authority_did}#atproto");
 
+    // Exact dedicated key #atproto_space first, fallback to #atproto
+    let dedicated = doc.verification_method.iter().find(|vm| {
+        (vm.id == "#atproto_space" || vm.id == expected_full_space)
+            && vm.controller == authority_did
+    });
+
+    let selected = if let Some(vm) = dedicated {
+        vm
+    } else {
+        doc.verification_method
+            .iter()
+            .find(|vm| {
+                (vm.id == "#atproto" || vm.id == expected_full_atproto)
+                    && vm.controller == authority_did
+            })
+            .ok_or(AuthReason::NoVerificationMethod)?
+    };
+
     if let Some(target_kid) = kid {
-        for vm in &doc.verification_method {
-            if (vm.id == target_kid
-                || vm.id.ends_with(target_kid)
-                || (target_kid == "#atproto_space" && vm.id == expected_full_space)
-                || (target_kid == "#atproto" && vm.id == expected_full_atproto))
-                && vm.controller == authority_did
-            {
-                return Ok(vm);
-            }
+        let matches = target_kid == selected.id
+            || (target_kid == "#atproto_space" && selected.id == expected_full_space)
+            || (target_kid == "#atproto" && selected.id == expected_full_atproto)
+            || (target_kid == expected_full_space && selected.id == "#atproto_space")
+            || (target_kid == expected_full_atproto && selected.id == "#atproto");
+
+        if !matches {
+            return Err(AuthReason::InvalidKid);
         }
     }
 
-    // Look for #atproto_space first
-    for vm in &doc.verification_method {
-        if (vm.id == "#atproto_space" || vm.id == expected_full_space)
-            && vm.controller == authority_did
-        {
-            return Ok(vm);
-        }
-    }
-
-    // Fallback to #atproto
-    for vm in &doc.verification_method {
-        if (vm.id == "#atproto" || vm.id == expected_full_atproto)
-            && vm.controller == authority_did
-        {
-            return Ok(vm);
-        }
-    }
-
-    Err(AuthReason::NoVerificationMethod)
+    Ok(selected)
 }
 
 pub async fn verify_nest_client_attestation(
@@ -588,10 +650,8 @@ pub async fn verify_nest_client_attestation(
         return Err(AppError::Unauthorized(AuthReason::IdMismatch));
     }
 
-    if let Some(configured_client_id) = &state.config.nest_client_id {
-        if iss != configured_client_id {
-            return Err(AppError::Unauthorized(AuthReason::IdMismatch));
-        }
+    if iss != state.config.nest_client_id {
+        return Err(AppError::Unauthorized(AuthReason::IdMismatch));
     }
 
     if aud != expected_aud && aud != state.config.service_did {
@@ -628,7 +688,9 @@ pub async fn verify_nest_client_attestation(
     let mut verified = false;
     if !state.config.nest_verifying_keys.is_empty() {
         for key in &state.config.nest_verifying_keys {
-            if key.verify(signing_input.as_bytes(), &sig_bytes).is_ok() {
+            if matches!(key, ParsedVerifyingKey::P256(_))
+                && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
+            {
                 verified = true;
                 break;
             }
@@ -642,8 +704,22 @@ pub async fn verify_nest_client_attestation(
         let vm = select_verification_method(&doc, iss, header.kid.as_deref())
             .map_err(AppError::Unauthorized)?;
         let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
-        if key.verify(signing_input.as_bytes(), &sig_bytes).is_ok() {
+        if matches!(key, ParsedVerifyingKey::P256(_))
+            && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
+        {
             verified = true;
+        }
+    } else if iss.starts_with("https://") {
+        let keys = fetch_https_jwks(&state.did_resolver, iss)
+            .await
+            .map_err(AppError::Unauthorized)?;
+        for key in keys {
+            if matches!(key, ParsedVerifyingKey::P256(_))
+                && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
+            {
+                verified = true;
+                break;
+            }
         }
     }
 
@@ -754,6 +830,7 @@ pub async fn verify_service_jwt(
         (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
         _ => return Err(AppError::Unauthorized(AuthReason::AlgKeyMismatch)),
     }
+
     // 8. Verify cryptographic signature
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])

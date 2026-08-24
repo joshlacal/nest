@@ -15,18 +15,18 @@ use uuid::Uuid;
 
 use crate::auth::{
     is_localhost_hostname, is_private_ip, parse_verification_key,
-    select_authority_verification_method, DidDocument, JwtHeader,
+    select_authority_verification_method, DidDocument, JwtHeader, ParsedVerifyingKey,
 };
 use crate::error::{AppError, AuthReason};
 
 pub trait SpaceHostTransport: Send + Sync {
     fn get_space_credential<'a>(
         &'a self,
-        endpoint_url: &'a str,
+        target_url: &'a url::Url,
         delegation_token: &'a str,
         dpop_proof: &'a str,
         space_uri: &'a str,
-        client_attestation: Option<&'a str>,
+        client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>>;
 }
 
@@ -52,30 +52,27 @@ impl DefaultSpaceHostTransport {
 impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn get_space_credential<'a>(
         &'a self,
-        endpoint_url: &'a str,
+        target_url: &'a url::Url,
         delegation_token: &'a str,
         dpop_proof: &'a str,
         space_uri: &'a str,
-        client_attestation: Option<&'a str>,
+        client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
-        let endpoint_url = endpoint_url.to_string();
+        let target_url = target_url.clone();
         let delegation_token = delegation_token.to_string();
         let dpop_proof = dpop_proof.to_string();
         let space_uri = space_uri.to_string();
-        let client_attestation = client_attestation.map(|s| s.to_string());
+        let client_attestation = client_attestation.to_string();
         let test_cert = self.test_root_cert.clone();
 
         Box::pin(async move {
-            let parsed_url = url::Url::parse(&endpoint_url)
-                .map_err(|e| AppError::InvalidRequest(format!("Invalid Space host URL: {e}")))?;
-
-            if parsed_url.scheme() != "https" {
+            if target_url.scheme() != "https" {
                 return Err(AppError::InvalidRequest(
                     "Space host endpoint must use HTTPS".into(),
                 ));
             }
 
-            let host = parsed_url.host_str().ok_or_else(|| {
+            let host = target_url.host_str().ok_or_else(|| {
                 AppError::InvalidRequest("Missing host in Space host URL".into())
             })?;
 
@@ -89,7 +86,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 }
             }
 
-            let port = parsed_url.port().unwrap_or(443);
+            let port = target_url.port().unwrap_or(443);
 
             // DNS resolution
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
@@ -124,24 +121,17 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .build()
                 .map_err(|e| AppError::Internal(format!("Failed to build pinned HTTPS client: {e}")))?;
 
-            let mut target_url = parsed_url.clone();
-            target_url.set_path("/xrpc/com.atproto.space.getSpaceCredential");
-
-            let mut req_body = serde_json::Map::new();
-            req_body.insert("space".to_string(), serde_json::Value::String(space_uri));
-            if let Some(attestation) = client_attestation {
-                req_body.insert(
-                    "clientAttestation".to_string(),
-                    serde_json::Value::String(attestation),
-                );
-            }
+            let req_body = serde_json::json!({
+                "space": space_uri,
+                "clientAttestation": client_attestation,
+            });
 
             let response = client
                 .post(target_url.as_str())
                 .header(reqwest::header::AUTHORIZATION, format!("Bearer {delegation_token}"))
                 .header("DPoP", dpop_proof)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&serde_json::Value::Object(req_body))
+                .json(&req_body)
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
@@ -174,7 +164,7 @@ pub struct RecordedSpaceHostCall {
     pub delegation_token: String,
     pub dpop_proof: String,
     pub space_uri: String,
-    pub client_attestation: Option<String>,
+    pub client_attestation: String,
 }
 
 #[derive(Default)]
@@ -205,18 +195,18 @@ impl MockSpaceHostTransport {
 impl SpaceHostTransport for MockSpaceHostTransport {
     fn get_space_credential<'a>(
         &'a self,
-        endpoint_url: &'a str,
+        target_url: &'a url::Url,
         delegation_token: &'a str,
         dpop_proof: &'a str,
         space_uri: &'a str,
-        client_attestation: Option<&'a str>,
+        client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
         let call = RecordedSpaceHostCall {
-            endpoint_url: endpoint_url.to_string(),
+            endpoint_url: target_url.to_string(),
             delegation_token: delegation_token.to_string(),
             dpop_proof: dpop_proof.to_string(),
             space_uri: space_uri.to_string(),
-            client_attestation: client_attestation.map(|s| s.to_string()),
+            client_attestation: client_attestation.to_string(),
         };
 
         {
@@ -260,25 +250,48 @@ impl SpaceClient {
         service_endpoint: &str,
         space_uri: &str,
         delegation_token: &str,
-        client_attestation: Option<&str>,
+        client_attestation: &str,
         authority_did: &str,
         authority_doc: &DidDocument,
     ) -> Result<(String, p256::ecdsa::SigningKey, DateTime<Utc>), AppError> {
+        let parsed_endpoint = url::Url::parse(service_endpoint)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid service endpoint URL: {e}")))?;
+
+        if parsed_endpoint.scheme() != "https" {
+            return Err(AppError::InvalidRequest(
+                "Service endpoint must use HTTPS".into(),
+            ));
+        }
+        if !parsed_endpoint.username().is_empty() || parsed_endpoint.password().is_some() {
+            return Err(AppError::InvalidRequest(
+                "Service endpoint must not contain userinfo".into(),
+            ));
+        }
+        if parsed_endpoint.query().is_some() || parsed_endpoint.fragment().is_some() {
+            return Err(AppError::InvalidRequest(
+                "Service endpoint must not contain query or fragment".into(),
+            ));
+        }
+
+        let path = parsed_endpoint.path().trim_end_matches('/');
+        let xrpc_path = if path.is_empty() {
+            "/xrpc/com.atproto.space.getSpaceCredential".to_string()
+        } else {
+            format!("{path}/xrpc/com.atproto.space.getSpaceCredential")
+        };
+        let mut xrpc_url = parsed_endpoint;
+        xrpc_url.set_path(&xrpc_path);
+
         let ephemeral_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let verifying_key = ephemeral_key.verifying_key();
         let expected_jkt = calculate_rfc7638_jkt(&verifying_key);
 
-        let target_url = format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
-            service_endpoint.trim_end_matches('/')
-        );
-
-        let dpop_proof = create_dpop_proof(&ephemeral_key, "POST", &target_url);
+        let dpop_proof = create_dpop_proof(&ephemeral_key, "POST", xrpc_url.as_str());
 
         let credential_jwt = self
             .transport
             .get_space_credential(
-                service_endpoint,
+                &xrpc_url,
                 delegation_token,
                 &dpop_proof,
                 space_uri,
@@ -466,6 +479,13 @@ pub fn validate_space_credential(
     )
     .map_err(AppError::Unauthorized)?;
     let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
+
+    // Match header algorithm to parsed verification key curve
+    match (&key, header.alg.as_str()) {
+        (ParsedVerifyingKey::P256(_), "ES256") => {}
+        (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
+        _ => return Err(AppError::Unauthorized(AuthReason::AlgKeyMismatch)),
+    }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     let sig_bytes = URL_SAFE_NO_PAD

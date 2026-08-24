@@ -130,8 +130,7 @@ async fn list_notifications_handler(
 pub struct ActivateSpaceInput {
     pub space: String,
     pub delegation_token: String,
-    #[serde(default)]
-    pub client_attestation: Option<String>,
+    pub client_attestation: String,
 }
 
 async fn activate_space_handler(
@@ -141,12 +140,18 @@ async fn activate_space_handler(
 ) -> Result<Json<ActivateSpaceOutput>, AppError> {
     tracing::debug!("Handling activateSpace request");
 
+    if input.client_attestation.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Missing or empty clientAttestation".into(),
+        ));
+    }
+
     let expires_at = access::activate_space(
         &state,
         &user.did,
         &input.space,
         &input.delegation_token,
-        input.client_attestation.as_deref(),
+        &input.client_attestation,
     )
     .await?;
 
@@ -210,8 +215,8 @@ async fn sync_projections_handler(
         _ => {}
     }
 
-    // 4. Verify Nest client attestation
-    let attestation_opt = headers
+    // 4. Verify Nest client attestation (FAIL-CLOSED dual authentication)
+    let attestation = headers
         .get("x-nest-client-attestation")
         .or_else(|| headers.get("nest-attestation"))
         .and_then(|v| v.to_str().ok())
@@ -223,23 +228,20 @@ async fn sync_projections_handler(
                 .or_else(|| input.payload.get("client_attestation"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-        });
+        })
+        .ok_or(AppError::Unauthorized(AuthReason::MissingHeader))?;
 
-    if let Some(attestation) = attestation_opt {
-        auth::verify_nest_client_attestation(&state, &attestation, &state.config.service_did)
-            .await?;
-    } else if !state.config.nest_verifying_keys.is_empty()
-        || state.config.nest_client_id.is_some()
-    {
-        return Err(AppError::Unauthorized(AuthReason::MissingHeader));
-    }
+    auth::verify_nest_client_attestation(&state, &attestation, &state.config.service_did)
+        .await?;
 
     let payload_digest = projections::compute_payload_digest(
         &input.operation_id,
+        input.operation_key.as_deref(),
         &input.actor_did,
         &input.space_uri,
         &input.kind,
         &input.payload,
+        input.generation,
     );
 
     let projection = input.to_projection()?;

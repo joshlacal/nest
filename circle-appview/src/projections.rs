@@ -48,13 +48,19 @@ pub struct SyncProjectionInput {
 
 pub fn compute_payload_digest(
     operation_id: &Uuid,
+    operation_key: Option<&str>,
     actor_did: &str,
     space_uri: &str,
     kind: &str,
     payload: &serde_json::Value,
+    generation: Option<i64>,
 ) -> Vec<u8> {
     let payload_str = serde_json::to_string(payload).unwrap_or_default();
-    let data = format!("{operation_id}:{actor_did}:{space_uri}:{kind}:{payload_str}");
+    let op_key_str = operation_key.unwrap_or_default();
+    let gen_str = generation.map(|g| g.to_string()).unwrap_or_default();
+    let data = format!(
+        "{operation_id}:{op_key_str}:{actor_did}:{space_uri}:{kind}:{payload_str}:{gen_str}"
+    );
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     hasher.finalize().to_vec()
@@ -212,10 +218,18 @@ pub async fn apply_projection(
         Projection::CircleDelete { space, .. } => space.as_str(),
     };
 
-    let tombstone: Option<(String,)> = sqlx::query_as(
-        "SELECT space_uri FROM circle_tombstones WHERE space_uri = $1",
+    let target_generation = match &projection {
+        Projection::CircleUpsert { generation, .. } => *generation,
+        Projection::MemberAdd { generation, .. } => *generation,
+        Projection::MemberRemove { generation, .. } => *generation,
+        Projection::CircleDelete { generation, .. } => *generation,
+    };
+
+    let tombstone: Option<(i64,)> = sqlx::query_as(
+        "SELECT generation FROM circle_tombstones WHERE space_uri = $1 AND generation >= $2",
     )
     .bind(target_space)
+    .bind(target_generation)
     .fetch_optional(&mut *tx)
     .await
     .map_err(AppError::Database)?;
@@ -226,7 +240,7 @@ pub async fn apply_projection(
                 // Already deleted, acknowledge
             }
             _ => {
-                // Circle has been deleted; stale projection cannot resurrect it
+                // Circle has been deleted at or after this generation; stale projection cannot resurrect it
                 tx.commit().await.map_err(AppError::Database)?;
                 return Ok(());
             }
@@ -246,22 +260,56 @@ pub async fn apply_projection(
             authority,
             name,
             created_at,
-            generation: _,
+            generation,
         } => {
+            // Check if deleted tombstone exists with higher or equal generation
+            let tombstone: Option<(i64,)> = sqlx::query_as(
+                "SELECT generation FROM circle_tombstones WHERE space_uri = $1 AND generation >= $2",
+            )
+            .bind(&space)
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
+            if tombstone.is_some() {
+                tx.commit().await.map_err(AppError::Database)?;
+                return Ok(());
+            }
+
+            // Check existing circle generation
+            let existing_gen: Option<(i64,)> = sqlx::query_as(
+                "SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE",
+            )
+            .bind(&space)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
+            if let Some((prev_gen,)) = existing_gen {
+                if prev_gen >= generation {
+                    tx.commit().await.map_err(AppError::Database)?;
+                    return Ok(());
+                }
+            }
+
             sqlx::query(
                 r#"
-                INSERT INTO circles (space_uri, authority_did, display_name, created_at, deleted_at)
-                VALUES ($1, $2, $3, $4, NULL)
+                INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation, deleted_at)
+                VALUES ($1, $2, $3, $4, $5, NULL)
                 ON CONFLICT (space_uri) DO UPDATE
                 SET authority_did = EXCLUDED.authority_did,
                     display_name = EXCLUDED.display_name,
+                    generation = EXCLUDED.generation,
                     deleted_at = NULL
+                WHERE circles.generation < EXCLUDED.generation
                 "#,
             )
             .bind(&space)
             .bind(&authority)
             .bind(&name)
             .bind(created_at)
+            .bind(generation)
             .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
@@ -274,8 +322,8 @@ pub async fn apply_projection(
             let authority = extract_authority_did(&space).unwrap_or_else(|_| member.clone());
             sqlx::query(
                 r#"
-                INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-                VALUES ($1, $2, 'Circle', now())
+                INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
+                VALUES ($1, $2, 'Circle', now(), 0)
                 ON CONFLICT (space_uri) DO NOTHING
                 "#,
             )
@@ -326,8 +374,8 @@ pub async fn apply_projection(
             let authority = extract_authority_did(&space).unwrap_or_else(|_| member.clone());
             sqlx::query(
                 r#"
-                INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-                VALUES ($1, $2, 'Circle', now())
+                INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
+                VALUES ($1, $2, 'Circle', now(), 0)
                 ON CONFLICT (space_uri) DO NOTHING
                 "#,
             )
@@ -388,16 +436,17 @@ pub async fn apply_projection(
             .await
             .map_err(AppError::Database)?;
         }
-        Projection::CircleDelete { space, .. } => {
-            // 1. Insert deletion tombstone
+        Projection::CircleDelete { space, generation } => {
+            // 1. Insert deletion tombstone with generation
             sqlx::query(
                 r#"
-                INSERT INTO circle_tombstones (space_uri, deleted_at)
-                VALUES ($1, now())
-                ON CONFLICT (space_uri) DO UPDATE SET deleted_at = now()
+                INSERT INTO circle_tombstones (space_uri, generation, deleted_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (space_uri, generation) DO UPDATE SET deleted_at = now()
                 "#,
             )
             .bind(&space)
+            .bind(generation)
             .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;

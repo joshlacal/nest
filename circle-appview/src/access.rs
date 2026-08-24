@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::auth::{
     parse_verification_key, select_verification_method, DidDocument, JwtHeader,
+    ParsedVerifyingKey,
 };
 use crate::config::AppState;
 use crate::error::{AppError, AuthReason};
@@ -122,12 +123,9 @@ pub fn resolve_space_host_endpoint(
 
     // 1. Try exact #atproto_space_host first
     for svc in &doc.service {
-        if svc.id == expected_short_id
-            || svc.id == expected_full_id
-            || svc.r#type == "AtprotoSpaceHost"
-        {
+        if svc.id == expected_short_id || svc.id == expected_full_id {
             if !svc.service_endpoint.is_empty() {
-                return Ok((svc.service_endpoint.clone(), svc.id.clone()));
+                return Ok((svc.service_endpoint.clone(), expected_full_id));
             }
         }
     }
@@ -136,12 +134,9 @@ pub fn resolve_space_host_endpoint(
     let pds_full_id = format!("{authority_did}#atproto_pds");
     let pds_short_id = "#atproto_pds";
     for svc in &doc.service {
-        if svc.id == pds_short_id
-            || svc.id == pds_full_id
-            || svc.r#type == "AtprotoPersonalDataServer"
-        {
+        if svc.id == pds_short_id || svc.id == pds_full_id {
             if !svc.service_endpoint.is_empty() {
-                return Ok((svc.service_endpoint.clone(), svc.id.clone()));
+                return Ok((svc.service_endpoint.clone(), pds_full_id));
             }
         }
     }
@@ -209,16 +204,9 @@ pub fn parse_and_validate_delegation_token(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Unauthorized(AuthReason::AudienceMismatch))?;
 
-    let authority_did = extract_authority_did(expected_space_uri)?;
-    let space_host_full = format!("{authority_did}#atproto_space_host");
-    let pds_full = format!("{authority_did}#atproto_pds");
-
     let aud_matches = aud == expected_audience
-        || aud == authority_did
-        || aud == "#atproto_space_host"
-        || aud == "#atproto_pds"
-        || aud == space_host_full
-        || aud == pds_full;
+        || (expected_audience.ends_with("#atproto_space_host") && aud == "#atproto_space_host")
+        || (expected_audience.ends_with("#atproto_pds") && aud == "#atproto_pds");
 
     if !aud_matches {
         return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
@@ -254,6 +242,13 @@ pub fn parse_and_validate_delegation_token(
         .map_err(AppError::Unauthorized)?;
     let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
 
+    // Verify algorithm matches key curve
+    match (&key, header.alg.as_str()) {
+        (ParsedVerifyingKey::P256(_), "ES256") => {}
+        (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
+        _ => return Err(AppError::Unauthorized(AuthReason::AlgKeyMismatch)),
+    }
+
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
@@ -277,8 +272,14 @@ pub async fn activate_space(
     user_did: &str,
     space: &str,
     delegation_token: &str,
-    client_attestation: Option<&str>,
+    client_attestation: &str,
 ) -> Result<DateTime<Utc>, AppError> {
+    if client_attestation.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Missing or empty client attestation".into(),
+        ));
+    }
+
     // 1. Extract authority DID from space URI
     let authority_did = extract_authority_did(space)?;
 
@@ -297,7 +298,8 @@ pub async fn activate_space(
         .map_err(AppError::Unauthorized)?;
 
     // 4. Resolve #atproto_space_host service endpoint (with #atproto_pds fallback)
-    let (service_endpoint, service_id) = resolve_space_host_endpoint(&authority_doc, &authority_did)?;
+    let (service_endpoint, service_id) =
+        resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
     // 5. Parse and validate delegation token claims and signature
     parse_and_validate_delegation_token(
@@ -325,8 +327,8 @@ pub async fn activate_space(
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
 
     // Check if Circle was deleted (tombstone)
-    let tombstone: Option<(String,)> = sqlx::query_as(
-        "SELECT space_uri FROM circle_tombstones WHERE space_uri = $1",
+    let tombstone: Option<(i64,)> = sqlx::query_as(
+        "SELECT generation FROM circle_tombstones WHERE space_uri = $1",
     )
     .bind(space)
     .fetch_optional(&mut *tx)
@@ -359,8 +361,8 @@ pub async fn activate_space(
             if user_did == authority_did {
                 sqlx::query(
                     r#"
-                    INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-                    VALUES ($1, $2, 'Circle', now())
+                    INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
+                    VALUES ($1, $2, 'Circle', now(), 0)
                     ON CONFLICT (space_uri) DO NOTHING
                     "#,
                 )
@@ -400,8 +402,8 @@ pub async fn activate_space(
                 // Initial circle & active member
                 sqlx::query(
                     r#"
-                    INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-                    VALUES ($1, $2, 'Circle', now())
+                    INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
+                    VALUES ($1, $2, 'Circle', now(), 0)
                     ON CONFLICT (space_uri) DO NOTHING
                     "#,
                 )
@@ -427,13 +429,13 @@ pub async fn activate_space(
         }
     }
 
-    // Persist access lease
+    // Persist access lease with GREATEST monotonic expiry
     sqlx::query(
         r#"
         INSERT INTO access_leases (space_uri, member_did, expires_at)
         VALUES ($1, $2, $3)
         ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET expires_at = EXCLUDED.expires_at
+        DO UPDATE SET expires_at = GREATEST(access_leases.expires_at, EXCLUDED.expires_at)
         "#,
     )
     .bind(space)
@@ -445,13 +447,23 @@ pub async fn activate_space(
 
     tx.commit().await.map_err(AppError::Database)?;
 
-    // 8. Store credential in memory ONLY after successful transaction commit
-    let active_cred = ActiveSpaceCredential {
-        token: credential_jwt,
-        dpop_key,
-        expires_at,
-    };
-    state.credential_store.insert(space.to_string(), active_cred).await;
+    // 8. Verify tombstone does not exist post-commit before inserting into in-memory store
+    let post_tombstone: Option<(i64,)> = sqlx::query_as(
+        "SELECT generation FROM circle_tombstones WHERE space_uri = $1",
+    )
+    .bind(space)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    if post_tombstone.is_none() {
+        let active_cred = ActiveSpaceCredential {
+            token: credential_jwt,
+            dpop_key,
+            expires_at,
+        };
+        state.credential_store.insert(space.to_string(), active_cred).await;
+    }
 
     Ok(expires_at)
 }

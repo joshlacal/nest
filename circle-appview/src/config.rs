@@ -12,7 +12,7 @@ pub struct Config {
     pub database_url: String,
     pub service_did: String,
     pub plc_directory_url: String,
-    pub nest_client_id: Option<String>,
+    pub nest_client_id: String,
     pub nest_verifying_keys: Vec<crate::auth::ParsedVerifyingKey>,
 }
 
@@ -29,7 +29,8 @@ impl Config {
             .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circle".to_string());
         let plc_directory_url = env::var("PLC_DIRECTORY_URL")
             .unwrap_or_else(|_| "https://plc.directory".to_string());
-        let nest_client_id = env::var("NEST_CLIENT_ID").ok();
+        let nest_client_id = env::var("NEST_CLIENT_ID")
+            .unwrap_or_else(|_| "https://nest.catbird.blue".to_string());
 
         Ok(Self {
             host,
