@@ -527,9 +527,46 @@ impl<'s> Scope<'s> {
             "profile" => Self::parse_profile(suffix),
             "email" => Self::parse_email(suffix),
             "include" => Self::parse_include(suffix),
-            "space" => Ok(Scope::Space(s.into())),
+            "space" => Self::parse_space(suffix, s),
             _ => Err(ParseError::UnknownPrefix(prefix.to_string())),
         }
+    }
+
+    fn parse_space(suffix: Option<&'s str>, original: &'s str) -> Result<Self, ParseError> {
+        let suffix = suffix.ok_or(ParseError::MissingResource)?;
+        let (nsid, query) = suffix
+            .split_once('?')
+            .ok_or_else(|| ParseError::InvalidResource(original.to_string()))?;
+        Nsid::new(nsid)?;
+        if nsid.is_empty() || query.is_empty() {
+            return Err(ParseError::InvalidResource(original.to_string()));
+        }
+
+        let mut has_action = false;
+        for parameter in query.split('&') {
+            let (key, value) = parameter
+                .split_once('=')
+                .ok_or_else(|| ParseError::InvalidResource(original.to_string()))?;
+            if key.is_empty() || value.is_empty() {
+                return Err(ParseError::InvalidResource(original.to_string()));
+            }
+            match key {
+                "authority" if value == "*" || value == "self" => {}
+                "action" if matches!(value, "read" | "create" | "update" | "delete") => {
+                    has_action = true;
+                }
+                "manage" if matches!(value, "create" | "update" | "delete") => {}
+                "collection" => {
+                    Nsid::new(value)?;
+                }
+                _ if key == "action" => return Err(ParseError::InvalidAction(value.to_string())),
+                _ => return Err(ParseError::InvalidResource(key.to_string())),
+            }
+        }
+        if !has_action {
+            return Err(ParseError::InvalidAction("missing action".to_string()));
+        }
+        Ok(Scope::Space(original.into()))
     }
 
     fn parse_account(suffix: Option<&'s str>) -> Result<Self, ParseError> {
@@ -1421,6 +1458,17 @@ mod tests {
             Scope::parse("account:email?action=invalid"),
             Err(ParseError::InvalidAction(_))
         ));
+    }
+    #[test]
+    fn test_space_scope_shape_validation() {
+        assert!(Scope::parse("space").is_err());
+        assert!(Scope::parse("space:?authority=*").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?authority=*&action=bogus").is_err());
+        assert!(Scope::parse("space:blue.catbird.circle?authority=*").is_err());
+        assert!(Scope::parse(
+            "space:blue.catbird.circle?authority=*&action=read&collection=app.bsky.feed.post"
+        )
+        .is_ok());
     }
 
     #[test]

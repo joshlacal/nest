@@ -386,8 +386,19 @@ pub struct AppState {
     pub session_encryption_key: Option<[u8; 32]>,
 }
 
+fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Error> {
+    use jacquard_oauth::scopes::Scope;
+
+    for scope in scopes {
+        Scope::parse(scope)
+            .map_err(|error| anyhow::anyhow!("Invalid configured OAuth scope {scope:?}: {error:?}"))?;
+    }
+    Ok(())
+}
+
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
+        validate_configured_oauth_scopes(&config.oauth.scopes)?;
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
                 let pool = PgPoolOptions::new()
@@ -654,5 +665,16 @@ mod tests {
         let scopes = default_scopes();
         assert!(scopes.contains(&crate::models::CIRCLE_MEMBER_SCOPE.to_string()));
         assert!(scopes.contains(&crate::models::CIRCLE_OWNER_SCOPE.to_string()));
+    }
+
+    #[test]
+    fn invalid_configured_space_scope_fails_before_startup() {
+        let error = validate_configured_oauth_scopes(&["space".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("Invalid configured OAuth scope"));
+    }
+
+    #[test]
+    fn unrelated_oauth_initialization_failures_remain_degraded() {
+        assert!(validate_configured_oauth_scopes(&["atproto".to_string()]).is_ok());
     }
 }
