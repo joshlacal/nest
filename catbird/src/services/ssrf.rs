@@ -221,13 +221,33 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
         return true;
     }
 
-    // Documentation: 2001:db8::/32
+    // Deprecated Site-Local: fec0::/10 (fec0:: - feff::, RFC 3879)
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return true;
+    }
+
+    // Documentation: 2001:db8::/32 (RFC 3849)
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+
+    // Benchmarking: 2001:2::/48 (RFC 5180, RFC 8218)
+    if segments[0] == 0x2001 && segments[1] == 0x0002 {
+        return true;
+    }
+
+    // Documentation: 3fff::/20 (RFC 9637)
+    if segments[0] == 0x3fff && (segments[1] & 0xf000) == 0x0000 {
         return true;
     }
 
     // Discard-Only Address Block: 100::/64 (RFC 6666)
     if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+        return true;
+    }
+
+    // Local-Use IPv4/IPv6 Translation: 64:ff9b:1::/48 (RFC 8215)
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
         return true;
     }
 
@@ -345,6 +365,29 @@ mod tests {
 
         // IPv6 IPv4-translated: 64:ff9b::/96
         assert!(validate_pds_url("https://[64:ff9b::1]").is_err());
+
+        // IPv6 Local-Use IPv4/IPv6 Translation: 64:ff9b:1::/48 (RFC 8215)
+        assert!(validate_pds_url("https://[64:ff9b:1::]").is_err()); // start
+        assert!(validate_pds_url("https://[64:ff9b:1:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
+        assert!(validate_pds_url("https://[64:ff9b:0:1::]").is_ok()); // outside
+        assert!(validate_pds_url("https://[64:ff9b:2::]").is_ok()); // outside
+
+        // IPv6 Benchmarking: 2001:2::/48 (RFC 5180)
+        assert!(validate_pds_url("https://[2001:2::]").is_err()); // start
+        assert!(validate_pds_url("https://[2001:2:ffff:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
+        assert!(validate_pds_url("https://[2001:1:ffff:ffff:ffff:ffff:ffff:ffff]").is_ok()); // outside
+        assert!(validate_pds_url("https://[2001:3::]").is_ok()); // outside
+
+        // IPv6 Deprecated Site-Local: fec0::/10 (RFC 3879)
+        assert!(validate_pds_url("https://[fec0::]").is_err()); // start
+        assert!(validate_pds_url("https://[feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
+        assert!(validate_pds_url("https://[fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff]").is_ok()); // outside
+
+        // IPv6 Documentation: 3fff::/20 (RFC 9637)
+        assert!(validate_pds_url("https://[3fff::]").is_err()); // start
+        assert!(validate_pds_url("https://[3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff]").is_err()); // end
+        assert!(validate_pds_url("https://[3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff]").is_ok()); // outside
+        assert!(validate_pds_url("https://[3fff:1000::]").is_ok()); // outside
     }
 
     #[test]

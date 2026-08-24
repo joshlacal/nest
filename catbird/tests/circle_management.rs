@@ -489,10 +489,11 @@ async fn create_circle_initial_member_partial_failure(pool: PgPool) {
         .await;
 
     // Add Carol fails at PDS
+    // Add Carol fails with explicit non-idempotent 400 error at PDS
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.simplespace.addMember"))
         .and(wiremock::matchers::body_string_contains("did:plc:carol"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("PDS Internal Error"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Invalid Member DID"))
         .mount(&pds)
         .await;
 
@@ -1055,7 +1056,7 @@ async fn concurrent_duplicate_member_update_claims_and_never_downgrades(pool: Pg
 
     // Test conditional SQL update: attempting to set state='failed' on a delivered row must be a no-op
     let outbox_id = uuid::Uuid::parse_str(op1.id.as_str()).unwrap();
-    let _ = env.service.set_projection_state(outbox_id, catbird::models::CircleProjectionState::Failed, Some("SimulatedError")).await;
+    let _ = env.service.set_projection_state(outbox_id, catbird::models::CircleProjectionState::Failed, Some("SimulatedError"), None).await;
 
     let state_after: (String,) = sqlx::query_as(
         "SELECT state FROM circle_projection_outbox WHERE id = $1"
@@ -1600,4 +1601,262 @@ async fn circle_middleware_rebinds_every_authenticated_circle_request(pool: PgPo
     .unwrap();
 
     assert_eq!(row.0, env.session.id.to_string());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn initial_member_mutation_5xx_stays_executing_4xx_marks_failed(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    // Mount capability probe
+    env._pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/blue.catbird.circle.getCapabilities"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "enabled": true,
+            "protocolRevision": 1
+        })))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-members"
+        })))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self"
+        })))
+        .mount(&env._pds)
+        .await;
+
+    // Member 1 (bob): 503 Service Unavailable (indeterminate server error)
+    // Member 2 (carol): 400 Bad Request (explicit non-idempotent 4xx)
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:bob"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("PDS Overloaded"))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:carol"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Invalid Member DID"))
+        .mount(&env._pds)
+        .await;
+
+    let req = catbird_atproto::generated::blue_catbird::circle::create_circle::CreateCircle {
+        name: "Partial Members Circle".into(),
+        member_dids: vec![bob(), carol()],
+        extra_data: Default::default(),
+    };
+
+    let res = env.service.create_circle(&env.session, req).await;
+    assert!(res.is_ok());
+    let op = res.unwrap();
+    assert_eq!(op.status, catbird_atproto::generated::blue_catbird::circle::defs::OperationStatus::Failed);
+
+    // Verify bob (503) is in 'executing' state for future crash reconciliation / replay
+    let bob_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error_code FROM circle_projection_outbox WHERE payload->>'member' = 'did:plc:bob'"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bob_row.0, "executing");
+    assert!(bob_row.1.unwrap().contains("503"));
+
+    // Verify carol (400) is in terminal 'failed' state
+    let carol_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error_code FROM circle_projection_outbox WHERE payload->>'member' = 'did:plc:carol'"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(carol_row.0, "failed");
+    assert!(carol_row.1.unwrap().contains("400"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciliation_transitions_explicit_4xx_to_failed(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    // Enqueue stale executing MemberAdd and MemberRemove operations
+    let add_op_id = env.service
+        .enqueue_projection(
+            "did:plc:alice",
+            &env.session.id.to_string(),
+            space().as_str(),
+            catbird::models::CircleProjectionKind::MemberAdd,
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            catbird::models::CircleProjectionState::Intent,
+        )
+        .await
+        .unwrap();
+
+    let remove_op_id = env.service
+        .enqueue_projection(
+            "did:plc:alice",
+            &env.session.id.to_string(),
+            space().as_str(),
+            catbird::models::CircleProjectionKind::MemberRemove,
+            serde_json::json!({ "space": space().as_str(), "member": carol().as_str(), "generation": 1 }),
+            catbird::models::CircleProjectionState::Intent,
+        )
+        .await
+        .unwrap();
+
+    // Mark both as executing and expired 60s ago
+    sqlx::query(
+        "UPDATE circle_projection_outbox SET state = 'executing', execution_started_at = now() - interval '60 seconds' WHERE id IN ($1, $2)"
+    )
+    .bind(add_op_id)
+    .bind(remove_op_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Mock PDS to return explicit non-idempotent 400 Bad Request
+    env._pds.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Account Deactivated"))
+        .mount(&env._pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.removeMember"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("Permission Denied"))
+        .mount(&env._pds)
+        .await;
+
+    let reconciled = env.service.reconcile_stale_projections(10).await.unwrap();
+    assert_eq!(reconciled, 0);
+
+    // Verify both rows transitioned from 'executing' to 'failed' instead of remaining in 'executing' forever
+    let add_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(add_op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(add_row.0, "failed");
+    assert!(add_row.1.unwrap().contains("Account Deactivated"));
+
+    let remove_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error_code FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(remove_op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remove_row.0, "failed");
+    assert!(remove_row.1.unwrap().contains("Permission Denied"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn claim_token_fencing_prevents_stale_executor_completion_overwrite(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    let op_id = env.service
+        .enqueue_projection(
+            "did:plc:alice",
+            &env.session.id.to_string(),
+            space().as_str(),
+            catbird::models::CircleProjectionKind::MemberAdd,
+            serde_json::json!({ "space": space().as_str(), "member": bob().as_str(), "generation": 1 }),
+            catbird::models::CircleProjectionState::Intent,
+        )
+        .await
+        .unwrap();
+
+    // 1. Executor 1 claims the operation
+    let token1 = env.service.claim_projection(op_id, &env.session.id.to_string()).await.unwrap().expect("should claim");
+
+    // 2. Simulate lease expiration (30 seconds pass)
+    sqlx::query(
+        "UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds' WHERE id = $1"
+    )
+    .bind(op_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 3. Executor 2 (e.g. background reconciliation or client retry) re-claims the operation
+    let token2 = env.service.claim_projection(op_id, &env.session.id.to_string()).await.unwrap().expect("should re-claim");
+    assert_ne!(token1, token2);
+
+    // 4. Executor 1 completes with stale token1 (e.g. failed) -> must be rejected by fencing CAS
+    let updated = env.service.set_projection_state(
+        op_id,
+        catbird::models::CircleProjectionState::Failed,
+        Some("Stale executor error"),
+        Some(token1),
+    ).await.unwrap();
+    assert!(!updated, "Stale executor update must not take effect");
+
+    // State must still be executing with token2
+    let row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT state, claim_token FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "executing");
+    assert_eq!(row.1, Some(token2));
+
+    // 5. Executor 2 completes with valid token2 (e.g. pending) -> succeeds
+    let updated2 = env.service.set_projection_state(
+        op_id,
+        catbird::models::CircleProjectionState::Pending,
+        None,
+        Some(token2),
+    ).await.unwrap();
+    assert!(updated2, "Active executor update must take effect");
+
+    let final_row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT state, claim_token FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(op_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(final_row.0, "pending");
+    assert_eq!(final_row.1, None); // Cleared on completion
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_rebind_database_error_propagates_as_upstream_unavailable(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    // Drop the outbox table to force an unexpected SQL error during every-request session rebind in auth_middleware
+    sqlx::query("DROP TABLE circle_projection_outbox CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let router = catbird::routes::atproto::create_router(env.state.clone()).with_state(env.state.clone());
+    let req = axum::http::Request::builder()
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .method("GET")
+        .header("authorization", format!("Bearer {}", env.session.id))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "UpstreamUnavailable");
 }

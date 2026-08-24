@@ -247,7 +247,7 @@ pub async fn auth_middleware(
         if let Some(pool) = &state.push_db {
             let actor_did = session.did.clone();
             let session_id_str = session.id.to_string();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 r#"
                 UPDATE circle_projection_outbox
                 SET session_id = $1
@@ -259,7 +259,15 @@ pub async fn auth_middleware(
             .bind(&session_id_str)
             .bind(&actor_did)
             .execute(pool)
-            .await;
+            .await
+            {
+                tracing::error!(error = %e, actor_did = %actor_did, "Failed to rebind projection outbox session");
+                return Err(atproto_auth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UpstreamUnavailable",
+                    "Database error while rebinding session. Please retry.",
+                ));
+            }
         }
     }
 

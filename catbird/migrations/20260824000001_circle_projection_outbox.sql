@@ -16,6 +16,7 @@ CREATE TABLE circle_projection_outbox (
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error_code TEXT,
     execution_started_at TIMESTAMPTZ,
+    claim_token UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
