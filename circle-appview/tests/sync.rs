@@ -450,7 +450,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         service_did: "did:web:appview.catbird.blue".into(),
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
-        circle_media_base_url: "https://media.catbird.blue".into(),
+        circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         nest_client_id: "https://nest.catbird.blue/client-metadata.json".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: vec![],

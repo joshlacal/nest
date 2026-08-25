@@ -13,7 +13,7 @@ pub struct Config {
     pub service_did: String,
     pub plc_directory_url: String,
     pub public_appview_url: String,
-    pub circle_media_base_url: String,
+    pub circle_media_base_url: url::Url,
     pub nest_client_id: String,
     pub nest_jwks_url: String,
     pub nest_verifying_keys: Vec<crate::auth::ParsedVerifyingKey>,
@@ -34,15 +34,27 @@ impl Config {
             env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let public_appview_url =
             env::var("PUBLIC_APPVIEW_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
-        let circle_media_base_url = env::var("CIRCLE_MEDIA_BASE_URL")
+        let circle_media_base_url_raw = env::var("CIRCLE_MEDIA_BASE_URL")
             .map_err(|_| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL environment variable is required"))?;
-        let parsed_media_url = url::Url::parse(&circle_media_base_url)
+        let circle_media_base_url = url::Url::parse(&circle_media_base_url_raw)
             .map_err(|e| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must be a valid URL: {e}"))?;
-        if parsed_media_url.scheme() != "https" {
+        if circle_media_base_url.scheme() != "https" {
             return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must use https scheme"));
         }
-        if parsed_media_url.host_str().is_none() {
+        if circle_media_base_url.host_str().is_none() {
             return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must have a valid host"));
+        }
+        if !circle_media_base_url.username().is_empty() || circle_media_base_url.password().is_some() {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain userinfo"));
+        }
+        if circle_media_base_url.query().is_some() {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain query parameters"));
+        }
+        if circle_media_base_url.fragment().is_some() {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a fragment"));
+        }
+        if circle_media_base_url.path() != "" && circle_media_base_url.path() != "/" {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL path must be empty or '/'"));
         }
         let nest_client_id = env::var("NEST_CLIENT_ID")
             .map_err(|_| anyhow::anyhow!("NEST_CLIENT_ID environment variable is required"))?;

@@ -38,7 +38,7 @@ pub async fn get_post_thread(
     space_uri: &str,
     depth: Option<i64>,
     parent_height: Option<i64>,
-    media_base_url: &str,
+    media_base_url: &url::Url,
 ) -> Result<GetPostThreadOutput, AppError> {
     let depth = depth.unwrap_or(6).clamp(0, 100) as usize;
     let parent_height = parent_height.unwrap_or(80).clamp(0, 100) as usize;
@@ -495,7 +495,7 @@ pub async fn get_post_thread(
         raw_nodes: Vec<RawThreadNode>,
         profiles: &std::collections::HashMap<String, ProfileViewBasic>,
         space_uri: &str,
-        media_base_url: &str,
+        media_base_url: &url::Url,
     ) -> Result<Vec<ThreadViewPostRepliesItem>, AppError> {
         let mut items = Vec::with_capacity(raw_nodes.len());
         for node in raw_nodes {
@@ -685,15 +685,12 @@ fn fetch_replies_raw<'a>(
         .bind(*budget as i64)
         .fetch_all(pool)
         .await?;
+        let direct_count = rows.len();
+        *budget = budget.saturating_sub(direct_count);
 
-        let mut reply_nodes = Vec::with_capacity(rows.len());
+        let mut reply_nodes = Vec::with_capacity(direct_count);
 
         for row in rows {
-            if *budget == 0 {
-                break;
-            }
-            *budget -= 1;
-
             let child_uri = row.0.clone();
             let child_replies = if depth > 1 && *budget > 0 {
                 fetch_replies_raw(pool, user_did, &child_uri, space_uri, depth - 1, budget).await?

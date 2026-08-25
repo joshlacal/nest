@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+use sha2::{Digest, Sha256};
+use circle_appview::validator::{policy, validate_record, RecordCandidate, ValidationPolicy};
 const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
 const ALICE_DID: &str = "did:plc:alice-circle-owner";
 const BOB_DID: &str = "did:plc:bob-circle-member";
@@ -52,6 +54,37 @@ fn compute_record_cid(val: &serde_json::Value) -> String {
     let bytes = serde_ipld_dagcbor::to_vec(val).unwrap();
     let (_, cid_str) = create_cid_bytes_from_data(&bytes);
     cid_str
+}
+fn compute_blob_cid(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    let mut cid_bytes = Vec::with_capacity(4 + 32);
+    cid_bytes.push(0x01); // CIDv1
+    cid_bytes.push(0x55); // raw binary multicodec
+    cid_bytes.push(0x12); // sha2-256
+    cid_bytes.push(0x20); // 32-byte digest
+    cid_bytes.extend_from_slice(&digest);
+    multibase::encode(multibase::Base::Base32Lower, &cid_bytes)
+}
+
+fn validate_fixture_record(
+    uri: &str,
+    author_did: &str,
+    collection: &str,
+    rkey: &str,
+    value: &serde_json::Value,
+    policy: &ValidationPolicy,
+) {
+    let candidate = RecordCandidate {
+        uri: uri.to_string(),
+        author_did: author_did.to_string(),
+        collection: collection.to_string(),
+        rkey: rkey.to_string(),
+        value: value.clone(),
+    };
+    validate_record(&candidate, policy)
+        .expect("view test fixture record must be valid according to semantic validator");
 }
 
 async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, duration: Duration) {
@@ -101,7 +134,7 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
-        circle_media_base_url: MEDIA_BASE.into(),
+        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
@@ -691,18 +724,22 @@ async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
     let reply_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7reply");
 
     let root_json = json!({"$type": "app.bsky.feed.post", "text": "Root post", "createdAt": "2026-08-24T12:00:00.000Z"});
+    let root_cid = compute_record_cid(&root_json);
     let reply_json = json!({
         "$type": "app.bsky.feed.post",
         "text": "Reply post",
         "createdAt": "2026-08-24T12:01:00.000Z",
         "reply": {
-            "root": {"uri": root_uri, "cid": "bafyreih327rootcid"},
-            "parent": {"uri": root_uri, "cid": "bafyreih327rootcid"}
+            "root": {"uri": &root_uri, "cid": &root_cid},
+            "parent": {"uri": &root_uri, "cid": &root_cid}
         }
     });
-
-    let root_cid = compute_record_cid(&root_json);
     let reply_cid = compute_record_cid(&reply_json);
+
+    let mut val_policy = policy(ALICE_DID, vec![BOB_DID]).with_space_uri(SPACE_1);
+    val_policy.add_post(&root_uri, &root_cid);
+    validate_fixture_record(&root_uri, ALICE_DID, "app.bsky.feed.post", "3l7root", &root_json, &val_policy);
+    validate_fixture_record(&reply_uri, BOB_DID, "app.bsky.feed.post", "3l7reply", &reply_json, &val_policy);
 
     // Root post (parent_uri IS NULL)
     sqlx::query(
@@ -866,6 +903,9 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
 
     let post_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3l7imagepost");
 
+    let blob_bytes = b"jpeg test image payload 12345";
+    let blob_cid = compute_blob_cid(blob_bytes);
+
     let post_json = json!({
         "$type": "app.bsky.feed.post",
         "text": "Post with image and aspect ratio",
@@ -880,14 +920,16 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
                 },
                 "image": {
                     "$type": "blob",
-                    "ref": { "$link": "bafkreiblob12345" },
+                    "ref": { "$link": &blob_cid },
                     "mimeType": "image/jpeg",
-                    "size": 123456
+                    "size": blob_bytes.len()
                 }
             }]
         }
     });
     let cid = compute_record_cid(&post_json);
+    let val_policy = policy(ALICE_DID, vec![BOB_DID]).with_space_uri(SPACE_1);
+    validate_fixture_record(&post_uri, ALICE_DID, "app.bsky.feed.post", "3l7imagepost", &post_json, &val_policy);
 
     sqlx::query(
         r#"
@@ -923,7 +965,7 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
             assert_eq!(images_view.images.len(), 1);
             assert_eq!(images_view.images[0].alt.as_str(), "Test image alt");
             assert!(images_view.images[0].fullsize.as_str().starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
-            assert!(images_view.images[0].fullsize.as_str().contains("bafkreiblob12345"));
+            assert!(images_view.images[0].fullsize.as_str().contains(&blob_cid));
             assert!(images_view.images[0].thumb.as_str().starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
 
             let ar = images_view.images[0].aspect_ratio.as_ref().expect("Aspect ratio must be preserved");
@@ -1250,7 +1292,7 @@ async fn thread_authorization_race_during_hydration_returns_access_removed(pool:
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: format!("http://{addr}"),
-        circle_media_base_url: MEDIA_BASE.into(),
+        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
@@ -1374,7 +1416,7 @@ async fn feed_authorization_race_during_hydration_returns_access_removed(pool: P
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: format!("http://{addr}"),
-        circle_media_base_url: MEDIA_BASE.into(),
+        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
@@ -1497,7 +1539,7 @@ async fn thread_circle_epoch_generation_change_during_hydration_returns_access_r
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: format!("http://{addr}"),
-        circle_media_base_url: MEDIA_BASE.into(),
+        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
@@ -1951,4 +1993,175 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
     let max_seen = max_concurrent_seen.load(Ordering::SeqCst);
     assert!(max_seen <= 8, "Global concurrency ceiling of 8 permits must never be exceeded (saw {max_seen})");
     assert!(max_seen > 1, "Must have processed requests concurrently");
+}
+
+#[test]
+fn test_circle_media_base_url_strict_https_origin_validation() {
+    let valid_cases = [
+        "https://media.catbird.blue",
+        "https://media.catbird.blue/",
+        "https://media.catbird.blue:8443",
+        "https://media.catbird.blue:8443/",
+    ];
+    for val in valid_cases {
+        std::env::set_var("CIRCLE_MEDIA_BASE_URL", val);
+        std::env::set_var("NEST_CLIENT_ID", "https://nest.catbird.blue");
+        std::env::set_var("NEST_JWKS_URL", "https://nest.catbird.blue/.well-known/jwks.json");
+        let cfg = Config::from_env().expect("Valid HTTPS origin must be accepted");
+        assert_eq!(cfg.circle_media_base_url.scheme(), "https");
+    }
+
+    let invalid_cases = [
+        ("https://user@media.catbird.blue/", "userinfo"),
+        ("https://user:pass@media.catbird.blue", "userinfo"),
+        ("https://media.catbird.blue/?upstream=wrong", "query"),
+        ("https://media.catbird.blue/#fragment", "fragment"),
+        ("https://media.catbird.blue/some/path", "path"),
+        ("http://media.catbird.blue", "http"),
+        ("ftp://media.catbird.blue", "ftp"),
+        ("not-a-url", "malformed"),
+    ];
+    for (val, desc) in invalid_cases {
+        std::env::set_var("CIRCLE_MEDIA_BASE_URL", val);
+        std::env::set_var("NEST_CLIENT_ID", "https://nest.catbird.blue");
+        std::env::set_var("NEST_JWKS_URL", "https://nest.catbird.blue/.well-known/jwks.json");
+        let res = Config::from_env();
+        assert!(res.is_err(), "Invalid CIRCLE_MEDIA_BASE_URL ({desc}: {val}) must be rejected");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direct_siblings(pool: PgPool) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+        .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let root_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3l7advroot");
+    let root_json = json!({"$type": "app.bsky.feed.post", "text": "Root", "createdAt": "2026-08-24T12:00:00.000Z"});
+    let root_cid = compute_record_cid(&root_json);
+    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7advroot', $5, now(), now())")
+        .bind(&root_uri).bind(&root_cid).bind(SPACE_1).bind(ALICE_DID).bind(&root_json).execute(&pool).await.unwrap();
+
+    // Seed a deep + wide tree with > 600 total nodes
+    let mut total_seeded = 1; // root
+
+    // Level 1 (50 siblings)
+    for i in 1..=50 {
+        let l1_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l1_{i}");
+        let l1_json = json!({
+            "$type": "app.bsky.feed.post",
+            "text": format!("Level 1 - {i}"),
+            "createdAt": format!("2026-08-24T12:01:{i:02}.000Z"),
+            "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &root_uri, "cid": &root_cid}}
+        });
+        let l1_cid = compute_record_cid(&l1_json);
+        sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $7)")
+            .bind(&l1_uri).bind(&l1_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l1_{i}")).bind(&l1_json).bind(&root_uri).execute(&pool).await.unwrap();
+        total_seeded += 1;
+
+        // Level 2 (10 children for first 10 Level 1 nodes)
+        if i <= 10 {
+            for j in 1..=10 {
+                let l2_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l2_{i}_{j}");
+                let l2_json = json!({
+                    "$type": "app.bsky.feed.post",
+                    "text": format!("Level 2 - {i} - {j}"),
+                    "createdAt": format!("2026-08-24T12:02:{j:02}.000Z"),
+                    "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &l1_uri, "cid": &l1_cid}}
+                });
+                let l2_cid = compute_record_cid(&l2_json);
+                sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
+                    .bind(&l2_uri).bind(&l2_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l2_{i}_{j}")).bind(&l2_json).bind(&l1_uri).bind(&root_uri).execute(&pool).await.unwrap();
+                total_seeded += 1;
+
+                // Level 3 (5 children for level 2 nodes of i=1)
+                if i == 1 {
+                    for k in 1..=5 {
+                        let l3_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l3_{j}_{k}");
+                        let l3_json = json!({
+                            "$type": "app.bsky.feed.post",
+                            "text": format!("Level 3 - {j} - {k}"),
+                            "createdAt": format!("2026-08-24T12:03:{k:02}.000Z"),
+                            "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &l2_uri, "cid": &l2_cid}}
+                        });
+                        let l3_cid = compute_record_cid(&l3_json);
+                        sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
+                            .bind(&l3_uri).bind(&l3_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l3_{j}_{k}")).bind(&l3_json).bind(&l2_uri).bind(&root_uri).execute(&pool).await.unwrap();
+                        total_seeded += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Seed additional 450 deep chain nodes attached to L1_50 to exceed 600 total nodes
+    let mut chain_parent_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l1_50");
+    let mut chain_parent_cid = compute_record_cid(&json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Level 1 - 50",
+        "createdAt": "2026-08-24T12:01:50.000Z",
+        "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &root_uri, "cid": &root_cid}}
+    }));
+
+    for n in 1..=450 {
+        let chain_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_chain_{n}");
+        let chain_json = json!({
+            "$type": "app.bsky.feed.post",
+            "text": format!("Chain {n}"),
+            "createdAt": "2026-08-24T12:10:00.000Z",
+            "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &chain_parent_uri, "cid": &chain_parent_cid}}
+        });
+        let chain_cid = compute_record_cid(&chain_json);
+        sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
+            .bind(&chain_uri).bind(&chain_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_chain_{n}")).bind(&chain_json).bind(&chain_parent_uri).bind(&root_uri).execute(&pool).await.unwrap();
+        chain_parent_uri = chain_uri;
+        chain_parent_cid = chain_cid;
+        total_seeded += 1;
+    }
+
+    assert!(total_seeded > 600, "Seeded {total_seeded} nodes (must exceed 600)");
+
+    let root_std_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/3l7advroot");
+    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 10 * 1024 * 1024).await.unwrap();
+    let thread_output: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
+
+    fn count_nodes(replies: &[ThreadViewPostRepliesItem]) -> usize {
+        let mut count = 0;
+        for item in replies {
+            if let ThreadViewPostRepliesItem::ThreadViewPost(tvp) = item {
+                count += 1;
+                if let Some(child_replies) = &tvp.replies {
+                    count += count_nodes(child_replies);
+                }
+            }
+        }
+        count
+    }
+
+    let thread = &thread_output.thread;
+
+    let reply_items = thread.replies.as_ref().expect("Thread must have replies");
+    let direct_replies_count = reply_items.len();
+    let total_reply_nodes = count_nodes(reply_items);
+    let total_thread_nodes = 1 + total_reply_nodes;
+
+    // Strict assertions:
+    // 1. Total thread nodes is <= 500 (MAX_THREAD_NODES bound)
+    assert!(total_thread_nodes <= 500, "Total thread nodes {total_thread_nodes} must not exceed MAX_THREAD_NODES (500)");
+    // 2. All 50 direct level-1 siblings were retained because the direct batch was charged before recursion
+    assert_eq!(direct_replies_count, 50, "All 50 direct level 1 siblings must be retained and not starved by child recursion");
+    // 3. Child replies were populated using only leftover budget
+    assert!(total_reply_nodes > 50, "Child recursion should have consumed leftover budget");
 }

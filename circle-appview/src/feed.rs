@@ -61,7 +61,7 @@ pub fn build_post_view(
     viewer_like_uri: Option<&str>,
     space_uri: &str,
     author_profile: catbird_atproto::generated::app_bsky::actor::ProfileViewBasic,
-    media_base_url: &str,
+    media_base_url: &url::Url,
 ) -> Result<PostView, AppError> {
     let embed = if let Some(e) = record_json.get("embed") {
         let type_str = e.get("$type").and_then(|t| t.as_str());
@@ -87,9 +87,8 @@ pub fn build_post_view(
                     _ => return Err(AppError::InvalidRequest("Missing blob CID in image embed".into())),
                 };
 
-                let base = media_base_url.trim_end_matches('/');
-                let mut media_url_parsed = url::Url::parse(&format!("{base}/xrpc/blue.catbird.circle.getMedia"))
-                    .map_err(|e| AppError::Internal(format!("Invalid media base URL: {e}")))?;
+                let mut media_url_parsed = media_base_url.join("/xrpc/blue.catbird.circle.getMedia")
+                    .map_err(|e| AppError::Internal(format!("Invalid media endpoint URL: {e}")))?;
                 media_url_parsed
                     .query_pairs_mut()
                     .append_pair("space", space_uri)
@@ -182,7 +181,7 @@ pub async fn get_feed(
     space_filter: Option<&str>,
     limit: Option<i64>,
     cursor_str: Option<&str>,
-    media_base_url: &str,
+    media_base_url: &url::Url,
 ) -> Result<GetFeedOutput, AppError> {
     let limit = limit.unwrap_or(50).clamp(1, 100) as usize;
 
