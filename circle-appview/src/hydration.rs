@@ -19,6 +19,7 @@ pub struct ProfileHydrator {
     cache: Arc<RwLock<HashMap<String, CachedProfile>>>,
     http_client: reqwest::Client,
     public_appview_url: String,
+    semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ProfileHydrator {
@@ -27,14 +28,16 @@ impl ProfileHydrator {
             cache: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             public_appview_url: public_appview_url.trim_end_matches('/').to_string(),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 
     pub fn unavailable_profile(did: &str) -> ProfileViewBasic {
+        let did_val = Did::new(SmolStr::new(did)).unwrap_or_else(|_| {
+            panic!("Invalid DID format: {did}");
+        });
         ProfileViewBasic {
-            did: Did::new(SmolStr::new(did)).unwrap_or_else(|_| {
-                Did::new(SmolStr::new("did:plc:unknown")).unwrap()
-            }),
+            did: did_val,
             handle: Handle::new(SmolStr::new("handle.invalid")).unwrap(),
             display_name: None,
             avatar: None,
@@ -51,6 +54,10 @@ impl ProfileHydrator {
     }
 
     async fn fetch_remote_profile(&self, did: &str) -> ProfileViewBasic {
+        let _permit = match self.semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => return Self::unavailable_profile(did),
+        };
         let url = format!("{}/xrpc/app.bsky.actor.getProfile?actor={}", self.public_appview_url, did);
         match self.http_client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -141,21 +148,16 @@ impl ProfileHydrator {
         if to_fetch.is_empty() {
             return results;
         }
-
-        // 2. Fetch uncached with bounded concurrency 8
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+        // 2. Fetch uncached with bounded concurrency 8 using shared service semaphore
         let mut handles = Vec::with_capacity(to_fetch.len());
 
         for did in to_fetch {
-            let sem = semaphore.clone();
             let this = self.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
                 let profile = this.fetch_remote_profile(&did).await;
                 (did, profile)
             }));
         }
-
         let mut cache_entries = Vec::with_capacity(handles.len());
         for handle in handles {
             if let Ok((did, profile)) = handle.await {
@@ -183,12 +185,16 @@ impl ProfileHydrator {
     }
 
     pub async fn set_cached_profile(&self, did: &str, profile: ProfileViewBasic) {
+        self.set_cached_profile_with_time(did, profile, Instant::now()).await;
+    }
+
+    pub async fn set_cached_profile_with_time(&self, did: &str, profile: ProfileViewBasic, cached_at: Instant) {
         let mut cache = self.cache.write().await;
         cache.insert(
             did.to_string(),
             CachedProfile {
                 profile,
-                cached_at: Instant::now(),
+                cached_at,
             },
         );
     }

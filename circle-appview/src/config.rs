@@ -36,6 +36,14 @@ impl Config {
             env::var("PUBLIC_APPVIEW_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
         let circle_media_base_url = env::var("CIRCLE_MEDIA_BASE_URL")
             .map_err(|_| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL environment variable is required"))?;
+        let parsed_media_url = url::Url::parse(&circle_media_base_url)
+            .map_err(|e| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must be a valid URL: {e}"))?;
+        if parsed_media_url.scheme() != "https" {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must use https scheme"));
+        }
+        if parsed_media_url.host_str().is_none() {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must have a valid host"));
+        }
         let nest_client_id = env::var("NEST_CLIENT_ID")
             .map_err(|_| anyhow::anyhow!("NEST_CLIENT_ID environment variable is required"))?;
         let nest_jwks_url = env::var("NEST_JWKS_URL")

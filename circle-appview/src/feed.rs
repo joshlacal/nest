@@ -63,10 +63,11 @@ pub fn build_post_view(
     author_profile: catbird_atproto::generated::app_bsky::actor::ProfileViewBasic,
     media_base_url: &str,
 ) -> Result<PostView, AppError> {
-    let embed = record_json.get("embed").and_then(|e| {
-        let type_str = e.get("$type").and_then(|t| t.as_str())?;
-        if type_str == "app.bsky.embed.images" {
-            let images_val = e.get("images").and_then(|i| i.as_array())?;
+    let embed = if let Some(e) = record_json.get("embed") {
+        let type_str = e.get("$type").and_then(|t| t.as_str());
+        if type_str == Some("app.bsky.embed.images") {
+            let images_val = e.get("images").and_then(|i| i.as_array())
+                .ok_or_else(|| AppError::InvalidRequest("Invalid images embed".into()))?;
             let mut view_images = Vec::new();
             for img in images_val {
                 let alt = img.get("alt").and_then(|a| a.as_str()).unwrap_or("").to_string();
@@ -79,15 +80,24 @@ pub fn build_post_view(
                         img.get("image")
                             .and_then(|i| i.get("cid"))
                             .and_then(|c| c.as_str())
-                    })
-                    .unwrap_or("");
+                    });
+
+                let blob_cid = match blob_cid {
+                    Some(cid) if !cid.is_empty() => cid,
+                    _ => return Err(AppError::InvalidRequest("Missing blob CID in image embed".into())),
+                };
 
                 let base = media_base_url.trim_end_matches('/');
-                let media_url = format!(
-                    "{}/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
-                    base, space_uri, author_did, blob_cid
-                );
-                let uri_val = UriValue::new(SmolStr::new(&media_url)).ok()?;
+                let mut media_url_parsed = url::Url::parse(&format!("{base}/xrpc/blue.catbird.circle.getMedia"))
+                    .map_err(|e| AppError::Internal(format!("Invalid media base URL: {e}")))?;
+                media_url_parsed
+                    .query_pairs_mut()
+                    .append_pair("space", space_uri)
+                    .append_pair("did", author_did)
+                    .append_pair("cid", blob_cid);
+                let media_url = media_url_parsed.to_string();
+                let uri_val = UriValue::new(SmolStr::new(&media_url))
+                    .map_err(|e| AppError::Internal(format!("Invalid media URI: {e}")))?;
 
                 let aspect_ratio = img.get("aspectRatio").and_then(|ar| {
                     let width = ar.get("width")?.as_i64()?;
@@ -118,7 +128,9 @@ pub fn build_post_view(
         } else {
             None
         }
-    });
+    } else {
+        None
+    };
 
     let viewer = viewer_like_uri.map(|like_uri| {
         let std_like_uri = normalize_uri_to_standard_aturi(like_uri);
@@ -285,6 +297,7 @@ pub async fn get_feed(
         i64,              // like_count
         i64,              // reply_count
         Option<String>,   // viewer_like_uri
+        i64,              // circle_generation
     )> = sqlx::query_as(
         r#"
         SELECT
@@ -316,10 +329,27 @@ pub async fn get_feed(
                            ))
                              AND root.space_uri = r.space_uri
                              AND root.deleted_at IS NULL
+                             AND root.collection = 'app.bsky.feed.post'
+                       )
+                   )
+                   AND (
+                       rep.parent_uri IS NULL
+                       OR EXISTS (
+                           SELECT 1 FROM circle_records p
+                           WHERE (p.uri = rep.parent_uri OR p.uri = (
+                               CASE
+                                   WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
+                                   ELSE rep.parent_uri
+                               END
+                           ))
+                             AND p.space_uri = r.space_uri
+                             AND p.deleted_at IS NULL
+                             AND p.collection = 'app.bsky.feed.post'
                        )
                    )
              ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri,
+            c.generation AS circle_generation
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
         JOIN access_leases a ON a.space_uri = r.space_uri AND a.member_did = $1 AND a.expires_at > now()
@@ -349,8 +379,48 @@ pub async fn get_feed(
     let has_more = rows.len() > limit;
     let page_rows = if has_more { &rows[..limit] } else { &rows[..] };
 
+    let mut space_gens = std::collections::HashMap::new();
+    for row in page_rows {
+        space_gens.insert(row.2.clone(), row.12);
+    }
+    if let Some(filtered_space) = space_filter {
+        if space_gens.is_empty() {
+            let gen_row: Option<(i64,)> = sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 AND deleted_at IS NULL")
+                .bind(filtered_space)
+                .fetch_optional(pool)
+                .await?;
+            if let Some((g,)) = gen_row {
+                space_gens.insert(filtered_space.to_string(), g);
+            }
+        }
+    }
+
     let author_dids: Vec<&str> = page_rows.iter().map(|r| r.3.as_str()).collect();
     let profiles_map = hydrator.get_profiles(&author_dids).await;
+
+    // Recheck authorization and generation for all involved Spaces after profile hydration
+    for (sp, gen) in &space_gens {
+        let valid: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT 1
+            FROM circles c
+            JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $1 AND a.expires_at > now()
+            JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
+            WHERE c.space_uri = $2 AND c.generation = $3 AND c.deleted_at IS NULL
+            "#,
+        )
+        .bind(user_did)
+        .bind(sp)
+        .bind(gen)
+        .fetch_optional(pool)
+        .await?;
+
+        if valid.is_none() {
+            return Err(AppError::AccessRemoved(
+                "Access removed for this Circle".into(),
+            ));
+        }
+    }
 
     let mut feed_items = Vec::with_capacity(page_rows.len());
 
@@ -396,14 +466,15 @@ pub async fn get_feed(
             extra_data: None,
         };
 
+        let circle_space_ref = SpaceRef::new(SmolStr::new(space_uri))
+            .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
+        let circle_owner_did = Did::new(SmolStr::new(circle_owner))
+            .map_err(|e| AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}")))?;
+
         let circle_summary = CircleSummary {
-            uri: SpaceRef::new(SmolStr::new(space_uri)).unwrap_or_else(|_| {
-                SpaceRef::new(SmolStr::new(format!("at://{circle_owner}/space/blue.catbird.circle/unknown"))).unwrap()
-            }),
+            uri: circle_space_ref,
             name: SmolStr::new(circle_name),
-            owner: Did::new(SmolStr::new(circle_owner)).unwrap_or_else(|_| {
-                Did::new(SmolStr::new("did:plc:unknown")).unwrap()
-            }),
+            owner: circle_owner_did,
             access_state: AccessState::Active,
             muted: Some(circle_muted),
             extra_data: None,

@@ -44,7 +44,7 @@ pub async fn get_post_thread(
     let parent_height = parent_height.unwrap_or(80).clamp(0, 100) as usize;
 
     // 1. Verify space exists and active access lease & membership
-    let circle_row: Option<(String, String, Option<DateTime<Utc>>, Option<bool>, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    let circle_row: Option<(String, String, Option<DateTime<Utc>>, Option<bool>, Option<String>, Option<DateTime<Utc>>, i64)> = sqlx::query_as(
         r#"
         SELECT
             c.display_name,
@@ -52,7 +52,8 @@ pub async fn get_post_thread(
             c.deleted_at,
             pref.muted,
             m.status,
-            a.expires_at
+            a.expires_at,
+            c.generation
         FROM circles c
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $2
         LEFT JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $2
@@ -65,10 +66,10 @@ pub async fn get_post_thread(
     .fetch_optional(pool)
     .await?;
 
-    let (circle_name, circle_owner, circle_muted) = match circle_row {
+    let (circle_name, circle_owner, circle_muted, initial_circle_generation) = match circle_row {
         None => return Err(AppError::NotFound("Space not found".into())),
-        Some((_, _, Some(_), _, _, _)) => return Err(AppError::NotFound("Space deleted".into())),
-        Some((name, owner, None, muted, member_status, expires_at)) => {
+        Some((_, _, Some(_), _, _, _, _)) => return Err(AppError::NotFound("Space deleted".into())),
+        Some((name, owner, None, muted, member_status, expires_at, gen)) => {
             let is_active = member_status.as_deref() == Some("active");
             let has_lease = expires_at.is_some_and(|exp| exp > Utc::now());
             if !is_active || !has_lease {
@@ -76,18 +77,19 @@ pub async fn get_post_thread(
                     "No active access lease for this Circle".into(),
                 ));
             }
-            (name, owner, muted.unwrap_or(false))
+            (name, owner, muted.unwrap_or(false), gen)
         }
     };
 
+    let circle_space_ref = SpaceRef::new(SmolStr::new(space_uri))
+        .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
+    let circle_owner_did = Did::new(SmolStr::new(&circle_owner))
+        .map_err(|e| AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}")))?;
+
     let circle_summary = CircleSummary {
-        uri: SpaceRef::new(SmolStr::new(space_uri)).unwrap_or_else(|_| {
-            SpaceRef::new(SmolStr::new(format!("at://{circle_owner}/space/blue.catbird.circle/unknown"))).unwrap()
-        }),
+        uri: circle_space_ref,
         name: SmolStr::new(circle_name),
-        owner: Did::new(SmolStr::new(&circle_owner)).unwrap_or_else(|_| {
-            Did::new(SmolStr::new("did:plc:unknown")).unwrap()
-        }),
+        owner: circle_owner_did,
         access_state: AccessState::Active,
         muted: Some(circle_muted),
         extra_data: None,
@@ -144,6 +146,22 @@ pub async fn get_post_thread(
                           ))
                             AND root.space_uri = $3
                             AND root.deleted_at IS NULL
+                            AND root.collection = 'app.bsky.feed.post'
+                      )
+                  )
+                  AND (
+                      rep.parent_uri IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM circle_records p
+                          WHERE (p.uri = rep.parent_uri OR p.uri = (
+                              CASE
+                                  WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
+                                  ELSE rep.parent_uri
+                              END
+                          ))
+                            AND p.space_uri = $3
+                            AND p.deleted_at IS NULL
+                            AND p.collection = 'app.bsky.feed.post'
                       )
                   )
             ) AS reply_count,
@@ -156,6 +174,36 @@ pub async fn get_post_thread(
           AND r.space_uri = $3
           AND r.collection = 'app.bsky.feed.post'
           AND r.deleted_at IS NULL
+          AND (
+              r.root_uri IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM circle_records root
+                  WHERE (root.uri = r.root_uri OR root.uri = (
+                      CASE
+                          WHEN r.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.root_uri, '/space/', 2)
+                          ELSE r.root_uri
+                      END
+                  ))
+                    AND root.space_uri = $3
+                    AND root.deleted_at IS NULL
+                    AND root.collection = 'app.bsky.feed.post'
+              )
+          )
+          AND (
+              r.parent_uri IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM circle_records p
+                  WHERE (p.uri = r.parent_uri OR p.uri = (
+                      CASE
+                          WHEN r.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.parent_uri, '/space/', 2)
+                          ELSE r.parent_uri
+                      END
+                  ))
+                    AND p.space_uri = $3
+                    AND p.deleted_at IS NULL
+                    AND p.collection = 'app.bsky.feed.post'
+              )
+          )
         "#,
     )
     .bind(post_uri)
@@ -168,9 +216,8 @@ pub async fn get_post_thread(
     let root_data = match root_row {
         Some(r) => r,
         None => {
-            // Check if post exists vs access lost
-            let post_exists: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
-                "SELECT deleted_at FROM circle_records WHERE (uri = $1 OR uri = $2) AND space_uri = $3",
+            let post_exists: Option<(Option<DateTime<Utc>>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT deleted_at, parent_uri, root_uri FROM circle_records WHERE (uri = $1 OR uri = $2) AND space_uri = $3 AND collection = 'app.bsky.feed.post'",
             )
             .bind(post_uri)
             .bind(&alt_post_uri)
@@ -178,12 +225,37 @@ pub async fn get_post_thread(
             .fetch_optional(pool)
             .await?;
 
-            if post_exists.is_none() || post_exists.unwrap().0.is_some() {
-                return Err(AppError::NotFound("Post not found".into()));
-            } else {
-                return Err(AppError::AccessRemoved(
-                    "Access removed for this Circle".into(),
-                ));
+            match &post_exists {
+                None | Some((Some(_), _, _)) => return Err(AppError::NotFound("Post not found".into())),
+                Some((None, parent_opt, root_opt)) => {
+                    if let Some(p_u) = parent_opt {
+                        let parent_active: Option<(i32,)> = sqlx::query_as(
+                            "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE '%/space/%' THEN 'at://' || SPLIT_PART($1, '/space/', 2) ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND collection = 'app.bsky.feed.post'",
+                        )
+                        .bind(p_u)
+                        .bind(space_uri)
+                        .fetch_optional(pool)
+                        .await?;
+                        if parent_active.is_none() {
+                            return Err(AppError::NotFound("Post parent not found or deleted".into()));
+                        }
+                    }
+                    if let Some(r_u) = root_opt {
+                        let root_active: Option<(i32,)> = sqlx::query_as(
+                            "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE '%/space/%' THEN 'at://' || SPLIT_PART($1, '/space/', 2) ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND collection = 'app.bsky.feed.post'",
+                        )
+                        .bind(r_u)
+                        .bind(space_uri)
+                        .fetch_optional(pool)
+                        .await?;
+                        if root_active.is_none() {
+                            return Err(AppError::NotFound("Post root not found or deleted".into()));
+                        }
+                    }
+                    return Err(AppError::AccessRemoved(
+                        "Access removed for this Circle".into(),
+                    ));
+                }
             }
         }
     };
@@ -253,6 +325,22 @@ pub async fn get_post_thread(
                               ))
                                 AND root.space_uri = $3
                                 AND root.deleted_at IS NULL
+                                AND root.collection = 'app.bsky.feed.post'
+                          )
+                      )
+                      AND (
+                          rep.parent_uri IS NULL
+                          OR EXISTS (
+                              SELECT 1 FROM circle_records p
+                              WHERE (p.uri = rep.parent_uri OR p.uri = (
+                                  CASE
+                                      WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
+                                      ELSE rep.parent_uri
+                                  END
+                              ))
+                                AND p.space_uri = $3
+                                AND p.deleted_at IS NULL
+                                AND p.collection = 'app.bsky.feed.post'
                           )
                       )
                 ) AS reply_count,
@@ -265,6 +353,36 @@ pub async fn get_post_thread(
               AND r.space_uri = $3
               AND r.collection = 'app.bsky.feed.post'
               AND r.deleted_at IS NULL
+              AND (
+                  r.root_uri IS NULL
+                  OR EXISTS (
+                      SELECT 1 FROM circle_records root
+                      WHERE (root.uri = r.root_uri OR root.uri = (
+                          CASE
+                              WHEN r.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.root_uri, '/space/', 2)
+                              ELSE r.root_uri
+                          END
+                      ))
+                        AND root.space_uri = $3
+                        AND root.deleted_at IS NULL
+                        AND root.collection = 'app.bsky.feed.post'
+                  )
+              )
+              AND (
+                  r.parent_uri IS NULL
+                  OR EXISTS (
+                      SELECT 1 FROM circle_records p
+                      WHERE (p.uri = r.parent_uri OR p.uri = (
+                          CASE
+                              WHEN r.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.parent_uri, '/space/', 2)
+                              ELSE r.parent_uri
+                          END
+                      ))
+                        AND p.space_uri = $3
+                        AND p.deleted_at IS NULL
+                        AND p.collection = 'app.bsky.feed.post'
+                  )
+              )
             "#,
         )
         .bind(&p_uri)
@@ -329,15 +447,20 @@ pub async fn get_post_thread(
     )?;
 
     // Fold ancestors from oldest to immediate parent:
-    let mut parent_thread: Option<ThreadViewPostParent> = terminal_not_found.map(|p_uri| {
-        let std_p = normalize_uri_to_standard_aturi(&p_uri);
-        let not_found = NotFoundPost {
-            not_found: true,
-            uri: AtUri::new(SmolStr::new(std_p)).unwrap_or_else(|_| AtUri::new(SmolStr::new("at://did:plc:unknown/app.bsky.feed.post/unknown")).unwrap()),
-            extra_data: None,
-        };
-        ThreadViewPostParent::NotFoundPost(Box::new(not_found))
-    });
+    let mut parent_thread: Option<ThreadViewPostParent> = match terminal_not_found {
+        Some(p_uri) => {
+            let std_p = normalize_uri_to_standard_aturi(&p_uri);
+            let not_found_uri = AtUri::new(SmolStr::new(std_p))
+                .map_err(|e| AppError::Internal(format!("Invalid ancestor URI: {e}")))?;
+            let not_found = NotFoundPost {
+                not_found: true,
+                uri: not_found_uri,
+                extra_data: None,
+            };
+            Some(ThreadViewPostParent::NotFoundPost(Box::new(not_found)))
+        }
+        None => None,
+    };
 
     for anc in ancestors.into_iter().rev() {
         let anc_profile = profiles
@@ -415,14 +538,14 @@ pub async fn get_post_thread(
         FROM circles c
         JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $1 AND a.expires_at > now()
         JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
-        WHERE c.space_uri = $2 AND c.deleted_at IS NULL
+        WHERE c.space_uri = $2 AND c.generation = $3 AND c.deleted_at IS NULL
         "#,
     )
     .bind(user_did)
     .bind(space_uri)
+    .bind(initial_circle_generation)
     .fetch_optional(pool)
     .await?;
-
     if final_lease.is_none() {
         return Err(AppError::AccessRemoved(
             "Access removed for this Circle".into(),
@@ -489,12 +612,12 @@ fn fetch_replies_raw<'a>(
                 r.indexed_at,
                 r.parent_uri,
                 r.root_uri,
-                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
+                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = (CASE WHEN r.uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.uri, '/space/', 2) ELSE r.uri END)) AND l.space_uri = r.space_uri) AS like_count,
                 (
                     SELECT count(*)
                     FROM circle_records rep
-                    WHERE (rep.parent_uri = r.uri OR rep.parent_uri = $1 OR rep.parent_uri = $2)
-                      AND rep.space_uri = $3
+                    WHERE (rep.parent_uri = r.uri OR rep.parent_uri = (CASE WHEN r.uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.uri, '/space/', 2) ELSE r.uri END))
+                      AND rep.space_uri = r.space_uri
                       AND rep.deleted_at IS NULL
                       AND (
                           rep.root_uri IS NULL
@@ -506,12 +629,28 @@ fn fetch_replies_raw<'a>(
                                       ELSE rep.root_uri
                                   END
                               ))
-                                AND root.space_uri = $3
+                                AND root.space_uri = r.space_uri
                                 AND root.deleted_at IS NULL
+                                AND root.collection = 'app.bsky.feed.post'
+                          )
+                      )
+                      AND (
+                          rep.parent_uri IS NULL
+                          OR EXISTS (
+                              SELECT 1 FROM circle_records p
+                              WHERE (p.uri = rep.parent_uri OR p.uri = (
+                                  CASE
+                                      WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
+                                      ELSE rep.parent_uri
+                                  END
+                              ))
+                                AND p.space_uri = r.space_uri
+                                AND p.deleted_at IS NULL
+                                AND p.collection = 'app.bsky.feed.post'
                           )
                       )
                 ) AS reply_count,
-                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
+                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = (CASE WHEN r.uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.uri, '/space/', 2) ELSE r.uri END)) AND l.space_uri = r.space_uri AND l.author_did = $4) AS viewer_like_uri
             FROM circle_records r
             JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
             JOIN access_leases a ON a.space_uri = r.space_uri AND a.member_did = $4 AND a.expires_at > now()
@@ -532,15 +671,18 @@ fn fetch_replies_raw<'a>(
                       ))
                         AND root.space_uri = $3
                         AND root.deleted_at IS NULL
+                        AND root.collection = 'app.bsky.feed.post'
                   )
               )
             ORDER BY r.created_at ASC, r.uri ASC
+            LIMIT $5
             "#,
         )
         .bind(parent_uri)
         .bind(&alt_parent_uri)
         .bind(space_uri)
         .bind(user_did)
+        .bind(*budget as i64)
         .fetch_all(pool)
         .await?;
 
