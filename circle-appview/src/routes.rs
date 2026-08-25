@@ -7,11 +7,13 @@ use axum::{
 };
 use catbird_atproto::generated::blue_catbird::circle::{
     activate_space::ActivateSpaceOutput,
-    defs::AccessState,
+    defs::{AccessState, CircleSummary, SpaceRef},
     get_capabilities::GetCapabilitiesOutput,
     list_circles::{ListCircles, ListCirclesOutput},
 };
-use catbird_atproto::jacquard_common::types::string::Datetime;
+use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+use catbird_atproto::jacquard_common::types::string::{Datetime, Did};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access;
@@ -99,19 +101,102 @@ async fn get_capabilities() -> Json<GetCapabilitiesOutput> {
 
 
 async fn list_circles_handler(
-    Extension(_user): Extension<AuthenticatedUser>,
-    Query(_query): Query<ListCircles>,
-    State(_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(query): Query<ListCircles>,
+    State(state): State<AppState>,
 ) -> Result<Json<ListCirclesOutput>, AppError> {
     tracing::debug!("Handling listCircles request");
 
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::InvalidRequest(
+            "Limit must be between 1 and 100".into(),
+        ));
+    }
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        bool,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            c.space_uri,
+            c.authority_did,
+            c.display_name,
+            COALESCE(pref.muted, false) AS muted,
+            l.expires_at
+        FROM circles c
+        JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
+        LEFT JOIN access_leases l ON l.space_uri = c.space_uri AND l.member_did = $1
+        LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $1
+        WHERE c.deleted_at IS NULL
+        ORDER BY c.created_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(&user.did)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    let mut circles = Vec::with_capacity(rows.len());
+    for (space_uri, authority_did, display_name, muted, expires_at) in rows {
+        let is_owner = user.did == authority_did;
+        let members = if is_owner {
+            let member_rows: Vec<(String,)> = sqlx::query_as(
+                r#"
+                SELECT member_did
+                FROM circle_members
+                WHERE space_uri = $1 AND status = 'active'
+                ORDER BY member_did ASC
+                "#,
+            )
+            .bind(&space_uri)
+            .fetch_all(&state.db)
+            .await
+            .map_err(AppError::Database)?;
+
+            let dids = member_rows
+                .into_iter()
+                .filter_map(|(d,)| Did::new(SmolStr::new(d)).ok())
+                .collect();
+            Some(dids)
+        } else {
+            None
+        };
+
+        let now = Utc::now();
+        let access_state = match expires_at {
+            Some(exp) if exp <= now => AccessState::Expired,
+            _ => AccessState::Active,
+        };
+
+        let uri = SpaceRef::new(SmolStr::new(space_uri))
+            .map_err(|e| AppError::Internal(format!("Invalid space ref: {e}")))?;
+        let owner = Did::new(SmolStr::new(authority_did))
+            .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
+
+        circles.push(CircleSummary {
+            access_state,
+            members,
+            muted: Some(muted),
+            name: SmolStr::new(display_name),
+            owner,
+            uri,
+            extra_data: None,
+        });
+    }
+
     Ok(Json(ListCirclesOutput {
-        circles: Vec::new(),
+        circles,
         cursor: None,
         extra_data: None,
     }))
 }
-
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

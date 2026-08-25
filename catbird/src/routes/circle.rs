@@ -24,6 +24,8 @@ pub fn create_routes() -> Router<Arc<AppState>> {
         .route("/internal/circle/push", post(circle_push::handle_circle_push))
         .route("/blue.catbird.circle.listNotifications", get(circle::list_notifications))
         .route("/blue.catbird.circle.getMedia", get(circle::get_media))
+        .route("/blue.catbird.circle.getOperation", get(circle::get_operation))
+        .route("/blue.catbird.circle.retryOperation", post(circle::retry_operation))
 }
 
 /// Standalone Circle router with explicit full `/xrpc` path prefixes.
@@ -42,5 +44,7 @@ pub fn routes(state: AppState) -> Router {
         .route("/xrpc/blue.catbird.circle.getPostThread", get(circle::get_post_thread))
         .route("/xrpc/blue.catbird.circle.listNotifications", get(circle::list_notifications))
         .route("/xrpc/blue.catbird.circle.getMedia", get(circle::get_media))
+        .route("/xrpc/blue.catbird.circle.getOperation", get(circle::get_operation))
+        .route("/xrpc/blue.catbird.circle.retryOperation", post(circle::retry_operation))
         .with_state(Arc::new(state))
 }

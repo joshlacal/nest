@@ -92,6 +92,7 @@ pub async fn get_post_thread(
         owner: circle_owner_did,
         access_state: AccessState::Active,
         muted: Some(circle_muted),
+        members: None,
         extra_data: None,
     };
 

@@ -2115,3 +2115,76 @@ async fn delete_circle_advances_generation_and_audience_strictly_checks_id(pool:
     let gen = row.0.get("generation").and_then(|g| g.as_i64()).unwrap();
     assert_eq!(gen, 2);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_operation_and_retry_operation_lifecycle_and_actor_binding(pool: PgPool) {
+    let env = setup_env(pool.clone()).await;
+
+    // 1. Create a circle operation that produces an outbox row
+    let request = UpdateMember {
+        space: space(),
+        member_did: bob(),
+        action: MemberAction::Add,
+        extra_data: None,
+    };
+
+    let op = env.service.update_member(&env.session, request.clone()).await.unwrap();
+    assert_eq!(op.status, OperationStatus::Complete);
+    let op_id = op.id.as_str();
+
+    // 2. get_operation by the actor returns Complete
+    let get_op = env.service.get_operation(&env.session, op_id).await.unwrap();
+    assert_eq!(get_op.id.as_str(), op_id);
+    assert_eq!(get_op.status, OperationStatus::Complete);
+    assert_eq!(get_op.space.unwrap().as_str(), space().as_str());
+
+    // 3. get_operation by a DIFFERENT actor returns error (authorization bound)
+    let other_session = CatbirdSession {
+        id: uuid::Uuid::new_v4(),
+        did: "did:plc:other-user".into(),
+        handle: "other.bsky.social".into(),
+        pds_url: env.session.pds_url.clone(),
+        access_token: "other-token".into(),
+        refresh_token: "other-refresh".into(),
+        scopes: env.session.scopes.clone(),
+        access_token_expires_at: env.session.access_token_expires_at,
+        created_at: env.session.created_at,
+        last_used_at: env.session.last_used_at,
+    };
+    let other_res = env.service.get_operation(&other_session, op_id).await;
+    assert!(other_res.is_err(), "Other actor must not access operation");
+
+    // 4. retry_operation on delivered operation returns Complete immediately without duplicating
+    let retry_del = env.service.retry_operation(&env.session, op_id).await.unwrap();
+    assert_eq!(retry_del.status, OperationStatus::Complete);
+    assert_eq!(retry_del.id.as_str(), op_id);
+
+    // 5. Simulate a failed outbox operation
+    let failed_op_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_projection_outbox (
+            id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, created_at, updated_at
+        ) VALUES
+            ($1, 'key-failed-retry', 'did:plc:alice', $2, $3, 'member_add', '{"member":"did:plc:bob","circleGeneration":1,"memberGeneration":1}'::jsonb, 'failed', 3, now() - interval '10 seconds', 'AppViewUnavailable', now(), now())
+        "#
+    )
+    .bind(failed_op_id)
+    .bind(env.session.id.to_string())
+    .bind(space().as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // get_operation on failed op reflects Failed status and sanitized error
+    let failed_get = env.service.get_operation(&env.session, &failed_op_id.to_string()).await.unwrap();
+    assert_eq!(failed_get.status, OperationStatus::Failed);
+    assert_eq!(failed_get.error.as_deref(), Some("AppViewUnavailable"));
+
+    // retry_operation transitions back to pending/delivered (replayed) and does NOT create a new operation
+    let retry_op = env.service.retry_operation(&env.session, &failed_op_id.to_string()).await.unwrap();
+    assert_eq!(retry_op.id.as_str(), failed_op_id.to_string().as_str());
+    // Outbox count remains exactly 2 (1 original + 1 failed)
+    let total_rows: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_projection_outbox").fetch_one(&pool).await.unwrap();
+    assert_eq!(total_rows.0, 2);
+}

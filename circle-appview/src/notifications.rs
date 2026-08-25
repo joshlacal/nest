@@ -166,6 +166,7 @@ pub async fn list_notifications(
         let circle_summary = CircleSummary {
             access_state: AccessState::Active,
             muted: Some(circle_muted),
+            members: None,
             name: SmolStr::new(circle_name),
             owner: Did::new(SmolStr::new(circle_owner))
                 .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?,

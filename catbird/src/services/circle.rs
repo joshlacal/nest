@@ -1048,6 +1048,179 @@ impl CircleService {
         })
     }
 
+    /// Read-only status query for a specific Circle operation.
+    /// Binds UUID to exact authenticated actor.
+    /// Maps internal `intent` and `executing` states to `pending`.
+    /// Never exposes private payload or internal error content.
+    pub async fn get_operation(
+        &self,
+        session: &CatbirdSession,
+        operation_id_str: &str,
+    ) -> Result<Operation, CircleError> {
+        require_circle_scopes(session)
+            .map_err(|e| CircleError::NotAuthorized(e.to_string()))?;
+
+        let op_uuid = Uuid::parse_str(operation_id_str)
+            .map_err(|_| CircleError::InvalidRequest("Invalid operation UUID".into()))?;
+        let Some(pool) = &self.db else {
+            return Err(CircleError::Database("Database unavailable".into()));
+        };
+
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT state, space_uri, last_error_code
+            FROM circle_projection_outbox
+            WHERE id = $1 AND actor_did = $2
+            "#,
+        )
+        .bind(op_uuid)
+        .bind(&session.did)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| CircleError::Database(e.to_string()))?;
+
+        let (state_str, space_uri, last_error_code) = match row {
+            Some(r) => r,
+            None => {
+                return Err(CircleError::InvalidRequest("Operation not found".into()));
+            }
+        };
+
+        let space_ref = SpaceRef::new(space_uri.into()).ok();
+
+        let (status, error) = match state_str.as_str() {
+            "delivered" => (OperationStatus::Complete, None),
+            "failed" => {
+                let err_msg = last_error_code
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "OperationFailed".to_string());
+                (OperationStatus::Failed, Some(err_msg.into()))
+            }
+            _ => (OperationStatus::Pending, None),
+        };
+
+        Ok(Operation {
+            id: op_uuid.to_string().into(),
+            status,
+            space: space_ref,
+            error,
+            extra_data: None,
+        })
+    }
+
+    /// Retries an existing failed or pending operation.
+    /// Binds UUID to exact authenticated actor and rebinds session.
+    /// Never creates a new operation, never resubmits create/update/delete requests,
+    /// and replays the persisted desired state through the outbox machinery.
+    pub async fn retry_operation(
+        &self,
+        session: &CatbirdSession,
+        operation_id_str: &str,
+    ) -> Result<Operation, CircleError> {
+        require_circle_scopes(session)
+            .map_err(|e| CircleError::NotAuthorized(e.to_string()))?;
+
+        let op_uuid = Uuid::parse_str(operation_id_str)
+            .map_err(|_| CircleError::InvalidRequest("Invalid operation UUID".into()))?;
+        let Some(pool) = &self.db else {
+            return Err(CircleError::Database("Database unavailable".into()));
+        };
+
+        let row: Option<CircleProjectionOperation> = sqlx::query_as(
+            r#"
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, created_at, updated_at
+            FROM circle_projection_outbox
+            WHERE id = $1 AND actor_did = $2
+            "#,
+        )
+        .bind(op_uuid)
+        .bind(&session.did)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| CircleError::Database(e.to_string()))?;
+
+        let op = match row {
+            Some(r) => r,
+            None => {
+                return Err(CircleError::InvalidRequest("Operation not found".into()));
+            }
+        };
+
+        let space_ref = SpaceRef::new(op.space_uri.clone().into()).ok();
+
+        match op.state {
+            CircleProjectionState::Delivered => {
+                Ok(Operation {
+                    id: op_uuid.to_string().into(),
+                    status: OperationStatus::Complete,
+                    space: space_ref,
+                    error: None,
+                    extra_data: None,
+                })
+            }
+            CircleProjectionState::Pending | CircleProjectionState::Intent | CircleProjectionState::Executing => {
+                let _ = sqlx::query(
+                    "UPDATE circle_projection_outbox SET session_id = $1, next_attempt_at = now() WHERE id = $2 AND actor_did = $3"
+                )
+                .bind(session.id.to_string())
+                .bind(op_uuid)
+                .bind(&session.did)
+                .execute(pool)
+                .await;
+
+                let delivered = self.deliver_projection_by_id(op_uuid, Some(session)).await;
+                Ok(Operation {
+                    id: op_uuid.to_string().into(),
+                    status: if delivered {
+                        OperationStatus::Complete
+                    } else {
+                        OperationStatus::Pending
+                    },
+                    space: space_ref,
+                    error: None,
+                    extra_data: None,
+                })
+            }
+            CircleProjectionState::Failed => {
+                let updated = sqlx::query(
+                    r#"
+                    UPDATE circle_projection_outbox
+                    SET state = 'pending',
+                        attempts = 0,
+                        next_attempt_at = now(),
+                        claim_token = NULL,
+                        last_error_code = NULL,
+                        session_id = $1,
+                        updated_at = now()
+                    WHERE id = $2 AND actor_did = $3 AND state = 'failed'
+                    "#
+                )
+                .bind(session.id.to_string())
+                .bind(op_uuid)
+                .bind(&session.did)
+                .execute(pool)
+                .await;
+
+                if let Err(e) = updated {
+                    return Err(CircleError::Database(e.to_string()));
+                }
+
+                let delivered = self.deliver_projection_by_id(op_uuid, Some(session)).await;
+                Ok(Operation {
+                    id: op_uuid.to_string().into(),
+                    status: if delivered {
+                        OperationStatus::Complete
+                    } else {
+                        OperationStatus::Pending
+                    },
+                    space: space_ref,
+                    error: None,
+                    extra_data: None,
+                })
+            }
+        }
+    }
+
     /// Activate a Space:
     /// 1. Verifies caller has Circle member scopes.
     /// 2. Verifies Circle capability and mandatory infrastructure.

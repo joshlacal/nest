@@ -12,6 +12,7 @@ use catbird_atproto::generated::app_bsky::actor::{ProfileAssociated, ProfileView
 use catbird_atproto::generated::app_bsky::feed::{PostViewEmbed, ThreadViewPostParent, ThreadViewPostRepliesItem};
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
+use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::string::{Datetime, Did, Handle, UriValue};
 use chrono::{Duration, Utc};
@@ -2199,4 +2200,110 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
     } else {
         panic!("Expected first reply item to be a ThreadViewPost");
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_circles_owner_receives_active_member_dids_and_non_owner_omits_members(pool: PgPool) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Family Circle', now())")
+        .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    // 1. Owner query (ALICE)
+    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let alice_req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(alice_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    let circle = &list_out.circles[0];
+    assert_eq!(circle.name.as_str(), "Family Circle");
+    assert_eq!(circle.owner.as_str(), ALICE_DID);
+    let members = circle.members.as_ref().expect("Owner must receive members array");
+    assert_eq!(members.len(), 2);
+    let member_dids: Vec<&str> = members.iter().map(|d| d.as_str()).collect();
+    assert!(member_dids.contains(&ALICE_DID));
+    assert!(member_dids.contains(&BOB_DID));
+
+    // Verify raw JSON includes "members" key
+    let raw_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(raw_json["circles"][0].get("members").is_some());
+
+    // 2. Non-owner member query (BOB)
+    let bob_token = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
+    let bob_req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(bob_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    let circle = &list_out.circles[0];
+    assert_eq!(circle.name.as_str(), "Family Circle");
+    assert!(circle.members.is_none(), "Non-owner must NOT receive members array");
+
+    // Verify raw JSON omits "members" key entirely (not empty array)
+    let raw_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(raw_json["circles"][0].get("members").is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_circles_excludes_deleted_and_non_members(pool: PgPool) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    // Space 1: Active
+    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Active Space', now())")
+        .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+
+    // Space 2: Deleted
+    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, deleted_at) VALUES ($1, $2, 'Deleted Space', now(), now())")
+        .bind(SPACE_2).bind(ALICE_DID).execute(&pool).await.unwrap();
+    grant_active_member(&pool, SPACE_2, ALICE_DID, Duration::hours(1)).await;
+
+    // Query as ALICE
+    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    assert_eq!(list_out.circles[0].name.as_str(), "Active Space");
+
+    // Query as BOB (non-member of Space 1)
+    let bob_token = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 0);
 }

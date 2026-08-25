@@ -72,10 +72,16 @@ use catbird_atproto::generated::blue_catbird::circle::delete_circle::{
 use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeed;
 use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
+use catbird_atproto::generated::blue_catbird::circle::get_operation::{
+    GetOperation, GetOperationOutput,
+};
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThread;
 use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCircles;
 use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotifications;
 use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecord;
+use catbird_atproto::generated::blue_catbird::circle::retry_operation::{
+    RetryOperation, RetryOperationOutput,
+};
 use catbird_atproto::generated::blue_catbird::circle::update_member::{
     UpdateMember, UpdateMemberOutput,
 };
@@ -154,6 +160,34 @@ pub async fn delete_circle(
     let service = CircleService::new(state);
     let op = service.delete_circle(&session, input).await?;
     Ok(Json(DeleteCircleOutput {
+        value: op,
+        extra_data: None,
+    }))
+}
+
+/// GET /xrpc/blue.catbird.circle.getOperation
+pub async fn get_operation(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    XrpcQuery(params): XrpcQuery<GetOperation>,
+) -> AppResult<Json<GetOperationOutput>> {
+    let service = CircleService::new(state);
+    let op = service.get_operation(&session, params.id.as_str()).await?;
+    Ok(Json(GetOperationOutput {
+        value: op,
+        extra_data: None,
+    }))
+}
+
+/// POST /xrpc/blue.catbird.circle.retryOperation
+pub async fn retry_operation(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<CatbirdSession>,
+    XrpcJson(input): XrpcJson<RetryOperation>,
+) -> AppResult<Json<RetryOperationOutput>> {
+    let service = CircleService::new(state);
+    let op = service.retry_operation(&session, input.id.as_str()).await?;
+    Ok(Json(RetryOperationOutput {
         value: op,
         extra_data: None,
     }))

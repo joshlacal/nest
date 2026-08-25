@@ -40,11 +40,15 @@ pub fn decode_cursor(cursor_str: &str) -> Result<FeedCursor, AppError> {
 pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
     if let Some(col_idx) = uri.rfind("/app.bsky.") {
         let prefix = &uri[..col_idx];
-        if let Some(after_at) = prefix.strip_prefix("at://") {
-            let did = after_at.split('/').next().unwrap_or(after_at);
-            let rest = &uri[col_idx..];
-            return format!("at://{did}{rest}");
-        }
+        let last_segment = prefix.rsplit('/').next().unwrap_or("");
+        let did = if last_segment.starts_with("did:") {
+            last_segment
+        } else {
+            let stripped = prefix.strip_prefix("at://").unwrap_or(prefix);
+            stripped.split('/').next().unwrap_or(stripped)
+        };
+        let rest = &uri[col_idx..];
+        return format!("at://{did}{rest}");
     }
     uri.to_string()
 }
@@ -476,6 +480,7 @@ pub async fn get_feed(
             owner: circle_owner_did,
             access_state: AccessState::Active,
             muted: Some(circle_muted),
+            members: None,
             extra_data: None,
         };
 
