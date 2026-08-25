@@ -454,6 +454,11 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         nest_client_id: "https://nest.catbird.blue/client-metadata.json".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: vec![],
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: "did:web:appview.catbird.blue#atproto_circle".into(),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
 
     let did_resolver = Arc::new(DidResolver::new(

@@ -5,7 +5,7 @@ use axum::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::blue_catbird::circle::defs::{NotificationReason, ReportReason};
+use catbird_atproto::generated::blue_catbird::circle::defs::NotificationReason;
 use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
 use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordOutput;
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
@@ -35,7 +35,7 @@ const BOB_DID: &str = "did:plc:bob-privacy-member";
 const DAVE_DID: &str = "did:plc:dave-privacy-unauthorized";
 const MEDIA_BASE: &str = "https://media.catbird.blue";
 const SPACE_1: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy1";
-const SPACE_2: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy2";
+const SPACE_2: &str = "at://did:plc:dave-privacy-unauthorized/space/blue.catbird.circle/3l7privacy2";
 
 fn url_encode(input: &str) -> String {
     let mut encoded = String::new();
@@ -55,6 +55,7 @@ fn url_encode(input: &str) -> String {
 struct PrivacyTestSetup {
     app: axum::Router,
     state: AppState,
+    mock_transport: Arc<circle_appview::space_client::MockSpaceHostTransport>,
     alice_key: p256::ecdsa::SigningKey,
     bob_key: p256::ecdsa::SigningKey,
     dave_key: p256::ecdsa::SigningKey,
@@ -185,10 +186,34 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
 
-    let state = AppState::new(config, pool.clone());
+    let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
+    let space_client = Arc::new(circle_appview::space_client::SpaceClient::with_transport(mock_transport.clone()));
+    let did_resolver = Arc::new(circle_appview::auth::DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+    let credential_store = Arc::new(circle_appview::access::CredentialStore::new());
+    let space_locks = Arc::new(circle_appview::access::SpaceLockManager::new());
+    let profile_hydrator = Arc::new(circle_appview::hydration::ProfileHydrator::new(
+        config.public_appview_url.clone(),
+        reqwest::Client::new(),
+    ));
 
+    let state = AppState {
+        config: Arc::new(config),
+        db: pool.clone(),
+        http_client: reqwest::Client::new(),
+        did_resolver: did_resolver.clone(),
+        credential_store,
+        space_client,
+        space_locks,
+        profile_hydrator: profile_hydrator.clone(),
+        push_client: None,
+    };
     register_did_doc(&state.did_resolver, ALICE_DID, &alice_key, Some("https://pds.alice.test"));
     register_did_doc(&state.did_resolver, BOB_DID, &bob_key, Some("https://pds.bob.test"));
     register_did_doc(&state.did_resolver, DAVE_DID, &dave_key, Some("https://pds.dave.test"));
@@ -214,7 +239,6 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
             },
         )
         .await;
-
     state
         .profile_hydrator
         .set_cached_profile(
@@ -238,10 +262,10 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         .await;
 
     let app = create_router(state.clone());
-
     PrivacyTestSetup {
         app,
         state,
+        mock_transport,
         alice_key,
         bob_key,
         dave_key,
@@ -800,10 +824,11 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
 
     let setup = setup_privacy_test(pool.clone()).await;
 
+    // 1. Seed Space 1 and Space 2
     sqlx::query(
         r#"
         INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Logged Space', now())
+        VALUES ($1, $2, 'Logged Space 1', now())
         "#,
     )
     .bind(SPACE_1)
@@ -812,37 +837,251 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
     .await
     .unwrap();
 
-    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Logged Space 2', now())
+        "#,
+    )
+    .bind(SPACE_2)
+    .bind(DAVE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
 
-    // Perform notification listing, preferences update, and reporting
-    let alice_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.listNotifications", &setup.alice_key);
+    // 2. Grant active members/leases
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_2, DAVE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_2, BOB_DID, Duration::hours(1)).await;
+
+    // 3. Store active credentials in credential store for both spaces
+    let cred_key_1 = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred-1".into(),
+                dpop_key: cred_key_1,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    let cred_key_2 = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_2.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred-2".into(),
+                dpop_key: cred_key_2,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    // 4. Define and seed real canary fixtures
+    let canary_post_text = "Super secret private post text canary alpha";
+    let canary_blob_cid = "bafkreiblobcanary123456789";
+    let canary_post_rkey = "3l7canaryrkey";
+    let canary_post_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/{canary_post_rkey}");
+    let canary_post_at_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/{canary_post_rkey}");
+    let canary_report_details = "Private confidential report details canary 9876";
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'bafyreicanarycid1', $2, $3, 'app.bsky.feed.post', $4, $5, now())
+        "#,
+    )
+    .bind(&canary_post_uri)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(canary_post_rkey)
+    .bind(json!({
+        "$type": "app.bsky.feed.post",
+        "text": canary_post_text,
+        "createdAt": "2026-08-24T12:00:00Z",
+        "embed": {
+            "$type": "app.bsky.embed.images",
+            "images": [{
+                "image": {
+                    "$type": "blob",
+                    "ref": { "$link": canary_blob_cid },
+                    "mimeType": "image/png",
+                    "size": 10
+                },
+                "alt": "canary image alt text"
+            }]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Keep the standard AT-URI representation available for report/thread traversal.
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        SELECT $1, cid, space_uri, author_did, collection, rkey, record_json, created_at
+        FROM circle_records WHERE uri = $2
+        "#,
+    )
+    .bind(&canary_post_at_uri)
+    .bind(&canary_post_uri)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed notification in SPACE_1 for Bob from Alice
+    sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(BOB_DID)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(&canary_post_uri)
+    .bind(format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.like/3l7canarylike"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Mount mock blob response on Alice's PDS
+    let mock_image_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{canary_blob_cid}"),
+        Some("image/png".to_string()),
+        mock_image_bytes,
+    );
+
+    // 5. Exercise all endpoints through setup.app
+
+    // A. List Notifications with query parameters
+    let bob_notif_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.listNotifications", &setup.bob_key);
     let req = Request::builder()
-        .uri("/xrpc/blue.catbird.circle.listNotifications")
-        .header(header::AUTHORIZATION, format!("Bearer {alice_jwt}"))
+        .uri("/xrpc/blue.catbird.circle.listNotifications?limit=10")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_notif_jwt}"))
         .body(Body::empty())
         .unwrap();
-
     let resp = setup.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let notif_output: ListNotificationsOutput = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(notif_output.notifications.len(), 1);
 
-    let pref_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.updatePreferences", &setup.alice_key);
+    if let Some(cursor_val) = notif_output.cursor {
+        let req = Request::builder()
+            .uri(format!("/xrpc/blue.catbird.circle.listNotifications?limit=10&cursor={cursor_val}"))
+            .header(header::AUTHORIZATION, format!("Bearer {bob_notif_jwt}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = setup.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // B. Update Preferences
+    let alice_pref_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.updatePreferences", &setup.alice_key);
     let req = Request::builder()
         .method("POST")
         .uri("/xrpc/blue.catbird.circle.updatePreferences")
-        .header(header::AUTHORIZATION, format!("Bearer {pref_jwt}"))
+        .header(header::AUTHORIZATION, format!("Bearer {alice_pref_jwt}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&json!({
             "space": SPACE_1,
             "muted": true
         })).unwrap()))
         .unwrap();
-
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    if status != StatusCode::OK {
+        let b = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        panic!("updatePreferences failed with {status}: {}", String::from_utf8_lossy(&b));
+    }
+    assert_eq!(status, StatusCode::OK);
+    // C. Report Record
+    let bob_report_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.reportRecord", &setup.bob_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/blue.catbird.circle.reportRecord")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_report_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({
+            "space": SPACE_1,
+            "uri": canary_post_at_uri,
+            "reason": "spam",
+            "details": canary_report_details
+        })).unwrap()))
+        .unwrap();
     let resp = setup.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Verify captured logs are non-empty and contain zero private identifiers/canaries
+    // D. Get Media
+    let bob_media_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(ALICE_DID),
+            canary_blob_cid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_media_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // E. Get Post Thread
+    let bob_thread_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?space={}&uri={}",
+            url_encode(SPACE_1),
+            url_encode(&canary_post_at_uri)
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_thread_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // F. Get Feed on Space 1 and Space 2
+    let bob_feed_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getFeed?space={}",
+            url_encode(SPACE_1)
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_feed_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bob_feed_jwt_2 = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getFeed?space={}",
+            url_encode(SPACE_2)
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_feed_jwt_2}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 6. Verify captured logs are non-empty, contain real trace logs, and zero private canaries
     let log_output = String::from_utf8_lossy(&log_bytes.lock().unwrap()).to_string();
     assert!(!log_output.is_empty(), "Tracing subscriber should have captured log events");
+    assert!(
+        log_output.lines().count() >= 5,
+        "Tracing should have captured multiple server log events; actual lines: {}",
+        log_output.lines().count()
+    );
 
     let forbidden_canaries = [
         ALICE_DID,
@@ -850,10 +1089,14 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
         DAVE_DID,
         SPACE_1,
         SPACE_2,
-        "Super secret private post text",
-        "bafkreiblobcanary12345",
-        "at://did:plc:alice-privacy-owner/app.bsky.feed.post/3l7canary",
+        canary_post_text,
+        canary_blob_cid,
+        &canary_post_uri,
+        canary_report_details,
+        "canarycursorxyz",
         "space=at%3A%2F%2F",
+        "did=did%3Aplc%3A",
+        "cid=bafk",
     ];
 
     for canary in forbidden_canaries {
@@ -927,7 +1170,8 @@ async fn push_client_mints_valid_jwt_and_dispatches_to_nest() {
     let mock_server = MockServer::start().await;
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-    let service_did = "did:web:circles.catbird.blue#atproto_circle";
+    let service_did = "did:web:circles.catbird.blue";
+    let key_id = "did:web:circles.catbird.blue#atproto_circle";
     let audience = "https://api.catbird.blue";
 
     Mock::given(method("POST"))
@@ -943,6 +1187,7 @@ async fn push_client_mints_valid_jwt_and_dispatches_to_nest() {
     let client = NestPushClient::new(
         format!("{}/internal/circle/push", mock_server.uri()),
         service_did.to_string(),
+        key_id.to_string(),
         audience.to_string(),
         signing_key,
         reqwest::Client::new(),
@@ -950,4 +1195,147 @@ async fn push_client_mints_valid_jwt_and_dispatches_to_nest() {
 
     let delivered = client.deliver_circle_activity(BOB_DID).await.unwrap();
     assert_eq!(delivered, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool) {
+    use circle_appview::push::NestPushClient;
+    use circle_appview::sync::SyncEngine;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+    let service_did = "did:web:circles.catbird.blue";
+    let key_id = "did:web:circles.catbird.blue#atproto_circle";
+    let audience = "https://api.catbird.blue";
+
+    Mock::given(method("POST"))
+        .and(path("/internal/circle/push"))
+        .and(header("content-type", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "delivered": 1
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let push_client = Arc::new(NestPushClient::new(
+        format!("{}/internal/circle/push", mock_server.uri()),
+        service_did.to_string(),
+        key_id.to_string(),
+        audience.to_string(),
+        signing_key,
+        reqwest::Client::new(),
+    ));
+
+    let mut setup = setup_privacy_test(pool.clone()).await;
+    setup.state.push_client = Some(push_client.clone());
+
+    // Create space owned by Alice with Bob as active member
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Push Test Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred".into(),
+                dpop_key: cred_key,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    // Alice creates post P1
+    let post_rkey = "3l7postp1aaaa";
+    let post_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/{post_rkey}");
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'bafyreip1cid', $2, $3, 'app.bsky.feed.post', $4, $5, now())
+        "#,
+    )
+    .bind(&post_uri)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(post_rkey)
+    .bind(json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Alice post for reply test",
+        "createdAt": "2026-08-24T12:00:00Z"
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let reply_rkey = "3l7bbbbbbbbbb";
+    let reply_value = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Bob reply to Alice",
+        "createdAt": "2026-08-24T12:01:00Z",
+        "reply": {
+            "root": { "uri": post_uri.clone(), "cid": "bafyreip1cid" },
+            "parent": { "uri": post_uri.clone(), "cid": "bafyreip1cid" }
+        }
+    });
+    let reply_cid = circle_appview::commit::compute_dagcbor_cid(&reply_value).unwrap();
+    let rec_reply = circle_appview::commit::RepoRecord {
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: reply_rkey.to_string(),
+        cid: reply_cid,
+        value: reply_value,
+    };
+
+    let mut lthash = circle_appview::commit::LtHash::new();
+    lthash.add(&rec_reply.collection, &rec_reply.rkey, &rec_reply.cid);
+
+    let commit_bob = circle_appview::commit::mint_signed_commit(
+        SPACE_1,
+        BOB_DID,
+        "3l7aaaaaaaaaa",
+        lthash.as_bytes(),
+        &setup.bob_key,
+    );
+    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_reply]).unwrap();
+    let bob_key = format!("{SPACE_1}:{BOB_DID}");
+    setup.mock_transport.set_get_repo_response(&bob_key, car_bob);
+
+    let sync_engine = SyncEngine::new(&setup.state);
+    let sync_res = sync_engine
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.hash.as_ref()))
+        .await
+        .unwrap();
+    assert_eq!(sync_res.records_accepted, 1);
+    // Verify notification was created in DB for Alice
+    let notif_count: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM circle_notifications WHERE recipient_did = $1 AND reason = 'reply'",
+    )
+    .bind(ALICE_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(notif_count.0, 1);
+
+    // Verify Wiremock received the push trigger for Alice
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["recipient_did"], ALICE_DID);
 }

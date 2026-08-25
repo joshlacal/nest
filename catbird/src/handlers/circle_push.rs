@@ -41,10 +41,11 @@ struct ServiceAuthClaims {
 
 #[derive(Debug, Clone, Deserialize)]
 struct JwtHeader {
-    #[allow(dead_code)]
     #[serde(default)]
     typ: Option<String>,
     alg: String,
+    #[serde(default)]
+    kid: Option<String>,
 }
 
 pub async fn handle_circle_push(
@@ -92,10 +93,18 @@ async fn verify_circle_service_jwt(state: &AppState, token: &str) -> AppResult<(
     let header: JwtHeader = serde_json::from_slice(&header_bytes)
         .map_err(|_| AppError::Unauthorized("Invalid header JSON".into()))?;
 
-    if header.alg != "ES256" {
-        return Err(AppError::Unauthorized("Unsupported JWT algorithm".into()));
+    if header.typ.as_deref() != Some("JWT") {
+        return Err(AppError::Unauthorized("Invalid or missing typ header; must be 'JWT'".into()));
     }
 
+    if header.alg != "ES256" {
+        return Err(AppError::Unauthorized("Unsupported JWT algorithm; must be ES256".into()));
+    }
+
+    let kid = header.kid.as_deref().unwrap_or("").trim();
+    if kid.is_empty() {
+        return Err(AppError::Unauthorized("Missing or empty kid header".into()));
+    }
     let claims_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|_| AppError::Unauthorized("Invalid claims base64".into()))?;
@@ -143,14 +152,15 @@ async fn verify_circle_service_jwt(state: &AppState, token: &str) -> AppResult<(
         return Err(AppError::Unauthorized("Audience mismatch".into()));
     }
 
-    // Verify issuer matches configured Circle service DID
+    // Verify exact issuer and key ID match configured Circle service DID
     let circle_service_did = &state.config.circle.service_did;
-    let base_circle_did = circle_service_did.split('#').next().unwrap_or(circle_service_did);
-    if !circle_service_did.is_empty() && claims.iss != *circle_service_did && claims.iss != base_circle_did {
+    if claims.iss != *circle_service_did {
         return Err(AppError::Unauthorized("Issuer mismatch".into()));
     }
 
-    // Cryptographically verify ES256 signature using the resolved Circle AppView verifying key
+    if kid != circle_service_did {
+        return Err(AppError::Unauthorized("Key ID (kid) mismatch".into()));
+    }
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| AppError::Unauthorized("Invalid signature base64".into()))?;

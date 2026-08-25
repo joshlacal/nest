@@ -12,6 +12,7 @@ pub async fn get_feed_handler(
     Query(query): Query<GetFeed>,
     State(state): State<AppState>,
 ) -> Result<Json<GetFeedOutput>, AppError> {
+    tracing::debug!("Handling getFeed request");
     let space_filter = query.space.as_ref().map(|s| s.as_str());
     let output = crate::feed::get_feed(
         &state.db,

@@ -12,6 +12,7 @@ pub async fn get_media_handler(
     Query(query): Query<GetMedia>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
+    tracing::debug!("Handling getMedia request");
     crate::media::get_media(
         &state,
         user,

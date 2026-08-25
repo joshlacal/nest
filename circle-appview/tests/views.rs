@@ -138,6 +138,11 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
 
     let state = AppState::new(config, pool.clone());
@@ -1296,6 +1301,11 @@ async fn thread_authorization_race_during_hydration_returns_access_removed(pool:
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
 
     let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));
@@ -1420,6 +1430,11 @@ async fn feed_authorization_race_during_hydration_returns_access_removed(pool: P
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
 
     let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));
@@ -1543,6 +1558,11 @@ async fn thread_circle_epoch_generation_change_during_hydration_returns_access_r
         nest_client_id: "https://nest.catbird.blue".into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: Vec::new(),
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
 
     let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));

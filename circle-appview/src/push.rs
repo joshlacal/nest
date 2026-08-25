@@ -26,9 +26,10 @@ pub struct CirclePushResponse {
 }
 
 pub struct NestPushClient {
-    push_url: String,
-    service_did: String,
-    audience: String,
+    pub push_url: String,
+    pub service_did: String,
+    pub key_id: String,
+    pub audience: String,
     signing_key: SigningKey,
     http_client: reqwest::Client,
 }
@@ -37,6 +38,7 @@ impl NestPushClient {
     pub fn new(
         push_url: String,
         service_did: String,
+        key_id: String,
         audience: String,
         signing_key: SigningKey,
         http_client: reqwest::Client,
@@ -44,6 +46,7 @@ impl NestPushClient {
         Self {
             push_url,
             service_did,
+            key_id,
             audience,
             signing_key,
             http_client,
@@ -57,9 +60,9 @@ impl NestPushClient {
 
         let header = json!({
             "alg": "ES256",
-            "typ": "JWT"
+            "typ": "JWT",
+            "kid": self.key_id,
         });
-
         let claims = json!({
             "iss": self.service_did,
             "aud": self.audience,
@@ -98,20 +101,26 @@ impl NestPushClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to dispatch push to Nest: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!("Failed to dispatch push notification trigger to Nest: transport error");
+                AppError::Internal(format!("Failed to dispatch push to Nest: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let err_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, "Nest push endpoint returned non-success status");
             return Err(AppError::Internal(format!(
-                "Nest push endpoint returned {status}: {err_body}"
+                "Nest push endpoint returned {status}"
             )));
         }
 
         let push_resp: CirclePushResponse = resp
             .json()
             .await
-            .map_err(|e| AppError::Internal(format!("Invalid response JSON from Nest push: {e}")))?;
+            .map_err(|_| {
+                tracing::warn!("Failed to parse response JSON from Nest push");
+                AppError::Internal("Invalid response JSON from Nest push".into())
+            })?;
 
         Ok(push_resp.delivered)
     }

@@ -94,6 +94,11 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         nest_client_id: NEST_CLIENT_ID.into(),
         nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
         nest_verifying_keys: vec![nest_verifying_key],
+        nest_push_url: None,
+        nest_push_audience: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        push_signing_key_path: None,
+        push_signing_key_hex: None,
     };
     // Keys
     let alice_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);

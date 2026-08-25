@@ -18,6 +18,7 @@ pub async fn update_preferences_handler(
     State(state): State<AppState>,
     Json(input): Json<UpdatePreferences>,
 ) -> Result<Json<UpdatePreferencesOutput>, AppError> {
+    tracing::debug!("Handling updatePreferences request");
     let muted = crate::preferences::update_preferences(
         &state.db,
         &user.did,
@@ -25,7 +26,6 @@ pub async fn update_preferences_handler(
         input.muted,
     )
     .await?;
-
     Ok(Json(UpdatePreferencesOutput {
         muted,
         extra_data: None,
@@ -37,6 +37,7 @@ pub async fn report_record_handler(
     State(state): State<AppState>,
     Json(input): Json<ReportRecord>,
 ) -> Result<Json<ReportRecordOutput>, AppError> {
+    tracing::debug!("Handling reportRecord request");
     let details_ref = input.details.as_ref().map(|s| s.as_str());
     let id = crate::reports::report_record(
         &state.db,

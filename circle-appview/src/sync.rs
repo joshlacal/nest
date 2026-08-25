@@ -43,6 +43,7 @@ pub struct SyncEngine {
     credential_store: Arc<CredentialStore>,
     did_resolver: Arc<DidResolver>,
     space_locks: Arc<SpaceLockManager>,
+    push_client: Option<Arc<crate::push::NestPushClient>>,
 }
 
 enum StagedMutation {
@@ -67,6 +68,7 @@ impl SyncEngine {
             credential_store: state.credential_store.clone(),
             did_resolver: state.did_resolver.clone(),
             space_locks: state.space_locks.clone(),
+            push_client: state.push_client.clone(),
         }
     }
 
@@ -83,7 +85,13 @@ impl SyncEngine {
             credential_store,
             did_resolver,
             space_locks,
+            push_client: None,
         }
+    }
+
+    pub fn with_push_client(mut self, push_client: Arc<crate::push::NestPushClient>) -> Self {
+        self.push_client = Some(push_client);
+        self
     }
 
     pub async fn sync_repo(
@@ -378,6 +386,7 @@ impl SyncEngine {
 
         // Execute staged mutations in exact sequential order in a single transaction
         let mut tx = self.db.begin().await?;
+        let mut new_notification_recipients: HashSet<String> = HashSet::new();
 
         for mutation in staged_mutations {
             match mutation {
@@ -490,6 +499,7 @@ impl SyncEngine {
                                     .bind(&valid.uri)
                                     .execute(&mut *tx)
                                     .await?;
+                                    new_notification_recipients.insert(recipient);
                                 }
                             } else {
                                 sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
@@ -558,6 +568,7 @@ impl SyncEngine {
                                     .bind(&valid.uri)
                                     .execute(&mut *tx)
                                     .await?;
+                                    new_notification_recipients.insert(recipient);
                                 }
                             } else {
                                 sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
@@ -648,6 +659,14 @@ impl SyncEngine {
 
         tx.commit().await?;
 
+        // Dispatch generic push notifications to distinct recipients after commit
+        if let Some(push_client) = &self.push_client {
+            for recipient in &new_notification_recipients {
+                if let Err(_e) = push_client.deliver_circle_activity(recipient).await {
+                    tracing::warn!("Failed to deliver circle activity push notification: dispatch error");
+                }
+            }
+        }
         Ok(SyncResult {
             mode: SyncMode::Incremental,
             commit_verified: true,
@@ -786,12 +805,9 @@ impl SyncEngine {
         }
 
         let latest_rev = decoded_car.commit.rev.to_string();
-
-        let mut tx = self.db.begin().await?;
-
-        // Upsert all valid records and track their URIs
         let mut recovered_uris: HashSet<String> = HashSet::new();
-
+        let mut tx = self.db.begin().await?;
+        let mut new_notification_recipients: HashSet<String> = HashSet::new();
         for (valid, cid_str) in staged_valid_records {
             recovered_uris.insert(valid.uri.clone());
 
@@ -902,6 +918,7 @@ impl SyncEngine {
                             .bind(&valid.uri)
                             .execute(&mut *tx)
                             .await?;
+                            new_notification_recipients.insert(recipient);
                         }
                     } else {
                         sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
@@ -969,6 +986,7 @@ impl SyncEngine {
                             .bind(&valid.uri)
                             .execute(&mut *tx)
                             .await?;
+                            new_notification_recipients.insert(recipient);
                         }
                     } else {
                         sqlx::query("DELETE FROM circle_notifications WHERE source_uri = $1")
@@ -1070,6 +1088,14 @@ impl SyncEngine {
 
         tx.commit().await?;
 
+        // Dispatch generic push notifications to distinct recipients after commit
+        if let Some(push_client) = &self.push_client {
+            for recipient in &new_notification_recipients {
+                if let Err(_e) = push_client.deliver_circle_activity(recipient).await {
+                    tracing::warn!("Failed to deliver circle activity push notification: dispatch error");
+                }
+            }
+        }
         Ok(SyncResult {
             mode: SyncMode::FullRecovery,
             commit_verified: true,

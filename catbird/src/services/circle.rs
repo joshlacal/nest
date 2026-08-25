@@ -2394,6 +2394,15 @@ pub async fn resolve_circle_verifying_key(
     }
 
     let doc: serde_json::Value = resp.json().await?;
+
+    // Enforce exact DID document ID binding
+    let doc_id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if doc_id != base_did {
+        anyhow::bail!(
+            "DID document ID mismatch: expected '{base_did}', got '{doc_id}'"
+        );
+    }
+
     let methods = doc
         .get("verificationMethod")
         .and_then(|v| v.as_array())
@@ -2404,25 +2413,39 @@ pub async fn resolve_circle_verifying_key(
         let frag_with_hash = format!("#{frag}");
         let full_id = format!("{base_did}#{frag}");
         for vm in methods {
+            let controller = vm.get("controller").and_then(|v| v.as_str()).unwrap_or("");
+            if controller != base_did && controller != doc_id {
+                continue;
+            }
             if let Some(id_str) = vm.get("id").and_then(|v| v.as_str()) {
                 if id_str == frag
                     || id_str == frag_with_hash
                     || id_str == full_id
-                    || id_str.ends_with(&frag_with_hash)
                 {
                     selected_vm = Some(vm);
                     break;
                 }
             }
         }
+    } else {
+        for vm in methods {
+            let controller = vm.get("controller").and_then(|v| v.as_str()).unwrap_or("");
+            if controller == base_did || controller == doc_id {
+                if selected_vm.is_some() {
+                    anyhow::bail!("Multiple verification methods exist in DID document; explicit key fragment required");
+                }
+                selected_vm = Some(vm);
+            }
+        }
     }
 
-    if selected_vm.is_none() {
-        selected_vm = methods.first();
-    }
-
-    let vm = selected_vm.ok_or_else(|| anyhow::anyhow!("No matching verificationMethod found"))?;
-
+    let vm = selected_vm.ok_or_else(|| {
+        if let Some(frag) = key_fragment {
+            anyhow::anyhow!("No matching verificationMethod with id '{frag}' and controller '{base_did}' found in DID document")
+        } else {
+            anyhow::anyhow!("No verificationMethod with matching controller found in DID document")
+        }
+    })?;
     if let Some(multibase_str) = vm.get("publicKeyMultibase").and_then(|v| v.as_str()) {
         let (_base, decoded) = multibase::decode(multibase_str)
             .map_err(|e| anyhow::anyhow!("Invalid publicKeyMultibase: {e}"))?;

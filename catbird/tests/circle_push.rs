@@ -21,7 +21,10 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn mint_circle_push_jwt(
+fn mint_custom_circle_push_jwt(
+    typ: Option<&str>,
+    alg: &str,
+    kid: Option<&str>,
     iss: &str,
     aud: &str,
     lxm: &str,
@@ -30,11 +33,15 @@ fn mint_circle_push_jwt(
     let now = Utc::now().timestamp();
     let jti = Uuid::new_v4().to_string();
 
-    let header = json!({
-        "typ": "JWT",
-        "alg": "ES256",
-        "kid": format!("{iss}#atproto"),
+    let mut header = json!({
+        "alg": alg,
     });
+    if let Some(t) = typ {
+        header["typ"] = json!(t);
+    }
+    if let Some(k) = kid {
+        header["kid"] = json!(k);
+    }
 
     let claims = json!({
         "iss": iss,
@@ -53,6 +60,23 @@ fn mint_circle_push_jwt(
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     format!("{signing_input}.{sig_b64}")
+}
+
+fn mint_circle_push_jwt(
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> String {
+    mint_custom_circle_push_jwt(
+        Some("JWT"),
+        "ES256",
+        Some("did:web:circles.catbird.blue#atproto_circle"),
+        iss,
+        aud,
+        lxm,
+        signing_key,
+    )
 }
 
 async fn create_test_state(verifying_key: Option<p256::ecdsa::VerifyingKey>) -> AppState {
@@ -197,6 +221,65 @@ async fn circle_push_requires_service_auth_and_delivers_generic_payload() {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
+    // 5. Request with missing/bad typ -> 401 Unauthorized
+    let bad_typ_jwt = mint_custom_circle_push_jwt(
+        Some("JOSE"),
+        "ES256",
+        Some("did:web:circles.catbird.blue#atproto_circle"),
+        &state.config.circle.service_did,
+        &state.config.oauth.client_id,
+        "blue.catbird.circle.push",
+        &correct_signing_key,
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/internal/circle/push")
+        .header(header::AUTHORIZATION, format!("Bearer {bad_typ_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 6. Request with missing/bad kid -> 401 Unauthorized
+    let bad_kid_jwt = mint_custom_circle_push_jwt(
+        Some("JWT"),
+        "ES256",
+        Some("did:web:wrong.service#unrelated_key"),
+        &state.config.circle.service_did,
+        &state.config.oauth.client_id,
+        "blue.catbird.circle.push",
+        &correct_signing_key,
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/internal/circle/push")
+        .header(header::AUTHORIZATION, format!("Bearer {bad_kid_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 7. Request with valid service JWT and aud = client_id -> 200 OK
+    let valid_client_id_jwt = mint_circle_push_jwt(
+        &state.config.circle.service_did,
+        &state.config.oauth.client_id,
+        "blue.catbird.circle.push",
+        &correct_signing_key,
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/internal/circle/push")
+        .header(header::AUTHORIZATION, format!("Bearer {valid_client_id_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -204,7 +287,7 @@ async fn circle_push_requires_service_auth_and_delivers_generic_payload() {
     let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
     assert_eq!(resp_json["status"], "ok");
 
-    // 6. Request with valid service JWT and aud = push.service_did -> 200 OK
+    // 8. Request with valid service JWT and aud = push.service_did -> 200 OK
     let valid_push_did_jwt = mint_circle_push_jwt(
         &state.config.circle.service_did,
         state.config.push.service_did.as_ref().unwrap(),
@@ -241,12 +324,17 @@ async fn resolve_circle_verifying_key_from_wiremock_did_doc() {
     multikey_bytes.extend_from_slice(sec1.as_bytes());
     let multikey_str = multibase::encode(multibase::Base::Base58Btc, &multikey_bytes);
 
+    let host = mock_server.address().ip().to_string();
+    let port = mock_server.address().port();
+    let base_did = format!("did:web:{host}%3A{port}");
+    let test_did = format!("{base_did}#atproto_circle");
+
     let did_doc = json!({
-        "id": "did:web:circles.catbird.blue",
+        "id": base_did,
         "verificationMethod": [{
-            "id": "did:web:circles.catbird.blue#atproto_circle",
+            "id": format!("{base_did}#atproto_circle"),
             "type": "Multikey",
-            "controller": "did:web:circles.catbird.blue",
+            "controller": base_did,
             "publicKeyMultibase": multikey_str
         }]
     });
@@ -256,10 +344,6 @@ async fn resolve_circle_verifying_key_from_wiremock_did_doc() {
         .respond_with(ResponseTemplate::new(200).set_body_json(did_doc))
         .mount(&mock_server)
         .await;
-
-    let host = mock_server.address().ip().to_string();
-    let port = mock_server.address().port();
-    let test_did = format!("did:web:{host}%3A{port}#atproto_circle");
 
     let resolved_vk = catbird::services::circle::resolve_circle_verifying_key(&test_did, None)
         .await
@@ -280,12 +364,17 @@ async fn resolve_circle_verifying_key_from_wiremock_jwk_did_doc() {
     let x_b64 = URL_SAFE_NO_PAD.encode(encoded_point.x().unwrap());
     let y_b64 = URL_SAFE_NO_PAD.encode(encoded_point.y().unwrap());
 
+    let host = mock_server.address().ip().to_string();
+    let port = mock_server.address().port();
+    let base_did = format!("did:web:{host}%3A{port}");
+    let test_did = format!("{base_did}#atproto_circle");
+
     let did_doc = json!({
-        "id": "did:web:circles.catbird.blue",
+        "id": base_did,
         "verificationMethod": [{
-            "id": "did:web:circles.catbird.blue#atproto_circle",
+            "id": format!("{base_did}#atproto_circle"),
             "type": "JsonWebKey2020",
-            "controller": "did:web:circles.catbird.blue",
+            "controller": base_did,
             "publicKeyJwk": {
                 "kty": "EC",
                 "crv": "P-256",
@@ -301,13 +390,154 @@ async fn resolve_circle_verifying_key_from_wiremock_jwk_did_doc() {
         .mount(&mock_server)
         .await;
 
-    let host = mock_server.address().ip().to_string();
-    let port = mock_server.address().port();
-    let test_did = format!("did:web:{host}%3A{port}#atproto_circle");
-
     let resolved_vk = catbird::services::circle::resolve_circle_verifying_key(&test_did, None)
         .await
         .unwrap();
 
     assert_eq!(resolved_vk.to_encoded_point(false), vk.to_encoded_point(false));
+}
+
+#[tokio::test]
+async fn resolve_circle_verifying_key_rejects_mismatched_did_doc_id() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let vk = signing_key.verifying_key();
+    let sec1 = vk.to_encoded_point(true);
+
+    let mut multikey_bytes = vec![0x80, 0x24];
+    multikey_bytes.extend_from_slice(sec1.as_bytes());
+    let multikey_str = multibase::encode(multibase::Base::Base58Btc, &multikey_bytes);
+
+    let host = mock_server.address().ip().to_string();
+    let port = mock_server.address().port();
+    let base_did = format!("did:web:{host}%3A{port}");
+    let test_did = format!("{base_did}#atproto_circle");
+
+    // Serve a document with a DIFFERENT id
+    let did_doc = json!({
+        "id": "did:web:attacker.controlled.blue",
+        "verificationMethod": [{
+            "id": "did:web:attacker.controlled.blue#atproto_circle",
+            "type": "Multikey",
+            "controller": "did:web:attacker.controlled.blue",
+            "publicKeyMultibase": multikey_str
+        }]
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/did.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(did_doc))
+        .mount(&mock_server)
+        .await;
+
+    let res = catbird::services::circle::resolve_circle_verifying_key(&test_did, None).await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("DID document ID mismatch"));
+}
+
+#[tokio::test]
+async fn resolve_circle_verifying_key_multi_key_and_no_fallback() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let signing_key_1 = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let vk_1 = signing_key_1.verifying_key();
+    let sec1_1 = vk_1.to_encoded_point(true);
+    let mut multikey_1 = vec![0x80, 0x24];
+    multikey_1.extend_from_slice(sec1_1.as_bytes());
+    let multikey_str_1 = multibase::encode(multibase::Base::Base58Btc, &multikey_1);
+
+    let signing_key_2 = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let vk_2 = signing_key_2.verifying_key();
+    let sec1_2 = vk_2.to_encoded_point(true);
+    let mut multikey_2 = vec![0x80, 0x24];
+    multikey_2.extend_from_slice(sec1_2.as_bytes());
+    let multikey_str_2 = multibase::encode(multibase::Base::Base58Btc, &multikey_2);
+
+    let host = mock_server.address().ip().to_string();
+    let port = mock_server.address().port();
+    let base_did = format!("did:web:{host}%3A{port}");
+
+    let did_doc = json!({
+        "id": base_did,
+        "verificationMethod": [
+            {
+                "id": format!("{base_did}#key-1"),
+                "type": "Multikey",
+                "controller": base_did,
+                "publicKeyMultibase": multikey_str_1
+            },
+            {
+                "id": format!("{base_did}#atproto_circle"),
+                "type": "Multikey",
+                "controller": base_did,
+                "publicKeyMultibase": multikey_str_2
+            }
+        ]
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/did.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(did_doc))
+        .mount(&mock_server)
+        .await;
+
+    // 1. Resolve exact key 2 -> returns key 2 (not first key!)
+    let test_did_2 = format!("{base_did}#atproto_circle");
+    let resolved_vk_2 = catbird::services::circle::resolve_circle_verifying_key(&test_did_2, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved_vk_2.to_encoded_point(false), vk_2.to_encoded_point(false));
+    assert_ne!(resolved_vk_2.to_encoded_point(false), vk_1.to_encoded_point(false));
+
+    // 2. Resolve nonexistent key fragment -> fails with error (NO silent fallback to first key!)
+    let test_did_bad = format!("{base_did}#nonexistent");
+    let res_bad = catbird::services::circle::resolve_circle_verifying_key(&test_did_bad, None).await;
+    assert!(res_bad.is_err());
+}
+
+#[tokio::test]
+async fn resolve_circle_verifying_key_rejects_wrong_controller() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let vk = signing_key.verifying_key();
+    let sec1 = vk.to_encoded_point(true);
+
+    let mut multikey_bytes = vec![0x80, 0x24];
+    multikey_bytes.extend_from_slice(sec1.as_bytes());
+    let multikey_str = multibase::encode(multibase::Base::Base58Btc, &multikey_bytes);
+
+    let host = mock_server.address().ip().to_string();
+    let port = mock_server.address().port();
+    let base_did = format!("did:web:{host}%3A{port}");
+    let test_did = format!("{base_did}#atproto_circle");
+
+    // Serve a document where controller does not match base_did
+    let did_doc = json!({
+        "id": base_did,
+        "verificationMethod": [{
+            "id": format!("{base_did}#atproto_circle"),
+            "type": "Multikey",
+            "controller": "did:web:unrelated.controller.blue",
+            "publicKeyMultibase": multikey_str
+        }]
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/did.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(did_doc))
+        .mount(&mock_server)
+        .await;
+
+    let res = catbird::services::circle::resolve_circle_verifying_key(&test_did, None).await;
+    assert!(res.is_err());
 }

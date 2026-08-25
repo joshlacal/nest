@@ -14,6 +14,7 @@ pub async fn get_post_thread_handler(
     Query(query): Query<GetPostThread>,
     State(state): State<AppState>,
 ) -> Result<Json<GetPostThreadOutput>, AppError> {
+    tracing::debug!("Handling getPostThread request");
     let output = crate::thread::get_post_thread(
         &state.db,
         &state.profile_hydrator,
