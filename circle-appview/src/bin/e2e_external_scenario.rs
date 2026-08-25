@@ -4,6 +4,7 @@
 //! - Four distinct preprovisioned Nest sessions for Alice, Bob, Carol, Dave
 //! - Nest gateway (for createCircle, activateSpace, updateMember, getOperation,
 //!   com.atproto.repo.createRecord/uploadBlob proxying with DPoP, and read forwarding)
+//! - Space-capable PDS instances and Circle AppView
 //! - Public AppView (for public control record and public boundary isolation verification)
 //!
 //! Exit codes:
@@ -12,7 +13,7 @@
 //! - 2: Missing prerequisite / unusable credential / unreachable service endpoint.
 
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use catbird_atproto::generated::blue_catbird::circle::create_circle::{
     CreateCircle, CreateCircleOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::defs::{
-    AccessState, MemberAction, OperationStatus, SpaceRef,
+    AccessState, MemberAction, NotificationReason, OperationStatus,
 };
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_operation::GetOperationOutput;
@@ -34,7 +35,7 @@ use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNo
 use catbird_atproto::generated::blue_catbird::circle::update_member::{
     UpdateMember, UpdateMemberOutput,
 };
-use catbird_atproto::types::string::{AtUri, Did};
+use catbird_atproto::types::string::Did;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,7 @@ pub struct UserSession {
     pub name: &'static str,
     pub did: String,
     pub session_id: String,
+    pub pds_url: Option<String>,
 }
 
 impl UserSession {
@@ -63,6 +65,7 @@ impl UserSession {
 #[derive(Debug, Clone)]
 pub struct ScenarioConfig {
     pub nest_url: String,
+    pub circle_appview_url: String,
     pub public_appview_url: String,
 
     pub alice: UserSession,
@@ -77,8 +80,12 @@ pub struct ScenarioConfig {
 impl ScenarioConfig {
     pub fn from_env() -> Result<Self, String> {
         let nest_url = env::var("NEST_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+        let circle_appview_url =
+            env::var("CIRCLE_APPVIEW_URL").unwrap_or_else(|_| "http://127.0.0.1:3002".into());
         let public_appview_url =
             env::var("PUBLIC_APPVIEW_URL").unwrap_or_else(|_| "https://public.api.bsky.app".into());
+
+        let default_pds = env::var("PDS_URL").ok();
 
         let alice_did = env::var("ALICE_DID")
             .map_err(|_| "ALICE_DID is required (e.g. did:plc:alice...)".to_string())?;
@@ -87,6 +94,7 @@ impl ScenarioConfig {
             .or_else(|_| env::var("ALICE_AUTH_TOKEN"))
             .or_else(|_| env::var("ALICE_TOKEN"))
             .map_err(|_| "ALICE_SESSION_ID is required (Nest session cookie/token)".to_string())?;
+        let alice_pds = env::var("ALICE_PDS_URL").ok().or_else(|| default_pds.clone());
 
         let bob_did = env::var("BOB_DID")
             .map_err(|_| "BOB_DID is required (e.g. did:plc:bob...)".to_string())?;
@@ -95,6 +103,7 @@ impl ScenarioConfig {
             .or_else(|_| env::var("BOB_AUTH_TOKEN"))
             .or_else(|_| env::var("BOB_TOKEN"))
             .map_err(|_| "BOB_SESSION_ID is required (Nest session cookie/token)".to_string())?;
+        let bob_pds = env::var("BOB_PDS_URL").ok().or_else(|| default_pds.clone());
 
         let carol_did = env::var("CAROL_DID")
             .map_err(|_| "CAROL_DID is required (e.g. did:plc:carol...)".to_string())?;
@@ -103,6 +112,7 @@ impl ScenarioConfig {
             .or_else(|_| env::var("CAROL_AUTH_TOKEN"))
             .or_else(|_| env::var("CAROL_TOKEN"))
             .map_err(|_| "CAROL_SESSION_ID is required (Nest session cookie/token)".to_string())?;
+        let carol_pds = env::var("CAROL_PDS_URL").ok().or_else(|| default_pds.clone());
 
         let dave_did = env::var("DAVE_DID")
             .map_err(|_| "DAVE_DID is required (e.g. did:plc:dave...)".to_string())?;
@@ -111,6 +121,7 @@ impl ScenarioConfig {
             .or_else(|_| env::var("DAVE_AUTH_TOKEN"))
             .or_else(|_| env::var("DAVE_TOKEN"))
             .map_err(|_| "DAVE_SESSION_ID is required (Nest session cookie/token)".to_string())?;
+        let dave_pds = env::var("DAVE_PDS_URL").ok().or_else(|| default_pds.clone());
 
         // Ensure all four sessions are distinct
         let sessions = [&alice_session, &bob_session, &carol_session, &dave_session];
@@ -143,26 +154,31 @@ impl ScenarioConfig {
 
         Ok(Self {
             nest_url,
+            circle_appview_url,
             public_appview_url,
             alice: UserSession {
                 name: "Alice",
                 did: alice_did,
                 session_id: alice_session,
+                pds_url: alice_pds,
             },
             bob: UserSession {
                 name: "Bob",
                 did: bob_did,
                 session_id: bob_session,
+                pds_url: bob_pds,
             },
             carol: UserSession {
                 name: "Carol",
                 did: carol_did,
                 session_id: carol_session,
+                pds_url: carol_pds,
             },
             dave: UserSession {
                 name: "Dave",
                 did: dave_did,
                 session_id: dave_session,
+                pds_url: dave_pds,
             },
             artifacts_dir,
             database_url,
@@ -181,6 +197,7 @@ pub struct CanaryManifest {
     pub reply_uri: String,
     pub like_uri: String,
     pub blob_cid: String,
+    pub image_canary: String,
     pub public_control_post_uri: String,
     pub public_control_text: String,
     pub member_response_markers: Vec<String>,
@@ -203,6 +220,7 @@ pub struct RunProvenance {
     pub started_at: String,
     pub completed_at: String,
     pub nest_url: String,
+    pub circle_appview_url: String,
     pub public_appview_url: String,
     pub alice_did: String,
     pub bob_did: String,
@@ -239,7 +257,7 @@ impl ScenarioRunner {
     }
 
     pub async fn check_readiness(&self) -> Result<(), String> {
-        eprintln!("[e2e_scenario] PROBE_NEST_READINESS_START");
+        eprintln!("[e2e_scenario] PROBE_SERVICES_READINESS_START");
 
         // 1. Probe Nest health
         let nest_probe = format!("{}/health", self.config.nest_url.trim_end_matches('/'));
@@ -256,7 +274,32 @@ impl ScenarioRunner {
             ));
         }
 
-        // 2. Probe Public AppView
+        // 2. Probe Circle AppView
+        let appview_probe = format!(
+            "{}/health",
+            self.config.circle_appview_url.trim_end_matches('/')
+        );
+        let appview_res = self.client.get(&appview_probe).send().await;
+        if appview_res.is_err() || !appview_res.as_ref().unwrap().status().is_success() {
+            let wk_appview = format!(
+                "{}/.well-known/atproto-did",
+                self.config.circle_appview_url.trim_end_matches('/')
+            );
+            let wk_res = self
+                .client
+                .get(&wk_appview)
+                .send()
+                .await
+                .map_err(|e| format!("Circle AppView probe failed at {wk_appview}: {e}"))?;
+            if !wk_res.status().is_success() {
+                return Err(format!(
+                    "Circle AppView at {} is unreachable",
+                    self.config.circle_appview_url
+                ));
+            }
+        }
+
+        // 3. Probe Public AppView
         let public_probe = format!(
             "{}/xrpc/_health",
             self.config.public_appview_url.trim_end_matches('/')
@@ -281,45 +324,105 @@ impl ScenarioRunner {
             }
         }
 
-        // 3. Probe Space capability with Alice's Nest session
+        // 4. Probe configured user PDS instances
+        let mut probed_pds = std::collections::HashSet::new();
+        for user in [
+            &self.config.alice,
+            &self.config.bob,
+            &self.config.carol,
+            &self.config.dave,
+        ] {
+            if let Some(pds_url) = &user.pds_url {
+                if probed_pds.insert(pds_url.clone()) {
+                    let pds_probe = format!("{}/xrpc/_health", pds_url.trim_end_matches('/'));
+                    let pds_res = self.client.get(&pds_probe).send().await;
+                    if pds_res.is_err() || !pds_res.as_ref().unwrap().status().is_success() {
+                        let desc_probe = format!(
+                            "{}/xrpc/com.atproto.server.describeServer",
+                            pds_url.trim_end_matches('/')
+                        );
+                        let desc_res = self
+                            .client
+                            .get(&desc_probe)
+                            .send()
+                            .await
+                            .map_err(|e| format!("PDS probe failed for {pds_url}: {e}"))?;
+                        if !desc_res.status().is_success() {
+                            return Err(format!(
+                                "Space-capable PDS at {pds_url} returned status {}",
+                                desc_res.status()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Validate Nest session-to-DID mapping for each user via /auth/session
+        let session_endpoint = format!("{}/auth/session", self.config.nest_url.trim_end_matches('/'));
+        for user in [
+            &self.config.alice,
+            &self.config.bob,
+            &self.config.carol,
+            &self.config.dave,
+        ] {
+            let req = user.apply_auth(self.client.get(&session_endpoint));
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("Session check failed for {}: {e}", user.name))?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "Session validation failed for {}: /auth/session returned status {}",
+                    user.name,
+                    resp.status()
+                ));
+            }
+            let session_info: Value = resp.json().await.map_err(|e| e.to_string())?;
+            let returned_did = session_info["did"].as_str().unwrap_or("");
+            if returned_did != user.did {
+                return Err(format!(
+                    "Session DID mismatch for {}: declared '{}', Nest session returned '{}'",
+                    user.name, user.did, returned_did
+                ));
+            }
+        }
+
+        // 6. Validate Space capability and protocol revision for all users
         let cap_url = format!(
             "{}/xrpc/blue.catbird.circle.getCapabilities",
             self.config.nest_url.trim_end_matches('/')
         );
-        let cap_req = self.config.alice.apply_auth(self.client.get(&cap_url));
-        let cap_res = cap_req
-            .send()
-            .await
-            .map_err(|e| format!("Alice capability probe failed at {cap_url}: {e}"))?;
-        if !cap_res.status().is_success() {
-            return Err(format!(
-                "Alice capability check returned status: {}",
-                cap_res.status()
-            ));
-        }
-        let cap_json: Value = cap_res.json().await.map_err(|e| e.to_string())?;
-        if cap_json["enabled"].as_bool() != Some(true) {
-            return Err("Space capability is not enabled on Nest gateway".to_string());
-        }
-        let rev = cap_json["protocolRevision"].as_str().unwrap_or("");
-        if rev != "89deb9faca20e56fa2a262fe9746ed52bc1095ba" {
-            return Err(format!(
-                "Space protocol revision mismatch: expected '89deb9faca20e56fa2a262fe9746ed52bc1095ba', got '{rev}'"
-            ));
-        }
-
-        // 4. Validate Bob, Carol, Dave sessions against Nest getCapabilities
-        for user in [&self.config.bob, &self.config.carol, &self.config.dave] {
+        for user in [
+            &self.config.alice,
+            &self.config.bob,
+            &self.config.carol,
+            &self.config.dave,
+        ] {
             let req = user.apply_auth(self.client.get(&cap_url));
             let resp = req
                 .send()
                 .await
-                .map_err(|e| format!("Session probe failed for {}: {e}", user.name))?;
+                .map_err(|e| format!("Capability probe failed for {}: {e}", user.name))?;
             if !resp.status().is_success() {
                 return Err(format!(
-                    "Session validation failed for {}: status {}",
+                    "Capability check failed for {}: status {}",
                     user.name,
                     resp.status()
+                ));
+            }
+            let cap_json: Value = resp.json().await.map_err(|e| e.to_string())?;
+            if cap_json["enabled"].as_bool() != Some(true) {
+                return Err(format!(
+                    "Space capability is not enabled on Nest gateway for {}",
+                    user.name
+                ));
+            }
+            let rev = cap_json["protocolRevision"].as_str().unwrap_or("");
+            if rev != "89deb9faca20e56fa2a262fe9746ed52bc1095ba" {
+                return Err(format!(
+                    "Space protocol revision mismatch for {}: expected '89deb9faca20e56fa2a262fe9746ed52bc1095ba', got '{rev}'",
+                    user.name
                 ));
             }
         }
@@ -374,7 +477,8 @@ impl ScenarioRunner {
         let post_text = format!("CANARY_TEXT_PRIVATE_POST_BODY_{run_id}");
         let reply_text = format!("CANARY_TEXT_PRIVATE_REPLY_BODY_{run_id}");
         let control_text = format!("CONTROL_PUBLIC_POST_BODY_{run_id}");
-        let image_data = format!("CANARY_SECRET_FAMILY_IMAGE_BYTES_{run_id}").into_bytes();
+        let image_canary = format!("CANARY_SECRET_FAMILY_IMAGE_BYTES_{run_id}");
+        let image_data = image_canary.as_bytes().to_vec();
 
         // Create 0700 artifacts directory
         let mut builder = fs::DirBuilder::new();
@@ -427,32 +531,70 @@ impl ScenarioRunner {
             .ok_or_else(|| "Public control record missing uri".to_string())?
             .to_string();
 
-        // Verify public control post on Public AppView
+        // Strict Public Positive Control: getPostThread on public control post
         let public_thread_url = format!(
             "{}/xrpc/app.bsky.feed.getPostThread?uri={}",
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&public_control_post_uri)
         );
-        let public_thread_resp = self.client.get(&public_thread_url).send().await;
-        if let Ok(resp) = public_thread_resp {
-            if resp.status().is_success() {
-                let body: Value = resp.json().await.unwrap_or(Value::Null);
-                public_capture.public_control_check = Some(body);
-            }
+        let public_thread_resp = self
+            .client
+            .get(&public_thread_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView getPostThread failed: {e}"))?;
+        if !public_thread_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView getPostThread on control post returned non-2xx status: {}",
+                public_thread_resp.status()
+            ));
         }
+        let public_thread_body: Value = public_thread_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse public thread body: {e}"))?;
+        let root_uri = public_thread_body["thread"]["post"]["uri"].as_str().unwrap_or("");
+        if root_uri != public_control_post_uri {
+            return Err(format!(
+                "Public control post thread root mismatch: expected '{public_control_post_uri}', got '{root_uri}'"
+            ));
+        }
+        public_capture.public_control_check = Some(public_thread_body);
 
+        // Strict Public Positive Control: getAuthorFeed on Alice
         let public_feed_url = format!(
             "{}/xrpc/app.bsky.feed.getAuthorFeed?actor={}",
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&self.config.alice.did)
         );
-        let public_feed_resp = self.client.get(&public_feed_url).send().await;
-        if let Ok(resp) = public_feed_resp {
-            if resp.status().is_success() {
-                let body: Value = resp.json().await.unwrap_or(Value::Null);
-                public_capture.public_author_feed_check = Some(body);
-            }
+        let public_feed_resp = self
+            .client
+            .get(&public_feed_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView getAuthorFeed failed: {e}"))?;
+        if !public_feed_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView getAuthorFeed returned non-2xx status: {}",
+                public_feed_resp.status()
+            ));
         }
+        let public_feed_body: Value = public_feed_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse public feed body: {e}"))?;
+        let feed_posts = public_feed_body["feed"].as_array().ok_or_else(|| {
+            "Public author feed response missing 'feed' array".to_string()
+        })?;
+        let found_control = feed_posts.iter().any(|item| {
+            item["post"]["uri"].as_str() == Some(&public_control_post_uri)
+        });
+        if !found_control {
+            return Err(format!(
+                "Public control post '{public_control_post_uri}' not found in Alice's author feed"
+            ));
+        }
+        public_capture.public_author_feed_check = Some(public_feed_body);
         eprintln!("[e2e_scenario] STEP_02_PUBLIC_CONTROL_POST_CREATED");
 
         // -------------------------------------------------------------
@@ -507,7 +649,7 @@ impl ScenarioRunner {
         eprintln!("[e2e_scenario] STEP_03_CIRCLE_CREATED");
 
         // -------------------------------------------------------------
-        // Step 3: Activate Space for Alice, Bob, Carol
+        // Step 3: Explicitly Activate Space for Alice, Bob, Carol
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_04_ACTIVATE_SPACE_START");
         let activate_url = format!(
@@ -668,6 +810,10 @@ impl ScenarioRunner {
             .as_str()
             .ok_or_else(|| "Reply creation missing uri".to_string())?
             .to_string();
+        let _reply_cid = reply_json["cid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         eprintln!("[e2e_scenario] STEP_07_REPLY_WRITTEN");
 
         // -------------------------------------------------------------
@@ -717,9 +863,10 @@ impl ScenarioRunner {
         );
 
         // Poll getFeed until post and reply are both indexed (feed length >= 2)
+        // and counts reflect Carol's like and Bob's reply.
         let poll_start = std::time::Instant::now();
         let mut feed_synced = false;
-        while poll_start.elapsed() < Duration::from_secs(15) {
+        while poll_start.elapsed() < Duration::from_secs(20) {
             let resp = self
                 .config
                 .alice
@@ -728,10 +875,21 @@ impl ScenarioRunner {
                 .await;
             if let Ok(r) = resp {
                 if r.status().is_success() {
-                    if let Ok(feed_output) = r.json::<GetFeedOutput>().await {
+                    if let Ok(feed_output) = r.json::<GetFeedOutput<String>>().await {
                         if feed_output.feed.len() >= 2 {
-                            feed_synced = true;
-                            break;
+                            // Verify post item has like_count == 1 and reply_count == 1
+                            if let Some(post_item) = feed_output
+                                .feed
+                                .iter()
+                                .find(|item| item.post.post.uri.as_str() == post_uri)
+                            {
+                                if post_item.post.post.like_count == Some(1)
+                                    && post_item.post.post.reply_count == Some(1)
+                                {
+                                    feed_synced = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -740,7 +898,7 @@ impl ScenarioRunner {
         }
 
         if !feed_synced {
-            return Err("Timed out waiting for Circle AppView sync to index post and reply".to_string());
+            return Err("Timed out waiting for Circle AppView sync to index post, reply, and like counts".to_string());
         }
 
         // Alice reads getPostThread via Nest
@@ -763,7 +921,7 @@ impl ScenarioRunner {
                 thread_resp.status()
             ));
         }
-        let _thread_output: GetPostThreadOutput = thread_resp
+        let _thread_output: GetPostThreadOutput<String> = thread_resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse GetPostThreadOutput: {e}"))?;
@@ -792,7 +950,44 @@ impl ScenarioRunner {
         }
         member_markers.push("BOB_MEDIA_OK".into());
 
-        // Alice reads listNotifications via Nest
+        // Carol reads getFeed: verify viewer like state
+        let carol_feed_resp = self
+            .config
+            .carol
+            .apply_auth(self.client.get(&feed_url))
+            .send()
+            .await
+            .map_err(|e| format!("Carol getFeed failed: {e}"))?;
+        if !carol_feed_resp.status().is_success() {
+            return Err(format!("Carol getFeed returned status {}", carol_feed_resp.status()));
+        }
+        let carol_feed: GetFeedOutput<String> = carol_feed_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Carol GetFeedOutput: {e}"))?;
+        if let Some(post_item) = carol_feed
+            .feed
+            .iter()
+            .find(|item| item.post.post.uri.as_str() == post_uri)
+        {
+            let viewer_like = post_item
+                .post
+                .post
+                .viewer
+                .as_ref()
+                .and_then(|v| v.like.as_ref())
+                .map(|u| u.as_str());
+            if viewer_like != Some(like_uri.as_str()) {
+                return Err(format!(
+                    "Carol viewer like state mismatch: expected Some('{like_uri}'), got {:?}",
+                    viewer_like
+                ));
+            }
+        } else {
+            return Err("Post item not found in Carol feed".to_string());
+        }
+
+        // Alice reads listNotifications via Nest: assert Bob reply and Carol like notifications
         let notifs_url = format!(
             "{}/xrpc/blue.catbird.circle.listNotifications",
             self.config.nest_url.trim_end_matches('/')
@@ -810,10 +1005,26 @@ impl ScenarioRunner {
                 notifs_resp.status()
             ));
         }
-        let _notifs_output: ListNotificationsOutput = notifs_resp
+        let notifs_output: ListNotificationsOutput<String> = notifs_resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse ListNotificationsOutput: {e}"))?;
+
+        let has_reply_notif = notifs_output.notifications.iter().any(|n| {
+            n.reason == NotificationReason::Reply
+                && n.actor.did.as_str() == self.config.bob.did
+        });
+        if !has_reply_notif {
+            return Err("Alice did not receive expected reply notification from Bob".to_string());
+        }
+
+        let has_like_notif = notifs_output.notifications.iter().any(|n| {
+            n.reason == NotificationReason::Like
+                && n.actor.did.as_str() == self.config.carol.did
+        });
+        if !has_like_notif {
+            return Err("Alice did not receive expected like notification from Carol".to_string());
+        }
 
         eprintln!("[e2e_scenario] STEP_09_AUTHORIZED_READS_VERIFIED");
 
@@ -832,7 +1043,7 @@ impl ScenarioRunner {
             && dave_feed_resp.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Dave feed access expected 401/403, got {}",
+                "Dave feed access expected exact 401/403, got {}",
                 dave_feed_resp.status()
             ));
         }
@@ -848,7 +1059,7 @@ impl ScenarioRunner {
             && dave_media_resp.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Dave media access expected 401/403, got {}",
+                "Dave media access expected exact 401/403, got {}",
                 dave_media_resp.status()
             ));
         }
@@ -864,12 +1075,12 @@ impl ScenarioRunner {
             && dave_thread_resp.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Dave thread access expected 401/403, got {}",
+                "Dave thread access expected exact 401/403, got {}",
                 dave_thread_resp.status()
             ));
         }
 
-        // Dave write attempt (reply) to Space
+        // Dave write attempt (real reply record with root/parent) to Space
         let dave_write_reply = self
             .config
             .dave
@@ -880,7 +1091,11 @@ impl ScenarioRunner {
                 "record": {
                     "$type": "app.bsky.feed.post",
                     "text": "unauthorized dave intrusion",
-                    "createdAt": Utc::now().to_rfc3339()
+                    "createdAt": Utc::now().to_rfc3339(),
+                    "reply": {
+                        "root": { "uri": post_uri, "cid": post_cid },
+                        "parent": { "uri": post_uri, "cid": post_cid }
+                    }
                 }
             }))
             .send()
@@ -890,12 +1105,12 @@ impl ScenarioRunner {
             && dave_write_reply.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Dave unauthorized reply write expected 401/403, got {}",
+                "Dave unauthorized reply write expected exact 401/403, got {}",
                 dave_write_reply.status()
             ));
         }
 
-        // Dave write attempt (like) to Space
+        // Dave write attempt (real like record with subject) to Space
         let dave_write_like = self
             .config
             .dave
@@ -916,13 +1131,13 @@ impl ScenarioRunner {
             && dave_write_like.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Dave unauthorized like write expected 401/403, got {}",
+                "Dave unauthorized like write expected exact 401/403, got {}",
                 dave_write_like.status()
             ));
         }
 
-        // Re-verify Alice's feed: item count and like count unchanged
-        let alice_feed_check: GetFeedOutput = self
+        // Re-verify Alice's feed: item count, reply count, and like count completely unchanged
+        let alice_feed_check: GetFeedOutput<String> = self
             .config
             .alice
             .apply_auth(self.client.get(&feed_url))
@@ -937,6 +1152,24 @@ impl ScenarioRunner {
                 "Feed item count changed unexpectedly after stranger attempts: got {}",
                 alice_feed_check.feed.len()
             ));
+        }
+        if let Some(post_item) = alice_feed_check
+            .feed
+            .iter()
+            .find(|item| item.post.post.uri.as_str() == post_uri)
+        {
+            if post_item.post.post.like_count != Some(1) {
+                return Err(format!(
+                    "Post like_count changed after stranger write: expected Some(1), got {:?}",
+                    post_item.post.post.like_count
+                ));
+            }
+            if post_item.post.post.reply_count != Some(1) {
+                return Err(format!(
+                    "Post reply_count changed after stranger write: expected Some(1), got {:?}",
+                    post_item.post.post.reply_count
+                ));
+            }
         }
 
         eprintln!("[e2e_scenario] STEP_10_STRANGER_DENIED_READS_AND_WRITES");
@@ -1061,7 +1294,7 @@ impl ScenarioRunner {
             )
             .await?;
 
-        // Bob reads are immediately forbidden
+        // Bob reads are immediately forbidden with exact 401/403
         let bob_feed_after = self
             .config
             .bob
@@ -1073,7 +1306,7 @@ impl ScenarioRunner {
             && bob_feed_after.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Bob feed after removal expected 401/403, got {}",
+                "Bob feed after removal expected exact 401/403, got {}",
                 bob_feed_after.status()
             ));
         }
@@ -1089,7 +1322,7 @@ impl ScenarioRunner {
             && bob_media_after.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Bob media after removal expected 401/403, got {}",
+                "Bob media after removal expected exact 401/403, got {}",
                 bob_media_after.status()
             ));
         }
@@ -1105,12 +1338,12 @@ impl ScenarioRunner {
             && bob_thread_after.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Bob thread after removal expected 401/403, got {}",
+                "Bob thread after removal expected exact 401/403, got {}",
                 bob_thread_after.status()
             ));
         }
 
-        // Bob write attempt (reply) to Space is rejected with exact 401/403
+        // Bob write attempt (real reply record) to Space is rejected with exact 401/403
         let bob_write_reply = self
             .config
             .bob
@@ -1121,7 +1354,11 @@ impl ScenarioRunner {
                 "record": {
                     "$type": "app.bsky.feed.post",
                     "text": "unauthorized bob post-revocation reply",
-                    "createdAt": Utc::now().to_rfc3339()
+                    "createdAt": Utc::now().to_rfc3339(),
+                    "reply": {
+                        "root": { "uri": post_uri, "cid": post_cid },
+                        "parent": { "uri": post_uri, "cid": post_cid }
+                    }
                 }
             }))
             .send()
@@ -1131,12 +1368,12 @@ impl ScenarioRunner {
             && bob_write_reply.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Bob write reply after removal expected 401/403, got {}",
+                "Bob write reply after removal expected exact 401/403, got {}",
                 bob_write_reply.status()
             ));
         }
 
-        // Bob write attempt (like) to Space is rejected with exact 401/403
+        // Bob write attempt (real like record) to Space is rejected with exact 401/403
         let bob_write_like = self
             .config
             .bob
@@ -1157,7 +1394,7 @@ impl ScenarioRunner {
             && bob_write_like.status() != StatusCode::UNAUTHORIZED
         {
             return Err(format!(
-                "Bob write like after removal expected 401/403, got {}",
+                "Bob write like after removal expected exact 401/403, got {}",
                 bob_write_like.status()
             ));
         }
@@ -1176,13 +1413,31 @@ impl ScenarioRunner {
                     resp.status()
                 ));
             }
-            let user_feed: GetFeedOutput = resp.json().await.map_err(|e| e.to_string())?;
+            let user_feed: GetFeedOutput<String> = resp.json().await.map_err(|e| e.to_string())?;
             if user_feed.feed.len() != 2 {
                 return Err(format!(
                     "{} feed length changed unexpectedly: got {}",
                     user.name,
                     user_feed.feed.len()
                 ));
+            }
+            if let Some(post_item) = user_feed
+                .feed
+                .iter()
+                .find(|item| item.post.post.uri.as_str() == post_uri)
+            {
+                if post_item.post.post.like_count != Some(1) {
+                    return Err(format!(
+                        "{} observed post like_count changed after Bob removal: expected Some(1), got {:?}",
+                        user.name, post_item.post.post.like_count
+                    ));
+                }
+                if post_item.post.post.reply_count != Some(1) {
+                    return Err(format!(
+                        "{} observed post reply_count changed after Bob removal: expected Some(1), got {:?}",
+                        user.name, post_item.post.post.reply_count
+                    ));
+                }
             }
         }
         member_markers.push("BOB_REMOVED_AND_REVOKED".into());
@@ -1198,85 +1453,157 @@ impl ScenarioRunner {
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&post_uri)
         );
-        let public_post_resp = self.client.get(&public_post_check_url).send().await;
-        if let Ok(resp) = public_post_resp {
-            if resp.status().is_success() {
-                return Err(format!(
-                    "Public AppView unexpectedly returned private post: {post_uri}"
-                ));
-            }
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            public_capture.private_post_check = Some(body);
+        let public_post_resp = self
+            .client
+            .get(&public_post_check_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView post check call failed: {e}"))?;
+        if public_post_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView unexpectedly returned private post: {post_uri}"
+            ));
         }
+        let post_err_body: Value = public_post_resp.json().await.unwrap_or(Value::Null);
+        public_capture.private_post_check = Some(post_err_body);
 
         let public_reply_check_url = format!(
             "{}/xrpc/app.bsky.feed.getPostThread?uri={}",
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&reply_uri)
         );
-        let public_reply_resp = self.client.get(&public_reply_check_url).send().await;
-        if let Ok(resp) = public_reply_resp {
-            if resp.status().is_success() {
-                return Err(format!(
-                    "Public AppView unexpectedly returned private reply: {reply_uri}"
-                ));
-            }
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            public_capture.private_reply_check = Some(body);
+        let public_reply_resp = self
+            .client
+            .get(&public_reply_check_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView reply check call failed: {e}"))?;
+        if public_reply_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView unexpectedly returned private reply: {reply_uri}"
+            ));
         }
+        let reply_err_body: Value = public_reply_resp.json().await.unwrap_or(Value::Null);
+        public_capture.private_reply_check = Some(reply_err_body);
 
         let search_post_url = format!(
             "{}/xrpc/app.bsky.feed.searchPosts?q={}",
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&post_text)
         );
-        let search_post_resp = self.client.get(&search_post_url).send().await;
-        if let Ok(resp) = search_post_resp {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            if let Some(posts) = body["posts"].as_array() {
-                if !posts.is_empty() {
-                    return Err(format!(
-                        "Public AppView search unexpectedly returned private post canary text: {post_text}"
-                    ));
-                }
-            }
-            public_capture.search_post_check = Some(body);
+        let search_post_resp = self
+            .client
+            .get(&search_post_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView search post call failed: {e}"))?;
+        if !search_post_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView searchPosts returned non-2xx status: {}",
+                search_post_resp.status()
+            ));
         }
+        let search_post_body: Value = search_post_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse search post body: {e}"))?;
+        if let Some(posts) = search_post_body["posts"].as_array() {
+            if !posts.is_empty() {
+                return Err(format!(
+                    "Public AppView search unexpectedly returned private post canary text: {post_text}"
+                ));
+            }
+        }
+        public_capture.search_post_check = Some(search_post_body);
 
         let search_reply_url = format!(
             "{}/xrpc/app.bsky.feed.searchPosts?q={}",
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&reply_text)
         );
-        let search_reply_resp = self.client.get(&search_reply_url).send().await;
-        if let Ok(resp) = search_reply_resp {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            if let Some(posts) = body["posts"].as_array() {
-                if !posts.is_empty() {
-                    return Err(format!(
-                        "Public AppView search unexpectedly returned private reply canary text: {reply_text}"
-                    ));
-                }
-            }
-            public_capture.search_reply_check = Some(body);
+        let search_reply_resp = self
+            .client
+            .get(&search_reply_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView search reply call failed: {e}"))?;
+        if !search_reply_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView searchPosts returned non-2xx status: {}",
+                search_reply_resp.status()
+            ));
         }
+        let search_reply_body: Value = search_reply_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse search reply body: {e}"))?;
+        if let Some(posts) = search_reply_body["posts"].as_array() {
+            if !posts.is_empty() {
+                return Err(format!(
+                    "Public AppView search unexpectedly returned private reply canary text: {reply_text}"
+                ));
+            }
+        }
+        public_capture.search_reply_check = Some(search_reply_body);
 
         let search_circle_url = format!(
             "{}/xrpc/app.bsky.actor.searchActors?q={}",
             self.config.public_appview_url.trim_end_matches('/'),
             url_encode(&circle_name)
         );
-        let search_circle_resp = self.client.get(&search_circle_url).send().await;
-        if let Ok(resp) = search_circle_resp {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            if let Some(actors) = body["actors"].as_array() {
-                if !actors.is_empty() {
-                    return Err(format!(
-                        "Public AppView search unexpectedly returned private circle name canary: {circle_name}"
-                    ));
-                }
+        let search_circle_resp = self
+            .client
+            .get(&search_circle_url)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView search circle call failed: {e}"))?;
+        if !search_circle_resp.status().is_success() {
+            return Err(format!(
+                "Public AppView searchActors returned non-2xx status: {}",
+                search_circle_resp.status()
+            ));
+        }
+        let search_circle_body: Value = search_circle_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse search actors body: {e}"))?;
+        if let Some(actors) = search_circle_body["actors"].as_array() {
+            if !actors.is_empty() {
+                return Err(format!(
+                    "Public AppView search unexpectedly returned private circle name canary: {circle_name}"
+                ));
             }
-            public_capture.search_circle_check = Some(body);
+        }
+        public_capture.search_circle_check = Some(search_circle_body);
+
+        // Positive and Negative Canary Isolation Check over all captured responses
+        let capture_json_str = serde_json::to_string(&public_capture)
+            .map_err(|e| format!("Failed to serialize public capture: {e}"))?;
+
+        // Positive control check: public_control_post_uri must be present
+        if !capture_json_str.contains(&public_control_post_uri) {
+            return Err(format!(
+                "Public control post URI '{public_control_post_uri}' missing from public HTTP capture"
+            ));
+        }
+
+        // Negative canary scan: none of the private canaries must appear in public captures
+        for canary in [
+            &circle_name,
+            &post_text,
+            &reply_text,
+            &space_uri,
+            &post_uri,
+            &reply_uri,
+            &like_uri,
+            &blob_cid,
+            &image_canary,
+        ] {
+            if capture_json_str.contains(canary.as_str()) {
+                return Err(format!(
+                    "Privacy leak detected: private canary '{canary}' found in public HTTP capture body"
+                ));
+            }
         }
 
         // Save public HTTP capture artifact (mode 0600)
@@ -1290,12 +1617,12 @@ impl ScenarioRunner {
         eprintln!("[e2e_scenario] STEP_13_PUBLIC_ISOLATION_VERIFIED");
 
         // -------------------------------------------------------------
-        // Step 13: Dump Database Diagnostics if DB is configured
+        // Step 13: Dump Database Diagnostics from real circle_rejections
         // -------------------------------------------------------------
         if let Some(db_url) = &self.config.database_url {
             if let Ok(pool) = PgPool::connect(db_url).await {
-                let rows = sqlx::query_as::<_, (String, String, String, chrono::DateTime<Utc>)>(
-                    "SELECT space_uri, record_cid, rejection_reason, created_at FROM sync_rejection_diagnostics ORDER BY created_at DESC LIMIT 100",
+                let rows = sqlx::query_as::<_, (String, String, chrono::DateTime<Utc>)>(
+                    "SELECT encode(uri_hash, 'hex') as uri_hash, reason_code, observed_at FROM circle_rejections ORDER BY observed_at DESC LIMIT 100",
                 )
                 .fetch_all(&pool)
                 .await
@@ -1303,12 +1630,11 @@ impl ScenarioRunner {
 
                 let diag_json: Vec<Value> = rows
                     .into_iter()
-                    .map(|(s_uri, cid, reason, dt)| {
+                    .map(|(hash, reason, dt)| {
                         json!({
-                            "space_uri": s_uri,
-                            "record_cid": cid,
-                            "rejection_reason": reason,
-                            "created_at": dt.to_rfc3339()
+                            "uri_hash": hash,
+                            "reason_code": reason,
+                            "observed_at": dt.to_rfc3339()
                         })
                     })
                     .collect();
@@ -1330,6 +1656,7 @@ impl ScenarioRunner {
             started_at,
             completed_at,
             nest_url: self.config.nest_url.clone(),
+            circle_appview_url: self.config.circle_appview_url.clone(),
             public_appview_url: self.config.public_appview_url.clone(),
             alice_did: self.config.alice.did.clone(),
             bob_did: self.config.bob.did.clone(),
@@ -1352,6 +1679,7 @@ impl ScenarioRunner {
             reply_uri,
             like_uri,
             blob_cid,
+            image_canary,
             public_control_post_uri,
             public_control_text: control_text,
             member_response_markers: member_markers,

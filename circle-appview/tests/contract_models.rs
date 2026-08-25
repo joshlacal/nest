@@ -10,7 +10,7 @@ use catbird_atproto::generated::blue_catbird::circle::create_circle::{
     CreateCircle, CreateCircleOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::defs::{
-    AccessState, MemberAction, Operation, OperationStatus, SpaceRef,
+    AccessState, MemberAction, NotificationReason, Operation, OperationStatus, SpaceRef,
 };
 use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
 use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
@@ -113,12 +113,26 @@ fn test_update_member_contract_serialization() {
     let input_remove: UpdateMember<String> = UpdateMember {
         action: MemberAction::Remove,
         member_did: Did::new("did:plc:bob".to_string()).unwrap(),
-        space: space_ref,
+        space: space_ref.clone(),
         extra_data: None,
     };
     let serialized_remove = serde_json::to_value(&input_remove).unwrap();
     assert_eq!(serialized_remove["action"], "remove");
     assert_eq!(serialized_remove["memberDid"], "did:plc:bob");
+
+    let output: UpdateMemberOutput<String> = UpdateMemberOutput {
+        value: Operation {
+            id: "op-uuid-update".to_string(),
+            status: OperationStatus::Complete,
+            space: Some(space_ref),
+            error: None,
+            extra_data: None,
+        },
+        extra_data: None,
+    };
+    let serialized_out = serde_json::to_value(&output).unwrap();
+    assert_eq!(serialized_out["id"], "op-uuid-update");
+    assert_eq!(serialized_out["status"], "complete");
 }
 
 #[test]
@@ -146,7 +160,7 @@ fn test_activate_space_contract_serialization() {
 }
 
 #[test]
-fn test_get_feed_contract_parameters() {
+fn test_get_feed_contract_parameters_and_output() {
     let space_ref: SpaceRef<String> =
         SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
     let input: GetFeed<String> = GetFeed {
@@ -162,10 +176,45 @@ fn test_get_feed_contract_parameters() {
     );
     assert_eq!(serialized["cursor"], "cur-123");
     assert_eq!(serialized["limit"], 25);
+
+    let sample_feed_json = json!({
+        "cursor": "next-cur-456",
+        "feed": [{
+            "circle": {
+                "name": "Family",
+                "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
+                "owner": "did:plc:alice",
+                "accessState": "active",
+                "members": ["did:plc:bob", "did:plc:carol"],
+                "muted": false
+            },
+            "post": {
+                "post": {
+                    "uri": "at://did:plc:alice/app.bsky.feed.post/3k123",
+                    "cid": "bafytestcid",
+                    "author": {
+                        "did": "did:plc:alice",
+                        "handle": "alice.test"
+                    },
+                    "record": {},
+                    "indexedAt": "2026-08-24T12:00:00.000Z",
+                    "likeCount": 1,
+                    "replyCount": 1
+                }
+            }
+        }]
+    });
+
+    let deserialized: GetFeedOutput<String> = serde_json::from_value(sample_feed_json).unwrap();
+    assert_eq!(deserialized.cursor.as_deref(), Some("next-cur-456"));
+    assert_eq!(deserialized.feed.len(), 1);
+    assert_eq!(deserialized.feed[0].circle.name, "Family");
+    assert_eq!(deserialized.feed[0].post.post.like_count, Some(1));
+    assert_eq!(deserialized.feed[0].post.post.reply_count, Some(1));
 }
 
 #[test]
-fn test_get_post_thread_contract_parameters() {
+fn test_get_post_thread_contract_parameters_and_output() {
     let space_ref: SpaceRef<String> =
         SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
     let input: GetPostThread<String> = GetPostThread {
@@ -187,6 +236,37 @@ fn test_get_post_thread_contract_parameters() {
     );
     assert_eq!(serialized["depth"], 6);
     assert_eq!(serialized["parentHeight"], 8);
+
+    let sample_thread_json = json!({
+        "circle": {
+            "name": "Family",
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
+            "owner": "did:plc:alice",
+            "accessState": "active"
+        },
+        "thread": {
+            "post": {
+                "uri": "at://did:plc:alice/app.bsky.feed.post/3kabc",
+                "cid": "bafytestcid",
+                "author": {
+                    "did": "did:plc:alice",
+                    "handle": "alice.test"
+                },
+                "record": {},
+                "indexedAt": "2026-08-24T12:00:00.000Z",
+                "likeCount": 1,
+                "replyCount": 1
+            }
+        }
+    });
+
+    let deserialized: GetPostThreadOutput<String> =
+        serde_json::from_value(sample_thread_json).unwrap();
+    assert_eq!(deserialized.circle.name, "Family");
+    assert_eq!(
+        deserialized.thread.post.uri.as_str(),
+        "at://did:plc:alice/app.bsky.feed.post/3kabc"
+    );
 }
 
 #[test]
@@ -206,6 +286,70 @@ fn test_get_media_contract_parameters() {
     assert_eq!(serialized["did"], "did:plc:alice");
     assert_eq!(serialized["cid"], "bafkreibm4k");
     assert!(serialized.get("authorDid").is_none());
+}
+
+#[test]
+fn test_list_notifications_contract_parameters_and_output() {
+    let input: ListNotifications<String> = ListNotifications {
+        cursor: Some("notif-cur-1".to_string()),
+        limit: Some(10),
+    };
+    let serialized = serde_json::to_value(&input).unwrap();
+    assert_eq!(serialized["cursor"], "notif-cur-1");
+    assert_eq!(serialized["limit"], 10);
+
+    let sample_notifs_json = json!({
+        "cursor": "next-notif",
+        "notifications": [
+            {
+                "id": "notif-uuid-1",
+                "reason": "reply",
+                "actor": {
+                    "did": "did:plc:bob",
+                    "handle": "bob.test"
+                },
+                "circle": {
+                    "name": "Family",
+                    "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
+                    "owner": "did:plc:alice",
+                    "accessState": "active"
+                },
+                "subject": "at://did:plc:alice/app.bsky.feed.post/3k123",
+                "indexedAt": "2026-08-24T12:00:00.000Z"
+            },
+            {
+                "id": "notif-uuid-2",
+                "reason": "like",
+                "actor": {
+                    "did": "did:plc:carol",
+                    "handle": "carol.test"
+                },
+                "circle": {
+                    "name": "Family",
+                    "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
+                    "owner": "did:plc:alice",
+                    "accessState": "active"
+                },
+                "subject": "at://did:plc:alice/app.bsky.feed.post/3k123",
+                "indexedAt": "2026-08-24T12:01:00.000Z"
+            }
+        ]
+    });
+
+    let deserialized: ListNotificationsOutput<String> =
+        serde_json::from_value(sample_notifs_json).unwrap();
+    assert_eq!(deserialized.cursor.as_deref(), Some("next-notif"));
+    assert_eq!(deserialized.notifications.len(), 2);
+    assert_eq!(deserialized.notifications[0].reason, NotificationReason::Reply);
+    assert_eq!(
+        deserialized.notifications[0].actor.did.as_str(),
+        "did:plc:bob"
+    );
+    assert_eq!(deserialized.notifications[1].reason, NotificationReason::Like);
+    assert_eq!(
+        deserialized.notifications[1].actor.did.as_str(),
+        "did:plc:carol"
+    );
 }
 
 #[test]
