@@ -2044,10 +2044,14 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
     sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7advroot', $5, now(), now())")
         .bind(&root_uri).bind(&root_cid).bind(SPACE_1).bind(ALICE_DID).bind(&root_json).execute(&pool).await.unwrap();
 
-    // Seed a deep + wide tree with > 600 total nodes
+    // Seed a tree with >499 reachable replies within depth=10:
+    // - 50 direct level-1 siblings attached to root
+    // - 460 direct children attached to the first level-1 sibling (L1_1)
     let mut total_seeded = 1; // root
+    let mut l1_1_uri = String::new();
+    let mut l1_1_cid = String::new();
 
-    // Level 1 (50 siblings)
+    // 1. Level 1 (50 siblings attached directly to root)
     for i in 1..=50 {
         let l1_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l1_{i}");
         let l1_json = json!({
@@ -2059,69 +2063,30 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
         let l1_cid = compute_record_cid(&l1_json);
         sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $7)")
             .bind(&l1_uri).bind(&l1_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l1_{i}")).bind(&l1_json).bind(&root_uri).execute(&pool).await.unwrap();
-        total_seeded += 1;
-
-        // Level 2 (10 children for first 10 Level 1 nodes)
-        if i <= 10 {
-            for j in 1..=10 {
-                let l2_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l2_{i}_{j}");
-                let l2_json = json!({
-                    "$type": "app.bsky.feed.post",
-                    "text": format!("Level 2 - {i} - {j}"),
-                    "createdAt": format!("2026-08-24T12:02:{j:02}.000Z"),
-                    "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &l1_uri, "cid": &l1_cid}}
-                });
-                let l2_cid = compute_record_cid(&l2_json);
-                sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
-                    .bind(&l2_uri).bind(&l2_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l2_{i}_{j}")).bind(&l2_json).bind(&l1_uri).bind(&root_uri).execute(&pool).await.unwrap();
-                total_seeded += 1;
-
-                // Level 3 (5 children for level 2 nodes of i=1)
-                if i == 1 {
-                    for k in 1..=5 {
-                        let l3_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l3_{j}_{k}");
-                        let l3_json = json!({
-                            "$type": "app.bsky.feed.post",
-                            "text": format!("Level 3 - {j} - {k}"),
-                            "createdAt": format!("2026-08-24T12:03:{k:02}.000Z"),
-                            "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &l2_uri, "cid": &l2_cid}}
-                        });
-                        let l3_cid = compute_record_cid(&l3_json);
-                        sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
-                            .bind(&l3_uri).bind(&l3_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l3_{j}_{k}")).bind(&l3_json).bind(&l2_uri).bind(&root_uri).execute(&pool).await.unwrap();
-                        total_seeded += 1;
-                    }
-                }
-            }
+        if i == 1 {
+            l1_1_uri = l1_uri;
+            l1_1_cid = l1_cid;
         }
-    }
-
-    // Seed additional 450 deep chain nodes attached to L1_50 to exceed 600 total nodes
-    let mut chain_parent_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l1_50");
-    let mut chain_parent_cid = compute_record_cid(&json!({
-        "$type": "app.bsky.feed.post",
-        "text": "Level 1 - 50",
-        "createdAt": "2026-08-24T12:01:50.000Z",
-        "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &root_uri, "cid": &root_cid}}
-    }));
-
-    for n in 1..=450 {
-        let chain_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_chain_{n}");
-        let chain_json = json!({
-            "$type": "app.bsky.feed.post",
-            "text": format!("Chain {n}"),
-            "createdAt": "2026-08-24T12:10:00.000Z",
-            "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &chain_parent_uri, "cid": &chain_parent_cid}}
-        });
-        let chain_cid = compute_record_cid(&chain_json);
-        sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
-            .bind(&chain_uri).bind(&chain_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_chain_{n}")).bind(&chain_json).bind(&chain_parent_uri).bind(&root_uri).execute(&pool).await.unwrap();
-        chain_parent_uri = chain_uri;
-        chain_parent_cid = chain_cid;
         total_seeded += 1;
     }
 
-    assert!(total_seeded > 600, "Seeded {total_seeded} nodes (must exceed 600)");
+    // 2. Attach 460 direct children to the first level-1 reply (L1_1)
+    // These are reachable at depth=2 (well within depth=10 limit)
+    for j in 1..=460 {
+        let child_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7adv_l1_1_c_{j}");
+        let child_json = json!({
+            "$type": "app.bsky.feed.post",
+            "text": format!("L1_1 Child {j}"),
+            "createdAt": format!("2026-08-24T12:05:00.{j:03}Z"),
+            "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &l1_1_uri, "cid": &l1_1_cid}}
+        });
+        let child_cid = compute_record_cid(&child_json);
+        sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now(), now(), $7, $8)")
+            .bind(&child_uri).bind(&child_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7adv_l1_1_c_{j}")).bind(&child_json).bind(&l1_1_uri).bind(&root_uri).execute(&pool).await.unwrap();
+        total_seeded += 1;
+    }
+
+    assert_eq!(total_seeded, 511, "Seeded exactly 511 nodes (1 root + 50 L1 siblings + 460 L1_1 children)");
 
     let root_std_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/3l7advroot");
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
@@ -2158,10 +2123,16 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
     let total_thread_nodes = 1 + total_reply_nodes;
 
     // Strict assertions:
-    // 1. Total thread nodes is <= 500 (MAX_THREAD_NODES bound)
-    assert!(total_thread_nodes <= 500, "Total thread nodes {total_thread_nodes} must not exceed MAX_THREAD_NODES (500)");
-    // 2. All 50 direct level-1 siblings were retained because the direct batch was charged before recursion
+    // 1. Total thread nodes saturates at exactly 500 (MAX_THREAD_NODES bound, root included per implementation accounting)
+    assert_eq!(total_thread_nodes, 500, "Total thread nodes must saturate at exactly MAX_THREAD_NODES (500)");
+    assert_eq!(total_reply_nodes, 499, "Total reply nodes must be exactly 499 (500 max - 1 root)");
+    // 2. All 50 direct level-1 siblings are retained because the direct batch was charged before recursion
     assert_eq!(direct_replies_count, 50, "All 50 direct level 1 siblings must be retained and not starved by child recursion");
-    // 3. Child replies were populated using only leftover budget
-    assert!(total_reply_nodes > 50, "Child recursion should have consumed leftover budget");
+    // 3. First sibling gets exactly 449 children consuming the remaining budget (499 - 50 = 449)
+    if let ThreadViewPostRepliesItem::ThreadViewPost(first_sibling) = &reply_items[0] {
+        let first_sibling_replies = first_sibling.replies.as_ref().expect("First sibling must have replies");
+        assert_eq!(first_sibling_replies.len(), 449, "First sibling must have exactly 449 child replies (449 remaining budget)");
+    } else {
+        panic!("Expected first reply item to be a ThreadViewPost");
+    }
 }
