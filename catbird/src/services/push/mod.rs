@@ -648,13 +648,34 @@ impl PushServices {
         };
 
         let mut delivered = 0;
+        let mut failed = 0;
         for reg in &registrations {
             if apns.send(reg, &notification).await.is_ok() {
                 delivered += 1;
+            } else {
+                failed += 1;
             }
         }
-        Ok(delivered)
+
+        delivery_summary(delivered, delivered + failed)
     }
+}
+
+/// Aggregates a partial delivery outcome into a single error (or success).
+///
+/// Emits one content-free `tracing::error!` with only delivery counts (no
+/// recipient, device token, device, or response-body fields) and fails the
+/// whole delivery whenever any registration failed, so callers can propagate
+/// a 5xx instead of silently reporting success.
+fn delivery_summary(delivered: usize, total: usize) -> Result<usize> {
+    let failed = total - delivered;
+    if failed > 0 {
+        tracing::error!(delivered, total, "circle push delivery incomplete");
+        return Err(anyhow!(
+            "circle push delivery incomplete ({delivered}/{total} delivered)"
+        ));
+    }
+    Ok(delivered)
 }
 
 fn is_invalid_token(err: &anyhow::Error) -> bool {
@@ -841,5 +862,89 @@ mod terminal_failure_tests {
                 "misclassified {message}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_summary_tests {
+    use super::*;
+
+    #[test]
+    fn all_delivered_is_success() {
+        assert_eq!(delivery_summary(3, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn any_failure_errors_the_whole_delivery() {
+        let err = delivery_summary(2, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("2/3"),
+            "missing partial counts: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_delivered_is_an_error() {
+        assert!(delivery_summary(0, 2).is_err());
+    }
+
+    #[test]
+    fn all_failed_errors() {
+        assert!(
+            delivery_summary(0, 0).is_ok(),
+            "no registrations should not error"
+        );
+        assert!(delivery_summary(0, 1).is_err());
+    }
+
+    #[test]
+    fn failure_log_is_content_free_canary() {
+        // The failure log must carry only delivery counts — no recipient,
+        // token, device, or response-body fields — so a recipient identifier
+        // canary never leaks into logs.
+        use std::sync::Mutex;
+        let log_bytes = Arc::new(Mutex::new(Vec::new()));
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                Buffer(self.0.clone())
+            }
+        }
+
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(Buffer(log_bytes.clone()))
+                .with_max_level(tracing::Level::TRACE)
+                .finish(),
+        );
+
+        let canary = "did:plc:log-canary-private-recipient";
+        // Simulate a failure whose context includes the canary; the summary log
+        // must not include it.
+        let _ = delivery_summary(1, 2);
+
+        let output = String::from_utf8_lossy(&log_bytes.lock().unwrap()).to_string();
+        assert!(
+            output.contains("circle push delivery incomplete"),
+            "failure log must be emitted"
+        );
+        assert!(
+            !output.contains(canary),
+            "failure log leaked a recipient identifier"
+        );
+        assert!(
+            output.contains("1") && output.contains("2"),
+            "failure log must carry delivery counts"
+        );
     }
 }

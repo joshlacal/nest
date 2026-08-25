@@ -89,6 +89,48 @@ impl Config {
             .ok()
             .or_else(|| env::var("CIRCLE_SIGNING_KEY_HEX").ok());
 
+        // Fail-closed push configuration: if any push-related variable is
+        // supplied, the whole set must be present and the signing key must
+        // load. Otherwise push would silently degrade to "no push client" in
+        // production despite an operator believing it was configured.
+        let push_vars_present = [
+            env::var("NEST_PUSH_URL").is_ok(),
+            env::var("NEST_PUSH_AUDIENCE").is_ok(),
+            env::var("NEST_PUSH_SERVICE_DID").is_ok(),
+            env::var("PUSH_KEY_ID").is_ok(),
+            env::var("PUSH_SIGNING_KEY_PATH").is_ok(),
+            env::var("PUSH_SIGNING_KEY_HEX").is_ok(),
+            env::var("CIRCLE_KEY_ID").is_ok(),
+            env::var("CIRCLE_SIGNING_KEY_PATH").is_ok(),
+            env::var("CIRCLE_SIGNING_KEY_HEX").is_ok(),
+        ]
+        .into_iter()
+        .any(|present| present);
+        if push_vars_present {
+            if nest_push_url.is_none() {
+                return Err(anyhow::anyhow!(
+                    "NEST_PUSH_URL (or NEST_URL) is required when push configuration is provided"
+                ));
+            }
+            let has_key_source =
+                push_signing_key_path.is_some() || push_signing_key_hex.is_some();
+            if !has_key_source {
+                return Err(anyhow::anyhow!(
+                    "PUSH_SIGNING_KEY_PATH or PUSH_SIGNING_KEY_HEX is required when push is configured"
+                ));
+            }
+            if try_load_signing_key(
+                push_signing_key_path.as_deref(),
+                push_signing_key_hex.as_deref(),
+            )
+            .is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "Push signing key could not be loaded from PUSH_SIGNING_KEY_PATH/PUSH_SIGNING_KEY_HEX"
+                ));
+            }
+        }
+
         Ok(Self {
             host,
             port,

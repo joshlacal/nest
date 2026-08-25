@@ -2050,6 +2050,50 @@ fn test_circle_media_base_url_strict_https_origin_validation() {
     }
 }
 
+#[test]
+fn push_config_fails_closed_when_incomplete() {
+    let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let secret = key.to_bytes();
+    let hex_key = secret
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    std::env::set_var("CIRCLE_MEDIA_BASE_URL", "https://media.catbird.blue");
+    std::env::set_var("NEST_CLIENT_ID", "https://nest.catbird.blue");
+    std::env::set_var("NEST_JWKS_URL", "https://nest.catbird.blue/.well-known/jwks.json");
+
+    // 1. Push URL provided but no signing key -> must fail.
+    std::env::set_var("NEST_PUSH_URL", "https://nest.catbird.blue/internal/circle/push");
+    std::env::remove_var("PUSH_SIGNING_KEY_HEX");
+    std::env::remove_var("PUSH_SIGNING_KEY_PATH");
+    assert!(
+        Config::from_env().is_err(),
+        "Push configured without a signing key must fail closed"
+    );
+
+    // 2. Signing key provided but no URL -> must fail.
+    std::env::remove_var("NEST_PUSH_URL");
+    std::env::set_var("PUSH_SIGNING_KEY_HEX", &hex_key);
+    assert!(
+        Config::from_env().is_err(),
+        "Push signing key without NEST_PUSH_URL must fail closed"
+    );
+
+    // 3. Complete config -> succeeds.
+    std::env::set_var("NEST_PUSH_URL", "https://nest.catbird.blue/internal/circle/push");
+    std::env::set_var("PUSH_SIGNING_KEY_HEX", &hex_key);
+    let cfg = Config::from_env().expect("Complete push config must be accepted");
+    assert_eq!(
+        cfg.nest_push_url.as_deref(),
+        Some("https://nest.catbird.blue/internal/circle/push")
+    );
+
+    // Cleanup.
+    std::env::remove_var("NEST_PUSH_URL");
+    std::env::remove_var("PUSH_SIGNING_KEY_HEX");
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direct_siblings(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;

@@ -338,6 +338,7 @@ mod tests {
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
             circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
             circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            circle_verifying_key: None,
             session_encryption_key: None,
         })
     }
@@ -542,6 +543,7 @@ mod tests {
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
             circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
             circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            circle_verifying_key: None,
             session_encryption_key: None,
         })
     }

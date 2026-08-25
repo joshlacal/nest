@@ -1162,7 +1162,7 @@ async fn notification_hydration_deduplicates_actor_dids(pool: PgPool) {
 }
 
 #[tokio::test]
-async fn push_client_mints_valid_jwt_and_dispatches_to_nest() {
+async fn push_client_logs_only_static_content_on_nest_failure() {
     use circle_appview::push::NestPushClient;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1170,31 +1170,47 @@ async fn push_client_mints_valid_jwt_and_dispatches_to_nest() {
     let mock_server = MockServer::start().await;
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-    let service_did = "did:web:circles.catbird.blue";
-    let key_id = "did:web:circles.catbird.blue#atproto_circle";
-    let audience = "https://api.catbird.blue";
-
+    // Nest returns 502 (delivery failed). The AppView client must surface the
+    // error and emit only static log lines — never the recipient DID.
     Mock::given(method("POST"))
         .and(path("/internal/circle/push"))
         .and(header("content-type", "application/json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "status": "ok",
-            "delivered": 1
-        })))
+        .respond_with(ResponseTemplate::new(502))
         .mount(&mock_server)
         .await;
 
+    let log_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let buffer_writer = TestLogBuffer(log_bytes.clone());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(buffer_writer)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+
     let client = NestPushClient::new(
         format!("{}/internal/circle/push", mock_server.uri()),
-        service_did.to_string(),
-        key_id.to_string(),
-        audience.to_string(),
+        "did:web:circles.catbird.blue".to_string(),
+        "did:web:circles.catbird.blue#atproto_circle".to_string(),
+        "https://api.catbird.blue".to_string(),
         signing_key,
         reqwest::Client::new(),
     );
 
-    let delivered = client.deliver_circle_activity(BOB_DID).await.unwrap();
-    assert_eq!(delivered, 1);
+    let recipient = BOB_DID;
+    let result = client.deliver_circle_activity(recipient).await;
+    assert!(result.is_err(), "502 response must surface as an error");
+
+    let output = String::from_utf8_lossy(&log_bytes.lock().unwrap()).to_string();
+    assert!(
+        !output.contains(recipient),
+        "AppView push failure log leaked the recipient DID"
+    );
+    assert!(
+        output.contains("Nest push endpoint returned non-success status")
+            || output.contains("Failed to dispatch push notification trigger to Nest"),
+        "AppView must log a static failure message"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

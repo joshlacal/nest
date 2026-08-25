@@ -126,6 +126,7 @@ async fn create_test_state(
         dpop_nonce_cache,
         circle_capability,
         circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        circle_verifying_key: None,
         session_encryption_key: None,
     });
 

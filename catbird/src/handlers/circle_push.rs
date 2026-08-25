@@ -6,7 +6,7 @@ use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use axum::{
     extract::State,
-    http::{header, HeaderMap},
+    http::{header, HeaderMap, StatusCode},
     Json,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -70,7 +70,13 @@ pub async fn handle_circle_push(
         push_services
             .deliver_circle_activity(&input.recipient_did)
             .await
-            .unwrap_or(0)
+            .map_err(|_e| {
+                tracing::warn!("circle push delivery failed");
+                AppError::Upstream {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    message: "Circle push delivery failed".into(),
+                }
+            })?
     } else {
         0
     };
