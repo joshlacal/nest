@@ -85,6 +85,9 @@ pub async fn get_media(
         )
         .await?;
 
+    // Layered enforcement: DefaultSpaceHostTransport::get_blob streaming cap is the primary
+    // line of defense to abort oversized network transfers without exhausting memory.
+    // The handler-level check below acts as defense-in-depth / belt-and-suspenders.
     let max_bytes: usize = 20 * 1024 * 1024; // 20 MiB
     if bytes.len() > max_bytes {
         return Err(AppError::InvalidRequest(

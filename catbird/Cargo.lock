@@ -641,6 +641,7 @@ dependencies = [
  "jacquard-oauth",
  "jose-jwk",
  "lazy_static",
+ "multibase",
  "p256",
  "prometheus",
  "rand 0.8.5",

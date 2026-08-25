@@ -132,31 +132,41 @@ async fn verify_circle_service_jwt(state: &AppState, token: &str) -> AppResult<(
         return Err(AppError::Unauthorized("Invalid or missing lxm claim".into()));
     }
 
-    // Verify audience matches Nest's service DID or configured client ID
+    // Verify audience matches Nest's configured push service DID or client ID (never issuer DID)
     let push_did = state.config.push.service_did.as_deref();
     let client_id = &state.config.oauth.client_id;
-    let circle_did = &state.config.circle.service_did;
 
     let aud_matches = claims.aud == *client_id
-        || push_did.map(|d| d == claims.aud).unwrap_or(false)
-        || (!circle_did.is_empty() && claims.aud == *circle_did);
+        || push_did.map(|d| d == claims.aud).unwrap_or(false);
 
     if !aud_matches {
         return Err(AppError::Unauthorized("Audience mismatch".into()));
     }
 
-    // Verify signature if signature bytes present
+    // Verify issuer matches configured Circle service DID
+    let circle_service_did = &state.config.circle.service_did;
+    let base_circle_did = circle_service_did.split('#').next().unwrap_or(circle_service_did);
+    if !circle_service_did.is_empty() && claims.iss != *circle_service_did && claims.iss != base_circle_did {
+        return Err(AppError::Unauthorized("Issuer mismatch".into()));
+    }
+
+    // Cryptographically verify ES256 signature using the resolved Circle AppView verifying key
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| AppError::Unauthorized("Invalid signature base64".into()))?;
-    let _signing_input = format!("{}.{}", parts[0], parts[1]);
-    let _sig = p256::ecdsa::Signature::from_slice(&sig_bytes)
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig = p256::ecdsa::Signature::from_slice(&sig_bytes)
         .map_err(|_| AppError::Unauthorized("Invalid signature format".into()))?;
-    // If test verifying key is available, or if did_resolver is available, verify key
-    let circle_service_did = &state.config.circle.service_did;
-    if !circle_service_did.is_empty() && claims.iss != *circle_service_did && !claims.iss.starts_with("did:") {
-        return Err(AppError::Unauthorized("Issuer mismatch".into()));
-    }
+
+    let verifying_key = state
+        .circle_verifying_key
+        .as_deref()
+        .ok_or_else(|| AppError::Unauthorized("Circle verifying key not available".into()))?;
+
+    use p256::ecdsa::signature::Verifier;
+    verifying_key
+        .verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| AppError::Unauthorized("Invalid JWT signature".into()))?;
 
     Ok(())
 }

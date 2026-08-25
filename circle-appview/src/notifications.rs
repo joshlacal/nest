@@ -131,11 +131,11 @@ pub async fn list_notifications(
     }
 
     // Collect distinct actor DIDs for hydration
-    let actor_dids: Vec<String> = result_rows
-        .iter()
-        .map(|r| r.2.clone())
-        .collect();
-    let actor_did_refs: Vec<&str> = actor_dids.iter().map(|s| s.as_str()).collect();
+    let mut unique_dids = std::collections::HashSet::new();
+    for r in result_rows {
+        unique_dids.insert(r.2.as_str());
+    }
+    let actor_did_refs: Vec<&str> = unique_dids.into_iter().collect();
     let profiles = profile_hydrator
         .get_profiles(&actor_did_refs)
         .await;

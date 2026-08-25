@@ -51,7 +51,7 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
     match host {
         Host::Ipv4(ipv4) => {
             #[cfg(debug_assertions)]
-            if ipv4.is_loopback() && is_http {
+            if ipv4.is_loopback() {
                 tracing::debug!(scheme = %scheme, host = %host_str, "SSRF: Allowing loopback in debug mode");
                 return Ok(());
             }
@@ -77,10 +77,8 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
                 // Allow localhost only in debug mode with HTTP
                 #[cfg(debug_assertions)]
                 {
-                    if is_http {
-                        tracing::debug!(scheme = %scheme, host = %host_str, "SSRF: Allowing localhost in debug mode");
-                        return Ok(());
-                    }
+                    tracing::debug!(scheme = %scheme, host = %host_str, "SSRF: Allowing localhost in debug mode");
+                    return Ok(());
                 }
 
                 // In release mode, block localhost entirely

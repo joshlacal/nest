@@ -412,6 +412,8 @@ pub struct AppState {
     /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
     pub circle_capability: Arc<crate::services::CircleCapabilityService<crate::services::AtProtoCircleProbe>>,
+    /// Verifying key for Circle AppView push requests, resolved at startup or injected for testing
+    pub circle_verifying_key: Option<Arc<p256::ecdsa::VerifyingKey>>,
     /// Liveness flag for the Circle projection retry worker
     pub circle_worker_alive: Arc<std::sync::atomic::AtomicBool>,
     /// AES-256-GCM encryption key for Redis session records
@@ -493,6 +495,7 @@ impl AppState {
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
             circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            circle_verifying_key: None,
             session_encryption_key,
         };
         // Initialize KeyStore first (needed by OAuth client)
@@ -558,6 +561,27 @@ impl AppState {
             }
             if state.push_db.is_none() {
                 anyhow::bail!("PostgreSQL (push_db) is mandatory when Circle capability is enabled");
+            }
+        }
+        if !state.config.circle.service_did.is_empty() {
+            match crate::services::circle::resolve_circle_verifying_key(
+                &state.config.circle.service_did,
+                state.config.circle.plc_directory_url.as_deref(),
+            ).await {
+                Ok(vk) => {
+                    tracing::info!(
+                        did = %state.config.circle.service_did,
+                        "Resolved Circle AppView public key at startup"
+                    );
+                    state.circle_verifying_key = Some(Arc::new(vk));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        did = %state.config.circle.service_did,
+                        error = %e,
+                        "Failed to resolve Circle AppView public key at startup"
+                    );
+                }
             }
         }
 

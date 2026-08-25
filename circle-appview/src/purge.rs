@@ -97,12 +97,11 @@ pub async fn deactivate_author(pool: &PgPool, author: &str) -> Result<(), PurgeE
         .execute(&mut *tx)
         .await?;
 
-    // 4. Delete notifications where author is recipient
-    sqlx::query("DELETE FROM circle_notifications WHERE recipient_did = $1")
+    // 4. Delete notifications where author is recipient or actor
+    sqlx::query("DELETE FROM circle_notifications WHERE recipient_did = $1 OR actor_did = $1")
         .bind(author)
         .execute(&mut *tx)
         .await?;
-
     // 5. Delete preferences
     sqlx::query("DELETE FROM circle_preferences WHERE member_did = $1")
         .bind(author)

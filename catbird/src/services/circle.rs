@@ -2286,3 +2286,182 @@ impl CircleService {
         }
     }
 }
+
+/// Resolves the Circle AppView public verifying key from its DID document at startup
+/// using a safe pinned transport that enforces SSRF checks and DNS pinning.
+pub async fn resolve_circle_verifying_key(
+    service_did: &str,
+    plc_directory_url: Option<&str>,
+) -> Result<p256::ecdsa::VerifyingKey, anyhow::Error> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let (base_did, key_fragment) = match service_did.split_once('#') {
+        Some((base, frag)) => (base, Some(frag)),
+        None => (service_did, None),
+    };
+
+    let env_plc = std::env::var("PLC_DIRECTORY_URL").ok();
+    let plc_base_str = plc_directory_url
+        .or(env_plc.as_deref())
+        .unwrap_or("https://plc.directory");
+    let plc_base = plc_base_str.trim_end_matches('/');
+
+    let did_doc_url = if let Some(rest) = base_did.strip_prefix("did:plc:") {
+        format!("{plc_base}/did:plc:{rest}")
+    } else if let Some(rest) = base_did.strip_prefix("did:web:") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.is_empty() || parts[0].trim().is_empty() {
+            anyhow::bail!("Invalid did:web identifier");
+        }
+        let domain_decoded = urlencoding::decode(parts[0])
+            .map_err(|e| anyhow::anyhow!("Invalid did:web encoding: {e}"))?;
+        let (hostname, port) = if let Some((h, p)) = domain_decoded.split_once(':') {
+            let parsed_port: u16 = p.parse().map_err(|_| anyhow::anyhow!("Invalid did:web port"))?;
+            (h.to_string(), parsed_port)
+        } else {
+            (domain_decoded.to_string(), 443)
+        };
+        let url_path = if parts.len() == 1 {
+            "/.well-known/did.json".to_string()
+        } else {
+            let path_parts: Result<Vec<_>, _> = parts[1..]
+                .iter()
+                .map(|p| urlencoding::decode(p))
+                .collect();
+            let path = path_parts
+                .map_err(|e| anyhow::anyhow!("Invalid did:web path encoding: {e}"))?
+                .join("/");
+            format!("/{path}/did.json")
+        };
+        if port == 443 {
+            format!("https://{hostname}{url_path}")
+        } else {
+            format!("https://{hostname}:{port}{url_path}")
+        }
+    } else {
+        anyhow::bail!("Unsupported DID method: {base_did}");
+    };
+
+    // Validate URL against SSRF policy
+    crate::services::ssrf::validate_pds_url(&did_doc_url)
+        .map_err(|e| anyhow::anyhow!("DID document URL rejected by SSRF policy: {e}"))?;
+
+    let parsed_url = url::Url::parse(&did_doc_url)?;
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing host in DID document URL"))?;
+    let port = parsed_url.port_or_known_default().unwrap_or(443);
+
+    let addr_str = format!("{host}:{port}");
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
+        .await
+        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {host}: {e}"))?
+        .collect();
+
+    if addrs.is_empty() {
+        anyhow::bail!("DNS resolution returned no addresses for {host}");
+    }
+
+    for addr in &addrs {
+        #[cfg(debug_assertions)]
+        if addr.ip().is_loopback() {
+            continue;
+        }
+        if crate::services::ssrf::is_private_ip(&addr.ip()) {
+            anyhow::bail!(
+                "Host '{host}' resolved to restricted IP address: {}",
+                addr.ip()
+            );
+        }
+    }
+    #[cfg(debug_assertions)]
+    let did_doc_url = if addrs.iter().any(|a| a.ip().is_loopback()) {
+        did_doc_url.replace("https://", "http://")
+    } else {
+        did_doc_url
+    };
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .resolve_to_addrs(host, &addrs)
+        .build()?;
+
+    let resp = client.get(&did_doc_url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("DID document lookup returned status {}", resp.status());
+    }
+
+    let doc: serde_json::Value = resp.json().await?;
+    let methods = doc
+        .get("verificationMethod")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("DID document contains no verificationMethod"))?;
+
+    let mut selected_vm = None;
+    if let Some(frag) = key_fragment {
+        let frag_with_hash = format!("#{frag}");
+        let full_id = format!("{base_did}#{frag}");
+        for vm in methods {
+            if let Some(id_str) = vm.get("id").and_then(|v| v.as_str()) {
+                if id_str == frag
+                    || id_str == frag_with_hash
+                    || id_str == full_id
+                    || id_str.ends_with(&frag_with_hash)
+                {
+                    selected_vm = Some(vm);
+                    break;
+                }
+            }
+        }
+    }
+
+    if selected_vm.is_none() {
+        selected_vm = methods.first();
+    }
+
+    let vm = selected_vm.ok_or_else(|| anyhow::anyhow!("No matching verificationMethod found"))?;
+
+    if let Some(multibase_str) = vm.get("publicKeyMultibase").and_then(|v| v.as_str()) {
+        let (_base, decoded) = multibase::decode(multibase_str)
+            .map_err(|e| anyhow::anyhow!("Invalid publicKeyMultibase: {e}"))?;
+        if decoded.starts_with(&[0x80, 0x24]) {
+            let key_bytes = &decoded[2..];
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid P-256 SEC1 bytes: {e}"))?;
+            return Ok(vk);
+        }
+        anyhow::bail!("Unsupported multikey prefix in publicKeyMultibase");
+    }
+
+    if let Some(jwk) = vm.get("publicKeyJwk") {
+        let kty = jwk.get("kty").and_then(|v| v.as_str()).unwrap_or("");
+        let crv = jwk.get("crv").and_then(|v| v.as_str()).unwrap_or("");
+        if kty == "EC" && crv == "P-256" {
+            let x_str = jwk
+                .get("x")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing jwk.x"))?;
+            let y_str = jwk
+                .get("y")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing jwk.y"))?;
+            let x_bytes = URL_SAFE_NO_PAD.decode(x_str)?;
+            let y_bytes = URL_SAFE_NO_PAD.decode(y_str)?;
+            if x_bytes.len() != 32 || y_bytes.len() != 32 {
+                anyhow::bail!("Invalid coordinate lengths for P-256 JWK");
+            }
+            let mut point_bytes = Vec::with_capacity(65);
+            point_bytes.push(0x04);
+            point_bytes.extend_from_slice(&x_bytes);
+            point_bytes.extend_from_slice(&y_bytes);
+            let encoded_point = p256::EncodedPoint::from_bytes(&point_bytes)?;
+            let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&encoded_point)?;
+            return Ok(vk);
+        }
+        anyhow::bail!("Unsupported JWK key type or curve: {kty}/{crv}");
+    }
+
+    anyhow::bail!("verificationMethod contains neither publicKeyMultibase nor publicKeyJwk")
+}

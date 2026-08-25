@@ -912,7 +912,15 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         let lock = self.blob_responses.lock().unwrap();
         let res = lock.get(&key).or_else(|| lock.get(&alt_key)).cloned();
         Box::pin(async move {
-            res.ok_or_else(|| AppError::NotFound(format!("No mock get_blob configured for {key}")))
+            let (content_type, bytes) =
+                res.ok_or_else(|| AppError::NotFound(format!("No mock get_blob configured for {key}")))?;
+            let max_bytes: usize = 20 * 1024 * 1024; // 20 MiB streaming cap
+            if bytes.len() > max_bytes {
+                return Err(AppError::InvalidRequest(format!(
+                    "Blob stream exceeds maximum size limit of {max_bytes} bytes"
+                )));
+            }
+            Ok((content_type, bytes))
         })
     }
 }

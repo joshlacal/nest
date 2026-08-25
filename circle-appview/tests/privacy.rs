@@ -533,7 +533,22 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
         )
         .await;
 
-    // Seed Bob's post and Bob's notification
+    // Seed Alice's post, Bob's post, and notifications
+    let alice_post = format!("{SPACE_1}/app.bsky.feed.post/3l7alicepost");
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'cidalice', $2, $3, 'app.bsky.feed.post', '3l7alicepost', $4, now())
+        "#,
+    )
+    .bind(&alice_post)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(json!({"text": "Alice published post", "createdAt": Utc::now().to_rfc3339()}))
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let bob_post = format!("{SPACE_1}/app.bsky.feed.post/3l7bobpost");
     sqlx::query(
         r#"
@@ -561,6 +576,24 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
     .bind(ALICE_DID)
     .bind(&bob_post)
     .bind(format!("{SPACE_1}/app.bsky.feed.post/3l7alicereply"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert notification where Bob is actor (Bob liked Alice's post)
+    let bob_actor_notif_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+        "#,
+    )
+    .bind(bob_actor_notif_id)
+    .bind(ALICE_DID)
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .bind(&alice_post)
+    .bind(format!("{SPACE_1}/app.bsky.feed.like/3l7boblike"))
     .execute(&pool)
     .await
     .unwrap();
@@ -605,6 +638,13 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
         .unwrap();
     assert!(bob_record_active.is_none());
 
+    // Verify actor-sourced notifications where Bob is actor are also purged upon deactivation
+    let bob_actor_notif: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM circle_notifications WHERE actor_did = $1")
+        .bind(BOB_DID)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(bob_actor_notif.is_none());
     // 3. Delete SPACE_1
     delete_space(&pool, &setup.state.credential_store, SPACE_1).await.unwrap();
 
@@ -725,8 +765,39 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
     assert_ne!(resp.status(), StatusCode::OK);
 }
 
+#[derive(Clone)]
+struct TestLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for TestLogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogBuffer {
+    type Writer = TestLogBuffer;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
+    let log_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let buffer_writer = TestLogBuffer(log_bytes.clone());
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer_writer)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("Starting privacy tracing test verification run");
+
     let setup = setup_privacy_test(pool.clone()).await;
 
     sqlx::query(
@@ -743,7 +814,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
 
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
 
-    // Perform notification listing and preferences update
+    // Perform notification listing, preferences update, and reporting
     let alice_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.listNotifications", &setup.alice_key);
     let req = Request::builder()
         .uri("/xrpc/blue.catbird.circle.listNotifications")
@@ -768,4 +839,115 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
 
     let resp = setup.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify captured logs are non-empty and contain zero private identifiers/canaries
+    let log_output = String::from_utf8_lossy(&log_bytes.lock().unwrap()).to_string();
+    assert!(!log_output.is_empty(), "Tracing subscriber should have captured log events");
+
+    let forbidden_canaries = [
+        ALICE_DID,
+        BOB_DID,
+        DAVE_DID,
+        SPACE_1,
+        SPACE_2,
+        "Super secret private post text",
+        "bafkreiblobcanary12345",
+        "at://did:plc:alice-privacy-owner/app.bsky.feed.post/3l7canary",
+        "space=at%3A%2F%2F",
+    ];
+
+    for canary in forbidden_canaries {
+        assert!(
+            !log_output.contains(canary),
+            "Log output leaked private identifier or text: '{canary}'. Captured logs:\n{log_output}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn notification_hydration_deduplicates_actor_dids(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Dedupe Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+
+    // Insert 5 notifications all from BOB_DID to ALICE_DID
+    for i in 0..5 {
+        sqlx::query(
+            r#"
+            INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+            VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(ALICE_DID)
+        .bind(SPACE_1)
+        .bind(BOB_DID)
+        .bind(format!("{SPACE_1}/app.bsky.feed.post/3l7post{i}"))
+        .bind(format!("{SPACE_1}/app.bsky.feed.like/3l7like{i}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let alice_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.listNotifications", &setup.alice_key);
+    let req = Request::builder()
+        .uri("/xrpc/blue.catbird.circle.listNotifications")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let output: ListNotificationsOutput = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(output.notifications.len(), 5);
+    for notif in output.notifications {
+        assert_eq!(notif.actor.did.as_str(), BOB_DID);
+    }
+}
+
+#[tokio::test]
+async fn push_client_mints_valid_jwt_and_dispatches_to_nest() {
+    use circle_appview::push::NestPushClient;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+    let service_did = "did:web:circles.catbird.blue#atproto_circle";
+    let audience = "https://api.catbird.blue";
+
+    Mock::given(method("POST"))
+        .and(path("/internal/circle/push"))
+        .and(header("content-type", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "delivered": 1
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = NestPushClient::new(
+        format!("{}/internal/circle/push", mock_server.uri()),
+        service_did.to_string(),
+        audience.to_string(),
+        signing_key,
+        reqwest::Client::new(),
+    );
+
+    let delivered = client.deliver_circle_activity(BOB_DID).await.unwrap();
+    assert_eq!(delivered, 1);
 }

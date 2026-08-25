@@ -12,6 +12,7 @@ pub mod notifications;
 pub mod preferences;
 pub mod projections;
 pub mod purge;
+pub mod push;
 pub mod reports;
 pub mod routes;
 pub mod space_client;
@@ -25,3 +26,4 @@ pub use auth::{
 pub use config::{AppState, Config};
 pub use error::AppError;
 pub use routes::create_router;
+pub use push::NestPushClient;
