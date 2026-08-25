@@ -545,3 +545,46 @@ pub async fn activate_space(
     }
     Ok(expires_at)
 }
+
+pub async fn check_active_lease(
+    pool: &sqlx::PgPool,
+    space_uri: &str,
+    user_did: &str,
+) -> Result<(), AppError> {
+    let circle_row: Option<(
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            c.deleted_at,
+            m.status,
+            a.expires_at
+        FROM circles c
+        LEFT JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $2
+        LEFT JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $2
+        WHERE c.space_uri = $1
+        "#,
+    )
+    .bind(space_uri)
+    .bind(user_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    match circle_row {
+        None => Err(AppError::NotFound("Space not found".into())),
+        Some((Some(_), _, _)) => Err(AppError::NotFound("Space deleted".into())),
+        Some((None, member_status, expires_at)) => {
+            let is_active = member_status.as_deref() == Some("active");
+            let has_lease = expires_at.is_some_and(|exp| exp > Utc::now());
+            if !is_active || !has_lease {
+                return Err(AppError::AccessRemoved(
+                    "No active access lease for this Circle".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}

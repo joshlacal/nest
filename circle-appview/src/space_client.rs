@@ -111,6 +111,22 @@ pub trait SpaceHostTransport: Send + Sync {
             ))
         })
     }
+
+    fn get_blob<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        _space_uri: &'a str,
+        _did: &'a str,
+        _cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound(
+                "get_blob not implemented on transport".into(),
+            ))
+        })
+    }
 }
 
 pub trait SpaceHostDnsResolver: Send + Sync {
@@ -564,6 +580,74 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             Ok(output.commit)
         })
     }
+
+    fn get_blob<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_credential: &'a str,
+        dpop_proof: &'a str,
+        space_uri: &'a str,
+        did: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_credential = space_credential.to_string();
+        let dpop_proof = dpop_proof.to_string();
+        let space_uri = space_uri.to_string();
+        let did = did.to_string();
+        let cid = cid.to_string();
+
+        Box::pin(async move {
+            let client = self.build_pinned_client(&target_url).await?;
+
+            let mut req_url = target_url.clone();
+            req_url
+                .query_pairs_mut()
+                .append_pair("space", &space_uri)
+                .append_pair("did", &did)
+                .append_pair("cid", &cid);
+
+            let mut response = client
+                .get(req_url.as_str())
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("DPoP {space_credential}"),
+                )
+                .header("DPoP", dpop_proof)
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!(
+                    "Space host getBlob returned {}",
+                    response.status()
+                )));
+            }
+
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            let max_bytes: usize = 20 * 1024 * 1024; // 20 MiB cap
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed reading getBlob stream: {e}")))?
+            {
+                if bytes.len() + chunk.len() > max_bytes {
+                    return Err(AppError::InvalidRequest(format!(
+                        "Blob stream exceeds maximum size limit of {max_bytes} bytes"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok((content_type, bytes))
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -593,6 +677,7 @@ pub struct MockSpaceHostTransport {
     latest_commits:
         Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::SignedCommit>>,
     calls: Mutex<Vec<RecordedSpaceHostCall>>,
+    blob_responses: Mutex<HashMap<String, (Option<String>, Vec<u8>)>>,
 }
 
 impl Default for MockSpaceHostTransport {
@@ -610,6 +695,7 @@ impl MockSpaceHostTransport {
             get_repo_responses: Mutex::new(HashMap::new()),
             latest_commits: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
+            blob_responses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -648,6 +734,16 @@ impl MockSpaceHostTransport {
     ) {
         let mut lock = self.latest_commits.lock().unwrap();
         lock.insert(space_and_repo.to_string(), commit);
+    }
+
+    pub fn set_blob_response(
+        &self,
+        key: &str,
+        content_type: Option<String>,
+        data: Vec<u8>,
+    ) {
+        let mut lock = self.blob_responses.lock().unwrap();
+        lock.insert(key.to_string(), (content_type, data));
     }
 
     pub fn recorded_calls(&self) -> Vec<RecordedSpaceHostCall> {
@@ -799,6 +895,24 @@ impl SpaceHostTransport for MockSpaceHostTransport {
             res.ok_or_else(|| {
                 AppError::NotFound(format!("No mock get_latest_commit configured for {key}"))
             })
+        })
+    }
+
+    fn get_blob<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        space_uri: &'a str,
+        did: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>> {
+        let key = format!("{space_uri}:{did}:{cid}");
+        let alt_key = format!("{did}:{cid}");
+        let lock = self.blob_responses.lock().unwrap();
+        let res = lock.get(&key).or_else(|| lock.get(&alt_key)).cloned();
+        Box::pin(async move {
+            res.ok_or_else(|| AppError::NotFound(format!("No mock get_blob configured for {key}")))
         })
     }
 }
@@ -972,6 +1086,30 @@ impl SpaceClient {
                 &dpop_proof,
                 space_uri,
                 repo_did,
+            )
+            .await
+    }
+
+    pub async fn get_blob(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+        did: &str,
+        cid: &str,
+        space_credential: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+    ) -> Result<(Option<String>, Vec<u8>), AppError> {
+        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getBlob")?;
+        let dpop_proof =
+            create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        self.transport
+            .get_blob(
+                &xrpc_url,
+                space_credential,
+                &dpop_proof,
+                space_uri,
+                did,
+                cid,
             )
             .await
     }

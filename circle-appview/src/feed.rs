@@ -40,8 +40,8 @@ pub fn decode_cursor(cursor_str: &str) -> Result<FeedCursor, AppError> {
 pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
     if let Some(col_idx) = uri.rfind("/app.bsky.") {
         let prefix = &uri[..col_idx];
-        if let Some(slash_idx) = prefix.rfind('/') {
-            let did = &prefix[slash_idx + 1..];
+        if let Some(after_at) = prefix.strip_prefix("at://") {
+            let did = after_at.split('/').next().unwrap_or(after_at);
             let rest = &uri[col_idx..];
             return format!("at://{did}{rest}");
         }

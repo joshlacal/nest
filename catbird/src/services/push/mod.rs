@@ -43,6 +43,17 @@ pub struct PushServices {
     pub apns: Option<ApnsDelivery>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CircleActivityPayload {
+    pub kind: String,
+}
+
+pub fn circle_activity_payload() -> CircleActivityPayload {
+    CircleActivityPayload {
+        kind: "circle_activity".to_string(),
+    }
+}
+
 impl PushServices {
     pub fn new(db_pool: Pool<Postgres>, config: PushConfig) -> Result<Self> {
         let service_did = config
@@ -612,6 +623,37 @@ impl PushServices {
             tracing::warn!("Chat push Redis subscription stream ended; reconnecting...");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+    }
+
+    pub async fn deliver_circle_activity(&self, recipient_did: &str) -> Result<usize> {
+        let registrations = self.registry.list_active_registrations(recipient_did).await?;
+        if registrations.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(apns) = &self.apns else {
+            return Ok(0);
+        };
+
+        let mut custom_data = std::collections::HashMap::new();
+        custom_data.insert("kind".to_string(), "circle_activity".to_string());
+
+        let notification = apns::ApnsNotification {
+            title: String::new(),
+            body: String::new(),
+            user_did: recipient_did.to_string(),
+            custom_data,
+            mutable_content: true,
+            thread_id: None,
+        };
+
+        let mut delivered = 0;
+        for reg in &registrations {
+            if apns.send(reg, &notification).await.is_ok() {
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
     }
 }
 

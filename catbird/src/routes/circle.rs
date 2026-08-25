@@ -1,7 +1,7 @@
 //! Circle routes definition
 
 use crate::config::AppState;
-use crate::handlers::circle;
+use crate::handlers::{circle, circle_push};
 use axum::{
     routing::{get, post},
     Router,
@@ -21,6 +21,7 @@ pub fn create_routes() -> Router<Arc<AppState>> {
         .route("/blue.catbird.circle.reportRecord", post(circle::report_record))
         .route("/blue.catbird.circle.getFeed", get(circle::get_feed))
         .route("/blue.catbird.circle.getPostThread", get(circle::get_post_thread))
+        .route("/internal/circle/push", post(circle_push::handle_circle_push))
         .route("/blue.catbird.circle.listNotifications", get(circle::list_notifications))
         .route("/blue.catbird.circle.getMedia", get(circle::get_media))
 }
@@ -37,6 +38,7 @@ pub fn routes(state: AppState) -> Router {
         .route("/xrpc/blue.catbird.circle.updatePreferences", post(circle::update_preferences))
         .route("/xrpc/blue.catbird.circle.reportRecord", post(circle::report_record))
         .route("/xrpc/blue.catbird.circle.getFeed", get(circle::get_feed))
+        .route("/internal/circle/push", post(circle_push::handle_circle_push))
         .route("/xrpc/blue.catbird.circle.getPostThread", get(circle::get_post_thread))
         .route("/xrpc/blue.catbird.circle.listNotifications", get(circle::list_notifications))
         .route("/xrpc/blue.catbird.circle.getMedia", get(circle::get_media))

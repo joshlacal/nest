@@ -10,7 +10,6 @@ use catbird_atproto::generated::blue_catbird::circle::{
     defs::AccessState,
     get_capabilities::GetCapabilitiesOutput,
     list_circles::{ListCircles, ListCirclesOutput},
-    list_notifications::{ListNotifications, ListNotificationsOutput},
 };
 use catbird_atproto::jacquard_common::types::string::Datetime;
 use serde::{Deserialize, Serialize};
@@ -55,7 +54,19 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/xrpc/blue.catbird.circle.listNotifications",
-            get(list_notifications_handler),
+            get(crate::handlers::notifications::list_notifications_handler),
+        )
+        .route(
+            "/xrpc/blue.catbird.circle.getMedia",
+            get(crate::handlers::media::get_media_handler),
+        )
+        .route(
+            "/xrpc/blue.catbird.circle.updatePreferences",
+            post(crate::handlers::moderation::update_preferences_handler),
+        )
+        .route(
+            "/xrpc/blue.catbird.circle.reportRecord",
+            post(crate::handlers::moderation::report_record_handler),
         )
         .route(
             "/xrpc/blue.catbird.circle.activateSpace",
@@ -101,19 +112,6 @@ async fn list_circles_handler(
     }))
 }
 
-async fn list_notifications_handler(
-    Extension(_user): Extension<AuthenticatedUser>,
-    Query(_query): Query<ListNotifications>,
-    State(_state): State<AppState>,
-) -> Result<Json<ListNotificationsOutput>, AppError> {
-    tracing::debug!("Handling listNotifications request");
-
-    Ok(Json(ListNotificationsOutput {
-        notifications: Vec::new(),
-        cursor: None,
-        extra_data: None,
-    }))
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

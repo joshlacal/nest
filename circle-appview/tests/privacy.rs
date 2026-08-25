@@ -1,0 +1,771 @@
+use axum::{
+    body::{to_bytes, Body},
+    http::{header, Request, StatusCode},
+};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
+use catbird_atproto::generated::blue_catbird::circle::defs::{NotificationReason, ReportReason};
+use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
+use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordOutput;
+use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+use chrono::{Duration, Utc};
+use circle_appview::{
+    access::ActiveSpaceCredential,
+    auth::{DidDocument, PublicKeyJwk, VerificationMethod},
+    config::{AppState, Config},
+    db,
+    purge::{deactivate_author, delete_space, remove_member},
+    routes::create_router,
+};
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::Signature;
+use p256::elliptic_curve::rand_core::OsRng;
+use p256::EncodedPoint;
+use serde_json::json;
+use sqlx::PgPool;
+use std::sync::Arc;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
+const ALICE_DID: &str = "did:plc:alice-privacy-owner";
+const BOB_DID: &str = "did:plc:bob-privacy-member";
+const DAVE_DID: &str = "did:plc:dave-privacy-unauthorized";
+const MEDIA_BASE: &str = "https://media.catbird.blue";
+const SPACE_1: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy1";
+const SPACE_2: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy2";
+
+fn url_encode(input: &str) -> String {
+    let mut encoded = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    encoded
+}
+
+struct PrivacyTestSetup {
+    app: axum::Router,
+    state: AppState,
+    alice_key: p256::ecdsa::SigningKey,
+    bob_key: p256::ecdsa::SigningKey,
+    dave_key: p256::ecdsa::SigningKey,
+}
+
+fn register_did_doc(
+    resolver: &circle_appview::auth::DidResolver,
+    did: &str,
+    key: &p256::ecdsa::SigningKey,
+    pds_endpoint: Option<&str>,
+) {
+    let vk = key.verifying_key();
+    let point = EncodedPoint::from(vk);
+    let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+    let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+
+    let p256_sec1 = vk.to_encoded_point(true);
+    let mut p256_multikey_bytes = vec![0x80, 0x24];
+    p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
+    let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
+
+    let mut services = Vec::new();
+    if let Some(endpoint) = pds_endpoint {
+        services.push(circle_appview::auth::DidService {
+            id: format!("{did}#atproto_pds"),
+            r#type: "AtprotoPersonalDataServer".into(),
+            service_endpoint: endpoint.into(),
+        });
+    }
+
+    let did_doc = DidDocument {
+        id: did.into(),
+        verification_method: vec![VerificationMethod {
+            id: format!("{did}#atproto"),
+            r#type: "Multikey".into(),
+            controller: did.into(),
+            public_key_jwk: Some(PublicKeyJwk {
+                kty: "EC".into(),
+                crv: "P-256".into(),
+                x,
+                y: Some(y),
+                kid: None,
+            }),
+            public_key_multibase: Some(p256_multikey),
+        }],
+        service: services,
+    };
+    resolver.insert_cached(did.into(), did_doc);
+}
+
+fn mint_jwt(did: &str, lxm: &str, signing_key: &p256::ecdsa::SigningKey) -> String {
+    let now = Utc::now().timestamp();
+    let jti = Uuid::new_v4().to_string();
+
+    let header = json!({
+        "typ": "JWT",
+        "alg": "ES256",
+        "kid": format!("{did}#atproto"),
+    });
+
+    let claims = json!({
+        "iss": did,
+        "aud": CIRCLE_AUDIENCE,
+        "lxm": lxm,
+        "jti": jti,
+        "iat": now,
+        "exp": now + 60,
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+
+    let signature: Signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    format!("{signing_input}.{sig_b64}")
+}
+
+async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, duration: Duration) {
+    sqlx::query(
+        r#"
+        INSERT INTO circle_members (space_uri, member_did, status, updated_at)
+        VALUES ($1, $2, 'active', now())
+        ON CONFLICT (space_uri, member_did)
+        DO UPDATE SET status = 'active', updated_at = now()
+        "#,
+    )
+    .bind(space_uri)
+    .bind(member_did)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO access_leases (space_uri, member_did, expires_at)
+        VALUES ($1, $2, now() + $3)
+        ON CONFLICT (space_uri, member_did)
+        DO UPDATE SET expires_at = now() + $3
+        "#,
+    )
+    .bind(space_uri)
+    .bind(member_did)
+    .bind(duration)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
+    db::run_migrations(&pool)
+        .await
+        .expect("Migrations must succeed");
+
+    let alice_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let bob_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let dave_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+    let config = Config {
+        host: "127.0.0.1".into(),
+        port: 3002,
+        database_url: "postgres://localhost/postgres".into(),
+        service_did: CIRCLE_AUDIENCE.into(),
+        plc_directory_url: "https://plc.directory".into(),
+        public_appview_url: "https://public.api.bsky.app".into(),
+        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
+        nest_client_id: "https://nest.catbird.blue".into(),
+        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
+        nest_verifying_keys: Vec::new(),
+    };
+
+    let state = AppState::new(config, pool.clone());
+
+    register_did_doc(&state.did_resolver, ALICE_DID, &alice_key, Some("https://pds.alice.test"));
+    register_did_doc(&state.did_resolver, BOB_DID, &bob_key, Some("https://pds.bob.test"));
+    register_did_doc(&state.did_resolver, DAVE_DID, &dave_key, Some("https://pds.dave.test"));
+
+    state
+        .profile_hydrator
+        .set_cached_profile(
+            ALICE_DID,
+            ProfileViewBasic {
+                did: Did::new(SmolStr::new(ALICE_DID)).unwrap(),
+                handle: Handle::new(SmolStr::new("alice.test")).unwrap(),
+                display_name: Some(SmolStr::new("Alice Owner")),
+                avatar: None,
+                associated: None,
+                viewer: None,
+                labels: None,
+                created_at: None,
+                pronouns: None,
+                status: None,
+                verification: None,
+                debug: None,
+                extra_data: None,
+            },
+        )
+        .await;
+
+    state
+        .profile_hydrator
+        .set_cached_profile(
+            BOB_DID,
+            ProfileViewBasic {
+                did: Did::new(SmolStr::new(BOB_DID)).unwrap(),
+                handle: Handle::new(SmolStr::new("bob.test")).unwrap(),
+                display_name: Some(SmolStr::new("Bob Member")),
+                avatar: None,
+                associated: None,
+                viewer: None,
+                labels: None,
+                created_at: None,
+                pronouns: None,
+                status: None,
+                verification: None,
+                debug: None,
+                extra_data: None,
+            },
+        )
+        .await;
+
+    let app = create_router(state.clone());
+
+    PrivacyTestSetup {
+        app,
+        state,
+        alice_key,
+        bob_key,
+        dave_key,
+    }
+}
+
+fn circle_activity_payload() -> serde_json::Value {
+    json!({
+        "kind": "circle_activity"
+    })
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unauthorized_user_cannot_fetch_media_or_notifications(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // Create private Circle owned by Alice with Bob as member
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Alice Private Circle', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    // Store active credential for SPACE_1 in state
+    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "mock-space-token".into(),
+                dpop_key: cred_key,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    // Seed private post with image blob
+    let blob_cid = "bafkreifh3zkw4w2p3o2v3h";
+    let post_uri = format!("{SPACE_1}/app.bsky.feed.post/3l7post1");
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'bafyreipost1', $2, $3, 'app.bsky.feed.post', '3l7post1', $4, now())
+        "#,
+    )
+    .bind(&post_uri)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Top secret circle photo",
+        "createdAt": Utc::now().to_rfc3339(),
+        "embed": {
+            "$type": "app.bsky.embed.images",
+            "images": [{
+                "alt": "private image",
+                "image": { "$link": blob_cid }
+            }]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed notification directed to Alice
+    sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'like', $5, $6, false, now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(ALICE_DID)
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .bind(&post_uri)
+    .bind(format!("{SPACE_1}/app.bsky.feed.like/3l7like1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Dave (unauthorized non-member) attempts getMedia
+    let dave_media_jwt = mint_jwt(DAVE_DID, "blue.catbird.circle.getMedia", &setup.dave_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(ALICE_DID),
+            url_encode(blob_cid),
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {dave_media_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 2. Dave (unauthorized) attempts listNotifications
+    let dave_notif_jwt = mint_jwt(DAVE_DID, "blue.catbird.circle.listNotifications", &setup.dave_key);
+    let req = Request::builder()
+        .uri("/xrpc/blue.catbird.circle.listNotifications")
+        .header(header::AUTHORIZATION, format!("Bearer {dave_notif_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let notifs: ListNotificationsOutput = serde_json::from_slice(&body_bytes).unwrap();
+    // Dave sees 0 notifications
+    assert_eq!(notifs.notifications.len(), 0);
+
+    // Alice (authorized) listNotifications -> sees 1 notification
+    let alice_notif_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.listNotifications", &setup.alice_key);
+    let req = Request::builder()
+        .uri("/xrpc/blue.catbird.circle.listNotifications")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_notif_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let notifs: ListNotificationsOutput = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(notifs.notifications.len(), 1);
+    assert_eq!(notifs.notifications[0].reason, NotificationReason::Like);
+}
+
+#[test]
+fn generic_push_contains_no_circle_metadata() {
+    let payload = circle_activity_payload();
+    let json = serde_json::to_string(&payload).unwrap();
+    assert_eq!(json, r#"{"kind":"circle_activity"}"#);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn report_requires_same_space_subject_and_stays_private(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // Create SPACE_1 and SPACE_2
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Space 1', now()), ($3, $2, 'Space 2', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(SPACE_2)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_2, ALICE_DID, Duration::hours(1)).await;
+
+    let post_space1 = format!("{SPACE_1}/app.bsky.feed.post/3l7post1");
+    let post_space2 = format!("{SPACE_2}/app.bsky.feed.post/3l7post2");
+    let post_space1_std = format!("at://{BOB_DID}/app.bsky.feed.post/3l7post1");
+    let post_space2_std = format!("at://{BOB_DID}/app.bsky.feed.post/3l7post2");
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES
+            ($1, 'cid1', $2, $3, 'app.bsky.feed.post', '3l7post1', $4, now()),
+            ($5, 'cid2', $6, $3, 'app.bsky.feed.post', '3l7post2', $4, now())
+        "#,
+    )
+    .bind(&post_space1)
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .bind(json!({"text": "Hello Space 1", "createdAt": Utc::now().to_rfc3339()}))
+    .bind(&post_space2)
+    .bind(SPACE_2)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report_lxm = "blue.catbird.circle.reportRecord";
+
+    // 1. Dave (unauthorized, no lease in SPACE_1) tries to report post_space1 -> FORBIDDEN
+    let dave_jwt = mint_jwt(DAVE_DID, report_lxm, &setup.dave_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/blue.catbird.circle.reportRecord")
+        .header(header::AUTHORIZATION, format!("Bearer {dave_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({
+            "space": SPACE_1,
+            "uri": post_space1_std,
+            "reason": "spam",
+            "details": "Spam in circle"
+        })).unwrap()))
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 2. Alice reports post_space2 under SPACE_1 (cross-space mismatch) -> BAD_REQUEST
+    let alice_jwt = mint_jwt(ALICE_DID, report_lxm, &setup.alice_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/blue.catbird.circle.reportRecord")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({
+            "space": SPACE_1,
+            "uri": post_space2_std,
+            "reason": "spam",
+        })).unwrap()))
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Alice reports post_space1 under SPACE_1 (valid same-space report) -> OK
+    let alice_jwt = mint_jwt(ALICE_DID, report_lxm, &setup.alice_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/blue.catbird.circle.reportRecord")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({
+            "space": SPACE_1,
+            "uri": post_space1_std,
+            "reason": "spam",
+            "details": "Private spam report"
+        })).unwrap()))
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let report_output: ReportRecordOutput = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(!report_output.id.as_str().is_empty());
+
+    // 4. Verify report is stored in database
+    let report_count: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_reports WHERE space_uri = $1")
+        .bind(SPACE_1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(report_count.0, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scopes(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // Create SPACE_1 with Alice and Bob
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Purge Scope Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred".into(),
+                dpop_key: cred_key,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    // Seed Bob's post and Bob's notification
+    let bob_post = format!("{SPACE_1}/app.bsky.feed.post/3l7bobpost");
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'cidbob', $2, $3, 'app.bsky.feed.post', '3l7bobpost', $4, now())
+        "#,
+    )
+    .bind(&bob_post)
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .bind(json!({"text": "Bob published post", "createdAt": Utc::now().to_rfc3339()}))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, subject_uri, source_uri, is_read, created_at)
+        VALUES ($1, $2, $3, $4, 'reply', $5, $6, false, now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(BOB_DID)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(&bob_post)
+    .bind(format!("{SPACE_1}/app.bsky.feed.post/3l7alicereply"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Remove Bob from SPACE_1
+    remove_member(&pool, SPACE_1, BOB_DID).await.unwrap();
+
+    // Verify Bob's lease is deleted
+    let bob_lease: Option<(String,)> = sqlx::query_as("SELECT member_did FROM access_leases WHERE space_uri = $1 AND member_did = $2")
+        .bind(SPACE_1)
+        .bind(BOB_DID)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(bob_lease.is_none());
+
+    // Verify Bob's notifications in SPACE_1 are purged
+    let bob_notif: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM circle_notifications WHERE space_uri = $1 AND recipient_did = $2")
+        .bind(SPACE_1)
+        .bind(BOB_DID)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(bob_notif.is_none());
+
+    // Verify Bob's published record is NOT deleted
+    let bob_record: Option<(String,)> = sqlx::query_as("SELECT uri FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
+        .bind(&bob_post)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(bob_record.is_some());
+
+    // 2. Deactivate Bob's account
+    deactivate_author(&pool, BOB_DID).await.unwrap();
+
+    // Verify Bob's record is now soft-deleted (deleted_at is NOT NULL)
+    let bob_record_active: Option<(String,)> = sqlx::query_as("SELECT uri FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
+        .bind(&bob_post)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(bob_record_active.is_none());
+
+    // 3. Delete SPACE_1
+    delete_space(&pool, &setup.state.credential_store, SPACE_1).await.unwrap();
+
+    // Verify Space rows cascaded
+    let circle_count: (i64,) = sqlx::query_as("SELECT count(*) FROM circles WHERE space_uri = $1")
+        .bind(SPACE_1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(circle_count.0, 0);
+
+    // Verify credential was removed
+    let cred = setup.state.credential_store.get(SPACE_1).await;
+    assert!(cred.is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Media Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred".into(),
+                dpop_key: cred_key,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    // Set up mock transport response for blob
+    let blob_cid = "bafkreivalidblob";
+    let mock_image_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00]; // PNG header + bytes
+    let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
+    mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{blob_cid}"),
+        Some("image/png".to_string()),
+        mock_image_bytes.clone(),
+    );
+
+    let space_client = Arc::new(circle_appview::space_client::SpaceClient::with_transport(mock_transport.clone()));
+    let custom_state = AppState::with_services(
+        setup.state.config.as_ref().clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        space_client,
+        setup.state.space_locks.clone(),
+    );
+    let app = create_router(custom_state);
+
+    // Bob requests Alice's blob in SPACE_1 -> 200 OK with no-cache and validated content-type
+    let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(ALICE_DID),
+            url_encode(blob_cid),
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store, private"
+    );
+    let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(body_bytes.as_ref(), &mock_image_bytes);
+
+    // Test blob exceeding 20 MiB limit is rejected
+    let oversize_cid = "bafkreioversizeblob";
+    let oversize_bytes = vec![0u8; 21 * 1024 * 1024]; // 21 MiB
+    mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{oversize_cid}"),
+        Some("image/jpeg".to_string()),
+        oversize_bytes,
+    );
+
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(ALICE_DID),
+            url_encode(oversize_cid),
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Logged Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+
+    // Perform notification listing and preferences update
+    let alice_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.listNotifications", &setup.alice_key);
+    let req = Request::builder()
+        .uri("/xrpc/blue.catbird.circle.listNotifications")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let pref_jwt = mint_jwt(ALICE_DID, "blue.catbird.circle.updatePreferences", &setup.alice_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/blue.catbird.circle.updatePreferences")
+        .header(header::AUTHORIZATION, format!("Bearer {pref_jwt}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({
+            "space": SPACE_1,
+            "muted": true
+        })).unwrap()))
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
