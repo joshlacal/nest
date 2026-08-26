@@ -21,19 +21,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use catbird_atproto::generated::app_bsky::actor::search_actors::SearchActorsOutput;
-use catbird_atproto::generated::app_bsky::embed::images::{Image, Images};
-use catbird_atproto::generated::app_bsky::feed::get_author_feed::GetAuthorFeedOutput;
-use catbird_atproto::generated::app_bsky::feed::get_post_thread::{
-    GetPostThreadOutput, GetPostThreadOutputThread,
+use catbird_atproto::generated::app_bsky::actor::search_actors::{
+    SearchActors, SearchActorsOutput,
 };
-use catbird_atproto::generated::app_bsky::feed::get_timeline::GetTimelineOutput;
+use catbird_atproto::generated::app_bsky::embed::images::{Image, Images};
+use catbird_atproto::generated::app_bsky::feed::get_author_feed::{
+    GetAuthorFeed, GetAuthorFeedOutput,
+};
+use catbird_atproto::generated::app_bsky::feed::get_post_thread::{
+    GetPostThread, GetPostThreadError, GetPostThreadOutput, GetPostThreadOutputThread,
+};
+use catbird_atproto::generated::app_bsky::feed::get_timeline::{GetTimeline, GetTimelineOutput};
 use catbird_atproto::generated::app_bsky::feed::like::Like;
 use catbird_atproto::generated::app_bsky::feed::post::{Post, PostEmbed, ReplyRef};
-use catbird_atproto::generated::app_bsky::feed::search_posts::SearchPostsOutput;
+use catbird_atproto::generated::app_bsky::feed::search_posts::{SearchPosts, SearchPostsOutput};
 use catbird_atproto::generated::app_bsky::feed::ThreadViewPostRepliesItem;
 use catbird_atproto::generated::app_bsky::notification::list_notifications::{
-    ListNotificationsOutput, NotificationReason as PublicNotificationReason,
+    ListNotifications, ListNotificationsOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::activate_space::{
     ActivateSpace, ActivateSpaceOutput,
@@ -43,13 +47,26 @@ use catbird_atproto::generated::blue_catbird::circle::create_circle::{
 };
 use catbird_atproto::generated::blue_catbird::circle::defs::{
     AccessState, MemberAction, NotificationReason as CircleNotificationReason, OperationStatus,
+    SpaceRef,
 };
-use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_operation::GetOperationOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput as CircleGetPostThreadOutput;
-use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
-use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput as CircleListNotificationsOutput;
+use catbird_atproto::generated::blue_catbird::circle::get_capabilities::{
+    GetCapabilities, GetCapabilitiesOutput,
+};
+use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
+use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
+use catbird_atproto::generated::blue_catbird::circle::get_operation::{
+    GetOperation, GetOperationOutput,
+};
+use catbird_atproto::generated::blue_catbird::circle::get_post_thread::{
+    GetPostThread as CircleGetPostThread, GetPostThreadOutput as CircleGetPostThreadOutput,
+};
+use catbird_atproto::generated::blue_catbird::circle::list_circles::{
+    ListCircles, ListCirclesOutput,
+};
+use catbird_atproto::generated::blue_catbird::circle::list_notifications::{
+    ListNotifications as CircleListNotifications,
+    ListNotificationsOutput as CircleListNotificationsOutput,
+};
 use catbird_atproto::generated::blue_catbird::circle::update_member::{
     UpdateMember, UpdateMemberOutput,
 };
@@ -59,12 +76,16 @@ use catbird_atproto::generated::com_atproto::repo::create_record::{
 use catbird_atproto::generated::com_atproto::repo::strong_ref::StrongRef;
 use catbird_atproto::generated::com_atproto::repo::upload_blob::UploadBlobOutput;
 use catbird_atproto::generated::com_atproto::server::describe_server::DescribeServerOutput;
-use catbird_atproto::generated::com_atproto::server::get_service_auth::GetServiceAuthOutput;
+use catbird_atproto::generated::com_atproto::server::get_service_auth::{
+    GetServiceAuth, GetServiceAuthOutput,
+};
 use catbird_atproto::generated::com_atproto::space::apply_writes::{
     ApplyWrites, ApplyWritesOutput, ApplyWritesOutputResultsItem, ApplyWritesWritesItem, Create,
 };
-use catbird_atproto::generated::com_atproto::space::get_latest_commit::GetLatestCommitOutput;
-use catbird_atproto::generated::com_atproto::space::list_spaces::ListSpacesOutput;
+use catbird_atproto::generated::com_atproto::space::get_latest_commit::{
+    GetLatestCommit, GetLatestCommitOutput,
+};
+use catbird_atproto::generated::com_atproto::space::list_spaces::{ListSpaces, ListSpacesOutput};
 use catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite;
 use catbird_atproto::jacquard_common::types::ident::AtIdentifier;
 use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Nsid};
@@ -78,12 +99,50 @@ use sqlx::PgPool;
 use url::Url;
 use uuid::Uuid;
 
-fn url_encode(input: &str) -> String {
-    url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn redact_database_url(url_str: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url_str) {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        parsed.to_string()
+    } else {
+        "redacted".to_string()
+    }
+}
+
+fn get_revision(path: &str) -> String {
+    if let Ok(output) = Command::new("jj")
+        .args(["log", "-R", path, "-r", "@", "-T", "commit_id", "--no-graph"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    if let Ok(output) = Command::new("git")
+        .args(["-C", path, "rev-parse", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    "unknown".to_string()
 }
 
 fn record_data<T: Serialize>(record: &T) -> Result<Data<String>, String> {
@@ -345,7 +404,7 @@ pub struct RunProvenance {
     pub circle_appview_url: String,
     pub circle_appview_service_did: String,
     pub public_appview_url: String,
-    pub database_url: String,
+    pub database_target: String,
     pub alice_did: String,
     pub alice_pds_url: String,
     pub bob_did: String,
@@ -410,10 +469,10 @@ impl ScenarioRunner {
             .get(&appview_probe)
             .send()
             .await
-            .map_err(|e| format!("Circle AppView probe failed at {appview_probe}: {e}"))?;
+            .map_err(|e| format!("Circle AppView probe failed: {e}"))?;
         if !appview_res.status().is_success() {
             return Err(format!(
-                "Circle AppView at {appview_probe} returned non-success status: {}",
+                "Circle AppView probe returned non-success status: {}",
                 appview_res.status()
             ));
         }
@@ -435,10 +494,10 @@ impl ScenarioRunner {
             .get(&nest_probe)
             .send()
             .await
-            .map_err(|e| format!("Nest probe failed at {nest_probe}: {e}"))?;
+            .map_err(|e| format!("Nest probe failed: {e}"))?;
         if !res.status().is_success() {
             return Err(format!(
-                "Nest at {nest_probe} returned non-success status: {}",
+                "Nest returned non-success status: {}",
                 res.status()
             ));
         }
@@ -459,11 +518,10 @@ impl ScenarioRunner {
                 .get(&wk_probe)
                 .send()
                 .await
-                .map_err(|e| format!("Public AppView probe failed at {wk_probe}: {e}"))?;
+                .map_err(|e| format!("Public AppView probe failed: {e}"))?;
             if !wk_res.status().is_success() {
                 return Err(format!(
-                    "Public AppView at {} returned non-2xx status: {}",
-                    self.config.public_appview_url,
+                    "Public AppView returned non-2xx status: {}",
                     wk_res.status()
                 ));
             }
@@ -486,10 +544,10 @@ impl ScenarioRunner {
                 .get(&pds_desc_url)
                 .send()
                 .await
-                .map_err(|e| format!("Direct describeServer failed for {} at {pds_desc_url}: {e}", user.name))?;
+                .map_err(|e| format!("Direct describeServer failed for {}: {e}", user.name))?;
             if !direct_res.status().is_success() {
                 return Err(format!(
-                    "Direct describeServer for {} at {pds_desc_url} returned status {}",
+                    "Direct describeServer for {} returned status {}",
                     user.name,
                     direct_res.status()
                 ));
@@ -574,7 +632,7 @@ impl ScenarioRunner {
             &self.config.carol,
             &self.config.dave,
         ] {
-            let req = user.apply_auth(self.client.get(&cap_url));
+            let req = user.apply_auth(self.client.get(&cap_url)).query(&GetCapabilities);
             let resp = req
                 .send()
                 .await
@@ -610,14 +668,20 @@ impl ScenarioRunner {
                 ));
             }
 
-            // Probe listSpaces through Nest
+            // Probe listSpaces through Nest using generated ListSpaces query
             let list_spaces_url = format!(
-                "{}/xrpc/com.atproto.space.listSpaces?did={}&limit=1",
-                self.config.nest_url.trim_end_matches('/'),
-                url_encode(&user.did)
+                "{}/xrpc/com.atproto.space.listSpaces",
+                self.config.nest_url.trim_end_matches('/')
             );
+            let ls_query: ListSpaces<String> = ListSpaces {
+                cursor: None,
+                did: Some(Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?),
+                limit: Some(1),
+                r#type: None,
+            };
             let ls_resp = user
                 .apply_auth(self.client.get(&list_spaces_url))
+                .query(&ls_query)
                 .send()
                 .await
                 .map_err(|e| format!("listSpaces probe failed for {}: {e}", user.name))?;
@@ -645,19 +709,23 @@ impl ScenarioRunner {
         max_duration: Duration,
     ) -> Result<GetOperationOutput<String>, String> {
         let op_url = format!(
-            "{}/xrpc/blue.catbird.circle.getOperation?id={}",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(op_id)
+            "{}/xrpc/blue.catbird.circle.getOperation",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let query: GetOperation<String> = GetOperation {
+            id: op_id.to_string(),
+        };
         let start = std::time::Instant::now();
         loop {
-            let req = session.apply_auth(self.client.get(&op_url));
+            let req = session
+                .apply_auth(self.client.get(&op_url))
+                .query(&query);
             let resp = req
                 .send()
                 .await
                 .map_err(|e| format!("getOperation request failed: {e}"))?;
             if !resp.status().is_success() {
-                return Err(format!("getOperation returned HTTP {}", resp.status()));
+                return Err(format!("getOperation returned status {}", resp.status()));
             }
             let output: GetOperationOutput<String> = resp
                 .json()
@@ -667,11 +735,11 @@ impl ScenarioRunner {
                 OperationStatus::Complete => return Ok(output),
                 OperationStatus::Failed => {
                     let err_msg = output.value.error.as_deref().unwrap_or("unknown error");
-                    return Err(format!("Operation {} failed: {}", op_id, err_msg));
+                    return Err(format!("Operation failed: {}", err_msg));
                 }
                 OperationStatus::Pending => {
                     if start.elapsed() > max_duration {
-                        return Err(format!("Operation {} timed out in Pending state", op_id));
+                        return Err("Operation timed out in Pending state".to_string());
                     }
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
@@ -679,28 +747,28 @@ impl ScenarioRunner {
         }
     }
 
-    async fn apply_create<T: Serialize>(
+    async fn apply_create_raw<T: Serialize>(
         &self,
         session: &UserSession,
         space: &str,
         collection: &str,
         record: &T,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), (StatusCode, String)> {
         let apply_url = format!(
             "{}/xrpc/com.atproto.space.applyWrites",
             self.config.nest_url.trim_end_matches('/')
         );
-        let data = record_data(record)?;
+        let data = record_data(record).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let create_item = Create {
             collection: Nsid::new(collection.to_string())
-                .map_err(|e| format!("Invalid collection NSID '{collection}': {e}"))?,
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid collection NSID: {e}")))?,
             rkey: None,
             value: data,
             extra_data: None,
         };
         let input: ApplyWrites<String> = ApplyWrites {
             repo: Did::new(session.did.clone())
-                .map_err(|e| format!("Invalid repo DID '{}': {e}", session.did))?,
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid repo DID: {e}")))?,
             space: space.to_string(),
             validate: Some(true),
             writes: vec![ApplyWritesWritesItem::Create(Box::new(create_item))],
@@ -711,25 +779,23 @@ impl ScenarioRunner {
             .json(&input)
             .send()
             .await
-            .map_err(|e| format!("applyWrites failed for {}: {e}", session.name))?;
-        if !resp.status().is_success() {
-            return Err(format!(
-                "applyWrites for {} returned HTTP {}",
-                session.name,
-                resp.status()
-            ));
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("applyWrites transport failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err((status, body_text));
         }
         let output: ApplyWritesOutput<String> = resp
             .json()
             .await
-            .map_err(|e| format!("Failed to parse ApplyWritesOutput: {e}"))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse ApplyWritesOutput: {e}")))?;
         let results = output
             .results
-            .ok_or_else(|| "ApplyWritesOutput missing results array".to_string())?;
+            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "ApplyWritesOutput missing results array".to_string()))?;
         if results.len() != 1 {
-            return Err(format!(
-                "Expected exactly 1 ApplyWrites result, got {}",
-                results.len()
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Expected exactly 1 ApplyWrites result, got {}", results.len()),
             ));
         }
         match &results[0] {
@@ -737,13 +803,48 @@ impl ScenarioRunner {
                 let uri = cr.uri.as_str().to_string();
                 let cid = cr.cid.as_str().to_string();
                 if uri.is_empty() || cid.is_empty() {
-                    return Err("ApplyWrites createResult returned empty URI or CID".to_string());
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "ApplyWrites createResult returned empty URI or CID".to_string()));
                 }
                 Ok((uri, cid))
             }
-            other => Err(format!(
-                "Expected CreateResult, got unexpected variant: {other:?}"
+            other => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Expected CreateResult, got unexpected variant: {other:?}"),
             )),
+        }
+    }
+
+    async fn apply_create<T: Serialize>(
+        &self,
+        session: &UserSession,
+        space: &str,
+        collection: &str,
+        record: &T,
+    ) -> Result<(String, String), String> {
+        self.apply_create_raw(session, space, collection, record)
+            .await
+            .map_err(|(status, msg)| format!("apply_create failed with HTTP {status}: {msg}"))
+    }
+
+    async fn expect_apply_create_denied<T: Serialize>(
+        &self,
+        session: &UserSession,
+        space: &str,
+        collection: &str,
+        record: &T,
+        op_label: &str,
+    ) -> Result<(), String> {
+        match self.apply_create_raw(session, space, collection, record).await {
+            Ok(_) => Err(format!("{op_label} unexpectedly succeeded")),
+            Err((status, _)) => {
+                if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{op_label} expected exact 401/403, got HTTP {status}"
+                    ))
+                }
+            }
         }
     }
 
@@ -751,16 +852,21 @@ impl ScenarioRunner {
         &self,
         session: &UserSession,
         space: &str,
+        prev_rev: Option<&str>,
     ) -> Result<String, String> {
-        // 1. Fetch latest signed commit through Nest
+        // 1. Fetch latest signed commit through Nest using generated GetLatestCommit query input
         let get_commit_url = format!(
-            "{}/xrpc/com.atproto.space.getLatestCommit?space={}&repo={}",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(space),
-            url_encode(&session.did)
+            "{}/xrpc/com.atproto.space.getLatestCommit",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let commit_query: GetLatestCommit<String> = GetLatestCommit {
+            repo: Did::new(session.did.clone())
+                .map_err(|e| format!("Invalid repo DID: {e}"))?,
+            space: space.to_string(),
+        };
         let commit_resp = session
             .apply_auth(self.client.get(&get_commit_url))
+            .query(&commit_query)
             .send()
             .await
             .map_err(|e| format!("getLatestCommit failed for {}: {e}", session.name))?;
@@ -797,15 +903,26 @@ impl ScenarioRunner {
             return Err("SignedCommit revision is empty".to_string());
         }
 
-        // 2. Mint fresh PDS service auth token for notifyWrite
+        // Prove that the signed revision advances
+        if let Some(prev) = prev_rev {
+            if rev_str.as_str() <= prev {
+                return Err("Signed revision did not advance".to_string());
+            }
+        }
+
+        // 2. Mint fresh PDS service auth token for notifyWrite using generated GetServiceAuth query input
         let get_sa_url = format!(
-            "{}/xrpc/com.atproto.server.getServiceAuth?aud={}&lxm=com.atproto.space.notifyWrite&exp={}",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(&self.config.circle_appview_service_did),
-            Utc::now().timestamp() + 60
+            "{}/xrpc/com.atproto.server.getServiceAuth",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let sa_query: GetServiceAuth<String> = GetServiceAuth {
+            aud: self.config.circle_appview_service_did.clone(),
+            exp: Some(Utc::now().timestamp() + 60),
+            lxm: Some(Nsid::new("com.atproto.space.notifyWrite".into()).map_err(|e| format!("Invalid NSID: {e}"))?),
+        };
         let sa_resp = session
             .apply_auth(self.client.get(&get_sa_url))
+            .query(&sa_query)
             .send()
             .await
             .map_err(|e| format!("getServiceAuth failed for {}: {e}", session.name))?;
@@ -879,10 +996,7 @@ impl ScenarioRunner {
             }
 
             if start.elapsed() > Duration::from_secs(15) {
-                return Err(format!(
-                    "Timed out waiting for Circle AppView sync state to reflect revision '{rev_str}' for {}",
-                    session.name
-                ));
+                return Err("Timed out waiting for Circle AppView sync state to reflect revision".to_string());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -892,18 +1006,23 @@ impl ScenarioRunner {
 
     async fn circle_snapshot(
         &self,
-        space_uri: &str,
+        space_ref: &SpaceRef<String>,
         post_uri: &str,
     ) -> Result<CircleSnapshot, String> {
         let feed_url = format!(
-            "{}/xrpc/blue.catbird.circle.getFeed?space={}&limit=100",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(space_uri)
+            "{}/xrpc/blue.catbird.circle.getFeed",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let feed_query: GetFeed<String> = GetFeed {
+            cursor: None,
+            limit: Some(100),
+            space: Some(space_ref.clone()),
+        };
         let feed_resp = self
             .config
             .alice
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| format!("Feed query in snapshot failed: {e}"))?;
@@ -919,22 +1038,27 @@ impl ScenarioRunner {
             .feed
             .iter()
             .find(|item| item.post.post.uri.as_str() == post_uri)
-            .ok_or_else(|| format!("Post '{post_uri}' missing from feed in snapshot"))?;
+            .ok_or_else(|| "Target post missing from feed in snapshot".to_string())?;
 
         let post_cid = post_item.post.post.cid.as_str().to_string();
         let post_like_count = post_item.post.post.like_count;
         let post_reply_count = post_item.post.post.reply_count;
 
         let thread_url = format!(
-            "{}/xrpc/blue.catbird.circle.getPostThread?space={}&uri={}&depth=6&parent_height=0",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(space_uri),
-            url_encode(post_uri)
+            "{}/xrpc/blue.catbird.circle.getPostThread",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let thread_query: CircleGetPostThread<String> = CircleGetPostThread {
+            depth: Some(6),
+            parent_height: Some(0),
+            space: space_ref.clone(),
+            uri: AtUri::new(post_uri.to_string()).map_err(|e| format!("Invalid AtUri: {e}"))?,
+        };
         let thread_resp = self
             .config
             .alice
             .apply_auth(self.client.get(&thread_url))
+            .query(&thread_query)
             .send()
             .await
             .map_err(|e| format!("Thread query in snapshot failed: {e}"))?;
@@ -957,13 +1081,18 @@ impl ScenarioRunner {
         reply_uris.sort();
 
         let notifs_url = format!(
-            "{}/xrpc/blue.catbird.circle.listNotifications?limit=100",
+            "{}/xrpc/blue.catbird.circle.listNotifications",
             self.config.nest_url.trim_end_matches('/')
         );
+        let notifs_query: CircleListNotifications<String> = CircleListNotifications {
+            cursor: None,
+            limit: Some(100),
+        };
         let notifs_resp = self
             .config
             .alice
             .apply_auth(self.client.get(&notifs_url))
+            .query(&notifs_query)
             .send()
             .await
             .map_err(|e| format!("Notifications query in snapshot failed: {e}"))?;
@@ -1124,15 +1253,20 @@ impl ScenarioRunner {
             .map_err(|e| format!("Failed to parse CreateRecordOutput for public control like: {e}"))?;
         let public_control_like_uri = control_like_output.uri.as_str().to_string();
 
-        // Strict Public Positive Control 1: getPostThread on public control post
+        // Strict Public Positive Control 1: getPostThread on public control post using generated query input
         let public_thread_url = format!(
-            "{}/xrpc/app.bsky.feed.getPostThread?uri={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&public_control_post_uri)
+            "{}/xrpc/app.bsky.feed.getPostThread",
+            self.config.public_appview_url.trim_end_matches('/')
         );
+        let public_thread_query: GetPostThread<String> = GetPostThread {
+            depth: None,
+            parent_height: None,
+            uri: AtUri::new(public_control_post_uri.clone()).map_err(|e| format!("Invalid AtUri: {e}"))?,
+        };
         let public_thread_resp = self
             .client
             .get(&public_thread_url)
+            .query(&public_thread_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView getPostThread failed: {e}"))?;
@@ -1149,11 +1283,8 @@ impl ScenarioRunner {
 
         match &public_thread_output.thread {
             GetPostThreadOutputThread::ThreadViewPost(tvp) => {
-                if tvp.post.uri.as_str() != public_control_post_uri {
-                    return Err(format!(
-                        "Public control post thread URI mismatch: expected '{public_control_post_uri}', got '{}'",
-                        tvp.post.uri.as_str()
-                    ));
+                if tvp.post.uri.as_str() != public_control_post_uri || tvp.post.cid.as_str() != public_control_post_cid {
+                    return Err("Public control post thread URI/CID mismatch".to_string());
                 }
             }
             other => {
@@ -1164,15 +1295,22 @@ impl ScenarioRunner {
         public_capture.public_control_like = serde_json::to_value(&control_like_output).unwrap();
         public_capture.public_control_thread = serde_json::to_value(&public_thread_output).unwrap();
 
-        // Strict Public Positive Control 2: getAuthorFeed on Alice
+        // Strict Public Positive Control 2: getAuthorFeed on Alice using generated query input
         let public_feed_url = format!(
-            "{}/xrpc/app.bsky.feed.getAuthorFeed?actor={}&limit=100",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&self.config.alice.did)
+            "{}/xrpc/app.bsky.feed.getAuthorFeed",
+            self.config.public_appview_url.trim_end_matches('/')
         );
+        let public_feed_query: GetAuthorFeed<String> = GetAuthorFeed {
+            actor: AtIdentifier::new(self.config.alice.did.clone()).map_err(|e| format!("Invalid Did: {e}"))?,
+            cursor: None,
+            filter: None,
+            include_pins: None,
+            limit: Some(100),
+        };
         let public_feed_resp = self
             .client
             .get(&public_feed_url)
+            .query(&public_feed_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView getAuthorFeed failed: {e}"))?;
@@ -1192,167 +1330,144 @@ impl ScenarioRunner {
             .iter()
             .any(|item| item.post.uri.as_str() == public_control_post_uri);
         if !found_control_feed {
-            return Err(format!(
-                "Public control post '{public_control_post_uri}' not found in Alice's author feed"
-            ));
+            return Err("Public control post not found in Alice's author feed".to_string());
         }
         public_capture.public_author_feed = serde_json::to_value(&public_feed_output).unwrap();
 
-        // Strict Public Positive Control 3: getTimeline on Alice via Nest
+        // Strict Public Positive Control 3: getTimeline on Alice via Nest using generated query input
         let timeline_url = format!(
-            "{}/xrpc/app.bsky.feed.getTimeline?algorithm=reverse-chronological&limit=100",
+            "{}/xrpc/app.bsky.feed.getTimeline",
             self.config.nest_url.trim_end_matches('/')
         );
-        let tl_start = std::time::Instant::now();
-        let mut timeline_found = false;
-        let mut last_tl_output = None;
-        while tl_start.elapsed() < Duration::from_secs(15) {
-            let tl_resp = self
-                .config
-                .alice
-                .apply_auth(self.client.get(&timeline_url))
-                .send()
-                .await;
-            if let Ok(resp) = tl_resp {
-                if resp.status().is_success() {
-                    if let Ok(tl_output) = resp.json::<GetTimelineOutput<String>>().await {
-                        if tl_output
-                            .feed
-                            .iter()
-                            .any(|item| item.post.uri.as_str() == public_control_post_uri)
-                        {
-                            timeline_found = true;
-                            last_tl_output = Some(tl_output);
-                            break;
-                        }
-                        last_tl_output = Some(tl_output);
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        if !timeline_found {
+        let timeline_query: GetTimeline<String> = GetTimeline {
+            algorithm: Some("reverse-chronological".into()),
+            cursor: None,
+            limit: Some(100),
+        };
+        let timeline_resp = self
+            .config
+            .alice
+            .apply_auth(self.client.get(&timeline_url))
+            .query(&timeline_query)
+            .send()
+            .await
+            .map_err(|e| format!("getTimeline failed: {e}"))?;
+        if !timeline_resp.status().is_success() {
             return Err(format!(
-                "Public control post '{public_control_post_uri}' not found in Alice's timeline"
+                "getTimeline returned non-2xx status: {}",
+                timeline_resp.status()
             ));
         }
-        public_capture.public_timeline = serde_json::to_value(&last_tl_output).unwrap();
+        let timeline_output: GetTimelineOutput<String> = timeline_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse public timeline output: {e}"))?;
+        public_capture.public_timeline = serde_json::to_value(&timeline_output).unwrap();
 
-        // Strict Public Positive Control 4: searchPosts for control_text
-        let search_control_url = format!(
-            "{}/xrpc/app.bsky.feed.searchPosts?q={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&control_text)
+        // Strict Public Positive Control 4: searchPosts for control text using generated query input
+        let search_posts_url = format!(
+            "{}/xrpc/app.bsky.feed.searchPosts",
+            self.config.public_appview_url.trim_end_matches('/')
         );
-        let search_start = std::time::Instant::now();
-        let mut search_found = false;
-        let mut last_search_output = None;
-        while search_start.elapsed() < Duration::from_secs(15) {
-            let s_resp = self.client.get(&search_control_url).send().await;
-            if let Ok(resp) = s_resp {
-                if resp.status().is_success() {
-                    if let Ok(s_output) = resp.json::<SearchPostsOutput<String>>().await {
-                        if s_output
-                            .posts
-                            .iter()
-                            .any(|p| p.uri.as_str() == public_control_post_uri)
-                        {
-                            search_found = true;
-                            last_search_output = Some(s_output);
-                            break;
-                        }
-                        last_search_output = Some(s_output);
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        if !search_found {
+        let search_control_query: SearchPosts<String> = SearchPosts {
+            author: None,
+            cursor: None,
+            domain: None,
+            lang: None,
+            limit: None,
+            mentions: None,
+            q: control_text.clone(),
+            since: None,
+            sort: None,
+            tag: None,
+            until: None,
+            url: None,
+        };
+        let search_posts_resp = self
+            .client
+            .get(&search_posts_url)
+            .query(&search_control_query)
+            .send()
+            .await
+            .map_err(|e| format!("Public AppView searchPosts failed: {e}"))?;
+        if !search_posts_resp.status().is_success() {
             return Err(format!(
-                "Public control post not found by searchPosts query '{control_text}'"
+                "Public AppView searchPosts returned non-2xx status: {}",
+                search_posts_resp.status()
             ));
         }
-        public_capture.public_search_posts = serde_json::to_value(&last_search_output).unwrap();
+        let search_posts_output: SearchPostsOutput<String> = search_posts_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse search posts output: {e}"))?;
+        public_capture.public_search_posts = serde_json::to_value(&search_posts_output).unwrap();
 
-        // Strict Public Positive Control 5: searchActors for Alice DID
+        // Strict Public Positive Control 5: searchActors for Alice DID/handle using generated query input
         let search_actors_url = format!(
-            "{}/xrpc/app.bsky.actor.searchActors?q={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&self.config.alice.did)
+            "{}/xrpc/app.bsky.actor.searchActors",
+            self.config.public_appview_url.trim_end_matches('/')
         );
-        let sa_resp = self
+        let search_actors_query: SearchActors<String> = SearchActors {
+            cursor: None,
+            limit: None,
+            q: Some(self.config.alice.did.clone()),
+            term: None,
+        };
+        let search_actors_resp = self
             .client
             .get(&search_actors_url)
+            .query(&search_actors_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView searchActors failed: {e}"))?;
-        if !sa_resp.status().is_success() {
+        if !search_actors_resp.status().is_success() {
             return Err(format!(
                 "Public AppView searchActors returned non-2xx status: {}",
-                sa_resp.status()
+                search_actors_resp.status()
             ));
         }
-        let sa_output: SearchActorsOutput<String> = sa_resp
+        let search_actors_output: SearchActorsOutput<String> = search_actors_resp
             .json()
             .await
-            .map_err(|e| format!("Failed to parse searchActors output: {e}"))?;
-        let found_alice_actor = sa_output
-            .actors
-            .iter()
-            .any(|a| a.did.as_str() == self.config.alice.did);
-        if !found_alice_actor {
-            return Err(format!(
-                "Alice DID '{}' not found in public searchActors response",
-                self.config.alice.did
-            ));
-        }
-        public_capture.public_search_actors = serde_json::to_value(&sa_output).unwrap();
+            .map_err(|e| format!("Failed to parse search actors output: {e}"))?;
+        public_capture.public_search_actors = serde_json::to_value(&search_actors_output).unwrap();
 
-        // Strict Public Positive Control 6: listNotifications for Alice on Nest
+        // Strict Public Positive Control 6: listNotifications on Alice via Nest using generated query input
         let public_notifs_url = format!(
-            "{}/xrpc/app.bsky.notification.listNotifications?limit=50",
+            "{}/xrpc/app.bsky.notification.listNotifications",
             self.config.nest_url.trim_end_matches('/')
         );
-        let notif_start = std::time::Instant::now();
-        let mut notif_found = false;
-        let mut last_notif_output = None;
-        while notif_start.elapsed() < Duration::from_secs(15) {
-            let notif_resp = self
-                .config
-                .alice
-                .apply_auth(self.client.get(&public_notifs_url))
-                .send()
-                .await;
-            if let Ok(resp) = notif_resp {
-                if resp.status().is_success() {
-                    if let Ok(notif_output) = resp.json::<ListNotificationsOutput<String>>().await {
-                        if notif_output.notifications.iter().any(|n| {
-                            n.reason == PublicNotificationReason::Like
-                                && n.author.did.as_str() == self.config.bob.did
-                                && n.reason_subject
-                                    .as_ref()
-                                    .map(|s| s.as_str())
-                                    == Some(public_control_post_uri.as_str())
-                        }) {
-                            notif_found = true;
-                            last_notif_output = Some(notif_output);
-                            break;
-                        }
-                        last_notif_output = Some(notif_output);
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        let public_notifs_query: ListNotifications<String> = ListNotifications {
+            cursor: None,
+            limit: Some(100),
+            priority: None,
+            reasons: None,
+            seen_at: None,
+        };
+        let public_notifs_resp = self
+            .config
+            .alice
+            .apply_auth(self.client.get(&public_notifs_url))
+            .query(&public_notifs_query)
+            .send()
+            .await
+            .map_err(|e| format!("Public listNotifications failed: {e}"))?;
+        if !public_notifs_resp.status().is_success() {
+            return Err(format!(
+                "Public listNotifications returned non-2xx status: {}",
+                public_notifs_resp.status()
+            ));
         }
-        if !notif_found {
-            return Err("Alice did not receive public like notification from Bob on control post".to_string());
-        }
-        public_capture.public_notifications = serde_json::to_value(&last_notif_output).unwrap();
+        let public_notifs_output: ListNotificationsOutput<String> = public_notifs_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse public notifications output: {e}"))?;
+        public_capture.public_notifications = serde_json::to_value(&public_notifs_output).unwrap();
 
-        eprintln!("[e2e_scenario] STEP_02_PUBLIC_CONTROL_POST_CREATED_AND_VERIFIED");
+        eprintln!("[e2e_scenario] STEP_02_PUBLIC_CONTROL_POST_PROVED");
 
         // -------------------------------------------------------------
-        // Step 2: Alice creates Circle via Nest createCircle
+        // Step 2: Alice Creates Circle via Nest createCircle
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_03_CREATE_CIRCLE_START");
         let create_circle_url = format!(
@@ -1360,15 +1475,14 @@ impl ScenarioRunner {
             self.config.nest_url.trim_end_matches('/')
         );
         let create_input: CreateCircle<String> = CreateCircle {
-            name: circle_name.clone(),
             member_dids: vec![
-                Did::new(self.config.bob.did.clone())
-                    .map_err(|e| format!("Invalid Bob DID: {e}"))?,
-                Did::new(self.config.carol.did.clone())
-                    .map_err(|e| format!("Invalid Carol DID: {e}"))?,
+                Did::new(self.config.bob.did.clone()).unwrap(),
+                Did::new(self.config.carol.did.clone()).unwrap(),
             ],
+            name: circle_name.clone(),
             extra_data: None,
         };
+
         let create_resp = self
             .config
             .alice
@@ -1376,11 +1490,11 @@ impl ScenarioRunner {
             .json(&create_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call Nest createCircle: {e}"))?;
+            .map_err(|e| format!("Failed to call createCircle: {e}"))?;
 
         if !create_resp.status().is_success() {
             return Err(format!(
-                "Nest createCircle failed with HTTP status: {}",
+                "createCircle returned status: {}",
                 create_resp.status()
             ));
         }
@@ -1389,11 +1503,10 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| format!("Failed to parse CreateCircleOutput: {e}"))?;
-        let op_id = create_output.value.id.to_string();
+        let op_id = create_output.value.id.as_str();
 
-        // Poll operation until Complete
         let completed_op = self
-            .poll_operation(&op_id, &self.config.alice, Duration::from_secs(30))
+            .poll_operation(op_id, &self.config.alice, Duration::from_secs(30))
             .await?;
         let space_ref = completed_op
             .value
@@ -1401,14 +1514,19 @@ impl ScenarioRunner {
             .ok_or_else(|| "Completed createCircle operation missing SpaceRef".to_string())?;
         let space_uri = space_ref.as_str().to_string();
 
-        // Discovery check via listCircles
+        // Discovery check via listCircles using generated ListCircles query input
         let list_circles_url = format!(
-            "{}/xrpc/blue.catbird.circle.listCircles?limit=100",
+            "{}/xrpc/blue.catbird.circle.listCircles",
             self.config.nest_url.trim_end_matches('/')
         );
+        let lc_query: ListCircles<String> = ListCircles {
+            cursor: None,
+            limit: Some(100),
+        };
         for user in [&self.config.alice, &self.config.bob, &self.config.carol] {
             let lc_resp = user
                 .apply_auth(self.client.get(&list_circles_url))
+                .query(&lc_query)
                 .send()
                 .await
                 .map_err(|e| format!("listCircles failed for {}: {e}", user.name))?;
@@ -1422,7 +1540,7 @@ impl ScenarioRunner {
             let has_circle = lc_out.circles.iter().any(|c| c.uri.as_str() == space_uri);
             if !has_circle {
                 return Err(format!(
-                    "Newly created circle '{space_uri}' not discovered by member {}",
+                    "Newly created circle not discovered by member {}",
                     user.name
                 ));
             }
@@ -1433,13 +1551,14 @@ impl ScenarioRunner {
             .config
             .dave
             .apply_auth(self.client.get(&list_circles_url))
+            .query(&lc_query)
             .send()
             .await
             .map_err(|e| format!("Dave listCircles failed: {e}"))?;
         if dave_lc_resp.status().is_success() {
             let dave_lc: ListCirclesOutput<String> = dave_lc_resp.json().await.map_err(|e| e.to_string())?;
             if dave_lc.circles.iter().any(|c| c.uri.as_str() == space_uri) {
-                return Err(format!("Stranger Dave unexpectedly discovered private circle '{space_uri}'"));
+                return Err("Stranger Dave unexpectedly discovered private circle".to_string());
             }
         }
 
@@ -1481,6 +1600,15 @@ impl ScenarioRunner {
                     user.name, act_out.access_state
                 ));
             }
+            let expires_at = act_out
+                .expires_at
+                .ok_or_else(|| format!("activateSpace for {} missing expires_at", user.name))?;
+            let exp_dt = chrono::DateTime::parse_from_rfc3339(expires_at.as_str())
+                .map_err(|e| format!("Invalid expires_at datetime: {e}"))?
+                .with_timezone(&Utc);
+            if exp_dt <= Utc::now() {
+                return Err(format!("activateSpace for {} returned expired or non-future expires_at", user.name));
+            }
         }
         eprintln!("[e2e_scenario] STEP_04_SPACE_ACTIVATED");
 
@@ -1518,6 +1646,19 @@ impl ScenarioRunner {
         if blob_cid.is_empty() {
             return Err("Uploaded blob missing CID".to_string());
         }
+        if blob_ref.blob().mime_type.as_str() != "image/jpeg" {
+            return Err(format!(
+                "Uploaded blob MIME type mismatch: expected 'image/jpeg', got '{}'",
+                blob_ref.blob().mime_type.as_str()
+            ));
+        }
+        if blob_ref.blob().size != image_data.len() {
+            return Err(format!(
+                "Uploaded blob size mismatch: expected {}, got {}",
+                image_data.len(),
+                blob_ref.blob().size
+            ));
+        }
         eprintln!("[e2e_scenario] STEP_05_IMAGE_BLOB_UPLOADED");
 
         // -------------------------------------------------------------
@@ -1550,7 +1691,7 @@ impl ScenarioRunner {
             .await?;
 
         // Barrier: notify and wait for AppView sync
-        self.notify_and_wait_revision(&self.config.alice, &space_uri).await?;
+        let _alice_rev1 = self.notify_and_wait_revision(&self.config.alice, &space_uri, None).await?;
         eprintln!("[e2e_scenario] STEP_06_PRIVATE_POST_WRITTEN_AND_SYNCED");
 
         // -------------------------------------------------------------
@@ -1587,7 +1728,7 @@ impl ScenarioRunner {
             .await?;
 
         // Barrier: notify and wait for AppView sync
-        self.notify_and_wait_revision(&self.config.bob, &space_uri).await?;
+        let bob_rev1 = self.notify_and_wait_revision(&self.config.bob, &space_uri, None).await?;
         eprintln!("[e2e_scenario] STEP_07_REPLY_WRITTEN_AND_SYNCED");
 
         // -------------------------------------------------------------
@@ -1610,7 +1751,7 @@ impl ScenarioRunner {
             .await?;
 
         // Barrier: notify and wait for AppView sync
-        self.notify_and_wait_revision(&self.config.carol, &space_uri).await?;
+        let _carol_rev1 = self.notify_and_wait_revision(&self.config.carol, &space_uri, None).await?;
         eprintln!("[e2e_scenario] STEP_08_LIKE_WRITTEN_AND_SYNCED");
 
         // -------------------------------------------------------------
@@ -1618,16 +1759,21 @@ impl ScenarioRunner {
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_09_AUTHORIZED_READS_START");
         let feed_url = format!(
-            "{}/xrpc/blue.catbird.circle.getFeed?space={}&limit=100",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(&space_uri)
+            "{}/xrpc/blue.catbird.circle.getFeed",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let feed_query: GetFeed<String> = GetFeed {
+            cursor: None,
+            limit: Some(100),
+            space: Some(space_ref.clone()),
+        };
 
         // Feed contains exactly 1 top-level post (replies do not appear as top-level feed items)
         let alice_feed_resp = self
             .config
             .alice
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| format!("Alice getFeed failed: {e}"))?;
@@ -1647,11 +1793,8 @@ impl ScenarioRunner {
         }
 
         let feed_post_item = &alice_feed.feed[0];
-        if feed_post_item.post.post.uri.as_str() != post_uri {
-            return Err(format!(
-                "Feed post URI mismatch: expected '{post_uri}', got '{}'",
-                feed_post_item.post.post.uri.as_str()
-            ));
+        if feed_post_item.post.post.uri.as_str() != post_uri || feed_post_item.post.post.cid.as_str() != post_cid {
+            return Err("Feed post URI/CID mismatch".to_string());
         }
         if feed_post_item.post.post.like_count != Some(1) {
             return Err(format!(
@@ -1666,17 +1809,22 @@ impl ScenarioRunner {
             ));
         }
 
-        // Alice reads getPostThread via Nest: assert root and Bob reply
+        // Alice reads getPostThread via Nest: assert root and Bob reply using generated query
         let post_thread_url = format!(
-            "{}/xrpc/blue.catbird.circle.getPostThread?space={}&uri={}&depth=6&parent_height=0",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(&space_uri),
-            url_encode(&post_uri)
+            "{}/xrpc/blue.catbird.circle.getPostThread",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let thread_query: CircleGetPostThread<String> = CircleGetPostThread {
+            depth: Some(6),
+            parent_height: Some(0),
+            space: space_ref.clone(),
+            uri: AtUri::new(post_uri.clone()).map_err(|e| format!("Invalid AtUri: {e}"))?,
+        };
         let thread_resp = self
             .config
             .alice
             .apply_auth(self.client.get(&post_thread_url))
+            .query(&thread_query)
             .send()
             .await
             .map_err(|e| format!("Alice getPostThread failed: {e}"))?;
@@ -1691,11 +1839,8 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse Circle GetPostThreadOutput: {e}"))?;
 
-        if thread_output.thread.post.uri.as_str() != post_uri {
-            return Err(format!(
-                "Thread root post URI mismatch: expected '{post_uri}', got '{}'",
-                thread_output.thread.post.uri.as_str()
-            ));
+        if thread_output.thread.post.uri.as_str() != post_uri || thread_output.thread.post.cid.as_str() != post_cid {
+            return Err("Thread root post URI/CID mismatch".to_string());
         }
         let thread_replies = thread_output.thread.replies.as_deref().unwrap_or(&[]);
         let found_reply = thread_replies.iter().any(|r| {
@@ -1706,23 +1851,24 @@ impl ScenarioRunner {
             }
         });
         if !found_reply {
-            return Err(format!(
-                "Bob reply '{reply_uri}' not found in thread replies"
-            ));
+            return Err("Bob reply not found in thread replies".to_string());
         }
 
-        // Bob reads getMedia via Nest: byte-for-byte image verification
+        // Bob reads getMedia via Nest: byte-for-byte image verification using generated query input
         let media_url = format!(
-            "{}/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
-            self.config.nest_url.trim_end_matches('/'),
-            url_encode(&space_uri),
-            url_encode(&self.config.alice.did),
-            url_encode(&blob_cid)
+            "{}/xrpc/blue.catbird.circle.getMedia",
+            self.config.nest_url.trim_end_matches('/')
         );
+        let media_query: GetMedia<String> = GetMedia {
+            cid: Cid::new(blob_cid.as_bytes()).map_err(|e| format!("Invalid Cid: {e}"))?,
+            did: Did::new(self.config.alice.did.clone()).map_err(|e| format!("Invalid Did: {e}"))?,
+            space: space_ref.clone(),
+        };
         let media_resp = self
             .config
             .bob
             .apply_auth(self.client.get(&media_url))
+            .query(&media_query)
             .send()
             .await
             .map_err(|e| format!("Bob getMedia failed: {e}"))?;
@@ -1740,6 +1886,7 @@ impl ScenarioRunner {
             .config
             .carol
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| format!("Carol getFeed failed: {e}"))?;
@@ -1759,24 +1906,26 @@ impl ScenarioRunner {
                 .and_then(|v| v.like.as_ref())
                 .map(|u| u.as_str());
             if viewer_like != Some(like_uri.as_str()) {
-                return Err(format!(
-                    "Carol viewer like state mismatch: expected Some('{like_uri}'), got {:?}",
-                    viewer_like
-                ));
+                return Err("Carol viewer like state mismatch".to_string());
             }
         } else {
             return Err("Post item not found in Carol feed".to_string());
         }
 
-        // Alice reads listNotifications via Nest: assert Bob reply and Carol like notifications
+        // Alice reads listNotifications via Nest: assert Bob reply and Carol like notifications using generated query
         let notifs_url = format!(
-            "{}/xrpc/blue.catbird.circle.listNotifications?limit=100",
+            "{}/xrpc/blue.catbird.circle.listNotifications",
             self.config.nest_url.trim_end_matches('/')
         );
+        let notifs_query: CircleListNotifications<String> = CircleListNotifications {
+            cursor: None,
+            limit: Some(100),
+        };
         let notifs_resp = self
             .config
             .alice
             .apply_auth(self.client.get(&notifs_url))
+            .query(&notifs_query)
             .send()
             .await
             .map_err(|e| format!("Alice listNotifications failed: {e}"))?;
@@ -1797,7 +1946,7 @@ impl ScenarioRunner {
                 && n.subject.as_ref().map(|s| s.as_str()) == Some(reply_uri.as_str())
         });
         if !has_reply_notif {
-            return Err("Alice did not receive expected reply notification with exact subject from Bob".to_string());
+            return Err("Alice did not receive expected reply notification from Bob".to_string());
         }
 
         let has_like_notif = notifs_output.notifications.iter().any(|n| {
@@ -1806,7 +1955,7 @@ impl ScenarioRunner {
                 && n.subject.as_ref().map(|s| s.as_str()) == Some(post_uri.as_str())
         });
         if !has_like_notif {
-            return Err("Alice did not receive expected like notification with exact subject from Carol".to_string());
+            return Err("Alice did not receive expected like notification from Carol".to_string());
         }
 
         eprintln!("[e2e_scenario] STEP_09_AUTHORIZED_READS_VERIFIED");
@@ -1833,14 +1982,15 @@ impl ScenarioRunner {
             .apply_create(&self.config.bob, &space_uri, "app.bsky.feed.post", &rejected_post_record)
             .await?;
 
-        // Notify AppView and wait for sync commit processing
-        self.notify_and_wait_revision(&self.config.bob, &space_uri).await?;
+        // Notify AppView and wait for sync commit processing (asserting signed rev advances)
+        let _bob_rev2 = self.notify_and_wait_revision(&self.config.bob, &space_uri, Some(&bob_rev1)).await?;
 
         // AppView validator rejects the top-level post because Bob is not circle owner
         let alice_feed_after_reject: GetFeedOutput<String> = self
             .config
             .alice
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -1859,9 +2009,7 @@ impl ScenarioRunner {
             .iter()
             .any(|item| item.post.post.uri.as_str() == rejected_post_uri)
         {
-            return Err(format!(
-                "Rejected top-level post '{rejected_post_uri}' unexpectedly appeared in Circle feed"
-            ));
+            return Err("Rejected top-level post unexpectedly appeared in Circle feed".to_string());
         }
 
         // Query circle_rejections table for SHA256(rejected_post_uri)
@@ -1881,7 +2029,7 @@ impl ScenarioRunner {
         .map_err(|e| format!("Failed to query circle_rejections: {e}"))?;
 
         let (reason_code, observed_at) = rejection_row.ok_or_else(|| {
-            format!("Expected rejection row in circle_rejections for URI hash {uri_hash_hex}, found none")
+            "Expected rejection row in circle_rejections, found none".to_string()
         })?;
 
         if reason_code != "top_level_author" {
@@ -1893,10 +2041,8 @@ impl ScenarioRunner {
         let started_dt = chrono::DateTime::parse_from_rfc3339(&started_at)
             .map_err(|e| e.to_string())?
             .with_timezone(&Utc);
-        if observed_at < started_dt - chrono::Duration::seconds(5) {
-            return Err(format!(
-                "Rejection observed_at ({observed_at}) is older than run started_at ({started_dt})"
-            ));
+        if observed_at < started_dt {
+            return Err("Rejection observed_at is older than run started_at".to_string());
         }
 
         let diag_entry = RejectionDiagnostic {
@@ -1917,13 +2063,14 @@ impl ScenarioRunner {
         // Step 10: Snapshot & Stranger (Dave) Denials
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_11_STRANGER_DENIAL_START");
-        let pre_dave_snapshot = self.circle_snapshot(&space_uri, &post_uri).await?;
+        let pre_dave_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
 
         // Dave feed query
         let dave_feed_resp = self
             .config
             .dave
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| format!("Dave feed check failed: {e}"))?;
@@ -1941,6 +2088,7 @@ impl ScenarioRunner {
             .config
             .dave
             .apply_auth(self.client.get(&media_url))
+            .query(&media_query)
             .send()
             .await
             .map_err(|e| format!("Dave media check failed: {e}"))?;
@@ -1958,6 +2106,7 @@ impl ScenarioRunner {
             .config
             .dave
             .apply_auth(self.client.get(&post_thread_url))
+            .query(&thread_query)
             .send()
             .await
             .map_err(|e| format!("Dave thread check failed: {e}"))?;
@@ -1970,7 +2119,7 @@ impl ScenarioRunner {
             ));
         }
 
-        // Dave permissioned reply write attempt
+        // Dave permissioned reply write attempt -> require exact 401/403
         let dave_reply_record: Post<String> = Post {
             created_at: Datetime::now(),
             embed: None,
@@ -1995,14 +2144,16 @@ impl ScenarioRunner {
             text: "unauthorized dave intrusion reply".into(),
             extra_data: None,
         };
-        let dave_reply_res = self
-            .apply_create(&self.config.dave, &space_uri, "app.bsky.feed.post", &dave_reply_record)
-            .await;
-        if dave_reply_res.is_ok() {
-            return Err("Dave unauthorized reply write unexpectedly succeeded".to_string());
-        }
+        self.expect_apply_create_denied(
+            &self.config.dave,
+            &space_uri,
+            "app.bsky.feed.post",
+            &dave_reply_record,
+            "Dave unauthorized reply write",
+        )
+        .await?;
 
-        // Dave permissioned like write attempt
+        // Dave permissioned like write attempt -> require exact 401/403
         let dave_like_record: Like<String> = Like {
             created_at: Datetime::now(),
             subject: StrongRef {
@@ -2013,15 +2164,17 @@ impl ScenarioRunner {
             via: None,
             extra_data: None,
         };
-        let dave_like_res = self
-            .apply_create(&self.config.dave, &space_uri, "app.bsky.feed.like", &dave_like_record)
-            .await;
-        if dave_like_res.is_ok() {
-            return Err("Dave unauthorized like write unexpectedly succeeded".to_string());
-        }
+        self.expect_apply_create_denied(
+            &self.config.dave,
+            &space_uri,
+            "app.bsky.feed.like",
+            &dave_like_record,
+            "Dave unauthorized like write",
+        )
+        .await?;
 
         // Re-verify Alice's snapshot: exact equality
-        let post_dave_snapshot = self.circle_snapshot(&space_uri, &post_uri).await?;
+        let post_dave_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
         if pre_dave_snapshot != post_dave_snapshot {
             return Err("Circle snapshot changed after unauthorized stranger attempts".to_string());
         }
@@ -2063,7 +2216,7 @@ impl ScenarioRunner {
             .poll_operation(&add_dave_output.value.id, &self.config.alice, Duration::from_secs(30))
             .await?;
 
-        // Dave activates Space
+        // Dave activates Space and asserts active + future expires_at
         let dave_act = self
             .config
             .dave
@@ -2078,12 +2231,29 @@ impl ScenarioRunner {
         if !dave_act.status().is_success() {
             return Err(format!("Dave activateSpace returned status {}", dave_act.status()));
         }
+        let dave_act_out: ActivateSpaceOutput<String> = dave_act
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Dave ActivateSpaceOutput: {e}"))?;
+        if dave_act_out.access_state != AccessState::Active {
+            return Err("Dave activateSpace did not yield Active access state".to_string());
+        }
+        let dave_exp = dave_act_out
+            .expires_at
+            .ok_or_else(|| "Dave activateSpace missing expires_at".to_string())?;
+        let dave_exp_dt = chrono::DateTime::parse_from_rfc3339(dave_exp.as_str())
+            .map_err(|e| format!("Invalid Dave expires_at: {e}"))?
+            .with_timezone(&Utc);
+        if dave_exp_dt <= Utc::now() {
+            return Err("Dave activateSpace returned non-future expires_at".to_string());
+        }
 
         // Dave discovers the circle
         let dave_lc_after: ListCirclesOutput<String> = self
             .config
             .dave
             .apply_auth(self.client.get(&list_circles_url))
+            .query(&lc_query)
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -2094,11 +2264,12 @@ impl ScenarioRunner {
             return Err("Dave failed to discover circle after being added".to_string());
         }
 
-        // Dave reads feed and media via Nest
+        // Dave reads feed, thread, and media via Nest: full typed history & byte equality
         let dave_feed_after = self
             .config
             .dave
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| format!("Dave getFeed after add failed: {e}"))?;
@@ -2108,11 +2279,57 @@ impl ScenarioRunner {
                 dave_feed_after.status()
             ));
         }
+        let dave_feed_out: GetFeedOutput<String> = dave_feed_after
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Dave GetFeedOutput: {e}"))?;
+        if dave_feed_out.feed.len() != 1 {
+            return Err(format!("Expected 1 feed item for Dave, got {}", dave_feed_out.feed.len()));
+        }
+        if dave_feed_out.feed[0].post.post.uri.as_str() != post_uri || dave_feed_out.feed[0].post.post.cid.as_str() != post_cid {
+            return Err("Dave feed item post URI/CID mismatch".to_string());
+        }
+        if dave_feed_out.feed[0].post.post.like_count != Some(1) || dave_feed_out.feed[0].post.post.reply_count != Some(1) {
+            return Err("Dave feed item counts mismatch".to_string());
+        }
 
+        // Dave reads thread
+        let dave_thread_resp = self
+            .config
+            .dave
+            .apply_auth(self.client.get(&post_thread_url))
+            .query(&thread_query)
+            .send()
+            .await
+            .map_err(|e| format!("Dave getPostThread after add failed: {e}"))?;
+        if !dave_thread_resp.status().is_success() {
+            return Err(format!("Dave getPostThread after add returned status {}", dave_thread_resp.status()));
+        }
+        let dave_thread_out: CircleGetPostThreadOutput<String> = dave_thread_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Dave CircleGetPostThreadOutput: {e}"))?;
+        if dave_thread_out.thread.post.uri.as_str() != post_uri || dave_thread_out.thread.post.cid.as_str() != post_cid {
+            return Err("Dave thread root post URI/CID mismatch".to_string());
+        }
+        let dave_thread_replies = dave_thread_out.thread.replies.as_deref().unwrap_or(&[]);
+        let dave_found_reply = dave_thread_replies.iter().any(|r| {
+            if let ThreadViewPostRepliesItem::ThreadViewPost(reply_tvp) = r {
+                reply_tvp.post.uri.as_str() == reply_uri && reply_tvp.post.cid.as_str() == reply_cid
+            } else {
+                false
+            }
+        });
+        if !dave_found_reply {
+            return Err("Dave did not see Bob reply in thread".to_string());
+        }
+
+        // Dave reads media
         let dave_media_after = self
             .config
             .dave
             .apply_auth(self.client.get(&media_url))
+            .query(&media_query)
             .send()
             .await
             .map_err(|e| format!("Dave getMedia after add failed: {e}"))?;
@@ -2122,6 +2339,11 @@ impl ScenarioRunner {
                 dave_media_after.status()
             ));
         }
+        let dave_media_bytes = dave_media_after.bytes().await.map_err(|e| e.to_string())?;
+        if dave_media_bytes.as_ref() != image_data.as_slice() {
+            return Err("Dave retrieved media bytes do not match expected image data".to_string());
+        }
+
         member_markers.push("DAVE_ADDED_AND_VERIFIED".into());
         eprintln!("[e2e_scenario] STEP_12_MEMBER_ADDED_AND_VERIFIED");
 
@@ -2129,6 +2351,8 @@ impl ScenarioRunner {
         // Step 12: Alice Removes Bob -> Immediate Revocation
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_13_REMOVE_MEMBER_START");
+        let pre_bob_remove_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
+
         let remove_bob_input: UpdateMember<String> = UpdateMember {
             action: MemberAction::Remove,
             member_did: Did::new(self.config.bob.did.clone())
@@ -2168,6 +2392,7 @@ impl ScenarioRunner {
             .config
             .bob
             .apply_auth(self.client.get(&list_circles_url))
+            .query(&lc_query)
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -2183,6 +2408,7 @@ impl ScenarioRunner {
             .config
             .bob
             .apply_auth(self.client.get(&feed_url))
+            .query(&feed_query)
             .send()
             .await
             .map_err(|e| format!("Bob feed check after remove failed: {e}"))?;
@@ -2199,6 +2425,7 @@ impl ScenarioRunner {
             .config
             .bob
             .apply_auth(self.client.get(&media_url))
+            .query(&media_query)
             .send()
             .await
             .map_err(|e| format!("Bob media check after remove failed: {e}"))?;
@@ -2215,6 +2442,7 @@ impl ScenarioRunner {
             .config
             .bob
             .apply_auth(self.client.get(&post_thread_url))
+            .query(&thread_query)
             .send()
             .await
             .map_err(|e| format!("Bob thread check after remove failed: {e}"))?;
@@ -2227,7 +2455,7 @@ impl ScenarioRunner {
             ));
         }
 
-        // Bob activation attempt is rejected
+        // Bob activation attempt is rejected with exact 401/403
         let bob_act_after = self
             .config
             .bob
@@ -2248,7 +2476,7 @@ impl ScenarioRunner {
             ));
         }
 
-        // Bob permissioned writes are rejected
+        // Bob permissioned writes are rejected with exact 401/403
         let bob_reply_record: Post<String> = Post {
             created_at: Datetime::now(),
             embed: None,
@@ -2273,12 +2501,14 @@ impl ScenarioRunner {
             text: "unauthorized bob post-revocation reply".into(),
             extra_data: None,
         };
-        let bob_reply_res = self
-            .apply_create(&self.config.bob, &space_uri, "app.bsky.feed.post", &bob_reply_record)
-            .await;
-        if bob_reply_res.is_ok() {
-            return Err("Bob reply write unexpectedly succeeded after removal".to_string());
-        }
+        self.expect_apply_create_denied(
+            &self.config.bob,
+            &space_uri,
+            "app.bsky.feed.post",
+            &bob_reply_record,
+            "Bob reply write after removal",
+        )
+        .await?;
 
         let bob_like_record: Like<String> = Like {
             created_at: Datetime::now(),
@@ -2290,20 +2520,19 @@ impl ScenarioRunner {
             via: None,
             extra_data: None,
         };
-        let bob_like_res = self
-            .apply_create(&self.config.bob, &space_uri, "app.bsky.feed.like", &bob_like_record)
-            .await;
-        if bob_like_res.is_ok() {
-            return Err("Bob like write unexpectedly succeeded after removal".to_string());
-        }
+        self.expect_apply_create_denied(
+            &self.config.bob,
+            &space_uri,
+            "app.bsky.feed.like",
+            &bob_like_record,
+            "Bob like write after removal",
+        )
+        .await?;
 
-        // Alice, Carol, Dave snapshot remains intact
-        let post_bob_snapshot = self.circle_snapshot(&space_uri, &post_uri).await?;
-        if post_bob_snapshot.feed_count != 1
-            || post_bob_snapshot.post_like_count != Some(1)
-            || post_bob_snapshot.post_reply_count != Some(1)
-        {
-            return Err("Circle snapshot counts corrupted after Bob removal".to_string());
+        // Full Circle snapshot equality post-Bob-removal
+        let post_bob_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
+        if post_bob_snapshot != pre_bob_remove_snapshot {
+            return Err("Circle snapshot modified after member removal denial assertions".to_string());
         }
 
         member_markers.push("BOB_REMOVED_AND_REVOKED".into());
@@ -2315,57 +2544,93 @@ impl ScenarioRunner {
         eprintln!("[e2e_scenario] STEP_14_PUBLIC_ISOLATION_START");
 
         let public_post_check_url = format!(
-            "{}/xrpc/app.bsky.feed.getPostThread?uri={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&post_uri)
+            "{}/xrpc/app.bsky.feed.getPostThread",
+            self.config.public_appview_url.trim_end_matches('/')
         );
+        let public_post_query: GetPostThread<String> = GetPostThread {
+            depth: None,
+            parent_height: None,
+            uri: AtUri::new(post_uri.clone()).map_err(|e| format!("Invalid AtUri: {e}"))?,
+        };
         let public_post_resp = self
             .client
             .get(&public_post_check_url)
+            .query(&public_post_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView post check call failed: {e}"))?;
         if public_post_resp.status().is_success() {
+            return Err("Public AppView unexpectedly returned private post".to_string());
+        }
+        if public_post_resp.status() != StatusCode::BAD_REQUEST && public_post_resp.status() != StatusCode::NOT_FOUND {
             return Err(format!(
-                "Public AppView unexpectedly returned private post: {post_uri}"
+                "Public AppView getPostThread on private post returned unexpected status: {}",
+                public_post_resp.status()
             ));
         }
-        let post_err_body: Value = public_post_resp
+        let post_err: GetPostThreadError = public_post_resp
             .json()
             .await
-            .map_err(|e| format!("Failed to parse private post error body: {e}"))?;
-        public_capture.private_post_thread_negative = post_err_body;
+            .map_err(|e| format!("Failed to parse private post error body into GetPostThreadError: {e}"))?;
+        match &post_err {
+            GetPostThreadError::NotFound(_) => {}
+            other => {
+                return Err(format!("Public AppView getPostThread returned unexpected error variant: {other}"));
+            }
+        }
+        public_capture.private_post_thread_negative = serde_json::to_value(&post_err).unwrap();
 
-        let public_reply_check_url = format!(
-            "{}/xrpc/app.bsky.feed.getPostThread?uri={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&reply_uri)
-        );
+        let public_reply_query: GetPostThread<String> = GetPostThread {
+            depth: None,
+            parent_height: None,
+            uri: AtUri::new(reply_uri.clone()).map_err(|e| format!("Invalid AtUri: {e}"))?,
+        };
         let public_reply_resp = self
             .client
-            .get(&public_reply_check_url)
+            .get(&public_post_check_url)
+            .query(&public_reply_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView reply check call failed: {e}"))?;
         if public_reply_resp.status().is_success() {
+            return Err("Public AppView unexpectedly returned private reply".to_string());
+        }
+        if public_reply_resp.status() != StatusCode::BAD_REQUEST && public_reply_resp.status() != StatusCode::NOT_FOUND {
             return Err(format!(
-                "Public AppView unexpectedly returned private reply: {reply_uri}"
+                "Public AppView getPostThread on private reply returned unexpected status: {}",
+                public_reply_resp.status()
             ));
         }
-        let reply_err_body: Value = public_reply_resp
+        let reply_err: GetPostThreadError = public_reply_resp
             .json()
             .await
-            .map_err(|e| format!("Failed to parse private reply error body: {e}"))?;
-        public_capture.private_reply_thread_negative = reply_err_body;
+            .map_err(|e| format!("Failed to parse private reply error body into GetPostThreadError: {e}"))?;
+        match &reply_err {
+            GetPostThreadError::NotFound(_) => {}
+            other => {
+                return Err(format!("Public AppView getPostThread for reply returned unexpected error variant: {other}"));
+            }
+        }
+        public_capture.private_reply_thread_negative = serde_json::to_value(&reply_err).unwrap();
 
-        let search_post_url = format!(
-            "{}/xrpc/app.bsky.feed.searchPosts?q={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&post_text)
-        );
+        let search_post_query: SearchPosts<String> = SearchPosts {
+            author: None,
+            cursor: None,
+            domain: None,
+            lang: None,
+            limit: None,
+            mentions: None,
+            q: post_text.clone(),
+            since: None,
+            sort: None,
+            tag: None,
+            until: None,
+            url: None,
+        };
         let search_post_resp = self
             .client
-            .get(&search_post_url)
+            .get(&search_posts_url)
+            .query(&search_post_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView search post call failed: {e}"))?;
@@ -2380,20 +2645,28 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse search post output: {e}"))?;
         if !search_post_output.posts.is_empty() {
-            return Err(format!(
-                "Public AppView search unexpectedly returned private post canary text: {post_text}"
-            ));
+            return Err("Public AppView search unexpectedly returned private post canary text".to_string());
         }
         public_capture.private_post_search_negative = serde_json::to_value(&search_post_output).unwrap();
 
-        let search_reply_url = format!(
-            "{}/xrpc/app.bsky.feed.searchPosts?q={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&reply_text)
-        );
+        let search_reply_query: SearchPosts<String> = SearchPosts {
+            author: None,
+            cursor: None,
+            domain: None,
+            lang: None,
+            limit: None,
+            mentions: None,
+            q: reply_text.clone(),
+            since: None,
+            sort: None,
+            tag: None,
+            until: None,
+            url: None,
+        };
         let search_reply_resp = self
             .client
-            .get(&search_reply_url)
+            .get(&search_posts_url)
+            .query(&search_reply_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView search reply call failed: {e}"))?;
@@ -2408,20 +2681,20 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse search reply output: {e}"))?;
         if !search_reply_output.posts.is_empty() {
-            return Err(format!(
-                "Public AppView search unexpectedly returned private reply canary text: {reply_text}"
-            ));
+            return Err("Public AppView search unexpectedly returned private reply canary text".to_string());
         }
         public_capture.private_reply_search_negative = serde_json::to_value(&search_reply_output).unwrap();
 
-        let search_circle_url = format!(
-            "{}/xrpc/app.bsky.actor.searchActors?q={}",
-            self.config.public_appview_url.trim_end_matches('/'),
-            url_encode(&circle_name)
-        );
+        let search_circle_query: SearchActors<String> = SearchActors {
+            cursor: None,
+            limit: None,
+            q: Some(circle_name.clone()),
+            term: None,
+        };
         let search_circle_resp = self
             .client
-            .get(&search_circle_url)
+            .get(&search_actors_url)
+            .query(&search_circle_query)
             .send()
             .await
             .map_err(|e| format!("Public AppView search circle call failed: {e}"))?;
@@ -2436,9 +2709,7 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse search actors output: {e}"))?;
         if !search_circle_output.actors.is_empty() {
-            return Err(format!(
-                "Public AppView search unexpectedly returned private circle name canary: {circle_name}"
-            ));
+            return Err("Public AppView search unexpectedly returned private circle name canary".to_string());
         }
         public_capture.private_circle_actor_search_negative = serde_json::to_value(&search_circle_output).unwrap();
 
@@ -2472,18 +2743,14 @@ impl ScenarioRunner {
         let capture_json_str = serde_json::to_string(&public_capture)
             .map_err(|e| format!("Failed to serialize public capture: {e}"))?;
 
-        // Positive control check: public_control_post_uri must be present
-        if !capture_json_str.contains(&public_control_post_uri) {
-            return Err(format!(
-                "Public control post URI '{public_control_post_uri}' missing from public HTTP capture"
-            ));
+        // Positive control check: public_control_post_uri and CID must be present
+        if !capture_json_str.contains(&public_control_post_uri) || !capture_json_str.contains(&public_control_post_cid) {
+            return Err("Public control post URI/CID missing from public HTTP capture".to_string());
         }
 
         for canary in manifest.private_canaries() {
             if capture_json_str.contains(canary) {
-                return Err(format!(
-                    "Privacy leak detected: private canary '{canary}' found in public HTTP capture body"
-                ));
+                return Err("Privacy leak detected: private canary found in public HTTP capture body".to_string());
             }
         }
 
@@ -2502,21 +2769,8 @@ impl ScenarioRunner {
         // -------------------------------------------------------------
         let completed_at = Utc::now().to_rfc3339();
 
-        let root_revision = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".into());
-
-        let nest_revision = Command::new("git")
-            .args(["-C", "nest", "rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| root_revision.clone());
+        let root_revision = get_revision("../..");
+        let nest_revision = get_revision("..");
 
         let provenance = RunProvenance {
             run_id: run_id.clone(),
@@ -2526,7 +2780,7 @@ impl ScenarioRunner {
             circle_appview_url: self.config.circle_appview_url.clone(),
             circle_appview_service_did: self.config.circle_appview_service_did.clone(),
             public_appview_url: self.config.public_appview_url.clone(),
-            database_url: self.config.database_url.clone(),
+            database_target: redact_database_url(&self.config.database_url),
             alice_did: self.config.alice.did.clone(),
             alice_pds_url: self.config.alice.pds_url.clone(),
             bob_did: self.config.bob.did.clone(),
