@@ -87,6 +87,10 @@ pub struct UserOAuthSession {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub token_endpoint: String,
+    /// Authorization server issuer. This, NOT the token endpoint, is the
+    /// `aud` of a `client_assertion`; refresh needs it as much as the initial
+    /// exchange does.
+    pub auth_server_iss: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub scope: String,
     pub dpop_key: p256::ecdsa::SigningKey,
@@ -349,7 +353,15 @@ impl OAuthService {
 
         let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
-        let client_assertion = self.create_client_assertion(&pending.token_endpoint)?;
+        // RFC 7523 as profiled by atproto: `aud` is the authorization server's
+        // ISSUER, not its token endpoint. Sending the endpoint is rejected with
+        // `invalid_client: unexpected "aud" claim value`.
+        let auth_server_iss = pending.auth_server_iss.clone().ok_or_else(|| {
+            AppError::Internal(
+                "Authorization server issuer unknown; cannot build a client assertion".into(),
+            )
+        })?;
+        let client_assertion = self.create_client_assertion(&auth_server_iss)?;
 
         let response = post_form_with_dpop(
             http_client,
@@ -403,6 +415,7 @@ impl OAuthService {
             access_token: token_data.access_token,
             refresh_token: token_data.refresh_token,
             token_endpoint: pending.token_endpoint,
+            auth_server_iss,
             expires_at,
             scope: token_data.scope.unwrap_or_else(|| CIRCLE_SCOPE.to_string()),
             dpop_key,
@@ -422,7 +435,14 @@ impl OAuthService {
         user_did: &str,
         http_client: &reqwest::Client,
     ) -> Result<(String, p256::ecdsa::SigningKey), AppError> {
-        let (needs_refresh, token_endpoint, refresh_token, dpop_key, current_token) = {
+        let (
+            needs_refresh,
+            token_endpoint,
+            auth_server_iss,
+            refresh_token,
+            dpop_key,
+            current_token,
+        ) = {
             let lock = self.sessions.read();
             let session = lock
                 .get(user_did)
@@ -434,6 +454,7 @@ impl OAuthService {
             (
                 expired && session.refresh_token.is_some(),
                 session.token_endpoint.clone(),
+                session.auth_server_iss.clone(),
                 session.refresh_token.clone(),
                 session.dpop_key.clone(),
                 session.access_token.clone(),
@@ -446,7 +467,7 @@ impl OAuthService {
 
         let refresh_token = refresh_token.unwrap();
         let new_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
-        let client_assertion = self.create_client_assertion(&token_endpoint)?;
+        let client_assertion = self.create_client_assertion(&auth_server_iss)?;
 
         let response = post_form_with_dpop(
             http_client,
