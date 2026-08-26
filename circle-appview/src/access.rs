@@ -550,69 +550,99 @@ pub async fn activate_circle(
         ));
     }
 
-    // 3. Sync Space repos to discover metadata.
-    // Acquire a Space credential under the calling user's OAuth session first.
-    if let Err(e) = ensure_space_credential(state, space_uri, Some(user_did)).await {
+    // 3. Acquire a Space credential under the calling user's OAuth session first.
+    let cred = ensure_space_credential(state, space_uri, Some(user_did)).await.map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "Failed to acquire space credential during activation");
-        return Err(e);
+        e
+    })?;
+
+    // 4. Fetch and parse the authority's repo IN MEMORY to discover and validate
+    // the blue.catbird.circle.metadata record before persisting the circles row.
+    let authority_doc = state
+        .did_resolver
+        .resolve(&authority_did)
+        .await
+        .map_err(|e| match e {
+            AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+            other => AppError::Internal(format!(
+                "Failed to resolve DID document for {authority_did}: {other}"
+            )),
+        })?;
+    let (repo_service_endpoint, _) = resolve_pds_endpoint(&authority_doc, &authority_did)?;
+    let author_vm = select_verification_method(&authority_doc, &authority_did, None)
+        .map_err(AppError::Unauthorized)?;
+    let author_signing_key =
+        parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
+
+    let car_bytes = state
+        .space_client
+        .get_repo(
+            &repo_service_endpoint,
+            space_uri,
+            &authority_did,
+            None,
+            &cred.token,
+            &cred.dpop_key,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, space_uri = %space_uri, "Failed to fetch authority repo during activation");
+            AppError::Internal(format!("Could not read the Space: repo fetch failed ({e})"))
+        })?;
+
+    let car = crate::commit::parse_permissioned_car(&car_bytes)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, space_uri = %space_uri, "CAR decoding failed during activation");
+            AppError::Internal(format!("Could not read the Space: CAR decoding failed ({e})"))
+        })?;
+
+    let (_commit, records, _lthash) = crate::commit::extract_and_validate_car(
+        &car,
+        space_uri,
+        &authority_did,
+        &author_signing_key,
+    )
+    .map_err(|e| {
+        tracing::warn!(error = %e, space_uri = %space_uri, "CAR validation failed during activation");
+        AppError::Internal(format!("Could not read the Space: CAR validation failed ({e})"))
+    })?;
+
+    let meta_records: Vec<_> = records
+        .into_iter()
+        .filter(|(col, _, _, _)| col == "blue.catbird.circle.metadata")
+        .collect();
+
+    if meta_records.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Space is not eligible: blue.catbird.circle.metadata record is absent".into(),
+        ));
     }
 
-    let sync_engine = crate::sync::SyncEngine::new(state);
-    let sync_error = match sync_engine.sync_repo(space_uri, &authority_did).await {
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!(error = %e, space_uri = %space_uri, "Space repo sync failed during activation");
-            Some(e.to_string())
-        }
-    };
-    // Fetch metadata record from circle_records
-    let meta_record: Option<(serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
-        r#"
-        SELECT record_json, created_at
-        FROM circle_records
-        WHERE space_uri = $1
-          AND author_did = $2
-          AND collection = 'blue.catbird.circle.metadata'
-          AND deleted_at IS NULL
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(space_uri)
-    .bind(&authority_did)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::Database)?;
+    let mut parsed_meta = Vec::new();
+    for (_col, _rkey, _cid, val) in meta_records {
+        let circle_id = val
+            .get("circleId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::InvalidRequest("Missing circleId in metadata record".into()))?
+            .to_string();
+        let name = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && s.chars().count() <= 64)
+            .unwrap_or("Circle")
+            .to_string();
+        let created_at = val
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+            .unwrap_or_else(Utc::now);
+        parsed_meta.push((circle_id, name, created_at));
+    }
+    parsed_meta.sort_by_key(|(_, _, created_at)| *created_at);
+    let (circle_id, display_name, created_at) = parsed_meta.pop().unwrap();
 
-    let (circle_id, display_name, created_at) = match meta_record {
-        Some((val, created_at)) => {
-            let circle_id = val
-                .get("circleId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::InvalidRequest("Missing circleId in metadata record".into()))?
-                .to_string();
-            let name = val
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Circle")
-                .to_string();
-            (circle_id, name, created_at)
-        }
-        None => {
-            return Err(match sync_error {
-                // Sync failed, so we never had a chance to see the record.
-                // Reporting it as "absent" would blame the user's Space for an
-                // AppView-side failure.
-                Some(err) => AppError::Internal(format!(
-                    "Could not read the Space: repo sync failed ({err})"
-                )),
-                None => AppError::InvalidRequest(
-                    "Space is not eligible: blue.catbird.circle.metadata record is absent".into(),
-                ),
-            });
-        }
-    };
-
+    // 5. INSERT the circles parent row.
     sqlx::query(
         r#"
         INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at)
@@ -633,7 +663,12 @@ pub async fn activate_circle(
     .await
     .map_err(AppError::Database)?;
 
-    // 5. Now that the circle row exists, persist the member cache.
+    // 6. Now that the circle row exists, sync the repo so children (circle_records, etc.) have their FK parent.
+    let sync_engine = crate::sync::SyncEngine::new(state);
+    if let Err(e) = sync_engine.sync_repo(space_uri, &authority_did).await {
+        tracing::warn!(error = %e, space_uri = %space_uri, "Space repo sync failed during activation");
+    }
+    // 7. Now that the circle row exists, persist the member cache.
     let members = refresh_member_cache(state, space_uri).await?;
 
     let circle_tid = catbird_atproto::jacquard_common::types::string::Tid::new(
@@ -1413,5 +1448,472 @@ mod tests {
         .expect("ensure_space_credential_from_parts must succeed while caller holds space lock");
 
         assert!(!cred.token.is_empty());
+    }
+
+    async fn start_mock_pds_tls_server() -> (String, tokio::task::JoinHandle<()>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+
+        let rustls_cert = rustls::pki_types::CertificateDer::from(cert_der);
+        let rustls_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![rustls_cert], rustls_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pds_endpoint = format!("https://127.0.0.1:{port}");
+
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = tls_stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    if req_str.starts_with("GET /xrpc/com.atproto.simplespace.getSpace") {
+                        let body = serde_json::json!({
+                            "authority": TEST_AUTHORITY_DID,
+                            "spaceType": "blue.catbird.circle",
+                            "skey": "3k2space1",
+                            "appAccess": {
+                                "$type": "com.atproto.space.defs#allowList",
+                                "allowed": ["https://circles.catbird.blue/oauth/client-metadata.json"]
+                            },
+                            "name": "Test Circle Space"
+                        }).to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls_stream.write_all(response.as_bytes()).await;
+                    } else if req_str.starts_with("GET /xrpc/com.atproto.simplespace.listMembers") {
+                        let body = serde_json::json!({
+                            "members": [
+                                { "did": TEST_USER_DID },
+                                { "did": TEST_AUTHORITY_DID }
+                            ]
+                        }).to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls_stream.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        (pds_endpoint, handle)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_activate_circle_success_creates_circle_and_synced_records(pool: PgPool) {
+        use crate::commit::{mint_repo_car, mint_signed_commit, RepoRecord, LtHash};
+
+        let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
+
+        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+        let http_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), http_client.clone()));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &user_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: pds_endpoint.clone(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &auth_key,
+            vec![
+                DidService {
+                    id: "#atproto_pds".into(),
+                    r#type: "AtprotoPersonalDataServer".into(),
+                    service_endpoint: pds_endpoint.clone(),
+                },
+                DidService {
+                    id: "#atproto_space_host".into(),
+                    r#type: "AtprotoSpaceHost".into(),
+                    service_endpoint: TEST_SPACE_HOST.into(),
+                },
+            ],
+        );
+
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_authority_signing_key(TEST_AUTHORITY_DID, auth_key.clone());
+
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        space_client.set_deps(crate::space_client::SpaceClientDeps {
+            http_client: http_client.clone(),
+            did_resolver: did_resolver.clone(),
+            oauth_service: oauth_service.clone(),
+        });
+
+        // Store active sessions for user and authority
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_user_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{pds_endpoint}/oauth/token"),
+            auth_server_iss: pds_endpoint.clone(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        let auth_session = UserOAuthSession {
+            user_did: TEST_AUTHORITY_DID.into(),
+            access_token: "test_auth_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{pds_endpoint}/oauth/token"),
+            auth_server_iss: pds_endpoint.clone(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(auth_session).await.unwrap();
+
+        // Build valid CAR containing blue.catbird.circle.metadata and a post
+        let meta_json = serde_json::json!({
+            "$type": "blue.catbird.circle.metadata",
+            "circleId": "3l7aaaaaaaaaa",
+            "name": "My Test Circle",
+            "createdAt": Utc::now().to_rfc3339()
+        });
+        let post_json = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Hello world from circle space!",
+            "createdAt": Utc::now().to_rfc3339()
+        });
+
+        let rec_meta = RepoRecord {
+            collection: "blue.catbird.circle.metadata".into(),
+            rkey: "self".into(),
+            cid: crate::commit::compute_dagcbor_cid(&meta_json).unwrap(),
+            value: meta_json,
+        };
+        let rec_post = RepoRecord {
+            collection: "app.bsky.feed.post".into(),
+            rkey: "3l7post222222".into(),
+            cid: crate::commit::compute_dagcbor_cid(&post_json).unwrap(),
+            value: post_json,
+        };
+
+        let mut lthash = LtHash::default();
+        lthash.add(&format!("{}/{}/{}", rec_meta.collection, rec_meta.rkey, rec_meta.cid));
+        lthash.add(&format!("{}/{}/{}", rec_post.collection, rec_post.rkey, rec_post.cid));
+
+        let commit = mint_signed_commit(
+            TEST_SPACE_URI,
+            TEST_AUTHORITY_DID,
+            "3l7rev234567a",
+            &lthash.state(),
+            &auth_key,
+        );
+
+        let car_bytes = mint_repo_car(&commit, &[rec_meta, rec_post]).unwrap();
+        let key = format!("{TEST_SPACE_URI}:{TEST_AUTHORITY_DID}");
+        mock_transport.set_get_repo_response(&key, car_bytes.clone());
+        mock_transport.set_get_repo_response(TEST_SPACE_URI, car_bytes);
+
+        let config = Arc::new(crate::config::Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
+            plc_directory_url: "https://plc.directory".into(),
+            public_appview_url: "https://public.api.bsky.app".into(),
+            circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
+            push_signing_key_path: None,
+            push_signing_key_hex: None,
+        });
+
+        let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
+            config.public_appview_url.clone(),
+            http_client.clone(),
+        ));
+
+        let state = AppState {
+            config,
+            db: pool.clone(),
+            http_client,
+            did_resolver,
+            credential_store: credential_store.clone(),
+            space_client,
+            space_locks: Arc::new(SpaceLockManager::new()),
+            profile_hydrator,
+            oauth_service,
+            push_client: None,
+        };
+
+        let summary = activate_circle(&state, TEST_USER_DID, TEST_SPACE_URI)
+            .await
+            .expect("activate_circle must succeed when metadata is present");
+
+        assert_eq!(summary.circle_id.as_str(), "3l7aaaaaaaaaa");
+        assert_eq!(summary.name.as_str(), "My Test Circle");
+        assert_eq!(summary.owner.as_str(), TEST_AUTHORITY_DID);
+        assert_eq!(summary.member_count, Some(2));
+
+        // Verify circles row is in DB
+        let circle_row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT circle_id, display_name, authority_did FROM circles WHERE space_uri = $1",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        assert!(circle_row.is_some(), "circles row must exist");
+        let (cid, name, auth) = circle_row.unwrap();
+        assert_eq!(cid, "3l7aaaaaaaaaa");
+        assert_eq!(name, "My Test Circle");
+        assert_eq!(auth, TEST_AUTHORITY_DID);
+
+        // Verify circle_records has the post record synced from repo
+        let post_record: Option<(String,)> = sqlx::query_as(
+            "SELECT rkey FROM circle_records WHERE space_uri = $1 AND collection = 'app.bsky.feed.post'",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        assert!(post_record.is_some(), "Synced post record must exist in circle_records");
+        assert_eq!(post_record.unwrap().0, "3l7post222222");
+
+        // Verify circle_member_cache has members
+        let member_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 ORDER BY member_did",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(member_rows.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_activate_circle_ineligible_when_metadata_absent_leaves_no_circle_row(pool: PgPool) {
+        use crate::commit::{mint_repo_car, mint_signed_commit, RepoRecord, LtHash};
+
+        let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
+
+        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+        let http_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), http_client.clone()));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &user_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: pds_endpoint.clone(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &auth_key,
+            vec![
+                DidService {
+                    id: "#atproto_pds".into(),
+                    r#type: "AtprotoPersonalDataServer".into(),
+                    service_endpoint: pds_endpoint.clone(),
+                },
+                DidService {
+                    id: "#atproto_space_host".into(),
+                    r#type: "AtprotoSpaceHost".into(),
+                    service_endpoint: TEST_SPACE_HOST.into(),
+                },
+            ],
+        );
+
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_authority_signing_key(TEST_AUTHORITY_DID, auth_key.clone());
+
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        space_client.set_deps(crate::space_client::SpaceClientDeps {
+            http_client: http_client.clone(),
+            did_resolver: did_resolver.clone(),
+            oauth_service: oauth_service.clone(),
+        });
+
+        // Store active sessions for user and authority
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_user_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{pds_endpoint}/oauth/token"),
+            auth_server_iss: pds_endpoint.clone(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        let auth_session = UserOAuthSession {
+            user_did: TEST_AUTHORITY_DID.into(),
+            access_token: "test_auth_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{pds_endpoint}/oauth/token"),
+            auth_server_iss: pds_endpoint.clone(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(auth_session).await.unwrap();
+
+        // Build valid CAR with ONLY a post record (NO metadata record)
+        let post_json = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Hello world with no metadata record",
+            "createdAt": Utc::now().to_rfc3339()
+        });
+
+        let rec_post = RepoRecord {
+            collection: "app.bsky.feed.post".into(),
+            rkey: "3l7post222222".into(),
+            cid: crate::commit::compute_dagcbor_cid(&post_json).unwrap(),
+            value: post_json,
+        };
+
+        let mut lthash = LtHash::default();
+        lthash.add(&format!("{}/{}/{}", rec_post.collection, rec_post.rkey, rec_post.cid));
+
+        let commit = mint_signed_commit(
+            TEST_SPACE_URI,
+            TEST_AUTHORITY_DID,
+            "3l7rev234567a",
+            &lthash.state(),
+            &auth_key,
+        );
+
+        let car_bytes = mint_repo_car(&commit, &[rec_post]).unwrap();
+        let key = format!("{TEST_SPACE_URI}:{TEST_AUTHORITY_DID}");
+        mock_transport.set_get_repo_response(&key, car_bytes.clone());
+        mock_transport.set_get_repo_response(TEST_SPACE_URI, car_bytes);
+
+        let config = Arc::new(crate::config::Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
+            plc_directory_url: "https://plc.directory".into(),
+            public_appview_url: "https://public.api.bsky.app".into(),
+            circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
+            push_signing_key_path: None,
+            push_signing_key_hex: None,
+        });
+
+        let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
+            config.public_appview_url.clone(),
+            http_client.clone(),
+        ));
+
+        let state = AppState {
+            config,
+            db: pool.clone(),
+            http_client,
+            did_resolver,
+            credential_store: credential_store.clone(),
+            space_client,
+            space_locks: Arc::new(SpaceLockManager::new()),
+            profile_hydrator,
+            oauth_service,
+            push_client: None,
+        };
+
+        let err = activate_circle(&state, TEST_USER_DID, TEST_SPACE_URI)
+            .await
+            .expect_err("activate_circle must fail when metadata is absent");
+
+        match err {
+            AppError::InvalidRequest(msg) => {
+                assert!(
+                    msg.contains("Space is not eligible: blue.catbird.circle.metadata record is absent"),
+                    "Error message must indicate space ineligibility, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::InvalidRequest, got: {:?}", other),
+        }
+
+        // Verify NO circles row exists in DB
+        let circle_row: Option<(String,)> = sqlx::query_as(
+            "SELECT circle_id FROM circles WHERE space_uri = $1",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        assert!(circle_row.is_none(), "NO circles row must exist in DB");
     }
 }

@@ -107,7 +107,7 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
-    #[error("Database error")]
+    #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
     #[error("Internal error: {0}")]
