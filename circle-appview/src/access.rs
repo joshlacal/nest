@@ -518,8 +518,18 @@ pub async fn activate_circle(
         ));
     }
 
-    // 2. Refresh member list from PDS and verify caller is authorized
-    let members = refresh_member_cache(state, space_uri).await?;
+    // 2. Authorize the caller against the PDS member list WITHOUT writing yet.
+    // `circle_member_cache` has a foreign key onto `circles`, so the cache can
+    // only be persisted after the circle row exists (step 4). Authorization
+    // still happens first: no row is created for a caller who is not a member.
+    let members = state
+        .space_client
+        .member_dids(space_uri)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "Failed to fetch member DIDs from PDS");
+            AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}"))
+        })?;
     if !members.iter().any(|m| m == user_did) && user_did != authority_did {
         return Err(AppError::Forbidden(
             "Caller is not a member or authority of this Space".into(),
@@ -588,6 +598,9 @@ pub async fn activate_circle(
     .execute(&state.db)
     .await
     .map_err(AppError::Database)?;
+
+    // 5. Now that the circle row exists, persist the member cache.
+    let members = refresh_member_cache(state, space_uri).await?;
 
     let circle_tid = catbird_atproto::jacquard_common::types::string::Tid::new(
         SmolStr::new(&circle_id),
