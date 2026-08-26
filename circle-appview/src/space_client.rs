@@ -1223,7 +1223,16 @@ impl SpaceClient {
                     }
                 }
             } else if let Some(obj) = val.as_object() {
-                if let Some(apps) = obj.get("allowList").and_then(|v| v.as_array()) {
+                // Real wire shape from com.atproto.simplespace.getSpace:
+                //   "appAccess": { "$type": "...defs#allowList", "allowed": [client_id, ...] }
+                // The array lives under `allowed`; `$type` is only the union tag.
+                // A `#open` policy has no list at all and therefore never names
+                // this AppView, which is the fail-closed reading we want.
+                let allowed = obj
+                    .get("allowed")
+                    .or_else(|| obj.get("allowList"))
+                    .and_then(|v| v.as_array());
+                if let Some(apps) = allowed {
                     for item in apps {
                         if let Some(s) = item.as_str() {
                             app_access_list.push(s.to_string());
