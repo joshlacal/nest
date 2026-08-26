@@ -751,7 +751,14 @@ impl ScenarioRunner {
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid repo DID: {e}")))?,
             space: AtSpaceUri::new(space.to_string())
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid space URI: {e}")))?,
-            validate: Some(true),
+            // A PDS can only validate lexicons it knows. `blue.catbird.circle.*`
+            // is a third-party lexicon, and the live Spaces PDS rejects such
+            // writes with "Unknown lexicon type" when validation is on. So
+            // validate the standard namespaces and skip validation for our own;
+            // the AppView validates Circle records on ingest regardless.
+            validate: Some(
+                collection.starts_with("app.bsky.") || collection.starts_with("com.atproto."),
+            ),
             writes: vec![ApplyWritesWritesItem::Create(Box::new(create_item))],
             extra_data: None,
         };

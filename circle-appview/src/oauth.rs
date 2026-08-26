@@ -31,7 +31,13 @@ fn url_encode(s: &str) -> String {
 use crate::auth::{parse_public_key_jwk, DidResolver, JwtHeader, PublicKeyJwk};
 use crate::config::AppState;
 use crate::error::{AppError, AuthReason};
-pub const CIRCLE_SCOPE: &str = "space:blue.catbird.circle?authority=*&action=read";
+/// Scope requested for the AppView's own grant.
+///
+/// The bare `atproto` scope is MANDATORY in every atproto OAuth authorization
+/// request; a PDS rejects the request with `invalid_request` / `Missing "atproto"
+/// scope` without it. The permissioned-data scope alone is not sufficient, which
+/// a live authorization against spaces-alpha.host.bsky.network proved.
+pub const CIRCLE_SCOPE: &str = "atproto space:blue.catbird.circle?authority=*&action=read";
 pub const CALLBACK_DEEP_LINK: &str = "blue.catbird://oauth/circle-appview";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -868,4 +874,28 @@ pub async fn resolve_and_verify_client_attestation(
         .map_err(AppError::Unauthorized)?;
 
     Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CIRCLE_SCOPE;
+
+    /// A PDS rejects an authorization request that omits the bare `atproto`
+    /// scope with `invalid_request` / `Missing "atproto" scope`. Dropping it
+    /// breaks every AppView authorization, and the failure only shows up
+    /// against a live PDS, so pin it here.
+    #[test]
+    fn circle_scope_includes_mandatory_atproto_scope() {
+        let scopes: Vec<&str> = CIRCLE_SCOPE.split(' ').collect();
+        assert!(
+            scopes.contains(&"atproto"),
+            "CIRCLE_SCOPE must include the bare `atproto` scope, got {CIRCLE_SCOPE:?}"
+        );
+        assert!(
+            scopes
+                .iter()
+                .any(|s| s.starts_with("space:blue.catbird.circle?")),
+            "CIRCLE_SCOPE must still request the Circle permissioned-data scope, got {CIRCLE_SCOPE:?}"
+        );
+    }
 }
