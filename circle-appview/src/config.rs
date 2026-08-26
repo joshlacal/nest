@@ -136,8 +136,15 @@ fn try_load_signing_key(path: Option<&str>, hex: Option<&str>) -> Option<p256::e
                     return Some(key);
                 }
             }
+            // PKCS#8 PEM ("BEGIN PRIVATE KEY") is what `FromStr` accepts.
             if let Ok(key) = trimmed.parse::<p256::ecdsa::SigningKey>() {
                 return Some(key);
+            }
+            // SEC1 PEM ("BEGIN EC PRIVATE KEY") is what `openssl ecparam -genkey`
+            // emits by default, so accept it too rather than silently falling
+            // through to an ephemeral key.
+            if let Ok(secret) = p256::SecretKey::from_sec1_pem(trimmed) {
+                return Some(secret.into());
             }
         }
     }
@@ -177,11 +184,34 @@ impl AppState {
             http_client.clone(),
         ));
 
-        let oauth_signing_key = try_load_signing_key(
+        // An ephemeral OAuth key is never acceptable for a confidential client:
+        // it changes on every restart, so the published JWKS stops matching the
+        // key that signs `client_assertion`, and every token exchange fails with
+        // `invalid_client: signature verification failed`. That failure mode is
+        // silent and remote, so a misconfigured key must stop startup instead.
+        let oauth_signing_key = match try_load_signing_key(
             config.oauth_signing_key_path.as_deref(),
             config.oauth_signing_key_hex.as_deref(),
-        )
-        .unwrap_or_else(|| p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        ) {
+            Some(key) => key,
+            None => {
+                let configured = config.oauth_signing_key_path.is_some()
+                    || config.oauth_signing_key_hex.is_some();
+                assert!(
+                    !configured,
+                    "OAuth signing key is configured but could not be parsed. Accepted forms: \
+                     raw 32-byte hex, SEC1 PEM (\"BEGIN EC PRIVATE KEY\"), or PKCS#8 PEM \
+                     (\"BEGIN PRIVATE KEY\"). Refusing to start with an ephemeral key."
+                );
+                tracing::error!(
+                    "No OAuth signing key configured; using an EPHEMERAL key. OAuth cannot \
+                     work: the published JWKS changes on every restart and every \
+                     client_assertion will fail signature verification. Set \
+                     OAUTH_SIGNING_KEY_PATH or OAUTH_SIGNING_KEY_HEX."
+                );
+                p256::ecdsa::SigningKey::random(&mut rand::thread_rng())
+            }
+        };
 
         let oauth_service = Arc::new(OAuthService::new(
             config.appview_base_url.clone(),
@@ -295,5 +325,48 @@ impl AppState {
             verification_method,
             service,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_load_signing_key;
+
+    /// `openssl ecparam -genkey -name prime256v1 -noout` emits SEC1, not PKCS#8.
+    /// Failing to load it used to fall back to an ephemeral key, which silently
+    /// broke every OAuth token exchange with `invalid_client`.
+    #[test]
+    fn loads_sec1_pem_key_from_file() {
+        let key = p256::SecretKey::random(&mut rand::thread_rng());
+        let pem = key
+            .to_sec1_pem(p256::pkcs8::LineEnding::LF)
+            .expect("encode sec1");
+        let file = std::env::temp_dir().join(format!("circle-sec1-{}.pem", uuid::Uuid::new_v4()));
+        std::fs::write(&file, pem.as_bytes()).expect("write key");
+
+        let loaded = try_load_signing_key(Some(file.to_str().unwrap()), None)
+            .expect("SEC1 PEM must load");
+        assert_eq!(
+            loaded.to_bytes().as_slice(),
+            key.to_bytes().as_slice(),
+            "loaded key must be the same key, not a fresh one"
+        );
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// Raw 32-byte hex must also work, since that is the other documented form.
+    #[test]
+    fn loads_raw_hex_key() {
+        let key = p256::SecretKey::random(&mut rand::thread_rng());
+        let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let loaded = try_load_signing_key(None, Some(&hex)).expect("hex key must load");
+        assert_eq!(loaded.to_bytes().as_slice(), key.to_bytes().as_slice());
+    }
+
+    /// A configured-but-garbage key must NOT yield a key; startup turns this into
+    /// a hard failure rather than an ephemeral identity.
+    #[test]
+    fn rejects_unparseable_key() {
+        assert!(try_load_signing_key(None, Some("not-a-key")).is_none());
     }
 }
