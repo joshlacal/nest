@@ -536,9 +536,18 @@ pub async fn activate_circle(
         ));
     }
 
-    // 3. Sync Space repos to discover metadata
+    // 3. Sync Space repos to discover metadata.
+    // A discarded error here is indistinguishable from a genuinely missing
+    // metadata record, which produces a misleading "not eligible" rejection, so
+    // record why the sync failed and carry it into the error below.
     let sync_engine = crate::sync::SyncEngine::new(state);
-    let _ = sync_engine.sync_repo(space_uri, &authority_did).await;
+    let sync_error = match sync_engine.sync_repo(space_uri, &authority_did).await {
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, space_uri = %space_uri, "Space repo sync failed during activation");
+            Some(e.to_string())
+        }
+    };
     // Fetch metadata record from circle_records
     let meta_record: Option<(serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
         r#"
@@ -573,9 +582,17 @@ pub async fn activate_circle(
             (circle_id, name, created_at)
         }
         None => {
-            return Err(AppError::InvalidRequest(
-                "Space is not eligible: blue.catbird.circle.metadata record is absent".into(),
-            ));
+            return Err(match sync_error {
+                // Sync failed, so we never had a chance to see the record.
+                // Reporting it as "absent" would blame the user's Space for an
+                // AppView-side failure.
+                Some(err) => AppError::Internal(format!(
+                    "Could not read the Space: repo sync failed ({err})"
+                )),
+                None => AppError::InvalidRequest(
+                    "Space is not eligible: blue.catbird.circle.metadata record is absent".into(),
+                ),
+            });
         }
     };
 
