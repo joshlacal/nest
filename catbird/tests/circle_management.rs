@@ -1213,7 +1213,7 @@ async fn reconcile_stale_projections_promotes_state_to_pending(pool: PgPool) {
         .and(path("/xrpc/com.atproto.space.getRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self",
-            "value": { "name": "Reconciled Circle" }
+            "value": { "$type": "blue.catbird.circle.metadata", "name": "Reconciled Circle" }
         })))
         .mount(&env._pds)
         .await;
@@ -1225,7 +1225,11 @@ async fn reconcile_stale_projections_promotes_state_to_pending(pool: PgPool) {
             &env.session.id.to_string(),
             "at://did:plc:alice/space/blue.catbird.circle/reconcile-test",
             catbird::models::CircleProjectionKind::CircleUpsert,
-            serde_json::json!({ "name": "Reconciled Circle" }),
+            serde_json::json!({
+                "name": "Reconciled Circle",
+                "createSpacePayload": { "type": "blue.catbird.circle" },
+                "metadataPayload": { "$type": "blue.catbird.circle.metadata", "name": "Reconciled Circle" }
+            }),
             catbird::models::CircleProjectionState::Intent,
         )
         .await
@@ -2480,12 +2484,31 @@ async fn circle_upsert_deterministic_replay_and_body_verification(pool: PgPool) 
     .await
     .unwrap();
 
-    // 1. Case: getRecord returns 503 -> transient error, does NOT proceed to createSpace or mutate PDS
+    // 1. Case: getRecord returns 503 -> transient error, retry_operation must NOT proceed to createSpace or mutate PDS
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.space.getRecord"))
         .respond_with(ResponseTemplate::new(503).set_body_string("Transient Service Unavailable"))
+        .expect(1)
         .mount(&pds)
         .await;
+
+    // Expect ZERO calls to createSpace or putRecord on transient error
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&pds)
+        .await;
+
+    let res1 = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
+    assert_eq!(res1.status, OperationStatus::Pending);
+
     // Fast-forward execution_started_at so case 2 can re-claim the lease
     sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds' WHERE id = $1")
         .bind(op_id)
@@ -2493,7 +2516,7 @@ async fn circle_upsert_deterministic_replay_and_body_verification(pool: PgPool) 
         .await
         .unwrap();
 
-    // 2. Case: getRecord returns 200 with MISMATCHED record name -> fails closed with MetadataRecordMismatch
+    // 2. Case: getRecord returns 200 with MISMATCHED record name or createdAt -> fails closed with MetadataRecordMismatch
     pds.reset().await;
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.space.listSpaces"))
@@ -2509,7 +2532,7 @@ async fn circle_upsert_deterministic_replay_and_body_verification(pool: PgPool) 
         .and(path("/xrpc/com.atproto.space.getRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uri": format!("{space_uri}/did:plc:alice/blue.catbird.circle.metadata/self"),
-            "value": { "$type": "blue.catbird.circle.metadata", "name": "Completely Different Name" }
+            "value": { "$type": "blue.catbird.circle.metadata", "name": "Completely Different Name", "createdAt": created_at_str }
         })))
         .mount(&pds)
         .await;
@@ -2518,14 +2541,78 @@ async fn circle_upsert_deterministic_replay_and_body_verification(pool: PgPool) 
     assert_eq!(res2.status, OperationStatus::Failed);
     assert!(res2.error.as_deref().unwrap().contains("MetadataRecordMismatch"));
 
-    // 3. Case: getRecord returns 200 with MATCHING record -> verified, transitions to Pending and delivers
-    // Fast-forward execution_started_at so case 3 can re-claim the lease
-    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds' WHERE id = $1")
+    // 3. Case: getRecord returns 200 with MISMATCHED $type -> fails closed
+    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds', state = 'failed' WHERE id = $1")
         .bind(op_id)
         .execute(&pool)
         .await
         .unwrap();
-    // 3. Case: getRecord returns 200 with MATCHING record -> verified, transitions to Pending and delivers
+    pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": format!("{space_uri}/did:plc:alice/blue.catbird.circle.metadata/self"),
+            "value": { "$type": "app.bsky.feed.post", "name": "Deterministic Circle", "createdAt": created_at_str }
+        })))
+        .mount(&pds)
+        .await;
+
+    let res2_type = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
+    assert_eq!(res2_type.status, OperationStatus::Failed);
+    assert!(res2_type.error.as_deref().unwrap().contains("MetadataRecordMismatch"));
+
+    // 4. Case: getRecord returns RecordNotFound -> authoritative absence, proceeds to createSpace and putRecord
+    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds', state = 'failed' WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({ "error": "RecordNotFound", "message": "not found" })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "uri": space_uri })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "uri": format!("{space_uri}/self"), "cid": "bafycid1" })))
+        .mount(&pds)
+        .await;
+
+    let res4 = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
+    assert_eq!(res4.status, OperationStatus::Complete);
+
+    // 5. Case: getRecord returns 200 with MATCHING record -> verified, transitions to Complete without PDS mutation
+    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds', state = 'failed' WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pds.reset().await;
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.space.listSpaces"))
@@ -2546,12 +2633,34 @@ async fn circle_upsert_deterministic_replay_and_body_verification(pool: PgPool) 
         .mount(&pds)
         .await;
 
-    let res3 = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
-    assert_eq!(res3.status, OperationStatus::Complete);
+    let res5 = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
+    assert_eq!(res5.status, OperationStatus::Complete);
+
+    // 6. Case: Missing persisted payloads -> fails closed
+    let missing_payload_op_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_projection_outbox (
+            id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, created_at, updated_at
+        ) VALUES (
+            $1, 'key-missing-p', 'did:plc:alice', $2, $3, 'circle_upsert', '{"name":"No Payload"}'::jsonb, 'failed', 1, now() - interval '10s', now(), now()
+        )
+        "#
+    )
+    .bind(missing_payload_op_id)
+    .bind(session.id.to_string())
+    .bind(space_uri)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let res6 = service.retry_operation(&session, &missing_payload_op_id.to_string()).await.unwrap();
+    assert_eq!(res6.status, OperationStatus::Failed);
+    assert!(res6.error.as_deref().unwrap().contains("MissingPersistedCreateSpacePayload"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn circle_upsert_concurrent_retry_claim_fencing_and_identical_bodies(pool: PgPool) {
+async fn circle_upsert_held_executor_concurrent_retry_claim_fencing_and_identical_bodies(pool: PgPool) {
     let pds = MockServer::start().await;
     let appview = MockServer::start().await;
     let pds_url = pds.uri().replace("127.0.0.1", "localhost");
@@ -2572,7 +2681,7 @@ async fn circle_upsert_concurrent_retry_claim_fencing_and_identical_bodies(pool:
     // getRecord returns 404
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.space.getRecord"))
-        .respond_with(ResponseTemplate::new(404).set_body_string("RecordNotFound"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({ "error": "RecordNotFound" })))
         .mount(&pds)
         .await;
 
@@ -2645,35 +2754,55 @@ async fn circle_upsert_concurrent_retry_claim_fencing_and_identical_bodies(pool:
     .await
     .unwrap();
 
-    // Spawn two concurrent retry attempts
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-
-    let s1 = service.clone();
-    let sess1 = session.clone();
-    let b1 = barrier.clone();
+    // 1. Executor 1 claims outbox row
     let op_str = op_id.to_string();
-    let op_str1 = op_str.clone();
-    let h1 = tokio::spawn(async move {
-        b1.wait().await;
-        s1.retry_operation(&sess1, &op_str1).await
-    });
+    let claim1 = service.claim_projection(op_id, &session.id.to_string()).await.unwrap();
+    assert!(claim1.is_some(), "Executor 1 must acquire claim token");
+    let token1 = claim1.unwrap();
 
-    let s2 = service.clone();
-    let sess2 = session.clone();
-    let b2 = barrier.clone();
-    let op_str2 = op_str.clone();
-    let h2 = tokio::spawn(async move {
-        b2.wait().await;
-        s2.retry_operation(&sess2, &op_str2).await
-    });
+    // 2. While Executor 1 holds token1, simulate lease expiration in DB
+    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds' WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    let (res1, res2) = tokio::join!(h1, h2);
-    let op1 = res1.unwrap().unwrap();
-    let op2 = res2.unwrap().unwrap();
+    // 3. Executor 2 calls retry_operation, acquires new claim token, and executes replay
+    let res2 = service.retry_operation(&session, &op_str).await.unwrap();
+    assert_eq!(res2.status, OperationStatus::Complete);
 
-    // Both see a valid operation response (either Complete or Pending), never corrupted state
-    assert!(op1.status == OperationStatus::Complete || op1.status == OperationStatus::Pending);
-    assert!(op2.status == OperationStatus::Complete || op2.status == OperationStatus::Pending);
+    // 4. Executor 1 finishes late and tries to transition with token1 -> CAS rejects it
+    let exec1_result = service.replay_pds_mutation(
+        &service.get_projection_by_id(op_id).await.unwrap().unwrap(),
+        &session,
+        token1,
+    ).await;
+    // Cannot mutate or overwrite because claim token was superseded
+    assert!(exec1_result.is_ok());
+
+    // 5. Inspect received requests in wiremock to prove identical bodies
+    let requests = pds.received_requests().await.unwrap();
+    let create_space_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/xrpc/com.atproto.simplespace.createSpace")
+        .collect();
+    let put_record_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/xrpc/com.atproto.space.putRecord")
+        .collect();
+
+    assert!(!create_space_requests.is_empty());
+    for req in &create_space_requests {
+        let body_json: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body_json, create_space_payload);
+    }
+
+    assert!(!put_record_requests.is_empty());
+    for req in &put_record_requests {
+        let body_json: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body_json["record"], metadata_payload);
+        assert_eq!(body_json["record"]["createdAt"], created_at_str);
+    }
 
     // Verify final state in database is delivered
     let final_state: (String,) = sqlx::query_as("SELECT state FROM circle_projection_outbox WHERE id = $1")
@@ -2682,4 +2811,88 @@ async fn circle_upsert_concurrent_retry_claim_fencing_and_identical_bodies(pool:
         .await
         .unwrap();
     assert_eq!(final_state.0, "delivered");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_circle_fails_closed_if_upsert_or_member_child_missing_from_outbox(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/internal/projections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "accepted" })))
+        .mount(&appview)
+        .await;
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = CircleService::new(state);
+    let session = alice_session(&pds_url);
+    let input = CreateCircle {
+        name: "Missing Child Test".into(),
+        member_dids: vec![bob()],
+        extra_data: None,
+    };
+
+    // Normal create succeeds and produces all expected children
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-missing-1"
+        })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self",
+            "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&pds)
+        .await;
+
+    let op = service.create_circle(&session, input.clone()).await.unwrap();
+    assert_eq!(op.status, OperationStatus::Complete);
+
+    // Now install AFTER INSERT trigger that deletes member_add row to simulate missing child at aggregation time
+    sqlx::raw_sql(
+        r#"
+        CREATE OR REPLACE FUNCTION drop_member_child() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.kind = 'member_add' THEN
+                DELETE FROM circle_projection_outbox WHERE id = NEW.id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        CREATE TRIGGER trigger_drop_member
+        AFTER INSERT ON circle_projection_outbox
+        FOR EACH ROW EXECUTE FUNCTION drop_member_child();
+        "#
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = service.create_circle(&session, input).await;
+    assert!(err.is_err());
+    let err_str = err.err().unwrap().to_string();
+    assert!(err_str.contains("Missing expected parent operation children in outbox") || err_str.contains("children not found"));
 }

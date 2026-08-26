@@ -4249,37 +4249,83 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
 async fn server_graceful_shutdown_drains_connections_and_awaits_sweep(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    // Find an open ephemeral port
+    let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe_listener.local_addr().unwrap().port();
+    drop(probe_listener);
 
-    let (sweep_handle, shutdown_tx) = circle_appview::sync::spawn_revision_sweep_task(
-        setup.state.clone(),
-        std::time::Duration::from_millis(50),
-    );
+    let mut config = setup.state.config.as_ref().clone();
+    config.host = "127.0.0.1".into();
+    config.port = port;
 
-    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let app = circle_appview::routes::create_router(setup.state.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let server_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = server_shutdown_rx.await;
-            })
-            .await
+    let server_handle = tokio::spawn(async move {
+        circle_appview::run_server_with_shutdown(config, pool, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
     });
 
-    // Verify server is accepting connections
+    // Wait briefly for server to bind and accept connections
     let client = reqwest::Client::new();
-    let resp = client.get(format!("http://{addr}/_health")).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut server_ready = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/_health")).send().await {
+            if resp.status() == reqwest::StatusCode::OK {
+                server_ready = true;
+                break;
+            }
+        }
+    }
+    assert!(server_ready, "Production server must be active and serving endpoints");
 
-    // Signal server shutdown (simulating SIGTERM/SIGINT)
-    server_shutdown_tx.send(()).unwrap();
-    let server_res = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await.unwrap();
-    assert!(server_res.unwrap().is_ok(), "Server must shut down gracefully without error");
+    // Trigger graceful shutdown signal
+    shutdown_tx.send(()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), server_handle).await.unwrap();
+    assert!(result.unwrap().is_ok(), "run_server_with_shutdown must exit with Ok(()) on clean shutdown");
+}
 
-    // Signal and await sweep task termination
-    shutdown_tx.send(true).unwrap();
-    let sweep_res = tokio::time::timeout(std::time::Duration::from_secs(2), sweep_handle).await.unwrap();
-    assert!(sweep_res.is_ok(), "Sweep task must join cleanly after server shutdown");
+#[sqlx::test(migrations = "./migrations")]
+async fn server_graceful_shutdown_propagates_server_error_and_cleans_up_sweep(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    // Hold port open to force server bind error
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = blocker.local_addr().unwrap().port();
+
+    let mut config = setup.state.config.as_ref().clone();
+    config.host = "127.0.0.1".into();
+    config.port = port;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Must propagate error and clean up sweep task without hanging
+    let res = circle_appview::run_server_with_shutdown(config, pool, async move {
+        let _ = shutdown_rx.await;
+    }).await;
+
+    assert!(res.is_err(), "Must propagate bind/server error");
+    drop(blocker);
+    let _ = shutdown_tx.send(());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_signal_responds_to_sigterm() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+    let pid = std::process::id();
+
+    let kill_handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = std::process::Command::new("kill")
+            .arg("-15")
+            .arg(pid.to_string())
+            .status();
+    });
+
+    let res = tokio::time::timeout(std::time::Duration::from_secs(2), sigterm.recv()).await;
+    kill_handle.join().unwrap();
+    assert!(res.is_ok(), "SIGTERM must trigger signal receiver");
 }

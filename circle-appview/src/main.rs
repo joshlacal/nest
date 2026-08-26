@@ -44,23 +44,7 @@ async fn main() -> Result<(), anyhow::Error> {
         config.nest_verifying_keys = keys;
     }
 
-    let state = AppState::new(config.clone(), pool);
-    let (sweep_handle, shutdown_tx) = circle_appview::sync::spawn_revision_sweep_task(
-        state.clone(),
-        std::time::Duration::from_secs(300),
-    );
-
-    let app = routes::create_router(state);
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Listening on {}", addr);
-
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-    server.await?;
-
-    let _ = shutdown_tx.send(true);
-    sweep_handle.await?;
-    Ok(())
+    circle_appview::run_server_with_shutdown(config, pool, shutdown_signal()).await
 }
 
 async fn shutdown_signal() {

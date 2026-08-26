@@ -275,6 +275,9 @@ impl CircleService {
             )
             .await?;
 
+        let mut expected_child_ids = std::collections::HashSet::new();
+        expected_child_ids.insert(upsert_op_id);
+
         // Atomically claim the operation: intent -> executing
         let upsert_claim_token = self.claim_projection(upsert_op_id, &session.id.to_string()).await?;
 
@@ -431,7 +434,7 @@ impl CircleService {
                     Some(parent_op_id),
                 )
                 .await?;
-
+            expected_child_ids.insert(member_op_id);
             let maybe_claim = self.claim_projection(member_op_id, &session.id.to_string()).await?;
             let member_claim_token = match maybe_claim {
                 Some(token) => token,
@@ -540,14 +543,22 @@ impl CircleService {
             .await
             .map_err(|e| CircleError::Database(e.to_string()))?;
 
-            if rows.is_empty() {
-                return Err(CircleError::Database("Parent operation children not found in outbox".into()));
+            // Must contain at least upsert_op_id with CircleUpsert kind
+            let has_upsert = rows.iter().any(|r| r.id == upsert_op_id && r.kind == CircleProjectionKind::CircleUpsert);
+            if !has_upsert {
+                return Err(CircleError::Database("Authoritative CircleUpsert child not found in outbox".into()));
             }
+
+            // Must contain all expected child IDs
+            let returned_ids: std::collections::HashSet<Uuid> = rows.iter().map(|r| r.id).collect();
+            if !expected_child_ids.is_subset(&returned_ids) {
+                return Err(CircleError::Database("Missing expected parent operation children in outbox".into()));
+            }
+
             rows
         } else {
             Vec::new()
         };
-
         let mut has_failed = has_terminal_member_failure;
         let mut first_error = None;
         let mut all_delivered = true;
@@ -1976,9 +1987,28 @@ impl CircleService {
     ) -> Result<bool, CircleError> {
         let atproto = AtProtoClient::new(self.state.clone());
         let dpop_data = self.resolve_dpop_data(session).await;
-
         match op.kind {
             CircleProjectionKind::CircleUpsert => {
+                let Some(create_space_payload) = op.payload.get("createSpacePayload").cloned() else {
+                    let _ = self.set_projection_state(
+                        op.id,
+                        CircleProjectionState::Failed,
+                        Some("MissingPersistedCreateSpacePayload"),
+                        Some(claim_token),
+                    ).await;
+                    return Ok(false);
+                };
+
+                let Some(metadata_payload) = op.payload.get("metadataPayload").cloned() else {
+                    let _ = self.set_projection_state(
+                        op.id,
+                        CircleProjectionState::Failed,
+                        Some("MissingPersistedMetadataPayload"),
+                        Some(claim_token),
+                    ).await;
+                    return Ok(false);
+                };
+
                 let query = format!(
                     "space={}&repo={}&collection=blue.catbird.circle.metadata&rkey=self",
                     urlencoding::encode(&op.space_uri),
@@ -2000,16 +2030,15 @@ impl CircleService {
                     Ok(r) => {
                         let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
                         if (200..300).contains(&status) {
-                            // Verify found record against persisted desired state
-                            let expected_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
+                            // Compare complete returned metadata with persisted desired payload
                             let rec_val: Result<serde_json::Value, _> = serde_json::from_slice(&body);
                             let verified = match rec_val {
                                 Ok(val) => {
-                                    let found_name = val.get("value")
-                                        .and_then(|v| v.get("name"))
-                                        .or_else(|| val.get("name"))
-                                        .and_then(|v| v.as_str());
-                                    found_name == Some(expected_name)
+                                    let record = val.get("value").unwrap_or(&val);
+                                    let type_matches = record.get("$type") == metadata_payload.get("$type");
+                                    let name_matches = record.get("name") == metadata_payload.get("name");
+                                    let created_at_matches = record.get("createdAt") == metadata_payload.get("createdAt");
+                                    type_matches && name_matches && created_at_matches
                                 }
                                 Err(_) => false,
                             };
@@ -2024,9 +2053,6 @@ impl CircleService {
                                 ).await;
                                 return Ok(false);
                             }
-                        } else if status == 404 || String::from_utf8_lossy(&body).to_lowercase().contains("notfound") || String::from_utf8_lossy(&body).to_lowercase().contains("record not found") {
-                            // Authoritative not-found -> proceed to createSpace and putRecord
-                            (false, true)
                         } else if is_retryable_status(status) {
                             let err_text = String::from_utf8_lossy(&body);
                             self.record_indeterminate_transport_error(
@@ -2036,15 +2062,27 @@ impl CircleService {
                             ).await;
                             return Ok(false);
                         } else {
-                            // Non-404 4xx error (e.g. auth error or space unavailable)
-                            let err_text = String::from_utf8_lossy(&body);
-                            let _ = self.set_projection_state(
-                                op.id,
-                                CircleProjectionState::Failed,
-                                Some(&format!("Replay getRecord error ({status}): {err_text}")),
-                                Some(claim_token),
-                            ).await;
-                            return Ok(false);
+                            // Parse generated GetRecordError contract
+                            use catbird_atproto::generated::com_atproto::space::get_record::GetRecordError;
+                            let parsed_err: Result<GetRecordError, _> = serde_json::from_slice(&body);
+                            let is_authoritative_absence = match parsed_err {
+                                Ok(GetRecordError::RecordNotFound(_)) | Ok(GetRecordError::SpaceNotFound(_)) => true,
+                                Ok(_) => false,
+                                Err(_) => status == 404,
+                            };
+
+                            if is_authoritative_absence {
+                                (false, true)
+                            } else {
+                                let err_text = String::from_utf8_lossy(&body);
+                                let _ = self.set_projection_state(
+                                    op.id,
+                                    CircleProjectionState::Failed,
+                                    Some(&format!("Replay getRecord error ({status}): {err_text}")),
+                                    Some(claim_token),
+                                ).await;
+                                return Ok(false);
+                            }
                         }
                     }
                     Err(e) => {
@@ -2064,22 +2102,6 @@ impl CircleService {
                 if !should_create_space {
                     return Ok(false);
                 }
-
-                let skey = op.space_uri.rsplit('/').next().unwrap_or("circle");
-                let client_id = self.state.config.oauth.client_id.clone();
-                let create_space_payload = op.payload.get("createSpacePayload").cloned().unwrap_or_else(|| {
-                    serde_json::json!({
-                        "type": "blue.catbird.circle",
-                        "skey": skey,
-                        "policy": {
-                            "$type": "com.atproto.simplespace.defs#memberListPolicy"
-                        },
-                        "appAccess": {
-                            "$type": "com.atproto.simplespace.defs#allowList",
-                            "allowed": [client_id]
-                        }
-                    })
-                });
 
                 let create_bytes = serde_json::to_vec(&create_space_payload)
                     .map_err(|e| CircleError::Internal(e.to_string()))?;
@@ -2134,22 +2156,12 @@ impl CircleService {
                 };
 
                 if space_created {
-                    let circle_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
-                    let created_at_str = op.payload.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
-                    let metadata_record = op.payload.get("metadataPayload").cloned().unwrap_or_else(|| {
-                        serde_json::json!({
-                            "$type": "blue.catbird.circle.metadata",
-                            "name": circle_name,
-                            "createdAt": created_at_str
-                        })
-                    });
-
                     let put_record_body = serde_json::json!({
                         "space": &op.space_uri,
                         "repo": session.did,
                         "collection": "blue.catbird.circle.metadata",
                         "rkey": "self",
-                        "record": metadata_record
+                        "record": metadata_payload
                     });
                     let put_bytes = serde_json::to_vec(&put_record_body)
                         .map_err(|e| CircleError::Internal(e.to_string()))?;
@@ -2203,6 +2215,7 @@ impl CircleService {
                     Ok(false)
                 }
             }
+
             CircleProjectionKind::MemberAdd => {
                 let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
                 let add_body = serde_json::json!({
@@ -2439,7 +2452,21 @@ impl CircleService {
 
         Ok(count.0)
     }
+    /// Get a projection operation by its ID directly.
+    pub async fn get_projection_by_id(&self, id: Uuid) -> Result<Option<CircleProjectionOperation>, CircleError> {
+        let Some(pool) = &self.db else {
+            return Ok(None);
+        };
 
+        let row: Option<CircleProjectionOperation> = sqlx::query_as(
+            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at FROM circle_projection_outbox WHERE id = $1"
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row)
+    }
 
     /// Sends internal projection to AppView using dedicated `blue.catbird.circle.syncProjection` service auth.
     async fn send_projection_to_appview(
