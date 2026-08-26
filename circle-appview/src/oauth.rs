@@ -334,6 +334,11 @@ impl OAuthService {
                 },
             );
         }
+        tracing::info!(
+            state = %state,
+            used_par = %authorization_url.contains("request_uri="),
+            "Stored pending OAuth state"
+        );
 
         Ok(authorization_url)
     }
@@ -345,6 +350,7 @@ impl OAuthService {
         state: &str,
         http_client: &reqwest::Client,
     ) -> Result<String, AppError> {
+        tracing::info!(state = %state, "Callback state lookup");
         let pending = {
             let mut lock = self.pending_states.write();
             lock.remove(state)
