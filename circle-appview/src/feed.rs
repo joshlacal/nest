@@ -1,3 +1,5 @@
+use crate::access;
+use crate::config::AppState;
 use crate::error::AppError;
 use crate::hydration::ProfileHydrator;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6,16 +8,16 @@ use catbird_atproto::generated::app_bsky::embed::images::{View as ImagesView, Vi
 use catbird_atproto::generated::app_bsky::feed::{
     FeedViewPost, PostView, PostViewEmbed, ViewerState,
 };
-use catbird_atproto::generated::blue_catbird::circle::defs::{
-    AccessState, CircleSummary, FeedItem, SpaceRef,
+use catbird_atproto::generated::blue_catbird::circle::{
+    CircleSummary, FeedItem,
 };
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, UriValue};
+use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
+use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Tid, UriValue};
 use catbird_atproto::jacquard_common::types::value::Data;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedCursor {
@@ -70,7 +72,9 @@ pub fn build_post_view(
     let embed = if let Some(e) = record_json.get("embed") {
         let type_str = e.get("$type").and_then(|t| t.as_str());
         if type_str == Some("app.bsky.embed.images") {
-            let images_val = e.get("images").and_then(|i| i.as_array())
+            let images_val = e
+                .get("images")
+                .and_then(|i| i.as_array())
                 .ok_or_else(|| AppError::InvalidRequest("Invalid images embed".into()))?;
             let mut view_images = Vec::new();
             for img in images_val {
@@ -91,7 +95,8 @@ pub fn build_post_view(
                     _ => return Err(AppError::InvalidRequest("Missing blob CID in image embed".into())),
                 };
 
-                let mut media_url_parsed = media_base_url.join("/xrpc/blue.catbird.circle.getMedia")
+                let mut media_url_parsed = media_base_url
+                    .join("/xrpc/blue.catbird.circle.getMedia")
                     .map_err(|e| AppError::Internal(format!("Invalid media endpoint URL: {e}")))?;
                 media_url_parsed
                     .query_pairs_mut()
@@ -150,12 +155,14 @@ pub fn build_post_view(
         }
     });
 
-    let record_data: Data =
-        serde_json::from_value(record_json.clone()).map_err(|e| AppError::Internal(format!("Invalid record data: {e}")))?;
+    let record_data: Data = serde_json::from_value(record_json.clone())
+        .map_err(|e| AppError::Internal(format!("Invalid record data: {e}")))?;
 
     let std_uri = normalize_uri_to_standard_aturi(uri);
-    let aturi = AtUri::new(SmolStr::new(std_uri)).map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
-    let cid_val = Cid::new(cid.as_bytes()).map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
+    let aturi = AtUri::new(SmolStr::new(std_uri))
+        .map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
+    let cid_val = Cid::new(cid.as_bytes())
+        .map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
 
     Ok(PostView {
         uri: aturi,
@@ -179,13 +186,11 @@ pub fn build_post_view(
 
 #[allow(clippy::type_complexity)]
 pub async fn get_feed(
-    pool: &PgPool,
-    hydrator: &ProfileHydrator,
+    state: &AppState,
     user_did: &str,
     space_filter: Option<&str>,
     limit: Option<i64>,
     cursor_str: Option<&str>,
-    media_base_url: &url::Url,
 ) -> Result<GetFeedOutput, AppError> {
     let limit = limit.unwrap_or(50).clamp(1, 100) as usize;
 
@@ -194,35 +199,11 @@ pub async fn get_feed(
         _ => None,
     };
 
-    // If a specific space is filtered, verify access lease and membership
+    // If a specific space is filtered, verify access via member cache (revalidating on miss/stale)
     if let Some(space_uri) = space_filter {
-        let space_info: Option<(Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
-            r#"
-            SELECT c.deleted_at, m.status, a.expires_at
-            FROM circles c
-            LEFT JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $2
-            LEFT JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $2
-            WHERE c.space_uri = $1
-            "#,
-        )
-        .bind(space_uri)
-        .bind(user_did)
-        .fetch_optional(pool)
-        .await?;
-
-        match space_info {
-            None => return Err(AppError::NotFound("Space not found".into())),
-            Some((Some(_), _, _)) => return Err(AppError::NotFound("Space deleted".into())),
-            Some((None, member_status, expires_at)) => {
-                let is_active_member = member_status.as_deref() == Some("active");
-                let has_valid_lease = expires_at.is_some_and(|exp| exp > Utc::now());
-                if !is_active_member || !has_valid_lease {
-                    return Err(AppError::AccessRemoved(
-                        "No active access lease for this Circle".into(),
-                    ));
-                }
-            }
-        }
+        access::check_member_access(state, space_uri, user_did).await?;
+    } else {
+        access::revalidate_stale_member_spaces(state, user_did).await?;
     }
 
     // Authorize cursor Space if cursor provided
@@ -240,7 +221,7 @@ pub async fn get_feed(
         )
         .bind(&c.uri)
         .bind(&alt_cursor_uri)
-        .fetch_optional(pool)
+        .fetch_optional(&state.db)
         .await?;
 
         let cursor_space_uri = match cursor_space {
@@ -259,28 +240,9 @@ pub async fn get_feed(
             }
         };
 
-        let cursor_lease: Option<(i32,)> = sqlx::query_as(
-            r#"
-            SELECT 1
-            FROM circles c
-            JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $1 AND a.expires_at > now()
-            JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
-            WHERE c.space_uri = $2 AND c.deleted_at IS NULL
-            "#,
-        )
-        .bind(user_did)
-        .bind(&cursor_space_uri)
-        .fetch_optional(pool)
-        .await?;
-
-        if cursor_lease.is_none() {
-            return Err(AppError::AccessRemoved(
-                "Access removed for cursor Space".into(),
-            ));
-        }
+        access::check_member_access(state, &cursor_space_uri, user_did).await?;
     }
 
-    // Fetch feed posts with counts and viewer like state
     let fetch_limit = (limit + 1) as i64;
     let (cursor_indexed_at, cursor_uri) = match &cursor {
         Some(c) => (Some(c.indexed_at), Some(c.uri.as_str())),
@@ -291,6 +253,7 @@ pub async fn get_feed(
         String,           // uri
         String,           // cid
         String,           // space_uri
+        String,           // circle_id
         String,           // author_did
         serde_json::Value,// record_json
         DateTime<Utc>,    // indexed_at
@@ -300,13 +263,13 @@ pub async fn get_feed(
         i64,              // like_count
         i64,              // reply_count
         Option<String>,   // viewer_like_uri
-        i64,              // circle_generation
     )> = sqlx::query_as(
         r#"
         SELECT
             r.uri,
             r.cid,
             r.space_uri,
+            c.circle_id,
             r.author_did,
             r.record_json,
             r.indexed_at,
@@ -351,12 +314,11 @@ pub async fn get_feed(
                        )
                    )
              ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri,
-            c.generation AS circle_generation
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
-        JOIN access_leases a ON a.space_uri = r.space_uri AND a.member_did = $1 AND a.expires_at > now()
-        JOIN circle_members m ON m.space_uri = r.space_uri AND m.member_did = $1 AND m.status = 'active'
+        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1
+        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
         WHERE r.collection = 'app.bsky.feed.post'
           AND r.deleted_at IS NULL
@@ -376,54 +338,14 @@ pub async fn get_feed(
     .bind(cursor_indexed_at)
     .bind(cursor_uri)
     .bind(fetch_limit)
-    .fetch_all(pool)
+    .fetch_all(&state.db)
     .await?;
 
     let has_more = rows.len() > limit;
     let page_rows = if has_more { &rows[..limit] } else { &rows[..] };
 
-    let mut space_gens = std::collections::HashMap::new();
-    for row in page_rows {
-        space_gens.insert(row.2.clone(), row.12);
-    }
-    if let Some(filtered_space) = space_filter {
-        if space_gens.is_empty() {
-            let gen_row: Option<(i64,)> = sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 AND deleted_at IS NULL")
-                .bind(filtered_space)
-                .fetch_optional(pool)
-                .await?;
-            if let Some((g,)) = gen_row {
-                space_gens.insert(filtered_space.to_string(), g);
-            }
-        }
-    }
-
-    let author_dids: Vec<&str> = page_rows.iter().map(|r| r.3.as_str()).collect();
-    let profiles_map = hydrator.get_profiles(&author_dids).await;
-
-    // Recheck authorization and generation for all involved Spaces after profile hydration
-    for (sp, gen) in &space_gens {
-        let valid: Option<(i32,)> = sqlx::query_as(
-            r#"
-            SELECT 1
-            FROM circles c
-            JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $1 AND a.expires_at > now()
-            JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
-            WHERE c.space_uri = $2 AND c.generation = $3 AND c.deleted_at IS NULL
-            "#,
-        )
-        .bind(user_did)
-        .bind(sp)
-        .bind(gen)
-        .fetch_optional(pool)
-        .await?;
-
-        if valid.is_none() {
-            return Err(AppError::AccessRemoved(
-                "Access removed for this Circle".into(),
-            ));
-        }
-    }
+    let author_dids: Vec<&str> = page_rows.iter().map(|r| r.4.as_str()).collect();
+    let profiles_map = state.profile_hydrator.get_profiles(&author_dids).await;
 
     let mut feed_items = Vec::with_capacity(page_rows.len());
 
@@ -431,15 +353,16 @@ pub async fn get_feed(
         let uri = &row.0;
         let cid = &row.1;
         let space_uri = &row.2;
-        let author_did = &row.3;
-        let record_json = &row.4;
-        let indexed_at = row.5;
-        let circle_name = &row.6;
-        let circle_owner = &row.7;
-        let circle_muted = row.8;
-        let like_count = row.9;
-        let reply_count = row.10;
-        let viewer_like_uri = row.11.as_deref();
+        let circle_id = &row.3;
+        let author_did = &row.4;
+        let record_json = &row.5;
+        let indexed_at = row.6;
+        let circle_name = &row.7;
+        let circle_owner = &row.8;
+        let circle_muted = row.9;
+        let like_count = row.10;
+        let reply_count = row.11;
+        let viewer_like_uri = row.12.as_deref();
 
         let author_profile = profiles_map
             .get(author_did)
@@ -457,7 +380,7 @@ pub async fn get_feed(
             viewer_like_uri,
             space_uri,
             author_profile,
-            media_base_url,
+            &state.config.circle_media_base_url,
         )?;
 
         let feed_view_post = FeedViewPost {
@@ -469,18 +392,20 @@ pub async fn get_feed(
             extra_data: None,
         };
 
-        let circle_space_ref = SpaceRef::new(SmolStr::new(space_uri))
+        let circle_tid = Tid::new(SmolStr::new(circle_id))
+            .map_err(|e| AppError::Internal(format!("Invalid circle TID '{circle_id}': {e}")))?;
+        let circle_space_ref = AtSpaceUri::new(SmolStr::new(space_uri))
             .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
         let circle_owner_did = Did::new(SmolStr::new(circle_owner))
             .map_err(|e| AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}")))?;
 
         let circle_summary = CircleSummary {
+            circle_id: circle_tid,
             uri: circle_space_ref,
             name: SmolStr::new(circle_name),
             owner: circle_owner_did,
-            access_state: AccessState::Active,
+            member_count: None,
             muted: Some(circle_muted),
-            members: None,
             extra_data: None,
         };
 
@@ -494,7 +419,7 @@ pub async fn get_feed(
     let next_cursor = if has_more {
         page_rows.last().map(|last_item| {
             SmolStr::new(encode_cursor(&FeedCursor {
-                indexed_at: last_item.5,
+                indexed_at: last_item.6,
                 uri: last_item.0.clone(),
             }))
         })

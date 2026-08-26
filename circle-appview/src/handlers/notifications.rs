@@ -16,8 +16,7 @@ pub async fn list_notifications_handler(
 ) -> Result<Json<ListNotificationsOutput>, AppError> {
     tracing::debug!("Handling listNotifications request");
     let output = crate::notifications::list_notifications(
-        &state.db,
-        &state.profile_hydrator,
+        &state,
         &user.did,
         query.limit,
         query.cursor.as_deref(),

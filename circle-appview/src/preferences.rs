@@ -1,15 +1,15 @@
 use crate::access;
+use crate::config::AppState;
 use crate::error::AppError;
-use sqlx::PgPool;
 
 pub async fn update_preferences(
-    pool: &PgPool,
+    state: &AppState,
     member_did: &str,
     space_uri: &str,
     muted: bool,
 ) -> Result<bool, AppError> {
-    // Requires a live lease
-    access::check_active_lease(pool, space_uri, member_did).await?;
+    // Requires verified member access in the Space
+    access::check_member_access(state, space_uri, member_did).await?;
 
     sqlx::query(
         r#"
@@ -22,7 +22,7 @@ pub async fn update_preferences(
     .bind(space_uri)
     .bind(member_did)
     .bind(muted)
-    .execute(pool)
+    .execute(&state.db)
     .await
     .map_err(AppError::Database)?;
 

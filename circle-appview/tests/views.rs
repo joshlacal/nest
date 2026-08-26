@@ -36,7 +36,7 @@ use tower::ServiceExt;
 
 use sha2::{Digest, Sha256};
 use circle_appview::validator::{policy, validate_record, RecordCandidate, ValidationPolicy};
-const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
+const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const ALICE_DID: &str = "did:plc:alice-circle-owner";
 const BOB_DID: &str = "did:plc:bob-circle-member";
 const CHARLIE_DID: &str = "did:plc:charlie-circle-nonmember";
@@ -88,13 +88,13 @@ fn validate_fixture_record(
         .expect("view test fixture record must be valid according to semantic validator");
 }
 
-async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, duration: Duration) {
+async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, _duration: Duration) {
     sqlx::query(
         r#"
-        INSERT INTO circle_members (space_uri, member_did, status, updated_at)
-        VALUES ($1, $2, 'active', now())
+        INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
+        VALUES ($1, $2, now())
         ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET status = 'active', updated_at = now()
+        DO UPDATE SET cached_at = now()
         "#,
     )
     .bind(space_uri)
@@ -105,15 +105,13 @@ async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, d
 
     sqlx::query(
         r#"
-        INSERT INTO access_leases (space_uri, member_did, expires_at)
-        VALUES ($1, $2, now() + $3)
-        ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET expires_at = now() + $3
+        INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count)
+        VALUES ($1, now(), 1)
+        ON CONFLICT (space_uri)
+        DO UPDATE SET last_refreshed_at = now()
         "#,
     )
     .bind(space_uri)
-    .bind(member_did)
-    .bind(duration)
     .execute(pool)
     .await
     .unwrap();
@@ -136,12 +134,11 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        appview_base_url: "http://127.0.0.1:3002".into(),
+        oauth_key_id: None,
+        oauth_signing_key_path: None,
+        oauth_signing_key_hex: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
     };
@@ -300,7 +297,7 @@ async fn feed_excludes_spaces_without_active_lease(pool: PgPool) {
 
     // 1. Create two spaces
     sqlx::query(
-        "INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())",
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())",
     )
     .bind(SPACE_1)
     .bind(ALICE_DID)
@@ -309,7 +306,7 @@ async fn feed_excludes_spaces_without_active_lease(pool: PgPool) {
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 2', now())",
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsbbbbb', $2, 'Space 2', now())",
     )
     .bind(SPACE_2)
     .bind(ALICE_DID)
@@ -384,7 +381,7 @@ async fn feed_excludes_spaces_without_active_lease(pool: PgPool) {
 async fn feed_with_specific_space_requires_active_lease_and_returns_access_removed_when_lost(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     // Bob has NO active lease in Space 1
@@ -401,7 +398,7 @@ async fn feed_with_specific_space_requires_active_lease_and_returns_access_remov
 
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let err_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err_json["error"], "AccessRemoved");
+    assert_eq!(err_json["error"], "Forbidden");
 
     // Grant Bob active lease & active membership
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
@@ -422,7 +419,7 @@ async fn feed_with_specific_space_requires_active_lease_and_returns_access_remov
 async fn feed_cursor_access_loss_returns_access_removed(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
@@ -480,7 +477,7 @@ async fn feed_cursor_access_loss_returns_access_removed(pool: PgPool) {
     let real_cursor = feed1.cursor.expect("Page 1 must return a cursor");
 
     // Now revoke Bob's lease/access to Space 1 before page 2
-    sqlx::query("DELETE FROM access_leases WHERE space_uri = $1 AND member_did = $2")
+    sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2")
         .bind(SPACE_1)
         .bind(BOB_DID)
         .execute(&pool)
@@ -502,14 +499,14 @@ async fn feed_cursor_access_loss_returns_access_removed(pool: PgPool) {
 
     let body2 = to_bytes(resp2.into_body(), 1024 * 1024).await.unwrap();
     let err_json: serde_json::Value = serde_json::from_slice(&body2).unwrap();
-    assert_eq!(err_json["error"], "AccessRemoved");
+    assert_eq!(err_json["error"], "Forbidden");
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
@@ -602,7 +599,7 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
 async fn feed_invalid_cursor_returns_invalid_request(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -626,7 +623,7 @@ async fn feed_invalid_cursor_returns_invalid_request(pool: PgPool) {
 async fn feed_excludes_muted_circles_in_unified_feed_but_includes_in_specific_space(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Muted Space', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Muted Space', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
@@ -694,14 +691,10 @@ async fn feed_excludes_muted_circles_in_unified_feed_but_includes_in_specific_sp
 async fn feed_excludes_removed_members_even_with_stale_lease(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
 
-    // Member status is 'removed', but stale access_leases row exists
-    sqlx::query("INSERT INTO circle_members (space_uri, member_did, status, updated_at) VALUES ($1, $2, 'removed', now())")
-        .bind(SPACE_1).bind(BOB_DID).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO access_leases (space_uri, member_did, expires_at) VALUES ($1, $2, now() + interval '1 hour')")
-        .bind(SPACE_1).bind(BOB_DID).execute(&pool).await.unwrap();
+    // Bob is NOT in circle_member_cache
 
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
     let req = Request::builder()
@@ -715,14 +708,14 @@ async fn feed_excludes_removed_members_even_with_stale_lease(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let err_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err_json["error"], "AccessRemoved");
+    assert_eq!(err_json["error"], "Forbidden");
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -786,9 +779,9 @@ async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
 async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space_interactions(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 2', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsbbbbb', $2, 'Space 2', now())")
         .bind(SPACE_2).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
@@ -903,7 +896,7 @@ async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space
 async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_and_absolute_media_url(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -986,9 +979,9 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
 async fn thread_never_traverses_public_or_other_space_records(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 2', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsbbbbb', $2, 'Space 2', now())")
         .bind(SPACE_2).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
@@ -1051,7 +1044,7 @@ async fn thread_never_traverses_public_or_other_space_records(pool: PgPool) {
 async fn thread_multi_level_parent_order_and_not_found_boundary(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -1121,7 +1114,7 @@ async fn thread_multi_level_parent_order_and_not_found_boundary(pool: PgPool) {
 async fn thread_excludes_replies_whose_root_or_parent_is_deleted(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -1167,7 +1160,7 @@ async fn thread_excludes_replies_whose_root_or_parent_is_deleted(pool: PgPool) {
 async fn thread_not_found_when_root_post_deleted_or_missing(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -1189,7 +1182,7 @@ async fn thread_not_found_when_root_post_deleted_or_missing(pool: PgPool) {
 async fn thread_caps_traversal_at_node_budget_and_prevents_unbounded_expansion(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -1226,399 +1219,12 @@ async fn thread_caps_traversal_at_node_budget_and_prevents_unbounded_expansion(p
     assert_eq!(replies.len(), 499, "Replies must be capped to budget (500 total nodes including root)");
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn thread_authorization_race_during_hydration_returns_access_removed(pool: PgPool) {
-    db::run_migrations(&pool).await.expect("Migrations must succeed");
-
-    let (in_flight_tx, mut in_flight_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (resume_tx, resume_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let in_flight_tx = Arc::new(in_flight_tx);
-    let resume_rx = Arc::new(tokio::sync::Mutex::new(resume_rx));
-
-    let mock_app = Router::new().route(
-        "/xrpc/app.bsky.actor.getProfile",
-        get(move |req: Request<Body>| {
-            let in_flight = in_flight_tx.clone();
-            let resume = resume_rx.clone();
-            async move {
-                let query = req.uri().query().unwrap_or("");
-                let actor = query.strip_prefix("actor=").unwrap_or("");
-                if actor == "did:plc:alice-race-author" {
-                    // Signal that hydration is in flight
-                    let _ = in_flight.send(()).await;
-                    // Wait for test to revoke lease/generation before resuming
-                    let mut rx = resume.lock().await;
-                    let _ = rx.recv().await;
-                }
-                let output = GetProfileOutput {
-                    value: ProfileViewDetailed {
-                        did: Did::new(SmolStr::new(actor)).unwrap(),
-                        handle: Handle::new(SmolStr::new("race.author")).unwrap(),
-                        display_name: Some(SmolStr::new("Race Author")),
-                        avatar: None,
-                        associated: None,
-                        banner: None,
-                        created_at: None,
-                        debug: None,
-                        description: None,
-                        followers_count: None,
-                        follows_count: None,
-                        indexed_at: None,
-                        joined_via_starter_pack: None,
-                        labels: None,
-                        pinned_post: None,
-                        posts_count: None,
-                        pronouns: None,
-                        status: None,
-                        verification: None,
-                        viewer: None,
-                        website: None,
-                        extra_data: None,
-                    },
-                    extra_data: None,
-                };
-                Json(output).into_response()
-            }
-        }),
-    );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, mock_app).await.unwrap();
-    });
-
-    let bob_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let race_author_did = "did:plc:alice-race-author";
-
-    let config = Config {
-        host: "127.0.0.1".into(),
-        port: 3002,
-        database_url: "postgres://localhost/postgres".into(),
-        service_did: CIRCLE_AUDIENCE.into(),
-        plc_directory_url: "https://plc.directory".into(),
-        public_appview_url: format!("http://{addr}"),
-        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
-        push_signing_key_path: None,
-        push_signing_key_hex: None,
-    };
-
-    let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));
-    let did_resolver = Arc::new(circle_appview::auth::DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
-    register_did_doc(&did_resolver, BOB_DID, &bob_key);
-
-    let state = AppState::with_profile_hydrator(config, pool.clone(), did_resolver, hydrator);
-    let app = circle_appview::routes::create_router(state);
-
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Space 1', now(), 1)")
-        .bind(SPACE_1).bind(race_author_did).execute(&pool).await.unwrap();
-    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
-
-    let root_uri = format!("{SPACE_1}/{race_author_did}/app.bsky.feed.post/3l7racepost");
-    let root_json = json!({"$type": "app.bsky.feed.post", "text": "Race post", "createdAt": "2026-08-24T12:00:00.000Z"});
-    let root_cid = compute_record_cid(&root_json);
-    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7racepost', $5, now(), now())")
-        .bind(&root_uri).bind(&root_cid).bind(SPACE_1).bind(race_author_did).bind(&root_json).execute(&pool).await.unwrap();
-
-    let root_std_uri = format!("at://{race_author_did}/app.bsky.feed.post/3l7racepost");
-    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &bob_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let pool_clone = pool.clone();
-    let request_handle = tokio::spawn(async move {
-        app.oneshot(req).await.unwrap()
-    });
-
-    // Wait until profile hydration starts
-    in_flight_rx.recv().await.expect("Hydration must start");
-
-    // While hydration is in-flight, revoke Bob's lease
-    sqlx::query("UPDATE access_leases SET expires_at = now() - interval '1 second' WHERE space_uri = $1 AND member_did = $2")
-        .bind(SPACE_1).bind(BOB_DID).execute(&pool_clone).await.unwrap();
-
-    // Resume hydration
-    resume_tx.send(()).await.unwrap();
-
-    let resp = request_handle.await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let err_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err_json["error"], "AccessRemoved");
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn feed_authorization_race_during_hydration_returns_access_removed(pool: PgPool) {
-    db::run_migrations(&pool).await.expect("Migrations must succeed");
-
-    let (in_flight_tx, mut in_flight_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (resume_tx, resume_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let in_flight_tx = Arc::new(in_flight_tx);
-    let resume_rx = Arc::new(tokio::sync::Mutex::new(resume_rx));
-
-    let mock_app = Router::new().route(
-        "/xrpc/app.bsky.actor.getProfile",
-        get(move |req: Request<Body>| {
-            let in_flight = in_flight_tx.clone();
-            let resume = resume_rx.clone();
-            async move {
-                let query = req.uri().query().unwrap_or("");
-                let actor = query.strip_prefix("actor=").unwrap_or("");
-                if actor == "did:plc:alice-feed-race-author" {
-                    let _ = in_flight.send(()).await;
-                    let mut rx = resume.lock().await;
-                    let _ = rx.recv().await;
-                }
-                let output = GetProfileOutput {
-                    value: ProfileViewDetailed {
-                        did: Did::new(SmolStr::new(actor)).unwrap(),
-                        handle: Handle::new(SmolStr::new("feedrace.author")).unwrap(),
-                        display_name: Some(SmolStr::new("Feed Race Author")),
-                        avatar: None,
-                        associated: None,
-                        banner: None,
-                        created_at: None,
-                        debug: None,
-                        description: None,
-                        followers_count: None,
-                        follows_count: None,
-                        indexed_at: None,
-                        joined_via_starter_pack: None,
-                        labels: None,
-                        pinned_post: None,
-                        posts_count: None,
-                        pronouns: None,
-                        status: None,
-                        verification: None,
-                        viewer: None,
-                        website: None,
-                        extra_data: None,
-                    },
-                    extra_data: None,
-                };
-                Json(output).into_response()
-            }
-        }),
-    );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, mock_app).await.unwrap();
-    });
-
-    let bob_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let race_author_did = "did:plc:alice-feed-race-author";
-
-    let config = Config {
-        host: "127.0.0.1".into(),
-        port: 3002,
-        database_url: "postgres://localhost/postgres".into(),
-        service_did: CIRCLE_AUDIENCE.into(),
-        plc_directory_url: "https://plc.directory".into(),
-        public_appview_url: format!("http://{addr}"),
-        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
-        push_signing_key_path: None,
-        push_signing_key_hex: None,
-    };
-
-    let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));
-    let did_resolver = Arc::new(circle_appview::auth::DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
-    register_did_doc(&did_resolver, BOB_DID, &bob_key);
-
-    let state = AppState::with_profile_hydrator(config, pool.clone(), did_resolver, hydrator);
-    let app = circle_appview::routes::create_router(state);
-
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Space 1', now(), 1)")
-        .bind(SPACE_1).bind(race_author_did).execute(&pool).await.unwrap();
-    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
-
-    let root_uri = format!("{SPACE_1}/{race_author_did}/app.bsky.feed.post/3l7feedrace");
-    let root_json = json!({"$type": "app.bsky.feed.post", "text": "Feed Race post", "createdAt": "2026-08-24T12:00:00.000Z"});
-    let root_cid = compute_record_cid(&root_json);
-    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7feedrace', $5, now(), now())")
-        .bind(&root_uri).bind(&root_cid).bind(SPACE_1).bind(race_author_did).bind(&root_json).execute(&pool).await.unwrap();
-
-    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &bob_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let pool_clone = pool.clone();
-    let request_handle = tokio::spawn(async move {
-        app.oneshot(req).await.unwrap()
-    });
-
-    // Wait until profile hydration starts
-    in_flight_rx.recv().await.expect("Hydration must start");
-
-    // While hydration is in-flight, revoke Bob's lease
-    sqlx::query("UPDATE access_leases SET expires_at = now() - interval '1 second' WHERE space_uri = $1 AND member_did = $2")
-        .bind(SPACE_1).bind(BOB_DID).execute(&pool_clone).await.unwrap();
-
-    // Resume hydration
-    resume_tx.send(()).await.unwrap();
-
-    let resp = request_handle.await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let err_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err_json["error"], "AccessRemoved");
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn thread_circle_epoch_generation_change_during_hydration_returns_access_removed(pool: PgPool) {
-    db::run_migrations(&pool).await.expect("Migrations must succeed");
-
-    let (in_flight_tx, mut in_flight_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (resume_tx, resume_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let in_flight_tx = Arc::new(in_flight_tx);
-    let resume_rx = Arc::new(tokio::sync::Mutex::new(resume_rx));
-
-    let mock_app = Router::new().route(
-        "/xrpc/app.bsky.actor.getProfile",
-        get(move |req: Request<Body>| {
-            let in_flight = in_flight_tx.clone();
-            let resume = resume_rx.clone();
-            async move {
-                let query = req.uri().query().unwrap_or("");
-                let actor = query.strip_prefix("actor=").unwrap_or("");
-                if actor == "did:plc:alice-epoch-author" {
-                    let _ = in_flight.send(()).await;
-                    let mut rx = resume.lock().await;
-                    let _ = rx.recv().await;
-                }
-                let output = GetProfileOutput {
-                    value: ProfileViewDetailed {
-                        did: Did::new(SmolStr::new(actor)).unwrap(),
-                        handle: Handle::new(SmolStr::new("epoch.author")).unwrap(),
-                        display_name: Some(SmolStr::new("Epoch Author")),
-                        avatar: None,
-                        associated: None,
-                        banner: None,
-                        created_at: None,
-                        debug: None,
-                        description: None,
-                        followers_count: None,
-                        follows_count: None,
-                        indexed_at: None,
-                        joined_via_starter_pack: None,
-                        labels: None,
-                        pinned_post: None,
-                        posts_count: None,
-                        pronouns: None,
-                        status: None,
-                        verification: None,
-                        viewer: None,
-                        website: None,
-                        extra_data: None,
-                    },
-                    extra_data: None,
-                };
-                Json(output).into_response()
-            }
-        }),
-    );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, mock_app).await.unwrap();
-    });
-
-    let bob_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let epoch_author_did = "did:plc:alice-epoch-author";
-
-    let config = Config {
-        host: "127.0.0.1".into(),
-        port: 3002,
-        database_url: "postgres://localhost/postgres".into(),
-        service_did: CIRCLE_AUDIENCE.into(),
-        plc_directory_url: "https://plc.directory".into(),
-        public_appview_url: format!("http://{addr}"),
-        circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
-        push_signing_key_path: None,
-        push_signing_key_hex: None,
-    };
-
-    let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));
-    let did_resolver = Arc::new(circle_appview::auth::DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
-    register_did_doc(&did_resolver, BOB_DID, &bob_key);
-
-    let state = AppState::with_profile_hydrator(config, pool.clone(), did_resolver, hydrator);
-    let app = circle_appview::routes::create_router(state);
-
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Space 1', now(), 1)")
-        .bind(SPACE_1).bind(epoch_author_did).execute(&pool).await.unwrap();
-    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
-
-    let root_uri = format!("{SPACE_1}/{epoch_author_did}/app.bsky.feed.post/3l7epochpost");
-    let root_json = json!({"$type": "app.bsky.feed.post", "text": "Epoch post", "createdAt": "2026-08-24T12:00:00.000Z"});
-    let root_cid = compute_record_cid(&root_json);
-    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7epochpost', $5, now(), now())")
-        .bind(&root_uri).bind(&root_cid).bind(SPACE_1).bind(epoch_author_did).bind(&root_json).execute(&pool).await.unwrap();
-
-    let root_std_uri = format!("at://{epoch_author_did}/app.bsky.feed.post/3l7epochpost");
-    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &bob_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let pool_clone = pool.clone();
-    let request_handle = tokio::spawn(async move {
-        app.oneshot(req).await.unwrap()
-    });
-
-    // Wait until profile hydration starts
-    in_flight_rx.recv().await.expect("Hydration must start");
-
-    // While hydration is in-flight, change the Circle generation (delete/recreate ABA)
-    sqlx::query("UPDATE circles SET generation = 2 WHERE space_uri = $1")
-        .bind(SPACE_1).execute(&pool_clone).await.unwrap();
-
-    // Resume hydration
-    resume_tx.send(()).await.unwrap();
-
-    let resp = request_handle.await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let err_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err_json["error"], "AccessRemoved");
-}
 
 #[sqlx::test(migrations = "./migrations")]
 async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_likes(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Space 1', now(), 0)")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, CHARLIE_DID, Duration::hours(1)).await;
@@ -1731,7 +1337,7 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
 async fn thread_orphan_reply_with_deleted_root_or_parent_returns_not_found(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Space 1', now(), 0)")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -2026,8 +1632,6 @@ fn test_circle_media_base_url_strict_https_origin_validation() {
     ];
     for val in valid_cases {
         std::env::set_var("CIRCLE_MEDIA_BASE_URL", val);
-        std::env::set_var("NEST_CLIENT_ID", "https://nest.catbird.blue");
-        std::env::set_var("NEST_JWKS_URL", "https://nest.catbird.blue/.well-known/jwks.json");
         let cfg = Config::from_env().expect("Valid HTTPS origin must be accepted");
         assert_eq!(cfg.circle_media_base_url.scheme(), "https");
     }
@@ -2044,62 +1648,17 @@ fn test_circle_media_base_url_strict_https_origin_validation() {
     ];
     for (val, desc) in invalid_cases {
         std::env::set_var("CIRCLE_MEDIA_BASE_URL", val);
-        std::env::set_var("NEST_CLIENT_ID", "https://nest.catbird.blue");
-        std::env::set_var("NEST_JWKS_URL", "https://nest.catbird.blue/.well-known/jwks.json");
         let res = Config::from_env();
         assert!(res.is_err(), "Invalid CIRCLE_MEDIA_BASE_URL ({desc}: {val}) must be rejected");
     }
 }
 
-#[test]
-fn push_config_fails_closed_when_incomplete() {
-    let key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let secret = key.to_bytes();
-    let hex_key = secret
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
-    std::env::set_var("CIRCLE_MEDIA_BASE_URL", "https://media.catbird.blue");
-    std::env::set_var("NEST_CLIENT_ID", "https://nest.catbird.blue");
-    std::env::set_var("NEST_JWKS_URL", "https://nest.catbird.blue/.well-known/jwks.json");
-
-    // 1. Push URL provided but no signing key -> must fail.
-    std::env::set_var("NEST_PUSH_URL", "https://nest.catbird.blue/internal/circle/push");
-    std::env::remove_var("PUSH_SIGNING_KEY_HEX");
-    std::env::remove_var("PUSH_SIGNING_KEY_PATH");
-    assert!(
-        Config::from_env().is_err(),
-        "Push configured without a signing key must fail closed"
-    );
-
-    // 2. Signing key provided but no URL -> must fail.
-    std::env::remove_var("NEST_PUSH_URL");
-    std::env::set_var("PUSH_SIGNING_KEY_HEX", &hex_key);
-    assert!(
-        Config::from_env().is_err(),
-        "Push signing key without NEST_PUSH_URL must fail closed"
-    );
-
-    // 3. Complete config -> succeeds.
-    std::env::set_var("NEST_PUSH_URL", "https://nest.catbird.blue/internal/circle/push");
-    std::env::set_var("PUSH_SIGNING_KEY_HEX", &hex_key);
-    let cfg = Config::from_env().expect("Complete push config must be accepted");
-    assert_eq!(
-        cfg.nest_push_url.as_deref(),
-        Some("https://nest.catbird.blue/internal/circle/push")
-    );
-
-    // Cleanup.
-    std::env::remove_var("NEST_PUSH_URL");
-    std::env::remove_var("PUSH_SIGNING_KEY_HEX");
-}
 
 #[sqlx::test(migrations = "./migrations")]
 async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direct_siblings(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Space 1', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
@@ -2203,10 +1762,10 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn list_circles_owner_receives_active_member_dids_and_non_owner_omits_members(pool: PgPool) {
+async fn list_circles_returns_member_count_and_omits_members_array(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Family Circle', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Family Circle', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
 
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
@@ -2229,15 +1788,11 @@ async fn list_circles_owner_receives_active_member_dids_and_non_owner_omits_memb
     let circle = &list_out.circles[0];
     assert_eq!(circle.name.as_str(), "Family Circle");
     assert_eq!(circle.owner.as_str(), ALICE_DID);
-    let members = circle.members.as_ref().expect("Owner must receive members array");
-    assert_eq!(members.len(), 2);
-    let member_dids: Vec<&str> = members.iter().map(|d| d.as_str()).collect();
-    assert!(member_dids.contains(&ALICE_DID));
-    assert!(member_dids.contains(&BOB_DID));
+    assert_eq!(circle.member_count, Some(1));
 
-    // Verify raw JSON includes "members" key
+    // Verify raw JSON omits "members" key
     let raw_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(raw_json["circles"][0].get("members").is_some());
+    assert!(raw_json["circles"][0].get("members").is_none());
 
     // 2. Non-owner member query (BOB)
     let bob_token = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
@@ -2255,7 +1810,7 @@ async fn list_circles_owner_receives_active_member_dids_and_non_owner_omits_memb
     assert_eq!(list_out.circles.len(), 1);
     let circle = &list_out.circles[0];
     assert_eq!(circle.name.as_str(), "Family Circle");
-    assert!(circle.members.is_none(), "Non-owner must NOT receive members array");
+    assert_eq!(circle.member_count, Some(1));
 
     // Verify raw JSON omits "members" key entirely (not empty array)
     let raw_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2267,12 +1822,12 @@ async fn list_circles_excludes_deleted_and_non_members(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
     // Space 1: Active
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, 'Active Space', now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Active Space', now())")
         .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
 
     // Space 2: Deleted
-    sqlx::query("INSERT INTO circles (space_uri, authority_did, display_name, created_at, deleted_at) VALUES ($1, $2, 'Deleted Space', now(), now())")
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at) VALUES ($1, '3l7viewsbbbbb', $2, 'Deleted Space', now(), now())")
         .bind(SPACE_2).bind(ALICE_DID).execute(&pool).await.unwrap();
     grant_active_member(&pool, SPACE_2, ALICE_DID, Duration::hours(1)).await;
 
@@ -2308,97 +1863,6 @@ async fn list_circles_excludes_deleted_and_non_members(pool: PgPool) {
     assert_eq!(list_out.circles.len(), 0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn list_circles_owner_sees_created_circle_before_activation_and_unactivated_member_is_expired(pool: PgPool) {
-    let setup = setup_views_test(pool.clone()).await;
-
-    use catbird_atproto::generated::blue_catbird::circle::defs::AccessState;
-    use uuid::Uuid;
-
-    // Create Circle via projection (no leases exist yet)
-    let proj = circle_appview::projections::Projection::CircleUpsert {
-        space: SPACE_1.to_string(),
-        authority: ALICE_DID.to_string(),
-        name: "Alice Circle".to_string(),
-        created_at: Utc::now(),
-        generation: 1,
-    };
-    circle_appview::projections::apply_projection(&pool, None, None, Uuid::new_v4(), proj, &[1u8; 32]).await.unwrap();
-
-    // Add Bob as member (unactivated invitee, no lease)
-    let member_proj = circle_appview::projections::Projection::MemberAdd {
-        space: SPACE_1.to_string(),
-        member: BOB_DID.to_string(),
-        circle_generation: 1,
-        member_generation: 1,
-    };
-    circle_appview::projections::apply_projection(&pool, None, None, Uuid::new_v4(), member_proj, &[2u8; 32]).await.unwrap();
-    // 1. Owner (Alice) queries before activation -> MUST see Circle with AccessState::Expired
-    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/xrpc/blue.catbird.circle.listCircles")
-        .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list_out.circles.len(), 1);
-    assert_eq!(list_out.circles[0].name.as_str(), "Alice Circle");
-    assert_eq!(list_out.circles[0].owner.as_str(), ALICE_DID);
-    assert_eq!(list_out.circles[0].access_state, AccessState::Expired);
-
-    // 2. Invitee (Bob) queries before activation -> MUST see Circle with AccessState::Expired (not Active)
-    let bob_token = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/xrpc/blue.catbird.circle.listCircles")
-        .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list_out.circles.len(), 1);
-    assert_eq!(list_out.circles[0].access_state, AccessState::Expired);
-
-    // 3. Alice activates (lease inserted) -> Alice now sees AccessState::Active
-    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
-
-    let alice_token_2 = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/xrpc/blue.catbird.circle.listCircles")
-        .header(header::AUTHORIZATION, format!("Bearer {alice_token_2}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list_out.circles.len(), 1);
-    assert_eq!(list_out.circles[0].access_state, AccessState::Active);
-
-    // Bob still has no lease -> Bob still sees AccessState::Expired
-    let bob_token_2 = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/xrpc/blue.catbird.circle.listCircles")
-        .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list_out.circles.len(), 1);
-    assert_eq!(list_out.circles[0].access_state, AccessState::Expired);
-}
 
 #[sqlx::test(migrations = "./migrations")]
 async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: PgPool) {
@@ -2416,7 +1880,7 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
 
     for (space_uri, name, created_at) in &spaces {
         sqlx::query(
-            "INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, $3, $4)"
+            "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7pageaaaaaa', $2, $3, $4)"
         )
         .bind(space_uri)
         .bind(ALICE_DID)

@@ -39,24 +39,15 @@ use catbird_atproto::generated::app_bsky::feed::ThreadViewPostRepliesItem;
 use catbird_atproto::generated::app_bsky::notification::list_notifications::{
     ListNotifications, ListNotificationsOutput, NotificationReason as PublicNotificationReason,
 };
-use catbird_atproto::generated::blue_catbird::circle::activate_space::{
-    ActivateSpace, ActivateSpaceOutput,
+use catbird_atproto::generated::blue_catbird::circle::activate_circle::{
+    ActivateCircle, ActivateCircleOutput,
 };
-use catbird_atproto::generated::blue_catbird::circle::create_circle::{
-    CreateCircle, CreateCircleOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::defs::{
-    AccessState, MemberAction, NotificationReason as CircleNotificationReason, OperationStatus,
-    SpaceRef,
-};
+use catbird_atproto::generated::blue_catbird::circle::NotificationReason as CircleNotificationReason;
 use catbird_atproto::generated::blue_catbird::circle::get_capabilities::{
     GetCapabilities, GetCapabilitiesOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
 use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
-use catbird_atproto::generated::blue_catbird::circle::get_operation::{
-    GetOperation, GetOperationOutput,
-};
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::{
     GetPostThread as CircleGetPostThread, GetPostThreadOutput as CircleGetPostThreadOutput,
 };
@@ -67,8 +58,10 @@ use catbird_atproto::generated::blue_catbird::circle::list_notifications::{
     ListNotifications as CircleListNotifications,
     ListNotificationsOutput as CircleListNotificationsOutput,
 };
-use catbird_atproto::generated::blue_catbird::circle::update_member::{
-    UpdateMember, UpdateMemberOutput,
+use catbird_atproto::generated::com_atproto::simplespace::add_member::AddMember;
+use catbird_atproto::generated::com_atproto::simplespace::remove_member::RemoveMember;
+use catbird_atproto::generated::com_atproto::simplespace::create_space::{
+    CreateSpace, CreateSpaceAppAccess, CreateSpacePolicy,
 };
 use catbird_atproto::generated::com_atproto::repo::create_record::{
     CreateRecord, CreateRecordOutput,
@@ -76,9 +69,6 @@ use catbird_atproto::generated::com_atproto::repo::create_record::{
 use catbird_atproto::generated::com_atproto::repo::strong_ref::StrongRef;
 use catbird_atproto::generated::com_atproto::repo::upload_blob::UploadBlobOutput;
 use catbird_atproto::generated::com_atproto::server::describe_server::DescribeServerOutput;
-use catbird_atproto::generated::com_atproto::server::get_service_auth::{
-    GetServiceAuth, GetServiceAuthOutput,
-};
 use catbird_atproto::generated::com_atproto::space::apply_writes::{
     ApplyWrites, ApplyWritesOutput, ApplyWritesOutputResultsItem, ApplyWritesWritesItem, Create,
 };
@@ -86,14 +76,14 @@ use catbird_atproto::generated::com_atproto::space::get_latest_commit::{
     GetLatestCommit, GetLatestCommitOutput,
 };
 use catbird_atproto::generated::com_atproto::space::list_spaces::{ListSpaces, ListSpacesOutput};
-use catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite;
+use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::ident::AtIdentifier;
 use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Nsid};
 use catbird_atproto::jacquard_common::types::value::Data;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use url::Url;
@@ -162,6 +152,14 @@ impl UserSession {
         req.header("Cookie", format!("catbird_session={}", self.session_id))
             .header("Authorization", format!("Bearer {}", self.session_id))
     }
+
+    pub fn apply_circle_auth(
+        &self,
+        req: reqwest::RequestBuilder,
+        service_did: &str,
+    ) -> reqwest::RequestBuilder {
+        self.apply_auth(req).header("atproto-proxy", service_did)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +168,7 @@ pub struct ScenarioConfig {
     pub nest_url: String,
     pub circle_appview_url: String,
     pub circle_appview_service_did: String,
+    pub circle_appview_client_id: String,
     pub public_appview_url: String,
     pub database_url: String,
 
@@ -191,7 +190,13 @@ impl ScenarioConfig {
             "CIRCLE_APPVIEW_URL is required (e.g. http://127.0.0.1:3002)".to_string()
         })?;
         let circle_appview_service_did = env::var("CIRCLE_APPVIEW_SERVICE_DID")
-            .map_err(|_| "CIRCLE_APPVIEW_SERVICE_DID is required (e.g. did:web:circles.catbird.blue#atproto_circle)".to_string())?;
+            .map_err(|_| "CIRCLE_APPVIEW_SERVICE_DID is required (e.g. did:web:circles.catbird.blue#atproto_circles)".to_string())?;
+        let circle_appview_client_id = env::var("CIRCLE_APPVIEW_CLIENT_ID").unwrap_or_else(|_| {
+            format!(
+                "{}/oauth/client-metadata.json",
+                circle_appview_url.trim_end_matches('/')
+            )
+        });
         let public_appview_url = env::var("PUBLIC_APPVIEW_URL").map_err(|_| {
             "PUBLIC_APPVIEW_URL is required (e.g. https://public.api.bsky.app)".to_string()
         })?;
@@ -275,6 +280,7 @@ impl ScenarioConfig {
             nest_url,
             circle_appview_url,
             circle_appview_service_did,
+            circle_appview_client_id,
             public_appview_url,
             database_url,
             alice: UserSession {
@@ -643,7 +649,7 @@ impl ScenarioRunner {
             &self.config.dave,
         ] {
             let req = user
-                .apply_auth(self.client.get(&cap_url))
+                .apply_circle_auth(self.client.get(&cap_url), &self.config.circle_appview_service_did)
                 .query(&GetCapabilities);
             let resp = req
                 .send()
@@ -716,48 +722,6 @@ impl ScenarioRunner {
         Ok(())
     }
 
-    async fn poll_operation(
-        &self,
-        op_id: &str,
-        session: &UserSession,
-        max_duration: Duration,
-    ) -> Result<GetOperationOutput<String>, String> {
-        let op_url = format!(
-            "{}/xrpc/blue.catbird.circle.getOperation",
-            self.config.nest_url.trim_end_matches('/')
-        );
-        let query: GetOperation<String> = GetOperation {
-            id: op_id.to_string(),
-        };
-        let start = std::time::Instant::now();
-        loop {
-            let req = session.apply_auth(self.client.get(&op_url)).query(&query);
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| format!("getOperation request failed: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("getOperation returned status {}", resp.status()));
-            }
-            let output: GetOperationOutput<String> = resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse GetOperationOutput: {e}"))?;
-            match output.value.status {
-                OperationStatus::Complete => return Ok(output),
-                OperationStatus::Failed => {
-                    let err_msg = output.value.error.as_deref().unwrap_or("unknown error");
-                    return Err(format!("Operation failed: {}", err_msg));
-                }
-                OperationStatus::Pending => {
-                    if start.elapsed() > max_duration {
-                        return Err("Operation timed out in Pending state".to_string());
-                    }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
-            }
-        }
-    }
 
     async fn apply_create_raw<T: Serialize>(
         &self,
@@ -785,7 +749,8 @@ impl ScenarioRunner {
         let input: ApplyWrites<String> = ApplyWrites {
             repo: Did::new(session.did.clone())
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid repo DID: {e}")))?,
-            space: space.to_string(),
+            space: AtSpaceUri::new(space.to_string())
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid space URI: {e}")))?,
             validate: Some(true),
             writes: vec![ApplyWritesWritesItem::Create(Box::new(create_item))],
             extra_data: None,
@@ -892,7 +857,8 @@ impl ScenarioRunner {
         );
         let commit_query: GetLatestCommit<String> = GetLatestCommit {
             repo: Did::new(session.did.clone()).map_err(|e| format!("Invalid repo DID: {e}"))?,
-            space: space.to_string(),
+            space: AtSpaceUri::new(space.to_string())
+                .map_err(|e| format!("Invalid space URI: {e}"))?,
         };
         let commit_resp = session
             .apply_auth(self.client.get(&get_commit_url))
@@ -952,70 +918,6 @@ impl ScenarioRunner {
             }
         }
 
-        // 2. Mint fresh PDS service auth token for notifyWrite using generated GetServiceAuth query input
-        let get_sa_url = format!(
-            "{}/xrpc/com.atproto.server.getServiceAuth",
-            self.config.nest_url.trim_end_matches('/')
-        );
-        let sa_query: GetServiceAuth<String> = GetServiceAuth {
-            aud: self.config.circle_appview_service_did.clone(),
-            exp: Some(Utc::now().timestamp() + 60),
-            lxm: Some(
-                Nsid::new("com.atproto.space.notifyWrite".into())
-                    .map_err(|e| format!("Invalid NSID: {e}"))?,
-            ),
-        };
-        let sa_resp = session
-            .apply_auth(self.client.get(&get_sa_url))
-            .query(&sa_query)
-            .send()
-            .await
-            .map_err(|e| format!("getServiceAuth failed for {}: {e}", session.name))?;
-        if !sa_resp.status().is_success() {
-            return Err(format!(
-                "getServiceAuth for {} returned HTTP {}",
-                session.name,
-                sa_resp.status()
-            ));
-        }
-        let sa_output: GetServiceAuthOutput<String> = sa_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse GetServiceAuthOutput: {e}"))?;
-        let service_jwt = sa_output.token;
-        if service_jwt.is_empty() {
-            return Err("getServiceAuth returned empty token".to_string());
-        }
-
-        // 3. Send NotifyWrite directly to Circle AppView
-        let notify_url = format!(
-            "{}/xrpc/com.atproto.space.notifyWrite",
-            self.config.circle_appview_url.trim_end_matches('/')
-        );
-        let notify_body: NotifyWrite<String> = NotifyWrite {
-            hash: commit.hash.clone(),
-            repo: Did::new(session.did.clone())
-                .map_err(|e| format!("Invalid Did for notifyWrite: {e}"))?,
-            rev: commit.rev.clone(),
-            space: space.to_string(),
-            extra_data: None,
-        };
-        let notify_resp = self
-            .client
-            .post(&notify_url)
-            .header("Authorization", format!("Bearer {service_jwt}"))
-            .json(&notify_body)
-            .send()
-            .await
-            .map_err(|e| format!("notifyWrite failed for {}: {e}", session.name))?;
-        if !notify_resp.status().is_success() {
-            return Err(format!(
-                "notifyWrite for {} returned HTTP {}",
-                session.name,
-                notify_resp.status()
-            ));
-        }
-
         // 4. Poll circle_repo_sync_state table in PostgreSQL until last_rev == commit.rev
         let pool = PgPool::connect(&self.config.database_url)
             .await
@@ -1054,7 +956,7 @@ impl ScenarioRunner {
 
     async fn circle_snapshot(
         &self,
-        space_ref: &SpaceRef<String>,
+        space_ref: &AtSpaceUri<String>,
         post_uri: &str,
     ) -> Result<CircleSnapshot, String> {
         let feed_url = format!(
@@ -1069,7 +971,7 @@ impl ScenarioRunner {
         let feed_resp = self
             .config
             .alice
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -1105,7 +1007,7 @@ impl ScenarioRunner {
         let thread_resp = self
             .config
             .alice
-            .apply_auth(self.client.get(&thread_url))
+            .apply_circle_auth(self.client.get(&thread_url), &self.config.circle_appview_service_did)
             .query(&thread_query)
             .send()
             .await
@@ -1142,7 +1044,7 @@ impl ScenarioRunner {
         let notifs_resp = self
             .config
             .alice
-            .apply_auth(self.client.get(&notifs_url))
+            .apply_circle_auth(self.client.get(&notifs_url), &self.config.circle_appview_service_did)
             .query(&notifs_query)
             .send()
             .await
@@ -1160,10 +1062,11 @@ impl ScenarioRunner {
 
         let mut notif_tuples = Vec::new();
         for n in &notifs_output.notifications {
-            let reason_str = match n.reason {
+            let reason_str = match &n.reason {
                 CircleNotificationReason::Reply => "reply",
                 CircleNotificationReason::Like => "like",
                 CircleNotificationReason::Invite => "invite",
+                CircleNotificationReason::Other(s) => s.as_str(),
             };
             let subj = n.subject.as_ref().map(|s| s.as_str().to_string());
             notif_tuples.push((
@@ -1567,49 +1470,111 @@ impl ScenarioRunner {
         // Step 2: Alice Creates Circle via Nest createCircle
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_03_CREATE_CIRCLE_START");
-        let create_circle_url = format!(
-            "{}/xrpc/blue.catbird.circle.createCircle",
+        let create_space_url = format!(
+            "{}/xrpc/com.atproto.simplespace.createSpace",
             self.config.nest_url.trim_end_matches('/')
         );
-        let create_input: CreateCircle<String> = CreateCircle {
-            member_dids: vec![
-                Did::new(self.config.bob.did.clone()).unwrap(),
-                Did::new(self.config.carol.did.clone()).unwrap(),
-            ],
-            name: circle_name.clone(),
+        let skey = "3l7e2eskey123456";
+        let circle_id = "3l7e2ecircle1234";
+        let create_space_input: CreateSpace<String> = CreateSpace {
+            app_access: CreateSpaceAppAccess::AllowList(Box::new(
+                catbird_atproto::generated::com_atproto::simplespace::AllowList {
+                    allowed: vec![self.config.circle_appview_client_id.clone()],
+                    extra_data: None,
+                },
+            )),
+            skey: Some(catbird_atproto::jacquard_common::types::string::RecordKey::any_static(skey).unwrap()),
+            policy: CreateSpacePolicy::MemberListPolicy(Box::new(
+                catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
+                    extra_data: None,
+                },
+            )),
+            r#type: Nsid::new("blue.catbird.circle".into())
+                .map_err(|e| format!("Invalid NSID: {e}"))?,
             extra_data: None,
         };
-
         let create_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&create_circle_url))
-            .json(&create_input)
+            .apply_auth(self.client.post(&create_space_url))
+            .json(&create_space_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call createCircle: {e}"))?;
-
+            .map_err(|e| format!("Failed to call createSpace: {e}"))?;
         if !create_resp.status().is_success() {
             return Err(format!(
-                "createCircle returned status: {}",
+                "createSpace returned status: {}",
                 create_resp.status()
             ));
         }
 
-        let create_output: CreateCircleOutput<String> = create_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse CreateCircleOutput: {e}"))?;
-        let op_id = create_output.value.id.as_str();
+        let space_uri = format!("at://{}/space/blue.catbird.circle/{}", self.config.alice.did, skey);
+        let space_ref = AtSpaceUri::new(space_uri.clone())
+            .map_err(|e| format!("Invalid AtSpaceUri: {e}"))?;
 
-        let completed_op = self
-            .poll_operation(op_id, &self.config.alice, Duration::from_secs(30))
-            .await?;
-        let space_ref = completed_op
-            .value
-            .space
-            .ok_or_else(|| "Completed createCircle operation missing SpaceRef".to_string())?;
-        let space_uri = space_ref.as_str().to_string();
+        // Alice writes metadata record
+        let meta_record = json!({
+            "$type": "blue.catbird.circle.metadata",
+            "circleId": circle_id,
+            "name": circle_name.clone(),
+            "createdAt": Utc::now().to_rfc3339(),
+        });
+        self.apply_create(
+            &self.config.alice,
+            &space_uri,
+            "blue.catbird.circle.metadata",
+            &meta_record,
+        )
+        .await?;
+
+        // Alice adds Bob and Carol via simplespace.addMember
+        let add_member_url = format!(
+            "{}/xrpc/com.atproto.simplespace.addMember",
+            self.config.nest_url.trim_end_matches('/')
+        );
+        for user in [&self.config.bob, &self.config.carol] {
+            let add_input = AddMember {
+                did: Did::new(user.did.clone()).unwrap(),
+                space: space_ref.clone(),
+                extra_data: None,
+            };
+            let add_resp = self
+                .config
+                .alice
+                .apply_auth(self.client.post(&add_member_url))
+                .json(&add_input)
+                .send()
+                .await
+                .map_err(|e| format!("addMember failed for {}: {e}", user.name))?;
+            if !add_resp.status().is_success() {
+                return Err(format!(
+                    "addMember for {} returned HTTP {}",
+                    user.name,
+                    add_resp.status()
+                ));
+            }
+        }
+
+        // Alice activates Circle on Circle AppView
+        let activate_url = format!(
+            "{}/xrpc/blue.catbird.circle.activateCircle",
+            self.config.nest_url.trim_end_matches('/')
+        );
+        let act_input = ActivateCircle {
+            space: space_ref.clone(),
+            extra_data: None,
+        };
+        let act_resp = self
+            .config
+            .alice
+            .apply_circle_auth(self.client.post(&activate_url), &self.config.circle_appview_service_did)
+            .json(&act_input)
+            .send()
+            .await
+            .map_err(|e| format!("Alice activateCircle failed: {e}"))?;
+        if !act_resp.status().is_success() {
+            return Err(format!("Alice activateCircle returned HTTP {}", act_resp.status()));
+        }
 
         // Discovery check via listCircles using generated ListCircles query input
         let list_circles_url = format!(
@@ -1622,7 +1587,7 @@ impl ScenarioRunner {
         };
         for user in [&self.config.alice, &self.config.bob, &self.config.carol] {
             let lc_resp = user
-                .apply_auth(self.client.get(&list_circles_url))
+                .apply_circle_auth(self.client.get(&list_circles_url), &self.config.circle_appview_service_did)
                 .query(&lc_query)
                 .send()
                 .await
@@ -1651,7 +1616,7 @@ impl ScenarioRunner {
         let dave_lc_resp = self
             .config
             .dave
-            .apply_auth(self.client.get(&list_circles_url))
+            .apply_circle_auth(self.client.get(&list_circles_url), &self.config.circle_appview_service_did)
             .query(&lc_query)
             .send()
             .await
@@ -1667,55 +1632,34 @@ impl ScenarioRunner {
         eprintln!("[e2e_scenario] STEP_03_CIRCLE_CREATED_AND_DISCOVERED");
 
         // -------------------------------------------------------------
-        // Step 3: Explicitly Activate Space for Alice, Bob, Carol
+        // Step 3: Explicitly Activate Space for Bob, Carol
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_04_ACTIVATE_SPACE_START");
-        let activate_url = format!(
-            "{}/xrpc/blue.catbird.circle.activateSpace",
-            self.config.nest_url.trim_end_matches('/')
-        );
-        for user in [&self.config.alice, &self.config.bob, &self.config.carol] {
-            let act_input: ActivateSpace<String> = ActivateSpace {
-                space: space_ref.clone(),
-                extra_data: None,
-            };
+        for user in [&self.config.bob, &self.config.carol] {
             let act_resp = user
-                .apply_auth(self.client.post(&activate_url))
+                .apply_circle_auth(self.client.post(&activate_url), &self.config.circle_appview_service_did)
                 .json(&act_input)
                 .send()
                 .await
-                .map_err(|e| format!("activateSpace failed for {}: {e}", user.name))?;
+                .map_err(|e| format!("activateCircle failed for {}: {e}", user.name))?;
             if !act_resp.status().is_success() {
                 return Err(format!(
-                    "activateSpace for {} returned status {}",
+                    "activateCircle for {} returned status {}",
                     user.name,
                     act_resp.status()
                 ));
             }
-            let act_out: ActivateSpaceOutput<String> = act_resp.json().await.map_err(|e| {
-                format!("Failed to parse ActivateSpaceOutput for {}: {e}", user.name)
+            let act_out: ActivateCircleOutput<String> = act_resp.json().await.map_err(|e| {
+                format!("Failed to parse ActivateCircleOutput for {}: {e}", user.name)
             })?;
-            if act_out.access_state != AccessState::Active {
+            if act_out.circle.name.as_str() != circle_name {
                 return Err(format!(
-                    "activateSpace for {} did not yield Active state (got {:?})",
-                    user.name, act_out.access_state
-                ));
-            }
-            let expires_at = act_out
-                .expires_at
-                .ok_or_else(|| format!("activateSpace for {} missing expires_at", user.name))?;
-            let exp_dt = chrono::DateTime::parse_from_rfc3339(expires_at.as_str())
-                .map_err(|e| format!("Invalid expires_at datetime: {e}"))?
-                .with_timezone(&Utc);
-            if exp_dt <= Utc::now() {
-                return Err(format!(
-                    "activateSpace for {} returned expired or non-future expires_at",
+                    "activateCircle for {} returned mismatched circle name",
                     user.name
                 ));
             }
         }
         eprintln!("[e2e_scenario] STEP_04_SPACE_ACTIVATED");
-
         // -------------------------------------------------------------
         // Step 4: Alice uploads image blob via Nest proxy
         // -------------------------------------------------------------
@@ -1906,7 +1850,7 @@ impl ScenarioRunner {
         let alice_feed_resp = self
             .config
             .alice
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -1962,7 +1906,7 @@ impl ScenarioRunner {
         let thread_resp = self
             .config
             .alice
-            .apply_auth(self.client.get(&post_thread_url))
+            .apply_circle_auth(self.client.get(&post_thread_url), &self.config.circle_appview_service_did)
             .query(&thread_query)
             .send()
             .await
@@ -2009,7 +1953,7 @@ impl ScenarioRunner {
         let media_resp = self
             .config
             .bob
-            .apply_auth(self.client.get(&media_url))
+            .apply_circle_auth(self.client.get(&media_url), &self.config.circle_appview_service_did)
             .query(&media_query)
             .send()
             .await
@@ -2030,7 +1974,7 @@ impl ScenarioRunner {
         let carol_feed_resp = self
             .config
             .carol
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -2072,7 +2016,7 @@ impl ScenarioRunner {
         let notifs_resp = self
             .config
             .alice
-            .apply_auth(self.client.get(&notifs_url))
+            .apply_circle_auth(self.client.get(&notifs_url), &self.config.circle_appview_service_did)
             .query(&notifs_query)
             .send()
             .await
@@ -2144,7 +2088,7 @@ impl ScenarioRunner {
         let alice_feed_after_reject: GetFeedOutput<String> = self
             .config
             .alice
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -2227,7 +2171,7 @@ impl ScenarioRunner {
         let dave_feed_resp = self
             .config
             .dave
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -2245,7 +2189,7 @@ impl ScenarioRunner {
         let dave_media_resp = self
             .config
             .dave
-            .apply_auth(self.client.get(&media_url))
+            .apply_circle_auth(self.client.get(&media_url), &self.config.circle_appview_service_did)
             .query(&media_query)
             .send()
             .await
@@ -2263,7 +2207,7 @@ impl ScenarioRunner {
         let dave_thread_resp = self
             .config
             .dave
-            .apply_auth(self.client.get(&post_thread_url))
+            .apply_circle_auth(self.client.get(&post_thread_url), &self.config.circle_appview_service_did)
             .query(&thread_query)
             .send()
             .await
@@ -2343,25 +2287,19 @@ impl ScenarioRunner {
         // Step 11: Alice Adds Dave to Circle via Nest updateMember
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_12_ADD_MEMBER_START");
-        let update_member_url = format!(
-            "{}/xrpc/blue.catbird.circle.updateMember",
-            self.config.nest_url.trim_end_matches('/')
-        );
-        let add_dave_input: UpdateMember<String> = UpdateMember {
-            action: MemberAction::Add,
-            member_did: Did::new(self.config.dave.did.clone())
-                .map_err(|e| format!("Invalid Dave DID: {e}"))?,
+        let add_dave_input = AddMember {
+            did: Did::new(self.config.dave.did.clone()).unwrap(),
             space: space_ref.clone(),
             extra_data: None,
         };
         let add_dave_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&update_member_url))
+            .apply_auth(self.client.post(&add_member_url))
             .json(&add_dave_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call updateMember to add Dave: {e}"))?;
+            .map_err(|e| format!("Failed to call addMember to add Dave: {e}"))?;
 
         if !add_dave_resp.status().is_success() {
             return Err(format!(
@@ -2369,58 +2307,34 @@ impl ScenarioRunner {
                 add_dave_resp.status()
             ));
         }
-        let add_dave_output: UpdateMemberOutput<String> = add_dave_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse UpdateMemberOutput for Dave add: {e}"))?;
-        let _ = self
-            .poll_operation(
-                &add_dave_output.value.id,
-                &self.config.alice,
-                Duration::from_secs(30),
-            )
-            .await?;
 
-        // Dave activates Space and asserts active + future expires_at
+        // Dave activates Circle
         let dave_act = self
             .config
             .dave
-            .apply_auth(self.client.post(&activate_url))
-            .json(&ActivateSpace::<String> {
-                space: space_ref.clone(),
-                extra_data: None,
-            })
+            .apply_circle_auth(self.client.post(&activate_url), &self.config.circle_appview_service_did)
+            .json(&act_input)
             .send()
             .await
-            .map_err(|e| format!("Dave activateSpace failed: {e}"))?;
+            .map_err(|e| format!("Dave activateCircle failed: {e}"))?;
         if !dave_act.status().is_success() {
             return Err(format!(
-                "Dave activateSpace returned status {}",
+                "Dave activateCircle returned status {}",
                 dave_act.status()
             ));
         }
-        let dave_act_out: ActivateSpaceOutput<String> = dave_act
+        let dave_act_out: ActivateCircleOutput<String> = dave_act
             .json()
             .await
-            .map_err(|e| format!("Failed to parse Dave ActivateSpaceOutput: {e}"))?;
-        if dave_act_out.access_state != AccessState::Active {
-            return Err("Dave activateSpace did not yield Active access state".to_string());
+            .map_err(|e| format!("Failed to parse Dave ActivateCircleOutput: {e}"))?;
+        if dave_act_out.circle.name.as_str() != circle_name {
+            return Err("Dave activateCircle returned mismatched name".to_string());
         }
-        let dave_exp = dave_act_out
-            .expires_at
-            .ok_or_else(|| "Dave activateSpace missing expires_at".to_string())?;
-        let dave_exp_dt = chrono::DateTime::parse_from_rfc3339(dave_exp.as_str())
-            .map_err(|e| format!("Invalid Dave expires_at: {e}"))?
-            .with_timezone(&Utc);
-        if dave_exp_dt <= Utc::now() {
-            return Err("Dave activateSpace returned non-future expires_at".to_string());
-        }
-
         // Dave discovers the circle
         let dave_lc_after: ListCirclesOutput<String> = self
             .config
             .dave
-            .apply_auth(self.client.get(&list_circles_url))
+            .apply_circle_auth(self.client.get(&list_circles_url), &self.config.circle_appview_service_did)
             .query(&lc_query)
             .send()
             .await
@@ -2440,7 +2354,7 @@ impl ScenarioRunner {
         let dave_feed_after = self
             .config
             .dave
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -2476,7 +2390,7 @@ impl ScenarioRunner {
         let dave_thread_resp = self
             .config
             .dave
-            .apply_auth(self.client.get(&post_thread_url))
+            .apply_circle_auth(self.client.get(&post_thread_url), &self.config.circle_appview_service_did)
             .query(&thread_query)
             .send()
             .await
@@ -2512,7 +2426,7 @@ impl ScenarioRunner {
         let dave_media_after = self
             .config
             .dave
-            .apply_auth(self.client.get(&media_url))
+            .apply_circle_auth(self.client.get(&media_url), &self.config.circle_appview_service_did)
             .query(&media_query)
             .send()
             .await
@@ -2537,9 +2451,12 @@ impl ScenarioRunner {
         eprintln!("[e2e_scenario] STEP_13_REMOVE_MEMBER_START");
         let pre_bob_remove_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
 
-        let remove_bob_input: UpdateMember<String> = UpdateMember {
-            action: MemberAction::Remove,
-            member_did: Did::new(self.config.bob.did.clone())
+        let remove_member_url = format!(
+            "{}/xrpc/com.atproto.simplespace.removeMember",
+            self.config.nest_url.trim_end_matches('/')
+        );
+        let remove_bob_input = RemoveMember {
+            did: Did::new(self.config.bob.did.clone())
                 .map_err(|e| format!("Invalid Bob DID: {e}"))?,
             space: space_ref.clone(),
             extra_data: None,
@@ -2547,11 +2464,11 @@ impl ScenarioRunner {
         let remove_bob_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&update_member_url))
+            .apply_auth(self.client.post(&remove_member_url))
             .json(&remove_bob_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call updateMember to remove Bob: {e}"))?;
+            .map_err(|e| format!("Failed to call removeMember to remove Bob: {e}"))?;
 
         if !remove_bob_resp.status().is_success() {
             return Err(format!(
@@ -2559,23 +2476,11 @@ impl ScenarioRunner {
                 remove_bob_resp.status()
             ));
         }
-        let remove_bob_output: UpdateMemberOutput<String> = remove_bob_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse UpdateMemberOutput for Bob remove: {e}"))?;
-        let _ = self
-            .poll_operation(
-                &remove_bob_output.value.id,
-                &self.config.alice,
-                Duration::from_secs(30),
-            )
-            .await?;
-
         // Bob discovery disappears
         let bob_lc_after: ListCirclesOutput<String> = self
             .config
             .bob
-            .apply_auth(self.client.get(&list_circles_url))
+            .apply_circle_auth(self.client.get(&list_circles_url), &self.config.circle_appview_service_did)
             .query(&lc_query)
             .send()
             .await
@@ -2595,7 +2500,7 @@ impl ScenarioRunner {
         let bob_feed_after = self
             .config
             .bob
-            .apply_auth(self.client.get(&feed_url))
+            .apply_circle_auth(self.client.get(&feed_url), &self.config.circle_appview_service_did)
             .query(&feed_query)
             .send()
             .await
@@ -2612,7 +2517,7 @@ impl ScenarioRunner {
         let bob_media_after = self
             .config
             .bob
-            .apply_auth(self.client.get(&media_url))
+            .apply_circle_auth(self.client.get(&media_url), &self.config.circle_appview_service_did)
             .query(&media_query)
             .send()
             .await
@@ -2629,7 +2534,7 @@ impl ScenarioRunner {
         let bob_thread_after = self
             .config
             .bob
-            .apply_auth(self.client.get(&post_thread_url))
+            .apply_circle_auth(self.client.get(&post_thread_url), &self.config.circle_appview_service_did)
             .query(&thread_query)
             .send()
             .await
@@ -2647,8 +2552,8 @@ impl ScenarioRunner {
         let bob_act_after = self
             .config
             .bob
-            .apply_auth(self.client.post(&activate_url))
-            .json(&ActivateSpace::<String> {
+            .apply_circle_auth(self.client.post(&activate_url), &self.config.circle_appview_service_did)
+            .json(&ActivateCircle::<String> {
                 space: space_ref.clone(),
                 extra_data: None,
             })

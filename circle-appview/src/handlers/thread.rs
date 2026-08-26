@@ -16,14 +16,12 @@ pub async fn get_post_thread_handler(
 ) -> Result<Json<GetPostThreadOutput>, AppError> {
     tracing::debug!("Handling getPostThread request");
     let output = crate::thread::get_post_thread(
-        &state.db,
-        &state.profile_hydrator,
+        &state,
         &user.did,
         query.uri.as_str(),
         query.space.as_str(),
         query.depth,
         query.parent_height,
-        &state.config.circle_media_base_url,
     )
     .await?;
 

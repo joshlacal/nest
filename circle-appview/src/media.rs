@@ -15,35 +15,11 @@ pub async fn get_media(
     did: &str,
     cid: &str,
 ) -> Result<Response, AppError> {
-    // 1. Require a live lease in the Space for the requesting user
-    access::check_active_lease(&state.db, space, &user.did).await?;
+    // 1. Require verified member access in the Space for the requesting user
+    access::check_member_access(state, space, &user.did).await?;
 
-    // 2. Validate author DID is an active writer/member in the Space (or Space authority)
-    let is_authority = match access::extract_authority_did(space) {
-        Ok(auth_did) => auth_did == did,
-        Err(_) => false,
-    };
-
-    if !is_authority {
-        let is_active_member: Option<(String,)> = sqlx::query_as(
-            r#"
-            SELECT member_did
-            FROM circle_members
-            WHERE space_uri = $1 AND member_did = $2 AND status = 'active'
-            "#,
-        )
-        .bind(space)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(AppError::Database)?;
-
-        if is_active_member.is_none() {
-            return Err(AppError::Forbidden(
-                "Author is not an active writer in this Space".into(),
-            ));
-        }
-    }
+    // 2. Validate author DID is a verified member in the Space (or Space authority)
+    access::check_member_access(state, space, did).await?;
 
     // 3. Obtain active Space credential from CredentialStore
     let credential = state
@@ -76,11 +52,10 @@ pub async fn get_media(
 
     // Layered enforcement: DefaultSpaceHostTransport::get_blob streaming cap is the primary
     // line of defense to abort oversized network transfers without exhausting memory.
-    // The handler-level check below acts as defense-in-depth / belt-and-suspenders.
     let max_bytes: usize = 20 * 1024 * 1024; // 20 MiB
     if bytes.len() > max_bytes {
         return Err(AppError::InvalidRequest(
-            "Media payload exceeds maximum size of 20 MiB".into(),
+            "Media blob size exceeds maximum permitted size".into(),
         ));
     }
 

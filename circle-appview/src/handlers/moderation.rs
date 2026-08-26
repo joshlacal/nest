@@ -20,7 +20,7 @@ pub async fn update_preferences_handler(
 ) -> Result<Json<UpdatePreferencesOutput>, AppError> {
     tracing::debug!("Handling updatePreferences request");
     let muted = crate::preferences::update_preferences(
-        &state.db,
+        &state,
         &user.did,
         input.space.as_str(),
         input.muted,
@@ -40,7 +40,7 @@ pub async fn report_record_handler(
     tracing::debug!("Handling reportRecord request");
     let details_ref = input.details.as_ref().map(|s| s.as_str());
     let id = crate::reports::report_record(
-        &state.db,
+        &state,
         &user.did,
         input.space.as_str(),
         input.uri.as_str(),

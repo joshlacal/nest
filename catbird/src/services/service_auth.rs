@@ -23,25 +23,6 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use std::sync::Arc;
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
-pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circle";
-
-pub const CIRCLE_ENDPOINTS: &[&str] = &[
-    "blue.catbird.circle.getCapabilities",
-    "blue.catbird.circle.createCircle",
-    "blue.catbird.circle.updateMember",
-    "blue.catbird.circle.deleteCircle",
-    "blue.catbird.circle.updatePreferences",
-    "blue.catbird.circle.reportRecord",
-    "blue.catbird.circle.activateSpace",
-    "blue.catbird.circle.listCircles",
-    "blue.catbird.circle.getFeed",
-    "blue.catbird.circle.getPostThread",
-    "blue.catbird.circle.listNotifications",
-    "blue.catbird.circle.getMedia",
-    "blue.catbird.circle.getOperation",
-    "blue.catbird.circle.retryOperation",
-    "blue.catbird.circle.syncProjection",
-];
 
 pub struct ServiceAuthProvider {
     state: Arc<AppState>,
@@ -66,7 +47,7 @@ impl ServiceAuthProvider {
         self.token_for_audience(session, MLS_APPVIEW_SERVICE_REF, lexicon).await
     }
 
-    /// Parameterized service-auth token fetcher for allowed audiences (MLS and Circle AppViews).
+    /// Parameterized service-auth token fetcher for allowed audiences (MLS AppView).
     /// Validates that `audience` is a configured service identifier and `lexicon` is an exact allowed NSID.
     pub async fn token_for_audience(
         &self,
@@ -96,24 +77,11 @@ impl ServiceAuthProvider {
 
         let is_mls_aud = audience == MLS_APPVIEW_SERVICE_REF
             || (!self.state.config.mls.service_did.is_empty() && audience == self.state.config.mls.service_did);
-        let is_circle_aud = !self.state.config.circle.service_did.is_empty()
-            && audience == self.state.config.circle.service_did;
-
         if is_mls_aud {
             let is_allowed_lxm = crate::services::CHAT_ENDPOINTS.contains(&lexicon);
             if !is_allowed_lxm {
                 return Err(AppError::BadRequest(format!(
                     "Unsupported MLS service auth lexicon: {lexicon}"
-                )));
-            }
-            return Ok(());
-        }
-
-        if is_circle_aud {
-            let is_allowed_lxm = CIRCLE_ENDPOINTS.contains(&lexicon);
-            if !is_allowed_lxm {
-                return Err(AppError::BadRequest(format!(
-                    "Unsupported Circle service auth lexicon: {lexicon}"
                 )));
             }
             return Ok(());
@@ -338,9 +306,6 @@ mod tests {
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
-            circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
-            circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            circle_verifying_key: None,
             session_encryption_key: None,
         })
     }
@@ -464,162 +429,4 @@ mod tests {
         assert_eq!(pds.call_count().await, 3);
     }
 
-    #[tokio::test]
-    async fn circle_token_uses_exact_audience_and_lxm() {
-        let pds = MockPds::new().await;
-        let provider = ServiceAuthProvider::new(test_state().await);
-        let session = test_session("did:plc:alice-circle", &pds.uri());
-
-        let token = provider
-            .token_for_audience(
-                &session,
-                "did:web:circles.catbird.blue#atproto_circle",
-                "blue.catbird.circle.getFeed",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(decode_claim(&token, "aud"), "did:web:circles.catbird.blue#atproto_circle");
-        assert_eq!(decode_claim(&token, "lxm"), "blue.catbird.circle.getFeed");
-
-        let call = pds.single_call().await;
-        assert_eq!(call.nsid, "com.atproto.server.getServiceAuth");
-        assert_eq!(call.query("aud"), Some("did:web:circles.catbird.blue#atproto_circle"));
-        assert_eq!(call.query("lxm"), Some("blue.catbird.circle.getFeed"));
-    }
-
-    #[tokio::test]
-    async fn rejects_unsupported_audience_or_wildcards() {
-        let pds = MockPds::new().await;
-        let provider = ServiceAuthProvider::new(test_state().await);
-        let session = test_session("did:plc:alice-reject", &pds.uri());
-
-        // Unsupported audience
-        let res = provider
-            .token_for_audience(&session, "did:web:evil.com", "blue.catbird.circle.getFeed")
-            .await;
-        assert!(res.is_err());
-
-        // Wildcard audience
-        let res = provider
-            .token_for_audience(&session, "*", "blue.catbird.circle.getFeed")
-            .await;
-        assert!(res.is_err());
-
-        // Wildcard lexicon
-        let res = provider
-            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.circle.*")
-            .await;
-        assert!(res.is_err());
-
-        // Unallowed lexicon for circle audience
-        let res = provider
-            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.chat.getConversations")
-            .await;
-        assert!(res.is_err());
-
-        // Unallowed lexicon for MLS audience
-        let res = provider
-            .token_for_audience(&session, MLS_APPVIEW_SERVICE_REF, "blue.catbird.circle.getFeed")
-            .await;
-        assert!(res.is_err());
-    }
-
-    async fn test_state_with_circle_did(circle_did: &str) -> Arc<AppState> {
-        let mut config = AppConfig::load().unwrap();
-        config.circle.service_did = circle_did.to_string();
-        let http_client = reqwest::Client::builder().build().unwrap();
-        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
-        let redis = redis::aio::ConnectionManager::new(redis_client).await.unwrap();
-
-        Arc::new(AppState {
-            config: Arc::new(config),
-            http_client,
-            redis,
-            push_db: None,
-            key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
-            auth_store: None,
-            push: None,
-            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
-            circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
-            circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            circle_verifying_key: None,
-            session_encryption_key: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn rejects_audience_or_lexicon_with_surrounding_whitespace() {
-        let pds = MockPds::new().await;
-        let provider = ServiceAuthProvider::new(test_state().await);
-        let session = test_session("did:plc:alice-whitespace", &pds.uri());
-
-        // Leading/trailing whitespace on circle audience
-        assert!(provider
-            .token_for_audience(&session, " did:web:circles.catbird.blue#atproto_circle", "blue.catbird.circle.getFeed")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, "did:web:circles.catbird.blue#atproto_circle ", "blue.catbird.circle.getFeed")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, "did:web:circles.catbird.blue#atproto_circle\n", "blue.catbird.circle.getFeed")
-            .await
-            .is_err());
-
-        // Leading/trailing whitespace on MLS audience
-        assert!(provider
-            .token_for_audience(&session, " did:web:chat.catbird.blue#atproto_mls", "blue.catbird.chat.getConversations")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, "did:web:chat.catbird.blue#atproto_mls ", "blue.catbird.chat.getConversations")
-            .await
-            .is_err());
-
-        // Leading/trailing whitespace on lexicon
-        assert!(provider
-            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, " blue.catbird.circle.getFeed")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.circle.getFeed ")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.circle.getFeed\r\n")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, MLS_APPVIEW_SERVICE_REF, " blue.catbird.chat.getConversations")
-            .await
-            .is_err());
-        assert!(provider
-            .token_for_audience(&session, MLS_APPVIEW_SERVICE_REF, "blue.catbird.chat.getConversations ")
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn custom_circle_did_narrows_allowlist_and_rejects_production_default() {
-        let pds = MockPds::new().await;
-        let custom_did = "did:web:custom.circles.blue#atproto_circle";
-        let provider = ServiceAuthProvider::new(test_state_with_circle_did(custom_did).await);
-        let session = test_session("did:plc:alice-custom-did", &pds.uri());
-
-        // Custom DID succeeds
-        let res = provider
-            .token_for_audience(&session, custom_did, "blue.catbird.circle.getFeed")
-            .await;
-        assert!(res.is_ok(), "configured custom circle did must be accepted");
-
-        // Hard-coded production DID is now rejected because custom DID is configured and overrides it
-        let res = provider
-            .token_for_audience(&session, CIRCLE_APPVIEW_SERVICE_REF, "blue.catbird.circle.getFeed")
-            .await;
-        assert!(res.is_err(), "production default circle did must be rejected when custom did is configured");
-    }
 }

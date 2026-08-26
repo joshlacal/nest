@@ -33,7 +33,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::blue_catbird::circle::defs::{CircleSummary, FeedItem};
+use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, FeedItem};
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
 use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
@@ -54,7 +54,7 @@ use circle_appview::{
     validator::{active_members, policy, validate, InvalidRecord, RecordCandidate},
 };
 
-const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
+const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const MEDIA_BASE: &str = "https://media.catbird.blue";
 
 const ALICE_DID: &str = "did:plc:alice-circle-owner-3u";
@@ -486,12 +486,11 @@ impl ThreeUserEnv {
             plc_directory_url: "https://plc.directory".into(),
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
-            nest_client_id: "https://nest.catbird.blue".into(),
-            nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-            nest_verifying_keys: Vec::new(),
-            nest_push_url: None,
-            nest_push_audience: None,
-            push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
         };
@@ -499,6 +498,12 @@ impl ThreeUserEnv {
         let profile_hydrator = Arc::new(ProfileHydrator::new(
             config.public_appview_url.clone(),
             reqwest::Client::new(),
+        ));
+        let oauth_signing_key = SigningKey::random(&mut OsRng);
+        let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
+            config.appview_base_url.clone(),
+            oauth_signing_key,
+            None,
         ));
 
         let state = AppState {
@@ -510,6 +515,7 @@ impl ThreeUserEnv {
             space_client,
             space_locks,
             profile_hydrator: profile_hydrator.clone(),
+            oauth_service,
             push_client: None,
         };
 
@@ -593,8 +599,8 @@ impl ThreeUserEnv {
         // Insert circle
         sqlx::query(
             r#"
-            INSERT INTO circles (space_uri, authority_did, display_name, generation, created_at)
-            VALUES ($1, $2, $3, 1, now())
+            INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+            VALUES ($1, '3l7familyaaaa', $2, $3, now())
             ON CONFLICT (space_uri) DO NOTHING
             "#,
         )
@@ -637,10 +643,10 @@ impl ThreeUserEnv {
     pub async fn grant_active_member(&self, space_uri: &str, member_did: &str) {
         sqlx::query(
             r#"
-            INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at)
-            VALUES ($1, $2, 'active', 1, now())
+            INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
+            VALUES ($1, $2, now())
             ON CONFLICT (space_uri, member_did)
-            DO UPDATE SET status = 'active', generation = 1, updated_at = now()
+            DO UPDATE SET cached_at = now()
             "#,
         )
         .bind(space_uri)
@@ -651,14 +657,13 @@ impl ThreeUserEnv {
 
         sqlx::query(
             r#"
-            INSERT INTO access_leases (space_uri, member_did, expires_at)
-            VALUES ($1, $2, now() + interval '2 hours')
-            ON CONFLICT (space_uri, member_did)
-            DO UPDATE SET expires_at = now() + interval '2 hours'
+            INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count)
+            VALUES ($1, now(), 1)
+            ON CONFLICT (space_uri)
+            DO UPDATE SET last_refreshed_at = now()
             "#,
         )
         .bind(space_uri)
-        .bind(member_did)
         .execute(&self.pool)
         .await
         .unwrap();
@@ -1212,17 +1217,17 @@ async fn privacy_audit_canaries_are_isolated_and_unleaked(pool: PgPool) {
     assert!(env.public_appview.search_uri(&circle.space_uri).await.is_none());
     assert!(env.public_appview.search_uri(canary_blob_cid).await.is_none());
 
-    // 6. Audit: Database state for removed member Bob must have zero active leases,
-    // notifications, or preferences, while member status is marked 'removed'
-    let bob_lease_count: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM access_leases WHERE space_uri = $1 AND member_did = $2",
+    // 6. Audit: Database state for removed member Bob must have zero cache entries,
+    // notifications, or preferences
+    let bob_cache_count: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
     )
     .bind(&circle.space_uri)
     .bind(env.bob.did())
     .fetch_one(&env.pool)
     .await
     .unwrap();
-    assert_eq!(bob_lease_count.0, 0, "Bob lease must be purged");
+    assert_eq!(bob_cache_count.0, 0, "Bob cache must be purged");
 
     let bob_notif_count: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM circle_notifications WHERE space_uri = $1 AND recipient_did = $2",
@@ -1244,36 +1249,16 @@ async fn privacy_audit_canaries_are_isolated_and_unleaked(pool: PgPool) {
     .unwrap();
     assert_eq!(bob_pref_count.0, 0, "Bob preferences must be purged");
 
-    let bob_status: (String,) = sqlx::query_as(
-        "SELECT status FROM circle_members WHERE space_uri = $1 AND member_did = $2",
-    )
-    .bind(&circle.space_uri)
-    .bind(env.bob.did())
-    .fetch_one(&env.pool)
-    .await
-    .unwrap();
-    assert_eq!(bob_status.0, "removed", "Bob status must be 'removed'");
-
-    // 7. Audit: Remaining members Alice, Carol, Dave have active status and active leases
+    // 7. Audit: Remaining members Alice, Carol, Dave have cached membership
     for member_did in [env.alice.did(), env.carol.did(), env.dave.did()] {
-        let status: (String,) = sqlx::query_as(
-            "SELECT status FROM circle_members WHERE space_uri = $1 AND member_did = $2",
+        let cache_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
         )
         .bind(&circle.space_uri)
         .bind(member_did)
         .fetch_one(&env.pool)
         .await
         .unwrap();
-        assert_eq!(status.0, "active", "Remaining member must be active");
-
-        let lease_count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM access_leases WHERE space_uri = $1 AND member_did = $2 AND expires_at > now()",
-        )
-        .bind(&circle.space_uri)
-        .bind(member_did)
-        .fetch_one(&env.pool)
-        .await
-        .unwrap();
-        assert_eq!(lease_count.0, 1, "Remaining member must have active lease");
+        assert_eq!(cache_count.0, 1, "Remaining member must be in cache");
     }
 }

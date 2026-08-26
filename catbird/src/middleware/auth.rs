@@ -37,66 +37,7 @@ fn atproto_auth_error(status: StatusCode, error: &str, message: impl Into<String
     }
 }
 
-fn is_circle_path(path: &str) -> bool {
-    path.contains("blue.catbird.circle.") || path.contains("/blue.catbird.circle")
-}
-
-fn classify_auth_error(error: AppError, is_circle: bool) -> AppError {
-    if is_circle {
-        return match error {
-            AppError::InvalidSession | AppError::SessionExpired | AppError::TokenRefresh(_) => {
-                atproto_auth_error(
-                    StatusCode::UNAUTHORIZED,
-                    "AuthRequired",
-                    "Session is invalid or expired. Please log in again.",
-                )
-            }
-            AppError::AuthTemporarilyUnavailable(message) => {
-                atproto_auth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "UpstreamUnavailable",
-                    message,
-                )
-            }
-            AppError::Redis(_) | AppError::HttpClient(_) => {
-                atproto_auth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "UpstreamUnavailable",
-                    "Authentication service is temporarily unavailable. Please retry.",
-                )
-            }
-            AppError::OAuth(message) => {
-                let lower = message.to_ascii_lowercase();
-                if lower.contains("invalid_grant")
-                    || lower.contains("invalid_token")
-                    || lower.contains("no refresh token")
-                    || lower.contains("no per-session oauth data")
-                {
-                    atproto_auth_error(
-                        StatusCode::UNAUTHORIZED,
-                        "AuthRequired",
-                        "Session expired. Please log in again.",
-                    )
-                } else {
-                    atproto_auth_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "UpstreamUnavailable",
-                        "Authentication service is temporarily unavailable. Please retry.",
-                    )
-                }
-            }
-            AppError::AtprotoResponse { .. } => error,
-            other => {
-                tracing::warn!("Unexpected auth failure type on Circle route: {}", other);
-                atproto_auth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "UpstreamUnavailable",
-                    "Authentication service is temporarily unavailable. Please retry.",
-                )
-            }
-        };
-    }
-
+fn classify_auth_error(error: AppError) -> AppError {
     match error {
         AppError::InvalidSession => atproto_auth_error(
             StatusCode::UNAUTHORIZED,
@@ -193,28 +134,19 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let is_circle = is_circle_path(req.uri().path());
     let session_id = extract_session_id(&req).ok_or_else(|| {
-        if is_circle {
-            atproto_auth_error(
-                StatusCode::UNAUTHORIZED,
-                "AuthRequired",
-                "Missing authentication session.",
-            )
-        } else {
-            atproto_auth_error(
-                StatusCode::UNAUTHORIZED,
-                "AuthenticationRequired",
-                "Missing authentication session.",
-            )
-        }
+        atproto_auth_error(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "Missing authentication session.",
+        )
     })?;
 
     let auth_store = state.auth_store.as_ref().ok_or_else(|| {
-        classify_auth_error(AppError::Internal("Auth store not configured".into()), is_circle)
+        classify_auth_error(AppError::Internal("Auth store not configured".into()))
     })?;
     let jacquard_client = state.jacquard_client.as_ref().ok_or_else(|| {
-        classify_auth_error(AppError::Internal("Jacquard client not configured".into()), is_circle)
+        classify_auth_error(AppError::Internal("Jacquard client not configured".into()))
     })?;
 
     // Try Jacquard path (new sessions + already-migrated sessions)
@@ -228,48 +160,19 @@ pub async fn auth_middleware(
                     tracing::info!(session_id = %session_id, "Legacy session migrated, retrying Jacquard lookup");
                     resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
                         .await
-                        .map_err(|e| classify_auth_error(e, is_circle))?
+                        .map_err(classify_auth_error)?
                 }
-                Ok(None) => return Err(classify_auth_error(AppError::InvalidSession, is_circle)),
+                Ok(None) => return Err(classify_auth_error(AppError::InvalidSession)),
                 Err(e) => {
                     tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
-                    return Err(classify_auth_error(AppError::InvalidSession, is_circle));
+                    return Err(classify_auth_error(AppError::InvalidSession));
                 }
             }
         }
         Err(e) => {
-            return Err(classify_auth_error(e, is_circle));
+            return Err(classify_auth_error(e));
         }
     };
-
-    // Rebind actor's projection outbox records on every authenticated Circle request
-    if is_circle {
-        if let Some(pool) = &state.push_db {
-            let actor_did = session.did.clone();
-            let session_id_str = session.id.to_string();
-            if let Err(e) = sqlx::query(
-                r#"
-                UPDATE circle_projection_outbox
-                SET session_id = $1
-                WHERE actor_did = $2
-                  AND state IN ('pending', 'intent', 'executing')
-                  AND session_id != $1
-                "#,
-            )
-            .bind(&session_id_str)
-            .bind(&actor_did)
-            .execute(pool)
-            .await
-            {
-                tracing::error!(error = %e, actor_did = %actor_did, "Failed to rebind projection outbox session");
-                return Err(atproto_auth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "UpstreamUnavailable",
-                    "Database error while rebinding session. Please retry.",
-                ));
-            }
-        }
-    }
 
     req.extensions_mut().insert(session);
     req.extensions_mut().insert(dpop_data);
@@ -379,7 +282,7 @@ mod tests {
 
     #[test]
     fn classifies_invalid_session_as_invalid_token() {
-        let mapped = classify_auth_error(AppError::InvalidSession, false);
+        let mapped = classify_auth_error(AppError::InvalidSession);
         match mapped {
             AppError::AtprotoResponse {
                 status,
@@ -391,27 +294,12 @@ mod tests {
             }
             _ => panic!("expected AtprotoResponse"),
         }
-
-        // For Circle routes, it should classify as AuthRequired
-        let circle_mapped = classify_auth_error(AppError::InvalidSession, true);
-        match circle_mapped {
-            AppError::AtprotoResponse {
-                status,
-                error,
-                message: _,
-            } => {
-                assert_eq!(status, StatusCode::UNAUTHORIZED);
-                assert_eq!(error, "AuthRequired");
-            }
-            _ => panic!("expected AtprotoResponse"),
-        }
     }
 
     #[test]
     fn classifies_transient_auth_failure_as_temporarily_unavailable() {
         let mapped = classify_auth_error(
             AppError::AuthTemporarilyUnavailable("upstream timeout".into()),
-            false,
         );
         match mapped {
             AppError::AtprotoResponse {
@@ -421,23 +309,6 @@ mod tests {
             } => {
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(error, "TemporarilyUnavailable");
-            }
-            _ => panic!("expected AtprotoResponse"),
-        }
-
-        // For Circle routes, it should classify as UpstreamUnavailable
-        let circle_mapped = classify_auth_error(
-            AppError::AuthTemporarilyUnavailable("upstream timeout".into()),
-            true,
-        );
-        match circle_mapped {
-            AppError::AtprotoResponse {
-                status,
-                error,
-                message: _,
-            } => {
-                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-                assert_eq!(error, "UpstreamUnavailable");
             }
             _ => panic!("expected AtprotoResponse"),
         }

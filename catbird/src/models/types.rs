@@ -88,33 +88,3 @@ pub struct ExchangeRequest {
 pub struct ExchangeResponse {
     pub session_id: String,
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::services::require_circle_scopes;
-
-    fn session_with_scopes(scopes: &[&str]) -> CatbirdSession {
-        let now = Utc::now();
-        CatbirdSession {
-            id: Uuid::new_v4(),
-            did: "did:plc:test".into(),
-            handle: "test.example".into(),
-            pds_url: "https://pds.example".into(),
-            access_token: "token".into(),
-            refresh_token: "refresh".into(),
-            scopes: scopes.iter().map(|scope| (*scope).into()).collect(),
-            access_token_expires_at: now + chrono::Duration::hours(1),
-            created_at: now,
-            last_used_at: now,
-        }
-    }
-
-    #[test]
-    fn circle_scope_requires_read_write_and_management_grants() {
-        let session = session_with_scopes(&[
-            "space:blue.catbird.circle?authority=*&action=read&action=create&action=update&action=delete&collection=app.bsky.feed.post&collection=app.bsky.feed.like",
-            "space:blue.catbird.circle?authority=self&action=create&action=update&action=delete&manage=create&manage=update&manage=delete&collection=blue.catbird.circle.metadata",
-        ]);
-        assert!(require_circle_scopes(&session).is_ok());
-    }
-}

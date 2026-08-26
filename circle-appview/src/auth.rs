@@ -95,6 +95,7 @@ pub struct JwksDocument {
 pub enum ParsedVerifyingKey {
     P256(p256::ecdsa::VerifyingKey),
     Secp256k1(k256::ecdsa::VerifyingKey),
+    Ed25519(ed25519_dalek::VerifyingKey),
 }
 
 impl ParsedVerifyingKey {
@@ -112,11 +113,31 @@ impl ParsedVerifyingKey {
                 vk.verify(msg, &sig).map_err(|_| AuthReason::BadSignature)?;
                 Ok(())
             }
+            Self::Ed25519(vk) => {
+                let sig = ed25519_dalek::Signature::from_slice(sig_bytes)
+                    .map_err(|_| AuthReason::InvalidSignatureFormat)?;
+                use ed25519_dalek::Verifier;
+                vk.verify(msg, &sig).map_err(|_| AuthReason::BadSignature)?;
+                Ok(())
+            }
         }
     }
 }
 
 pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, AuthReason> {
+    if jwk.kty == "OKP" && jwk.crv.eq_ignore_ascii_case("Ed25519") {
+        let x = URL_SAFE_NO_PAD
+            .decode(&jwk.x)
+            .map_err(|_| AuthReason::InvalidCoordinates)?;
+        if x.len() != 32 {
+            return Err(AuthReason::InvalidCoordinates);
+        }
+        let bytes: &[u8; 32] = x.as_slice().try_into().map_err(|_| AuthReason::InvalidCoordinates)?;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes)
+            .map_err(|_| AuthReason::InvalidCoordinates)?;
+        return Ok(ParsedVerifyingKey::Ed25519(vk));
+    }
+
     if jwk.kty != "EC" {
         return Err(AuthReason::InvalidKeyType);
     }
@@ -166,6 +187,18 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
 
         let (_base, decoded) =
             multibase::decode(multibase_str).map_err(|_| AuthReason::InvalidMultikey)?;
+
+        // Ed25519 multicodec prefix: 0xed -> varint [0xed, 0x01]
+        if decoded.starts_with(&[0xed, 0x01]) {
+            let key_bytes = &decoded[2..];
+            if key_bytes.len() != 32 {
+                return Err(AuthReason::InvalidCoordinates);
+            }
+            let bytes: &[u8; 32] = key_bytes.try_into().map_err(|_| AuthReason::InvalidCoordinates)?;
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes)
+                .map_err(|_| AuthReason::InvalidCoordinates)?;
+            return Ok(ParsedVerifyingKey::Ed25519(vk));
+        }
 
         // P-256 multicodec prefix: 0x1200 -> varint [0x80, 0x24]
         if decoded.starts_with(&[0x80, 0x24]) {
@@ -472,8 +505,18 @@ impl DidResolver {
         };
 
         let url = format!("https://{hostname}:{port}{url_path}");
-
         self.web_transport.fetch(&url, &hostname, pinned_addr).await
+    }
+
+    pub async fn resolve_pds_endpoint(&self, did: &str) -> Result<String, AuthReason> {
+        let doc = self.resolve(did).await?;
+        let pds_full_id = format!("{did}#atproto_pds");
+        let service = doc
+            .service
+            .iter()
+            .find(|s| s.id == "#atproto_pds" || s.id == pds_full_id || s.r#type == "AtprotoPersonalDataServer")
+            .ok_or(AuthReason::NoVerificationMethod)?;
+        Ok(service.service_endpoint.clone())
     }
 }
 
@@ -621,121 +664,6 @@ pub fn select_authority_verification_method<'a>(
     Ok(selected)
 }
 
-pub async fn verify_nest_client_attestation(
-    state: &AppState,
-    token: &str,
-    expected_aud: &str,
-) -> Result<String, AppError> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(AppError::Unauthorized(AuthReason::InvalidJwtFormat));
-    }
-
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(parts[0])
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderEncoding))?;
-    let header: JwtHeader = serde_json::from_slice(&header_bytes)
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
-
-    match &header.typ {
-        Some(t) if t == "JWT" => {}
-        _ => return Err(AppError::Unauthorized(AuthReason::InvalidTyp)),
-    }
-
-    if header.alg != "ES256" {
-        return Err(AppError::Unauthorized(AuthReason::UnsupportedAlg));
-    }
-
-    let claims_bytes = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsEncoding))?;
-    let claims: serde_json::Value = serde_json::from_slice(&claims_bytes)
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
-
-    let iss = claims
-        .get("iss")
-        .and_then(|v| v.as_str())
-        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
-    let sub = claims
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
-    let aud = claims
-        .get("aud")
-        .and_then(|v| v.as_str())
-        .ok_or(AppError::Unauthorized(AuthReason::AudienceMismatch))?;
-    let exp = claims
-        .get("exp")
-        .and_then(|v| v.as_i64())
-        .ok_or(AppError::Unauthorized(AuthReason::MissingExp))?;
-    let iat = claims
-        .get("iat")
-        .and_then(|v| v.as_i64())
-        .ok_or(AppError::Unauthorized(AuthReason::MissingIat))?;
-    let jti = claims
-        .get("jti")
-        .and_then(|v| v.as_str())
-        .ok_or(AppError::Unauthorized(AuthReason::MissingJti))?;
-
-    if iss != sub {
-        return Err(AppError::Unauthorized(AuthReason::IdMismatch));
-    }
-
-    if iss != state.config.nest_client_id {
-        return Err(AppError::Unauthorized(AuthReason::IdMismatch));
-    }
-
-    if aud != expected_aud && aud != state.config.service_did {
-        return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
-    }
-
-    let now = Utc::now().timestamp();
-    if iat > now + 300 {
-        return Err(AppError::Unauthorized(AuthReason::FutureIat));
-    }
-    if exp <= now {
-        return Err(AppError::Unauthorized(AuthReason::Expired));
-    }
-    if exp - iat > 300 {
-        return Err(AppError::Unauthorized(AuthReason::LifetimeExceeded));
-    }
-
-    let exp_dt = DateTime::from_timestamp(exp, 0)
-        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
-
-    // Single-use JTI nonce consumption
-    let is_new = crate::db::consume_jti_nonce(&state.db, jti, iss, aud, exp_dt)
-        .await
-        .map_err(AppError::Database)?;
-    if !is_new {
-        return Err(AppError::Unauthorized(AuthReason::ReplayedJti));
-    }
-
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let sig_bytes = URL_SAFE_NO_PAD
-        .decode(parts[2])
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidSignatureFormat))?;
-
-    if state.config.nest_verifying_keys.is_empty() {
-        return Err(AppError::Unauthorized(AuthReason::NoVerificationMethod));
-    }
-
-    let mut verified = false;
-    for key in &state.config.nest_verifying_keys {
-        if matches!(key, ParsedVerifyingKey::P256(_))
-            && key.verify(signing_input.as_bytes(), &sig_bytes).is_ok()
-        {
-            verified = true;
-            break;
-        }
-    }
-
-    if !verified {
-        return Err(AppError::Unauthorized(AuthReason::BadSignature));
-    }
-
-    Ok(iss.to_string())
-}
 
 pub async fn verify_service_jwt(
     state: &AppState,
@@ -848,7 +776,8 @@ pub async fn verify_service_jwt(
         .map_err(AppError::Unauthorized)?;
 
     // 9. Enforce single-use JTI replay protection
-    let expires_at = DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(Utc::now);
+    let expires_at = DateTime::from_timestamp(claims.exp, 0)
+        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
     let fresh = db::consume_jti_nonce(&state.db, &jti, &claims.iss, &claims.aud, expires_at)
         .await
         .map_err(AppError::Database)?;
@@ -881,12 +810,9 @@ pub async fn authenticate(
         .ok_or(AppError::Unauthorized(AuthReason::InvalidHeader))?;
 
     let path = request.uri().path();
-    let expected_lxm = if path == "/internal/projections" {
-        Some("blue.catbird.circle.syncProjection")
-    } else {
-        path.strip_prefix("/xrpc/")
-            .map(|s| s.trim_start_matches('/'))
-    };
+    let expected_lxm = path
+        .strip_prefix("/xrpc/")
+        .map(|s| s.trim_start_matches('/'));
     let user = verify_service_jwt(&state, token, &state.config.service_did, expected_lxm).await?;
 
     request.extensions_mut().insert(user);

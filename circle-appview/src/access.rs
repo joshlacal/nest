@@ -5,8 +5,11 @@ use crate::config::AppState;
 use crate::error::{AppError, AuthReason};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use catbird_atproto::generated::blue_catbird::circle::CircleSummary;
+use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -36,7 +39,6 @@ impl CredentialStore {
         }
 
         let mut lock = self.values.write().await;
-        // Prune expired credentials under write lock
         let now = Utc::now();
         lock.retain(|_, v| v.expires_at > now);
 
@@ -59,7 +61,6 @@ impl CredentialStore {
             }
         }
 
-        // If expired, prune it under write lock
         let mut lock = self.values.write().await;
         if let Some(cred) = lock.get(space) {
             if cred.expires_at <= now {
@@ -161,28 +162,25 @@ pub fn resolve_space_host_endpoint(
     }
 
     let expected_full_id = format!("{authority_did}#atproto_space_host");
-    let expected_short_id = "#atproto_space_host";
-
-    // 1. Try exact #atproto_space_host first
-    for svc in &doc.service {
-        if (svc.id == expected_short_id || svc.id == expected_full_id)
-            && !svc.service_endpoint.is_empty()
+    for service in &doc.service {
+        if service.r#type == "AtprotoSpaceHost"
+            && (service.id == "#atproto_space_host" || service.id == expected_full_id)
         {
-            return Ok((svc.service_endpoint.clone(), expected_full_id));
+            return Ok((service.service_endpoint.clone(), service.id.clone()));
         }
     }
 
-    // 2. Fallback to exact #atproto_pds
-    let pds_full_id = format!("{authority_did}#atproto_pds");
-    let pds_short_id = "#atproto_pds";
-    for svc in &doc.service {
-        if (svc.id == pds_short_id || svc.id == pds_full_id) && !svc.service_endpoint.is_empty() {
-            return Ok((svc.service_endpoint.clone(), pds_full_id));
+    let expected_atproto_pds = format!("{authority_did}#atproto_pds");
+    for service in &doc.service {
+        if service.r#type == "AtprotoPersonalDataServer"
+            && (service.id == "#atproto_pds" || service.id == expected_atproto_pds)
+        {
+            return Ok((service.service_endpoint.clone(), service.id.clone()));
         }
     }
-
-    Err(AppError::InvalidRequest(
-        "No #atproto_space_host or #atproto_pds service found in authority DID document".into(),
+    Err(AppError::NotFound(
+        "Authority DID document does not declare an #atproto_space_host or #atproto_pds service"
+            .into(),
     ))
 }
 
@@ -193,19 +191,36 @@ pub fn resolve_pds_endpoint(
     if doc.id != author_did {
         return Err(AppError::Unauthorized(AuthReason::IdMismatch));
     }
-
-    let pds_full_id = format!("{author_did}#atproto_pds");
-    let pds_short_id = "#atproto_pds";
-    for svc in &doc.service {
-        if (svc.id == pds_short_id || svc.id == pds_full_id)
-            && svc.r#type == "AtprotoPersonalDataServer"
-            && !svc.service_endpoint.is_empty()
+    let expected_full_id = format!("{author_did}#atproto_pds");
+    for service in &doc.service {
+        if service.r#type == "AtprotoPersonalDataServer"
+            && (service.id == "#atproto_pds" || service.id == expected_full_id)
         {
-            return Ok((svc.service_endpoint.clone(), pds_full_id));
+            return Ok((service.service_endpoint.clone(), service.id.clone()));
         }
     }
-    Err(AppError::InvalidRequest(
-        "No #atproto_pds service found in author DID document".into(),
+
+    Err(AppError::NotFound(
+        "DID document does not declare an AtprotoPersonalDataServer (#atproto_pds) service".into(),
+    ))
+}
+
+pub fn resolve_circles_appview_endpoint(
+    doc: &DidDocument,
+    appview_did: &str,
+) -> Result<(String, String), AppError> {
+    if doc.id != appview_did {
+        return Err(AppError::Unauthorized(AuthReason::IdMismatch));
+    }
+    let expected_full_id = format!("{appview_did}#atproto_circles");
+    for service in &doc.service {
+        if service.id == "#atproto_circles" || service.id == expected_full_id {
+            return Ok((service.service_endpoint.clone(), service.id.clone()));
+        }
+    }
+
+    Err(AppError::NotFound(
+        "AppView DID document does not declare an #atproto_circles service".into(),
     ))
 }
 
@@ -218,91 +233,54 @@ pub fn parse_and_validate_delegation_token(
 ) -> Result<DelegationTokenClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(AppError::InvalidRequest(
-            "Invalid delegation token format".into(),
-        ));
+        return Err(AppError::Unauthorized(AuthReason::InvalidJwtFormat));
     }
 
     let header_bytes = URL_SAFE_NO_PAD
         .decode(parts[0])
-        .map_err(|_| AppError::InvalidRequest("Invalid delegation token header encoding".into()))?;
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderEncoding))?;
     let header: JwtHeader = serde_json::from_slice(&header_bytes)
-        .map_err(|_| AppError::InvalidRequest("Invalid delegation token header JSON".into()))?;
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
 
-    match &header.typ {
-        Some(t) if t == "atproto-delegation+jwt" || t == "JWT" => {}
-        _ => return Err(AppError::Unauthorized(AuthReason::InvalidTyp)),
+    if header.typ.as_deref() != Some("atproto-delegation-token+jwt") {
+        return Err(AppError::Unauthorized(AuthReason::InvalidTyp));
     }
 
-    if header.alg != "ES256" && header.alg != "ES256K" {
-        return Err(AppError::Unauthorized(AuthReason::UnsupportedAlg));
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsEncoding))?;
+    let claims: DelegationTokenClaims = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
+
+    if claims.iss != expected_user_did {
+        return Err(AppError::Unauthorized(AuthReason::ControllerMismatch));
     }
-
-    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| {
-        AppError::InvalidRequest("Invalid delegation token payload encoding".into())
-    })?;
-    let claims: serde_json::Value = serde_json::from_slice(&claims_bytes)
-        .map_err(|_| AppError::InvalidRequest("Invalid delegation token claims JSON".into()))?;
-
-    let iss = claims
-        .get("iss")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::InvalidRequest("Missing iss in delegation token claims".into()))?;
-    if iss != expected_user_did {
-        return Err(AppError::Forbidden(
-            "Delegation token issuer does not match authenticated user".into(),
-        ));
-    }
-
-    let sub = claims
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::InvalidRequest("Missing sub in delegation token claims".into()))?;
-    if sub != expected_space_uri {
+    if claims.sub != expected_space_uri {
         return Err(AppError::InvalidRequest(
-            "Delegation token subject does not match requested space".into(),
+            "Delegation token subject does not match requested Space URI".into(),
         ));
     }
-
-    let aud = claims
-        .get("aud")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::AudienceMismatch))?;
-
-    if aud != expected_audience {
+    if claims.aud != expected_audience {
         return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
     }
-    let exp = claims
-        .get("exp")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::MissingExp))?;
+
     let now = Utc::now().timestamp();
-    if exp <= now {
+    if claims.exp <= now {
         return Err(AppError::Unauthorized(AuthReason::Expired));
     }
-
-    let iat = claims
-        .get("iat")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::MissingIat))?;
-    if iat > now + 300 {
+    if claims.iat > now + 300 {
         return Err(AppError::Unauthorized(AuthReason::FutureIat));
     }
-
-    let jti = claims
-        .get("jti")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::MissingJti))?;
-    if jti.is_empty() {
-        return Err(AppError::Unauthorized(AuthReason::MissingJti));
+    if claims.jti.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Empty jti in delegation token claims".into(),
+        ));
     }
 
-    // Verify signature using user's DID document
     let vm = select_verification_method(user_doc, expected_user_did, header.kid.as_deref())
         .map_err(AppError::Unauthorized)?;
     let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
 
-    // Verify algorithm matches key curve
     match (&key, header.alg.as_str()) {
         (ParsedVerifyingKey::P256(_), "ES256") => {}
         (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
@@ -317,274 +295,319 @@ pub fn parse_and_validate_delegation_token(
     key.verify(signing_input.as_bytes(), &sig_bytes)
         .map_err(|_| AppError::Unauthorized(AuthReason::BadSignature))?;
 
-    Ok(DelegationTokenClaims {
-        iss: iss.to_string(),
-        sub: sub.to_string(),
-        aud: aud.to_string(),
-        exp,
-        iat,
-        jti: jti.to_string(),
-    })
+    Ok(claims)
 }
 
-pub async fn activate_space(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAccessOutcome {
+    Authorized,
+    DeniedNotMember,
+    IndeterminateDenied,
+}
+
+/// Verify service-auth subject is in the cached member list for the target Circle,
+/// revalidating against the owner's PDS on cache miss, stale cache, or cached denial.
+/// Returns explicit MemberAccessOutcome to distinguish authorized, removed, and indeterminate outcomes.
+pub async fn verify_member_access(
+    state: &AppState,
+    space_uri: &str,
+    user_did: &str,
+) -> Result<MemberAccessOutcome, AppError> {
+    // 1. Check if the circle exists and is not deleted
+    let space_row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
+        "SELECT deleted_at FROM circles WHERE space_uri = $1",
+    )
+    .bind(space_uri)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    if let Some((Some(_),)) = space_row {
+        return Err(AppError::NotFound("Circle deleted".into()));
+    }
+
+    // 2. Check cache freshness metadata (TTL: 300 seconds)
+    let cache_meta: Option<(DateTime<Utc>, i32)> = sqlx::query_as(
+        "SELECT last_refreshed_at, member_count FROM circle_member_cache_meta WHERE space_uri = $1",
+    )
+    .bind(space_uri)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    let now = Utc::now();
+    let is_fresh = cache_meta.as_ref().is_some_and(|(refreshed_at, _)| {
+        now.signed_duration_since(*refreshed_at).num_seconds() < 300
+    });
+
+    if is_fresh {
+        let is_cached: Option<(String,)> = sqlx::query_as(
+            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+        )
+        .bind(space_uri)
+        .bind(user_did)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::Database)?;
+
+        if is_cached.is_some() {
+            return Ok(MemberAccessOutcome::Authorized);
+        }
+        // Cached denial or miss: revalidate against PDS
+    }
+
+    // Refresh member cache from owner's PDS
+    match refresh_member_cache(state, space_uri).await {
+        Ok(members) => {
+            if members.iter().any(|m| m == user_did) {
+                Ok(MemberAccessOutcome::Authorized)
+            } else {
+                Ok(MemberAccessOutcome::DeniedNotMember)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Member cache refresh failed, denying access as indeterminate");
+            Ok(MemberAccessOutcome::IndeterminateDenied)
+        }
+    }
+}
+
+/// Verify service-auth subject is in the cached member list for the target Circle,
+/// revalidating against the owner's PDS on cache miss, stale cache, or cached denial.
+/// An unreadable member list MUST deny — never default-allow, never serve from unvalidated cache.
+pub async fn check_member_access(
+    state: &AppState,
+    space_uri: &str,
+    user_did: &str,
+) -> Result<(), AppError> {
+    match verify_member_access(state, space_uri, user_did).await? {
+        MemberAccessOutcome::Authorized => Ok(()),
+        MemberAccessOutcome::DeniedNotMember => Err(AppError::AccessRemoved(
+            "Not authorized: user is not on the Circle member list".into(),
+        )),
+        MemberAccessOutcome::IndeterminateDenied => Err(AppError::Forbidden(
+            "Unable to establish membership: member list unreadable from upstream".into(),
+        )),
+    }
+}
+
+/// Revalidates any candidate spaces for a user where the member cache is stale (> 300s).
+/// For each stale space, attempts to refresh the member cache from the owner's PDS.
+/// Unreadable spaces remain stale and thus excluded by the freshness gate (fail-closed).
+pub async fn revalidate_stale_member_spaces(
     state: &AppState,
     user_did: &str,
-    space: &str,
-    delegation_token: &str,
-    client_attestation: &str,
-) -> Result<DateTime<Utc>, AppError> {
-    if client_attestation.trim().is_empty() {
-        return Err(AppError::InvalidRequest(
-            "Missing or empty client attestation".into(),
-        ));
-    }
-
-    // 1. Extract authority DID from space URI
-    let authority_did = extract_authority_did(space)?;
-
-    // 2. Resolve user DID document
-    let user_doc = state
-        .did_resolver
-        .resolve(user_did)
-        .await
-        .map_err(AppError::Unauthorized)?;
-
-    // 3. Resolve authority DID document
-    let authority_doc = state
-        .did_resolver
-        .resolve(&authority_did)
-        .await
-        .map_err(AppError::Unauthorized)?;
-
-    // 4. Resolve #atproto_space_host service endpoint (with #atproto_pds fallback)
-    let (service_endpoint, service_id) =
-        resolve_space_host_endpoint(&authority_doc, &authority_did)?;
-
-    // 5. Parse and validate delegation token claims and signature
-    parse_and_validate_delegation_token(delegation_token, user_did, space, &service_id, &user_doc)?;
-
-    // Acquire per-Space async lock spanning exchange, DB check, lease insertion, and credential store insertion
-    let _space_lock = state.space_locks.acquire(space).await;
-
-    // 6. Exchange credential with Space host via DPoP
-    let (credential_jwt, dpop_key, expires_at) = state
-        .space_client
-        .exchange_credential(
-            &service_endpoint,
-            space,
-            delegation_token,
-            client_attestation,
-            &authority_did,
-            &authority_doc,
-        )
-        .await?;
-
-    // 7. Atomic transaction for lease creation: locks and verifies circle and member state
-    let mut tx = state.db.begin().await.map_err(AppError::Database)?;
-
-    // Check if Circle was deleted (tombstone)
-    let tombstone: Option<(i64,)> = sqlx::query_as(
-        "SELECT generation FROM circle_tombstones WHERE space_uri = $1 ORDER BY generation DESC LIMIT 1",
-    )
-    .bind(space)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(AppError::Database)?;
-
-    let circle_gen: Option<(i64,)> =
-        sqlx::query_as("SELECT generation FROM circles WHERE space_uri = $1 FOR UPDATE")
-            .bind(space)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-
-    if let Some((t_gen,)) = tombstone {
-        if let Some((c_gen,)) = circle_gen {
-            if t_gen >= c_gen {
-                return Err(AppError::Forbidden("Circle is deleted".into()));
-            }
-        } else {
-            return Err(AppError::Forbidden("Circle is deleted".into()));
-        }
-    }
-    // Check member status
-    let member_row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT status, generation FROM circle_members WHERE space_uri = $1 AND member_did = $2 FOR UPDATE",
-    )
-    .bind(space)
-    .bind(user_did)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(AppError::Database)?;
-
-    match member_row {
-        Some((status, _gen)) => {
-            if status == "removed" {
-                return Err(AppError::Forbidden(
-                    "Member has been removed from Circle".into(),
-                ));
-            }
-        }
-        None => {
-            if user_did == authority_did {
-                sqlx::query(
-                    r#"
-                    INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
-                    VALUES ($1, $2, 'Circle', now(), 0)
-                    ON CONFLICT (space_uri) DO NOTHING
-                    "#,
-                )
-                .bind(space)
-                .bind(&authority_did)
-                .execute(&mut *tx)
-                .await
-                .map_err(AppError::Database)?;
-
-                sqlx::query(
-                    r#"
-                    INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at)
-                    VALUES ($1, $2, 'active', 0, now())
-                    ON CONFLICT (space_uri, member_did) DO NOTHING
-                    "#,
-                )
-                .bind(space)
-                .bind(user_did)
-                .execute(&mut *tx)
-                .await
-                .map_err(AppError::Database)?;
-            } else {
-                let circle_exists: Option<(String,)> =
-                    sqlx::query_as("SELECT space_uri FROM circles WHERE space_uri = $1")
-                        .bind(space)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(AppError::Database)?;
-
-                if circle_exists.is_some() {
-                    return Err(AppError::Forbidden(
-                        "User is not an active member of this Circle".into(),
-                    ));
-                }
-
-                // Initial circle & active member
-                sqlx::query(
-                    r#"
-                    INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation)
-                    VALUES ($1, $2, 'Circle', now(), 0)
-                    ON CONFLICT (space_uri) DO NOTHING
-                    "#,
-                )
-                .bind(space)
-                .bind(&authority_did)
-                .execute(&mut *tx)
-                .await
-                .map_err(AppError::Database)?;
-
-                sqlx::query(
-                    r#"
-                    INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at)
-                    VALUES ($1, $2, 'active', 0, now())
-                    ON CONFLICT (space_uri, member_did) DO NOTHING
-                    "#,
-                )
-                .bind(space)
-                .bind(user_did)
-                .execute(&mut *tx)
-                .await
-                .map_err(AppError::Database)?;
-            }
-        }
-    }
-
-    // Persist access lease with GREATEST monotonic expiry
-    sqlx::query(
+) -> Result<(), AppError> {
+    let stale_spaces: Vec<(String,)> = sqlx::query_as(
         r#"
-        INSERT INTO access_leases (space_uri, member_did, expires_at)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET expires_at = GREATEST(access_leases.expires_at, EXCLUDED.expires_at)
+        SELECT DISTINCT c.space_uri
+        FROM circles c
+        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1
+        LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
+        WHERE c.deleted_at IS NULL
+          AND (c.authority_did = $1 OR m.member_did IS NOT NULL)
+          AND (meta.last_refreshed_at IS NULL OR meta.last_refreshed_at <= now() - INTERVAL '300 seconds')
         "#,
     )
-    .bind(space)
     .bind(user_did)
-    .bind(expires_at)
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    for (space_uri,) in stale_spaces {
+        let _ = refresh_member_cache(state, &space_uri).await;
+    }
+
+    Ok(())
+}
+
+/// Refreshes the member list cache by calling com.atproto.simplespace.listMembers on the owner's PDS.
+pub async fn refresh_member_cache(
+    state: &AppState,
+    space_uri: &str,
+) -> Result<Vec<String>, AppError> {
+    let member_dids = state
+        .space_client
+        .member_dids(space_uri)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "Failed to fetch member DIDs from PDS");
+            AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}"))
+        })?;
+
+    let mut tx = state.db.begin().await.map_err(AppError::Database)?;
+
+    sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1")
+        .bind(space_uri)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+
+    for member_did in &member_dids {
+        sqlx::query(
+            r#"
+            INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (space_uri, member_did) DO UPDATE SET cached_at = now()
+            "#,
+        )
+        .bind(space_uri)
+        .bind(member_did)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count)
+        VALUES ($1, now(), $2)
+        ON CONFLICT (space_uri) DO UPDATE
+        SET last_refreshed_at = now(), member_count = EXCLUDED.member_count
+        "#,
+    )
+    .bind(space_uri)
+    .bind(member_dids.len() as i32)
     .execute(&mut *tx)
     .await
     .map_err(AppError::Database)?;
 
     tx.commit().await.map_err(AppError::Database)?;
 
-    // 8. Verify tombstone does not exist post-commit before inserting into in-memory store
-    let post_tombstone: Option<(i64,)> = sqlx::query_as(
-        "SELECT generation FROM circle_tombstones WHERE space_uri = $1 ORDER BY generation DESC LIMIT 1",
-    )
-    .bind(space)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::Database)?;
-
-    let can_insert = match post_tombstone {
-        None => true,
-        Some((t_gen,)) => match circle_gen {
-            Some((c_gen,)) => c_gen > t_gen,
-            None => false,
-        },
-    };
-
-    if can_insert {
-        let active_cred = ActiveSpaceCredential {
-            token: credential_jwt,
-            dpop_key,
-            expires_at,
-        };
-        state
-            .credential_store
-            .insert(space.to_string(), active_cred)
-            .await;
-    }
-    Ok(expires_at)
+    Ok(member_dids)
 }
 
-pub async fn check_active_lease(
-    pool: &sqlx::PgPool,
+pub async fn get_cached_member_count(
+    pool: &PgPool,
     space_uri: &str,
-    user_did: &str,
-) -> Result<(), AppError> {
-    let circle_row: Option<(
-        Option<DateTime<Utc>>,
-        Option<String>,
-        Option<DateTime<Utc>>,
-    )> = sqlx::query_as(
-        r#"
-        SELECT
-            c.deleted_at,
-            m.status,
-            a.expires_at
-        FROM circles c
-        LEFT JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $2
-        LEFT JOIN access_leases a ON a.space_uri = c.space_uri AND a.member_did = $2
-        WHERE c.space_uri = $1
-        "#,
+) -> Result<Option<i64>, AppError> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT member_count FROM circle_member_cache_meta WHERE space_uri = $1",
     )
     .bind(space_uri)
-    .bind(user_did)
     .fetch_optional(pool)
     .await
     .map_err(AppError::Database)?;
 
-    match circle_row {
-        None => Err(AppError::NotFound("Space not found".into())),
-        Some((Some(_), _, _)) => Err(AppError::NotFound("Space deleted".into())),
-        Some((None, member_status, expires_at)) => {
-            let is_active = member_status.as_deref() == Some("active");
-            let has_lease = expires_at.is_some_and(|exp| exp > Utc::now());
-            if !is_active || !has_lease {
-                return Err(AppError::AccessRemoved(
-                    "No active access lease for this Circle".into(),
-                ));
-            }
-            Ok(())
-        }
+    Ok(row.map(|(count,)| count as i64))
+}
+
+/// Activates a Circle by verifying Space on PDS and returning defs#circleSummary.
+pub async fn activate_circle(
+    state: &AppState,
+    user_did: &str,
+    space_uri: &str,
+) -> Result<CircleSummary, AppError> {
+    let authority_did = extract_authority_did(space_uri)?;
+
+    // 1. Independent verification via get_space on the owner's PDS
+    let space_config = state
+        .space_client
+        .get_space(space_uri)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "get_space failed on PDS");
+            AppError::NotFound(format!("Space not found or upstream unavailable: {e}"))
+        })?;
+
+    // Verify appAccess names this AppView's client_id
+    let expected_client_id = &state.oauth_service.client_id;
+    if !space_config.app_access.iter().any(|c| c == expected_client_id) {
+        return Err(AppError::Forbidden(
+            "Space appAccess does not name this Circle AppView client_id".into(),
+        ));
     }
+
+    // 2. Refresh member list from PDS and verify caller is authorized
+    let members = refresh_member_cache(state, space_uri).await?;
+    if !members.iter().any(|m| m == user_did) && user_did != authority_did {
+        return Err(AppError::Forbidden(
+            "Caller is not a member or authority of this Space".into(),
+        ));
+    }
+
+    // 3. Sync Space repos to discover metadata
+    let sync_engine = crate::sync::SyncEngine::new(state);
+    let _ = sync_engine.sync_repo(space_uri, &authority_did).await;
+    // Fetch metadata record from circle_records
+    let meta_record: Option<(serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT record_json, created_at
+        FROM circle_records
+        WHERE space_uri = $1
+          AND author_did = $2
+          AND collection = 'blue.catbird.circle.metadata'
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(space_uri)
+    .bind(&authority_did)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    let (circle_id, display_name, created_at) = match meta_record {
+        Some((val, created_at)) => {
+            let circle_id = val
+                .get("circleId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::InvalidRequest("Missing circleId in metadata record".into()))?
+                .to_string();
+            let name = val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Circle")
+                .to_string();
+            (circle_id, name, created_at)
+        }
+        None => {
+            return Err(AppError::InvalidRequest(
+                "Space is not eligible: blue.catbird.circle.metadata record is absent".into(),
+            ));
+        }
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at)
+        VALUES ($1, $2, $3, $4, $5, NULL)
+        ON CONFLICT (space_uri) DO UPDATE
+        SET circle_id = EXCLUDED.circle_id,
+            authority_did = EXCLUDED.authority_did,
+            display_name = EXCLUDED.display_name,
+            deleted_at = NULL
+        "#,
+    )
+    .bind(space_uri)
+    .bind(&circle_id)
+    .bind(&authority_did)
+    .bind(&display_name)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    let circle_tid = catbird_atproto::jacquard_common::types::string::Tid::new(
+        SmolStr::new(&circle_id),
+    ).map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
+
+    let space_ref = catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new(
+        SmolStr::new(space_uri),
+    ).map_err(|e| AppError::Internal(format!("Invalid space URI: {e}")))?;
+
+    let owner_did = catbird_atproto::jacquard_common::types::string::Did::new(
+        SmolStr::new(&authority_did),
+    ).map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
+
+    Ok(CircleSummary {
+        circle_id: circle_tid,
+        uri: space_ref,
+        name: SmolStr::new(&display_name),
+        owner: owner_did,
+        member_count: Some(members.len() as i64),
+        muted: Some(false),
+        extra_data: None,
+    })
 }

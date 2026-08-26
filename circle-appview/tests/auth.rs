@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
-pub const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
+pub const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 pub const ALICE_DID: &str = "did:plc:alice-test-circle";
 
 struct TestSetup {
@@ -53,12 +53,11 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        appview_base_url: "http://127.0.0.1:3002".into(),
+        oauth_key_id: None,
+        oauth_signing_key_path: None,
+        oauth_signing_key_hex: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
     };
@@ -968,12 +967,11 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        appview_base_url: "http://127.0.0.1:3002".into(),
+        oauth_key_id: None,
+        oauth_signing_key_path: None,
+        oauth_signing_key_hex: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
     };
@@ -1027,12 +1025,11 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             plc_directory_url: "https://plc.directory".into(),
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
-            nest_client_id: "https://nest.catbird.blue".into(),
-            nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-            nest_verifying_keys: Vec::new(),
-            nest_push_url: None,
-            nest_push_audience: None,
-            push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
         },
@@ -1078,12 +1075,11 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             plc_directory_url: "https://plc.directory".into(),
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
-            nest_client_id: "https://nest.catbird.blue".into(),
-            nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-            nest_verifying_keys: Vec::new(),
-            nest_push_url: None,
-            nest_push_audience: None,
-            push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
         },
@@ -1439,5 +1435,250 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
     assert!(
         !logs.contains(&bad_sig_token),
         "Captured logs must not contain raw auth token"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn did_document_endpoint_serves_single_atproto_circles_service_entry(pool: PgPool) {
+    use circle_appview::access::resolve_circles_appview_endpoint;
+    let setup = setup_test(pool).await;
+
+    for path in ["/.well-known/did.json", "/did.json"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = setup.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path} must return 200 OK");
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let doc: DidDocument = serde_json::from_slice(&body).expect("Must parse valid DidDocument");
+
+        assert_eq!(doc.id, "did:web:circles.catbird.blue");
+
+        // Must expose EXACTLY ONE service entry: #atproto_circles
+        assert_eq!(
+            doc.service.len(),
+            1,
+            "DID document must expose exactly one service entry"
+        );
+        let svc = &doc.service[0];
+        assert_eq!(
+            svc.id, "#atproto_circles",
+            "Service entry id must be #atproto_circles"
+        );
+        assert_eq!(
+            svc.r#type, "AtprotoCirclesAppView",
+            "Service entry type must be AtprotoCirclesAppView"
+        );
+        assert_eq!(
+            svc.service_endpoint, "http://127.0.0.1:3002",
+            "Service entry endpoint must match configured AppView base URL"
+        );
+
+        // Must expose verification method for key authentication
+        assert_eq!(
+            doc.verification_method.len(),
+            1,
+            "DID document must expose verification method"
+        );
+        assert_eq!(
+            doc.verification_method[0].r#type,
+            "JsonWebKey2020",
+            "Verification method type must be JsonWebKey2020"
+        );
+        assert_eq!(
+            doc.verification_method[0].controller,
+            "did:web:circles.catbird.blue",
+            "Verification method controller must match document DID"
+        );
+
+        // Resolution helper must succeed against the published document
+        let (endpoint, svc_id) = resolve_circles_appview_endpoint(&doc, "did:web:circles.catbird.blue")
+            .expect("resolve_circles_appview_endpoint must succeed");
+        assert_eq!(endpoint, "http://127.0.0.1:3002");
+        assert_eq!(svc_id, "#atproto_circles");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn oauth_metadata_and_jwks_endpoints_serve_consistent_identity(pool: PgPool) {
+    use circle_appview::oauth::{CIRCLE_SCOPE, JwksResponse, OAuthClientMetadata};
+    let setup = setup_test(pool).await;
+
+    // 1. client-metadata.json
+    for path in ["/oauth/client-metadata.json", "/.well-known/oauth-client-metadata.json"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = setup.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path} must return 200 OK");
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let meta: OAuthClientMetadata =
+            serde_json::from_slice(&body).expect("Must parse OAuthClientMetadata");
+
+        assert_eq!(meta.client_id, "http://127.0.0.1:3002/oauth/client-metadata.json");
+        assert_eq!(meta.client_name, "Catbird Circles AppView");
+        assert_eq!(meta.client_uri, "http://127.0.0.1:3002");
+        assert_eq!(meta.redirect_uris, vec!["http://127.0.0.1:3002/oauth/callback"]);
+        assert_eq!(meta.grant_types, vec!["authorization_code", "refresh_token"]);
+        assert_eq!(meta.response_types, vec!["code"]);
+        assert_eq!(meta.scope, CIRCLE_SCOPE);
+        assert_eq!(meta.token_endpoint_auth_method, "private_key_jwt");
+        assert_eq!(meta.token_endpoint_auth_signing_alg, "ES256");
+        assert_eq!(meta.jwks_uri, "http://127.0.0.1:3002/oauth/jwks.json");
+        assert!(meta.dpop_bound_access_tokens);
+    }
+
+    // 2. jwks.json
+    for path in ["/oauth/jwks.json", "/.well-known/jwks.json"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = setup.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path} must return 200 OK");
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let jwks: JwksResponse =
+            serde_json::from_slice(&body).expect("Must parse JwksResponse");
+
+        assert_eq!(jwks.keys.len(), 1, "JWKS must contain one public key");
+        let key = &jwks.keys[0];
+        assert_eq!(key.kty, "EC");
+        assert_eq!(key.crv, "P-256");
+        assert_eq!(key.kid, Some(setup.state.oauth_service.key_id.clone()));
+        assert!(!key.x.is_empty());
+        assert!(key.y.is_some());
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn space_authority_verifies_live_client_attestation_against_published_jwks(pool: PgPool) {
+    use circle_appview::oauth::{
+        verify_client_attestation_with_jwks, JwksResponse, OAuthClientMetadata,
+    };
+    let setup = setup_test(pool).await;
+
+    let space_host_service = "did:web:space-authority.example.com#atproto_space_host";
+    let expected_client_id = &setup.state.oauth_service.client_id;
+
+    // 1. Sign a live attestation
+    let token = setup
+        .state
+        .oauth_service
+        .sign_client_attestation(space_host_service)
+        .expect("sign_client_attestation must succeed");
+
+    // 2. Direct verification with the helper
+    let verified_claims = verify_client_attestation_with_jwks(
+        &token,
+        expected_client_id,
+        space_host_service,
+        &setup.state.oauth_service.jwks,
+    )
+    .expect("verify_client_attestation_with_jwks must succeed");
+
+    assert_eq!(&verified_claims.iss, expected_client_id);
+    assert_eq!(&verified_claims.sub, expected_client_id);
+    assert_eq!(&verified_claims.aud, space_host_service);
+    assert!(verified_claims.exp > Utc::now().timestamp());
+    assert!(verified_claims.iat <= Utc::now().timestamp());
+    assert!(!verified_claims.jti.is_empty());
+
+    // 3. Space Authority procedure over HTTP endpoints:
+    //    a) Decode token header & claims to resolve client_id
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3);
+    let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+    let header: circle_appview::auth::JwtHeader = serde_json::from_slice(&header_bytes).unwrap();
+    assert_eq!(header.typ.as_deref(), Some("atproto-client-attestation+jwt"));
+    assert_eq!(header.alg, "ES256");
+
+    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+    let claims_val: serde_json::Value = serde_json::from_slice(&claims_bytes).unwrap();
+    let client_id = claims_val["iss"].as_str().unwrap();
+    assert_eq!(client_id, expected_client_id);
+
+    //    b) Resolve client_id -> fetch client-metadata.json
+    let req_meta = Request::builder()
+        .method("GET")
+        .uri("/oauth/client-metadata.json")
+        .body(Body::empty())
+        .unwrap();
+    let resp_meta = setup.app.clone().oneshot(req_meta).await.unwrap();
+    assert_eq!(resp_meta.status(), StatusCode::OK);
+    let meta_bytes = to_bytes(resp_meta.into_body(), usize::MAX).await.unwrap();
+    let _metadata: OAuthClientMetadata = serde_json::from_slice(&meta_bytes).unwrap();
+
+    //    c) Fetch JWKS from metadata.jwks_uri
+    let req_jwks = Request::builder()
+        .method("GET")
+        .uri("/oauth/jwks.json")
+        .body(Body::empty())
+        .unwrap();
+    let resp_jwks = setup.app.clone().oneshot(req_jwks).await.unwrap();
+    assert_eq!(resp_jwks.status(), StatusCode::OK);
+    let jwks_bytes = to_bytes(resp_jwks.into_body(), usize::MAX).await.unwrap();
+    let jwks: JwksResponse = serde_json::from_slice(&jwks_bytes).unwrap();
+
+    //    d) Match key by kid and verify ES256 signature
+    let kid = header.kid.as_deref().unwrap();
+    let jwk = jwks.keys.iter().find(|k| k.kid.as_deref() == Some(kid)).expect("Must find key by kid");
+    let parsed_key = circle_appview::auth::parse_public_key_jwk(jwk).unwrap();
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+    parsed_key.verify(signing_input.as_bytes(), &sig_bytes).expect("Signature verification must succeed");
+
+    // 4. Negative tests
+    // 4a. Tampered payload
+    let tampered_claims = json!({
+        "iss": "did:plc:evil",
+        "sub": "did:plc:evil",
+        "aud": space_host_service,
+        "iat": Utc::now().timestamp(),
+        "exp": Utc::now().timestamp() + 60,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    let tampered_claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&tampered_claims).unwrap().as_bytes());
+    let tampered_token = format!("{}.{}.{}", parts[0], tampered_claims_b64, parts[2]);
+    assert!(
+        verify_client_attestation_with_jwks(&tampered_token, expected_client_id, space_host_service, &jwks).is_err(),
+        "Tampered payload must be rejected"
+    );
+
+    // 4b. Wrong audience
+    assert!(
+        verify_client_attestation_with_jwks(&token, expected_client_id, "did:web:wrong-host", &jwks).is_err(),
+        "Wrong audience must be rejected"
+    );
+
+    // 4c. Wrong client_id
+    assert!(
+        verify_client_attestation_with_jwks(&token, "https://wrong.client/oauth/client-metadata.json", space_host_service, &jwks).is_err(),
+        "Wrong client_id must be rejected"
+    );
+
+    // 4d. Wrong kid
+    let wrong_kid_jwks = JwksResponse {
+        keys: vec![PublicKeyJwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: jwk.x.clone(),
+            y: jwk.y.clone(),
+            kid: Some("wrong-kid-123".into()),
+        }],
+    };
+    assert!(
+        verify_client_attestation_with_jwks(&token, expected_client_id, space_host_service, &wrong_kid_jwks).is_err(),
+        "Mismatched kid must be rejected"
     );
 }

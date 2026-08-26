@@ -63,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
-    state.circle_capability.set_state(Arc::downgrade(&state));
     tracing::info!("Connected to Redis at {}", app_config.redis.url);
 
     // Register Prometheus metrics
@@ -82,19 +81,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Start Circle retry worker when Circle is enabled
-    let (circle_shutdown_tx, circle_shutdown_rx) = tokio::sync::watch::channel(false);
-    let _circle_worker_handle = if state.config.circle.service_url.is_some() {
-        if state.push_db.is_none() {
-            anyhow::bail!("Circle is enabled (service_url is configured) but push_db (PostgreSQL) is not configured");
-        }
-        let circle_service = Arc::new(crate::services::CircleService::new(state.clone()));
-        let handle = circle_service.spawn_retry_worker(circle_shutdown_rx);
-        tracing::info!("Circle retry worker started");
-        Some(handle)
-    } else {
-        None
-    };
     // Start background task to update active sessions gauge
     let metrics_state = state.clone();
     let key_prefix = app_config.redis.key_prefix.clone();
@@ -177,14 +163,14 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(circle_shutdown_tx))
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     Ok(())
 }
 
 /// Wait for SIGTERM or CTRL+C for graceful shutdown
-async fn shutdown_signal(circle_shutdown_tx: tokio::sync::watch::Sender<bool>) {
+async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
@@ -193,7 +179,6 @@ async fn shutdown_signal(circle_shutdown_tx: tokio::sync::watch::Sender<bool>) {
         _ = ctrl_c => tracing::info!("Received CTRL+C, shutting down gracefully..."),
         _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down gracefully..."),
     }
-    let _ = circle_shutdown_tx.send(true);
 }
 
 /// Count active sessions in Redis by scanning session keys

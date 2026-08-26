@@ -1,19 +1,19 @@
 use crate::access;
+use crate::config::AppState;
 use crate::error::AppError;
-use catbird_atproto::generated::blue_catbird::circle::defs::ReportReason;
-use sqlx::PgPool;
+use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordReason;
 use uuid::Uuid;
 
 pub async fn report_record(
-    pool: &PgPool,
+    state: &AppState,
     reporter_did: &str,
     space_uri: &str,
     subject_uri: &str,
-    reason: ReportReason,
+    reason: ReportRecordReason,
     details: Option<&str>,
 ) -> Result<String, AppError> {
-    // 1. Require a live lease in the Space
-    access::check_active_lease(pool, space_uri, reporter_did).await?;
+    // 1. Require verified member access in the Space
+    access::check_member_access(state, space_uri, reporter_did).await?;
 
     // 2. Validate details length (max 500 chars in database constraint)
     if let Some(d) = details {
@@ -51,9 +51,10 @@ pub async fn report_record(
     .bind(&standard_aturi)
     .bind(&space_based_uri)
     .bind(space_uri)
-    .fetch_optional(pool)
+    .fetch_optional(&state.db)
     .await
     .map_err(AppError::Database)?;
+
     let verified_subject_uri = match subject_row {
         Some((uri,)) => uri,
         None => {
@@ -64,10 +65,13 @@ pub async fn report_record(
     };
 
     let report_id = Uuid::new_v4();
-    let reason_str = match reason {
-        ReportReason::Spam => "spam",
-        ReportReason::Abuse => "abuse",
-        ReportReason::Other => "other",
+    let reason_str = match &reason {
+        ReportRecordReason::Spam => "spam",
+        ReportRecordReason::Abuse => "abuse",
+        ReportRecordReason::Other => "other",
+        ReportRecordReason::UnknownValue(val) => {
+            return Err(AppError::InvalidRequest(format!("Unknown report reason: {val}")));
+        }
     };
 
     sqlx::query(
@@ -82,7 +86,7 @@ pub async fn report_record(
     .bind(&verified_subject_uri)
     .bind(reason_str)
     .bind(details)
-    .execute(pool)
+    .execute(&state.db)
     .await
     .map_err(AppError::Database)?;
 

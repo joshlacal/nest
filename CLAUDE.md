@@ -70,6 +70,10 @@ Client-facing endpoints in `handlers/push.rs`: `register_push`,
 `unregister_push`, `get_preferences`, `put_preferences_v2`,
 `list_activity_subscriptions`, `put_activity_subscription`.
 
+
+### Circles (nest holds NO Circle role)
+
+Nest holds **zero Circle role**. Nest does not create Circles, track membership, hold Circle projections/leases/outbox, mint client attestations for the AppView, or bridge push notifications. The Circle AppView (`nest/circle-appview`) is a standalone service with its own OAuth confidential client identity. Nest is solely a confidential OAuth gateway and generic `/*lexicon` proxy; its only relevance to Circles is that the generic proxy forwards client-supplied `atproto-proxy` headers upstream to route requests to the standalone Circle AppView (`did:web:circles.catbird.blue#atproto_circles`).
 ### Source Structure
 
 ```

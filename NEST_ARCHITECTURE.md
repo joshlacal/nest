@@ -72,3 +72,13 @@ graph LR
 
 *   **Client vs Gateway:** The iOS client is "dumb". It does not hold the Refresh Token. It holds a session identifier for the Gateway.
 *   **DPoP:** Handled entirely by Nest.
+
+## 6. Circles (Nest Holds NO Circle Role)
+
+Nest holds **zero Circle role**. Nest is solely a confidential OAuth gateway and generic `/*lexicon` proxy:
+*   Nest **does not** create Circles, track membership, or coordinate Space administration (Space operations are direct between the client and the user's PDS via `com.atproto.simplespace.*` and `com.atproto.space.*`).
+*   Nest **does not** hold Circle projections, access leases, or an outbox.
+*   Nest **does not** mint client attestations for the AppView (the standalone Circle AppView is its own OAuth confidential client and mints its own attestations).
+*   Nest **does not** bridge push notifications for Circles (Circle push is content-free and delivered directly by the AppView).
+
+Nest's only relevance to Circles is that its generic `/*lexicon` proxy forwards a client-supplied `atproto-proxy` header upstream, which is how clients route reads to the standalone Circle AppView (`did:web:circles.catbird.blue#atproto_circles`).

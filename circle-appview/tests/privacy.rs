@@ -5,7 +5,7 @@ use axum::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::blue_catbird::circle::defs::NotificationReason;
+use catbird_atproto::generated::blue_catbird::circle::NotificationReason;
 use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
 use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordOutput;
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circle";
+const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const ALICE_DID: &str = "did:plc:alice-privacy-owner";
 const BOB_DID: &str = "did:plc:bob-privacy-member";
 const DAVE_DID: &str = "did:plc:dave-privacy-unauthorized";
@@ -135,13 +135,13 @@ fn mint_jwt(did: &str, lxm: &str, signing_key: &p256::ecdsa::SigningKey) -> Stri
     format!("{signing_input}.{sig_b64}")
 }
 
-async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, duration: Duration) {
+async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, _duration: Duration) {
     sqlx::query(
         r#"
-        INSERT INTO circle_members (space_uri, member_did, status, updated_at)
-        VALUES ($1, $2, 'active', now())
+        INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
+        VALUES ($1, $2, now())
         ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET status = 'active', updated_at = now()
+        DO UPDATE SET cached_at = now()
         "#,
     )
     .bind(space_uri)
@@ -152,15 +152,13 @@ async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, d
 
     sqlx::query(
         r#"
-        INSERT INTO access_leases (space_uri, member_did, expires_at)
-        VALUES ($1, $2, now() + $3)
-        ON CONFLICT (space_uri, member_did)
-        DO UPDATE SET expires_at = now() + $3
+        INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count)
+        VALUES ($1, now(), 1)
+        ON CONFLICT (space_uri)
+        DO UPDATE SET last_refreshed_at = now()
         "#,
     )
     .bind(space_uri)
-    .bind(member_did)
-    .bind(duration)
     .execute(pool)
     .await
     .unwrap();
@@ -183,12 +181,11 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
-        nest_client_id: "https://nest.catbird.blue".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: Vec::new(),
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circle"),
+        appview_base_url: "http://127.0.0.1:3002".into(),
+        oauth_key_id: None,
+        oauth_signing_key_path: None,
+        oauth_signing_key_hex: None,
+        push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
     };
@@ -202,6 +199,12 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         config.public_appview_url.clone(),
         reqwest::Client::new(),
     ));
+    let oauth_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
+        config.appview_base_url.clone(),
+        oauth_signing_key,
+        None,
+    ));
 
     let state = AppState {
         config: Arc::new(config),
@@ -212,6 +215,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         space_client,
         space_locks,
         profile_hydrator: profile_hydrator.clone(),
+        oauth_service,
         push_client: None,
     };
     register_did_doc(&state.did_resolver, ALICE_DID, &alice_key, Some("https://pds.alice.test"));
@@ -285,8 +289,8 @@ async fn unauthorized_user_cannot_fetch_media_or_notifications(pool: PgPool) {
     // Create private Circle owned by Alice with Bob as member
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Alice Private Circle', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Alice Private Circle', now())
         "#,
     )
     .bind(SPACE_1)
@@ -419,8 +423,8 @@ async fn report_requires_same_space_subject_and_stays_private(pool: PgPool) {
     // Create SPACE_1 and SPACE_2
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Space 1', now()), ($3, $2, 'Space 2', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Space 1', now()), ($3, '3l7privacybbb', $2, 'Space 2', now())
         "#,
     )
     .bind(SPACE_1)
@@ -530,8 +534,8 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
     // Create SPACE_1 with Alice and Bob
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Purge Scope Space', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Purge Scope Space', now())
         "#,
     )
     .bind(SPACE_1)
@@ -625,8 +629,8 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
     // 1. Remove Bob from SPACE_1
     remove_member(&pool, SPACE_1, BOB_DID).await.unwrap();
 
-    // Verify Bob's lease is deleted
-    let bob_lease: Option<(String,)> = sqlx::query_as("SELECT member_did FROM access_leases WHERE space_uri = $1 AND member_did = $2")
+    // Verify Bob's cache is deleted
+    let bob_lease: Option<(String,)> = sqlx::query_as("SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2")
         .bind(SPACE_1)
         .bind(BOB_DID)
         .fetch_optional(&pool)
@@ -691,8 +695,8 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
 
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Media Space', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Media Space', now())
         "#,
     )
     .bind(SPACE_1)
@@ -795,8 +799,8 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
 
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Media Res Space', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Media Res Space', now())
         "#,
     )
     .bind(SPACE_1)
@@ -862,7 +866,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
         .unwrap();
 
     let resp1 = app.clone().oneshot(req1).await.unwrap();
-    assert_eq!(resp1.status(), StatusCode::BAD_REQUEST, "Wrong service ID must be rejected");
+    assert_eq!(resp1.status(), StatusCode::NOT_FOUND, "Wrong service ID must be rejected");
 
     // 2. Author DID doc with suffix ID ("#fake#atproto_pds")
     let suffix_did = "did:plc:author-suffix-id";
@@ -891,7 +895,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
         .unwrap();
 
     let resp2 = app.clone().oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST, "Suffix service ID must be rejected");
+    assert_eq!(resp2.status(), StatusCode::NOT_FOUND, "Suffix service ID must be rejected");
 }
 
 #[derive(Clone)]
@@ -932,8 +936,8 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
     // 1. Seed Space 1 and Space 2
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Logged Space 1', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Logged Space 1', now())
         "#,
     )
     .bind(SPACE_1)
@@ -944,8 +948,8 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
 
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Logged Space 2', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacybbb', $2, 'Logged Space 2', now())
         "#,
     )
     .bind(SPACE_2)
@@ -1218,8 +1222,8 @@ async fn notification_hydration_deduplicates_actor_dids(pool: PgPool) {
 
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Dedupe Space', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Dedupe Space', now())
         "#,
     )
     .bind(SPACE_1)
@@ -1267,15 +1271,15 @@ async fn notification_hydration_deduplicates_actor_dids(pool: PgPool) {
 }
 
 #[tokio::test]
-async fn push_client_logs_only_static_content_on_nest_failure() {
-    use circle_appview::push::NestPushClient;
+async fn push_client_logs_only_static_content_on_push_failure() {
+    use circle_appview::push::CirclePushClient;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-    // Nest returns 502 (delivery failed). The AppView client must surface the
+    // Push service returns 502 (delivery failed). The AppView client must surface the
     // error and emit only static log lines — never the recipient DID.
     Mock::given(method("POST"))
         .and(path("/internal/circle/push"))
@@ -1293,11 +1297,11 @@ async fn push_client_logs_only_static_content_on_nest_failure() {
             .finish(),
     );
 
-    let client = NestPushClient::new(
-        format!("{}/internal/circle/push", mock_server.uri()),
+    let client = CirclePushClient::new(
+        Some(format!("{}/internal/circle/push", mock_server.uri())),
         "did:web:circles.catbird.blue".to_string(),
-        "did:web:circles.catbird.blue#atproto_circle".to_string(),
-        "https://api.catbird.blue".to_string(),
+        "did:web:circles.catbird.blue#atproto_circles".to_string(),
+        Some("https://api.catbird.blue".to_string()),
         signing_key,
         reqwest::Client::new(),
     );
@@ -1312,24 +1316,23 @@ async fn push_client_logs_only_static_content_on_nest_failure() {
         "AppView push failure log leaked the recipient DID"
     );
     assert!(
-        output.contains("Nest push endpoint returned non-success status")
-            || output.contains("Failed to dispatch push notification trigger to Nest"),
+        output.contains("Push endpoint returned error")
+            || output.contains("Failed to dispatch push notification trigger"),
         "AppView must log a static failure message"
     );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool) {
-    use circle_appview::push::NestPushClient;
+async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
+    use circle_appview::push::CirclePushClient;
     use circle_appview::sync::SyncEngine;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
     let mock_server = MockServer::start().await;
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
     let service_did = "did:web:circles.catbird.blue";
-    let key_id = "did:web:circles.catbird.blue#atproto_circle";
+    let key_id = "did:web:circles.catbird.blue#atproto_circles";
     let audience = "https://api.catbird.blue";
 
     Mock::given(method("POST"))
@@ -1342,11 +1345,11 @@ async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool
         .mount(&mock_server)
         .await;
 
-    let push_client = Arc::new(NestPushClient::new(
-        format!("{}/internal/circle/push", mock_server.uri()),
+    let push_client = Arc::new(CirclePushClient::new(
+        Some(format!("{}/internal/circle/push", mock_server.uri())),
         service_did.to_string(),
         key_id.to_string(),
-        audience.to_string(),
+        Some(audience.to_string()),
         signing_key,
         reqwest::Client::new(),
     ));
@@ -1357,8 +1360,8 @@ async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool
     // Create space owned by Alice with Bob as active member
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Push Test Space', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7privacyaaa', $2, 'Push Test Space', now())
         "#,
     )
     .bind(SPACE_1)
@@ -1387,21 +1390,24 @@ async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool
     // Alice creates post P1
     let post_rkey = "3l7postp1aaaa";
     let post_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/{post_rkey}");
-    sqlx::query(
-        r#"
-        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
-        VALUES ($1, 'bafyreip1cid', $2, $3, 'app.bsky.feed.post', $4, $5, now())
-        "#,
-    )
-    .bind(&post_uri)
-    .bind(SPACE_1)
-    .bind(ALICE_DID)
-    .bind(post_rkey)
-    .bind(json!({
+    let post_val = json!({
         "$type": "app.bsky.feed.post",
         "text": "Alice post for reply test",
         "createdAt": "2026-08-24T12:00:00Z"
-    }))
+    });
+    let post_cid = circle_appview::commit::compute_dagcbor_cid(&post_val).unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', $5, $6, now())
+        "#,
+    )
+    .bind(&post_uri)
+    .bind(&post_cid)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(post_rkey)
+    .bind(&post_val)
     .execute(&pool)
     .await
     .unwrap();
@@ -1412,8 +1418,8 @@ async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool
         "text": "Bob reply to Alice",
         "createdAt": "2026-08-24T12:01:00Z",
         "reply": {
-            "root": { "uri": post_uri.clone(), "cid": "bafyreip1cid" },
-            "parent": { "uri": post_uri.clone(), "cid": "bafyreip1cid" }
+            "root": { "uri": post_uri.clone(), "cid": post_cid.clone() },
+            "parent": { "uri": post_uri.clone(), "cid": post_cid.clone() }
         }
     });
     let reply_cid = circle_appview::commit::compute_dagcbor_cid(&reply_value).unwrap();
@@ -1424,14 +1430,14 @@ async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool
         value: reply_value,
     };
 
-    let mut lthash = circle_appview::commit::LtHash::new();
-    lthash.add(&rec_reply.collection, &rec_reply.rkey, &rec_reply.cid);
+    let mut lthash = circle_appview::commit::LtHash::default();
+    lthash.add(&circle_appview::commit::format_lthash_element(&rec_reply.collection, &rec_reply.rkey, &rec_reply.cid));
 
     let commit_bob = circle_appview::commit::mint_signed_commit(
         SPACE_1,
         BOB_DID,
         "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
+        &lthash.state(),
         &setup.bob_key,
     );
     let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_reply]).unwrap();
@@ -1458,5 +1464,12 @@ async fn sync_mutation_dispatches_generic_push_to_nest_after_commit(pool: PgPool
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["recipient_did"], ALICE_DID);
+    assert_eq!(body["recipientDid"], ALICE_DID);
+
+    // Privacy assertions: verify payload is content-free
+    let body_str = String::from_utf8_lossy(&requests[0].body);
+    assert!(!body_str.contains("Bob reply to Alice"), "Push payload leaked post text");
+    assert!(!body_str.contains("Push Test Space"), "Push payload leaked Circle name");
+    assert!(!body_str.contains(BOB_DID), "Push payload leaked actor DID");
+    assert!(!body_str.contains(&post_uri), "Push payload leaked record URI");
 }

@@ -52,38 +52,6 @@ pub async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRes
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "redis not ready");
     }
 
-    if state.config.circle.service_url.is_some() {
-        if let Some(pool) = &state.push_db {
-            if sqlx::query("SELECT 1").execute(pool).await.is_err() {
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "circle database not ready",
-                );
-            }
-        } else {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "circle enabled but database not configured",
-            );
-        }
-
-        if !state
-            .circle_worker_alive
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "circle retry worker not ready",
-            );
-        }
-
-        if state.key_store.is_none() || state.jacquard_client.is_none() || state.auth_store.is_none() {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "circle auth infrastructure not ready",
-            );
-        }
-    }
     (axum::http::StatusCode::OK, "ready")
 }
 

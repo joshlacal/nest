@@ -1,5 +1,6 @@
 use crate::access::CredentialStore;
 use crate::auth::DidResolver;
+use crate::oauth::OAuthService;
 use crate::space_client::SpaceClient;
 use sqlx::PgPool;
 use std::env;
@@ -14,11 +15,10 @@ pub struct Config {
     pub plc_directory_url: String,
     pub public_appview_url: String,
     pub circle_media_base_url: url::Url,
-    pub nest_client_id: String,
-    pub nest_jwks_url: String,
-    pub nest_verifying_keys: Vec<crate::auth::ParsedVerifyingKey>,
-    pub nest_push_url: Option<String>,
-    pub nest_push_audience: Option<String>,
+    pub appview_base_url: String,
+    pub oauth_key_id: Option<String>,
+    pub oauth_signing_key_path: Option<String>,
+    pub oauth_signing_key_hex: Option<String>,
     pub push_key_id: String,
     pub push_signing_key_path: Option<String>,
     pub push_signing_key_hex: Option<String>,
@@ -34,44 +34,46 @@ impl Config {
         let database_url = env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_string());
         let service_did = env::var("SERVICE_DID")
-            .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circle".to_string());
+            .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circles".to_string());
         let plc_directory_url =
             env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let public_appview_url =
             env::var("PUBLIC_APPVIEW_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
         let circle_media_base_url_raw = env::var("CIRCLE_MEDIA_BASE_URL")
-            .map_err(|_| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL environment variable is required"))?;
+            .unwrap_or_else(|_| "https://media.circles.catbird.blue".to_string());
         let circle_media_base_url = url::Url::parse(&circle_media_base_url_raw)
             .map_err(|e| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must be a valid URL: {e}"))?;
         if circle_media_base_url.scheme() != "https" {
             return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must use https scheme"));
         }
-        if circle_media_base_url.host_str().is_none() {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must have a valid host"));
-        }
         if !circle_media_base_url.username().is_empty() || circle_media_base_url.password().is_some() {
             return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain userinfo"));
         }
         if circle_media_base_url.query().is_some() {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain query parameters"));
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a query component"));
         }
         if circle_media_base_url.fragment().is_some() {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a fragment"));
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a fragment component"));
         }
-        if circle_media_base_url.path() != "" && circle_media_base_url.path() != "/" {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL path must be empty or '/'"));
+        let path = circle_media_base_url.path();
+        if path != "" && path != "/" {
+            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a path component"));
         }
-        let nest_client_id = env::var("NEST_CLIENT_ID")
-            .map_err(|_| anyhow::anyhow!("NEST_CLIENT_ID environment variable is required"))?;
-        let nest_jwks_url = env::var("NEST_JWKS_URL")
-            .map_err(|_| anyhow::anyhow!("NEST_JWKS_URL environment variable is required"))?;
-        let nest_push_url = env::var("NEST_PUSH_URL")
+
+        let appview_base_url = env::var("APPVIEW_BASE_URL")
+            .or_else(|_| env::var("PUBLIC_URL"))
+            .unwrap_or_else(|_| format!("http://{host}:{port}"));
+
+        let oauth_key_id = env::var("OAUTH_KEY_ID")
             .ok()
-            .or_else(|| env::var("NEST_URL").ok().map(|u| format!("{}/internal/circle/push", u.trim_end_matches('/'))));
-        let nest_push_audience = env::var("NEST_PUSH_AUDIENCE")
+            .or_else(|| env::var("APPVIEW_KEY_ID").ok());
+        let oauth_signing_key_path = env::var("OAUTH_SIGNING_KEY_PATH")
             .ok()
-            .or_else(|| env::var("NEST_PUSH_SERVICE_DID").ok())
-            .or_else(|| Some(nest_client_id.clone()));
+            .or_else(|| env::var("APPVIEW_SIGNING_KEY_PATH").ok());
+        let oauth_signing_key_hex = env::var("OAUTH_SIGNING_KEY_HEX")
+            .ok()
+            .or_else(|| env::var("APPVIEW_SIGNING_KEY_HEX").ok());
+
         let push_key_id = env::var("PUSH_KEY_ID")
             .ok()
             .or_else(|| env::var("CIRCLE_KEY_ID").ok())
@@ -79,7 +81,7 @@ impl Config {
                 if service_did.contains('#') {
                     service_did.clone()
                 } else {
-                    format!("{service_did}#atproto_circle")
+                    format!("{service_did}#atproto_circles")
                 }
             });
         let push_signing_key_path = env::var("PUSH_SIGNING_KEY_PATH")
@@ -89,48 +91,6 @@ impl Config {
             .ok()
             .or_else(|| env::var("CIRCLE_SIGNING_KEY_HEX").ok());
 
-        // Fail-closed push configuration: if any push-related variable is
-        // supplied, the whole set must be present and the signing key must
-        // load. Otherwise push would silently degrade to "no push client" in
-        // production despite an operator believing it was configured.
-        let push_vars_present = [
-            env::var("NEST_PUSH_URL").is_ok(),
-            env::var("NEST_PUSH_AUDIENCE").is_ok(),
-            env::var("NEST_PUSH_SERVICE_DID").is_ok(),
-            env::var("PUSH_KEY_ID").is_ok(),
-            env::var("PUSH_SIGNING_KEY_PATH").is_ok(),
-            env::var("PUSH_SIGNING_KEY_HEX").is_ok(),
-            env::var("CIRCLE_KEY_ID").is_ok(),
-            env::var("CIRCLE_SIGNING_KEY_PATH").is_ok(),
-            env::var("CIRCLE_SIGNING_KEY_HEX").is_ok(),
-        ]
-        .into_iter()
-        .any(|present| present);
-        if push_vars_present {
-            if nest_push_url.is_none() {
-                return Err(anyhow::anyhow!(
-                    "NEST_PUSH_URL (or NEST_URL) is required when push configuration is provided"
-                ));
-            }
-            let has_key_source =
-                push_signing_key_path.is_some() || push_signing_key_hex.is_some();
-            if !has_key_source {
-                return Err(anyhow::anyhow!(
-                    "PUSH_SIGNING_KEY_PATH or PUSH_SIGNING_KEY_HEX is required when push is configured"
-                ));
-            }
-            if try_load_signing_key(
-                push_signing_key_path.as_deref(),
-                push_signing_key_hex.as_deref(),
-            )
-            .is_none()
-            {
-                return Err(anyhow::anyhow!(
-                    "Push signing key could not be loaded from PUSH_SIGNING_KEY_PATH/PUSH_SIGNING_KEY_HEX"
-                ));
-            }
-        }
-
         Ok(Self {
             host,
             port,
@@ -139,17 +99,17 @@ impl Config {
             plc_directory_url,
             public_appview_url,
             circle_media_base_url,
-            nest_client_id,
-            nest_jwks_url,
-            nest_verifying_keys: Vec::new(),
-            nest_push_url,
-            nest_push_audience,
+            appview_base_url,
+            oauth_key_id,
+            oauth_signing_key_path,
+            oauth_signing_key_hex,
             push_key_id,
             push_signing_key_path,
             push_signing_key_hex,
         })
     }
 }
+
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
     if s.len() % 2 != 0 {
         return Err(());
@@ -162,24 +122,22 @@ fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
 
 fn try_load_signing_key(path: Option<&str>, hex: Option<&str>) -> Option<p256::ecdsa::SigningKey> {
     if let Some(h) = hex {
-        let trimmed = h.trim();
-        if let Ok(bytes) = hex_to_bytes(trimmed) {
-            if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&bytes) {
-                return Some(k);
+        if let Ok(bytes) = hex_to_bytes(h) {
+            if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+                return Some(key);
             }
         }
     }
     if let Some(p) = path {
-        if let Ok(content) = std::fs::read(p) {
-            if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&content) {
-                return Some(k);
-            }
-            if let Ok(text) = std::str::from_utf8(&content) {
-                if let Ok(bytes) = hex_to_bytes(text.trim()) {
-                    if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&bytes) {
-                        return Some(k);
-                    }
+        if let Ok(content) = std::fs::read_to_string(p) {
+            let trimmed = content.trim();
+            if let Ok(bytes) = hex_to_bytes(trimmed) {
+                if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+                    return Some(key);
                 }
+            }
+            if let Ok(key) = trimmed.parse::<p256::ecdsa::SigningKey>() {
+                return Some(key);
             }
         }
     }
@@ -196,8 +154,10 @@ pub struct AppState {
     pub space_client: Arc<SpaceClient>,
     pub space_locks: Arc<crate::access::SpaceLockManager>,
     pub profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
-    pub push_client: Option<Arc<crate::push::NestPushClient>>,
+    pub oauth_service: Arc<OAuthService>,
+    pub push_client: Option<Arc<crate::push::CirclePushClient>>,
 }
+
 impl AppState {
     pub fn new(config: Config, db: PgPool) -> Self {
         let config = Arc::new(config);
@@ -217,28 +177,38 @@ impl AppState {
             http_client.clone(),
         ));
 
-        let push_client = if let (Some(push_url), Some(signing_key)) = (
-            &config.nest_push_url,
-            try_load_signing_key(
-                config.push_signing_key_path.as_deref(),
-                config.push_signing_key_hex.as_deref(),
-            ),
-        ) {
-            let audience = config
-                .nest_push_audience
-                .clone()
-                .unwrap_or_else(|| config.nest_client_id.clone());
-            Some(Arc::new(crate::push::NestPushClient::new(
-                push_url.clone(),
+        let oauth_signing_key = try_load_signing_key(
+            config.oauth_signing_key_path.as_deref(),
+            config.oauth_signing_key_hex.as_deref(),
+        )
+        .unwrap_or_else(|| p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+
+        let oauth_service = Arc::new(OAuthService::new(
+            config.appview_base_url.clone(),
+            oauth_signing_key,
+            config.oauth_key_id.clone(),
+        ));
+
+        space_client.set_deps(crate::space_client::SpaceClientDeps {
+            http_client: http_client.clone(),
+            did_resolver: did_resolver.clone(),
+            oauth_service: oauth_service.clone(),
+        });
+        let push_signing_key = try_load_signing_key(
+            config.push_signing_key_path.as_deref(),
+            config.push_signing_key_hex.as_deref(),
+        );
+
+        let push_client = push_signing_key.map(|key| {
+            Arc::new(crate::push::CirclePushClient::new(
+                env::var("PUSH_URL").ok(),
                 config.service_did.clone(),
                 config.push_key_id.clone(),
-                audience,
-                signing_key,
+                env::var("PUSH_AUDIENCE").ok(),
+                key,
                 http_client.clone(),
-            )))
-        } else {
-            None
-        };
+            ))
+        });
 
         Self {
             config,
@@ -249,45 +219,30 @@ impl AppState {
             space_client,
             space_locks,
             profile_hydrator,
+            oauth_service,
             push_client,
         }
     }
-
-    pub fn with_push_client(mut self, push_client: Arc<crate::push::NestPushClient>) -> Self {
-        self.push_client = Some(push_client);
-        self
-    }
-
-    pub fn set_push_client(&mut self, push_client: Option<Arc<crate::push::NestPushClient>>) {
-        self.push_client = push_client;
-    }
     pub fn with_did_resolver(config: Config, db: PgPool, did_resolver: Arc<DidResolver>) -> Self {
-        let config = Arc::new(config);
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        let credential_store = Arc::new(CredentialStore::new());
-        let space_client = Arc::new(SpaceClient::new());
-        let space_locks = Arc::new(crate::access::SpaceLockManager::new());
-        let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
-            config.public_appview_url.clone(),
-            http_client.clone(),
-        ));
-
-        Self {
-            config,
-            db,
-            http_client,
+        let mut state = Self::new(config, db);
+        state.did_resolver = did_resolver.clone();
+        state.space_client.set_deps(crate::space_client::SpaceClientDeps {
+            http_client: state.http_client.clone(),
             did_resolver,
-            credential_store,
-            space_client,
-            space_locks,
-            profile_hydrator,
-            push_client: None,
-        }
+            oauth_service: state.oauth_service.clone(),
+        });
+        state
     }
-
+    pub fn with_profile_hydrator(
+        config: Config,
+        db: PgPool,
+        did_resolver: Arc<DidResolver>,
+        profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
+    ) -> Self {
+        let mut state = Self::with_did_resolver(config, db, did_resolver);
+        state.profile_hydrator = profile_hydrator;
+        state
+    }
     pub fn with_services(
         config: Config,
         db: PgPool,
@@ -296,55 +251,49 @@ impl AppState {
         space_client: Arc<SpaceClient>,
         space_locks: Arc<crate::access::SpaceLockManager>,
     ) -> Self {
-        let config = Arc::new(config);
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-
-        let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
-            config.public_appview_url.clone(),
-            http_client.clone(),
-        ));
-
-        Self {
-            config,
-            db,
-            http_client,
-            did_resolver,
-            credential_store,
-            space_client,
-            space_locks,
-            profile_hydrator,
-            push_client: None,
-        }
+        let mut state = Self::with_did_resolver(config, db, did_resolver);
+        state.credential_store = credential_store;
+        state.space_client = space_client;
+        state.space_locks = space_locks;
+        state
     }
 
-    pub fn with_profile_hydrator(
-        config: Config,
-        db: PgPool,
-        did_resolver: Arc<DidResolver>,
-        profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
-    ) -> Self {
-        let config = Arc::new(config);
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        let credential_store = Arc::new(CredentialStore::new());
-        let space_client = Arc::new(SpaceClient::new());
-        let space_locks = Arc::new(crate::access::SpaceLockManager::new());
 
-        Self {
-            config,
-            db,
-            http_client,
-            did_resolver,
-            credential_store,
-            space_client,
-            space_locks,
-            profile_hydrator,
-            push_client: None,
+
+    pub fn with_oauth_service(mut self, oauth_service: Arc<OAuthService>) -> Self {
+        self.oauth_service = oauth_service;
+        self
+    }
+
+    pub fn did_document(&self) -> crate::auth::DidDocument {
+        let base_did = if self.config.service_did.contains('#') {
+            self.config.service_did.split('#').next().unwrap().to_string()
+        } else {
+            self.config.service_did.clone()
+        };
+        let key_id_full = format!("{base_did}#{}", self.oauth_service.key_id);
+
+        let mut verification_method = Vec::new();
+        if let Some(first_key) = self.oauth_service.jwks.keys.first() {
+            verification_method.push(crate::auth::VerificationMethod {
+                id: key_id_full,
+                r#type: "JsonWebKey2020".to_string(),
+                controller: base_did.clone(),
+                public_key_jwk: Some(first_key.clone()),
+                public_key_multibase: None,
+            });
+        }
+
+        let service = vec![crate::auth::DidService {
+            id: "#atproto_circles".to_string(),
+            r#type: "AtprotoCirclesAppView".to_string(),
+            service_endpoint: self.oauth_service.base_url.clone(),
+        }];
+
+        crate::auth::DidDocument {
+            id: base_did,
+            verification_method,
+            service,
         }
     }
 }

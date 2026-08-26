@@ -765,6 +765,105 @@ mod tests {
         let err_msg = result.unwrap_err();
         assert!(!err_msg.contains(&session_id), "Error must not leak session_id");
     }
+
+    /// Test that the generic proxy preserves and forwards client-supplied atproto-proxy header
+    #[tokio::test]
+    async fn test_generic_proxy_forwards_atproto_proxy_header() {
+        use axum::http::HeaderMap;
+        use catbird::config::{AppConfig, AppState};
+        use catbird::models::CatbirdSession;
+        use catbird::services::DpopNonceCache;
+        use chrono::Utc;
+        use std::sync::Arc;
+        use uuid::Uuid;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let appview_target = "did:web:circles.catbird.blue#atproto_circles";
+
+        // Expect the upstream server to receive the atproto-proxy header untouched
+        Mock::given(method("GET"))
+            .and(path("/xrpc/blue.catbird.circle.getFeed"))
+            .and(header("atproto-proxy", appview_target))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "feed": [] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = AppConfig::load().unwrap();
+        let http_client = reqwest::Client::builder().build().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:alice-proxy".into(),
+            handle: "alice.test".into(),
+            pds_url: server.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "atproto-proxy",
+            axum::http::HeaderValue::from_static(appview_target),
+        );
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        let response = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(state),
+            axum::Extension(session),
+            Some(axum::Extension(catbird::middleware::RequestId(
+                "req-test-proxy".into(),
+            ))),
+            Some(axum::Extension(dpop_data)),
+            axum::http::Method::GET,
+            axum::extract::Path("blue.catbird.circle.getFeed".to_string()),
+            axum::extract::RawQuery(None),
+            headers,
+            axum::body::Body::empty(),
+        )
+        .await
+        .expect("proxy_xrpc handler succeeds");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["feed"], serde_json::json!([]));
+    }
 }
 /// Tests that require a running Redis instance
 #[cfg(test)]

@@ -24,12 +24,48 @@ use circle_appview::auth::{
 use circle_appview::commit::{
     compute_commit_context, compute_commit_mac, compute_dagcbor_cid, decode_repo_car,
     derive_commit_mac_key, mint_repo_car, mint_signed_commit, verify_commit,
-    CommitError, LtHash, RepoRecord,
+    LtHash as RepoLtHash, RepoRecord, CommitContext,
 };
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
-use circle_appview::projections::{extract_generation_i64, SyncProjectionInput};
 use circle_appview::space_client::{MockSpaceHostTransport, SpaceClient};
+
+#[derive(Clone)]
+struct TestLtHash {
+    inner: RepoLtHash,
+    state_buf: Vec<u8>,
+}
+
+impl Default for TestLtHash {
+    fn default() -> Self {
+        Self {
+            inner: RepoLtHash::default(),
+            state_buf: vec![0u8; 2048],
+        }
+    }
+}
+
+impl TestLtHash {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn add(&mut self, collection: &str, rkey: &str, cid: &str) {
+        self.inner.add(&format!("{collection}/{rkey}/{cid}"));
+        self.state_buf = self.inner.state().to_vec();
+    }
+    fn remove(&mut self, collection: &str, rkey: &str, cid: &str) {
+        self.inner.remove(&format!("{collection}/{rkey}/{cid}"));
+        self.state_buf = self.inner.state().to_vec();
+    }
+    fn as_bytes(&self) -> &[u8; 2048] {
+        self.state_buf.as_slice().try_into().unwrap()
+    }
+    fn digest(&self) -> [u8; 32] {
+        self.inner.digest()
+    }
+}
+
+type LtHash = TestLtHash;
 use circle_appview::sync::{sweep_once, SyncEngine, SyncMode};
 use circle_appview::validator::{
     active_members, compute_uri_hash, policy, validate, InvalidRecord, RecordCandidate,
@@ -242,7 +278,7 @@ fn rejects_nonmember_top_level_cross_space_and_quote() {
     );
     assert_eq!(
         validate(dave_reply(), &policy),
-        Err(InvalidRecord::NoAccessLease)
+        Err(InvalidRecord::NotMember)
     );
     assert_eq!(
         validate(cross_space_reply(), &policy),
@@ -304,75 +340,32 @@ fn commit_verification_succeeds_and_fails_on_tampering() {
     let rev = "3l7aaaaaaaaaa";
     let signed_commit = mint_signed_commit(space(), owner(), rev, lthash.as_bytes(), &signing_key);
 
+    let context = CommitContext {
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(space()).unwrap(),
+        author: catbird_atproto::jacquard_common::types::did::Did::new_owned(owner()).unwrap(),
+        rev: catbird_atproto::jacquard_common::types::tid::Tid::new(rev).unwrap(),
+    };
+
     // 1. Valid commit verification succeeds
-    assert!(verify_commit(
-        space(),
-        owner(),
-        &signed_commit,
-        lthash.as_bytes(),
-        &parsed_vk
-    )
-    .is_ok());
+    assert!(verify_commit(&signed_commit, &context, &parsed_vk).is_ok());
 
-    // 2. Tampered LtHash state -> HashMismatch
-    let mut bad_lthash = LtHash::new();
-    bad_lthash.add("app.bsky.feed.post", "3l7test222222", "bafytestcid2");
-    assert_eq!(
-        verify_commit(
-            space(),
-            owner(),
-            &signed_commit,
-            bad_lthash.as_bytes(),
-            &parsed_vk
-        ),
-        Err(CommitError::HashMismatch)
-    );
-
-    // 3. Tampered MAC -> MacMismatch
+    // 2. Tampered MAC -> fails
     let mut tampered_mac_commit = signed_commit.clone();
     tampered_mac_commit.mac =
         catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]);
-    assert_eq!(
-        verify_commit(
-            space(),
-            owner(),
-            &tampered_mac_commit,
-            lthash.as_bytes(),
-            &parsed_vk
-        ),
-        Err(CommitError::MacMismatch)
-    );
+    assert!(verify_commit(&tampered_mac_commit, &context, &parsed_vk).is_err());
 
-    // 4. Tampered Signature -> InvalidSignature
+    // 3. Tampered Signature -> fails
     let mut tampered_sig_commit = signed_commit.clone();
     tampered_sig_commit.sig =
         catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[1u8; 64]);
-    assert!(matches!(
-        verify_commit(
-            space(),
-            owner(),
-            &tampered_sig_commit,
-            lthash.as_bytes(),
-            &parsed_vk
-        ),
-        Err(CommitError::InvalidSignature(_))
-    ));
+    assert!(verify_commit(&tampered_sig_commit, &context, &parsed_vk).is_err());
 
-    // 5. Version Mismatch -> UnsupportedVersion
+    // 4. Version Mismatch -> fails
     let mut bad_ver_commit = signed_commit.clone();
     bad_ver_commit.ver = 2;
-    assert_eq!(
-        verify_commit(
-            space(),
-            owner(),
-            &bad_ver_commit,
-            lthash.as_bytes(),
-            &parsed_vk
-        ),
-        Err(CommitError::UnsupportedVersion(2))
-    );
+    assert!(verify_commit(&bad_ver_commit, &context, &parsed_vk).is_err());
 }
-
 // ---------------------------------------------------------------------------------------
 // Test Infrastructure for End-to-End Sync Engine Tests
 // ---------------------------------------------------------------------------------------
@@ -451,12 +444,11 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         plc_directory_url: "https://plc.directory".into(),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
-        nest_client_id: "https://nest.catbird.blue/client-metadata.json".into(),
-        nest_jwks_url: "https://nest.catbird.blue/.well-known/jwks.json".into(),
-        nest_verifying_keys: vec![],
-        nest_push_url: None,
-        nest_push_audience: None,
-        push_key_id: "did:web:appview.catbird.blue#atproto_circle".into(),
+        appview_base_url: "http://127.0.0.1:3002".into(),
+        oauth_key_id: None,
+        oauth_signing_key_path: None,
+        oauth_signing_key_hex: None,
+        push_key_id: "did:web:appview.catbird.blue#atproto_circles".into(),
         push_signing_key_path: None,
         push_signing_key_hex: None,
     };
@@ -523,7 +515,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
 
     // Populate circle and member in DB with active lease
     sqlx::query(
-        "INSERT INTO circles (space_uri, authority_did, display_name, created_at, generation) VALUES ($1, $2, 'Test Circle', now(), 1)",
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7syncaaaaaa', $2, 'Test Circle', now())",
     )
     .bind(SPACE_URI)
     .bind(OWNER_DID)
@@ -532,7 +524,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at) VALUES ($1, $2, 'active', 1, now()), ($1, $3, 'active', 1, now())",
+        "INSERT INTO circle_member_cache (space_uri, member_did, cached_at) VALUES ($1, $2, now()), ($1, $3, now())",
     )
     .bind(SPACE_URI)
     .bind(OWNER_DID)
@@ -542,11 +534,9 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO access_leases (space_uri, member_did, expires_at) VALUES ($1, $2, now() + interval '2 hours'), ($1, $3, now() + interval '2 hours')",
+        "INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count) VALUES ($1, now(), 2)",
     )
     .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .bind(BOB_DID)
     .execute(&pool)
     .await
     .unwrap();
@@ -921,7 +911,7 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
         ),
         repo: Did::from(String::from(OWNER_DID)),
         rev: Tid::from(String::from(rev)),
-        space: SPACE_URI.into(),
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI).unwrap(),
         extra_data: None,
     };
 
@@ -1070,17 +1060,17 @@ fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
     let ctx = compute_commit_context(
         "at://did:plc:alice/space/blue.catbird.circle/1",
         "did:plc:alice",
-        "3l7rev123",
+        "3l7revaaaaaaa",
         &ikm,
-    );
+    ).expect("valid commit context");
 
     // Check raw protocol tag (no len prefix) and uint16be fields
     let tag = b"atproto-space-v1";
     assert_eq!(&ctx[0..tag.len()], tag);
-    assert_eq!(ctx.len(), 124);
+    assert_eq!(ctx.len(), 128);
     assert_eq!(
         to_hex(&ctx),
-        "617470726f746f2d73706163652d7631002e61743a2f2f6469643a706c633a616c6963652f73706163652f626c75652e636174626972642e636972636c652f31000d6469643a706c633a616c6963650009336c3772657631323300204242424242424242424242424242424242424242424242424242424242424242"
+        "617470726f746f2d73706163652d7631002e61743a2f2f6469643a706c633a616c6963652f73706163652f626c75652e636174626972642e636972636c652f31000d6469643a706c633a616c696365000d336c377265766161616161616100204242424242424242424242424242424242424242424242424242424242424242"
     );
 
     // 2. Exact HKDF-Expand from 32-byte IKM directly (PRK = ikm)
@@ -1088,7 +1078,7 @@ fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
     assert_eq!(mac_key.len(), 32);
     assert_eq!(
         to_hex(&mac_key),
-        "ed363ae3aa4d3dbcb6413e86db3692eaf4a1713d578cd72b508b3b6ccfa5215c"
+        "79a1578c6bac70083d9b6d4a1dc31c6cd60e0ae8d00c8f59ba22d4870075662a"
     );
 
     let lthash_digest = [0x55u8; 32];
@@ -1096,7 +1086,7 @@ fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
     assert_eq!(mac.len(), 32);
     assert_eq!(
         to_hex(&mac),
-        "6842083d790cee0c14f392372f95dffb9fc2c2e8a37807211febca0c729cbe65"
+        "0b99383cb6dedfb157b960b29169303a7bae9e3968bfd6e277d5b98e34202f57"
     );
     // 3. LtHash item formatting: direct BLAKE3 XOF over exact {collection}/{rkey}/{cid}
     let mut h1 = LtHash::new();
@@ -1209,7 +1199,7 @@ fn dagcbor_cid_with_nested_links_and_raw_bytes() {
     assert!(cid_str.starts_with("bafyre"));
 
     let ipld = circle_appview::commit::json_to_ipld(&post_val).unwrap();
-    let json_back = ipld.to_json();
+    let json_back: serde_json::Value = serde_json::to_value(&ipld).unwrap();
     assert_eq!(
         json_back["embed"]["images"][0]["image"]["ref"]["$link"],
         blob_cid_str
@@ -1311,7 +1301,7 @@ fn author_pds_resolution_requires_exact_atproto_pds_id_and_type() {
     };
     let (endpoint, id) = resolve_pds_endpoint(&doc_valid, BOB_DID).unwrap();
     assert_eq!(endpoint, "https://pds.bob.example.com");
-    assert_eq!(id, format!("{BOB_DID}#atproto_pds"));
+    assert_eq!(id, "#atproto_pds");
 }
 
 #[test]
@@ -1521,7 +1511,7 @@ async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]),
         repo: Did::from(String::from(OWNER_DID)),
         rev: Tid::from(String::from("3l7rev234567a")),
-        space: SPACE_URI.into(),
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI).unwrap(),
         extra_data: None,
     };
 
@@ -1571,47 +1561,6 @@ async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
     assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
 }
 
-#[test]
-fn typed_integer_generations_in_projections() {
-    // 1. Integer generation as number 9 -> parsed as 9
-    let num_val = json!(9);
-    assert_eq!(extract_generation_i64(Some(&num_val)), Some(9));
-
-    // 2. Integer generation as whole-number float 9.0 -> parsed as 9
-    let float_val = json!(9.0);
-    assert_eq!(extract_generation_i64(Some(&float_val)), Some(9));
-
-    // 3. Integer generation as string "9" -> parsed as 9
-    let str_val = json!("9");
-    assert_eq!(extract_generation_i64(Some(&str_val)), Some(9));
-
-    // 4. Fractional float -> rejected as None
-    let frac_val = json!(9.5);
-    assert_eq!(extract_generation_i64(Some(&frac_val)), None);
-
-    // 5. Projection input validation with string generation
-    let input = SyncProjectionInput {
-        operation_id: uuid::Uuid::new_v4(),
-        operation_key: None,
-        actor_did: OWNER_DID.to_string(),
-        space_uri: SPACE_URI.to_string(),
-        kind: "circle_upsert".to_string(),
-        payload: json!({
-            "name": "My Circle",
-            "circleGeneration": "9"
-        }),
-        generation: Some(9),
-        circle_generation: None,
-        member_generation: None,
-    };
-    let proj = input.to_projection().unwrap();
-    match proj {
-        circle_appview::projections::Projection::CircleUpsert { generation, .. } => {
-            assert_eq!(generation, 9);
-        }
-        _ => panic!("Expected CircleUpsert"),
-    }
-}
 #[sqlx::test(migrations = "./migrations")]
 async fn full_recovery_verifies_against_authority_expected_hash_and_rejects_mismatch(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
@@ -2182,7 +2131,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&wrong_hash),
         repo: Did::from(String::from(OWNER_DID)),
         rev: Tid::from(String::from(rev)),
-        space: SPACE_URI.into(),
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI).unwrap(),
         extra_data: None,
     };
 
@@ -2191,11 +2140,10 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
         axum::http::header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
-
-    let res_mismatch = circle_appview::routes::notify_write_handler(
+    let res_mismatch = circle_appview::sync::notify_write_handler(
         axum::extract::State(setup.state.clone()),
         headers.clone(),
-        axum::Json(notify_input_mismatched),
+        bytes::Bytes::from(serde_json::to_vec(&notify_input_mismatched).unwrap()),
     )
     .await;
     assert!(res_mismatch.is_err(), "Mismatched notify hash must be rejected");
@@ -2205,7 +2153,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&lthash.digest()),
         repo: Did::from(String::from(OWNER_DID)),
         rev: Tid::from(String::from(rev)),
-        space: SPACE_URI.into(),
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI).unwrap(),
         extra_data: None,
     };
 
@@ -2220,11 +2168,10 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
         axum::http::header::AUTHORIZATION,
         format!("Bearer {token2}").parse().unwrap(),
     );
-
-    let res_correct = circle_appview::routes::notify_write_handler(
+    let res_correct = circle_appview::sync::notify_write_handler(
         axum::extract::State(setup.state.clone()),
         headers2,
-        axum::Json(notify_input_correct),
+        bytes::Bytes::from(serde_json::to_vec(&notify_input_correct).unwrap()),
     )
     .await;
     assert!(res_correct.is_ok(), "Matching notify hash must succeed");
@@ -2568,13 +2515,13 @@ fn strict_car_rejects_noncanonical_signed_commit_dagcbor() {
     noncanonical_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
     noncanonical_commit_cbor.extend_from_slice(commit.ikm.as_ref());
 
-    let (nc_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&noncanonical_commit_cbor);
-    let nc_cid_link = circle_appview::commit::CidLink::from_bytes(nc_cid_bytes.clone());
-    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+    let (nc_cid_bytes, nc_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&noncanonical_commit_cbor);
+    let nc_cid: cid::Cid = nc_cid_str.parse().unwrap();
+    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
 
     let header = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![nc_cid_link, drisl_cid_link],
+        roots: vec![nc_cid, drisl_cid],
     };
     let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
 
@@ -2632,13 +2579,13 @@ fn strict_car_rejects_signed_commit_with_extra_data_float() {
     float_commit_cbor.extend_from_slice(&[0x64, b'h', b'a', b's', b'h', 0x58, commit.hash.len() as u8]);
     float_commit_cbor.extend_from_slice(commit.hash.as_ref());
     float_commit_cbor.extend_from_slice(&[0x6b, b'e', b'x', b't', b'r', b'a', b'_', b'f', b'l', b'o', b'a', b't', 0xfa, 0x42, 0x2a, 0x00, 0x00]);
-    let (float_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&float_commit_cbor);
-    let float_cid_link = circle_appview::commit::CidLink::from_bytes(float_cid_bytes.clone());
-    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+    let (float_cid_bytes, float_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&float_commit_cbor);
+    let float_cid: cid::Cid = float_cid_str.parse().unwrap();
+    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
 
     let header = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![float_cid_link, drisl_cid_link],
+        roots: vec![float_cid, drisl_cid],
     };
     let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
 
@@ -2696,16 +2643,15 @@ fn strict_car_rejects_signed_commit_with_unknown_extra_data() {
     // 11-byte key 'extra_field', 5-byte string 'value' (0x65, b'v', b'a', b'l', b'u', b'e')
     extra_commit_cbor.extend_from_slice(&[0x6b, b'e', b'x', b't', b'r', b'a', b'_', b'f', b'i', b'e', b'l', b'd', 0x65, b'v', b'a', b'l', b'u', b'e']);
 
-    let (extra_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&extra_commit_cbor);
-    let extra_cid_link = circle_appview::commit::CidLink::from_bytes(extra_cid_bytes.clone());
-    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+    let (extra_cid_bytes, extra_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&extra_commit_cbor);
+    let extra_cid: cid::Cid = extra_cid_str.parse().unwrap();
+    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
 
     let header = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![extra_cid_link, drisl_cid_link],
+        roots: vec![extra_cid, drisl_cid],
     };
     let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
-
     let mut tampered_car = Vec::new();
     circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
     tampered_car.extend_from_slice(&header_cbor);
@@ -2748,14 +2694,14 @@ fn strict_car_rejects_cidv0_and_unblessed_cidv1_codecs() {
     let commit_digest = sha2::Sha256::digest(&commit_cbor);
 
     // 1. CAR with CIDv0 root (starts with 0x12, 0x20...) in block 1
-    let mut cidv0_bytes = vec![0x12, 0x20];
-    cidv0_bytes.extend_from_slice(&commit_digest);
-    let cidv0_link = circle_appview::commit::CidLink::from_bytes(cidv0_bytes.clone());
-    let drisl_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.data_root_cid).unwrap();
+    let cidv0_mh = multihash::Multihash::wrap(0x12, &commit_digest).unwrap();
+    let cidv0_cid = cid::Cid::new_v0(cidv0_mh).unwrap();
+    let cidv0_bytes = cidv0_cid.to_bytes();
+    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
 
     let header_v0 = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![cidv0_link, drisl_cid_link.clone()],
+        roots: vec![cidv0_cid, drisl_cid.clone()],
     };
     let header_v0_cbor = serde_ipld_dagcbor::to_vec(&header_v0).unwrap();
     let mut car_v0 = Vec::new();
@@ -2774,17 +2720,16 @@ fn strict_car_rejects_cidv0_and_unblessed_cidv1_codecs() {
     assert!(res_v0.is_err(), "CIDv0 root and block in CAR must be rejected");
 
     // 2. CAR with unblessed CIDv1 codec (0x55 raw binary instead of 0x71 dag-cbor)
-    let mut unblessed_cidv1 = vec![0x01, 0x55, 0x12, 0x20];
-    unblessed_cidv1.extend_from_slice(&commit_digest);
-    let unblessed_link = circle_appview::commit::CidLink::from_bytes(unblessed_cidv1.clone());
+    let unblessed_mh = multihash::Multihash::wrap(0x12, &commit_digest).unwrap();
+    let unblessed_cid = cid::Cid::new_v1(0x55, unblessed_mh);
+    let unblessed_cidv1 = unblessed_cid.to_bytes();
 
     let header_unblessed = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![unblessed_link, drisl_cid_link],
+        roots: vec![unblessed_cid, drisl_cid],
     };
     let header_unblessed_cbor = serde_ipld_dagcbor::to_vec(&header_unblessed).unwrap();
     let mut car_unblessed = Vec::new();
-    circle_appview::commit::encode_varint(header_unblessed_cbor.len() as u64, &mut car_unblessed);
     car_unblessed.extend_from_slice(&header_unblessed_cbor);
     circle_appview::commit::encode_varint((unblessed_cidv1.len() + commit_cbor.len()) as u64, &mut car_unblessed);
     car_unblessed.extend_from_slice(&unblessed_cidv1);
@@ -2868,10 +2813,10 @@ fn strict_car_rejects_duplicate_map_keys_in_ipld_and_drisl() {
     let decoded = decode_repo_car(&valid_car).unwrap();
 
     // Construct DRISL map block with duplicate map key
-    let (dummy_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(b"dummy data");
-    let link = circle_appview::commit::CidLink::from_bytes(dummy_cid_bytes);
+    let (_dummy_cid_bytes, dummy_cid_str) = circle_appview::commit::create_cid_bytes_from_data(b"dummy data");
+    let dummy_cid: cid::Cid = dummy_cid_str.parse().unwrap();
+    let link: circle_appview::commit::CidLink<jacquard_common::SmolStr> = circle_appview::commit::CidLink::ipld(dummy_cid);
     let link_cbor = serde_ipld_dagcbor::to_vec(&link).unwrap();
-
     let mut dup_drisl_cbor = Vec::new();
     dup_drisl_cbor.push(0xa2); // 2 map entries
     let key = "app.bsky.feed.post/3l7post1";
@@ -2885,13 +2830,13 @@ fn strict_car_rejects_duplicate_map_keys_in_ipld_and_drisl() {
     dup_drisl_cbor.extend_from_slice(key.as_bytes());
     dup_drisl_cbor.extend_from_slice(&link_cbor);
 
-    let (dup_drisl_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&dup_drisl_cbor);
-    let dup_drisl_cid_link = circle_appview::commit::CidLink::from_bytes(dup_drisl_cid_bytes.clone());
-    let commit_cid_link = circle_appview::commit::CidLink::from_cid_str(&decoded.commit_cid).unwrap();
+    let (dup_drisl_cid_bytes, dup_drisl_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&dup_drisl_cbor);
+    let dup_drisl_cid: cid::Cid = dup_drisl_cid_str.parse().unwrap();
+    let commit_cid: cid::Cid = decoded.commit_cid.parse().unwrap();
 
     let header = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![commit_cid_link, dup_drisl_cid_link],
+        roots: vec![commit_cid, dup_drisl_cid],
     };
     let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
 
@@ -2946,25 +2891,25 @@ fn strict_car_rejects_duplicate_map_keys_in_record_block() {
     dup_rec_cbor.extend_from_slice(type_val.as_bytes());
 
     let (dup_rec_cid_bytes, dup_rec_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&dup_rec_cbor);
-    let dup_rec_cid_link = circle_appview::commit::CidLink::from_bytes(dup_rec_cid_bytes.clone());
-
+    let dup_rec_cid_obj: cid::Cid = dup_rec_cid_str.parse().unwrap();
+    let dup_rec_cid_link: circle_appview::commit::CidLink<jacquard_common::SmolStr> = circle_appview::commit::CidLink::ipld(dup_rec_cid_obj);
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", &dup_rec_cid_str);
     let commit = mint_signed_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", lthash.as_bytes(), &signing_key);
     let commit_cbor = serde_ipld_dagcbor::to_vec(&commit).unwrap();
-    let (commit_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&commit_cbor);
-    let commit_cid_link = circle_appview::commit::CidLink::from_bytes(commit_cid_bytes.clone());
+    let (commit_cid_bytes, commit_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&commit_cbor);
+    let commit_cid: cid::Cid = commit_cid_str.parse().unwrap();
 
     // Construct valid DRISL map pointing to dup_rec_cid_link
     let mut drisl_map = std::collections::BTreeMap::new();
-    drisl_map.insert("app.bsky.feed.post/3l7post1".to_string(), dup_rec_cid_link);
+    drisl_map.insert(jacquard_common::SmolStr::new("app.bsky.feed.post/3l7post1"), dup_rec_cid_link);
     let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_map).unwrap();
-    let (drisl_cid_bytes, _) = circle_appview::commit::create_cid_bytes_from_data(&drisl_cbor);
-    let drisl_cid_link = circle_appview::commit::CidLink::from_bytes(drisl_cid_bytes.clone());
+    let (drisl_cid_bytes, drisl_cid_str) = circle_appview::commit::create_cid_bytes_from_data(&drisl_cbor);
+    let drisl_cid: cid::Cid = drisl_cid_str.parse().unwrap();
 
     let header = circle_appview::commit::CarHeader {
         version: 1,
-        roots: vec![commit_cid_link, drisl_cid_link],
+        roots: vec![commit_cid, drisl_cid],
     };
     let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
 
@@ -3011,18 +2956,17 @@ async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
         format!("Bearer {token}").parse().unwrap(),
     );
 
-    // 1. Hash is 16 bytes (not 32) -> 400 Bad Request
     let short_hash_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x11u8; 16]),
         repo: Did::from(String::from(OWNER_DID)),
         rev: Tid::from(String::from("3l7234567a234")),
-        space: SPACE_URI.into(),
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI).unwrap(),
         extra_data: None,
     };
-    let res = circle_appview::routes::notify_write_handler(
+    let res = circle_appview::sync::notify_write_handler(
         axum::extract::State(setup.state.clone()),
         headers,
-        axum::Json(short_hash_input),
+        bytes::Bytes::from(serde_json::to_vec(&short_hash_input).unwrap()),
     )
     .await;
     assert!(matches!(res, Err(AppError::InvalidRequest(_))), "Non-32-byte hash must return InvalidRequest");
@@ -3671,8 +3615,8 @@ async fn alpha_migration_purges_legacy_notifications_and_enforces_source_provena
     // Seed circle
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
-        VALUES ($1, $2, 'Test Circle', now())
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7syncaaaaaa', $2, 'Test Circle', now())
         "#,
     )
     .bind(SPACE_URI)

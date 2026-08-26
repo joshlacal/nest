@@ -5,12 +5,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum InvalidRecord {
     #[error("Only the space authority can author top-level posts")]
     TopLevelAuthor,
-    #[error("Author does not hold an active member access lease")]
-    NoAccessLease,
+    #[error("Author is not a current member of the Space")]
+    NotMember,
     #[error("Cross-space reference is not allowed")]
     CrossSpaceReference,
     #[error("Unsupported embed type")]
@@ -27,7 +28,7 @@ impl InvalidRecord {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::TopLevelAuthor => "top_level_author",
-            Self::NoAccessLease => "no_access_lease",
+            Self::NotMember => "not_member",
             Self::CrossSpaceReference => "cross_space_reference",
             Self::UnsupportedEmbed => "unsupported_embed",
             Self::UnsupportedCollection(_) => "unsupported_collection",
@@ -74,7 +75,6 @@ impl ValidationPolicy {
         self
     }
 
-
     pub fn known_post_uris(&self) -> HashSet<String> {
         self.known_posts.keys().cloned().collect()
     }
@@ -92,8 +92,12 @@ impl ValidationPolicy {
         self
     }
 
-    pub fn has_lease(&self, did: &str) -> bool {
+    pub fn has_membership(&self, did: &str) -> bool {
         self.active_members.contains(did)
+    }
+
+    pub fn has_lease(&self, did: &str) -> bool {
+        self.has_membership(did)
     }
 
     pub fn is_owner(&self, did: &str) -> bool {
@@ -280,6 +284,7 @@ pub fn validate_record(
                 }
             }
 
+            // Reject quote embeds and only accept image embeds
             if let Some(embed) = &post.embed {
                 match embed {
                     PostEmbed::Images(images) => {
@@ -300,9 +305,9 @@ pub fn validate_record(
             let created_at = post.created_at.as_ref().with_timezone(&Utc);
 
             if let Some(reply) = &post.reply {
-                // Must have active member access lease
-                if !policy.has_lease(&candidate.author_did) {
-                    return Err(InvalidRecord::NoAccessLease);
+                // Reply: author must be on the member list at index time
+                if !policy.has_membership(&candidate.author_did) {
+                    return Err(InvalidRecord::NotMember);
                 }
 
                 let raw_parent_uri = candidate.value.get("reply").and_then(|r| r.get("parent")).and_then(|p| p.get("uri")).and_then(|u| u.as_str()).unwrap_or(reply.parent.uri.as_ref());
@@ -338,14 +343,14 @@ pub fn validate_record(
                     post_uri: None,
                 })
             } else {
-                // Top-level post: must be authored by Space owner
+                // Top-level post: must be authored by Space owner / authority
                 if !policy.is_owner(&candidate.author_did) {
                     return Err(InvalidRecord::TopLevelAuthor);
                 }
 
-                // Owner must also hold an active lease / membership
-                if !policy.has_lease(&candidate.author_did) {
-                    return Err(InvalidRecord::NoAccessLease);
+                // Owner must also hold membership
+                if !policy.has_membership(&candidate.author_did) {
+                    return Err(InvalidRecord::NotMember);
                 }
 
                 Ok(ValidatedRecord {
@@ -370,8 +375,8 @@ pub fn validate_record(
             like.validate()
                 .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for like: {e}")))?;
 
-            if !policy.has_lease(&candidate.author_did) {
-                return Err(InvalidRecord::NoAccessLease);
+            if !policy.has_membership(&candidate.author_did) {
+                return Err(InvalidRecord::NotMember);
             }
             let created_at = like.created_at.as_ref().with_timezone(&Utc);
 

@@ -8,7 +8,10 @@ use crate::access::{
     SpaceLockManager,
 };
 use crate::auth::{select_verification_method, DidResolver};
-use crate::commit::{compute_dagcbor_cid, decode_repo_car, verify_commit, LtHash, LTHASH_SIZE};
+use crate::commit::{
+    compute_dagcbor_cid, extract_and_validate_car, parse_permissioned_car, verify_commit,
+    CommitContext, LtHash, LTHASH_SIZE,
+};
 use crate::config::AppState;
 use crate::error::AppError;
 use crate::space_client::SpaceClient;
@@ -43,7 +46,7 @@ pub struct SyncEngine {
     credential_store: Arc<CredentialStore>,
     did_resolver: Arc<DidResolver>,
     space_locks: Arc<SpaceLockManager>,
-    push_client: Option<Arc<crate::push::NestPushClient>>,
+    push_client: Option<Arc<crate::push::CirclePushClient>>,
 }
 
 enum StagedMutation {
@@ -89,7 +92,7 @@ impl SyncEngine {
         }
     }
 
-    pub fn with_push_client(mut self, push_client: Arc<crate::push::NestPushClient>) -> Self {
+    pub fn with_push_client(mut self, push_client: Arc<crate::push::CirclePushClient>) -> Self {
         self.push_client = Some(push_client);
         self
     }
@@ -139,10 +142,9 @@ impl SyncEngine {
         // Load active members and post-only known post URIs to build ValidationPolicy
         let active_member_rows: Vec<(String,)> = sqlx::query_as(
             r#"
-            SELECT m.member_did
-            FROM circle_members m
-            JOIN access_leases l ON l.space_uri = m.space_uri AND l.member_did = m.member_did
-            WHERE m.space_uri = $1 AND m.status = 'active' AND l.expires_at > now()
+            SELECT member_did
+            FROM circle_member_cache
+            WHERE space_uri = $1
             "#,
         )
         .bind(space_uri)
@@ -174,11 +176,9 @@ impl SyncEngine {
 
         let (last_rev, mut lthash) = match existing_sync {
             Some((rev, hash_bytes)) if hash_bytes.len() == LTHASH_SIZE => {
-                let mut arr = [0u8; LTHASH_SIZE];
-                arr.copy_from_slice(&hash_bytes);
-                (Some(rev), LtHash::from_bytes(arr))
+                (Some(rev), LtHash::from_state(&hash_bytes).unwrap_or_default())
             }
-            _ => (None, LtHash::new()),
+            _ => (None, LtHash::default()),
         };
 
         // Incremental sync with pagination and direct DAG-CBOR CID verification
@@ -228,9 +228,9 @@ impl SyncEngine {
                 if let Some(cid) = &op.cid {
                     let cid_str = cid.as_str();
                     if let Some(prev) = &op.prev {
-                        lthash.remove(collection_str, rkey_str, prev.as_str());
+                        lthash.remove(&format!("{collection_str}/{rkey_str}/{}", prev.as_str()));
                     }
-                    lthash.add(collection_str, rkey_str, cid_str);
+                    lthash.add(&format!("{collection_str}/{rkey_str}/{cid_str}"));
 
                     // Direct DAG-CBOR CID verification on Jacquard Data
                     if let Some(data_val) = &op.value {
@@ -279,9 +279,8 @@ impl SyncEngine {
                         }
                     }
                 } else {
-                    // Deletion op
                     if let Some(prev) = &op.prev {
-                        lthash.remove(collection_str, rkey_str, prev.as_str());
+                        lthash.remove(&format!("{collection_str}/{rkey_str}/{}", prev.as_str()));
                     }
                     current_policy.remove_post(&uri);
                     staged_mutations.push(StagedMutation::DeleteRecord { uri });
@@ -342,14 +341,49 @@ impl SyncEngine {
 
         let commit_verified = if let Some(commit) = &commit_to_verify {
             latest_rev = commit.rev.to_string();
-            let verified = verify_commit(
-                space_uri,
-                author_did,
-                commit,
-                lthash.as_bytes(),
-                &author_signing_key,
-            )
-            .is_ok();
+            let space_uri_parsed = match jacquard_common::types::aturi::AtSpaceUri::new_owned(space_uri) {
+                Ok(u) => u,
+                Err(_) => {
+                    return self
+                        .full_recovery(
+                            space_uri,
+                            author_did,
+                            &repo_service_endpoint,
+                            &cred.token,
+                            &cred.dpop_key,
+                            &author_signing_key,
+                            &policy,
+                            expected_authority_hash,
+                            expected_authority_rev,
+                        )
+                        .await;
+                }
+            };
+            let author_did_parsed = match jacquard_common::types::did::Did::new_owned(author_did) {
+                Ok(d) => d,
+                Err(_) => {
+                    return self
+                        .full_recovery(
+                            space_uri,
+                            author_did,
+                            &repo_service_endpoint,
+                            &cred.token,
+                            &cred.dpop_key,
+                            &author_signing_key,
+                            &policy,
+                            expected_authority_hash,
+                            expected_authority_rev,
+                        )
+                        .await;
+                }
+            };
+            let context = CommitContext {
+                space: space_uri_parsed,
+                author: author_did_parsed,
+                rev: commit.rev.clone(),
+            };
+            let hash_matches = commit.hash.as_ref() == lthash.digest().as_slice();
+            let verified = hash_matches && verify_commit(commit, &context, &author_signing_key).is_ok();
 
             if verified {
                 let hash_ok = match expected_authority_hash {
@@ -367,7 +401,6 @@ impl SyncEngine {
         } else {
             false
         };
-
         if !commit_verified {
             return self
                 .full_recovery(
@@ -653,10 +686,9 @@ impl SyncEngine {
         .bind(space_uri)
         .bind(author_did)
         .bind(&latest_rev)
-        .bind(lthash.as_bytes().as_slice())
+        .bind(lthash.state().as_slice())
         .execute(&mut *tx)
         .await?;
-
         tx.commit().await?;
 
         // Dispatch generic push notifications to distinct recipients after commit
@@ -701,10 +733,35 @@ impl SyncEngine {
             )
             .await?;
 
-        let decoded_car = decode_repo_car(&car_bytes)
+        let car = parse_permissioned_car(&car_bytes)
+            .await
             .map_err(|e| AppError::Internal(format!("CAR decoding failed: {e}")))?;
 
-        let mut pending_records = decoded_car.records;
+        let (commit, records, lthash) = extract_and_validate_car(
+            &car,
+            space_uri,
+            author_did,
+            author_signing_key,
+        )
+        .map_err(|e| AppError::Internal(format!("CAR validation failed: {e}")))?;
+
+        // Verify against expected authority hash and rev if provided
+        if let Some(expected_hash) = expected_authority_hash {
+            if commit.hash.as_ref() != expected_hash {
+                return Err(AppError::Internal(
+                    "CAR commit hash does not match expected authority hash".into(),
+                ));
+            }
+        }
+        if let Some(expected_rev) = expected_authority_rev {
+            if commit.rev.as_str() != expected_rev {
+                return Err(AppError::Internal(
+                    "CAR commit revision does not match expected authority revision".into(),
+                ));
+            }
+        }
+
+        let mut pending_records = records;
         let mut staged_valid_records = Vec::new();
         let mut staged_rejections = Vec::new();
         let mut current_policy = policy.clone();
@@ -722,44 +779,37 @@ impl SyncEngine {
         for (u, c) in other_authors_posts {
             current_policy.known_posts.insert(u, c);
         }
-        let mut lthash = LtHash::new();
         let ops_applied = pending_records.len();
         let mut records_accepted = 0;
         let mut records_rejected = 0;
-
-        for rec in &pending_records {
-            lthash.add(&rec.collection, &rec.rkey, &rec.cid);
-        }
 
         // Multi-pass resolution for intra-repo dependencies (posts before replies/likes)
         let mut progress = true;
         while progress && !pending_records.is_empty() {
             progress = false;
             let mut remaining = Vec::new();
-            for rec in pending_records {
-                let collection_str = rec.collection.as_str();
-                let rkey_str = rec.rkey.as_str();
+            for (collection_str, rkey_str, cid_str, value_json) in pending_records {
                 let uri = format!("{space_uri}/{author_did}/{collection_str}/{rkey_str}");
 
                 let candidate = RecordCandidate {
                     uri: uri.clone(),
                     author_did: author_did.to_string(),
-                    collection: collection_str.to_string(),
-                    rkey: rkey_str.to_string(),
-                    value: rec.value.clone(),
+                    collection: collection_str.clone(),
+                    rkey: rkey_str.clone(),
+                    value: value_json.clone(),
                 };
 
                 match validate_record(&candidate, &current_policy) {
                     Ok(valid) => {
                         records_accepted += 1;
                         if valid.collection == "app.bsky.feed.post" {
-                            current_policy.add_post(valid.uri.clone(), rec.cid.clone());
+                            current_policy.add_post(valid.uri.clone(), cid_str.clone());
                         }
-                        staged_valid_records.push((valid, rec.cid));
+                        staged_valid_records.push((valid, cid_str));
                         progress = true;
                     }
                     Err(InvalidRecord::CrossSpaceReference) => {
-                        remaining.push((rec, uri, InvalidRecord::CrossSpaceReference));
+                        remaining.push(((collection_str, rkey_str, cid_str, value_json), uri, InvalidRecord::CrossSpaceReference));
                     }
                     Err(invalid) => {
                         records_rejected += 1;
@@ -778,33 +828,7 @@ impl SyncEngine {
             }
         }
 
-        // Verify root commit embedded in CAR against LtHash
-        verify_commit(
-            space_uri,
-            author_did,
-            &decoded_car.commit,
-            lthash.as_bytes(),
-            author_signing_key,
-        )
-        .map_err(|e| AppError::Internal(format!("Commit verification failed on CAR: {e}")))?;
-
-        // Verify against expected authority hash and rev if provided
-        if let Some(expected_hash) = expected_authority_hash {
-            if decoded_car.commit.hash.as_ref() != expected_hash {
-                return Err(AppError::Internal(
-                    "CAR commit hash does not match expected authority hash".into(),
-                ));
-            }
-        }
-        if let Some(expected_rev) = expected_authority_rev {
-            if decoded_car.commit.rev.as_str() != expected_rev {
-                return Err(AppError::Internal(
-                    "CAR commit revision does not match expected authority revision".into(),
-                ));
-            }
-        }
-
-        let latest_rev = decoded_car.commit.rev.to_string();
+        let latest_rev = commit.rev.to_string();
         let mut recovered_uris: HashSet<String> = HashSet::new();
         let mut tx = self.db.begin().await?;
         let mut new_notification_recipients: HashSet<String> = HashSet::new();
@@ -1082,10 +1106,9 @@ impl SyncEngine {
         .bind(space_uri)
         .bind(author_did)
         .bind(&latest_rev)
-        .bind(lthash.as_bytes().as_slice())
+        .bind(lthash.state().as_slice())
         .execute(&mut *tx)
         .await?;
-
         tx.commit().await?;
 
         // Dispatch generic push notifications to distinct recipients after commit
@@ -1245,4 +1268,99 @@ pub fn spawn_revision_sweep_task(
         }
     });
     (handle, shutdown_tx)
+}
+
+pub async fn notify_write_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<axum::response::Response, AppError> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized(crate::error::AuthReason::MissingHeader))?;
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_header.strip_prefix("bearer "))
+        .ok_or(AppError::Unauthorized(crate::error::AuthReason::InvalidHeader))?;
+    let user = crate::auth::verify_service_jwt(
+        &state,
+        token,
+        &state.config.service_did,
+        Some("com.atproto.space.notifyWrite"),
+    )
+    .await?;
+
+    let input: catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite =
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid notifyWrite body: {e}")))?;
+
+    if input.hash.len() != 32 {
+        return Err(AppError::InvalidRequest("Hash must be exactly 32 bytes".into()));
+    }
+    if input.rev.as_str().is_empty() {
+        return Err(AppError::InvalidRequest("Rev cannot be empty".into()));
+    }
+
+    let authority = extract_authority_did(input.space.as_str())?;
+    if user.did != authority && user.did != input.repo.as_str() {
+        return Err(AppError::Forbidden(
+            "Caller DID does not match space authority or repo author".into(),
+        ));
+    }
+
+    let sync_engine = SyncEngine::new(&state);
+    sync_engine
+        .sync_repo_with_expected_commit(
+            input.space.as_str(),
+            input.repo.as_str(),
+            Some(input.hash.as_ref()),
+            Some(input.rev.as_str()),
+        )
+        .await?;
+
+    use axum::response::IntoResponse;
+    Ok(axum::http::StatusCode::OK.into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct NotifySpaceDeletedPayload {
+    pub space: String,
+}
+
+pub async fn notify_space_deleted_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<axum::response::Response, AppError> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized(crate::error::AuthReason::MissingHeader))?;
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_header.strip_prefix("bearer "))
+        .ok_or(AppError::Unauthorized(crate::error::AuthReason::InvalidHeader))?;
+    let user = crate::auth::verify_service_jwt(
+        &state,
+        token,
+        &state.config.service_did,
+        Some("com.atproto.space.notifySpaceDeleted"),
+    )
+    .await?;
+
+    let input: NotifySpaceDeletedPayload = serde_json::from_slice(&body)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid notifySpaceDeleted body: {e}")))?;
+
+    let authority = crate::access::extract_authority_did(&input.space)?;
+    if user.did != authority {
+        return Err(AppError::Unauthorized(crate::error::AuthReason::IdMismatch));
+    }
+
+    crate::purge::delete_space(&state.db, &state.credential_store, &input.space)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    use axum::response::IntoResponse;
+    Ok(axum::http::StatusCode::OK.into_response())
 }

@@ -25,9 +25,6 @@ pub struct AppConfig {
     /// Clean-chat configuration (blue.catbird.chat.*)
     #[serde(default)]
     pub chat: ChatConfig,
-    /// Circle AppView configuration (optional)
-    #[serde(default)]
-    pub circle: CircleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,32 +120,6 @@ fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CircleConfig {
-    /// URL of the Circle AppView service (e.g., http://127.0.0.1:3002)
-    #[serde(default)]
-    pub service_url: Option<String>,
-    /// DID of the Circle AppView service (e.g., did:web:circles.catbird.blue#atproto_circle)
-    #[serde(default = "default_circle_service_did")]
-    pub service_did: String,
-    /// PLC directory base URL (defaults to https://plc.directory)
-    #[serde(default)]
-    pub plc_directory_url: Option<String>,
-}
-
-fn default_circle_service_did() -> String {
-    "did:web:circles.catbird.blue#atproto_circle".to_string()
-}
-
-impl Default for CircleConfig {
-    fn default() -> Self {
-        Self {
-            service_url: None,
-            service_did: default_circle_service_did(),
-            plc_directory_url: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PushConfig {
@@ -300,8 +271,6 @@ fn default_scopes() -> Vec<String> {
         "atproto".to_string(),
         "transition:generic".to_string(),
         "transition:chat.bsky".to_string(),
-        crate::models::CIRCLE_MEMBER_SCOPE.to_string(),
-        crate::models::CIRCLE_OWNER_SCOPE.to_string(),
     ]
 }
 
@@ -411,11 +380,6 @@ pub struct AppState {
     /// a guaranteed `use_dpop_nonce` round trip. See
     /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
-    pub circle_capability: Arc<crate::services::CircleCapabilityService<crate::services::AtProtoCircleProbe>>,
-    /// Verifying key for Circle AppView push requests, resolved at startup or injected for testing
-    pub circle_verifying_key: Option<Arc<p256::ecdsa::VerifyingKey>>,
-    /// Liveness flag for the Circle projection retry worker
-    pub circle_worker_alive: Arc<std::sync::atomic::AtomicBool>,
     /// AES-256-GCM encryption key for Redis session records
     pub session_encryption_key: Option<[u8; 32]>,
 }
@@ -433,14 +397,6 @@ fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Err
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         validate_configured_oauth_scopes(&config.oauth.scopes)?;
-        if config.circle.service_url.is_some() {
-            if config.oauth.client_id.trim().is_empty() {
-                anyhow::bail!("Catbird OAuth client_id must be configured when Circle capability is enabled");
-            }
-            if config.circle.service_did.trim().is_empty() {
-                anyhow::bail!("Circle service_did must be configured when Circle capability is enabled");
-            }
-        }
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
                 let pool = PgPoolOptions::new()
@@ -493,9 +449,6 @@ impl AppState {
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
-            circle_capability: Arc::new(crate::services::CircleCapabilityService::new(crate::services::AtProtoCircleProbe::new())),
-            circle_worker_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            circle_verifying_key: None,
             session_encryption_key,
         };
         // Initialize KeyStore first (needed by OAuth client)
@@ -552,38 +505,6 @@ impl AppState {
             }
         }
 
-        if state.config.circle.service_url.is_some() {
-            if state.key_store.is_none() {
-                anyhow::bail!("KeyStore failed to initialize but is mandatory when Circle capability is enabled");
-            }
-            if state.jacquard_client.is_none() || state.auth_store.is_none() {
-                anyhow::bail!("Jacquard OAuthClient failed to initialize but is mandatory when Circle capability is enabled");
-            }
-            if state.push_db.is_none() {
-                anyhow::bail!("PostgreSQL (push_db) is mandatory when Circle capability is enabled");
-            }
-        }
-        if !state.config.circle.service_did.is_empty() {
-            match crate::services::circle::resolve_circle_verifying_key(
-                &state.config.circle.service_did,
-                state.config.circle.plc_directory_url.as_deref(),
-            ).await {
-                Ok(vk) => {
-                    tracing::info!(
-                        did = %state.config.circle.service_did,
-                        "Resolved Circle AppView public key at startup"
-                    );
-                    state.circle_verifying_key = Some(Arc::new(vk));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        did = %state.config.circle.service_did,
-                        error = %e,
-                        "Failed to resolve Circle AppView public key at startup"
-                    );
-                }
-            }
-        }
 
         Ok(state)
     }
@@ -738,43 +659,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_scopes_include_circle_scopes() {
+    fn default_scopes_contain_standard_scopes() {
         let scopes = default_scopes();
-        assert!(scopes.contains(&crate::models::CIRCLE_MEMBER_SCOPE.to_string()));
-        assert!(scopes.contains(&crate::models::CIRCLE_OWNER_SCOPE.to_string()));
-    }
-
-    #[test]
-    fn invalid_configured_space_scope_fails_before_startup() {
-        let error = validate_configured_oauth_scopes(&["space".to_string()]).unwrap_err();
-        assert!(error.to_string().contains("Invalid configured OAuth scope"));
-
-        let error = validate_configured_oauth_scopes(&[
-            "space:blue.catbird.circle?authority=*&authority=self&action=read".to_string(),
-        ])
-        .unwrap_err();
-        assert!(error.to_string().contains("Invalid configured OAuth scope"));
-    }
-
-    #[test]
-    fn unrelated_oauth_initialization_failures_remain_degraded() {
-        assert!(validate_configured_oauth_scopes(&["atproto".to_string()]).is_ok());
-    }
-
-    #[test]
-    fn circle_config_defaults_when_section_is_absent() {
-        let default_circle = CircleConfig::default();
-        assert_eq!(default_circle.service_did, default_circle_service_did());
-        assert_eq!(default_circle.service_did, "did:web:circles.catbird.blue#atproto_circle");
-        assert!(default_circle.service_url.is_none());
-
-        #[derive(Deserialize)]
-        struct PartialApp {
-            #[serde(default)]
-            circle: CircleConfig,
-        }
-        let partial: PartialApp = serde_json::from_str("{}").expect("deserializes");
-        assert_eq!(partial.circle.service_did, "did:web:circles.catbird.blue#atproto_circle");
-        assert!(partial.circle.service_url.is_none());
+        assert!(scopes.contains(&"atproto".to_string()));
+        assert!(scopes.contains(&"transition:generic".to_string()));
+        assert!(scopes.contains(&"transition:chat.bsky".to_string()));
     }
 }

@@ -9,8 +9,8 @@ pub mod handlers;
 pub mod hydration;
 pub mod media;
 pub mod notifications;
+pub mod oauth;
 pub mod preferences;
-pub mod projections;
 pub mod purge;
 pub mod push;
 pub mod reports;
@@ -30,7 +30,7 @@ pub use auth::{
 pub use config::{AppState, Config};
 pub use error::AppError;
 pub use routes::create_router;
-pub use push::NestPushClient;
+pub use push::CirclePushClient;
 
 /// Run Circle AppView HTTP server with graceful shutdown and guaranteed background sweep drain.
 pub async fn run_server_with_shutdown<F>(

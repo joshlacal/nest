@@ -15,13 +15,11 @@ pub async fn get_feed_handler(
     tracing::debug!("Handling getFeed request");
     let space_filter = query.space.as_ref().map(|s| s.as_str());
     let output = crate::feed::get_feed(
-        &state.db,
-        &state.profile_hydrator,
+        &state,
         &user.did,
         space_filter,
         query.limit,
         query.cursor.as_deref(),
-        &state.config.circle_media_base_url,
     )
     .await?;
 

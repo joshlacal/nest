@@ -1,6 +1,8 @@
-//! Nest Push Client for Circle AppView
+//! Direct Push Client for Circle AppView
 //!
-//! Authenticates and sends generic push notification triggers to Nest's internal push endpoint.
+//! Delivers content-free push notification triggers directly from the AppView.
+//! Payloads contain only recipient DID: no post text, Circle name, actor name,
+//! record URI, or blob URL.
 
 use crate::error::AppError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -25,21 +27,22 @@ pub struct CirclePushResponse {
     pub delivered: usize,
 }
 
-pub struct NestPushClient {
-    pub push_url: String,
+#[derive(Clone)]
+pub struct CirclePushClient {
+    pub push_url: Option<String>,
     pub service_did: String,
     pub key_id: String,
-    pub audience: String,
+    pub audience: Option<String>,
     signing_key: SigningKey,
     http_client: reqwest::Client,
 }
 
-impl NestPushClient {
+impl CirclePushClient {
     pub fn new(
-        push_url: String,
+        push_url: Option<String>,
         service_did: String,
         key_id: String,
-        audience: String,
+        audience: Option<String>,
         signing_key: SigningKey,
         http_client: reqwest::Client,
     ) -> Self {
@@ -55,73 +58,79 @@ impl NestPushClient {
 
     /// Mints a signed ES256 service authorization JWT for `blue.catbird.circle.push`
     pub fn mint_service_jwt(&self) -> Result<String, AppError> {
-        let now = Utc::now().timestamp();
-        let jti = Uuid::new_v4().to_string();
-
+        let aud = self.audience.as_deref().unwrap_or(&self.service_did);
         let header = json!({
             "alg": "ES256",
-            "typ": "JWT",
-            "kid": self.key_id,
+            "typ": "atproto-service-auth+jwt",
+            "kid": self.key_id
         });
+
+        let now = Utc::now().timestamp();
+        let jti = Uuid::new_v4().to_string();
         let claims = json!({
             "iss": self.service_did,
-            "aud": self.audience,
+            "aud": aud,
             "exp": now + 60,
             "iat": now,
             "jti": jti,
             "lxm": "blue.catbird.circle.push"
         });
 
-        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).map_err(|e| {
-            AppError::Internal(format!("Failed to serialize JWT header: {e}"))
-        })?);
-        let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).map_err(|e| {
-            AppError::Internal(format!("Failed to serialize JWT claims: {e}"))
-        })?);
+        let header_str = serde_json::to_string(&header)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize JWT header: {e}")))?;
+        let claims_str = serde_json::to_string(&claims)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize JWT claims: {e}")))?;
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_str.as_bytes());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims_str.as_bytes());
         let signing_input = format!("{header_b64}.{claims_b64}");
 
         let signature: Signature = self.signing_key.sign(signing_input.as_bytes());
-        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let sig_bytes = signature.to_bytes();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig_bytes);
 
         Ok(format!("{signing_input}.{sig_b64}"))
     }
 
-    /// Delivers a generic circle_activity push trigger to Nest for the given recipient DID.
+    /// Delivers a generic content-free circle_activity push trigger for the given recipient DID.
     pub async fn deliver_circle_activity(&self, recipient_did: &str) -> Result<usize, AppError> {
-        let jwt = self.mint_service_jwt()?;
-        let body = json!({
-            "recipient_did": recipient_did
-        });
+        let push_url = match &self.push_url {
+            Some(url) if !url.trim().is_empty() => url,
+            _ => {
+                tracing::debug!("Push URL not configured; skipping push delivery");
+                return Ok(0);
+            }
+        };
 
-        let resp = self
+        let token = self.mint_service_jwt()?;
+        let payload = CirclePushPayload {
+            recipient_did: recipient_did.to_string(),
+        };
+
+        let res = self
             .http_client
-            .post(&self.push_url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body)
+            .post(push_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .json(&payload)
             .send()
             .await
-            .map_err(|e| {
-                tracing::warn!("Failed to dispatch push notification trigger to Nest: transport error");
-                AppError::Internal(format!("Failed to dispatch push to Nest: {e}"))
-            })?;
+            .map_err(|e| AppError::Internal(format!("Push request failed: {e}")))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            tracing::warn!(status = %status, "Nest push endpoint returned non-success status");
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, "Push endpoint returned error");
             return Err(AppError::Internal(format!(
-                "Nest push endpoint returned {status}"
+                "Push endpoint error {status}: {body}"
             )));
         }
 
-        let push_resp: CirclePushResponse = resp
+        let push_res: CirclePushResponse = res
             .json()
             .await
-            .map_err(|_| {
-                tracing::warn!("Failed to parse response JSON from Nest push");
-                AppError::Internal("Invalid response JSON from Nest push".into())
-            })?;
+            .map_err(|e| AppError::Internal(format!("Invalid push response JSON: {e}")))?;
 
-        Ok(push_resp.delivered)
+        Ok(push_res.delivered)
     }
 }

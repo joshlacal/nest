@@ -3,374 +3,272 @@
 //! Validates that generated types match Lexicon definitions and serialize/deserialize
 //! with exact camelCase fields and typed descriptors, preventing field drift.
 
-use catbird_atproto::generated::blue_catbird::circle::activate_space::{
-    ActivateSpace, ActivateSpaceOutput,
+use catbird_atproto::generated::blue_catbird::circle::activate_circle::{
+    ActivateCircle, ActivateCircleOutput,
 };
-use catbird_atproto::generated::blue_catbird::circle::create_circle::{
-    CreateCircle, CreateCircleOutput,
+use catbird_atproto::generated::blue_catbird::circle::{
+    CircleSummary, NotificationReason,
 };
-use catbird_atproto::generated::blue_catbird::circle::defs::{
-    AccessState, MemberAction, NotificationReason, Operation, OperationStatus, SpaceRef,
-};
+use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
 use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
-use catbird_atproto::generated::blue_catbird::circle::get_operation::{
-    GetOperation, GetOperationOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::{
-    GetPostThread, GetPostThreadOutput,
+use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThread;
+use catbird_atproto::generated::blue_catbird::circle::list_circles::{
+    ListCircles, ListCirclesOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::list_notifications::{
     ListNotifications, ListNotificationsOutput,
 };
-use catbird_atproto::generated::blue_catbird::circle::update_member::{
-    UpdateMember, UpdateMemberOutput,
+use catbird_atproto::generated::blue_catbird::circle::report_record::{
+    ReportRecord, ReportRecordReason,
 };
-use catbird_atproto::types::string::{AtUri, Cid, Did};
+use catbird_atproto::generated::blue_catbird::circle::update_preferences::{
+    UpdatePreferences, UpdatePreferencesOutput,
+};
+use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
+use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Did, Tid};
 use serde_json::json;
 
 #[test]
-fn test_create_circle_contract_serialization() {
-    let input: CreateCircle<String> = CreateCircle {
-        name: "Test Circle".to_string(),
-        member_dids: vec![
-            Did::new("did:plc:bob".to_string()).unwrap(),
-            Did::new("did:plc:carol".to_string()).unwrap(),
-        ],
+fn test_activate_circle_contract_serialization() {
+    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
+    let input = ActivateCircle {
+        space: space_uri,
         extra_data: None,
     };
 
     let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(serialized["name"], "Test Circle");
-    assert_eq!(
-        serialized["memberDids"],
-        json!(["did:plc:bob", "did:plc:carol"])
-    );
-    // Must NOT have legacy/drift names
-    assert!(serialized.get("initialMembers").is_none());
+    assert_eq!(serialized["space"], "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
 
-    // Roundtrip
-    let deserialized: CreateCircle<String> = serde_json::from_value(serialized).unwrap();
-    assert_eq!(deserialized.name.as_str(), "Test Circle");
-    assert_eq!(deserialized.member_dids.len(), 2);
+    let deserialized: ActivateCircle = serde_json::from_value(serialized).unwrap();
+    assert_eq!(deserialized.space.as_str(), "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
 }
 
 #[test]
-fn test_create_circle_output_contract() {
-    let space_ref: SpaceRef<String> =
-        SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
-    let op: Operation<String> = Operation {
-        id: "op-uuid-456".to_string(),
-        status: OperationStatus::Complete,
-        space: Some(space_ref),
-        error: None,
+fn test_activate_circle_output_contract() {
+    let circle_summary = CircleSummary {
+        circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
+        uri: AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap(),
+        name: SmolStr::new("Test Circle"),
+        owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
+        member_count: Some(5),
+        muted: Some(false),
         extra_data: None,
     };
-    let output: CreateCircleOutput<String> = CreateCircleOutput {
-        value: op,
+
+    let output = ActivateCircleOutput {
+        circle: circle_summary,
         extra_data: None,
     };
 
     let serialized = serde_json::to_value(&output).unwrap();
-    assert_eq!(serialized["id"], "op-uuid-456");
-    assert_eq!(serialized["status"], "complete");
-    assert_eq!(
-        serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
-    // Must NOT have drift names
-    assert!(serialized.get("spaceUri").is_none());
-
-    let deserialized: CreateCircleOutput<String> = serde_json::from_value(serialized).unwrap();
-    assert_eq!(deserialized.value.status, OperationStatus::Complete);
-    assert_eq!(
-        deserialized.value.space.unwrap().as_str(),
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
+    assert_eq!(serialized["circle"]["circleId"], "3l7aaaaaaaaaa");
+    assert_eq!(serialized["circle"]["name"], "Test Circle");
+    assert_eq!(serialized["circle"]["owner"], "did:plc:alice");
+    assert_eq!(serialized["circle"]["memberCount"], 5);
+    assert_eq!(serialized["circle"]["muted"], false);
+    // Must NOT contain removed fields
+    assert!(serialized["circle"].get("members").is_none());
+    assert!(serialized["circle"].get("accessState").is_none());
 }
 
 #[test]
-fn test_update_member_contract_serialization() {
-    let space_ref: SpaceRef<String> =
-        SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
-    let input_add: UpdateMember<String> = UpdateMember {
-        action: MemberAction::Add,
-        member_did: Did::new("did:plc:dave".to_string()).unwrap(),
-        space: space_ref.clone(),
+fn test_circle_summary_contract() {
+    let summary = CircleSummary {
+        circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
+        uri: AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap(),
+        name: SmolStr::new("Alice's Inner Circle"),
+        owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
+        member_count: Some(42),
+        muted: Some(true),
         extra_data: None,
     };
 
-    let serialized_add = serde_json::to_value(&input_add).unwrap();
-    assert_eq!(serialized_add["action"], "add");
-    assert_eq!(serialized_add["memberDid"], "did:plc:dave");
-    assert_eq!(
-        serialized_add["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
-    assert!(serialized_add.get("spaceUri").is_none());
-    assert!(serialized_add.get("member").is_none());
+    let serialized = serde_json::to_value(&summary).unwrap();
+    assert_eq!(serialized["circleId"], "3l7aaaaaaaaaa");
+    assert_eq!(serialized["uri"], "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
+    assert_eq!(serialized["name"], "Alice's Inner Circle");
+    assert_eq!(serialized["owner"], "did:plc:alice");
+    assert_eq!(serialized["memberCount"], 42);
+    assert_eq!(serialized["muted"], true);
 
-    let input_remove: UpdateMember<String> = UpdateMember {
-        action: MemberAction::Remove,
-        member_did: Did::new("did:plc:bob".to_string()).unwrap(),
-        space: space_ref.clone(),
-        extra_data: None,
-    };
-    let serialized_remove = serde_json::to_value(&input_remove).unwrap();
-    assert_eq!(serialized_remove["action"], "remove");
-    assert_eq!(serialized_remove["memberDid"], "did:plc:bob");
-
-    let output: UpdateMemberOutput<String> = UpdateMemberOutput {
-        value: Operation {
-            id: "op-uuid-update".to_string(),
-            status: OperationStatus::Complete,
-            space: Some(space_ref),
-            error: None,
-            extra_data: None,
-        },
-        extra_data: None,
-    };
-    let serialized_out = serde_json::to_value(&output).unwrap();
-    assert_eq!(serialized_out["id"], "op-uuid-update");
-    assert_eq!(serialized_out["status"], "complete");
+    let json_str = serde_json::to_string(&summary).unwrap();
+    let deserialized: CircleSummary = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(deserialized.circle_id.as_str(), "3l7aaaaaaaaaa");
+    assert_eq!(deserialized.member_count, Some(42));
+    assert_eq!(deserialized.muted, Some(true));
 }
 
 #[test]
-fn test_activate_space_contract_serialization() {
-    let space_ref: SpaceRef<String> =
-        SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
-    let input: ActivateSpace<String> = ActivateSpace {
-        space: space_ref,
-        extra_data: None,
-    };
+fn test_report_record_reason_open_union() {
+    let reason_spam: ReportRecordReason = serde_json::from_value(json!("spam")).unwrap();
+    assert_eq!(reason_spam, ReportRecordReason::Spam);
 
-    let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(
-        serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
+    let reason_abuse: ReportRecordReason = serde_json::from_value(json!("abuse")).unwrap();
+    assert_eq!(reason_abuse, ReportRecordReason::Abuse);
 
-    let output: ActivateSpaceOutput<String> = ActivateSpaceOutput {
-        access_state: AccessState::Active,
-        expires_at: None,
-        extra_data: None,
-    };
-    let serialized_out = serde_json::to_value(&output).unwrap();
-    assert_eq!(serialized_out["accessState"], "active");
+    let reason_other: ReportRecordReason = serde_json::from_value(json!("other")).unwrap();
+    assert_eq!(reason_other, ReportRecordReason::Other);
+
+    // Open union: unknown value deserializes into UnknownValue
+    let reason_unknown: ReportRecordReason = serde_json::from_value(json!("harassment")).unwrap();
+    match reason_unknown {
+        ReportRecordReason::UnknownValue(val) => assert_eq!(val.as_str(), "harassment"),
+        _ => panic!("Expected UnknownValue"),
+    }
 }
 
 #[test]
-fn test_get_feed_contract_parameters_and_output() {
-    let space_ref: SpaceRef<String> =
-        SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
-    let input: GetFeed<String> = GetFeed {
-        space: Some(space_ref),
-        cursor: Some("cur-123".to_string()),
+fn test_notification_reason_open_union() {
+    let reason_reply: NotificationReason = serde_json::from_value(json!("reply")).unwrap();
+    assert_eq!(reason_reply, NotificationReason::Reply);
+
+    let reason_like: NotificationReason = serde_json::from_value(json!("like")).unwrap();
+    assert_eq!(reason_like, NotificationReason::Like);
+
+    let reason_invite: NotificationReason = serde_json::from_value(json!("invite")).unwrap();
+    assert_eq!(reason_invite, NotificationReason::Invite);
+
+    // Open union: unknown value deserializes into Other
+    let reason_custom: NotificationReason = serde_json::from_value(json!("mention")).unwrap();
+    match reason_custom {
+        NotificationReason::Other(val) => assert_eq!(val.as_str(), "mention"),
+        _ => panic!("Expected Other"),
+    }
+}
+
+#[test]
+fn test_get_capabilities_output_contract() {
+    let output = GetCapabilitiesOutput {
+        enabled: true,
+        protocol_revision: SmolStr::new("89deb9faca20e56fa2a262fe9746ed52bc1095ba"),
+        supports_images: true,
+        extra_data: None,
+    };
+
+    let serialized = serde_json::to_value(&output).unwrap();
+    assert_eq!(serialized["enabled"], true);
+    assert_eq!(serialized["protocolRevision"], "89deb9faca20e56fa2a262fe9746ed52bc1095ba");
+    assert_eq!(serialized["supportsImages"], true);
+}
+
+#[test]
+fn test_get_feed_query_and_output_contract() {
+    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
+    let query = GetFeed {
+        cursor: Some(SmolStr::new("cursor123")),
         limit: Some(25),
+        space: Some(space_uri),
     };
-
-    let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(
-        serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
-    assert_eq!(serialized["cursor"], "cur-123");
+    let serialized = serde_json::to_value(&query).unwrap();
+    assert_eq!(serialized["space"], "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
     assert_eq!(serialized["limit"], 25);
+    assert_eq!(serialized["cursor"], "cursor123");
 
-    let sample_feed_json = json!({
-        "cursor": "next-cur-456",
-        "feed": [{
-            "circle": {
-                "name": "Family",
-                "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
-                "owner": "did:plc:alice",
-                "accessState": "active",
-                "members": ["did:plc:bob", "did:plc:carol"],
-                "muted": false
-            },
-            "post": {
-                "post": {
-                    "uri": "at://did:plc:alice/app.bsky.feed.post/3k123",
-                    "cid": "bafytestcid",
-                    "author": {
-                        "did": "did:plc:alice",
-                        "handle": "alice.test"
-                    },
-                    "record": {},
-                    "indexedAt": "2026-08-24T12:00:00.000Z",
-                    "likeCount": 1,
-                    "replyCount": 1
-                }
-            }
-        }]
-    });
-
-    let deserialized: GetFeedOutput<String> = serde_json::from_value(sample_feed_json).unwrap();
-    assert_eq!(deserialized.cursor.as_deref(), Some("next-cur-456"));
-    assert_eq!(deserialized.feed.len(), 1);
-    assert_eq!(deserialized.feed[0].circle.name, "Family");
-    assert_eq!(deserialized.feed[0].post.post.like_count, Some(1));
-    assert_eq!(deserialized.feed[0].post.post.reply_count, Some(1));
-}
-
-#[test]
-fn test_get_post_thread_contract_parameters_and_output() {
-    let space_ref: SpaceRef<String> =
-        SpaceRef::new("at://did:plc:alice/space/blue.catbird.circle/skey123".to_string()).unwrap();
-    let input: GetPostThread<String> = GetPostThread {
-        space: space_ref,
-        uri: AtUri::new("at://did:plc:alice/app.bsky.feed.post/3kabc".to_string())
-            .unwrap(),
-        depth: Some(6),
-        parent_height: Some(8),
+    let output = GetFeedOutput {
+        cursor: Some(SmolStr::new("next_cursor")),
+        feed: Vec::new(),
+        extra_data: None,
     };
-
-    let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(
-        serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
-    assert_eq!(
-        serialized["uri"],
-        "at://did:plc:alice/app.bsky.feed.post/3kabc"
-    );
-    assert_eq!(serialized["depth"], 6);
-    assert_eq!(serialized["parentHeight"], 8);
-
-    let sample_thread_json = json!({
-        "circle": {
-            "name": "Family",
-            "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
-            "owner": "did:plc:alice",
-            "accessState": "active"
-        },
-        "thread": {
-            "post": {
-                "uri": "at://did:plc:alice/app.bsky.feed.post/3kabc",
-                "cid": "bafytestcid",
-                "author": {
-                    "did": "did:plc:alice",
-                    "handle": "alice.test"
-                },
-                "record": {},
-                "indexedAt": "2026-08-24T12:00:00.000Z",
-                "likeCount": 1,
-                "replyCount": 1
-            }
-        }
-    });
-
-    let deserialized: GetPostThreadOutput<String> =
-        serde_json::from_value(sample_thread_json).unwrap();
-    assert_eq!(deserialized.circle.name, "Family");
-    assert_eq!(
-        deserialized.thread.post.uri.as_str(),
-        "at://did:plc:alice/app.bsky.feed.post/3kabc"
-    );
+    let out_ser = serde_json::to_value(&output).unwrap();
+    assert_eq!(out_ser["cursor"], "next_cursor");
+    assert_eq!(out_ser["feed"], json!([]));
 }
 
 #[test]
-fn test_get_media_contract_parameters() {
-    let space_ref =
-        SpaceRef::new(catbird_atproto::jacquard_common::DefaultStr::from("at://did:plc:alice/space/blue.catbird.circle/skey123")).unwrap();
-    let input = GetMedia {
-        space: space_ref,
-        did: Did::new(catbird_atproto::jacquard_common::DefaultStr::from("did:plc:alice")).unwrap(),
-        cid: Cid::from(String::from("bafkreibm4k")),
-    };
-    let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(
-        serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/skey123"
-    );
-    assert_eq!(serialized["did"], "did:plc:alice");
-    assert_eq!(serialized["cid"], "bafkreibm4k");
-    assert!(serialized.get("authorDid").is_none());
-}
-
-#[test]
-fn test_list_notifications_contract_parameters_and_output() {
-    let input: ListNotifications<String> = ListNotifications {
-        cursor: Some("notif-cur-1".to_string()),
+fn test_list_circles_query_and_output_contract() {
+    let query = ListCircles {
+        cursor: Some(SmolStr::new("cursor_c")),
         limit: Some(10),
     };
-    let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(serialized["cursor"], "notif-cur-1");
+    let serialized = serde_json::to_value(&query).unwrap();
     assert_eq!(serialized["limit"], 10);
+    assert_eq!(serialized["cursor"], "cursor_c");
 
-    let sample_notifs_json = json!({
-        "cursor": "next-notif",
-        "notifications": [
-            {
-                "id": "notif-uuid-1",
-                "reason": "reply",
-                "actor": {
-                    "did": "did:plc:bob",
-                    "handle": "bob.test"
-                },
-                "circle": {
-                    "name": "Family",
-                    "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
-                    "owner": "did:plc:alice",
-                    "accessState": "active"
-                },
-                "subject": "at://did:plc:alice/app.bsky.feed.post/3k123",
-                "indexedAt": "2026-08-24T12:00:00.000Z"
-            },
-            {
-                "id": "notif-uuid-2",
-                "reason": "like",
-                "actor": {
-                    "did": "did:plc:carol",
-                    "handle": "carol.test"
-                },
-                "circle": {
-                    "name": "Family",
-                    "uri": "at://did:plc:alice/space/blue.catbird.circle/skey123",
-                    "owner": "did:plc:alice",
-                    "accessState": "active"
-                },
-                "subject": "at://did:plc:alice/app.bsky.feed.post/3k123",
-                "indexedAt": "2026-08-24T12:01:00.000Z"
-            }
-        ]
-    });
-
-    let deserialized: ListNotificationsOutput<String> =
-        serde_json::from_value(sample_notifs_json).unwrap();
-    assert_eq!(deserialized.cursor.as_deref(), Some("next-notif"));
-    assert_eq!(deserialized.notifications.len(), 2);
-    assert_eq!(deserialized.notifications[0].reason, NotificationReason::Reply);
-    assert_eq!(
-        deserialized.notifications[0].actor.did.as_str(),
-        "did:plc:bob"
-    );
-    assert_eq!(deserialized.notifications[1].reason, NotificationReason::Like);
-    assert_eq!(
-        deserialized.notifications[1].actor.did.as_str(),
-        "did:plc:carol"
-    );
+    let output = ListCirclesOutput {
+        circles: Vec::new(),
+        cursor: Some(SmolStr::new("next_cursor_c")),
+        extra_data: None,
+    };
+    let out_ser = serde_json::to_value(&output).unwrap();
+    assert_eq!(out_ser["cursor"], "next_cursor_c");
+    assert_eq!(out_ser["circles"], json!([]));
 }
 
 #[test]
-fn test_get_operation_contract() {
-    let input: GetOperation<String> = GetOperation {
-        id: "op-uuid-789".to_string(),
+fn test_list_notifications_query_and_output_contract() {
+    let query = ListNotifications {
+        cursor: Some(SmolStr::new("cursor_n")),
+        limit: Some(20),
     };
-    let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(serialized["id"], "op-uuid-789");
+    let serialized = serde_json::to_value(&query).unwrap();
+    assert_eq!(serialized["limit"], 20);
+    assert_eq!(serialized["cursor"], "cursor_n");
 
-    let output: GetOperationOutput<String> = GetOperationOutput {
-        value: Operation {
-            id: "op-uuid-789".to_string(),
-            status: OperationStatus::Pending,
-            space: None,
-            error: None,
-            extra_data: None,
-        },
+    let output = ListNotificationsOutput {
+        cursor: Some(SmolStr::new("next_cursor_n")),
+        notifications: Vec::new(),
         extra_data: None,
     };
-    let serialized_out = serde_json::to_value(&output).unwrap();
-    assert_eq!(serialized_out["id"], "op-uuid-789");
-    assert_eq!(serialized_out["status"], "pending");
+    let out_ser = serde_json::to_value(&output).unwrap();
+    assert_eq!(out_ser["cursor"], "next_cursor_n");
+    assert_eq!(out_ser["notifications"], json!([]));
+}
+
+#[test]
+fn test_get_media_and_post_thread_contract() {
+    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
+    let aturi = AtUri::new(SmolStr::new("at://did:plc:alice/app.bsky.feed.post/3l7rkey")).unwrap();
+    let did = Did::new(SmolStr::new("did:plc:alice")).unwrap();
+    let media = GetMedia {
+        cid: Cid::new(b"bafkreibblob").unwrap(),
+        did,
+        space: space_uri.clone(),
+    };
+    let media_ser = serde_json::to_value(&media).unwrap();
+    assert_eq!(media_ser["cid"], "bafkreibblob");
+    assert_eq!(media_ser["did"], "did:plc:alice");
+
+    let thread_query = GetPostThread {
+        depth: Some(10),
+        parent_height: Some(80),
+        space: space_uri,
+        uri: aturi,
+    };
+    let thread_ser = serde_json::to_value(&thread_query).unwrap();
+    assert_eq!(thread_ser["depth"], 10);
+    assert_eq!(thread_ser["parentHeight"], 80);
+}
+
+#[test]
+fn test_moderation_and_preferences_contract() {
+    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
+    let aturi = AtUri::new(SmolStr::new("at://did:plc:alice/app.bsky.feed.post/3l7rkey")).unwrap();
+
+    let report = ReportRecord {
+        details: Some(SmolStr::new("Inappropriate content")),
+        reason: ReportRecordReason::Abuse,
+        space: space_uri.clone(),
+        uri: aturi,
+        extra_data: None,
+    };
+    let report_ser = serde_json::to_value(&report).unwrap();
+    assert_eq!(report_ser["reason"], "abuse");
+    assert_eq!(report_ser["details"], "Inappropriate content");
+
+    let pref = UpdatePreferences {
+        muted: true,
+        space: space_uri,
+        extra_data: None,
+    };
+    let pref_ser = serde_json::to_value(&pref).unwrap();
+    assert_eq!(pref_ser["muted"], true);
+
+    let pref_out = UpdatePreferencesOutput::<SmolStr> {
+        muted: true,
+        extra_data: None,
+    };
+    let pref_out_ser = serde_json::to_value(&pref_out).unwrap();
+    assert_eq!(pref_out_ser["muted"], true);
 }

@@ -23,8 +23,6 @@ fn documented(var: &str) -> bool {
 fn env_example_documents_all_required_variables() {
     for var in [
         "CIRCLE_MEDIA_BASE_URL",
-        "NEST_CLIENT_ID",
-        "NEST_JWKS_URL",
     ] {
         assert!(
             documented(var),
@@ -42,6 +40,8 @@ fn env_example_documents_base_variables() {
         "CIRCLE_APPVIEW_PORT",
         "DATABASE_URL",
         "SERVICE_DID",
+        "APPVIEW_BASE_URL",
+        "APPVIEW_CLIENT_ID",
         "PLC_DIRECTORY_URL",
         "PUBLIC_APPVIEW_URL",
         "RUST_LOG",
@@ -53,14 +53,13 @@ fn env_example_documents_base_variables() {
     }
 }
 
-/// The fail-closed push block must remain documented alongside the base vars.
+/// The direct push block must remain documented alongside the base vars.
 #[test]
 fn env_example_documents_push_block() {
     let example = example();
     for var in [
-        "NEST_PUSH_URL",
-        "NEST_PUSH_AUDIENCE",
-        "NEST_PUSH_SERVICE_DID",
+        "PUSH_URL",
+        "PUSH_AUDIENCE",
         "PUSH_KEY_ID",
         "PUSH_SIGNING_KEY_PATH",
         "PUSH_SIGNING_KEY_HEX",
@@ -70,8 +69,18 @@ fn env_example_documents_push_block() {
             "push variable {var} is missing from .env.example push block"
         );
     }
+}
+
+/// Verify that .env.example contains no stale singular #atproto_circle references.
+#[test]
+fn env_example_uses_atproto_circles_plural() {
+    let example = example();
     assert!(
-        example.contains("fail-closed"),
-        "push block must document its fail-closed behavior"
+        !example.contains("#atproto_circle\n") && !example.contains("#atproto_circle "),
+        ".env.example must not contain stale singular #atproto_circle references"
+    );
+    assert!(
+        example.contains("SERVICE_DID=did:web:circles.catbird.blue#atproto_circles"),
+        ".env.example must use #atproto_circles for SERVICE_DID"
     );
 }

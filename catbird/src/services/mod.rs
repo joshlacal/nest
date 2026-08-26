@@ -2,9 +2,6 @@
 //!
 //! Business logic and external service integrations.
 
-pub mod circle;
-mod circle_capability;
-pub mod client_attestation;
 mod atproto_client;
 pub mod chat_poll;
 mod crypto;
@@ -27,9 +24,5 @@ pub use mls_auth::{
 };
 pub use push::PushServices;
 pub use redis_auth_store::RedisAuthStore;
-pub use circle::CircleService;
-pub use circle_capability::{AtProtoCircleProbe, CircleCapability, CircleCapabilityService, CircleProbe, CircleProbeResult};
-pub use crate::models::require_circle_scopes;
-pub use client_attestation::{ClientAttestationError, ClientAttestationProvider};
-pub use service_auth::{ServiceAuthProvider, CIRCLE_APPVIEW_SERVICE_REF, MLS_APPVIEW_SERVICE_REF};
+pub use service_auth::{ServiceAuthProvider, MLS_APPVIEW_SERVICE_REF};
 
