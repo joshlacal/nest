@@ -1103,16 +1103,14 @@ impl SpaceClient {
                 }
             }
 
-            let dpop_proof = crate::oauth::create_dpop_proof(&dpop_key, "GET", req_url.as_str(), Some(&token))?;
-
-            let resp = deps
-                .http_client
-                .get(req_url.as_str())
-                .header(reqwest::header::AUTHORIZATION, format!("DPoP {token}"))
-                .header("DPoP", dpop_proof)
-                .send()
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to fetch listMembers: {e}")))?;
+            let resp = crate::oauth::get_with_dpop(
+                &deps.http_client,
+                &dpop_key,
+                req_url.as_str(),
+                &token,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to fetch listMembers: {e}")))?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1178,16 +1176,14 @@ impl SpaceClient {
             .map_err(|e| AppError::InvalidRequest(format!("Invalid XRPC URL: {e}")))?;
         req_url.query_pairs_mut().append_pair("space", space);
 
-        let dpop_proof = crate::oauth::create_dpop_proof(&dpop_key, "GET", req_url.as_str(), Some(&token))?;
-
-        let resp = deps
-            .http_client
-            .get(req_url.as_str())
-            .header(reqwest::header::AUTHORIZATION, format!("DPoP {token}"))
-            .header("DPoP", dpop_proof)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to fetch getSpace: {e}")))?;
+        let resp = crate::oauth::get_with_dpop(
+            &deps.http_client,
+            &dpop_key,
+            req_url.as_str(),
+            &token,
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch getSpace: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

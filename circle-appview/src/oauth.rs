@@ -351,28 +351,25 @@ impl OAuthService {
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
         let client_assertion = self.create_client_assertion(&pending.token_endpoint)?;
 
-        let dpop_proof = create_dpop_proof(&dpop_key, "POST", &pending.token_endpoint, None)?;
-
-        let params = [
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("code_verifier", pending.code_verifier.as_str()),
-            ("client_id", self.client_id.as_str()),
-            (
-                "client_assertion_type",
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            ),
-            ("client_assertion", client_assertion.as_str()),
-        ];
-
-        let response = http_client
-            .post(&pending.token_endpoint)
-            .header("DPoP", dpop_proof)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?;
+        let response = post_form_with_dpop(
+            http_client,
+            &dpop_key,
+            &pending.token_endpoint,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("code_verifier", pending.code_verifier.as_str()),
+                ("client_id", self.client_id.as_str()),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", client_assertion.as_str()),
+            ],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -449,27 +446,25 @@ impl OAuthService {
 
         let refresh_token = refresh_token.unwrap();
         let new_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
-        let dpop_proof = create_dpop_proof(&new_dpop_key, "POST", &token_endpoint, None)?;
         let client_assertion = self.create_client_assertion(&token_endpoint)?;
 
-        let params = [
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-            ("client_id", self.client_id.as_str()),
-            (
-                "client_assertion_type",
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            ),
-            ("client_assertion", client_assertion.as_str()),
-        ];
-
-        let response = http_client
-            .post(&token_endpoint)
-            .header("DPoP", dpop_proof)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("Token refresh request error: {e}")))?;
+        let response = post_form_with_dpop(
+            http_client,
+            &new_dpop_key,
+            &token_endpoint,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.as_str()),
+                ("client_id", self.client_id.as_str()),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", client_assertion.as_str()),
+            ],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("Token refresh request error: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -610,11 +605,62 @@ impl OAuthService {
     }
 }
 
+/// Sends a DPoP-bound form POST, satisfying an authorization server that demands
+/// a DPoP nonce.
+///
+/// RFC 9449 §8: the server may reject a request with 400 `use_dpop_nonce` and
+/// supply a `DPoP-Nonce` header, and the client MUST retry with that nonce in
+/// the proof. atproto authorization servers require this, so the unnonced first
+/// attempt is the expected path, not an error worth surfacing.
+async fn post_form_with_dpop(
+    http_client: &reqwest::Client,
+    key: &p256::ecdsa::SigningKey,
+    url: &str,
+    params: &[(&str, &str)],
+) -> Result<reqwest::Response, AppError> {
+    let send = |proof: String| {
+        http_client
+            .post(url)
+            .header("DPoP", proof)
+            .form(params)
+            .send()
+    };
+
+    let first = send(create_dpop_proof(key, "POST", url, None, None)?)
+        .await
+        .map_err(|e| AppError::Internal(format!("DPoP request failed: {e}")))?;
+
+    if first.status() != reqwest::StatusCode::BAD_REQUEST {
+        return Ok(first);
+    }
+
+    // Capture the nonce before consuming the body.
+    let nonce = first
+        .headers()
+        .get("DPoP-Nonce")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = first.text().await.unwrap_or_default();
+
+    let needs_nonce = body.contains("use_dpop_nonce");
+    match (needs_nonce, nonce) {
+        (true, Some(nonce)) => send(create_dpop_proof(key, "POST", url, None, Some(&nonce))?)
+            .await
+            .map_err(|e| AppError::Internal(format!("DPoP retry failed: {e}"))),
+        (true, None) => Err(AppError::Internal(
+            "Server demanded a DPoP nonce but sent no DPoP-Nonce header".into(),
+        )),
+        // A genuine 400. Rebuild an equivalent error for the caller to report.
+        (false, _) => Err(AppError::Internal(format!("400 Bad Request: {body}"))),
+    }
+}
+
 pub fn create_dpop_proof(
     key: &p256::ecdsa::SigningKey,
     method: &str,
     target_url: &str,
     access_token: Option<&str>,
+    nonce: Option<&str>,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let jti = Uuid::new_v4().to_string();
@@ -649,6 +695,10 @@ pub fn create_dpop_proof(
         claims["ath"] = serde_json::Value::String(ath);
     }
 
+    if let Some(nonce) = nonce {
+        claims["nonce"] = serde_json::Value::String(nonce.to_owned());
+    }
+
     let header_str = serde_json::to_string(&header)
         .map_err(|e| AppError::Internal(format!("DPoP header serialization: {e}")))?;
     let claims_str = serde_json::to_string(&claims)
@@ -662,6 +712,68 @@ pub fn create_dpop_proof(
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
 
     Ok(format!("{signing_input}.{sig_b64}"))
+}
+
+/// Sends a DPoP-bound GET with an access token, satisfying a resource server
+/// that demands a DPoP nonce.
+///
+/// Same RFC 9449 §8 dance as [`post_form_with_dpop`], but a resource server
+/// signals the requirement with 401 and `WWW-Authenticate: DPoP
+/// error="use_dpop_nonce"` rather than a 400 body, so both are accepted.
+pub async fn get_with_dpop(
+    http_client: &reqwest::Client,
+    key: &p256::ecdsa::SigningKey,
+    url: &str,
+    token: &str,
+) -> Result<reqwest::Response, AppError> {
+    let send = |proof: String| {
+        http_client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, format!("DPoP {token}"))
+            .header("DPoP", proof)
+            .send()
+    };
+
+    let first = send(create_dpop_proof(key, "GET", url, Some(token), None)?)
+        .await
+        .map_err(|e| AppError::Internal(format!("DPoP request failed: {e}")))?;
+
+    let status = first.status();
+    if status != reqwest::StatusCode::UNAUTHORIZED
+        && status != reqwest::StatusCode::BAD_REQUEST
+    {
+        return Ok(first);
+    }
+
+    let nonce = first
+        .headers()
+        .get("DPoP-Nonce")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let challenge = first
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+
+    // Only retry when the server actually asked for a nonce; otherwise this is a
+    // real auth failure and must surface, not be silently retried.
+    if !challenge.contains("use_dpop_nonce") {
+        let body = first.text().await.unwrap_or_default();
+        if !body.contains("use_dpop_nonce") {
+            return Err(AppError::Internal(format!("{status}: {body}")));
+        }
+    }
+
+    match nonce {
+        Some(nonce) => send(create_dpop_proof(key, "GET", url, Some(token), Some(&nonce))?)
+            .await
+            .map_err(|e| AppError::Internal(format!("DPoP retry failed: {e}"))),
+        None => Err(AppError::Internal(
+            "Server demanded a DPoP nonce but sent no DPoP-Nonce header".into(),
+        )),
+    }
 }
 
 // Axum Route Handlers
