@@ -45,11 +45,29 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let state = AppState::new(config.clone(), pool);
+    let (sweep_handle, shutdown_tx) = circle_appview::sync::spawn_revision_sweep_task(
+        state.clone(),
+        std::time::Duration::from_secs(300),
+    );
+
     let app = routes::create_router(state);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    let server = axum::serve(listener, app);
+    tokio::select! {
+        res = server => {
+            if let Err(e) = res {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutdown signal received, draining server and background tasks");
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = sweep_handle.await;
     Ok(())
 }

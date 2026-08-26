@@ -20,6 +20,7 @@ pub struct CircleProjectionOperation {
     pub last_error_code: Option<String>,
     pub execution_started_at: Option<DateTime<Utc>>,
     pub claim_token: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

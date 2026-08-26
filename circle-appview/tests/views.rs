@@ -2307,3 +2307,185 @@ async fn list_circles_excludes_deleted_and_non_members(pool: PgPool) {
     let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
     assert_eq!(list_out.circles.len(), 0);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_circles_owner_sees_created_circle_before_activation_and_unactivated_member_is_expired(pool: PgPool) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    use catbird_atproto::generated::blue_catbird::circle::defs::AccessState;
+    use uuid::Uuid;
+
+    // Create Circle via projection (no leases exist yet)
+    let proj = circle_appview::projections::Projection::CircleUpsert {
+        space: SPACE_1.to_string(),
+        authority: ALICE_DID.to_string(),
+        name: "Alice Circle".to_string(),
+        created_at: Utc::now(),
+        generation: 1,
+    };
+    circle_appview::projections::apply_projection(&pool, None, None, Uuid::new_v4(), proj, &[1u8; 32]).await.unwrap();
+
+    // Add Bob as member (unactivated invitee, no lease)
+    let member_proj = circle_appview::projections::Projection::MemberAdd {
+        space: SPACE_1.to_string(),
+        member: BOB_DID.to_string(),
+        circle_generation: 1,
+        member_generation: 1,
+    };
+    circle_appview::projections::apply_projection(&pool, None, None, Uuid::new_v4(), member_proj, &[2u8; 32]).await.unwrap();
+    // 1. Owner (Alice) queries before activation -> MUST see Circle with AccessState::Expired
+    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    assert_eq!(list_out.circles[0].name.as_str(), "Alice Circle");
+    assert_eq!(list_out.circles[0].owner.as_str(), ALICE_DID);
+    assert_eq!(list_out.circles[0].access_state, AccessState::Expired);
+
+    // 2. Invitee (Bob) queries before activation -> MUST see Circle with AccessState::Expired (not Active)
+    let bob_token = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    assert_eq!(list_out.circles[0].access_state, AccessState::Expired);
+
+    // 3. Alice activates (lease inserted) -> Alice now sees AccessState::Active
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+
+    let alice_token_2 = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token_2}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    assert_eq!(list_out.circles[0].access_state, AccessState::Active);
+
+    // Bob still has no lease -> Bob still sees AccessState::Expired
+    let bob_token_2 = mint_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_out: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_out.circles.len(), 1);
+    assert_eq!(list_out.circles[0].access_state, AccessState::Expired);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: PgPool) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    let fixed_time = Utc::now();
+    // Create 5 circles for Alice: two sharing the exact same timestamp to test stability
+    let spaces = [
+        ("at://did:plc:alice/space/blue.catbird.circle/circle-1", "Circle 1", fixed_time + Duration::seconds(10)),
+        ("at://did:plc:alice/space/blue.catbird.circle/circle-2", "Circle 2", fixed_time + Duration::seconds(20)),
+        ("at://did:plc:alice/space/blue.catbird.circle/circle-3", "Circle 3", fixed_time + Duration::seconds(20)), // Same timestamp as 2
+        ("at://did:plc:alice/space/blue.catbird.circle/circle-4", "Circle 4", fixed_time + Duration::seconds(30)),
+        ("at://did:plc:alice/space/blue.catbird.circle/circle-5", "Circle 5", fixed_time + Duration::seconds(40)),
+    ];
+
+    for (space_uri, name, created_at) in &spaces {
+        sqlx::query(
+            "INSERT INTO circles (space_uri, authority_did, display_name, created_at) VALUES ($1, $2, $3, $4)"
+        )
+        .bind(space_uri)
+        .bind(ALICE_DID)
+        .bind(name)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+
+    // Page 1: limit = 2
+    let req1 = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles?limit=2")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp1 = setup.app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let body1 = to_bytes(resp1.into_body(), 1024 * 1024).await.unwrap();
+    let page1: ListCirclesOutput = serde_json::from_slice(&body1).unwrap();
+    assert_eq!(page1.circles.len(), 2);
+    assert!(page1.cursor.is_some());
+    let cur1 = page1.cursor.unwrap();
+
+    // Page 2: limit = 2 with cursor from Page 1
+    let alice_token_p2 = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let req2 = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.listCircles?limit=2&cursor={cur1}"))
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token_p2}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp2 = setup.app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = to_bytes(resp2.into_body(), 1024 * 1024).await.unwrap();
+    let page2: ListCirclesOutput = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(page2.circles.len(), 2);
+    assert!(page2.cursor.is_some());
+    let cur2 = page2.cursor.unwrap();
+
+    // Page 3: limit = 2 with cursor from Page 2
+    let alice_token_p3 = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let req3 = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.listCircles?limit=2&cursor={cur2}"))
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token_p3}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp3 = setup.app.clone().oneshot(req3).await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK);
+    let body3 = to_bytes(resp3.into_body(), 1024 * 1024).await.unwrap();
+    let page3: ListCirclesOutput = serde_json::from_slice(&body3).unwrap();
+    assert_eq!(page3.circles.len(), 1);
+    assert!(page3.cursor.is_none(), "Last page must return cursor: None");
+
+    // Collect all URIs across pages
+    let mut all_uris = Vec::new();
+    all_uris.extend(page1.circles.into_iter().map(|c| c.uri.as_str().to_string()));
+    all_uris.extend(page2.circles.into_iter().map(|c| c.uri.as_str().to_string()));
+    all_uris.extend(page3.circles.into_iter().map(|c| c.uri.as_str().to_string()));
+    assert_eq!(all_uris[0], "at://did:plc:alice/space/blue.catbird.circle/circle-5");
+    assert_eq!(all_uris[1], "at://did:plc:alice/space/blue.catbird.circle/circle-4");
+    assert_eq!(all_uris[2], "at://did:plc:alice/space/blue.catbird.circle/circle-3");
+    assert_eq!(all_uris[3], "at://did:plc:alice/space/blue.catbird.circle/circle-2");
+    assert_eq!(all_uris[4], "at://did:plc:alice/space/blue.catbird.circle/circle-1");
+}

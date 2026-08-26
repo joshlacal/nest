@@ -227,7 +227,8 @@ impl CircleService {
         self.ensure_capability_and_infra(session, &dpop_data, &req_id).await?;
         let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
 
-        // 1. Generate skey and space_uri before createSpace, and persist intent first
+        // 1. Generate parent_op_id, skey and space_uri before createSpace, and persist intent first
+        let parent_op_id = Uuid::new_v4();
         let skey = Uuid::new_v4().simple().to_string();
         let pre_space_uri = format!("at://{}/space/blue.catbird.circle/{}", session.did, skey);
 
@@ -240,13 +241,14 @@ impl CircleService {
             "circleGeneration": 1
         });
         let upsert_op_id = self
-            .enqueue_projection(
+            .enqueue_projection_with_parent(
                 &session.did,
                 &session.id.to_string(),
                 &pre_space_uri,
                 CircleProjectionKind::CircleUpsert,
                 upsert_payload,
                 CircleProjectionState::Intent,
+                Some(parent_op_id),
             )
             .await?;
 
@@ -413,13 +415,14 @@ impl CircleService {
                 "memberGeneration": 1
             });
             let member_op_id = self
-                .enqueue_projection(
+                .enqueue_projection_with_parent(
                     &session.did,
                     &session.id.to_string(),
                     &space_uri,
                     CircleProjectionKind::MemberAdd,
                     member_payload,
                     CircleProjectionState::Intent,
+                    Some(parent_op_id),
                 )
                 .await?;
 
@@ -510,33 +513,70 @@ impl CircleService {
             }
         }
         // 5. Try immediate delivery of all due projections
-        let upsert_delivered = self.deliver_projection_by_id(upsert_op_id, Some(session)).await;
-        let mut all_members_delivered = true;
+        let _ = self.deliver_projection_by_id(upsert_op_id, Some(session)).await;
         for member_op_id in &successful_member_ops {
-            if !self.deliver_projection_by_id(*member_op_id, Some(session)).await {
-                all_members_delivered = false;
+            let _ = self.deliver_projection_by_id(*member_op_id, Some(session)).await;
+        }
+
+        // Aggregate status across all child rows of parent_op_id
+        let child_rows: Vec<CircleProjectionOperation> = if let Some(pool) = &self.db {
+            sqlx::query_as(
+                r#"
+                SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at
+                FROM circle_projection_outbox
+                WHERE (id = $1 OR parent_id = $1) AND actor_did = $2
+                ORDER BY created_at ASC
+                "#,
+            )
+            .bind(parent_op_id)
+            .bind(&session.did)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let mut has_failed = has_terminal_member_failure;
+        let mut first_error = None;
+        let mut all_delivered = true;
+
+        if !child_rows.is_empty() {
+            has_failed = false;
+            all_delivered = true;
+            for r in &child_rows {
+                match r.state {
+                    CircleProjectionState::Delivered => {}
+                    CircleProjectionState::Failed => {
+                        has_failed = true;
+                        all_delivered = false;
+                        if first_error.is_none() {
+                            first_error = r.last_error_code.clone().filter(|s| !s.trim().is_empty());
+                        }
+                    }
+                    _ => {
+                        all_delivered = false;
+                    }
+                }
             }
         }
 
-        let is_complete = upsert_delivered && all_members_delivered && !has_indeterminate_member && !has_terminal_member_failure;
-
-        let status = if has_terminal_member_failure {
-            OperationStatus::Failed
-        } else if is_complete {
-            OperationStatus::Complete
+        let (status, error) = if has_failed {
+            (
+                OperationStatus::Failed,
+                Some("MemberAdditionPartialFailure".into()),
+            )
+        } else if all_delivered && !has_indeterminate_member {
+            (OperationStatus::Complete, None)
         } else {
-            OperationStatus::Pending
+            (OperationStatus::Pending, None)
         };
 
         Ok(Operation {
-            id: upsert_op_id.to_string().into(),
+            id: parent_op_id.to_string().into(),
             status,
             space: Some(space_ref),
-            error: if has_terminal_member_failure {
-                Some("MemberAdditionPartialFailure".into())
-            } else {
-                None
-            },
+            error,
             extra_data: None,
         })
     }
@@ -1066,37 +1106,54 @@ impl CircleService {
             return Err(CircleError::Database("Database unavailable".into()));
         };
 
-        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
             r#"
-            SELECT state, space_uri, last_error_code
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at
             FROM circle_projection_outbox
-            WHERE id = $1 AND actor_did = $2
+            WHERE (id = $1 OR parent_id = $1) AND actor_did = $2
+            ORDER BY created_at ASC
             "#,
         )
         .bind(op_uuid)
         .bind(&session.did)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
         .map_err(|e| CircleError::Database(e.to_string()))?;
 
-        let (state_str, space_uri, last_error_code) = match row {
-            Some(r) => r,
-            None => {
-                return Err(CircleError::InvalidRequest("Operation not found".into()));
-            }
-        };
+        if rows.is_empty() {
+            return Err(CircleError::InvalidRequest("Operation not found".into()));
+        }
 
-        let space_ref = SpaceRef::new(space_uri.into()).ok();
+        let space_uri = &rows[0].space_uri;
+        let space_ref = SpaceRef::new(space_uri.clone().into()).ok();
 
-        let (status, error) = match state_str.as_str() {
-            "delivered" => (OperationStatus::Complete, None),
-            "failed" => {
-                let err_msg = last_error_code
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "OperationFailed".to_string());
-                (OperationStatus::Failed, Some(err_msg.into()))
+        let mut has_failed = false;
+        let mut first_error = None;
+        let mut all_delivered = true;
+
+        for r in &rows {
+            match r.state {
+                CircleProjectionState::Delivered => {}
+                CircleProjectionState::Failed => {
+                    has_failed = true;
+                    all_delivered = false;
+                    if first_error.is_none() {
+                        first_error = r.last_error_code.clone().filter(|s| !s.trim().is_empty());
+                    }
+                }
+                _ => {
+                    all_delivered = false;
+                }
             }
-            _ => (OperationStatus::Pending, None),
+        }
+
+        let (status, error) = if has_failed {
+            let err_msg = first_error.unwrap_or_else(|| "OperationFailed".to_string());
+            (OperationStatus::Failed, Some(err_msg.into()))
+        } else if all_delivered {
+            (OperationStatus::Complete, None)
+        } else {
+            (OperationStatus::Pending, None)
         };
 
         Ok(Operation {
@@ -1111,7 +1168,7 @@ impl CircleService {
     /// Retries an existing failed or pending operation.
     /// Binds UUID to exact authenticated actor and rebinds session.
     /// Never creates a new operation, never resubmits create/update/delete requests,
-    /// and replays the persisted desired state through the outbox machinery.
+    /// and replays the persisted desired state through the outbox machinery under CAS claim token fencing.
     pub async fn retry_operation(
         &self,
         session: &CatbirdSession,
@@ -1126,99 +1183,108 @@ impl CircleService {
             return Err(CircleError::Database("Database unavailable".into()));
         };
 
-        let row: Option<CircleProjectionOperation> = sqlx::query_as(
+        let _ = self.rebind_actor_sessions(&session.did, &session.id.to_string()).await;
+
+        let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
             r#"
-            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, created_at, updated_at
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at
             FROM circle_projection_outbox
-            WHERE id = $1 AND actor_did = $2
+            WHERE (id = $1 OR parent_id = $1) AND actor_did = $2
+            ORDER BY created_at ASC
             "#,
         )
         .bind(op_uuid)
         .bind(&session.did)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
         .map_err(|e| CircleError::Database(e.to_string()))?;
 
-        let op = match row {
-            Some(r) => r,
-            None => {
-                return Err(CircleError::InvalidRequest("Operation not found".into()));
+        if rows.is_empty() {
+            return Err(CircleError::InvalidRequest("Operation not found".into()));
+        }
+
+        let space_uri = &rows[0].space_uri;
+        let space_ref = SpaceRef::new(space_uri.clone().into()).ok();
+
+        for op in &rows {
+            if op.state == CircleProjectionState::Delivered {
+                continue;
             }
-        };
 
-        let space_ref = SpaceRef::new(op.space_uri.clone().into()).ok();
-
-        match op.state {
-            CircleProjectionState::Delivered => {
-                Ok(Operation {
-                    id: op_uuid.to_string().into(),
-                    status: OperationStatus::Complete,
-                    space: space_ref,
-                    error: None,
-                    extra_data: None,
-                })
-            }
-            CircleProjectionState::Pending | CircleProjectionState::Intent | CircleProjectionState::Executing => {
-                let _ = sqlx::query(
-                    "UPDATE circle_projection_outbox SET session_id = $1, next_attempt_at = now() WHERE id = $2 AND actor_did = $3"
-                )
-                .bind(session.id.to_string())
-                .bind(op_uuid)
-                .bind(&session.did)
-                .execute(pool)
-                .await;
-
-                let delivered = self.deliver_projection_by_id(op_uuid, Some(session)).await;
-                Ok(Operation {
-                    id: op_uuid.to_string().into(),
-                    status: if delivered {
-                        OperationStatus::Complete
-                    } else {
-                        OperationStatus::Pending
-                    },
-                    space: space_ref,
-                    error: None,
-                    extra_data: None,
-                })
-            }
-            CircleProjectionState::Failed => {
-                let updated = sqlx::query(
-                    r#"
-                    UPDATE circle_projection_outbox
-                    SET state = 'pending',
-                        attempts = 0,
-                        next_attempt_at = now(),
-                        claim_token = NULL,
-                        last_error_code = NULL,
-                        session_id = $1,
-                        updated_at = now()
-                    WHERE id = $2 AND actor_did = $3 AND state = 'failed'
-                    "#
-                )
-                .bind(session.id.to_string())
-                .bind(op_uuid)
-                .bind(&session.did)
-                .execute(pool)
-                .await;
-
-                if let Err(e) = updated {
-                    return Err(CircleError::Database(e.to_string()));
+            if op.state == CircleProjectionState::Failed
+                || op.state == CircleProjectionState::Intent
+                || op.state == CircleProjectionState::Executing
+            {
+                if let Some(claim_token) = self.claim_projection(op.id, &session.id.to_string()).await? {
+                    let _ = self.replay_pds_mutation(op, session, claim_token).await;
                 }
+            }
 
-                let delivered = self.deliver_projection_by_id(op_uuid, Some(session)).await;
-                Ok(Operation {
-                    id: op_uuid.to_string().into(),
-                    status: if delivered {
-                        OperationStatus::Complete
-                    } else {
-                        OperationStatus::Pending
-                    },
-                    space: space_ref,
-                    error: None,
-                    extra_data: None,
-                })
+            let current: Option<(String,)> = sqlx::query_as(
+                "SELECT state FROM circle_projection_outbox WHERE id = $1"
+            )
+            .bind(op.id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+
+            if let Some((st,)) = current {
+                if st == "pending" {
+                    self.deliver_projection_by_id(op.id, Some(session)).await;
+                }
             }
         }
+
+        let updated_rows: Vec<CircleProjectionOperation> = sqlx::query_as(
+            r#"
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at
+            FROM circle_projection_outbox
+            WHERE (id = $1 OR parent_id = $1) AND actor_did = $2
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(op_uuid)
+        .bind(&session.did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| CircleError::Database(e.to_string()))?;
+
+        let mut has_failed = false;
+        let mut first_error = None;
+        let mut all_delivered = true;
+
+        for r in &updated_rows {
+            match r.state {
+                CircleProjectionState::Delivered => {}
+                CircleProjectionState::Failed => {
+                    has_failed = true;
+                    all_delivered = false;
+                    if first_error.is_none() {
+                        first_error = r.last_error_code.clone().filter(|s| !s.trim().is_empty());
+                    }
+                }
+                _ => {
+                    all_delivered = false;
+                }
+            }
+        }
+
+        let (status, error) = if has_failed {
+            let err_msg = first_error.unwrap_or_else(|| "OperationFailed".to_string());
+            (OperationStatus::Failed, Some(err_msg.into()))
+        } else if all_delivered {
+            (OperationStatus::Complete, None)
+        } else {
+            (OperationStatus::Pending, None)
+        };
+
+        Ok(Operation {
+            id: op_uuid.to_string().into(),
+            status,
+            space: space_ref,
+            error,
+            extra_data: None,
+        })
     }
 
     /// Activate a Space:
@@ -1656,9 +1722,9 @@ impl CircleService {
         }
     }
 
-    /// Enqueue a projection operation to `circle_projection_outbox`.
+    /// Enqueue a projection operation to `circle_projection_outbox` with an optional parent_id.
     /// Guarantees idempotency via unique `operation_key`.
-    pub async fn enqueue_projection(
+    pub async fn enqueue_projection_with_parent(
         &self,
         actor_did: &str,
         session_id: &str,
@@ -1666,6 +1732,7 @@ impl CircleService {
         kind: CircleProjectionKind,
         payload: serde_json::Value,
         state: CircleProjectionState,
+        parent_id: Option<Uuid>,
     ) -> Result<Uuid, CircleError> {
         let op_key = calculate_operation_key(actor_did, space_uri, kind, &payload);
         let id = Uuid::new_v4();
@@ -1674,12 +1741,13 @@ impl CircleService {
             let row_id: (Uuid,) = sqlx::query_as(
                 r#"
                 INSERT INTO circle_projection_outbox (
-                    id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, created_at, updated_at
+                    id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, parent_id, created_at, updated_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, 0, now(), now(), now()
+                    $1, $2, $3, $4, $5, $6, $7, $8, 0, now(), $9, now(), now()
                 )
                 ON CONFLICT (operation_key) DO UPDATE
-                    SET session_id = EXCLUDED.session_id
+                    SET session_id = EXCLUDED.session_id,
+                        parent_id = COALESCE(circle_projection_outbox.parent_id, EXCLUDED.parent_id)
                 RETURNING id
                 "#,
             )
@@ -1691,6 +1759,7 @@ impl CircleService {
             .bind(kind.as_str())
             .bind(&payload)
             .bind(state.as_str())
+            .bind(parent_id)
             .fetch_one(pool)
             .await?;
 
@@ -1700,6 +1769,20 @@ impl CircleService {
                 "Circle projection outbox database is not available".into(),
             ))
         }
+    }
+
+    /// Enqueue a projection operation to `circle_projection_outbox`.
+    /// Guarantees idempotency via unique `operation_key`.
+    pub async fn enqueue_projection(
+        &self,
+        actor_did: &str,
+        session_id: &str,
+        space_uri: &str,
+        kind: CircleProjectionKind,
+        payload: serde_json::Value,
+        state: CircleProjectionState,
+    ) -> Result<Uuid, CircleError> {
+        self.enqueue_projection_with_parent(actor_did, session_id, space_uri, kind, payload, state, None).await
     }
 
     /// Attempts immediate delivery of a single projection by ID.
@@ -1713,7 +1796,7 @@ impl CircleService {
         };
 
         let row: Option<CircleProjectionOperation> = match sqlx::query_as(
-            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, created_at, updated_at FROM circle_projection_outbox WHERE id = $1"
+            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at FROM circle_projection_outbox WHERE id = $1"
         )
         .bind(id)
         .fetch_optional(pool)
@@ -1767,7 +1850,7 @@ impl CircleService {
         let mut tx = pool.begin().await?;
 
         let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
-            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, created_at, updated_at FROM circle_projection_outbox WHERE state = 'pending' AND next_attempt_at <= now() ORDER BY next_attempt_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED"
+            "SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at FROM circle_projection_outbox WHERE state = 'pending' AND next_attempt_at <= now() ORDER BY next_attempt_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED"
         )
         .bind(batch_size)
         .fetch_all(&mut *tx)
@@ -1839,7 +1922,7 @@ impl CircleService {
         // 1. List stale candidate rows without bulk lease
         let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
             r#"
-            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, created_at, updated_at
+            SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at
             FROM circle_projection_outbox
             WHERE (state = 'intent' AND (created_at < now() - interval '30 seconds' OR updated_at < now() - interval '30 seconds'))
                OR (state = 'executing' AND (execution_started_at IS NULL OR execution_started_at < now() - interval '30 seconds'))
@@ -1868,325 +1951,350 @@ impl CircleService {
                 None => continue,
             };
 
-            let atproto = AtProtoClient::new(self.state.clone());
-            let dpop_data = self.resolve_dpop_data(&session).await;
-
-            match op.kind {
-                CircleProjectionKind::CircleUpsert => {
-                    let query = format!(
-                        "space={}&repo={}&collection=blue.catbird.circle.metadata&rkey=self",
-                        urlencoding::encode(&op.space_uri),
-                        urlencoding::encode(&op.actor_did)
-                    );
-                    let resp = atproto.proxy_request(
-                        &session,
-                        reqwest::Method::GET,
-                        "/xrpc/com.atproto.space.getRecord",
-                        Some(&query),
-                        None,
-                        None,
-                        None,
-                        "reconcile-check-metadata",
-                        Some(&dpop_data),
-                    ).await;
-
-                    let metadata_exists = match resp {
-                        Ok(r) => {
-                            let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                            (200..300).contains(&status)
-                        }
-                        Err(_) => false,
-                    };
-
-                    if metadata_exists {
-                        if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
-                            reconciled_count += 1;
-                        }
-                        continue;
-                    }
-
-                    let skey = op.space_uri.rsplit('/').next().unwrap_or("circle");
-                    let client_id = self.state.config.oauth.client_id.clone();
-                    let create_space_payload = serde_json::json!({
-                        "type": "blue.catbird.circle",
-                        "skey": skey,
-                        "policy": {
-                            "$type": "com.atproto.simplespace.defs#memberListPolicy"
-                        },
-                        "appAccess": {
-                            "$type": "com.atproto.simplespace.defs#allowList",
-                            "allowed": [client_id]
-                        }
-                    });
-
-                    if let Ok(create_bytes) = serde_json::to_vec(&create_space_payload) {
-                        let create_resp = atproto.proxy_request(
-                            &session,
-                            reqwest::Method::POST,
-                            "/xrpc/com.atproto.simplespace.createSpace",
-                            None,
-                            Some(Bytes::from(create_bytes)),
-                            Some("application/json"),
-                            None,
-                            "reconcile-create-space",
-                            Some(&dpop_data),
-                        ).await;
-
-                        let space_created = match create_resp {
-                            Ok(r) => {
-                                let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                                if (200..300).contains(&status) {
-                                    true
-                                } else {
-                                    let err_text = String::from_utf8_lossy(&body);
-                                    if err_text.to_lowercase().contains("already exists") || status == 409 {
-                                        true
-                                    } else if is_retryable_status(status) {
-                                        self.record_indeterminate_transport_error(
-                                            op.id,
-                                            &format!("Reconciliation createSpace server/retryable error ({status}): {err_text}"),
-                                            Some(claim_token),
-                                        ).await;
-                                        false
-                                    } else {
-                                        let _ = self.set_projection_state(
-                                            op.id,
-                                            CircleProjectionState::Failed,
-                                            Some(&format!("Reconciliation createSpace error ({status}): {err_text}")),
-                                            Some(claim_token),
-                                        ).await;
-                                        false
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                self.record_indeterminate_transport_error(
-                                    op.id,
-                                    &format!("Reconciliation createSpace network error: {e}"),
-                                    Some(claim_token),
-                                ).await;
-                                false
-                            }
-                        };
-
-                        if space_created {
-                            let circle_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
-                            let now_str = Utc::now().to_rfc3339();
-                            let put_record_body = serde_json::json!({
-                                "space": &op.space_uri,
-                                "repo": session.did,
-                                "collection": "blue.catbird.circle.metadata",
-                                "rkey": "self",
-                                "record": {
-                                    "$type": "blue.catbird.circle.metadata",
-                                    "name": circle_name,
-                                    "createdAt": now_str
-                                }
-                            });
-                            if let Ok(put_bytes) = serde_json::to_vec(&put_record_body) {
-                                let put_resp = atproto.proxy_request(
-                                    &session,
-                                    reqwest::Method::POST,
-                                    "/xrpc/com.atproto.space.putRecord",
-                                    None,
-                                    Some(Bytes::from(put_bytes)),
-                                    Some("application/json"),
-                                    None,
-                                    "reconcile-create-metadata",
-                                    Some(&dpop_data),
-                                ).await;
-
-                                match put_resp {
-                                    Ok(r) => {
-                                        let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                                        if (200..300).contains(&status) {
-                                            if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
-                                                reconciled_count += 1;
-                                            }
-                                        } else if is_retryable_status(status) {
-                                            let err_text = String::from_utf8_lossy(&body);
-                                            self.record_indeterminate_transport_error(
-                                                op.id,
-                                                &format!("Reconciliation putRecord server/retryable error ({status}): {err_text}"),
-                                                Some(claim_token),
-                                            ).await;
-                                        } else {
-                                            let err_text = String::from_utf8_lossy(&body);
-                                            let _ = self.set_projection_state(
-                                                op.id,
-                                                CircleProjectionState::Failed,
-                                                Some(&format!("Reconciliation putRecord error ({status}): {err_text}")),
-                                                Some(claim_token),
-                                            ).await;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.record_indeterminate_transport_error(
-                                            op.id,
-                                            &format!("Reconciliation putRecord network error: {e}"),
-                                            Some(claim_token),
-                                        ).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                CircleProjectionKind::MemberAdd => {
-                    let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
-                    let add_body = serde_json::json!({
-                        "space": &op.space_uri,
-                        "did": member_did
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&add_body) {
-                        let add_resp = atproto.proxy_request(
-                            &session,
-                            reqwest::Method::POST,
-                            "/xrpc/com.atproto.simplespace.addMember",
-                            None,
-                            Some(Bytes::from(bytes)),
-                            Some("application/json"),
-                            None,
-                            "reconcile-add-member",
-                            Some(&dpop_data),
-                        ).await;
-                        match add_resp {
-                            Ok(r) => {
-                                let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                                let body_text = String::from_utf8_lossy(&body);
-                                if (200..300).contains(&status) || body_text.to_lowercase().contains("already") || status == 409 {
-                                    if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
-                                        reconciled_count += 1;
-                                    }
-                                } else if is_retryable_status(status) {
-                                    self.record_indeterminate_transport_error(
-                                        op.id,
-                                        &format!("Reconciliation addMember server/retryable error ({status}): {body_text}"),
-                                        Some(claim_token),
-                                    ).await;
-                                } else {
-                                    let _ = self.set_projection_state(
-                                        op.id,
-                                        CircleProjectionState::Failed,
-                                        Some(&format!("Reconciliation addMember error ({status}): {body_text}")),
-                                        Some(claim_token),
-                                    ).await;
-                                }
-                            }
-                            Err(e) => {
-                                self.record_indeterminate_transport_error(
-                                    op.id,
-                                    &format!("Reconciliation addMember network error: {e}"),
-                                    Some(claim_token),
-                                ).await;
-                            }
-                        }
-                    }
-                }
-                CircleProjectionKind::MemberRemove => {
-                    let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
-                    let remove_body = serde_json::json!({
-                        "space": &op.space_uri,
-                        "did": member_did
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&remove_body) {
-                        let remove_resp = atproto.proxy_request(
-                            &session,
-                            reqwest::Method::POST,
-                            "/xrpc/com.atproto.simplespace.removeMember",
-                            None,
-                            Some(Bytes::from(bytes)),
-                            Some("application/json"),
-                            None,
-                            "reconcile-remove-member",
-                            Some(&dpop_data),
-                        ).await;
-                        match remove_resp {
-                            Ok(r) => {
-                                let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                                let body_text = String::from_utf8_lossy(&body);
-                                if (200..300).contains(&status) || status == 404 || body_text.to_lowercase().contains("not found") || body_text.to_lowercase().contains("not a member") {
-                                    if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
-                                        reconciled_count += 1;
-                                    }
-                                } else if is_retryable_status(status) {
-                                    self.record_indeterminate_transport_error(
-                                        op.id,
-                                        &format!("Reconciliation removeMember server/retryable error ({status}): {body_text}"),
-                                        Some(claim_token),
-                                    ).await;
-                                } else {
-                                    let _ = self.set_projection_state(
-                                        op.id,
-                                        CircleProjectionState::Failed,
-                                        Some(&format!("Reconciliation removeMember error ({status}): {body_text}")),
-                                        Some(claim_token),
-                                    ).await;
-                                }
-                            }
-                            Err(e) => {
-                                self.record_indeterminate_transport_error(
-                                    op.id,
-                                    &format!("Reconciliation removeMember network error: {e}"),
-                                    Some(claim_token),
-                                ).await;
-                            }
-                        }
-                    }
-                }
-                CircleProjectionKind::CircleDelete => {
-                    let delete_body = serde_json::json!({
-                        "space": &op.space_uri
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&delete_body) {
-                        let del_resp = atproto.proxy_request(
-                            &session,
-                            reqwest::Method::POST,
-                            "/xrpc/com.atproto.simplespace.deleteSpace",
-                            None,
-                            Some(Bytes::from(bytes)),
-                            Some("application/json"),
-                            None,
-                            "reconcile-delete-space",
-                            Some(&dpop_data),
-                        ).await;
-                        match del_resp {
-                            Ok(r) => {
-                                let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                                let body_text = String::from_utf8_lossy(&body);
-                                if (200..300).contains(&status) || status == 404 || body_text.to_lowercase().contains("not found") {
-                                    if self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await? {
-                                        reconciled_count += 1;
-                                    }
-                                } else if is_retryable_status(status) {
-                                    self.record_indeterminate_transport_error(
-                                        op.id,
-                                        &format!("Reconciliation deleteSpace server/retryable error ({status}): {body_text}"),
-                                        Some(claim_token),
-                                    ).await;
-                                } else {
-                                    let _ = self.set_projection_state(
-                                        op.id,
-                                        CircleProjectionState::Failed,
-                                        Some(&format!("Reconciliation deleteSpace error ({status}): {body_text}")),
-                                        Some(claim_token),
-                                    ).await;
-                                }
-                            }
-                            Err(e) => {
-                                self.record_indeterminate_transport_error(
-                                    op.id,
-                                    &format!("Reconciliation deleteSpace network error: {e}"),
-                                    Some(claim_token),
-                                ).await;
-                            }
-                        }
-                    }
-                }
+            if let Ok(true) = self.replay_pds_mutation(&op, &session, claim_token).await {
+                reconciled_count += 1;
             }
         }
 
         Ok(reconciled_count)
+    }
+
+    /// Replay authoritative PDS mutation for an outbox operation under CAS claim token fencing.
+    /// Transitions state to 'pending' upon PDS success, or 'failed' upon non-retryable PDS error.
+    /// Never delivers projections directly.
+    pub async fn replay_pds_mutation(
+        &self,
+        op: &CircleProjectionOperation,
+        session: &CatbirdSession,
+        claim_token: Uuid,
+    ) -> Result<bool, CircleError> {
+        let atproto = AtProtoClient::new(self.state.clone());
+        let dpop_data = self.resolve_dpop_data(session).await;
+
+        match op.kind {
+            CircleProjectionKind::CircleUpsert => {
+                let query = format!(
+                    "space={}&repo={}&collection=blue.catbird.circle.metadata&rkey=self",
+                    urlencoding::encode(&op.space_uri),
+                    urlencoding::encode(&op.actor_did)
+                );
+                let resp = atproto.proxy_request(
+                    session,
+                    reqwest::Method::GET,
+                    "/xrpc/com.atproto.space.getRecord",
+                    Some(&query),
+                    None,
+                    None,
+                    None,
+                    "replay-check-metadata",
+                    Some(&dpop_data),
+                ).await;
+
+                let metadata_exists = match resp {
+                    Ok(r) => {
+                        let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                        (200..300).contains(&status)
+                    }
+                    Err(_) => false,
+                };
+
+                if metadata_exists {
+                    return self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await;
+                }
+
+                let skey = op.space_uri.rsplit('/').next().unwrap_or("circle");
+                let client_id = self.state.config.oauth.client_id.clone();
+                let create_space_payload = serde_json::json!({
+                    "type": "blue.catbird.circle",
+                    "skey": skey,
+                    "policy": {
+                        "$type": "com.atproto.simplespace.defs#memberListPolicy"
+                    },
+                    "appAccess": {
+                        "$type": "com.atproto.simplespace.defs#allowList",
+                        "allowed": [client_id]
+                    }
+                });
+
+                let create_bytes = serde_json::to_vec(&create_space_payload)
+                    .map_err(|e| CircleError::Internal(e.to_string()))?;
+
+                let create_resp = atproto.proxy_request(
+                    session,
+                    reqwest::Method::POST,
+                    "/xrpc/com.atproto.simplespace.createSpace",
+                    None,
+                    Some(Bytes::from(create_bytes)),
+                    Some("application/json"),
+                    None,
+                    "replay-create-space",
+                    Some(&dpop_data),
+                ).await;
+
+                let space_created = match create_resp {
+                    Ok(r) => {
+                        let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                        if (200..300).contains(&status) {
+                            true
+                        } else {
+                            let err_text = String::from_utf8_lossy(&body);
+                            if err_text.to_lowercase().contains("already exists") || status == 409 {
+                                true
+                            } else if is_retryable_status(status) {
+                                self.record_indeterminate_transport_error(
+                                    op.id,
+                                    &format!("Replay createSpace server/retryable error ({status}): {err_text}"),
+                                    Some(claim_token),
+                                ).await;
+                                false
+                            } else {
+                                let _ = self.set_projection_state(
+                                    op.id,
+                                    CircleProjectionState::Failed,
+                                    Some(&format!("Replay createSpace error ({status}): {err_text}")),
+                                    Some(claim_token),
+                                ).await;
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.record_indeterminate_transport_error(
+                            op.id,
+                            &format!("Replay createSpace network error: {e}"),
+                            Some(claim_token),
+                        ).await;
+                        false
+                    }
+                };
+
+                if space_created {
+                    let circle_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
+                    let now_str = Utc::now().to_rfc3339();
+                    let put_record_body = serde_json::json!({
+                        "space": &op.space_uri,
+                        "repo": session.did,
+                        "collection": "blue.catbird.circle.metadata",
+                        "rkey": "self",
+                        "record": {
+                            "$type": "blue.catbird.circle.metadata",
+                            "name": circle_name,
+                            "createdAt": now_str
+                        }
+                    });
+                    let put_bytes = serde_json::to_vec(&put_record_body)
+                        .map_err(|e| CircleError::Internal(e.to_string()))?;
+
+                    let put_resp = atproto.proxy_request(
+                        session,
+                        reqwest::Method::POST,
+                        "/xrpc/com.atproto.space.putRecord",
+                        None,
+                        Some(Bytes::from(put_bytes)),
+                        Some("application/json"),
+                        None,
+                        "replay-create-metadata",
+                        Some(&dpop_data),
+                    ).await;
+
+                    match put_resp {
+                        Ok(r) => {
+                            let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                            if (200..300).contains(&status) {
+                                self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await
+                            } else if is_retryable_status(status) {
+                                let err_text = String::from_utf8_lossy(&body);
+                                self.record_indeterminate_transport_error(
+                                    op.id,
+                                    &format!("Replay putRecord server/retryable error ({status}): {err_text}"),
+                                    Some(claim_token),
+                                ).await;
+                                Ok(false)
+                            } else {
+                                let err_text = String::from_utf8_lossy(&body);
+                                let _ = self.set_projection_state(
+                                    op.id,
+                                    CircleProjectionState::Failed,
+                                    Some(&format!("Replay putRecord error ({status}): {err_text}")),
+                                    Some(claim_token),
+                                ).await;
+                                Ok(false)
+                            }
+                        }
+                        Err(e) => {
+                            self.record_indeterminate_transport_error(
+                                op.id,
+                                &format!("Replay putRecord network error: {e}"),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        }
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            CircleProjectionKind::MemberAdd => {
+                let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+                let add_body = serde_json::json!({
+                    "space": &op.space_uri,
+                    "did": member_did
+                });
+                let bytes = serde_json::to_vec(&add_body)
+                    .map_err(|e| CircleError::Internal(e.to_string()))?;
+
+                let add_resp = atproto.proxy_request(
+                    session,
+                    reqwest::Method::POST,
+                    "/xrpc/com.atproto.simplespace.addMember",
+                    None,
+                    Some(Bytes::from(bytes)),
+                    Some("application/json"),
+                    None,
+                    "replay-add-member",
+                    Some(&dpop_data),
+                ).await;
+
+                match add_resp {
+                    Ok(r) => {
+                        let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                        let body_text = String::from_utf8_lossy(&body);
+                        if (200..300).contains(&status) || body_text.to_lowercase().contains("already") || status == 409 {
+                            self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await
+                        } else if is_retryable_status(status) {
+                            self.record_indeterminate_transport_error(
+                                op.id,
+                                &format!("Replay addMember server/retryable error ({status}): {body_text}"),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        } else {
+                            let _ = self.set_projection_state(
+                                op.id,
+                                CircleProjectionState::Failed,
+                                Some(&format!("Replay addMember error ({status}): {body_text}")),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        }
+                    }
+                    Err(e) => {
+                        self.record_indeterminate_transport_error(
+                            op.id,
+                            &format!("Replay addMember network error: {e}"),
+                            Some(claim_token),
+                        ).await;
+                        Ok(false)
+                    }
+                }
+            }
+            CircleProjectionKind::MemberRemove => {
+                let member_did = op.payload.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+                let remove_body = serde_json::json!({
+                    "space": &op.space_uri,
+                    "did": member_did
+                });
+                let bytes = serde_json::to_vec(&remove_body)
+                    .map_err(|e| CircleError::Internal(e.to_string()))?;
+
+                let remove_resp = atproto.proxy_request(
+                    session,
+                    reqwest::Method::POST,
+                    "/xrpc/com.atproto.simplespace.removeMember",
+                    None,
+                    Some(Bytes::from(bytes)),
+                    Some("application/json"),
+                    None,
+                    "replay-remove-member",
+                    Some(&dpop_data),
+                ).await;
+
+                match remove_resp {
+                    Ok(r) => {
+                        let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                        let body_text = String::from_utf8_lossy(&body);
+                        if (200..300).contains(&status) || status == 404 || body_text.to_lowercase().contains("not found") || body_text.to_lowercase().contains("not a member") {
+                            self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await
+                        } else if is_retryable_status(status) {
+                            self.record_indeterminate_transport_error(
+                                op.id,
+                                &format!("Replay removeMember server/retryable error ({status}): {body_text}"),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        } else {
+                            let _ = self.set_projection_state(
+                                op.id,
+                                CircleProjectionState::Failed,
+                                Some(&format!("Replay removeMember error ({status}): {body_text}")),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        }
+                    }
+                    Err(e) => {
+                        self.record_indeterminate_transport_error(
+                            op.id,
+                            &format!("Replay removeMember network error: {e}"),
+                            Some(claim_token),
+                        ).await;
+                        Ok(false)
+                    }
+                }
+            }
+            CircleProjectionKind::CircleDelete => {
+                let delete_body = serde_json::json!({
+                    "space": &op.space_uri
+                });
+                let bytes = serde_json::to_vec(&delete_body)
+                    .map_err(|e| CircleError::Internal(e.to_string()))?;
+
+                let del_resp = atproto.proxy_request(
+                    session,
+                    reqwest::Method::POST,
+                    "/xrpc/com.atproto.simplespace.deleteSpace",
+                    None,
+                    Some(Bytes::from(bytes)),
+                    Some("application/json"),
+                    None,
+                    "replay-delete-space",
+                    Some(&dpop_data),
+                ).await;
+
+                match del_resp {
+                    Ok(r) => {
+                        let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                        let body_text = String::from_utf8_lossy(&body);
+                        if (200..300).contains(&status) || status == 404 || body_text.to_lowercase().contains("not found") {
+                            self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await
+                        } else if is_retryable_status(status) {
+                            self.record_indeterminate_transport_error(
+                                op.id,
+                                &format!("Replay deleteSpace server/retryable error ({status}): {body_text}"),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        } else {
+                            let _ = self.set_projection_state(
+                                op.id,
+                                CircleProjectionState::Failed,
+                                Some(&format!("Replay deleteSpace error ({status}): {body_text}")),
+                                Some(claim_token),
+                            ).await;
+                            Ok(false)
+                        }
+                    }
+                    Err(e) => {
+                        self.record_indeterminate_transport_error(
+                            op.id,
+                            &format!("Replay deleteSpace network error: {e}"),
+                            Some(claim_token),
+                        ).await;
+                        Ok(false)
+                    }
+                }
+            }
+        }
     }
 
     /// Spawns a background task for processing due projections and monitors liveness.

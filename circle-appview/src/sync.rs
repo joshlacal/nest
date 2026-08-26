@@ -1203,3 +1203,46 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
 
     Ok(summary)
 }
+
+/// Spawn and retain a production revision sweep task on a repeating interval.
+/// Runs `sweep_once` on each tick, emits only content-free aggregate logs/errors,
+/// and terminates gracefully when shutdown is signaled.
+pub fn spawn_revision_sweep_task(
+    state: AppState,
+    interval_duration: std::time::Duration,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<bool>) {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval_duration);
+        // First tick completes immediately
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("Revision sweep background task shutting down");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    match sweep_once(&state).await {
+                        Ok(summary) => {
+                            tracing::info!(
+                                spaces_checked = summary.spaces_checked,
+                                repos_checked = summary.repos_checked,
+                                repos_synced = summary.repos_synced,
+                                repos_failed = summary.repos_failed,
+                                "Completed scheduled revision sweep"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(error_code = "RevisionSweepFailed", "Scheduled revision sweep failed");
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (handle, shutdown_tx)
+}

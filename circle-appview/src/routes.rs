@@ -14,8 +14,11 @@ use catbird_atproto::generated::blue_catbird::circle::{
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::string::{Datetime, Did};
 use chrono::{DateTime, Utc};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::CIRCLE_PROTOCOL_REVISION;
 use crate::access;
 use crate::auth::{self, AuthenticatedUser};
 use crate::config::AppState;
@@ -93,10 +96,30 @@ async fn health_check() -> Json<HealthResponse> {
 async fn get_capabilities() -> Json<GetCapabilitiesOutput> {
     Json(GetCapabilitiesOutput {
         enabled: true,
-        protocol_revision: "1".into(),
+        protocol_revision: CIRCLE_PROTOCOL_REVISION.into(),
         supports_images: true,
         extra_data: None,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircleListCursor {
+    pub created_at: DateTime<Utc>,
+    pub space_uri: String,
+}
+
+pub fn encode_circle_cursor(cursor: &CircleListCursor) -> String {
+    let json_bytes = serde_json::to_vec(cursor).unwrap_or_default();
+    URL_SAFE_NO_PAD.encode(json_bytes)
+}
+
+pub fn decode_circle_cursor(cursor_str: &str) -> Result<CircleListCursor, AppError> {
+    let decoded_bytes = URL_SAFE_NO_PAD
+        .decode(cursor_str)
+        .map_err(|_| AppError::InvalidRequest("Invalid cursor encoding".into()))?;
+    let cursor: CircleListCursor = serde_json::from_slice(&decoded_bytes)
+        .map_err(|_| AppError::InvalidRequest("Invalid cursor payload".into()))?;
+    Ok(cursor)
 }
 
 
@@ -114,10 +137,23 @@ async fn list_circles_handler(
         ));
     }
 
+    let cursor = match query.cursor.as_deref() {
+        Some(c) if !c.trim().is_empty() => Some(decode_circle_cursor(c)?),
+        _ => None,
+    };
+
+    let (cursor_created_at, cursor_space_uri) = match &cursor {
+        Some(c) => (Some(c.created_at), Some(c.space_uri.clone())),
+        None => (None, None),
+    };
+
+    let fetch_limit = limit + 1;
+
     let rows: Vec<(
         String,
         String,
         String,
+        DateTime<Utc>,
         bool,
         Option<DateTime<Utc>>,
     )> = sqlx::query_as(
@@ -126,26 +162,54 @@ async fn list_circles_handler(
             c.space_uri,
             c.authority_did,
             c.display_name,
+            c.created_at,
             COALESCE(pref.muted, false) AS muted,
             l.expires_at
         FROM circles c
-        JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
+        LEFT JOIN circle_members m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.status = 'active'
         LEFT JOIN access_leases l ON l.space_uri = c.space_uri AND l.member_did = $1
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $1
         WHERE c.deleted_at IS NULL
-        ORDER BY c.created_at DESC
-        LIMIT $2
+          AND (c.authority_did = $1 OR m.member_did IS NOT NULL)
+          AND (
+              $2::timestamptz IS NULL
+              OR c.created_at < $2
+              OR (c.created_at = $2 AND c.space_uri < $3)
+          )
+        ORDER BY c.created_at DESC, c.space_uri DESC
+        LIMIT $4
         "#,
     )
     .bind(&user.did)
-    .bind(limit)
+    .bind(cursor_created_at)
+    .bind(cursor_space_uri)
+    .bind(fetch_limit)
     .fetch_all(&state.db)
     .await
     .map_err(AppError::Database)?;
 
-    let mut circles = Vec::with_capacity(rows.len());
-    for (space_uri, authority_did, display_name, muted, expires_at) in rows {
-        let is_owner = user.did == authority_did;
+    let has_more = rows.len() > limit as usize;
+    let result_rows = if has_more {
+        &rows[..limit as usize]
+    } else {
+        &rows[..]
+    };
+
+    let next_cursor = if has_more {
+        result_rows.last().map(|r| {
+            encode_circle_cursor(&CircleListCursor {
+                created_at: r.3,
+                space_uri: r.0.clone(),
+            })
+        })
+    } else {
+        None
+    };
+
+    let now = Utc::now();
+    let mut circles = Vec::with_capacity(result_rows.len());
+    for (space_uri, authority_did, display_name, _created_at, muted, expires_at) in result_rows {
+        let is_owner = user.did == *authority_did;
         let members = if is_owner {
             let member_rows: Vec<(String,)> = sqlx::query_as(
                 r#"
@@ -155,7 +219,7 @@ async fn list_circles_handler(
                 ORDER BY member_did ASC
                 "#,
             )
-            .bind(&space_uri)
+            .bind(space_uri)
             .fetch_all(&state.db)
             .await
             .map_err(AppError::Database)?;
@@ -169,10 +233,9 @@ async fn list_circles_handler(
             None
         };
 
-        let now = Utc::now();
         let access_state = match expires_at {
-            Some(exp) if exp <= now => AccessState::Expired,
-            _ => AccessState::Active,
+            Some(exp) if *exp > now => AccessState::Active,
+            _ => AccessState::Expired,
         };
 
         let uri = SpaceRef::new(SmolStr::new(space_uri))
@@ -183,7 +246,7 @@ async fn list_circles_handler(
         circles.push(CircleSummary {
             access_state,
             members,
-            muted: Some(muted),
+            muted: Some(*muted),
             name: SmolStr::new(display_name),
             owner,
             uri,
@@ -193,7 +256,7 @@ async fn list_circles_handler(
 
     Ok(Json(ListCirclesOutput {
         circles,
-        cursor: None,
+        cursor: next_cursor.map(SmolStr::new),
         extra_data: None,
     }))
 }

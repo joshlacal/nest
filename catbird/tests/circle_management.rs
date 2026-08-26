@@ -2188,3 +2188,182 @@ async fn get_operation_and_retry_operation_lifecycle_and_actor_binding(pool: PgP
     let total_rows: (i64,) = sqlx::query_as("SELECT count(*) FROM circle_projection_outbox").fetch_one(&pool).await.unwrap();
     assert_eq!(total_rows.0, 2);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_circle_partial_failure_get_and_retry_operation_lifecycle(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "supportsImages": true
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-parent-1"
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/blue.catbird.circle.metadata/self",
+            "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        })))
+        .mount(&pds)
+        .await;
+
+    // Bob succeeds
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:bob"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&pds)
+        .await;
+
+    // Carol initially fails 400 Bad Request
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:carol"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Invalid Member DID"))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "mock-pds-service-auth-jwt"
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/internal/projections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "accepted" })))
+        .mount(&appview)
+        .await;
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = CircleService::new(state);
+    let session = alice_session(&pds_url);
+
+    let input = CreateCircle {
+        name: "Partial Parent Circle".into(),
+        member_dids: vec![bob(), carol()],
+        extra_data: None,
+    };
+
+    // 1. Initial create returns parent operation with Failed status
+    let parent_op = service.create_circle(&session, input).await.unwrap();
+    assert_eq!(parent_op.status, OperationStatus::Failed);
+    assert_eq!(parent_op.error.as_deref(), Some("MemberAdditionPartialFailure"));
+    let parent_id = parent_op.id.as_str();
+
+    // 2. get_operation on the parent ID aggregates child states and returns Failed (not Complete!)
+    let get_op = service.get_operation(&session, parent_id).await.unwrap();
+    assert_eq!(get_op.id.as_str(), parent_id);
+    assert_eq!(get_op.status, OperationStatus::Failed);
+
+    // 3. Now PDS is fixed so Carol's addMember succeeds
+    pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .and(wiremock::matchers::body_string_contains("did:plc:carol"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+
+    // 4. retry_operation on the same parent ID replays the failed PDS mutation for Carol,
+    //    succeeds at PDS, delivers projection to AppView, and returns Complete
+    let retry_res = service.retry_operation(&session, parent_id).await.unwrap();
+    assert_eq!(retry_res.id.as_str(), parent_id);
+    assert_eq!(retry_res.status, OperationStatus::Complete);
+
+    // 5. Subsequent get_operation on the parent ID now reports Complete
+    let get_op_after = service.get_operation(&session, parent_id).await.unwrap();
+    assert_eq!(get_op_after.id.as_str(), parent_id);
+    assert_eq!(get_op_after.status, OperationStatus::Complete);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn retry_operation_never_projects_without_pds_success(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+
+    // PDS deterministically rejects addMember with 400 Bad Request
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.addMember"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Deterministically Rejected Member"))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = CircleService::new(state);
+    let session = alice_session(&pds_url);
+
+    let request = UpdateMember {
+        space: space(),
+        member_did: bob(),
+        action: MemberAction::Add,
+        extra_data: None,
+    };
+
+    let initial_err = service.update_member(&session, request).await;
+    assert!(initial_err.is_err());
+
+    let row: (Uuid, String) = sqlx::query_as(
+        "SELECT id, state FROM circle_projection_outbox WHERE payload->>'member' = 'did:plc:bob'"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.1, "failed");
+
+    // Calling retry_operation while PDS still rejects must replay PDS mutation,
+    // transition back to Failed, and NEVER deliver projection to AppView
+    let retry_res = service.retry_operation(&session, &row.0.to_string()).await.unwrap();
+    assert_eq!(retry_res.status, OperationStatus::Failed);
+    assert!(retry_res.error.unwrap().contains("Deterministically Rejected Member"));
+
+    // Verify outbox state in DB is still failed, never delivered
+    let row_after: (String,) = sqlx::query_as(
+        "SELECT state FROM circle_projection_outbox WHERE id = $1"
+    )
+    .bind(row.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row_after.0, "failed");
+}

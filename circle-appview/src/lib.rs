@@ -20,6 +20,8 @@ pub mod sync;
 pub mod thread;
 pub mod validator;
 
+pub const CIRCLE_PROTOCOL_REVISION: &str = "89deb9faca20e56fa2a262fe9746ed52bc1095ba";
+
 pub use auth::{
     authenticate, AuthenticatedUser, DidDocument, DidResolver, PublicKeyJwk, VerificationMethod,
 };

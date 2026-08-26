@@ -365,7 +365,8 @@ async fn verifies_public_health_and_capabilities_unauthenticated(pool: PgPool) {
     let bytes = to_bytes(caps_resp.into_body(), 1024 * 1024).await.unwrap();
     let caps: GetCapabilitiesOutput = serde_json::from_slice(&bytes).unwrap();
     assert!(caps.enabled);
-    assert_eq!(caps.protocol_revision.as_str(), "1");
+    assert_eq!(caps.protocol_revision.as_str(), circle_appview::CIRCLE_PROTOCOL_REVISION);
+    assert_eq!(caps.protocol_revision.as_str(), "89deb9faca20e56fa2a262fe9746ed52bc1095ba");
     assert!(caps.supports_images);
 }
 

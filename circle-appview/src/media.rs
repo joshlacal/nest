@@ -59,18 +59,7 @@ pub async fn get_media(
         .await
         .map_err(AppError::Unauthorized)?;
 
-    let pds_endpoint = author_doc
-        .service
-        .iter()
-        .find(|svc| {
-            svc.id == "#atproto_pds"
-                || svc.id.ends_with("#atproto_pds")
-                || svc.r#type == "AtprotoPersonalDataServer"
-        })
-        .map(|svc| svc.service_endpoint.clone())
-        .ok_or_else(|| {
-            AppError::InvalidRequest("Author DID doc does not declare #atproto_pds".into())
-        })?;
+    let (pds_endpoint, _) = crate::access::resolve_pds_endpoint(&author_doc, did)?;
 
     // 5. Fetch blob via SpaceClient with active Space credential and DPoP proof
     let (content_type, bytes) = state

@@ -482,6 +482,21 @@ pub async fn apply_projection(
             .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO circle_members (space_uri, member_did, status, generation, updated_at)
+                VALUES ($1, $2, 'active', $3, now())
+                ON CONFLICT (space_uri, member_did) DO UPDATE
+                SET status = 'active', generation = EXCLUDED.generation, updated_at = now()
+                "#,
+            )
+            .bind(&space)
+            .bind(&authority)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
         }
         Projection::MemberAdd {
             space,

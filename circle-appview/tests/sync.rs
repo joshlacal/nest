@@ -4146,3 +4146,101 @@ fn validator_rejects_missing_or_mismatched_type_and_unsupported_embeds() {
     };
     assert!(matches!(validate(empty_tag, &pol), Err(InvalidRecord::MalformedRecord(_))));
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_down_cleanly(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let post_val = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post synced by scheduled background revision sweep",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let post_cid = compute_dagcbor_cid(&post_val).unwrap();
+
+    let mut lthash = LtHash::new();
+    lthash.add("app.bsky.feed.post", "3l7sweepsch1", &post_cid);
+    let rev = "3l7234567a234";
+    let commit = mint_signed_commit(
+        SPACE_URI,
+        OWNER_DID,
+        rev,
+        lthash.as_bytes(),
+        &setup.owner_signing_key,
+    );
+
+    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::from(post_cid.clone())),
+        collection: Nsid::from(String::from("app.bsky.feed.post")),
+        prev: None,
+        rev: Tid::from(String::from(rev)),
+        rkey: RecordKey::from(Rkey::from(String::from("3l7sweepsch1"))),
+        value: Some(serde_json::from_value(post_val).unwrap()),
+        extra_data: None,
+    };
+
+    let key = format!("{SPACE_URI}:{OWNER_DID}");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: Some(commit),
+            cursor: None,
+            ops: vec![op_entry],
+            extra_data: None,
+        },
+    );
+
+    let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
+        did: Did::from(String::from(OWNER_DID)),
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            &lthash.digest(),
+        ),
+        rev: Tid::from(String::from(rev)),
+        extra_data: None,
+    };
+    setup.mock_transport.set_list_repos_response(
+        SPACE_URI,
+        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+            cursor: None,
+            repos: vec![repo_item],
+            extra_data: None,
+        },
+    );
+
+    let expected_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7sweepsch1");
+
+    // Verify record is NOT yet in the database (simulating dropped notifyWrite)
+    let before: Option<(String,)> = sqlx::query_as("SELECT uri FROM circle_records WHERE uri = $1")
+        .bind(&expected_uri)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(before.is_none(), "Record must not exist before sweep");
+
+    // Spawn the retained background sweep task with a fast interval for test
+    let (sweep_handle, shutdown_tx) = circle_appview::sync::spawn_revision_sweep_task(
+        setup.state.clone(),
+        std::time::Duration::from_millis(50),
+    );
+
+    // Poll database for record appearance
+    let mut synced = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let after: Option<(String,)> = sqlx::query_as("SELECT uri FROM circle_records WHERE uri = $1")
+            .bind(&expected_uri)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        if after.is_some() {
+            synced = true;
+            break;
+        }
+    }
+    assert!(synced, "Scheduled revision sweep must repair missed notification and sync repo");
+
+    // Graceful shutdown
+    shutdown_tx.send(true).unwrap();
+    let join_res = tokio::time::timeout(std::time::Duration::from_secs(2), sweep_handle).await;
+    assert!(join_res.is_ok(), "Sweep task must shut down cleanly");
+}

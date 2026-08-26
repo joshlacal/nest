@@ -313,10 +313,15 @@ mod tests {
 
     #[test]
     fn test_blocks_private_ipv4() {
-        // Loopback
-        assert!(validate_pds_url("https://127.0.0.1").is_err());
-        assert!(validate_pds_url("https://127.0.0.2").is_err());
+        // Loopback is checked via is_private_ipv4 (allowed in debug mode for WireMock)
+        assert!(is_private_ipv4(&std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(is_private_ipv4(&std::net::Ipv4Addr::new(127, 0, 0, 2)));
 
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(validate_pds_url("https://127.0.0.1").is_err());
+            assert!(validate_pds_url("https://127.0.0.2").is_err());
+        }
         // Private ranges
         assert!(validate_pds_url("https://10.0.0.1").is_err());
         assert!(validate_pds_url("https://10.255.255.255").is_err());

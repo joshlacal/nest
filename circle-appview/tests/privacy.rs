@@ -789,6 +789,111 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
     assert_ne!(resp.status(), StatusCode::OK);
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, authority_did, display_name, created_at)
+        VALUES ($1, $2, 'Media Res Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "active-cred-media-res".into(),
+                dpop_key: cred_key,
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    let blob_cid = "bafkreiblobres";
+    let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
+    let space_client = Arc::new(circle_appview::space_client::SpaceClient::with_transport(mock_transport.clone()));
+
+    // 1. Author DID doc with wrong service ID but right type ("#custom_pds", "AtprotoPersonalDataServer")
+    let custom_pds_did = "did:plc:author-wrong-id";
+    grant_active_member(&pool, SPACE_1, custom_pds_did, Duration::hours(1)).await;
+    let wrong_id_doc = DidDocument {
+        id: custom_pds_did.to_string(),
+        verification_method: vec![],
+        service: vec![circle_appview::auth::DidService {
+            id: "#custom_pds".to_string(),
+            r#type: "AtprotoPersonalDataServer".to_string(),
+            service_endpoint: "https://pds.example.com".to_string(),
+        }],
+    };
+    setup.state.did_resolver.insert_cached(custom_pds_did.to_string(), wrong_id_doc);
+
+    let custom_state = AppState::with_services(
+        setup.state.config.as_ref().clone(),
+        pool.clone(),
+        setup.state.did_resolver.clone(),
+        setup.state.credential_store.clone(),
+        space_client.clone(),
+        setup.state.space_locks.clone(),
+    );
+    let app = create_router(custom_state);
+
+    let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+    let req1 = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(custom_pds_did),
+            url_encode(blob_cid),
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_jwt}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::BAD_REQUEST, "Wrong service ID must be rejected");
+
+    // 2. Author DID doc with suffix ID ("#fake#atproto_pds")
+    let suffix_did = "did:plc:author-suffix-id";
+    grant_active_member(&pool, SPACE_1, suffix_did, Duration::hours(1)).await;
+    let suffix_doc = DidDocument {
+        id: suffix_did.to_string(),
+        verification_method: vec![],
+        service: vec![circle_appview::auth::DidService {
+            id: "#fake#atproto_pds".to_string(),
+            r#type: "AtprotoPersonalDataServer".to_string(),
+            service_endpoint: "https://pds.example.com".to_string(),
+        }],
+    };
+    setup.state.did_resolver.insert_cached(suffix_did.to_string(), suffix_doc);
+
+    let bob_jwt_2 = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+    let req2 = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(suffix_did),
+            url_encode(blob_cid),
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_jwt_2}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST, "Suffix service ID must be rejected");
+}
+
 #[derive(Clone)]
 struct TestLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
 
