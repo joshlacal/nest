@@ -37,7 +37,7 @@ use catbird_atproto::generated::app_bsky::feed::post::{Post, PostEmbed, ReplyRef
 use catbird_atproto::generated::app_bsky::feed::search_posts::{SearchPosts, SearchPostsOutput};
 use catbird_atproto::generated::app_bsky::feed::ThreadViewPostRepliesItem;
 use catbird_atproto::generated::app_bsky::notification::list_notifications::{
-    ListNotifications, ListNotificationsOutput,
+    ListNotifications, ListNotificationsOutput, NotificationReason as PublicNotificationReason,
 };
 use catbird_atproto::generated::blue_catbird::circle::activate_space::{
     ActivateSpace, ActivateSpaceOutput,
@@ -103,21 +103,18 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn redact_database_url(url_str: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url_str) {
-        let _ = parsed.set_username("");
-        let _ = parsed.set_password(None);
-        parsed.set_query(None);
-        parsed.set_fragment(None);
-        parsed.to_string()
-    } else {
-        "redacted".to_string()
-    }
-}
-
 fn get_revision(path: &str) -> String {
     if let Ok(output) = Command::new("jj")
-        .args(["log", "-R", path, "-r", "@", "-T", "commit_id", "--no-graph"])
+        .args([
+            "log",
+            "-R",
+            path,
+            "-r",
+            "@",
+            "-T",
+            "commit_id",
+            "--no-graph",
+        ])
         .output()
     {
         if output.status.success() {
@@ -146,8 +143,8 @@ fn get_revision(path: &str) -> String {
 }
 
 fn record_data<T: Serialize>(record: &T) -> Result<Data<String>, String> {
-    let val = serde_json::to_value(record)
-        .map_err(|e| format!("Failed to serialize record: {e}"))?;
+    let val =
+        serde_json::to_value(record).map_err(|e| format!("Failed to serialize record: {e}"))?;
     serde_json::from_value(val)
         .map_err(|e| format!("Failed to convert serialized record to Data: {e}"))
 }
@@ -190,14 +187,17 @@ impl ScenarioConfig {
 
         let nest_url = env::var("NEST_URL")
             .map_err(|_| "NEST_URL is required (e.g. http://127.0.0.1:3000)".to_string())?;
-        let circle_appview_url = env::var("CIRCLE_APPVIEW_URL")
-            .map_err(|_| "CIRCLE_APPVIEW_URL is required (e.g. http://127.0.0.1:3002)".to_string())?;
+        let circle_appview_url = env::var("CIRCLE_APPVIEW_URL").map_err(|_| {
+            "CIRCLE_APPVIEW_URL is required (e.g. http://127.0.0.1:3002)".to_string()
+        })?;
         let circle_appview_service_did = env::var("CIRCLE_APPVIEW_SERVICE_DID")
             .map_err(|_| "CIRCLE_APPVIEW_SERVICE_DID is required (e.g. did:web:circles.catbird.blue#atproto_circle)".to_string())?;
-        let public_appview_url = env::var("PUBLIC_APPVIEW_URL")
-            .map_err(|_| "PUBLIC_APPVIEW_URL is required (e.g. https://public.api.bsky.app)".to_string())?;
-        let database_url = env::var("DATABASE_URL")
-            .map_err(|_| "DATABASE_URL is required (PostgreSQL connection string for Circle AppView)".to_string())?;
+        let public_appview_url = env::var("PUBLIC_APPVIEW_URL").map_err(|_| {
+            "PUBLIC_APPVIEW_URL is required (e.g. https://public.api.bsky.app)".to_string()
+        })?;
+        let database_url = env::var("DATABASE_URL").map_err(|_| {
+            "DATABASE_URL is required (PostgreSQL connection string for Circle AppView)".to_string()
+        })?;
 
         let alice_did = env::var("ALICE_DID")
             .map_err(|_| "ALICE_DID is required (e.g. did:plc:alice...)".to_string())?;
@@ -237,8 +237,7 @@ impl ScenarioConfig {
             ("CAROL_PDS_URL", &carol_pds),
             ("DAVE_PDS_URL", &dave_pds),
         ] {
-            let parsed = Url::parse(u)
-                .map_err(|e| format!("Invalid URL for {name} '{u}': {e}"))?;
+            let parsed = Url::parse(u).map_err(|e| format!("Invalid URL for {name} '{u}': {e}"))?;
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
                 return Err(format!("{name} must use http or https scheme, got '{u}'"));
             }
@@ -404,7 +403,7 @@ pub struct RunProvenance {
     pub circle_appview_url: String,
     pub circle_appview_service_did: String,
     pub public_appview_url: String,
-    pub database_target: String,
+    pub database_kind: String,
     pub alice_did: String,
     pub alice_pds_url: String,
     pub bob_did: String,
@@ -552,10 +551,13 @@ impl ScenarioRunner {
                     direct_res.status()
                 ));
             }
-            let direct_desc: DescribeServerOutput<String> = direct_res
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse direct describeServer for {}: {e}", user.name))?;
+            let direct_desc: DescribeServerOutput<String> =
+                direct_res.json().await.map_err(|e| {
+                    format!(
+                        "Failed to parse direct describeServer for {}: {e}",
+                        user.name
+                    )
+                })?;
 
             // Session-routed describeServer via Nest
             let nest_desc_url = format!(
@@ -574,10 +576,13 @@ impl ScenarioRunner {
                     routed_res.status()
                 ));
             }
-            let routed_desc: DescribeServerOutput<String> = routed_res
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse routed describeServer for {}: {e}", user.name))?;
+            let routed_desc: DescribeServerOutput<String> =
+                routed_res.json().await.map_err(|e| {
+                    format!(
+                        "Failed to parse routed describeServer for {}: {e}",
+                        user.name
+                    )
+                })?;
 
             if direct_desc.did.as_str() != routed_desc.did.as_str() {
                 return Err(format!(
@@ -590,7 +595,10 @@ impl ScenarioRunner {
         }
 
         // 5. Validate Nest session-to-DID mapping for each user via /auth/session
-        let session_endpoint = format!("{}/auth/session", self.config.nest_url.trim_end_matches('/'));
+        let session_endpoint = format!(
+            "{}/auth/session",
+            self.config.nest_url.trim_end_matches('/')
+        );
         for user in [
             &self.config.alice,
             &self.config.bob,
@@ -609,10 +617,12 @@ impl ScenarioRunner {
                     resp.status()
                 ));
             }
-            let session_info: SessionProbeResponse = resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse /auth/session response for {}: {e}", user.name))?;
+            let session_info: SessionProbeResponse = resp.json().await.map_err(|e| {
+                format!(
+                    "Failed to parse /auth/session response for {}: {e}",
+                    user.name
+                )
+            })?;
             if session_info.did != user.did {
                 return Err(format!(
                     "Session DID mismatch for {}: declared '{}', Nest session returned '{}'",
@@ -632,7 +642,9 @@ impl ScenarioRunner {
             &self.config.carol,
             &self.config.dave,
         ] {
-            let req = user.apply_auth(self.client.get(&cap_url)).query(&GetCapabilities);
+            let req = user
+                .apply_auth(self.client.get(&cap_url))
+                .query(&GetCapabilities);
             let resp = req
                 .send()
                 .await
@@ -644,10 +656,12 @@ impl ScenarioRunner {
                     resp.status()
                 ));
             }
-            let cap_out: GetCapabilitiesOutput<String> = resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse GetCapabilitiesOutput for {}: {e}", user.name))?;
+            let cap_out: GetCapabilitiesOutput<String> = resp.json().await.map_err(|e| {
+                format!(
+                    "Failed to parse GetCapabilitiesOutput for {}: {e}",
+                    user.name
+                )
+            })?;
             if !cap_out.enabled {
                 return Err(format!(
                     "Space capability is not enabled on Nest gateway for {}",
@@ -717,9 +731,7 @@ impl ScenarioRunner {
         };
         let start = std::time::Instant::now();
         loop {
-            let req = session
-                .apply_auth(self.client.get(&op_url))
-                .query(&query);
+            let req = session.apply_auth(self.client.get(&op_url)).query(&query);
             let resp = req
                 .send()
                 .await
@@ -760,8 +772,12 @@ impl ScenarioRunner {
         );
         let data = record_data(record).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let create_item = Create {
-            collection: Nsid::new(collection.to_string())
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid collection NSID: {e}")))?,
+            collection: Nsid::new(collection.to_string()).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid collection NSID: {e}"),
+                )
+            })?,
             rkey: None,
             value: data,
             extra_data: None,
@@ -775,27 +791,36 @@ impl ScenarioRunner {
             extra_data: None,
         };
         let req = session.apply_auth(self.client.post(&apply_url));
-        let resp = req
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("applyWrites transport failed: {e}")))?;
+        let resp = req.json(&input).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("applyWrites transport failed: {e}"),
+            )
+        })?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             return Err((status, body_text));
         }
-        let output: ApplyWritesOutput<String> = resp
-            .json()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse ApplyWritesOutput: {e}")))?;
-        let results = output
-            .results
-            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "ApplyWritesOutput missing results array".to_string()))?;
+        let output: ApplyWritesOutput<String> = resp.json().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse ApplyWritesOutput: {e}"),
+            )
+        })?;
+        let results = output.results.ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ApplyWritesOutput missing results array".to_string(),
+            )
+        })?;
         if results.len() != 1 {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Expected exactly 1 ApplyWrites result, got {}", results.len()),
+                format!(
+                    "Expected exactly 1 ApplyWrites result, got {}",
+                    results.len()
+                ),
             ));
         }
         match &results[0] {
@@ -803,7 +828,10 @@ impl ScenarioRunner {
                 let uri = cr.uri.as_str().to_string();
                 let cid = cr.cid.as_str().to_string();
                 if uri.is_empty() || cid.is_empty() {
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "ApplyWrites createResult returned empty URI or CID".to_string()));
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ApplyWrites createResult returned empty URI or CID".to_string(),
+                    ));
                 }
                 Ok((uri, cid))
             }
@@ -834,7 +862,10 @@ impl ScenarioRunner {
         record: &T,
         op_label: &str,
     ) -> Result<(), String> {
-        match self.apply_create_raw(session, space, collection, record).await {
+        match self
+            .apply_create_raw(session, space, collection, record)
+            .await
+        {
             Ok(_) => Err(format!("{op_label} unexpectedly succeeded")),
             Err((status, _)) => {
                 if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -860,8 +891,7 @@ impl ScenarioRunner {
             self.config.nest_url.trim_end_matches('/')
         );
         let commit_query: GetLatestCommit<String> = GetLatestCommit {
-            repo: Did::new(session.did.clone())
-                .map_err(|e| format!("Invalid repo DID: {e}"))?,
+            repo: Did::new(session.did.clone()).map_err(|e| format!("Invalid repo DID: {e}"))?,
             space: space.to_string(),
         };
         let commit_resp = session
@@ -884,16 +914,28 @@ impl ScenarioRunner {
         let commit = commit_output.commit;
 
         if commit.ver != 1 {
-            return Err(format!("Expected SignedCommit ver == 1, got {}", commit.ver));
+            return Err(format!(
+                "Expected SignedCommit ver == 1, got {}",
+                commit.ver
+            ));
         }
         if commit.hash.len() != 32 {
-            return Err(format!("Expected SignedCommit hash length 32, got {}", commit.hash.len()));
+            return Err(format!(
+                "Expected SignedCommit hash length 32, got {}",
+                commit.hash.len()
+            ));
         }
         if commit.ikm.len() != 32 {
-            return Err(format!("Expected SignedCommit ikm length 32, got {}", commit.ikm.len()));
+            return Err(format!(
+                "Expected SignedCommit ikm length 32, got {}",
+                commit.ikm.len()
+            ));
         }
         if commit.mac.len() != 32 {
-            return Err(format!("Expected SignedCommit mac length 32, got {}", commit.mac.len()));
+            return Err(format!(
+                "Expected SignedCommit mac length 32, got {}",
+                commit.mac.len()
+            ));
         }
         if commit.sig.is_empty() {
             return Err("SignedCommit signature is empty".to_string());
@@ -918,7 +960,10 @@ impl ScenarioRunner {
         let sa_query: GetServiceAuth<String> = GetServiceAuth {
             aud: self.config.circle_appview_service_did.clone(),
             exp: Some(Utc::now().timestamp() + 60),
-            lxm: Some(Nsid::new("com.atproto.space.notifyWrite".into()).map_err(|e| format!("Invalid NSID: {e}"))?),
+            lxm: Some(
+                Nsid::new("com.atproto.space.notifyWrite".into())
+                    .map_err(|e| format!("Invalid NSID: {e}"))?,
+            ),
         };
         let sa_resp = session
             .apply_auth(self.client.get(&get_sa_url))
@@ -996,7 +1041,10 @@ impl ScenarioRunner {
             }
 
             if start.elapsed() > Duration::from_secs(15) {
-                return Err("Timed out waiting for Circle AppView sync state to reflect revision".to_string());
+                return Err(
+                    "Timed out waiting for Circle AppView sync state to reflect revision"
+                        .to_string(),
+                );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -1063,7 +1111,10 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Thread query in snapshot failed: {e}"))?;
         if !thread_resp.status().is_success() {
-            return Err(format!("Thread query returned HTTP {}", thread_resp.status()));
+            return Err(format!(
+                "Thread query returned HTTP {}",
+                thread_resp.status()
+            ));
         }
         let thread_output: CircleGetPostThreadOutput<String> = thread_resp
             .json()
@@ -1097,7 +1148,10 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Notifications query in snapshot failed: {e}"))?;
         if !notifs_resp.status().is_success() {
-            return Err(format!("Notifications query returned HTTP {}", notifs_resp.status()));
+            return Err(format!(
+                "Notifications query returned HTTP {}",
+                notifs_resp.status()
+            ));
         }
         let notifs_output: CircleListNotificationsOutput<String> = notifs_resp
             .json()
@@ -1150,7 +1204,10 @@ impl ScenarioRunner {
         builder
             .create(&self.config.artifacts_dir)
             .map_err(|e| format!("Failed to create artifacts directory: {e}"))?;
-        let _ = fs::set_permissions(&self.config.artifacts_dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(
+            &self.config.artifacts_dir,
+            fs::Permissions::from_mode(0o700),
+        );
 
         let mut public_capture = PublicHttpCapture {
             run_id: run_id.clone(),
@@ -1205,10 +1262,10 @@ impl ScenarioRunner {
             ));
         }
 
-        let control_output: CreateRecordOutput<String> = control_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse CreateRecordOutput for public control post: {e}"))?;
+        let control_output: CreateRecordOutput<String> =
+            control_resp.json().await.map_err(|e| {
+                format!("Failed to parse CreateRecordOutput for public control post: {e}")
+            })?;
         let public_control_post_uri = control_output.uri.as_str().to_string();
         let public_control_post_cid = control_output.cid.as_str().to_string();
 
@@ -1247,10 +1304,10 @@ impl ScenarioRunner {
                 control_like_resp.status()
             ));
         }
-        let control_like_output: CreateRecordOutput<String> = control_like_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse CreateRecordOutput for public control like: {e}"))?;
+        let control_like_output: CreateRecordOutput<String> =
+            control_like_resp.json().await.map_err(|e| {
+                format!("Failed to parse CreateRecordOutput for public control like: {e}")
+            })?;
         let public_control_like_uri = control_like_output.uri.as_str().to_string();
 
         // Strict Public Positive Control 1: getPostThread on public control post using generated query input
@@ -1261,7 +1318,8 @@ impl ScenarioRunner {
         let public_thread_query: GetPostThread<String> = GetPostThread {
             depth: None,
             parent_height: None,
-            uri: AtUri::new(public_control_post_uri.clone()).map_err(|e| format!("Invalid AtUri: {e}"))?,
+            uri: AtUri::new(public_control_post_uri.clone())
+                .map_err(|e| format!("Invalid AtUri: {e}"))?,
         };
         let public_thread_resp = self
             .client
@@ -1283,12 +1341,16 @@ impl ScenarioRunner {
 
         match &public_thread_output.thread {
             GetPostThreadOutputThread::ThreadViewPost(tvp) => {
-                if tvp.post.uri.as_str() != public_control_post_uri || tvp.post.cid.as_str() != public_control_post_cid {
+                if tvp.post.uri.as_str() != public_control_post_uri
+                    || tvp.post.cid.as_str() != public_control_post_cid
+                {
                     return Err("Public control post thread URI/CID mismatch".to_string());
                 }
             }
             other => {
-                return Err(format!("Expected ThreadViewPost on control post, got variant: {other:?}"));
+                return Err(format!(
+                    "Expected ThreadViewPost on control post, got variant: {other:?}"
+                ));
             }
         }
         public_capture.public_control_post = serde_json::to_value(&control_output).unwrap();
@@ -1301,7 +1363,8 @@ impl ScenarioRunner {
             self.config.public_appview_url.trim_end_matches('/')
         );
         let public_feed_query: GetAuthorFeed<String> = GetAuthorFeed {
-            actor: AtIdentifier::new(self.config.alice.did.clone()).map_err(|e| format!("Invalid Did: {e}"))?,
+            actor: AtIdentifier::new(self.config.alice.did.clone())
+                .map_err(|e| format!("Invalid Did: {e}"))?,
             cursor: None,
             filter: None,
             include_pins: None,
@@ -1362,6 +1425,13 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| format!("Failed to parse public timeline output: {e}"))?;
+        let timeline_has_control = timeline_output.feed.iter().any(|item| {
+            item.post.uri.as_str() == public_control_post_uri
+                && item.post.cid.as_str() == public_control_post_cid
+        });
+        if !timeline_has_control {
+            return Err("Public control post not found in Alice's timeline".to_string());
+        }
         public_capture.public_timeline = serde_json::to_value(&timeline_output).unwrap();
 
         // Strict Public Positive Control 4: searchPosts for control text using generated query input
@@ -1400,6 +1470,13 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| format!("Failed to parse search posts output: {e}"))?;
+        let search_has_control = search_posts_output.posts.iter().any(|post| {
+            post.uri.as_str() == public_control_post_uri
+                && post.cid.as_str() == public_control_post_cid
+        });
+        if !search_has_control {
+            return Err("Public control post not found in post search".to_string());
+        }
         public_capture.public_search_posts = serde_json::to_value(&search_posts_output).unwrap();
 
         // Strict Public Positive Control 5: searchActors for Alice DID/handle using generated query input
@@ -1430,6 +1507,13 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| format!("Failed to parse search actors output: {e}"))?;
+        if !search_actors_output
+            .actors
+            .iter()
+            .any(|actor| actor.did.as_str() == self.config.alice.did)
+        {
+            return Err("Alice not found in public actor search".to_string());
+        }
         public_capture.public_search_actors = serde_json::to_value(&search_actors_output).unwrap();
 
         // Strict Public Positive Control 6: listNotifications on Alice via Nest using generated query input
@@ -1462,6 +1546,19 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| format!("Failed to parse public notifications output: {e}"))?;
+        let notifications_have_control_like =
+            public_notifs_output
+                .notifications
+                .iter()
+                .any(|notification| {
+                    notification.reason == PublicNotificationReason::Like
+                        && notification.author.did.as_str() == self.config.bob.did
+                        && notification.reason_subject.as_ref().map(|uri| uri.as_str())
+                            == Some(public_control_post_uri.as_str())
+                });
+        if !notifications_have_control_like {
+            return Err("Bob's public control like not found in Alice's notifications".to_string());
+        }
         public_capture.public_notifications = serde_json::to_value(&public_notifs_output).unwrap();
 
         eprintln!("[e2e_scenario] STEP_02_PUBLIC_CONTROL_POST_PROVED");
@@ -1531,7 +1628,11 @@ impl ScenarioRunner {
                 .await
                 .map_err(|e| format!("listCircles failed for {}: {e}", user.name))?;
             if !lc_resp.status().is_success() {
-                return Err(format!("listCircles for {} returned HTTP {}", user.name, lc_resp.status()));
+                return Err(format!(
+                    "listCircles for {} returned HTTP {}",
+                    user.name,
+                    lc_resp.status()
+                ));
             }
             let lc_out: ListCirclesOutput<String> = lc_resp
                 .json()
@@ -1556,7 +1657,8 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Dave listCircles failed: {e}"))?;
         if dave_lc_resp.status().is_success() {
-            let dave_lc: ListCirclesOutput<String> = dave_lc_resp.json().await.map_err(|e| e.to_string())?;
+            let dave_lc: ListCirclesOutput<String> =
+                dave_lc_resp.json().await.map_err(|e| e.to_string())?;
             if dave_lc.circles.iter().any(|c| c.uri.as_str() == space_uri) {
                 return Err("Stranger Dave unexpectedly discovered private circle".to_string());
             }
@@ -1590,10 +1692,9 @@ impl ScenarioRunner {
                     act_resp.status()
                 ));
             }
-            let act_out: ActivateSpaceOutput<String> = act_resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse ActivateSpaceOutput for {}: {e}", user.name))?;
+            let act_out: ActivateSpaceOutput<String> = act_resp.json().await.map_err(|e| {
+                format!("Failed to parse ActivateSpaceOutput for {}: {e}", user.name)
+            })?;
             if act_out.access_state != AccessState::Active {
                 return Err(format!(
                     "activateSpace for {} did not yield Active state (got {:?})",
@@ -1607,7 +1708,10 @@ impl ScenarioRunner {
                 .map_err(|e| format!("Invalid expires_at datetime: {e}"))?
                 .with_timezone(&Utc);
             if exp_dt <= Utc::now() {
-                return Err(format!("activateSpace for {} returned expired or non-future expires_at", user.name));
+                return Err(format!(
+                    "activateSpace for {} returned expired or non-future expires_at",
+                    user.name
+                ));
             }
         }
         eprintln!("[e2e_scenario] STEP_04_SPACE_ACTIVATED");
@@ -1686,12 +1790,22 @@ impl ScenarioRunner {
             extra_data: None,
         };
 
+        let alice_rev0 = self
+            .notify_and_wait_revision(&self.config.alice, &space_uri, None)
+            .await?;
         let (post_uri, post_cid) = self
-            .apply_create(&self.config.alice, &space_uri, "app.bsky.feed.post", &post_record)
+            .apply_create(
+                &self.config.alice,
+                &space_uri,
+                "app.bsky.feed.post",
+                &post_record,
+            )
             .await?;
 
         // Barrier: notify and wait for AppView sync
-        let _alice_rev1 = self.notify_and_wait_revision(&self.config.alice, &space_uri, None).await?;
+        let _alice_rev1 = self
+            .notify_and_wait_revision(&self.config.alice, &space_uri, Some(&alice_rev0))
+            .await?;
         eprintln!("[e2e_scenario] STEP_06_PRIVATE_POST_WRITTEN_AND_SYNCED");
 
         // -------------------------------------------------------------
@@ -1723,12 +1837,22 @@ impl ScenarioRunner {
             extra_data: None,
         };
 
+        let bob_rev0 = self
+            .notify_and_wait_revision(&self.config.bob, &space_uri, None)
+            .await?;
         let (reply_uri, reply_cid) = self
-            .apply_create(&self.config.bob, &space_uri, "app.bsky.feed.post", &reply_record)
+            .apply_create(
+                &self.config.bob,
+                &space_uri,
+                "app.bsky.feed.post",
+                &reply_record,
+            )
             .await?;
 
         // Barrier: notify and wait for AppView sync
-        let bob_rev1 = self.notify_and_wait_revision(&self.config.bob, &space_uri, None).await?;
+        let bob_rev1 = self
+            .notify_and_wait_revision(&self.config.bob, &space_uri, Some(&bob_rev0))
+            .await?;
         eprintln!("[e2e_scenario] STEP_07_REPLY_WRITTEN_AND_SYNCED");
 
         // -------------------------------------------------------------
@@ -1746,12 +1870,22 @@ impl ScenarioRunner {
             extra_data: None,
         };
 
+        let carol_rev0 = self
+            .notify_and_wait_revision(&self.config.carol, &space_uri, None)
+            .await?;
         let (like_uri, like_cid) = self
-            .apply_create(&self.config.carol, &space_uri, "app.bsky.feed.like", &like_record)
+            .apply_create(
+                &self.config.carol,
+                &space_uri,
+                "app.bsky.feed.like",
+                &like_record,
+            )
             .await?;
 
         // Barrier: notify and wait for AppView sync
-        let _carol_rev1 = self.notify_and_wait_revision(&self.config.carol, &space_uri, None).await?;
+        let _carol_rev1 = self
+            .notify_and_wait_revision(&self.config.carol, &space_uri, Some(&carol_rev0))
+            .await?;
         eprintln!("[e2e_scenario] STEP_08_LIKE_WRITTEN_AND_SYNCED");
 
         // -------------------------------------------------------------
@@ -1778,7 +1912,10 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Alice getFeed failed: {e}"))?;
         if !alice_feed_resp.status().is_success() {
-            return Err(format!("Alice getFeed returned HTTP {}", alice_feed_resp.status()));
+            return Err(format!(
+                "Alice getFeed returned HTTP {}",
+                alice_feed_resp.status()
+            ));
         }
         let alice_feed: GetFeedOutput<String> = alice_feed_resp
             .json()
@@ -1793,7 +1930,9 @@ impl ScenarioRunner {
         }
 
         let feed_post_item = &alice_feed.feed[0];
-        if feed_post_item.post.post.uri.as_str() != post_uri || feed_post_item.post.post.cid.as_str() != post_cid {
+        if feed_post_item.post.post.uri.as_str() != post_uri
+            || feed_post_item.post.post.cid.as_str() != post_cid
+        {
             return Err("Feed post URI/CID mismatch".to_string());
         }
         if feed_post_item.post.post.like_count != Some(1) {
@@ -1839,7 +1978,9 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse Circle GetPostThreadOutput: {e}"))?;
 
-        if thread_output.thread.post.uri.as_str() != post_uri || thread_output.thread.post.cid.as_str() != post_cid {
+        if thread_output.thread.post.uri.as_str() != post_uri
+            || thread_output.thread.post.cid.as_str() != post_cid
+        {
             return Err("Thread root post URI/CID mismatch".to_string());
         }
         let thread_replies = thread_output.thread.replies.as_deref().unwrap_or(&[]);
@@ -1861,7 +2002,8 @@ impl ScenarioRunner {
         );
         let media_query: GetMedia<String> = GetMedia {
             cid: Cid::new(blob_cid.as_bytes()).map_err(|e| format!("Invalid Cid: {e}"))?,
-            did: Did::new(self.config.alice.did.clone()).map_err(|e| format!("Invalid Did: {e}"))?,
+            did: Did::new(self.config.alice.did.clone())
+                .map_err(|e| format!("Invalid Did: {e}"))?,
             space: space_ref.clone(),
         };
         let media_resp = self
@@ -1873,7 +2015,10 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Bob getMedia failed: {e}"))?;
         if !media_resp.status().is_success() {
-            return Err(format!("Bob getMedia returned status {}", media_resp.status()));
+            return Err(format!(
+                "Bob getMedia returned status {}",
+                media_resp.status()
+            ));
         }
         let media_bytes = media_resp.bytes().await.map_err(|e| e.to_string())?;
         if media_bytes.as_ref() != image_data.as_slice() {
@@ -1891,7 +2036,10 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Carol getFeed failed: {e}"))?;
         if !carol_feed_resp.status().is_success() {
-            return Err(format!("Carol getFeed returned status {}", carol_feed_resp.status()));
+            return Err(format!(
+                "Carol getFeed returned status {}",
+                carol_feed_resp.status()
+            ));
         }
         let carol_feed: GetFeedOutput<String> = carol_feed_resp
             .json()
@@ -1979,11 +2127,18 @@ impl ScenarioRunner {
 
         // PDS accepts the valid record into Bob's space repo
         let (rejected_post_uri, rejected_post_cid) = self
-            .apply_create(&self.config.bob, &space_uri, "app.bsky.feed.post", &rejected_post_record)
+            .apply_create(
+                &self.config.bob,
+                &space_uri,
+                "app.bsky.feed.post",
+                &rejected_post_record,
+            )
             .await?;
 
         // Notify AppView and wait for sync commit processing (asserting signed rev advances)
-        let _bob_rev2 = self.notify_and_wait_revision(&self.config.bob, &space_uri, Some(&bob_rev1)).await?;
+        let _bob_rev2 = self
+            .notify_and_wait_revision(&self.config.bob, &space_uri, Some(&bob_rev1))
+            .await?;
 
         // AppView validator rejects the top-level post because Bob is not circle owner
         let alice_feed_after_reject: GetFeedOutput<String> = self
@@ -2015,7 +2170,9 @@ impl ScenarioRunner {
         // Query circle_rejections table for SHA256(rejected_post_uri)
         let pool = PgPool::connect(&self.config.database_url)
             .await
-            .map_err(|e| format!("Failed to connect to Circle AppView DB for rejection audit: {e}"))?;
+            .map_err(|e| {
+                format!("Failed to connect to Circle AppView DB for rejection audit: {e}")
+            })?;
 
         let uri_hash_bytes = Sha256::digest(rejected_post_uri.as_bytes()).to_vec();
         let uri_hash_hex = hex_encode(&uri_hash_bytes);
@@ -2028,9 +2185,8 @@ impl ScenarioRunner {
         .await
         .map_err(|e| format!("Failed to query circle_rejections: {e}"))?;
 
-        let (reason_code, observed_at) = rejection_row.ok_or_else(|| {
-            "Expected rejection row in circle_rejections, found none".to_string()
-        })?;
+        let (reason_code, observed_at) = rejection_row
+            .ok_or_else(|| "Expected rejection row in circle_rejections, found none".to_string())?;
 
         if reason_code != "top_level_author" {
             return Err(format!(
@@ -2054,7 +2210,9 @@ impl ScenarioRunner {
         let diag_path = self.config.artifacts_dir.join("db_diagnostics.json");
         self.write_private_file(
             &diag_path,
-            serde_json::to_string_pretty(&vec![diag_entry]).unwrap().as_bytes(),
+            serde_json::to_string_pretty(&vec![diag_entry])
+                .unwrap()
+                .as_bytes(),
         )?;
 
         eprintln!("[e2e_scenario] STEP_10_SEMANTIC_REJECTION_PROVED");
@@ -2206,14 +2364,21 @@ impl ScenarioRunner {
             .map_err(|e| format!("Failed to call updateMember to add Dave: {e}"))?;
 
         if !add_dave_resp.status().is_success() {
-            return Err(format!("add Dave returned status {}", add_dave_resp.status()));
+            return Err(format!(
+                "add Dave returned status {}",
+                add_dave_resp.status()
+            ));
         }
         let add_dave_output: UpdateMemberOutput<String> = add_dave_resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse UpdateMemberOutput for Dave add: {e}"))?;
         let _ = self
-            .poll_operation(&add_dave_output.value.id, &self.config.alice, Duration::from_secs(30))
+            .poll_operation(
+                &add_dave_output.value.id,
+                &self.config.alice,
+                Duration::from_secs(30),
+            )
             .await?;
 
         // Dave activates Space and asserts active + future expires_at
@@ -2229,7 +2394,10 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Dave activateSpace failed: {e}"))?;
         if !dave_act.status().is_success() {
-            return Err(format!("Dave activateSpace returned status {}", dave_act.status()));
+            return Err(format!(
+                "Dave activateSpace returned status {}",
+                dave_act.status()
+            ));
         }
         let dave_act_out: ActivateSpaceOutput<String> = dave_act
             .json()
@@ -2260,7 +2428,11 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| e.to_string())?;
-        if !dave_lc_after.circles.iter().any(|c| c.uri.as_str() == space_uri) {
+        if !dave_lc_after
+            .circles
+            .iter()
+            .any(|c| c.uri.as_str() == space_uri)
+        {
             return Err("Dave failed to discover circle after being added".to_string());
         }
 
@@ -2284,12 +2456,19 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse Dave GetFeedOutput: {e}"))?;
         if dave_feed_out.feed.len() != 1 {
-            return Err(format!("Expected 1 feed item for Dave, got {}", dave_feed_out.feed.len()));
+            return Err(format!(
+                "Expected 1 feed item for Dave, got {}",
+                dave_feed_out.feed.len()
+            ));
         }
-        if dave_feed_out.feed[0].post.post.uri.as_str() != post_uri || dave_feed_out.feed[0].post.post.cid.as_str() != post_cid {
+        if dave_feed_out.feed[0].post.post.uri.as_str() != post_uri
+            || dave_feed_out.feed[0].post.post.cid.as_str() != post_cid
+        {
             return Err("Dave feed item post URI/CID mismatch".to_string());
         }
-        if dave_feed_out.feed[0].post.post.like_count != Some(1) || dave_feed_out.feed[0].post.post.reply_count != Some(1) {
+        if dave_feed_out.feed[0].post.post.like_count != Some(1)
+            || dave_feed_out.feed[0].post.post.reply_count != Some(1)
+        {
             return Err("Dave feed item counts mismatch".to_string());
         }
 
@@ -2303,13 +2482,18 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Dave getPostThread after add failed: {e}"))?;
         if !dave_thread_resp.status().is_success() {
-            return Err(format!("Dave getPostThread after add returned status {}", dave_thread_resp.status()));
+            return Err(format!(
+                "Dave getPostThread after add returned status {}",
+                dave_thread_resp.status()
+            ));
         }
         let dave_thread_out: CircleGetPostThreadOutput<String> = dave_thread_resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse Dave CircleGetPostThreadOutput: {e}"))?;
-        if dave_thread_out.thread.post.uri.as_str() != post_uri || dave_thread_out.thread.post.cid.as_str() != post_cid {
+        if dave_thread_out.thread.post.uri.as_str() != post_uri
+            || dave_thread_out.thread.post.cid.as_str() != post_cid
+        {
             return Err("Dave thread root post URI/CID mismatch".to_string());
         }
         let dave_thread_replies = dave_thread_out.thread.replies.as_deref().unwrap_or(&[]);
@@ -2399,7 +2583,11 @@ impl ScenarioRunner {
             .json()
             .await
             .map_err(|e| e.to_string())?;
-        if bob_lc_after.circles.iter().any(|c| c.uri.as_str() == space_uri) {
+        if bob_lc_after
+            .circles
+            .iter()
+            .any(|c| c.uri.as_str() == space_uri)
+        {
             return Err("Bob still discovers circle after being removed".to_string());
         }
 
@@ -2532,7 +2720,9 @@ impl ScenarioRunner {
         // Full Circle snapshot equality post-Bob-removal
         let post_bob_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
         if post_bob_snapshot != pre_bob_remove_snapshot {
-            return Err("Circle snapshot modified after member removal denial assertions".to_string());
+            return Err(
+                "Circle snapshot modified after member removal denial assertions".to_string(),
+            );
         }
 
         member_markers.push("BOB_REMOVED_AND_REVOKED".into());
@@ -2562,20 +2752,23 @@ impl ScenarioRunner {
         if public_post_resp.status().is_success() {
             return Err("Public AppView unexpectedly returned private post".to_string());
         }
-        if public_post_resp.status() != StatusCode::BAD_REQUEST && public_post_resp.status() != StatusCode::NOT_FOUND {
+        if public_post_resp.status() != StatusCode::BAD_REQUEST
+            && public_post_resp.status() != StatusCode::NOT_FOUND
+        {
             return Err(format!(
                 "Public AppView getPostThread on private post returned unexpected status: {}",
                 public_post_resp.status()
             ));
         }
-        let post_err: GetPostThreadError = public_post_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse private post error body into GetPostThreadError: {e}"))?;
+        let post_err: GetPostThreadError = public_post_resp.json().await.map_err(|e| {
+            format!("Failed to parse private post error body into GetPostThreadError: {e}")
+        })?;
         match &post_err {
             GetPostThreadError::NotFound(_) => {}
             other => {
-                return Err(format!("Public AppView getPostThread returned unexpected error variant: {other}"));
+                return Err(format!(
+                    "Public AppView getPostThread returned unexpected error variant: {other}"
+                ));
             }
         }
         public_capture.private_post_thread_negative = serde_json::to_value(&post_err).unwrap();
@@ -2595,16 +2788,17 @@ impl ScenarioRunner {
         if public_reply_resp.status().is_success() {
             return Err("Public AppView unexpectedly returned private reply".to_string());
         }
-        if public_reply_resp.status() != StatusCode::BAD_REQUEST && public_reply_resp.status() != StatusCode::NOT_FOUND {
+        if public_reply_resp.status() != StatusCode::BAD_REQUEST
+            && public_reply_resp.status() != StatusCode::NOT_FOUND
+        {
             return Err(format!(
                 "Public AppView getPostThread on private reply returned unexpected status: {}",
                 public_reply_resp.status()
             ));
         }
-        let reply_err: GetPostThreadError = public_reply_resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse private reply error body into GetPostThreadError: {e}"))?;
+        let reply_err: GetPostThreadError = public_reply_resp.json().await.map_err(|e| {
+            format!("Failed to parse private reply error body into GetPostThreadError: {e}")
+        })?;
         match &reply_err {
             GetPostThreadError::NotFound(_) => {}
             other => {
@@ -2645,9 +2839,12 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse search post output: {e}"))?;
         if !search_post_output.posts.is_empty() {
-            return Err("Public AppView search unexpectedly returned private post canary text".to_string());
+            return Err(
+                "Public AppView search unexpectedly returned private post canary text".to_string(),
+            );
         }
-        public_capture.private_post_search_negative = serde_json::to_value(&search_post_output).unwrap();
+        public_capture.private_post_search_negative =
+            serde_json::to_value(&search_post_output).unwrap();
 
         let search_reply_query: SearchPosts<String> = SearchPosts {
             author: None,
@@ -2681,9 +2878,12 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse search reply output: {e}"))?;
         if !search_reply_output.posts.is_empty() {
-            return Err("Public AppView search unexpectedly returned private reply canary text".to_string());
+            return Err(
+                "Public AppView search unexpectedly returned private reply canary text".to_string(),
+            );
         }
-        public_capture.private_reply_search_negative = serde_json::to_value(&search_reply_output).unwrap();
+        public_capture.private_reply_search_negative =
+            serde_json::to_value(&search_reply_output).unwrap();
 
         let search_circle_query: SearchActors<String> = SearchActors {
             cursor: None,
@@ -2709,9 +2909,13 @@ impl ScenarioRunner {
             .await
             .map_err(|e| format!("Failed to parse search actors output: {e}"))?;
         if !search_circle_output.actors.is_empty() {
-            return Err("Public AppView search unexpectedly returned private circle name canary".to_string());
+            return Err(
+                "Public AppView search unexpectedly returned private circle name canary"
+                    .to_string(),
+            );
         }
-        public_capture.private_circle_actor_search_negative = serde_json::to_value(&search_circle_output).unwrap();
+        public_capture.private_circle_actor_search_negative =
+            serde_json::to_value(&search_circle_output).unwrap();
 
         // Authoritative Canary Manifest
         let manifest = CanaryManifest {
@@ -2744,13 +2948,18 @@ impl ScenarioRunner {
             .map_err(|e| format!("Failed to serialize public capture: {e}"))?;
 
         // Positive control check: public_control_post_uri and CID must be present
-        if !capture_json_str.contains(&public_control_post_uri) || !capture_json_str.contains(&public_control_post_cid) {
+        if !capture_json_str.contains(&public_control_post_uri)
+            || !capture_json_str.contains(&public_control_post_cid)
+        {
             return Err("Public control post URI/CID missing from public HTTP capture".to_string());
         }
 
         for canary in manifest.private_canaries() {
             if capture_json_str.contains(canary) {
-                return Err("Privacy leak detected: private canary found in public HTTP capture body".to_string());
+                return Err(
+                    "Privacy leak detected: private canary found in public HTTP capture body"
+                        .to_string(),
+                );
             }
         }
 
@@ -2780,7 +2989,7 @@ impl ScenarioRunner {
             circle_appview_url: self.config.circle_appview_url.clone(),
             circle_appview_service_did: self.config.circle_appview_service_did.clone(),
             public_appview_url: self.config.public_appview_url.clone(),
-            database_target: redact_database_url(&self.config.database_url),
+            database_kind: "postgresql".to_string(),
             alice_did: self.config.alice.did.clone(),
             alice_pds_url: self.config.alice.pds_url.clone(),
             bob_did: self.config.bob.did.clone(),
@@ -2795,7 +3004,9 @@ impl ScenarioRunner {
         let prov_path = self.config.artifacts_dir.join("provenance.json");
         self.write_private_file(
             &prov_path,
-            serde_json::to_string_pretty(&provenance).unwrap().as_bytes(),
+            serde_json::to_string_pretty(&provenance)
+                .unwrap()
+                .as_bytes(),
         )?;
 
         let manifest_path = self.config.artifacts_dir.join("canary_manifest.json");
