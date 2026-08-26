@@ -406,8 +406,13 @@ async fn space_host_resolution_falls_back_to_atproto_pds(pool: PgPool) {
     )
     .unwrap();
 
+    // Only the endpoint falls back. The service identifier is the audience of a
+    // client attestation and of a delegation token, and always names the
+    // space-host role fully qualified. Asserting "#atproto_pds" here is what let
+    // the AppView send a bare relative fragment as an `aud`, which the live PDS
+    // rejected with InvalidClientAttestation.
     assert_eq!(endpoint, pds_endpoint);
-    assert_eq!(service_id, "#atproto_pds");
+    assert_eq!(service_id, format!("{AUTHORITY_DID}#atproto_space_host"));
 }
 
 #[sqlx::test(migrations = "./migrations")]

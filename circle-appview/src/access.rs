@@ -153,6 +153,19 @@ pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
     Ok(did.to_string())
 }
 
+/// Resolve a Space authority's space-host endpoint, and the service identifier
+/// that addresses it as an audience.
+///
+/// The returned identifier is always the fully-qualified
+/// `{authority_did}#atproto_space_host`. Per the permissioned-data proposal, that
+/// is the `aud` of both a delegation token and a client attestation, and it names
+/// the space-host *role* rather than whichever DID document entry the endpoint was
+/// resolved from. `#atproto_space_host` and `#atproto_space` are both optional: an
+/// authority that omits them falls back to `#atproto_pds` and `#atproto` for the
+/// endpoint and key, but the audience does not change with that fallback. Returning
+/// the matched `service.id` here instead sent the bare relative fragment
+/// `"#atproto_pds"` as an audience, which the live PDS rejected with
+/// `InvalidClientAttestation`.
 pub fn resolve_space_host_endpoint(
     doc: &DidDocument,
     authority_did: &str,
@@ -161,12 +174,13 @@ pub fn resolve_space_host_endpoint(
         return Err(AppError::Unauthorized(AuthReason::IdMismatch));
     }
 
-    let expected_full_id = format!("{authority_did}#atproto_space_host");
+    let space_host_service = format!("{authority_did}#atproto_space_host");
+
     for service in &doc.service {
         if service.r#type == "AtprotoSpaceHost"
-            && (service.id == "#atproto_space_host" || service.id == expected_full_id)
+            && (service.id == "#atproto_space_host" || service.id == space_host_service)
         {
-            return Ok((service.service_endpoint.clone(), service.id.clone()));
+            return Ok((service.service_endpoint.clone(), space_host_service));
         }
     }
 
@@ -175,7 +189,7 @@ pub fn resolve_space_host_endpoint(
         if service.r#type == "AtprotoPersonalDataServer"
             && (service.id == "#atproto_pds" || service.id == expected_atproto_pds)
         {
-            return Ok((service.service_endpoint.clone(), service.id.clone()));
+            return Ok((service.service_endpoint.clone(), space_host_service));
         }
     }
     Err(AppError::NotFound(
@@ -812,6 +826,45 @@ mod tests {
     const TEST_AUTHORITY_DID: &str = "did:plc:authority-space-owner";
     const TEST_SPACE_HOST: &str = "https://space-host.example.com";
     const TEST_USER_PDS: &str = "https://pds.alice.example.com";
+
+    /// The `aud` of a client attestation and of a delegation token is the
+    /// space-host *role* identifier, always fully qualified, even when the
+    /// endpoint was resolved from the `#atproto_pds` fallback. Returning the
+    /// matched service's own relative id here sent `"#atproto_pds"` as an
+    /// audience and the live PDS answered `InvalidClientAttestation`.
+    #[test]
+    fn space_host_audience_is_always_the_qualified_space_host_service() {
+        let declared = DidDocument {
+            id: TEST_AUTHORITY_DID.into(),
+            verification_method: vec![],
+            service: vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        };
+        let (endpoint, service) =
+            resolve_space_host_endpoint(&declared, TEST_AUTHORITY_DID).unwrap();
+        assert_eq!(endpoint, TEST_SPACE_HOST);
+        assert_eq!(service, format!("{TEST_AUTHORITY_DID}#atproto_space_host"));
+
+        // An authority that declares no space host falls back to its PDS for the
+        // endpoint, but the audience must not fall back with it.
+        let fallback = DidDocument {
+            id: TEST_AUTHORITY_DID.into(),
+            verification_method: vec![],
+            service: vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        };
+        let (endpoint, service) =
+            resolve_space_host_endpoint(&fallback, TEST_AUTHORITY_DID).unwrap();
+        assert_eq!(endpoint, TEST_USER_PDS);
+        assert_eq!(service, format!("{TEST_AUTHORITY_DID}#atproto_space_host"));
+        assert!(!service.starts_with('#'), "audience must be fully qualified");
+    }
 
     fn register_test_did_doc(
         resolver: &DidResolver,
