@@ -91,6 +91,13 @@ impl Config {
             .ok()
             .or_else(|| env::var("CIRCLE_SIGNING_KEY_HEX").ok());
 
+        let session_encryption_key_raw = env::var("SESSION_ENCRYPTION_KEY").map_err(|_| {
+            anyhow::anyhow!(
+                "SESSION_ENCRYPTION_KEY environment variable is required (32 bytes as 64-character hex or base64)"
+            )
+        })?;
+        let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
+
         Ok(Self {
             host,
             port,
@@ -119,6 +126,54 @@ fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
         .collect()
 }
+pub fn parse_session_encryption_key(raw: &str) -> Result<[u8; 32], anyhow::Error> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("SESSION_ENCRYPTION_KEY must not be empty"));
+    }
+    // Try hex (64 hex characters -> 32 bytes)
+    if trimmed.len() == 64 {
+        if let Ok(bytes) = hex_to_bytes(trimmed) {
+            if bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                return Ok(key);
+            }
+        }
+    }
+    // Try standard base64 and URL-safe base64 (with or without padding)
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine;
+
+    for engine in &[&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = engine.decode(trimmed) {
+            if bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                return Ok(key);
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "SESSION_ENCRYPTION_KEY is invalid: expected 32 bytes (64-character hex or base64)"
+    ))
+}
+
+pub fn load_session_encryption_key_or_fail() -> [u8; 32] {
+    match env::var("SESSION_ENCRYPTION_KEY") {
+        Ok(raw) => match parse_session_encryption_key(&raw) {
+            Ok(key) => key,
+            Err(e) => {
+                panic!("SESSION_ENCRYPTION_KEY is malformed: {e}. Refusing to start without valid encryption key.");
+            }
+        },
+        Err(_) => {
+            panic!("SESSION_ENCRYPTION_KEY environment variable is required (32 bytes as 64-character hex or base64). Refusing to start without encryption key.");
+        }
+    }
+}
+
 
 fn try_load_signing_key(path: Option<&str>, hex: Option<&str>) -> Option<p256::ecdsa::SigningKey> {
     if let Some(h) = hex {
@@ -213,10 +268,14 @@ impl AppState {
             }
         };
 
-        let oauth_service = Arc::new(OAuthService::new(
+        let session_encryption_key = load_session_encryption_key_or_fail();
+
+        let oauth_service = Arc::new(OAuthService::with_encryption_key(
+            db.clone(),
             config.appview_base_url.clone(),
             oauth_signing_key,
             config.oauth_key_id.clone(),
+            session_encryption_key,
         ));
 
         space_client.set_deps(crate::space_client::SpaceClientDeps {
@@ -347,8 +406,8 @@ mod tests {
         let loaded = try_load_signing_key(Some(file.to_str().unwrap()), None)
             .expect("SEC1 PEM must load");
         assert_eq!(
-            loaded.to_bytes().as_slice(),
-            key.to_bytes().as_slice(),
+            loaded.to_bytes(),
+            key.to_bytes(),
             "loaded key must be the same key, not a fresh one"
         );
         std::fs::remove_file(&file).ok();
@@ -360,7 +419,7 @@ mod tests {
         let key = p256::SecretKey::random(&mut rand::thread_rng());
         let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         let loaded = try_load_signing_key(None, Some(&hex)).expect("hex key must load");
-        assert_eq!(loaded.to_bytes().as_slice(), key.to_bytes().as_slice());
+        assert_eq!(loaded.to_bytes(), key.to_bytes());
     }
 
     /// A configured-but-garbage key must NOT yield a key; startup turns this into
@@ -368,5 +427,33 @@ mod tests {
     #[test]
     fn rejects_unparseable_key() {
         assert!(try_load_signing_key(None, Some("not-a-key")).is_none());
+    }
+
+    #[test]
+    fn parses_hex_session_encryption_key() {
+        let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed = super::parse_session_encryption_key(hex_key).expect("hex key must parse");
+        assert_eq!(parsed[0], 0x01);
+        assert_eq!(parsed[31], 0xef);
+    }
+
+    #[test]
+    fn parses_base64_session_encryption_key() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let raw = [42u8; 32];
+        let b64 = STANDARD.encode(raw);
+        let parsed = super::parse_session_encryption_key(&b64).expect("base64 key must parse");
+        assert_eq!(parsed, raw);
+    }
+
+    #[test]
+    fn rejects_invalid_session_encryption_keys() {
+        assert!(super::parse_session_encryption_key("").is_err());
+        assert!(super::parse_session_encryption_key("not-a-key").is_err());
+        assert!(super::parse_session_encryption_key("0123456789abcdef").is_err()); // 8 bytes
+        // 31 bytes in hex (62 hex chars)
+        let short_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+        assert!(super::parse_session_encryption_key(short_hex).is_err());
     }
 }

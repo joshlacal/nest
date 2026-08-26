@@ -41,6 +41,20 @@ pub struct SpaceClientDeps {
 }
 
 pub trait SpaceHostTransport: Send + Sync {
+    fn get_delegation_token<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_uri: &'a str,
+        _access_token: &'a str,
+        _dpop_key: &'a p256::ecdsa::SigningKey,
+    ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound(
+                "get_delegation_token not implemented on transport".into(),
+            ))
+        })
+    }
+
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
@@ -278,10 +292,13 @@ impl DefaultSpaceHostTransport {
             .dns_resolver
             .resolve_dns(host, port)
             .await
-            .map_err(AppError::Unauthorized)?;
+            .map_err(|e| match e {
+                AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+                other => AppError::Internal(format!("DNS resolution failed for {host}:{port}: {other}")),
+            })?;
 
         if addrs.is_empty() {
-            return Err(AppError::Unauthorized(AuthReason::SsrfBlocked));
+            return Err(AppError::Internal(format!("DNS resolution returned no addresses for {host}")));
         }
 
         if !self.allow_loopback_for_test {
@@ -310,6 +327,62 @@ impl DefaultSpaceHostTransport {
 }
 
 impl SpaceHostTransport for DefaultSpaceHostTransport {
+    fn get_delegation_token<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_uri: &'a str,
+        access_token: &'a str,
+        dpop_key: &'a p256::ecdsa::SigningKey,
+    ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_uri = space_uri.to_string();
+        let access_token = access_token.to_string();
+        let dpop_key = dpop_key.clone();
+
+        Box::pin(async move {
+            let client = self.build_pinned_client(&target_url).await?;
+
+            let mut req_url = target_url.clone();
+            req_url
+                .query_pairs_mut()
+                .append_pair("space", &space_uri);
+
+            let response = crate::oauth::get_with_dpop(
+                &client,
+                &dpop_key,
+                req_url.as_str(),
+                &access_token,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to get delegation token: {e}")))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|e| AppError::Internal(format!("Failed to read error body: {e}")))?;
+                return Err(parse_xrpc_error(status, &body));
+            }
+
+            #[derive(Deserialize)]
+            struct DelegationTokenResponse {
+                token: String,
+            }
+
+            let body: DelegationTokenResponse = response
+                .json()
+                .await
+                .map_err(|e| AppError::Internal(format!("Invalid delegation token response JSON: {e}")))?;
+
+            if body.token.is_empty() {
+                return Err(AppError::Internal("Empty delegation token received".into()));
+            }
+
+            Ok(body.token)
+        })
+    }
+
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
@@ -347,9 +420,11 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 
             if !response.status().is_success() {
                 let status = response.status();
-                return Err(AppError::Internal(format!(
-                    "Space host returned non-success status: {status}"
-                )));
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|e| AppError::Internal(format!("Failed to read error body: {e}")))?;
+                return Err(parse_xrpc_error(status, &body));
             }
 
             let body: serde_json::Value = response
@@ -760,8 +835,18 @@ pub struct RecordedSpaceHostCall {
     pub client_attestation: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordedDelegationTokenCall {
+    pub endpoint_url: String,
+    pub space_uri: String,
+    pub access_token: String,
+}
+
 pub struct MockSpaceHostTransport {
     responses: Mutex<HashMap<String, Result<String, String>>>,
+    delegation_token_responses: Mutex<HashMap<String, Result<String, String>>>,
+    delegation_token_calls: Mutex<Vec<RecordedDelegationTokenCall>>,
+    authority_keys: Mutex<HashMap<String, p256::ecdsa::SigningKey>>,
     list_repos_responses: Mutex<
         HashMap<
             String,
@@ -792,6 +877,9 @@ impl MockSpaceHostTransport {
     pub fn new() -> Self {
         Self {
             responses: Mutex::new(HashMap::new()),
+            delegation_token_responses: Mutex::new(HashMap::new()),
+            delegation_token_calls: Mutex::new(Vec::new()),
+            authority_keys: Mutex::new(HashMap::new()),
             list_repos_responses: Mutex::new(HashMap::new()),
             list_repo_ops_responses: Mutex::new(HashMap::new()),
             get_repo_responses: Mutex::new(HashMap::new()),
@@ -805,6 +893,21 @@ impl MockSpaceHostTransport {
     pub fn set_credential_response(&self, space: &str, result: Result<String, String>) {
         let mut lock = self.responses.lock().unwrap();
         lock.insert(space.to_string(), result);
+    }
+
+    pub fn set_delegation_token_response(&self, space: &str, result: Result<String, String>) {
+        let mut lock = self.delegation_token_responses.lock().unwrap();
+        lock.insert(space.to_string(), result);
+    }
+
+    pub fn set_authority_signing_key(&self, authority_did: &str, key: p256::ecdsa::SigningKey) {
+        let mut lock = self.authority_keys.lock().unwrap();
+        lock.insert(authority_did.to_string(), key);
+    }
+
+    pub fn recorded_delegation_token_calls(&self) -> Vec<RecordedDelegationTokenCall> {
+        let lock = self.delegation_token_calls.lock().unwrap();
+        lock.clone()
     }
 
     pub fn set_list_repos_response(
@@ -861,6 +964,32 @@ impl MockSpaceHostTransport {
 }
 
 impl SpaceHostTransport for MockSpaceHostTransport {
+    fn get_delegation_token<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_uri: &'a str,
+        access_token: &'a str,
+        _dpop_key: &'a p256::ecdsa::SigningKey,
+    ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
+        {
+            let mut calls = self.delegation_token_calls.lock().unwrap();
+            calls.push(RecordedDelegationTokenCall {
+                endpoint_url: target_url.to_string(),
+                space_uri: space_uri.to_string(),
+                access_token: access_token.to_string(),
+            });
+        }
+        let lock = self.delegation_token_responses.lock().unwrap();
+        let res = lock.get(space_uri).cloned();
+        Box::pin(async move {
+            match res {
+                Some(Ok(token)) => Ok(token),
+                Some(Err(e)) => Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e)),
+                None => Ok(format!("mock_delegation_token_{space_uri}")),
+            }
+        })
+    }
+
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
@@ -879,13 +1008,34 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 client_attestation: client_attestation.to_string(),
             });
         }
-        let lock = self.responses.lock().unwrap();
-        let res = lock.get(space_uri).cloned();
+        let authority_did = extract_authority_from_space_uri(space_uri).unwrap_or_default();
+        let authority_key = {
+            let keys = self.authority_keys.lock().unwrap();
+            keys.get(&authority_did).cloned()
+        };
+        let res = {
+            let lock = self.responses.lock().unwrap();
+            lock.get(space_uri).cloned()
+        };
         Box::pin(async move {
             match res {
                 Some(Ok(cred)) => Ok(cred),
-                Some(Err(e)) => Err(AppError::Internal(e)),
-                None => Err(AppError::NotFound(format!("No mock response for {space_uri}"))),
+                Some(Err(e)) => Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e)),
+                None => {
+                    if let Some(key) = authority_key {
+                        let jkt = extract_jkt_from_dpop_proof(dpop_proof).unwrap_or_else(|_| "mock_jkt".into());
+                        let cred = mint_mock_space_credential(
+                            &key,
+                            &authority_did,
+                            space_uri,
+                            &jkt,
+                            Utc::now() + chrono::Duration::hours(2),
+                        );
+                        Ok(cred)
+                    } else {
+                        Err(AppError::NotFound(format!("No mock response for {space_uri}")))
+                    }
+                }
             }
         })
     }
@@ -1063,6 +1213,20 @@ impl SpaceClient {
     pub fn set_deps(&self, deps: SpaceClientDeps) {
         let mut lock = self.deps.write();
         *lock = Some(deps);
+    }
+
+    /// Mint a delegation token from the user's PDS using AppView's OAuth access token.
+    pub async fn get_delegation_token(
+        &self,
+        user_pds_endpoint: &str,
+        space_uri: &str,
+        access_token: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+    ) -> Result<String, AppError> {
+        let xrpc_url = construct_xrpc_url(user_pds_endpoint, "com.atproto.space.getDelegationToken")?;
+        self.transport
+            .get_delegation_token(&xrpc_url, space_uri, access_token, dpop_key)
+            .await
     }
 
     /// Fetch member DIDs via `com.atproto.simplespace.listMembers` from the owner's PDS using AppView's OAuth session.
@@ -1672,4 +1836,302 @@ pub fn validate_space_credential(
         .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
 
     Ok(expires_at)
+}
+
+#[derive(Deserialize)]
+struct XrpcErrorPayload {
+    error: Option<String>,
+    message: Option<String>,
+}
+
+pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
+    if status.is_server_error() {
+        return AppError::Internal(format!("Upstream server error ({status}): {body}"));
+    }
+
+    let payload: XrpcErrorPayload = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(_) => {
+            return AppError::Internal(format!(
+                "Failed to parse XRPC error payload ({status}): {body}"
+            ));
+        }
+    };
+
+    let error_code = match payload.error.as_deref() {
+        Some(code) => code,
+        None => {
+            return AppError::Internal(format!(
+                "XRPC error response missing error field ({status}): {body}"
+            ));
+        }
+    };
+
+    let message = payload.message.as_deref().unwrap_or(body);
+
+    match error_code {
+        "AppNotAuthorized" => AppError::Forbidden(format!("AppNotAuthorized: {message}")),
+        "UserNotAuthorized" => AppError::Forbidden(format!("UserNotAuthorized: {message}")),
+        "NotAuthorized" => AppError::Forbidden(format!("NotAuthorized: {message}")),
+        "InvalidDelegationToken" => {
+            AppError::Forbidden(format!("InvalidDelegationToken: {message}"))
+        }
+        "InvalidClientAttestation" => {
+            AppError::Forbidden(format!("InvalidClientAttestation: {message}"))
+        }
+        "SpaceNotFound" => AppError::NotFound(format!("SpaceNotFound: {message}")),
+        "SpaceDeleted" => AppError::AccessRemoved(format!("SpaceDeleted: {message}")),
+        other => match status {
+            reqwest::StatusCode::NOT_FOUND => AppError::NotFound(format!("{other}: {message}")),
+            reqwest::StatusCode::FORBIDDEN => AppError::Forbidden(format!("{other}: {message}")),
+            reqwest::StatusCode::BAD_REQUEST => {
+                AppError::InvalidRequest(format!("{other}: {message}"))
+            }
+            _ => AppError::Internal(format!("{other} ({status}): {message}")),
+        },
+    }
+}
+
+pub fn extract_jkt_from_dpop_proof(dpop_proof: &str) -> Result<String, AppError> {
+    let parts: Vec<&str> = dpop_proof.split('.').collect();
+    if parts.is_empty() {
+        return Err(AppError::InvalidRequest("Invalid DPoP proof format".into()));
+    }
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderEncoding))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
+    let jwk = header
+        .get("jwk")
+        .ok_or_else(|| AppError::Unauthorized(AuthReason::MissingKid))?;
+    let x = jwk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Unauthorized(AuthReason::InvalidCoordinates))?;
+    let y = jwk
+        .get("y")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Unauthorized(AuthReason::InvalidCoordinates))?;
+    let canonical_json = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+    let hash = Sha256::digest(canonical_json.as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(hash))
+}
+
+pub fn mint_mock_space_credential(
+    authority_key: &p256::ecdsa::SigningKey,
+    authority_did: &str,
+    space_uri: &str,
+    jkt: &str,
+    expires_at: DateTime<Utc>,
+) -> String {
+    let header = json!({
+        "typ": "atproto-space-credential+jwt",
+        "alg": "ES256"
+    });
+    let claims = json!({
+        "iss": authority_did,
+        "sub": space_uri,
+        "cnf": {
+            "jkt": jkt
+        },
+        "exp": expires_at.timestamp(),
+        "iat": Utc::now().timestamp(),
+        "jti": Uuid::new_v4().to_string()
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+    let claims_b64 = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+    let sig: p256::ecdsa::Signature = authority_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    format!("{signing_input}.{sig_b64}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn test_parse_xrpc_error_5xx_with_semantic_code_is_internal() {
+        let err = parse_xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"SpaceNotFound","message":"database failed"}"#,
+        );
+        match err {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Upstream server error (500"),
+                    "500 with SpaceNotFound must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for 500 error, got: {:?}", other),
+        }
+
+        let err2 = parse_xrpc_error(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"AppNotAuthorized","message":"gateway bad"}"#,
+        );
+        match err2 {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Upstream server error (502"),
+                    "502 with AppNotAuthorized must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for 502 error, got: {:?}", other),
+        }
+
+        let err3 = parse_xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"SpaceDeleted","message":"server overloaded"}"#,
+        );
+        match err3 {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Upstream server error (503"),
+                    "503 with SpaceDeleted must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for 503 error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xrpc_error_unread_or_invalid_body_is_internal() {
+        // Truncated/HTML 404 should NOT become NotFound
+        let err = parse_xrpc_error(StatusCode::NOT_FOUND, "<html>404 Not Found from proxy</html>");
+        match err {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Failed to parse XRPC error payload"),
+                    "Unparsed 404 must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for unparsed 404, got: {:?}", other),
+        }
+
+        // Truncated/HTML 403 should NOT become Forbidden
+        let err2 = parse_xrpc_error(StatusCode::FORBIDDEN, "<html>403 Forbidden Cloudflare</html>");
+        match err2 {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Failed to parse XRPC error payload"),
+                    "Unparsed 403 must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for unparsed 403, got: {:?}", other),
+        }
+
+        // Broken JSON body
+        let err3 = parse_xrpc_error(StatusCode::BAD_REQUEST, "{\"error\": \"InvalidReq");
+        match err3 {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Failed to parse XRPC error payload"),
+                    "Malformed JSON must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for malformed JSON, got: {:?}", other),
+        }
+
+        // JSON without "error" field
+        let err4 = parse_xrpc_error(StatusCode::BAD_REQUEST, r#"{"message":"something went wrong"}"#);
+        match err4 {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("missing error field"),
+                    "JSON without error field must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for missing error field, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xrpc_error_valid_semantic_codes() {
+        let err = parse_xrpc_error(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"SpaceNotFound","message":"Space not found on PDS"}"#,
+        );
+        match err {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains("SpaceNotFound"), "Expected SpaceNotFound, got: {msg}");
+            }
+            other => panic!("Expected AppError::NotFound, got: {:?}", other),
+        }
+
+        let err2 = parse_xrpc_error(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"AppNotAuthorized","message":"Client not allowed"}"#,
+        );
+        match err2 {
+            AppError::Forbidden(msg) => {
+                assert!(msg.contains("AppNotAuthorized"), "Expected AppNotAuthorized, got: {msg}");
+            }
+            other => panic!("Expected AppError::Forbidden, got: {:?}", other),
+        }
+
+        let err3 = parse_xrpc_error(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"UserNotAuthorized","message":"User not member"}"#,
+        );
+        match err3 {
+            AppError::Forbidden(msg) => {
+                assert!(msg.contains("UserNotAuthorized"), "Expected UserNotAuthorized, got: {msg}");
+            }
+            other => panic!("Expected AppError::Forbidden, got: {:?}", other),
+        }
+
+        let err4 = parse_xrpc_error(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"SpaceDeleted","message":"Space has been deleted"}"#,
+        );
+        match err4 {
+            AppError::AccessRemoved(msg) => {
+                assert!(msg.contains("SpaceDeleted"), "Expected SpaceDeleted, got: {msg}");
+            }
+            other => panic!("Expected AppError::AccessRemoved, got: {:?}", other),
+        }
+    }
+
+    struct FailingDnsResolver;
+    impl SpaceHostDnsResolver for FailingDnsResolver {
+        fn resolve_dns<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+            Box::pin(async move { Err(AuthReason::DidResolutionFailed) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dns_transport_failure_is_internal_not_unauthorized() {
+        let transport = DefaultSpaceHostTransport::with_dns_resolver(Arc::new(FailingDnsResolver));
+        let url = url::Url::parse("https://space.example.com/xrpc/endpoint").unwrap();
+        let err = transport.build_pinned_client(&url).await.expect_err("DNS failure must fail");
+
+        match err {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("DNS resolution failed"),
+                    "DNS failure must be internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for DNS failure, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_rejection_remains_unauthorized() {
+        let transport = DefaultSpaceHostTransport::new();
+        let url = url::Url::parse("https://127.0.0.1/xrpc/endpoint").unwrap();
+        let err = transport.build_pinned_client(&url).await.expect_err("SSRF must fail");
+
+        match err {
+            AppError::Unauthorized(AuthReason::SsrfBlocked) => {}
+            other => panic!("Expected AppError::Unauthorized(SsrfBlocked), got: {:?}", other),
+        }
+    }
 }

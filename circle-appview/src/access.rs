@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ActiveSpaceCredential {
     pub token: String,
     pub dpop_key: p256::ecdsa::SigningKey,
@@ -537,9 +537,12 @@ pub async fn activate_circle(
     }
 
     // 3. Sync Space repos to discover metadata.
-    // A discarded error here is indistinguishable from a genuinely missing
-    // metadata record, which produces a misleading "not eligible" rejection, so
-    // record why the sync failed and carry it into the error below.
+    // Acquire a Space credential under the calling user's OAuth session first.
+    if let Err(e) = ensure_space_credential(state, space_uri, Some(user_did)).await {
+        tracing::warn!(error = %e, space_uri = %space_uri, "Failed to acquire space credential during activation");
+        return Err(e);
+    }
+
     let sync_engine = crate::sync::SyncEngine::new(state);
     let sync_error = match sync_engine.sync_repo(space_uri, &authority_did).await {
         Ok(_) => None,
@@ -640,4 +643,722 @@ pub async fn activate_circle(
         muted: Some(false),
         extra_data: None,
     })
+}
+/// Ensure an active Space credential is available in the CredentialStore for the given space_uri.
+///
+/// If already cached and valid, returns it immediately.
+/// Otherwise, selects an active OAuth session (preferred_user_did, or a space member with an active session,
+/// or the space authority), obtains a delegation token from the user's PDS, signs a client attestation,
+/// exchanges for a space credential with the Space host, and inserts it into the credential store.
+pub async fn ensure_space_credential(
+    state: &AppState,
+    space_uri: &str,
+    preferred_user_did: Option<&str>,
+) -> Result<ActiveSpaceCredential, AppError> {
+    if let Some(cred) = state.credential_store.get(space_uri).await {
+        return Ok(cred);
+    }
+
+    let _lock_guard = state.space_locks.acquire(space_uri).await;
+
+    ensure_space_credential_from_parts(
+        &state.db,
+        &state.space_client,
+        &state.credential_store,
+        &state.did_resolver,
+        &state.oauth_service,
+        &state.http_client,
+        space_uri,
+        preferred_user_did,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn ensure_space_credential_from_parts(
+    db: &PgPool,
+    space_client: &crate::space_client::SpaceClient,
+    credential_store: &CredentialStore,
+    did_resolver: &crate::auth::DidResolver,
+    oauth_service: &crate::oauth::OAuthService,
+    http_client: &reqwest::Client,
+    space_uri: &str,
+    preferred_user_did: Option<&str>,
+) -> Result<ActiveSpaceCredential, AppError> {
+    // 1. Return early if credential store already holds an active, unexpired credential
+    if let Some(cred) = credential_store.get(space_uri).await {
+        return Ok(cred);
+    }
+
+    let authority_did = extract_authority_did(space_uri)?;
+
+    // 2. Choose whose OAuth session to act under:
+    // - preferred_user_did if we hold a session for them
+    // - otherwise a member of that Space for whom we DO hold a session
+    //   (intersect circle_member_cache with oauth_service.list_sessions())
+    // - otherwise the Space authority
+    let mut acting_user_did: Option<String> = None;
+
+    if let Some(preferred) = preferred_user_did {
+        if oauth_service.get_session(preferred).await?.is_some() {
+            acting_user_did = Some(preferred.to_string());
+        }
+    }
+
+    if acting_user_did.is_none() {
+        let member_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1",
+        )
+        .bind(space_uri)
+        .fetch_all(db)
+        .await?;
+
+        if !member_rows.is_empty() {
+            let sessions = oauth_service.list_sessions().await?;
+            for (member_did,) in member_rows {
+                if sessions.iter().any(|s| s.user_did == member_did) {
+                    acting_user_did = Some(member_did);
+                    break;
+                }
+            }
+        }
+    }
+
+    if acting_user_did.is_none() && oauth_service.get_session(&authority_did).await?.is_some() {
+        acting_user_did = Some(authority_did.clone());
+    }
+
+    let user_did = acting_user_did.ok_or_else(|| {
+        AppError::Forbidden(
+            "Circle authorization required: no active OAuth session for user, members, or space authority".into(),
+        )
+    })?;
+
+    // 3. Obtain valid token and DPoP signing key for the chosen user
+    let (access_token, dpop_key) = oauth_service
+        .get_valid_token(&user_did, http_client)
+        .await?;
+
+    // 4. Resolve that user's PDS endpoint from their DID document
+    let user_doc = did_resolver
+        .resolve(&user_did)
+        .await
+        .map_err(|e| match e {
+            AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+            other => AppError::Internal(format!("Failed to resolve DID document for {user_did}: {other}")),
+        })?;
+    let (user_pds_endpoint, _) = resolve_pds_endpoint(&user_doc, &user_did)?;
+
+    // 5. Step 1: Mint delegation token from user's PDS
+    let delegation_token = space_client
+        .get_delegation_token(
+            &user_pds_endpoint,
+            space_uri,
+            &access_token,
+            &dpop_key,
+        )
+        .await?;
+
+    // 6. Resolve space host endpoint and authority DID document
+    let authority_doc = did_resolver
+        .resolve(&authority_did)
+        .await
+        .map_err(|e| match e {
+            AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+            other => AppError::Internal(format!("Failed to resolve DID document for {authority_did}: {other}")),
+        })?;
+    let (space_host_endpoint, space_host_service) =
+        resolve_space_host_endpoint(&authority_doc, &authority_did)?;
+
+    // 7. Step 2: Sign client attestation and exchange for Space credential
+    let client_attestation = oauth_service
+        .sign_client_attestation(&space_host_service)?;
+
+    let (credential_jwt, ephemeral_dpop_key, expires_at) = space_client
+        .exchange_credential(
+            &space_host_endpoint,
+            space_uri,
+            &delegation_token,
+            &client_attestation,
+            &authority_did,
+            &authority_doc,
+        )
+        .await?;
+
+    let cred = ActiveSpaceCredential {
+        token: credential_jwt,
+        dpop_key: ephemeral_dpop_key,
+        expires_at,
+    };
+
+    // 8. Store in CredentialStore
+    credential_store.insert(space_uri.to_string(), cred.clone()).await;
+
+    Ok(cred)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod};
+    use crate::oauth::{OAuthService, UserOAuthSession};
+    use crate::space_client::{MockSpaceHostTransport, SpaceClient};
+    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::EncodedPoint;
+    use std::sync::Arc;
+
+    const TEST_SPACE_URI: &str = "at://did:plc:authority-space-owner/space/blue.catbird.circle/3k2space1";
+    const TEST_USER_DID: &str = "did:plc:alice-member-user";
+    const TEST_AUTHORITY_DID: &str = "did:plc:authority-space-owner";
+    const TEST_SPACE_HOST: &str = "https://space-host.example.com";
+    const TEST_USER_PDS: &str = "https://pds.alice.example.com";
+
+    fn register_test_did_doc(
+        resolver: &DidResolver,
+        did: &str,
+        signing_key: &p256::ecdsa::SigningKey,
+        services: Vec<DidService>,
+    ) {
+        let ep = EncodedPoint::from(signing_key.verifying_key());
+        let x = URL_SAFE_NO_PAD.encode(ep.x().expect("x"));
+        let y = URL_SAFE_NO_PAD.encode(ep.y().expect("y"));
+        let jwk = PublicKeyJwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x,
+            y: Some(y),
+            kid: Some(format!("{did}#atproto")),
+        };
+        let vm = VerificationMethod {
+            id: format!("{did}#atproto"),
+            r#type: "JsonWebKey2020".into(),
+            controller: did.into(),
+            public_key_jwk: Some(jwk),
+            public_key_multibase: None,
+        };
+        let doc = DidDocument {
+            id: did.into(),
+            verification_method: vec![vm],
+            service: services,
+        };
+        resolver.insert_cached(did.into(), doc);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_success_populates_store(pool: PgPool) {
+        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &user_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &auth_key,
+            vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
+
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_authority_signing_key(TEST_AUTHORITY_DID, auth_key.clone());
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        // Store active session for user
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+            auth_server_iss: TEST_USER_PDS.into(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        let http_client = reqwest::Client::new();
+        let cred = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            Some(TEST_USER_DID),
+        )
+        .await
+        .expect("ensure_space_credential should succeed");
+
+        assert!(!cred.token.is_empty());
+        assert!(cred.expires_at > Utc::now());
+
+        // Credential store must now hold the credential
+        let cached = credential_store.get(TEST_SPACE_URI).await;
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().token, cred.token);
+
+        // Mock transport must have recorded delegation token and credential exchange calls
+        let dt_calls = mock_transport.recorded_delegation_token_calls();
+        assert_eq!(dt_calls.len(), 1);
+        assert_eq!(dt_calls[0].space_uri, TEST_SPACE_URI);
+
+        let cred_calls = mock_transport.recorded_calls();
+        assert_eq!(cred_calls.len(), 1);
+        assert_eq!(cred_calls[0].space_uri, TEST_SPACE_URI);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_cached_does_not_rerun_chain(pool: PgPool) {
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        // Pre-populate credential store with unexpired credential
+        let existing_cred = ActiveSpaceCredential {
+            token: "already_cached_token".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            expires_at: Utc::now() + chrono::Duration::hours(2),
+        };
+        credential_store.insert(TEST_SPACE_URI.to_string(), existing_cred.clone()).await;
+
+        let http_client = reqwest::Client::new();
+        let cred = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            Some(TEST_USER_DID),
+        )
+        .await
+        .expect("Cached credential should return without network calls");
+
+        assert_eq!(cred.token, "already_cached_token");
+        assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 0);
+        assert_eq!(mock_transport.recorded_calls().len(), 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_app_not_authorized_surfaced(pool: PgPool) {
+        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &user_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &auth_key,
+            vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
+
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        // Set AppNotAuthorized error response from authority
+        mock_transport.set_credential_response(
+            TEST_SPACE_URI,
+            Err(serde_json::json!({
+                "error": "AppNotAuthorized",
+                "message": "Client AppView not permitted to read Space"
+            }).to_string()),
+        );
+
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+            auth_server_iss: TEST_USER_PDS.into(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        let http_client = reqwest::Client::new();
+        let err = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            Some(TEST_USER_DID),
+        )
+        .await
+        .expect_err("Must fail when AppNotAuthorized returned by authority");
+
+        match err {
+            AppError::Forbidden(msg) => {
+                assert!(
+                    msg.contains("AppNotAuthorized"),
+                    "Error message must clearly identify AppNotAuthorized, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Forbidden for AppNotAuthorized, got: {:?}", other),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_no_usable_session_fails(pool: PgPool) {
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        let http_client = reqwest::Client::new();
+        let err = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            None,
+        )
+        .await
+        .expect_err("Must fail when no session is held for user/member/authority");
+
+        match err {
+            AppError::Forbidden(msg) => {
+                assert!(
+                    msg.contains("Circle authorization required") || msg.contains("no active OAuth session"),
+                    "Error must indicate authorization is needed, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Forbidden for missing session, got: {:?}", other),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_db_failure_propagates_database_error(pool: PgPool) {
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        // Close the pool to force a database error on member cache lookup
+        pool.close().await;
+
+        let http_client = reqwest::Client::new();
+        let err = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            None,
+        )
+        .await
+        .expect_err("DB failure must propagate as an error");
+
+        match err {
+            AppError::Database(_) => {}
+            other => panic!("Expected AppError::Database for DB failure, got: {:?}", other),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_did_resolver_failure_surfaces_as_internal(pool: PgPool) {
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        // Unmocked DID resolver pointing to unreachable endpoint to simulate PLC outage
+        let did_resolver = Arc::new(DidResolver::new("http://127.0.0.1:1".into(), reqwest::Client::new()));
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+            auth_server_iss: TEST_USER_PDS.into(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        let http_client = reqwest::Client::new();
+        let err = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            Some(TEST_USER_DID),
+        )
+        .await
+        .expect_err("DID resolution outage must fail");
+
+        match err {
+            AppError::Internal(msg) => {
+                assert!(
+                    msg.contains("Failed to resolve DID document"),
+                    "Error must indicate DID resolution failure as internal error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AppError::Internal for DID resolution outage, got: {:?}", other),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_ensure_space_credential_concurrent_runs_chain_once(pool: PgPool) {
+        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &user_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &auth_key,
+            vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
+
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_authority_signing_key(TEST_AUTHORITY_DID, auth_key.clone());
+
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+            auth_server_iss: TEST_USER_PDS.into(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        let config = Arc::new(crate::config::Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
+            plc_directory_url: "https://plc.directory".into(),
+            public_appview_url: "https://public.api.bsky.app".into(),
+            circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
+            push_signing_key_path: None,
+            push_signing_key_hex: None,
+        });
+
+        let http_client = reqwest::Client::new();
+        let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
+            config.public_appview_url.clone(),
+            http_client.clone(),
+        ));
+
+        let state = AppState {
+            config,
+            db: pool,
+            http_client,
+            did_resolver,
+            credential_store: credential_store.clone(),
+            space_client,
+            space_locks: Arc::new(SpaceLockManager::new()),
+            profile_hydrator,
+            oauth_service,
+            push_client: None,
+        };
+
+        // Spawn 5 concurrent tasks requesting the same space credential
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                ensure_space_credential(&state, TEST_SPACE_URI, Some(TEST_USER_DID)).await
+            }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap();
+            assert!(res.is_ok(), "Concurrent ensure_space_credential must succeed: {:?}", res.err());
+        }
+
+        // The chain must have run exactly once due to the per-space lock and double-checked caching
+        assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
+        assert_eq!(mock_transport.recorded_calls().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_sync_lock_with_ensure_space_credential_from_parts_no_deadlock(pool: PgPool) {
+        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+
+        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &user_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &auth_key,
+            vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
+
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_authority_signing_key(TEST_AUTHORITY_DID, auth_key.clone());
+
+        let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
+        let credential_store = Arc::new(CredentialStore::new());
+        let space_locks = Arc::new(SpaceLockManager::new());
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            oauth_key,
+            None,
+        ));
+
+        let user_session = UserOAuthSession {
+            user_did: TEST_USER_DID.into(),
+            access_token: "test_access_token".into(),
+            refresh_token: None,
+            token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+            auth_server_iss: TEST_USER_PDS.into(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        };
+        oauth_service.store_session(user_session).await.unwrap();
+
+        // Simulate SyncEngine holding the space lock
+        let _sync_guard = space_locks.acquire(TEST_SPACE_URI).await;
+
+        let http_client = reqwest::Client::new();
+        let cred = ensure_space_credential_from_parts(
+            &pool,
+            &space_client,
+            &credential_store,
+            &did_resolver,
+            &oauth_service,
+            &http_client,
+            TEST_SPACE_URI,
+            Some(TEST_USER_DID),
+        )
+        .await
+        .expect("ensure_space_credential_from_parts must succeed while caller holds space lock");
+
+        assert!(!cred.token.is_empty());
+    }
 }

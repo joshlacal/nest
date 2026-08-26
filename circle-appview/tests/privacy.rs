@@ -201,6 +201,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
     ));
     let oauth_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
+        pool.clone(),
         config.appview_base_url.clone(),
         oauth_signing_key,
         None,

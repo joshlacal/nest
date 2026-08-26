@@ -46,6 +46,8 @@ pub struct SyncEngine {
     credential_store: Arc<CredentialStore>,
     did_resolver: Arc<DidResolver>,
     space_locks: Arc<SpaceLockManager>,
+    oauth_service: Option<Arc<crate::oauth::OAuthService>>,
+    http_client: reqwest::Client,
     push_client: Option<Arc<crate::push::CirclePushClient>>,
 }
 
@@ -71,6 +73,8 @@ impl SyncEngine {
             credential_store: state.credential_store.clone(),
             did_resolver: state.did_resolver.clone(),
             space_locks: state.space_locks.clone(),
+            oauth_service: Some(state.oauth_service.clone()),
+            http_client: state.http_client.clone(),
             push_client: state.push_client.clone(),
         }
     }
@@ -88,10 +92,16 @@ impl SyncEngine {
             credential_store,
             did_resolver,
             space_locks,
+            oauth_service: None,
+            http_client: reqwest::Client::new(),
             push_client: None,
         }
     }
 
+    pub fn with_oauth_service(mut self, oauth_service: Arc<crate::oauth::OAuthService>) -> Self {
+        self.oauth_service = Some(oauth_service);
+        self
+    }
     pub fn with_push_client(mut self, push_client: Arc<crate::push::CirclePushClient>) -> Self {
         self.push_client = Some(push_client);
         self
@@ -123,16 +133,42 @@ impl SyncEngine {
     ) -> Result<SyncResult, AppError> {
         let _lock_guard = self.space_locks.acquire(space_uri).await;
 
-        let cred = self.credential_store.get(space_uri).await.ok_or_else(|| {
-            AppError::Forbidden("No active Space credential in store for Space".into())
-        })?;
+        let cred = match self.credential_store.get(space_uri).await {
+            Some(c) => c,
+            None => {
+                if let Some(oauth) = &self.oauth_service {
+                    crate::access::ensure_space_credential_from_parts(
+                        &self.db,
+                        &self.space_client,
+                        &self.credential_store,
+                        &self.did_resolver,
+                        oauth,
+                        &self.http_client,
+                        space_uri,
+                        Some(author_did),
+                    )
+                    .await?
+                } else {
+                    return Err(AppError::Forbidden(
+                        "No active Space credential in store for Space".into(),
+                    ));
+                }
+            }
+        };
 
         let authority_did = extract_authority_did(space_uri)?;
         let author_doc = self
             .did_resolver
             .resolve(author_did)
             .await
-            .map_err(AppError::Unauthorized)?;
+            .map_err(|e| match e {
+                crate::error::AuthReason::SsrfBlocked => {
+                    AppError::Unauthorized(crate::error::AuthReason::SsrfBlocked)
+                }
+                other => AppError::Internal(format!(
+                    "Failed to resolve DID document for {author_did}: {other}"
+                )),
+            })?;
         let (repo_service_endpoint, _) = resolve_pds_endpoint(&author_doc, author_did)?;
         let author_vm = select_verification_method(&author_doc, author_did, None)
             .map_err(AppError::Unauthorized)?;
@@ -1141,9 +1177,13 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
 
     for (space_uri,) in active_spaces {
         summary.spaces_checked += 1;
-        let cred = match state.credential_store.get(&space_uri).await {
-            Some(c) => c,
-            None => continue,
+        let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
+                summary.repos_failed += 1;
+                continue;
+            }
         };
         let authority_did = match extract_authority_did(&space_uri) {
             Ok(a) => a,
