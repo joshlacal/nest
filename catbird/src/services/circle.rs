@@ -231,14 +231,37 @@ impl CircleService {
         let parent_op_id = Uuid::new_v4();
         let skey = Uuid::new_v4().simple().to_string();
         let pre_space_uri = format!("at://{}/space/blue.catbird.circle/{}", session.did, skey);
+        let client_id = self.state.config.oauth.client_id.clone();
+        let created_at_dt = Utc::now();
+        let created_at_str = created_at_dt.to_rfc3339();
+
+        let create_space_payload = serde_json::json!({
+            "type": "blue.catbird.circle",
+            "skey": &skey,
+            "policy": {
+                "$type": "com.atproto.simplespace.defs#memberListPolicy"
+            },
+            "appAccess": {
+                "$type": "com.atproto.simplespace.defs#allowList",
+                "allowed": [client_id]
+            }
+        });
+
+        let metadata_record_payload = serde_json::json!({
+            "$type": "blue.catbird.circle.metadata",
+            "name": input.name.as_str(),
+            "createdAt": &created_at_str
+        });
 
         let upsert_payload = serde_json::json!({
             "space": &pre_space_uri,
             "authority": &session.did,
             "name": input.name.as_str(),
-            "createdAt": Utc::now(),
+            "createdAt": &created_at_str,
             "generation": 1,
-            "circleGeneration": 1
+            "circleGeneration": 1,
+            "createSpacePayload": &create_space_payload,
+            "metadataPayload": &metadata_record_payload
         });
         let upsert_op_id = self
             .enqueue_projection_with_parent(
@@ -256,18 +279,6 @@ impl CircleService {
         let upsert_claim_token = self.claim_projection(upsert_op_id, &session.id.to_string()).await?;
 
         // 2. Create Space at user's PDS using AllowList with configured client_id
-        let client_id = self.state.config.oauth.client_id.clone();
-        let create_space_payload = serde_json::json!({
-            "type": "blue.catbird.circle",
-            "skey": &skey,
-            "policy": {
-                "$type": "com.atproto.simplespace.defs#memberListPolicy"
-            },
-            "appAccess": {
-                "$type": "com.atproto.simplespace.defs#allowList",
-                "allowed": [client_id]
-            }
-        });
         let create_space_bytes = serde_json::to_vec(&create_space_payload)
             .map_err(|e| CircleError::Internal(e.to_string()))?;
 
@@ -333,17 +344,12 @@ impl CircleService {
             .map_err(|e| CircleError::InvalidRequest(e.0))?;
 
         // 3. Put metadata record at blue.catbird.circle.metadata/self via com.atproto.space.putRecord
-        let now_str = Utc::now().to_rfc3339();
         let put_record_body = serde_json::json!({
             "space": &space_uri,
             "repo": session.did,
             "collection": "blue.catbird.circle.metadata",
             "rkey": "self",
-            "record": {
-                "$type": "blue.catbird.circle.metadata",
-                "name": input.name.as_str(),
-                "createdAt": now_str
-            }
+            "record": &metadata_record_payload
         });
         let put_record_bytes = serde_json::to_vec(&put_record_body)
             .map_err(|e| CircleError::Internal(e.to_string()))?;
@@ -520,7 +526,7 @@ impl CircleService {
 
         // Aggregate status across all child rows of parent_op_id
         let child_rows: Vec<CircleProjectionOperation> = if let Some(pool) = &self.db {
-            sqlx::query_as(
+            let rows: Vec<CircleProjectionOperation> = sqlx::query_as(
                 r#"
                 SELECT id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, last_error_code, execution_started_at, claim_token, parent_id, created_at, updated_at
                 FROM circle_projection_outbox
@@ -532,7 +538,12 @@ impl CircleService {
             .bind(&session.did)
             .fetch_all(pool)
             .await
-            .unwrap_or_default()
+            .map_err(|e| CircleError::Database(e.to_string()))?;
+
+            if rows.is_empty() {
+                return Err(CircleError::Database("Parent operation children not found in outbox".into()));
+            }
+            rows
         } else {
             Vec::new()
         };
@@ -541,26 +552,21 @@ impl CircleService {
         let mut first_error = None;
         let mut all_delivered = true;
 
-        if !child_rows.is_empty() {
-            has_failed = false;
-            all_delivered = true;
-            for r in &child_rows {
-                match r.state {
-                    CircleProjectionState::Delivered => {}
-                    CircleProjectionState::Failed => {
-                        has_failed = true;
-                        all_delivered = false;
-                        if first_error.is_none() {
-                            first_error = r.last_error_code.clone().filter(|s| !s.trim().is_empty());
-                        }
+        for r in &child_rows {
+            match r.state {
+                CircleProjectionState::Delivered => {}
+                CircleProjectionState::Failed => {
+                    has_failed = true;
+                    all_delivered = false;
+                    if first_error.is_none() {
+                        first_error = r.last_error_code.clone().filter(|s| !s.trim().is_empty());
                     }
-                    _ => {
-                        all_delivered = false;
-                    }
+                }
+                _ => {
+                    all_delivered = false;
                 }
             }
         }
-
         let (status, error) = if has_failed {
             (
                 OperationStatus::Failed,
@@ -1990,30 +1996,89 @@ impl CircleService {
                     Some(&dpop_data),
                 ).await;
 
-                let metadata_exists = match resp {
+                let (metadata_exists, should_create_space) = match resp {
                     Ok(r) => {
-                        let (status, _) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
-                        (200..300).contains(&status)
+                        let (status, body) = self.extract_response_body(r).await.unwrap_or((500, Bytes::new()));
+                        if (200..300).contains(&status) {
+                            // Verify found record against persisted desired state
+                            let expected_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
+                            let rec_val: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+                            let verified = match rec_val {
+                                Ok(val) => {
+                                    let found_name = val.get("value")
+                                        .and_then(|v| v.get("name"))
+                                        .or_else(|| val.get("name"))
+                                        .and_then(|v| v.as_str());
+                                    found_name == Some(expected_name)
+                                }
+                                Err(_) => false,
+                            };
+                            if verified {
+                                (true, false)
+                            } else {
+                                let _ = self.set_projection_state(
+                                    op.id,
+                                    CircleProjectionState::Failed,
+                                    Some("MetadataRecordMismatch"),
+                                    Some(claim_token),
+                                ).await;
+                                return Ok(false);
+                            }
+                        } else if status == 404 || String::from_utf8_lossy(&body).to_lowercase().contains("notfound") || String::from_utf8_lossy(&body).to_lowercase().contains("record not found") {
+                            // Authoritative not-found -> proceed to createSpace and putRecord
+                            (false, true)
+                        } else if is_retryable_status(status) {
+                            let err_text = String::from_utf8_lossy(&body);
+                            self.record_indeterminate_transport_error(
+                                op.id,
+                                &format!("Replay getRecord server/retryable error ({status}): {err_text}"),
+                                Some(claim_token),
+                            ).await;
+                            return Ok(false);
+                        } else {
+                            // Non-404 4xx error (e.g. auth error or space unavailable)
+                            let err_text = String::from_utf8_lossy(&body);
+                            let _ = self.set_projection_state(
+                                op.id,
+                                CircleProjectionState::Failed,
+                                Some(&format!("Replay getRecord error ({status}): {err_text}")),
+                                Some(claim_token),
+                            ).await;
+                            return Ok(false);
+                        }
                     }
-                    Err(_) => false,
+                    Err(e) => {
+                        self.record_indeterminate_transport_error(
+                            op.id,
+                            &format!("Replay getRecord network error: {e}"),
+                            Some(claim_token),
+                        ).await;
+                        return Ok(false);
+                    }
                 };
 
                 if metadata_exists {
                     return self.set_projection_state(op.id, CircleProjectionState::Pending, None, Some(claim_token)).await;
                 }
 
+                if !should_create_space {
+                    return Ok(false);
+                }
+
                 let skey = op.space_uri.rsplit('/').next().unwrap_or("circle");
                 let client_id = self.state.config.oauth.client_id.clone();
-                let create_space_payload = serde_json::json!({
-                    "type": "blue.catbird.circle",
-                    "skey": skey,
-                    "policy": {
-                        "$type": "com.atproto.simplespace.defs#memberListPolicy"
-                    },
-                    "appAccess": {
-                        "$type": "com.atproto.simplespace.defs#allowList",
-                        "allowed": [client_id]
-                    }
+                let create_space_payload = op.payload.get("createSpacePayload").cloned().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "type": "blue.catbird.circle",
+                        "skey": skey,
+                        "policy": {
+                            "$type": "com.atproto.simplespace.defs#memberListPolicy"
+                        },
+                        "appAccess": {
+                            "$type": "com.atproto.simplespace.defs#allowList",
+                            "allowed": [client_id]
+                        }
+                    })
                 });
 
                 let create_bytes = serde_json::to_vec(&create_space_payload)
@@ -2070,17 +2135,21 @@ impl CircleService {
 
                 if space_created {
                     let circle_name = op.payload.get("name").and_then(|v| v.as_str()).unwrap_or("Circle");
-                    let now_str = Utc::now().to_rfc3339();
+                    let created_at_str = op.payload.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+                    let metadata_record = op.payload.get("metadataPayload").cloned().unwrap_or_else(|| {
+                        serde_json::json!({
+                            "$type": "blue.catbird.circle.metadata",
+                            "name": circle_name,
+                            "createdAt": created_at_str
+                        })
+                    });
+
                     let put_record_body = serde_json::json!({
                         "space": &op.space_uri,
                         "repo": session.did,
                         "collection": "blue.catbird.circle.metadata",
                         "rkey": "self",
-                        "record": {
-                            "$type": "blue.catbird.circle.metadata",
-                            "name": circle_name,
-                            "createdAt": now_str
-                        }
+                        "record": metadata_record
                     });
                     let put_bytes = serde_json::to_vec(&put_record_body)
                         .map_err(|e| CircleError::Internal(e.to_string()))?;

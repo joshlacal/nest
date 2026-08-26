@@ -17,12 +17,9 @@ CREATE TABLE circle_projection_outbox (
     last_error_code TEXT,
     execution_started_at TIMESTAMPTZ,
     claim_token UUID,
-    parent_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX idx_circle_projection_outbox_parent ON circle_projection_outbox (parent_id);
 
 CREATE INDEX idx_circle_projection_outbox_due ON circle_projection_outbox (state, next_attempt_at) WHERE state = 'pending';
 CREATE INDEX idx_circle_projection_outbox_space ON circle_projection_outbox (space_uri);

@@ -55,19 +55,41 @@ async fn main() -> Result<(), anyhow::Error> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on {}", addr);
 
-    let server = axum::serve(listener, app);
-    tokio::select! {
-        res = server => {
-            if let Err(e) = res {
-                tracing::error!("Server error: {}", e);
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutdown signal received, draining server and background tasks");
-        }
-    }
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    server.await?;
 
     let _ = shutdown_tx.send(true);
-    let _ = sweep_handle.await;
+    sweep_handle.await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => signal.recv().await,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to install SIGTERM handler");
+                std::future::pending::<Option<()>>().await
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<Option<()>>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT, initiating graceful shutdown");
+        }
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown");
+        }
+    }
 }

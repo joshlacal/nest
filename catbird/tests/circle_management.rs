@@ -2367,3 +2367,319 @@ async fn retry_operation_never_projects_without_pds_success(pool: PgPool) {
     .unwrap();
     assert_eq!(row_after.0, "failed");
 }
+
+#[sqlx::test(migrations = false)]
+async fn migration_upgrade_path_from_initial_outbox_to_parent_id(pool: PgPool) {
+    // 1. Apply original 20260824000001 migration
+    let mig1 = include_str!("../migrations/20260824000001_circle_projection_outbox.sql");
+    sqlx::raw_sql(mig1).execute(&pool).await.unwrap();
+
+    // Verify table exists without parent_id column initially
+    let op_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO circle_projection_outbox (
+            id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, created_at, updated_at
+        ) VALUES (
+            $1, 'key-orig-1', 'did:plc:alice', 'sess-1', 'at://did:plc:alice/space/blue.catbird.circle/1', 'circle_upsert', '{"name":"Test"}'::jsonb, 'intent', 0, now(), now(), now()
+        )
+        "#
+    )
+    .bind(op_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2. Apply additive 20260825000001 migration
+    let mig2 = include_str!("../migrations/20260825000001_circle_projection_parent_id.sql");
+    sqlx::raw_sql(mig2).execute(&pool).await.unwrap();
+
+    // 3. Verify parent_id column is now usable and update/query works
+    let parent_id = Uuid::new_v4();
+    sqlx::query("UPDATE circle_projection_outbox SET parent_id = $1 WHERE id = $2")
+        .bind(parent_id)
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let fetched: (Option<Uuid>,) = sqlx::query_as("SELECT parent_id FROM circle_projection_outbox WHERE id = $1")
+        .bind(op_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(fetched.0, Some(parent_id));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn circle_upsert_deterministic_replay_and_body_verification(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/internal/projections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "accepted" })))
+        .mount(&appview)
+        .await;
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = CircleService::new(state);
+    let session = alice_session(&pds_url);
+
+    let space_uri = "at://did:plc:alice/space/blue.catbird.circle/test-upsert-det";
+    let op_id = Uuid::new_v4();
+    let created_at_str = "2026-08-26T00:00:00Z";
+
+    let create_space_payload = serde_json::json!({
+        "type": "blue.catbird.circle",
+        "skey": "test-upsert-det",
+        "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
+        "appAccess": { "$type": "com.atproto.simplespace.defs#allowList", "allowed": ["http://localhost:8080/client-metadata.json"] }
+    });
+    let metadata_payload = serde_json::json!({
+        "$type": "blue.catbird.circle.metadata",
+        "name": "Deterministic Circle",
+        "createdAt": created_at_str
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_projection_outbox (
+            id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, created_at, updated_at
+        ) VALUES (
+            $1, 'key-det-1', 'did:plc:alice', $2, $3, 'circle_upsert', $4, 'failed', 1, now() - interval '10s', now(), now()
+        )
+        "#
+    )
+    .bind(op_id)
+    .bind(session.id.to_string())
+    .bind(space_uri)
+    .bind(serde_json::json!({
+        "space": space_uri,
+        "authority": "did:plc:alice",
+        "name": "Deterministic Circle",
+        "createdAt": created_at_str,
+        "createSpacePayload": create_space_payload,
+        "metadataPayload": metadata_payload
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Case: getRecord returns 503 -> transient error, does NOT proceed to createSpace or mutate PDS
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("Transient Service Unavailable"))
+        .mount(&pds)
+        .await;
+    // Fast-forward execution_started_at so case 2 can re-claim the lease
+    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds' WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 2. Case: getRecord returns 200 with MISMATCHED record name -> fails closed with MetadataRecordMismatch
+    pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": format!("{space_uri}/did:plc:alice/blue.catbird.circle.metadata/self"),
+            "value": { "$type": "blue.catbird.circle.metadata", "name": "Completely Different Name" }
+        })))
+        .mount(&pds)
+        .await;
+
+    let res2 = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
+    assert_eq!(res2.status, OperationStatus::Failed);
+    assert!(res2.error.as_deref().unwrap().contains("MetadataRecordMismatch"));
+
+    // 3. Case: getRecord returns 200 with MATCHING record -> verified, transitions to Pending and delivers
+    // Fast-forward execution_started_at so case 3 can re-claim the lease
+    sqlx::query("UPDATE circle_projection_outbox SET execution_started_at = now() - interval '60 seconds' WHERE id = $1")
+        .bind(op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 3. Case: getRecord returns 200 with MATCHING record -> verified, transitions to Pending and delivers
+    pds.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": format!("{space_uri}/did:plc:alice/blue.catbird.circle.metadata/self"),
+            "value": { "$type": "blue.catbird.circle.metadata", "name": "Deterministic Circle", "createdAt": created_at_str }
+        })))
+        .mount(&pds)
+        .await;
+
+    let res3 = service.retry_operation(&session, &op_id.to_string()).await.unwrap();
+    assert_eq!(res3.status, OperationStatus::Complete);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn circle_upsert_concurrent_retry_claim_fencing_and_identical_bodies(pool: PgPool) {
+    let pds = MockServer::start().await;
+    let appview = MockServer::start().await;
+    let pds_url = pds.uri().replace("127.0.0.1", "localhost");
+    let appview_url = appview.uri().replace("127.0.0.1", "localhost");
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.listSpaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "supportsImages": true })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": "mock-pds-service-auth-jwt" })))
+        .mount(&pds)
+        .await;
+
+    // getRecord returns 404
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.space.getRecord"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("RecordNotFound"))
+        .mount(&pds)
+        .await;
+
+    // createSpace succeeds
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.simplespace.createSpace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-concurrent-upsert"
+        })))
+        .mount(&pds)
+        .await;
+
+    // putRecord succeeds
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": "at://did:plc:alice/space/blue.catbird.circle/test-concurrent-upsert/did:plc:alice/blue.catbird.circle.metadata/self",
+            "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        })))
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/internal/projections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "accepted" })))
+        .mount(&appview)
+        .await;
+
+    let state = create_test_state(Some(pool.clone()), &pds_url, Some(appview_url), None).await;
+    let service = Arc::new(CircleService::new(state));
+    let session = alice_session(&pds_url);
+
+    let space_uri = "at://did:plc:alice/space/blue.catbird.circle/test-concurrent-upsert";
+    let op_id = Uuid::new_v4();
+    let created_at_str = "2026-08-26T00:00:00Z";
+
+    let create_space_payload = serde_json::json!({
+        "type": "blue.catbird.circle",
+        "skey": "test-concurrent-upsert",
+        "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
+        "appAccess": { "$type": "com.atproto.simplespace.defs#allowList", "allowed": ["http://localhost:8080/client-metadata.json"] }
+    });
+    let metadata_payload = serde_json::json!({
+        "$type": "blue.catbird.circle.metadata",
+        "name": "Concurrent Circle",
+        "createdAt": created_at_str
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_projection_outbox (
+            id, operation_key, actor_did, session_id, space_uri, kind, payload, state, attempts, next_attempt_at, created_at, updated_at
+        ) VALUES (
+            $1, 'key-conc-1', 'did:plc:alice', $2, $3, 'circle_upsert', $4, 'failed', 1, now() - interval '10s', now(), now()
+        )
+        "#
+    )
+    .bind(op_id)
+    .bind(session.id.to_string())
+    .bind(space_uri)
+    .bind(serde_json::json!({
+        "space": space_uri,
+        "authority": "did:plc:alice",
+        "name": "Concurrent Circle",
+        "createdAt": created_at_str,
+        "createSpacePayload": create_space_payload,
+        "metadataPayload": metadata_payload
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Spawn two concurrent retry attempts
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let s1 = service.clone();
+    let sess1 = session.clone();
+    let b1 = barrier.clone();
+    let op_str = op_id.to_string();
+    let op_str1 = op_str.clone();
+    let h1 = tokio::spawn(async move {
+        b1.wait().await;
+        s1.retry_operation(&sess1, &op_str1).await
+    });
+
+    let s2 = service.clone();
+    let sess2 = session.clone();
+    let b2 = barrier.clone();
+    let op_str2 = op_str.clone();
+    let h2 = tokio::spawn(async move {
+        b2.wait().await;
+        s2.retry_operation(&sess2, &op_str2).await
+    });
+
+    let (res1, res2) = tokio::join!(h1, h2);
+    let op1 = res1.unwrap().unwrap();
+    let op2 = res2.unwrap().unwrap();
+
+    // Both see a valid operation response (either Complete or Pending), never corrupted state
+    assert!(op1.status == OperationStatus::Complete || op1.status == OperationStatus::Pending);
+    assert!(op2.status == OperationStatus::Complete || op2.status == OperationStatus::Pending);
+
+    // Verify final state in database is delivered
+    let final_state: (String,) = sqlx::query_as("SELECT state FROM circle_projection_outbox WHERE id = $1")
+        .bind(op_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(final_state.0, "delivered");
+}

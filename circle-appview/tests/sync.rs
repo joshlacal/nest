@@ -4244,3 +4244,42 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
     let join_res = tokio::time::timeout(std::time::Duration::from_secs(2), sweep_handle).await;
     assert!(join_res.is_ok(), "Sweep task must shut down cleanly");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn server_graceful_shutdown_drains_connections_and_awaits_sweep(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (sweep_handle, shutdown_tx) = circle_appview::sync::spawn_revision_sweep_task(
+        setup.state.clone(),
+        std::time::Duration::from_millis(50),
+    );
+
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let app = circle_appview::routes::create_router(setup.state.clone());
+
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.await;
+            })
+            .await
+    });
+
+    // Verify server is accepting connections
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("http://{addr}/_health")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Signal server shutdown (simulating SIGTERM/SIGINT)
+    server_shutdown_tx.send(()).unwrap();
+    let server_res = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await.unwrap();
+    assert!(server_res.unwrap().is_ok(), "Server must shut down gracefully without error");
+
+    // Signal and await sweep task termination
+    shutdown_tx.send(true).unwrap();
+    let sweep_res = tokio::time::timeout(std::time::Duration::from_secs(2), sweep_handle).await.unwrap();
+    assert!(sweep_res.is_ok(), "Sweep task must join cleanly after server shutdown");
+}
