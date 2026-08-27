@@ -150,8 +150,6 @@ pub async fn login(
             .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
     };
 
-    use jacquard_oauth::types::AuthorizeOptions;
-
     // Generate a clean UUID for the OAuth state (= Jacquard session_id).
     let session_nonce = uuid::Uuid::new_v4().to_string();
 
@@ -212,24 +210,24 @@ pub async fn login(
         initial_scopes
     };
 
-    let scopes = jacquard_oauth::scopes::Scopes::from_scopes(
-        requested_scopes.into_iter().map(|s| s.convert()),
+    // `start_auth` would ignore a per-request scope set: it forwards only
+    // `prompt` and `state` into the PAR, which then takes its scope from the
+    // client metadata. Left alone, sign-in would request the full declared
+    // `max_scopes`, including the account-management permissions that are meant
+    // to be asked for only on a later just-in-time upgrade. See
+    // `services::oauth_authorize`.
+    let auth_url = crate::services::oauth_authorize::start_auth_with_scopes(
+        jacquard_client,
+        identifier,
+        &requested_scopes,
+        &session_nonce,
+        None,
     )
-    .map_err(|e| AppError::Internal(format!("Failed to construct Scopes: {e}")))?;
-
-    let options = AuthorizeOptions {
-        state: Some(session_nonce.into()),
-        scopes,
-        ..Default::default()
-    };
-
-    let auth_url = jacquard_client
-        .start_auth(identifier, options)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Jacquard start_auth failed");
-            AppError::OAuth("Authorization initiation failed".into())
-        })?;
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "Authorization initiation failed");
+        AppError::OAuth("Authorization initiation failed".into())
+    })?;
 
     // Redirect to the PDS authorization URL
     Ok(Response::builder()

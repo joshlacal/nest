@@ -769,6 +769,7 @@ impl AppState {
                     auth_store,
                     &catmos_client_id,
                     &catmos_redirect,
+                    &state.catmos_oauth_scopes,
                 ) {
                     Ok(client) => {
                         state.catmos_jacquard_client = Some(Arc::new(client));
@@ -861,14 +862,16 @@ impl AppState {
         Ok((store, client))
     }
 
-    /// Build a JacquardOAuthClient with a custom client_id and redirect_uri,
-    /// reusing an existing RedisAuthStore. Used for catmos-web's separate OAuth identity.
+    /// Build a client whose PAR requests exactly `scopes`, reusing an existing
+    /// `RedisAuthStore` so a later callback resolves through any client backed by
+    /// the same store.
     fn build_jacquard_client(
         state: &AppState,
         key_store: &crate::services::KeyStore,
         existing_store: &crate::services::RedisAuthStore,
         client_id_str: &str,
         redirect_uri_str: &str,
+        scopes: &[jacquard_oauth::scopes::Scope],
     ) -> Result<JacquardOAuthClient, anyhow::Error> {
         use jacquard_oauth::atproto::AtprotoClientMetadata;
         use jacquard_oauth::scopes::Scopes;
@@ -882,27 +885,25 @@ impl AppState {
         let redirect_uri = jacquard_common::deps::fluent_uri::Uri::parse(redirect_uri_str)
             .map_err(|e| anyhow::anyhow!("Invalid redirect_uri: {e:?}"))?
             .to_owned();
-        let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(format!(
-            "{}/.well-known/jwks.json",
-            state.config.server.base_url.trim_end_matches('/')
-        ).as_str())
+        let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
+            format!(
+                "{}/.well-known/jwks.json",
+                state.config.server.base_url.trim_end_matches('/')
+            )
+            .as_str(),
+        )
         .map_err(|e| anyhow::anyhow!("Invalid jwks_uri: {e:?}"))?
         .to_owned();
 
-        let scopes = Scopes::from_scopes(
-            state
-                .catmos_oauth_scopes
-                .iter()
-                .cloned()
-                .map(|s| s.convert()),
-        )
-        .map_err(|e| anyhow::anyhow!("Invalid catmos scopes: {e:?}"))?;
-        let metadata = AtprotoClientMetadata::new(
-            vec![redirect_uri],
-            client_id,
-            Some(scopes),
-        )
-        .with_jwks_uri(jwks_uri);
+        if scopes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Refusing to build an OAuth client with an empty scope set"
+            ));
+        }
+        let scopes = Scopes::from_scopes(scopes.iter().cloned().map(|s| s.convert()))
+            .map_err(|e| anyhow::anyhow!("Invalid scopes: {e:?}"))?;
+        let metadata = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes))
+            .with_jwks_uri(jwks_uri);
 
         let client_data = ClientData::new(Some(keyset), metadata);
         let resolver = Self::build_resolver();

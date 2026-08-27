@@ -7,6 +7,7 @@ pub mod chat_poll;
 mod crypto;
 mod dpop_nonce_cache;
 mod mls_auth;
+pub mod oauth_authorize;
 pub mod oauth_upgrade;
 pub mod push;
 pub(crate) mod redis_auth_store;

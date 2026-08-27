@@ -301,29 +301,23 @@ pub async fn upgrade_start(
             AppError::Internal("OAuth upgrade operation failed".into())
         })?
         .to_owned();
-    let scopes = jacquard_oauth::scopes::Scopes::from_scopes(
-        parsed_scopes.into_iter().map(|s| s.convert()),
-    )
-    .map_err(|e| {
-        tracing::error!(
-            category = "jacquard",
-            error = %e,
-            "Failed to construct Scopes for Jacquard authorization"
-        );
-        AppError::Internal("OAuth upgrade operation failed".into())
-    })?;
 
     let flow_state = start_result.state.clone();
-    let options = jacquard_oauth::types::AuthorizeOptions {
-        state: Some(start_result.state.into()),
-        scopes,
-        redirect_uri: Some(redirect_url),
-        prompt: None,
-    };
-
     let auth_identifier = resolve_oauth_identifier(&session.pds_url);
 
-    let auth_url = match jacquard_client.start_auth(&auth_identifier, options).await {
+    // An upgrade exists precisely to request a wider scope set than sign-in did,
+    // and the PAR's scope comes from the client metadata rather than from
+    // `AuthorizeOptions`, so the request is built per call. See
+    // `services::oauth_authorize`.
+    let auth_url = match crate::services::oauth_authorize::start_auth_with_scopes(
+        jacquard_client,
+        &auth_identifier,
+        &parsed_scopes,
+        &flow_state,
+        Some(redirect_url),
+    )
+    .await
+    {
         Ok(auth_url) => auth_url,
         Err(err) => {
             tracing::error!(
