@@ -187,12 +187,10 @@ pub fn generate_dpop_proof(
         jti,
     };
 
-    let encoded_header = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?,
-    );
-    let encoded_payload = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?,
-    );
+    let encoded_header = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&header).map_err(|e| AppError::Internal(e.to_string()))?);
+    let encoded_payload = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).map_err(|e| AppError::Internal(e.to_string()))?);
 
     let signing_input = format!("{}.{}", encoded_header, encoded_payload);
     let signature: Signature = dpop_signing_key.sign(signing_input.as_bytes());
@@ -222,10 +220,14 @@ pub fn verify_dpop_proof(
         .map_err(|e| AppError::BadRequest(format!("invalid DPoP header JSON: {e}")))?;
 
     if header.typ != "dpop+jwt" || header.alg != "ES256" {
-        return Err(AppError::BadRequest("unsupported DPoP proof header alg/typ".into()));
+        return Err(AppError::BadRequest(
+            "unsupported DPoP proof header alg/typ".into(),
+        ));
     }
     if header.jwk.kty != "EC" || header.jwk.crv != "P-256" {
-        return Err(AppError::BadRequest("DPoP proof JWK must be EC P-256".into()));
+        return Err(AppError::BadRequest(
+            "DPoP proof JWK must be EC P-256".into(),
+        ));
     }
 
     let proof_jkt = calculate_rfc7638_jkt(&header.jwk);
@@ -245,7 +247,9 @@ pub fn verify_dpop_proof(
         .decode(&header.jwk.y)
         .map_err(|e| AppError::BadRequest(format!("invalid base64url jwk.y: {e}")))?;
     if x_bytes.len() != 32 || y_bytes.len() != 32 {
-        return Err(AppError::BadRequest("invalid P-256 coordinate length".into()));
+        return Err(AppError::BadRequest(
+            "invalid P-256 coordinate length".into(),
+        ));
     }
 
     let mut point_bytes = Vec::with_capacity(65);
@@ -267,7 +271,9 @@ pub fn verify_dpop_proof(
 
     verifying_key
         .verify(signing_input.as_bytes(), &signature)
-        .map_err(|e| AppError::BadRequest(format!("DPoP proof signature verification failed: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!("DPoP proof signature verification failed: {e}"))
+        })?;
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -354,18 +360,13 @@ impl MlsAuthService {
 
     /// Get the delivery service URL (loopback target)
     pub fn service_url(&self) -> Option<&str> {
-        self.state
-            .config
-            .mls
-            .service_url
-            .as_deref()
-            .or_else(|| {
-                if !self.state.config.chat.ds_internal_url.is_empty() {
-                    Some(self.state.config.chat.ds_internal_url.as_str())
-                } else {
-                    None
-                }
-            })
+        self.state.config.mls.service_url.as_deref().or_else(|| {
+            if !self.state.config.chat.ds_internal_url.is_empty() {
+                Some(self.state.config.chat.ds_internal_url.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     pub fn chat_issuer(&self) -> &str {
@@ -409,7 +410,6 @@ impl MlsAuthService {
             "https://mlschat.catbird.blue"
         }
     }
-
 
     /// Generate legacy v1 service auth token for MLS requests (Bearer auth)
     pub fn generate_service_token(
@@ -503,15 +503,8 @@ impl MlsAuthService {
             )
             .await
         } else {
-            self.proxy_v1_request(
-                session,
-                method,
-                lexicon,
-                query_string,
-                body,
-                content_type,
-            )
-            .await
+            self.proxy_v1_request(session, method, lexicon, query_string, body, content_type)
+                .await
         }
     }
 
@@ -530,7 +523,12 @@ impl MlsAuthService {
             .ok_or_else(|| AppError::Config("MLS service_url not configured".into()))?;
 
         let url = if let Some(qs) = query_string {
-            format!("{}/xrpc/{}?{}", service_url.trim_end_matches('/'), lexicon, qs)
+            format!(
+                "{}/xrpc/{}?{}",
+                service_url.trim_end_matches('/'),
+                lexicon,
+                qs
+            )
         } else {
             format!("{}/xrpc/{}", service_url.trim_end_matches('/'), lexicon)
         };
@@ -618,7 +616,12 @@ impl MlsAuthService {
             .ok_or_else(|| AppError::Config("Chat delivery service URL not configured".into()))?;
 
         let url = if let Some(qs) = query_string {
-            format!("{}/xrpc/{}?{}", service_url.trim_end_matches('/'), lexicon, qs)
+            format!(
+                "{}/xrpc/{}?{}",
+                service_url.trim_end_matches('/'),
+                lexicon,
+                qs
+            )
         } else {
             format!("{}/xrpc/{}", service_url.trim_end_matches('/'), lexicon)
         };
@@ -631,18 +634,20 @@ impl MlsAuthService {
         let device_id = if let Some(id) = device_id_override {
             id.to_string()
         } else if let Some(id) = body.as_ref().and_then(|b| {
-            serde_json::from_slice::<serde_json::Value>(b).ok().and_then(|v| {
-                let inner = v
-                    .get("signedRequest")
-                    .and_then(|sr| sr.get("body"))
-                    .unwrap_or_else(|| v.get("body").unwrap_or(&v));
-                inner
-                    .get("actorDeviceId")
-                    .or_else(|| inner.get("deviceId"))
-                    .or_else(|| inner.get("recipientDeviceId"))
-                    .and_then(|d| d.as_str())
-                    .map(|s| s.to_string())
-            })
+            serde_json::from_slice::<serde_json::Value>(b)
+                .ok()
+                .and_then(|v| {
+                    let inner = v
+                        .get("signedRequest")
+                        .and_then(|sr| sr.get("body"))
+                        .unwrap_or_else(|| v.get("body").unwrap_or(&v));
+                    inner
+                        .get("actorDeviceId")
+                        .or_else(|| inner.get("deviceId"))
+                        .or_else(|| inner.get("recipientDeviceId"))
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string())
+                })
         }) {
             id
         } else if let Some(ref pool) = self.state.push_db {
@@ -826,11 +831,21 @@ mod tests {
     #[test]
     fn test_is_mls_lexicon_recognition() {
         // Legacy v1 MLS endpoints must NOT be routed as active MLS endpoints
-        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.getConvos"));
-        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.sendMessage"));
-        assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.mlsChat.publishKeyPackages"));
-        assert!(!MlsAuthService::is_v1_mls_lexicon("blue.catbird.mlsChat.getConvos"));
-        assert!(!MlsAuthService::is_clean_chat_lexicon("blue.catbird.mlsChat.getConvos"));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.sendMessage"
+        ));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "blue.catbird.mlsChat.publishKeyPackages"
+        ));
+        assert!(!MlsAuthService::is_v1_mls_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
+        assert!(!MlsAuthService::is_clean_chat_lexicon(
+            "blue.catbird.mlsChat.getConvos"
+        ));
 
         // All 33 clean-chat procedures
         for endpoint in CHAT_ENDPOINTS {
@@ -850,10 +865,16 @@ mod tests {
 
         // Non-MLS endpoints
         assert!(!MlsAuthService::is_mls_lexicon("app.bsky.feed.getTimeline"));
-        assert!(!MlsAuthService::is_mls_lexicon("chat.bsky.convo.listConvos"));
-        assert!(!MlsAuthService::is_mls_lexicon("com.atproto.repo.getRecord"));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "chat.bsky.convo.listConvos"
+        ));
+        assert!(!MlsAuthService::is_mls_lexicon(
+            "com.atproto.repo.getRecord"
+        ));
         assert!(!MlsAuthService::is_mls_lexicon("blue.catbird.chat.defs"));
-        assert!(!MlsAuthService::is_clean_chat_lexicon("blue.catbird.chat.defs"));
+        assert!(!MlsAuthService::is_clean_chat_lexicon(
+            "blue.catbird.chat.defs"
+        ));
     }
 
     #[test]
@@ -885,15 +906,8 @@ mod tests {
         let proof = generate_dpop_proof(&dpop_key, method, htu, access_token, now).unwrap();
 
         // Verify valid proof
-        let claims = verify_dpop_proof(
-            &proof,
-            method,
-            htu,
-            access_token,
-            Some(&dpop_jkt),
-            now,
-        )
-        .unwrap();
+        let claims =
+            verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now).unwrap();
 
         assert_eq!(claims.htm, "POST");
         assert_eq!(claims.htu, htu);
@@ -905,14 +919,38 @@ mod tests {
         // 1. Wrong method
         assert!(verify_dpop_proof(&proof, "GET", htu, access_token, Some(&dpop_jkt), now).is_err());
         // 2. Wrong htu
-        assert!(verify_dpop_proof(&proof, method, "https://mlschat.catbird.blue/xrpc/blue.catbird.chat.getEntries", access_token, Some(&dpop_jkt), now).is_err());
+        assert!(verify_dpop_proof(
+            &proof,
+            method,
+            "https://mlschat.catbird.blue/xrpc/blue.catbird.chat.getEntries",
+            access_token,
+            Some(&dpop_jkt),
+            now
+        )
+        .is_err());
         // 3. Wrong access token (ath mismatch)
-        assert!(verify_dpop_proof(&proof, method, htu, "tampered_token", Some(&dpop_jkt), now).is_err());
+        assert!(
+            verify_dpop_proof(&proof, method, htu, "tampered_token", Some(&dpop_jkt), now).is_err()
+        );
         // 4. Wrong JKT
-        assert!(verify_dpop_proof(&proof, method, htu, access_token, Some("different_jkt_43_chars_long_aaaaaaaaaaaaaa"), now).is_err());
+        assert!(verify_dpop_proof(
+            &proof,
+            method,
+            htu,
+            access_token,
+            Some("different_jkt_43_chars_long_aaaaaaaaaaaaaa"),
+            now
+        )
+        .is_err());
         // 5. Expired / clock skew > 60s
-        assert!(verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now + 61).is_err());
-        assert!(verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now - 61).is_err());
+        assert!(
+            verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now + 61)
+                .is_err()
+        );
+        assert!(
+            verify_dpop_proof(&proof, method, htu, access_token, Some(&dpop_jkt), now - 61)
+                .is_err()
+        );
     }
 
     #[test]

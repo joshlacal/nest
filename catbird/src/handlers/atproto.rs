@@ -13,6 +13,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,10 +24,11 @@ use crate::metrics;
 use crate::middleware::JacquardDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{
-    CatbirdSession, ExchangeRequest, ExchangeResponse, LogoutResponse, OAuthCallback,
-    SessionInfo,
+    CatbirdSession, ExchangeRequest, ExchangeResponse, LogoutResponse, OAuthCallback, SessionInfo,
 };
-use crate::services::{AtProtoClient, MlsAuthService, ProxyResponse};
+use crate::services::{
+    AtProtoClient, MlsAuthService, ProxyResponse, ServiceAuthProvider, CIRCLE_ENDPOINTS,
+};
 
 /// Handle login initiation (Redirect flow)
 ///
@@ -152,7 +154,9 @@ pub async fn login(
                 .arg(600)
                 .query_async::<_, ()>(&mut conn)
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to persist oauth_redirect: {}", e)))?;
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to persist oauth_redirect: {}", e))
+                })?;
         }
 
         // 4. oauth_nonce
@@ -178,10 +182,7 @@ pub async fn login(
                 .await
             {
                 // Don't fail login — callback will fall back to legacy inference.
-                tracing::warn!(
-                    "Failed to persist oauth_client selector to Redis: {}",
-                    e
-                );
+                tracing::warn!("Failed to persist oauth_client selector to Redis: {}", e);
             }
         }
 
@@ -412,14 +413,16 @@ pub async fn oauth_callback(
         let (Some(ref r), Some(ref nonce)) = (&redirect_to, &stored_nonce) else {
             tracing::error!("Exchange flow state missing from Redis for state");
             return Err(AppError::Internal(
-                "Exchange flow state missing; refusing downgrade to session-bearing redirect".into(),
+                "Exchange flow state missing; refusing downgrade to session-bearing redirect"
+                    .into(),
             ));
         };
 
         if !is_allowed_redirect(r) || !is_valid_base64url_43(nonce) {
             tracing::error!("Exchange flow state invalid for state");
             return Err(AppError::Internal(
-                "Exchange flow state invalid; refusing downgrade to session-bearing redirect".into(),
+                "Exchange flow state invalid; refusing downgrade to session-bearing redirect"
+                    .into(),
             ));
         }
 
@@ -444,7 +447,9 @@ pub async fn oauth_callback(
             .arg(60) // 60s TTL
             .query_async::<_, ()>(&mut conn)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to store exchange key in Redis: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to store exchange key in Redis: {}", e))
+            })?;
         format!("{}?code={}", r, exchange_code)
     } else if let Some(ref r) = redirect_to {
         // catmos-web: redirect_to was stored in Redis during login (no browser_nonce)
@@ -648,7 +653,8 @@ pub async fn exchange_code(
     };
 
     // 3. FIX 1 + FIX 2: Compute composite key. Lookup IS validation.
-    let exchange_key = compute_exchange_redis_key(&payload.code, &payload.browser_nonce, &canonical_origin);
+    let exchange_key =
+        compute_exchange_redis_key(&payload.code, &payload.browser_nonce, &canonical_origin);
 
     // 4. Atomically consume the key using GETDEL.
     // If the nonce or origin was wrong, the computed key did not match, returning None (401),
@@ -670,10 +676,11 @@ pub async fn exchange_code(
         return Err(AppError::Unauthorized("Invalid exchange request".into()));
     };
 
-    let plaintext_bytes = crate::services::redis_crypto::open(enc_key, &sealed_b64).map_err(|e| {
-        tracing::warn!("Exchange failed: decryption failed: {}", e);
-        AppError::Unauthorized("Invalid exchange request".into())
-    })?;
+    let plaintext_bytes =
+        crate::services::redis_crypto::open(enc_key, &sealed_b64).map_err(|e| {
+            tracing::warn!("Exchange failed: decryption failed: {}", e);
+            AppError::Unauthorized("Invalid exchange request".into())
+        })?;
 
     let session_id = String::from_utf8(plaintext_bytes).map_err(|_| {
         tracing::warn!("Exchange failed: decrypted session_id is not valid UTF-8");
@@ -698,7 +705,11 @@ pub fn canonicalize_origin(raw: &str) -> Option<String> {
 
 /// Compute the composite Redis key for exchange code lookup:
 /// `exchange:<hex SHA-256( code || 0x00 || browser_nonce || 0x00 || canonical_origin )>`
-pub fn compute_exchange_redis_key(code: &str, browser_nonce: &str, canonical_origin: &str) -> String {
+pub fn compute_exchange_redis_key(
+    code: &str,
+    browser_nonce: &str,
+    canonical_origin: &str,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(code.as_bytes());
@@ -712,9 +723,10 @@ pub fn compute_exchange_redis_key(code: &str, browser_nonce: &str, canonical_ori
 
 /// Validate 43-character unpadded base64url string ([A-Za-z0-9_-])
 pub fn is_valid_base64url_43(s: &str) -> bool {
-    s.len() == 43 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    s.len() == 43
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
-
 
 /// Mint a 43-character unpadded base64url exchange code from 32 CSPRNG bytes
 pub fn generate_exchange_code() -> String {
@@ -732,20 +744,87 @@ async fn atomic_getdel(
     conn: &mut redis::aio::ConnectionManager,
     key: &str,
 ) -> Result<Option<String>, redis::RedisError> {
-    match redis::cmd("GETDEL").arg(key).query_async::<_, Option<String>>(conn).await {
+    match redis::cmd("GETDEL")
+        .arg(key)
+        .query_async::<_, Option<String>>(conn)
+        .await
+    {
         Ok(val) => Ok(val),
         Err(err) if err.to_string().contains("unknown command") => {
-            let script = redis::Script::new(r#"
+            let script = redis::Script::new(
+                r#"
                 local val = redis.call('GET', KEYS[1])
                 if val then
                     redis.call('DEL', KEYS[1])
                 end
                 return val
-            "#);
+            "#,
+            );
             script.key(key).invoke_async(conn).await
         }
         Err(err) => Err(err),
     }
+}
+
+const MAX_CIRCLE_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_circle_request(
+    state: Arc<AppState>,
+    session: &CatbirdSession,
+    base_url: &str,
+    audience: &str,
+    dpop_data: &JacquardDpopData,
+    method: reqwest::Method,
+    lexicon: &str,
+    query: Option<&str>,
+    body: Option<bytes::Bytes>,
+    content_type: Option<&str>,
+) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
+    let mut url = format!("{}/xrpc/{lexicon}", base_url.trim_end_matches('/'));
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let token = ServiceAuthProvider::new(state.clone())
+        .token_for_audience_with_dpop(session, audience, lexicon, dpop_data)
+        .await?;
+    let mut request = state.http_client.request(method, &url).bearer_auth(token);
+    if let Some(content_type) = content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    if headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_CIRCLE_RESPONSE_SIZE)
+    {
+        return Err(AppError::ResponseTooLarge(
+            "Circle AppView response exceeds 10 MiB".into(),
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len() + chunk.len() > MAX_CIRCLE_RESPONSE_SIZE {
+            return Err(AppError::ResponseTooLarge(
+                "Circle AppView response exceeds 10 MiB".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
@@ -802,6 +881,52 @@ pub async fn proxy_xrpc(
         Some(body_bytes.clone())
     };
 
+    if CIRCLE_ENDPOINTS.contains(&lexicon.as_str()) {
+        tracing::info!(
+            request_id = %request_id,
+            lexicon = %lexicon,
+            user = %session.did,
+            "Routing Circle request directly to standalone AppView"
+        );
+        let circle_dpop = dpop_data
+            .as_ref()
+            .map(|extension| &extension.0)
+            .ok_or(AppError::InvalidSession)?;
+        let (status, response_headers, response_body) = proxy_circle_request(
+            state.clone(),
+            &session,
+            &state.config.circle.base_url,
+            &state.config.circle.service_did,
+            circle_dpop,
+            method,
+            &lexicon,
+            query_string.as_deref(),
+            body_option,
+            content_type,
+        )
+        .await?;
+
+        metrics::record_proxy_request(&lexicon, status, start.elapsed().as_secs_f64());
+        let mut response = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+        for (name, value) in response_headers.iter() {
+            if matches!(
+                name.as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-disposition"
+                    | "cache-control"
+                    | "etag"
+                    | "last-modified"
+            ) {
+                if let Ok(value) = value.to_str() {
+                    response = response.header(name.as_str(), value);
+                }
+            }
+        }
+        return Ok(response.body(Body::from(response_body)).unwrap());
+    }
+
     // Check if this is an MLS lexicon and direct routing is enabled
     let mls_service = MlsAuthService::new(state.clone());
     if MlsAuthService::is_mls_lexicon(&lexicon) && mls_service.is_enabled() {
@@ -827,31 +952,32 @@ pub async fn proxy_xrpc(
             }
         });
 
-        let (status, response_headers, response_body) = if MlsAuthService::is_clean_chat_lexicon(&lexicon) {
-            mls_service
-                .proxy_clean_chat_request(
-                    &session,
-                    method.try_into().unwrap_or(reqwest::Method::GET),
-                    &lexicon,
-                    query_string.as_deref(),
-                    body_option,
-                    content_type,
-                    device_id_header,
-                    session_dpop_key.as_ref(),
-                )
-                .await?
-        } else {
-            mls_service
-                .proxy_request(
-                    &session,
-                    method.try_into().unwrap_or(reqwest::Method::GET),
-                    &lexicon,
-                    query_string.as_deref(),
-                    body_option,
-                    content_type,
-                )
-                .await?
-        };
+        let (status, response_headers, response_body) =
+            if MlsAuthService::is_clean_chat_lexicon(&lexicon) {
+                mls_service
+                    .proxy_clean_chat_request(
+                        &session,
+                        method.try_into().unwrap_or(reqwest::Method::GET),
+                        &lexicon,
+                        query_string.as_deref(),
+                        body_option,
+                        content_type,
+                        device_id_header,
+                        session_dpop_key.as_ref(),
+                    )
+                    .await?
+            } else {
+                mls_service
+                    .proxy_request(
+                        &session,
+                        method.try_into().unwrap_or(reqwest::Method::GET),
+                        &lexicon,
+                        query_string.as_deref(),
+                        body_option,
+                        content_type,
+                    )
+                    .await?
+            };
 
         let response_shape = json_shape(&response_body);
         tracing::info!(

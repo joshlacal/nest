@@ -1,18 +1,7 @@
-//! MLS AppView Service Authentication Provider
+//! AppView Service Authentication Provider
 //!
-//! Obtains PDS-issued service auth tokens for MLS AppView communication.
-//! Tokens are issued by the user's PDS via `com.atproto.server.getServiceAuth`
-//! with `aud = MLS_APPVIEW_SERVICE_REF` and `lxm = <lexicon>`, and returned verbatim.
-//!
-//! DELIBERATELY NOT CACHED. mls-ds enforces single-use replay protection: it
-//! records each token's `jti` in the Postgres `auth_jti_nonce` table and rejects
-//! any second presentation (`auth.rs:1163-1178`, applied at `:1253` via
-//! `enforce_standard_with_replay_store`). A cached token therefore yields HTTP
-//! 200 on its first use and 401 on every later one. Measured in production on
-//! 2026-08-22: a fresh token returned 200 with a 22KB conversation payload; the
-//! same token replayed returned `{"error":"NotAuthorized"}`, byte-identical to
-//! the response for a deliberately corrupted token. One `getServiceAuth` call
-//! per chat request is the correct cost, not an inefficiency to optimise away.
+//! Obtains fresh PDS-issued service-auth tokens for endpoint-bound AppView requests.
+//! Tokens are deliberately not cached because AppViews may enforce single-use `jti`s.
 
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
@@ -23,6 +12,17 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use std::sync::Arc;
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
+pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circles";
+pub const CIRCLE_ENDPOINTS: &[&str] = &[
+    "blue.catbird.circle.activateCircle",
+    "blue.catbird.circle.getFeed",
+    "blue.catbird.circle.getMedia",
+    "blue.catbird.circle.getPostThread",
+    "blue.catbird.circle.listCircles",
+    "blue.catbird.circle.listNotifications",
+    "blue.catbird.circle.reportRecord",
+    "blue.catbird.circle.updatePreferences",
+];
 
 pub struct ServiceAuthProvider {
     state: Arc<AppState>,
@@ -33,22 +33,18 @@ impl ServiceAuthProvider {
         Self { state }
     }
 
-
     /// MLS helper: delegates directly to `token_for_audience` with the MLS audience.
     /// PDS-issued service-auth JWT: `iss` is the user's own bare DID, `aud` is
     /// MLS_APPVIEW_SERVICE_REF, `lxm` is exactly `lexicon`. Returned verbatim —
     /// never re-signed or re-wrapped. Minted fresh on every call because the
     /// token is single-use; see the module comment.
-    pub async fn token_for(
-        &self,
-        session: &CatbirdSession,
-        lexicon: &str,
-    ) -> AppResult<String> {
-        self.token_for_audience(session, MLS_APPVIEW_SERVICE_REF, lexicon).await
+    pub async fn token_for(&self, session: &CatbirdSession, lexicon: &str) -> AppResult<String> {
+        self.token_for_audience(session, MLS_APPVIEW_SERVICE_REF, lexicon)
+            .await
     }
 
-    /// Parameterized service-auth token fetcher for allowed audiences (MLS AppView).
-    /// Validates that `audience` is a configured service identifier and `lexicon` is an exact allowed NSID.
+    /// Parameterized service-auth token fetcher for the exact MLS and Circle
+    /// AppView audiences and endpoint allowlists.
     pub async fn token_for_audience(
         &self,
         session: &CatbirdSession,
@@ -56,7 +52,23 @@ impl ServiceAuthProvider {
         lexicon: &str,
     ) -> AppResult<String> {
         self.validate_audience_and_lexicon(audience, lexicon)?;
-        self.fetch_service_auth_from_pds(session, audience, lexicon).await
+        self.fetch_service_auth_from_pds(session, audience, lexicon, None)
+            .await
+    }
+
+    /// Mint with the DPoP key already authenticated by gateway middleware.
+    /// Circle routing uses this path so a registry miss can never substitute a
+    /// random key that does not match the OAuth access token's binding.
+    pub async fn token_for_audience_with_dpop(
+        &self,
+        session: &CatbirdSession,
+        audience: &str,
+        lexicon: &str,
+        dpop_data: &JacquardDpopData,
+    ) -> AppResult<String> {
+        self.validate_audience_and_lexicon(audience, lexicon)?;
+        self.fetch_service_auth_from_pds(session, audience, lexicon, Some(dpop_data))
+            .await
     }
 
     fn validate_audience_and_lexicon(&self, audience: &str, lexicon: &str) -> AppResult<()> {
@@ -65,23 +77,39 @@ impl ServiceAuthProvider {
             || audience.contains('*')
             || audience.contains(char::is_whitespace)
         {
-            return Err(AppError::BadRequest(format!("Invalid service auth audience: {audience:?}")));
+            return Err(AppError::BadRequest(format!(
+                "Invalid service auth audience: {audience:?}"
+            )));
         }
         if lexicon.is_empty()
             || lexicon != lexicon.trim()
             || lexicon.contains('*')
             || lexicon.contains(char::is_whitespace)
         {
-            return Err(AppError::BadRequest(format!("Invalid service auth lexicon: {lexicon:?}")));
+            return Err(AppError::BadRequest(format!(
+                "Invalid service auth lexicon: {lexicon:?}"
+            )));
         }
 
         let is_mls_aud = audience == MLS_APPVIEW_SERVICE_REF
-            || (!self.state.config.mls.service_did.is_empty() && audience == self.state.config.mls.service_did);
+            || (!self.state.config.mls.service_did.is_empty()
+                && audience == self.state.config.mls.service_did);
         if is_mls_aud {
             let is_allowed_lxm = crate::services::CHAT_ENDPOINTS.contains(&lexicon);
             if !is_allowed_lxm {
                 return Err(AppError::BadRequest(format!(
                     "Unsupported MLS service auth lexicon: {lexicon}"
+                )));
+            }
+            return Ok(());
+        }
+
+        if audience == CIRCLE_APPVIEW_SERVICE_REF
+            || audience == self.state.config.circle.service_did
+        {
+            if !CIRCLE_ENDPOINTS.contains(&lexicon) {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported Circle service auth lexicon: {lexicon}"
                 )));
             }
             return Ok(());
@@ -96,6 +124,7 @@ impl ServiceAuthProvider {
         session: &CatbirdSession,
         audience: &str,
         lexicon: &str,
+        dpop_data: Option<&JacquardDpopData>,
     ) -> AppResult<String> {
         let client = AtProtoClient::new(self.state.clone());
         let now = Utc::now().timestamp();
@@ -107,7 +136,10 @@ impl ServiceAuthProvider {
             urlencoding::encode(lexicon),
             requested_exp
         );
-        let dpop_data = self.resolve_dpop_data(session).await;
+        let dpop_data = match dpop_data {
+            Some(dpop_data) => dpop_data.clone(),
+            None => self.resolve_dpop_data(session).await,
+        };
 
         let response = client
             .proxy_request(
@@ -127,7 +159,8 @@ impl ServiceAuthProvider {
             ProxyResponse::Buffered { status, body, .. } => {
                 if !(200..300).contains(&status) {
                     let msg = String::from_utf8_lossy(&body).into_owned();
-                    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                    let status_code =
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
                     let error_code = match status {
                         401 => "AuthRequired",
                         403 => "AccessRemoved",
@@ -137,7 +170,9 @@ impl ServiceAuthProvider {
                     return Err(AppError::AtprotoResponse {
                         status: status_code,
                         error: error_code.into(),
-                        message: format!("com.atproto.server.getServiceAuth failed ({status}): {msg}"),
+                        message: format!(
+                            "com.atproto.server.getServiceAuth failed ({status}): {msg}"
+                        ),
                     });
                 }
                 body
@@ -150,13 +185,16 @@ impl ServiceAuthProvider {
                 });
             }
         };
-        let json: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| AppError::Internal(format!("Invalid getServiceAuth JSON response: {}", e)))?;
+        let json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+            AppError::Internal(format!("Invalid getServiceAuth JSON response: {}", e))
+        })?;
 
         let token = json
             .get("token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::Internal("getServiceAuth response missing 'token' string".into()))?
+            .ok_or_else(|| {
+                AppError::Internal("getServiceAuth response missing 'token' string".into())
+            })?
             .to_string();
 
         Ok(token)
@@ -165,7 +203,11 @@ impl ServiceAuthProvider {
     async fn resolve_dpop_data(&self, session: &CatbirdSession) -> JacquardDpopData {
         if let Some(jacquard_client) = &self.state.jacquard_client {
             if let Ok(did) = jacquard_common::types::did::Did::new(&session.did) {
-                if let Ok(session_data) = jacquard_client.registry.get(&did, &session.id.to_string(), true).await {
+                if let Ok(session_data) = jacquard_client
+                    .registry
+                    .get(&did, &session.id.to_string(), true)
+                    .await
+                {
                     return JacquardDpopData {
                         dpop_key: session_data.dpop_data.dpop_key.clone(),
                         dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
@@ -228,8 +270,12 @@ mod tests {
                     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
                     use base64::Engine;
 
-                    let query: HashMap<String, String> = request.url.query_pairs().into_owned().collect();
-                    let aud = query.get("aud").cloned().unwrap_or_else(|| MLS_APPVIEW_SERVICE_REF.to_string());
+                    let query: HashMap<String, String> =
+                        request.url.query_pairs().into_owned().collect();
+                    let aud = query
+                        .get("aud")
+                        .cloned()
+                        .unwrap_or_else(|| MLS_APPVIEW_SERVICE_REF.to_string());
                     let lxm = query.get("lxm").cloned().unwrap_or_default();
 
                     let now = Utc::now().timestamp();
@@ -275,12 +321,21 @@ mod tests {
         }
 
         async fn call_count(&self) -> usize {
-            self.server.received_requests().await.map(|r| r.len()).unwrap_or(0)
+            self.server
+                .received_requests()
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0)
         }
 
         async fn single_call(&self) -> RecordedCall {
             let requests = self.server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), 1, "expected exactly 1 call, got {}", requests.len());
+            assert_eq!(
+                requests.len(),
+                1,
+                "expected exactly 1 call, got {}",
+                requests.len()
+            );
             let req = &requests[0];
             let path = req.url.path();
             let nsid = path.strip_prefix("/xrpc/").unwrap_or(path).to_string();
@@ -293,7 +348,9 @@ mod tests {
         let config = AppConfig::load().unwrap();
         let http_client = reqwest::Client::builder().build().unwrap();
         let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
-        let redis = redis::aio::ConnectionManager::new(redis_client).await.unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
 
         Arc::new(AppState {
             config: Arc::new(config),
@@ -353,7 +410,10 @@ mod tests {
         let call = pds.single_call().await;
         assert_eq!(call.nsid, "com.atproto.server.getServiceAuth");
         assert_eq!(call.query("aud"), Some(MLS_APPVIEW_SERVICE_REF));
-        assert_eq!(call.query("lxm"), Some("blue.catbird.chat.getConversations"));
+        assert_eq!(
+            call.query("lxm"),
+            Some("blue.catbird.chat.getConversations")
+        );
         let requested_exp: i64 = call.query("exp").expect("exp requested").parse().unwrap();
         let now = Utc::now().timestamp();
         assert!(
@@ -365,6 +425,24 @@ mod tests {
             requested_exp - now > 0,
             "requested lifetime must be in the future"
         );
+    }
+
+    #[tokio::test]
+    async fn requests_a_pds_token_for_an_exact_circle_appview_endpoint() {
+        let pds = MockPds::new().await;
+        let provider = ServiceAuthProvider::new(test_state().await);
+        let session = test_session("did:plc:alice-circle", &pds.uri());
+        let circle_service = "did:web:circles.catbird.blue#atproto_circles";
+        let circle_lxm = "blue.catbird.circle.listCircles";
+
+        let _ = provider
+            .token_for_audience(&session, circle_service, circle_lxm)
+            .await
+            .expect("Circle service-auth token minted");
+
+        let call = pds.single_call().await;
+        assert_eq!(call.query("aud"), Some(circle_service));
+        assert_eq!(call.query("lxm"), Some(circle_lxm));
     }
 
     /// Regression test for the production defect found 2026-08-22. Tokens were
@@ -428,5 +506,4 @@ mod tests {
         // three distinct cache keys, three distinct PDS calls.
         assert_eq!(pds.call_count().await, 3);
     }
-
 }

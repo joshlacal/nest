@@ -361,8 +361,8 @@ impl AtProtoClient {
 
             // Log error response bodies for debugging (excluding Space requests for privacy)
             if status >= 400 && status != 401 {
-                let is_space = url.contains("com.atproto.space")
-                    || url.contains("com.atproto.simplespace");
+                let is_space =
+                    url.contains("com.atproto.space") || url.contains("com.atproto.simplespace");
                 if !is_space {
                     if let Ok(error_text) = std::str::from_utf8(&body) {
                         let truncated = if error_text.len() > 200 {

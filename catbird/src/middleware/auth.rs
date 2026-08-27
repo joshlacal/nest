@@ -150,7 +150,13 @@ pub async fn auth_middleware(
     })?;
 
     // Try Jacquard path (new sessions + already-migrated sessions)
-    let (session, dpop_data) = match resolve_session_via_jacquard(auth_store, jacquard_client, &session_id).await {
+    let (session, dpop_data) = match resolve_session_via_jacquard(
+        auth_store,
+        jacquard_client,
+        &session_id,
+    )
+    .await
+    {
         Ok((session, dpop_data)) => (session, dpop_data),
         Err(AppError::InvalidSession) => {
             // Session not found — attempt legacy migration
@@ -243,7 +249,11 @@ async fn resolve_session_via_jacquard(
             .as_ref()
             .map(|t| t.to_string())
             .unwrap_or_default(),
-        scopes: session_data.scopes.iter().map(|scope| scope.to_string()).collect(),
+        scopes: session_data
+            .scopes
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
         access_token_expires_at: expires_at,
         created_at: Utc::now(), // Not tracked in Jacquard session
         last_used_at: Utc::now(),
@@ -298,9 +308,9 @@ mod tests {
 
     #[test]
     fn classifies_transient_auth_failure_as_temporarily_unavailable() {
-        let mapped = classify_auth_error(
-            AppError::AuthTemporarilyUnavailable("upstream timeout".into()),
-        );
+        let mapped = classify_auth_error(AppError::AuthTemporarilyUnavailable(
+            "upstream timeout".into(),
+        ));
         match mapped {
             AppError::AtprotoResponse {
                 status,

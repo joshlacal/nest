@@ -240,7 +240,11 @@ pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     }
 
     // Discard-Only Address Block: 100::/64 (RFC 6666) and Dummy IPv6 Prefix: 100:0:0:1::/64 (RFC 8504)
-    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && (segments[3] == 0 || segments[3] == 1) {
+    if segments[0] == 0x0100
+        && segments[1] == 0
+        && segments[2] == 0
+        && (segments[3] == 0 || segments[3] == 1)
+    {
         return true;
     }
 

@@ -84,15 +84,8 @@ mod tests {
         let proof = generate_dpop_proof(&dpop_signing_key, "POST", &htu, token, now).unwrap();
 
         // 2. Verify DPoP proof
-        let proof_claims = verify_dpop_proof(
-            &proof,
-            "POST",
-            &htu,
-            token,
-            Some(&dpop_jkt),
-            now,
-        )
-        .unwrap();
+        let proof_claims =
+            verify_dpop_proof(&proof, "POST", &htu, token, Some(&dpop_jkt), now).unwrap();
 
         assert_eq!(proof_claims.htm, "POST");
         assert_eq!(proof_claims.htu, htu);
@@ -113,21 +106,31 @@ mod tests {
         assert!(is_allowed_redirect("https://catbird.blue/oauth/callback"));
 
         // Near misses and path traversals MUST be rejected
-        assert!(!is_allowed_redirect("https://catbird.blue/oauth/callback/../evil"));
+        assert!(!is_allowed_redirect(
+            "https://catbird.blue/oauth/callback/../evil"
+        ));
         assert!(!is_allowed_redirect("https://catbird.blue/other"));
         assert!(!is_allowed_redirect("https://catbird.blue/"));
         assert!(!is_allowed_redirect("https://catbird.blue"));
 
         // Subdomain attacks MUST be rejected
-        assert!(!is_allowed_redirect("https://catmos.catbird.blue.evil.com/"));
-        assert!(!is_allowed_redirect("https://catmos.catbird.blue.evil.com/callback"));
-        assert!(!is_allowed_redirect("https://catbird.blue.evil.com/oauth/callback"));
+        assert!(!is_allowed_redirect(
+            "https://catmos.catbird.blue.evil.com/"
+        ));
+        assert!(!is_allowed_redirect(
+            "https://catmos.catbird.blue.evil.com/callback"
+        ));
+        assert!(!is_allowed_redirect(
+            "https://catbird.blue.evil.com/oauth/callback"
+        ));
 
         // Valid Catmos production origins
         assert!(is_allowed_redirect("https://catmos.catbird.blue/callback"));
         assert!(is_allowed_redirect("https://catmos.catbird.blue/"));
         assert!(is_allowed_redirect("https://catmos.pages.dev/callback"));
-        assert!(is_allowed_redirect("https://preview-123.catmos.pages.dev/callback"));
+        assert!(is_allowed_redirect(
+            "https://preview-123.catmos.pages.dev/callback"
+        ));
 
         // Loopback addresses for local dev
         assert!(is_allowed_redirect("http://127.0.0.1:8080/callback"));
@@ -146,18 +149,32 @@ mod tests {
         use catbird::handlers::atproto::is_valid_base64url_43;
 
         // Exactly 43 characters with [A-Za-z0-9_-]
-        assert!(is_valid_base64url_43("A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V"));
-        assert!(is_valid_base64url_43("a-b_c1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZab"));
+        assert!(is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V"
+        ));
+        assert!(is_valid_base64url_43(
+            "a-b_c1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZab"
+        ));
 
         // Wrong length
-        assert!(!is_valid_base64url_43("A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1")); // 42 chars
-        assert!(!is_valid_base64url_43("A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1VV")); // 44 chars
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1"
+        )); // 42 chars
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1VV"
+        )); // 44 chars
         assert!(!is_valid_base64url_43(""));
 
         // Disallowed characters
-        assert!(!is_valid_base64url_43("A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1+")); // '+' invalid
-        assert!(!is_valid_base64url_43("A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1/")); // '/' invalid
-        assert!(!is_valid_base64url_43("A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1=")); // '=' invalid
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1+"
+        )); // '+' invalid
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1/"
+        )); // '/' invalid
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1="
+        )); // '=' invalid
     }
 
     /// Test ADR-014 exchange code generation: 43 chars, unpadded base64url, high entropy
@@ -175,7 +192,10 @@ mod tests {
                 "Code must match base64url format: {}",
                 code
             );
-            assert!(seen.insert(code), "Exchange codes must be distinct (CSPRNG)");
+            assert!(
+                seen.insert(code),
+                "Exchange codes must be distinct (CSPRNG)"
+            );
         }
     }
 
@@ -195,7 +215,8 @@ mod tests {
         );
 
         // Catmos JSON-state shape with valid redirect_to
-        let catmos_state = r#"{"redirect_to":"https://catmos.catbird.blue/callback","client":"catmos"}"#;
+        let catmos_state =
+            r#"{"redirect_to":"https://catmos.catbird.blue/callback","client":"catmos"}"#;
         let catmos_redirect = build_app_redirect(catmos_state, session_id);
         assert_eq!(
             catmos_redirect,
@@ -220,7 +241,9 @@ mod tests {
         use std::sync::Arc;
 
         let config = catbird::config::AppConfig::load().unwrap();
-        let mut state_obj = catbird::config::AppState::new(config.clone()).await.unwrap();
+        let mut state_obj = catbird::config::AppState::new(config.clone())
+            .await
+            .unwrap();
         state_obj.session_encryption_key = Some([0x42u8; 32]);
         let state = Arc::new(state_obj);
 
@@ -252,7 +275,10 @@ mod tests {
                     msg
                 );
             }
-            other => panic!("Expected BadRequest for native callback without nonce, got {:?}", other),
+            other => panic!(
+                "Expected BadRequest for native callback without nonce, got {:?}",
+                other
+            ),
         }
 
         // 3. browser_nonce present but redirect_to missing -> 400 Bad Request
@@ -268,7 +294,10 @@ mod tests {
             catbird::error::AppError::BadRequest(msg) => {
                 assert!(msg.contains("Missing redirect_to"));
             }
-            other => panic!("Expected BadRequest for missing redirect_to, got {:?}", other),
+            other => panic!(
+                "Expected BadRequest for missing redirect_to, got {:?}",
+                other
+            ),
         }
 
         // 4. browser_nonce present with disallowed redirect_to -> 400 Bad Request
@@ -285,7 +314,10 @@ mod tests {
             catbird::error::AppError::BadRequest(msg) => {
                 assert!(msg.contains("Disallowed redirect_to URL"));
             }
-            other => panic!("Expected BadRequest for disallowed redirect_to, got {:?}", other),
+            other => panic!(
+                "Expected BadRequest for disallowed redirect_to, got {:?}",
+                other
+            ),
         }
 
         // 5. Malformed browser_nonce -> 400 Bad Request
@@ -331,7 +363,10 @@ mod tests {
                     msg
                 );
             }
-            other => panic!("Expected Internal error for missing encryption key, got {:?}", other),
+            other => panic!(
+                "Expected Internal error for missing encryption key, got {:?}",
+                other
+            ),
         }
     }
 
@@ -393,8 +428,10 @@ mod tests {
         let exchange_code = generate_exchange_code();
 
         // FIX 1 + FIX 2 (Amended): Store sealed session_id at composite key
-        let exchange_key = compute_exchange_redis_key(&exchange_code, &browser_nonce, &canonical_origin);
-        let sealed_val = catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
+        let exchange_key =
+            compute_exchange_redis_key(&exchange_code, &browser_nonce, &canonical_origin);
+        let sealed_val =
+            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
 
         // Invariant: assert no Redis key or value contains raw code, raw nonce, or plaintext session_id
         assert!(
@@ -494,7 +531,8 @@ mod tests {
         // --- TEST REQUIREMENT 2: wrong Origin -> 401 AND code still redeemable afterwards ---
         let code2 = generate_exchange_code();
         let key2 = compute_exchange_redis_key(&code2, &browser_nonce, &canonical_origin);
-        let sealed_val2 = catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
+        let sealed_val2 =
+            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
         let _: () = redis::cmd("SET")
             .arg(&key2)
             .arg(&sealed_val2)
@@ -536,7 +574,8 @@ mod tests {
         // (4) Missing Origin test -> 401
         let code3 = generate_exchange_code();
         let key3 = compute_exchange_redis_key(&code3, &browser_nonce, &canonical_origin);
-        let sealed_val3 = catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
+        let sealed_val3 =
+            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
         let _: () = redis::cmd("SET")
             .arg(&key3)
             .arg(&sealed_val3)
@@ -660,7 +699,10 @@ mod tests {
             );
 
             let res = login(State(Arc::new(state)), Query(params)).await;
-            assert!(res.is_err(), "Login MUST fail when Redis persistence fails in exchange mode");
+            assert!(
+                res.is_err(),
+                "Login MUST fail when Redis persistence fails in exchange mode"
+            );
             match res.unwrap_err() {
                 catbird::error::AppError::Internal(msg) => {
                     assert!(
@@ -700,11 +742,13 @@ mod tests {
 
         let canonical_origin = canonicalize_origin(android_redirect_to).unwrap();
         let exchange_code = generate_exchange_code();
-        let exchange_key = compute_exchange_redis_key(&exchange_code, android_nonce, &canonical_origin);
+        let exchange_key =
+            compute_exchange_redis_key(&exchange_code, android_nonce, &canonical_origin);
 
         // Store session_id at composite key
         let enc_key = [0x42u8; 32];
-        let sealed_session_id = catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
+        let sealed_session_id =
+            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
         let _: () = redis::cmd("SET")
             .arg(&exchange_key)
             .arg(&sealed_session_id)
@@ -719,8 +763,14 @@ mod tests {
             callback_location,
             format!("https://catbird.blue/oauth/callback?code={}", exchange_code)
         );
-        assert!(!callback_location.contains('#'), "Exchange redirect must NOT contain fragments");
-        assert!(!callback_location.contains("session_id"), "Exchange redirect must NOT contain session_id");
+        assert!(
+            !callback_location.contains('#'),
+            "Exchange redirect must NOT contain fragments"
+        );
+        assert!(
+            !callback_location.contains("session_id"),
+            "Exchange redirect must NOT contain session_id"
+        );
 
         // --- Mode 2: Catmos Web Query Mode (?session_id=) ---
         // Stored mode is absent/legacy, redirect_to is present & allowed
@@ -729,7 +779,10 @@ mod tests {
         let catmos_location = format!("{}?session_id={}", catmos_redirect_to, session_id);
         assert_eq!(
             catmos_location,
-            format!("https://catmos.catbird.blue/callback?session_id={}", session_id)
+            format!(
+                "https://catmos.catbird.blue/callback?session_id={}",
+                session_id
+            )
         );
 
         // --- Mode 3: iOS Legacy Fragment Mode (#session_id=) ---
@@ -737,7 +790,10 @@ mod tests {
         let ios_location = build_app_redirect(&session_id, &session_id);
         assert_eq!(
             ios_location,
-            format!("https://catbird.blue/oauth/callback#session_id={}", session_id)
+            format!(
+                "https://catbird.blue/oauth/callback#session_id={}",
+                session_id
+            )
         );
 
         // --- FIX 4 Invariant: Exchange mode admitted, but nonce missing at callback ---
@@ -755,20 +811,31 @@ mod tests {
                         Ok(format!("{}?code=...", r))
                     }
                 }
-                _ => Err("Exchange flow state missing; refusing downgrade to session-bearing redirect"),
+                _ => Err(
+                    "Exchange flow state missing; refusing downgrade to session-bearing redirect",
+                ),
             }
         } else {
             Ok(build_app_redirect(&session_id, &session_id))
         };
 
-        assert!(result.is_err(), "Must fail closed when exchange nonce binding is missing");
+        assert!(
+            result.is_err(),
+            "Must fail closed when exchange nonce binding is missing"
+        );
         let err_msg = result.unwrap_err();
-        assert!(!err_msg.contains(&session_id), "Error must not leak session_id");
+        assert!(
+            !err_msg.contains(&session_id),
+            "Error must not leak session_id"
+        );
     }
 
-    /// Test that the generic proxy preserves and forwards client-supplied atproto-proxy header
+    /// Circle AppView requests mint endpoint-bound service auth at the PDS and
+    /// route directly to the standalone AppView. Spaces Alpha returns 500 when
+    /// asked to proxy custom Circle services itself, so forwarding
+    /// `atproto-proxy` is not a viable Circle transport.
     #[tokio::test]
-    async fn test_generic_proxy_forwards_atproto_proxy_header() {
+    async fn test_circle_proxy_mints_service_auth_and_routes_directly_to_appview() {
         use axum::http::HeaderMap;
         use catbird::config::{AppConfig, AppState};
         use catbird::models::CatbirdSession;
@@ -776,25 +843,39 @@ mod tests {
         use chrono::Utc;
         use std::sync::Arc;
         use uuid::Uuid;
-        use wiremock::matchers::{header, method, path};
+        use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let pds = MockServer::start().await;
+        let appview = MockServer::start().await;
         let appview_target = "did:web:circles.catbird.blue#atproto_circles";
+        let lexicon = "blue.catbird.circle.getFeed";
 
-        // Expect the upstream server to receive the atproto-proxy header untouched
         Mock::given(method("GET"))
-            .and(path("/xrpc/blue.catbird.circle.getFeed"))
-            .and(header("atproto-proxy", appview_target))
+            .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+            .and(query_param("aud", appview_target))
+            .and(query_param("lxm", lexicon))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "feed": [] })),
+                    .set_body_json(serde_json::json!({ "token": "circle-service-token" })),
             )
             .expect(1)
-            .mount(&server)
+            .mount(&pds)
             .await;
 
-        let config = AppConfig::load().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/blue.catbird.circle.getFeed"))
+            .and(header("authorization", "Bearer circle-service-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "feed": [] })),
+            )
+            .expect(1)
+            .mount(&appview)
+            .await;
+
+        let mut config = AppConfig::load().unwrap();
+        config.circle.base_url = appview.uri();
+        config.circle.service_did = appview_target.into();
         let http_client = reqwest::Client::builder().build().unwrap();
         let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
         let redis = redis::aio::ConnectionManager::new(redis_client)
@@ -819,7 +900,7 @@ mod tests {
             id: Uuid::new_v4(),
             did: "did:plc:alice-proxy".into(),
             handle: "alice.test".into(),
-            pds_url: server.uri(),
+            pds_url: pds.uri(),
             access_token: "mock-token".into(),
             refresh_token: "mock-refresh".into(),
             scopes: vec!["atproto".into()],
@@ -845,17 +926,17 @@ mod tests {
             axum::extract::State(state),
             axum::Extension(session),
             Some(axum::Extension(catbird::middleware::RequestId(
-                "req-test-proxy".into(),
+                "req-test-circle-proxy".into(),
             ))),
             Some(axum::Extension(dpop_data)),
             axum::http::Method::GET,
-            axum::extract::Path("blue.catbird.circle.getFeed".to_string()),
+            axum::extract::Path(lexicon.to_string()),
             axum::extract::RawQuery(None),
             headers,
             axum::body::Body::empty(),
         )
         .await
-        .expect("proxy_xrpc handler succeeds");
+        .expect("Circle proxy succeeds");
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)

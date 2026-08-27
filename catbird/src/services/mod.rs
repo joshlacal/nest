@@ -24,5 +24,6 @@ pub use mls_auth::{
 };
 pub use push::PushServices;
 pub use redis_auth_store::RedisAuthStore;
-pub use service_auth::{ServiceAuthProvider, MLS_APPVIEW_SERVICE_REF};
-
+pub use service_auth::{
+    ServiceAuthProvider, CIRCLE_APPVIEW_SERVICE_REF, CIRCLE_ENDPOINTS, MLS_APPVIEW_SERVICE_REF,
+};

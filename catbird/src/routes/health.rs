@@ -49,7 +49,10 @@ pub async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRes
         .is_ok();
 
     if !redis_ok {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "redis not ready");
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "redis not ready",
+        );
     }
 
     (axum::http::StatusCode::OK, "ready")

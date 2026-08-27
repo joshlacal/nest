@@ -43,7 +43,6 @@ pub struct PushServices {
     pub apns: Option<ApnsDelivery>,
 }
 
-
 impl PushServices {
     pub fn new(db_pool: Pool<Postgres>, config: PushConfig) -> Result<Self> {
         let service_did = config
@@ -616,7 +615,6 @@ impl PushServices {
     }
 }
 
-
 fn is_invalid_token(err: &anyhow::Error) -> bool {
     if let Some(a2_err) = err.downcast_ref::<a2::Error>() {
         if let a2::Error::ResponseError(response) = a2_err {
@@ -703,7 +701,11 @@ pub(crate) async fn resolve_background_session(
             .as_ref()
             .map(|token| token.to_string())
             .unwrap_or_default(),
-        scopes: session_data.scopes.iter().map(|scope| scope.to_string()).collect(),
+        scopes: session_data
+            .scopes
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
         access_token_expires_at: expires_at,
         created_at: Utc::now(),
         last_used_at: Utc::now(),
@@ -803,4 +805,3 @@ mod terminal_failure_tests {
         }
     }
 }
-

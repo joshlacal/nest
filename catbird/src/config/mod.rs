@@ -25,6 +25,34 @@ pub struct AppConfig {
     /// Clean-chat configuration (blue.catbird.chat.*)
     #[serde(default)]
     pub chat: ChatConfig,
+    /// Standalone Circle AppView direct-routing configuration.
+    #[serde(default)]
+    pub circle: CircleConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CircleConfig {
+    #[serde(default = "default_circle_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_circle_service_did")]
+    pub service_did: String,
+}
+
+fn default_circle_base_url() -> String {
+    "https://circles.catbird.blue".to_string()
+}
+
+fn default_circle_service_did() -> String {
+    "did:web:circles.catbird.blue#atproto_circles".to_string()
+}
+
+impl Default for CircleConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_circle_base_url(),
+            service_did: default_circle_service_did(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,7 +147,6 @@ pub struct MlsConfig {
 fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
 }
-
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PushConfig {
@@ -304,7 +331,8 @@ impl AppConfig {
 
         // Override chat config with direct CHAT_* environment variables if present
         if let Ok(val) = std::env::var("CHAT_ENABLED") {
-            app_config.chat.enabled = matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+            app_config.chat.enabled =
+                matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
         if let Ok(val) = std::env::var("CHAT_NEST_ISSUER") {
             if !val.is_empty() {
@@ -388,8 +416,9 @@ fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Err
     use jacquard_oauth::scopes::Scope;
 
     for scope in scopes {
-        Scope::parse(scope)
-            .map_err(|error| anyhow::anyhow!("Invalid configured OAuth scope {scope:?}: {error:?}"))?;
+        Scope::parse(scope).map_err(|error| {
+            anyhow::anyhow!("Invalid configured OAuth scope {scope:?}: {error:?}")
+        })?;
     }
     Ok(())
 }
@@ -505,7 +534,6 @@ impl AppState {
             }
         }
 
-
         Ok(state)
     }
 
@@ -559,7 +587,9 @@ impl AppState {
             .map(|s| {
                 Scope::parse(s)
                     .map(|scope| scope.into_static())
-                    .map_err(|error| anyhow::anyhow!("Invalid configured OAuth scope {s:?}: {error:?}"))
+                    .map_err(|error| {
+                        anyhow::anyhow!("Invalid configured OAuth scope {s:?}: {error:?}")
+                    })
             })
             .collect::<Result<_, _>>()?;
 
@@ -609,7 +639,9 @@ impl AppState {
             .map(|s| {
                 Scope::parse(s)
                     .map(|scope| scope.into_static())
-                    .map_err(|error| anyhow::anyhow!("Invalid CATMOS_OAUTH_SCOPES value {s:?}: {error:?}"))
+                    .map_err(|error| {
+                        anyhow::anyhow!("Invalid CATMOS_OAUTH_SCOPES value {s:?}: {error:?}")
+                    })
             })
             .collect::<Result<_, _>>()?;
 
