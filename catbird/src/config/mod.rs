@@ -156,9 +156,11 @@ pub struct PushConfig {
     /// DID that clients should send in registerPush/unregisterPush
     #[serde(default)]
     pub service_did: Option<String>,
-    /// How often Nest should opportunistically refresh cached moderation state
-    #[serde(default = "default_push_sync_interval_seconds")]
-    pub sync_interval_seconds: u64,
+    /// How long a cached per-actor moderation verdict is served before Nest
+    /// re-asks the appview. Short: it exists to collapse bursts from one actor,
+    /// not to be a source of truth.
+    #[serde(default = "default_push_verdict_ttl_seconds")]
+    pub verdict_ttl_seconds: u64,
     /// Background queue poll interval in milliseconds
     #[serde(default = "default_push_queue_poll_interval_ms")]
     pub queue_poll_interval_ms: u64,
@@ -199,8 +201,8 @@ pub struct ApnsConfig {
     pub production: bool,
 }
 
-fn default_push_sync_interval_seconds() -> u64 {
-    300
+fn default_push_verdict_ttl_seconds() -> u64 {
+    60
 }
 
 fn default_push_queue_poll_interval_ms() -> u64 {

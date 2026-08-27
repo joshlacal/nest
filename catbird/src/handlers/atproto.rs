@@ -1073,20 +1073,14 @@ pub async fn proxy_xrpc(
             }
 
             if (200..300).contains(&status) {
-                if let Err(err) = mirror_push_mutation_if_needed(
-                    &state,
-                    &session,
-                    jacquard_dpop.as_ref(),
-                    &lexicon,
-                    &body_bytes,
-                )
-                .await
+                if let Err(err) =
+                    apply_moderation_mutation(&state, &session, &lexicon, &body_bytes).await
                 {
                     tracing::warn!(
                         lexicon = %lexicon,
                         user = %session.did,
                         error = %err,
-                        "Failed to mirror push moderation mutation"
+                        "Failed to apply moderation mutation to push state"
                     );
                 }
             }
@@ -1171,10 +1165,21 @@ fn describe_json_shape(value: &Value, depth: usize) -> String {
     }
 }
 
-async fn mirror_push_mutation_if_needed(
+/// React to a moderation mutation the user just made through Nest, so the push
+/// pipeline honours it immediately rather than on the next cache expiry.
+///
+/// Two jobs. Thread mutes are recorded locally, because `thread_mutes` is state
+/// Nest owns. Everything else — actor mutes, blocks, list mutes and list blocks
+/// — only invalidates the cached per-actor verdicts for this user; the answers
+/// themselves come from `app.bsky.actor.defs#viewerState` at decision time.
+/// Nest used to mirror that whole graph here to keep a local replica warm; the
+/// replica is gone (ADR-022), but the invalidation is still required. Without
+/// it, muting someone moments after their notification arrived would leave the
+/// "not muted" verdict just cached by that notification's own decision serving
+/// for the rest of the TTL, and their next notification would be delivered.
+async fn apply_moderation_mutation(
     state: &Arc<AppState>,
     session: &CatbirdSession,
-    jacquard_dpop: Option<&JacquardDpopData>,
     lexicon: &str,
     request_body: &[u8],
 ) -> anyhow::Result<()> {
@@ -1189,103 +1194,90 @@ async fn mirror_push_mutation_if_needed(
     };
 
     match lexicon {
-        "app.bsky.graph.muteActor" => {
-            if let Some(actor) = body.get("actor").and_then(|value| value.as_str()) {
-                push.moderation_cache
-                    .upsert_actor_mute(&session.did, actor)
-                    .await?;
+        "app.bsky.graph.muteThread" | "app.bsky.graph.unmuteThread" => {
+            let Some(root) = body.get("root").and_then(|value| value.as_str()) else {
+                return Ok(());
+            };
+            if lexicon == "app.bsky.graph.muteThread" {
+                push.thread_mutes.mute_thread(&session.did, root).await?;
+            } else {
+                push.thread_mutes.unmute_thread(&session.did, root).await?;
             }
         }
-        "app.bsky.graph.unmuteActor" => {
-            if let Some(actor) = body.get("actor").and_then(|value| value.as_str()) {
-                push.moderation_cache
-                    .remove_actor_mute(&session.did, actor)
-                    .await?;
-            }
+        "app.bsky.graph.muteActor"
+        | "app.bsky.graph.unmuteActor"
+        | "app.bsky.graph.muteActorList"
+        | "app.bsky.graph.unmuteActorList" => {
+            push.moderation.invalidate_recipient(&session.did).await?;
         }
-        "app.bsky.graph.muteActorList" => {
-            if let (Some(list), Some(dpop)) = (
-                body.get("list").and_then(|value| value.as_str()),
-                jacquard_dpop,
-            ) {
-                push.moderation_cache
-                    .sync_list_subscription(state, session, dpop, list, "curatelist")
-                    .await?;
-            }
-        }
-        "app.bsky.graph.unmuteActorList" => {
-            if let Some(list) = body.get("list").and_then(|value| value.as_str()) {
-                push.moderation_cache
-                    .remove_list_subscription(&session.did, list)
-                    .await?;
-            }
-        }
-        "app.bsky.graph.muteThread" => {
-            if let Some(root) = body.get("root").and_then(|value| value.as_str()) {
-                push.moderation_cache
-                    .mute_thread(&session.did, root)
-                    .await?;
-            }
-        }
-        "app.bsky.graph.unmuteThread" => {
-            if let Some(root) = body.get("root").and_then(|value| value.as_str()) {
-                push.moderation_cache
-                    .unmute_thread(&session.did, root)
-                    .await?;
-            }
-        }
-        "com.atproto.repo.createRecord" => {
-            if let Some(collection) = body.get("collection").and_then(|value| value.as_str()) {
-                match collection {
-                    "app.bsky.graph.block" => {
-                        if let Some(subject) = body
-                            .get("record")
-                            .and_then(|value| value.get("subject"))
-                            .and_then(|value| value.as_str())
-                        {
-                            push.moderation_cache
-                                .upsert_actor_block(&session.did, subject)
-                                .await?;
-                        }
-                    }
-                    "app.bsky.graph.listblock" => {
-                        if let (Some(subject), Some(dpop)) = (
-                            body.get("record")
-                                .and_then(|value| value.get("subject"))
-                                .and_then(|value| value.as_str()),
-                            jacquard_dpop,
-                        ) {
-                            push.moderation_cache
-                                .sync_list_subscription(state, session, dpop, subject, "modlist")
-                                .await?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "com.atproto.repo.deleteRecord" => {
-            if let (Some(collection), Some(dpop)) = (
-                body.get("collection").and_then(|value| value.as_str()),
-                jacquard_dpop,
-            ) {
-                match collection {
-                    "app.bsky.graph.block" => {
-                        push.moderation_cache
-                            .refresh_actor_relationships_for_session(state, session, dpop)
-                            .await?;
-                    }
-                    "app.bsky.graph.listblock" => {
-                        push.moderation_cache
-                            .refresh_list_relationships_for_session(state, session, dpop)
-                            .await?;
-                    }
-                    _ => {}
-                }
-            }
+        // Blocks and list blocks are repo records, so they arrive as generic
+        // record writes rather than dedicated procedures.
+        "com.atproto.repo.createRecord"
+        | "com.atproto.repo.deleteRecord"
+        | "com.atproto.repo.applyWrites"
+            if moderation_record_write(&body) =>
+        {
+            push.moderation.invalidate_recipient(&session.did).await?;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+/// Whether a repo write touches a collection that changes moderation state.
+///
+/// `applyWrites` batches heterogeneous writes, so every entry is checked.
+fn moderation_record_write(body: &Value) -> bool {
+    const MODERATION_COLLECTIONS: [&str; 2] = ["app.bsky.graph.block", "app.bsky.graph.listblock"];
+
+    let touches = |value: &Value| {
+        value
+            .get("collection")
+            .and_then(Value::as_str)
+            .is_some_and(|collection| MODERATION_COLLECTIONS.contains(&collection))
+    };
+
+    if touches(body) {
+        return true;
+    }
+
+    body.get("writes")
+        .and_then(Value::as_array)
+        .is_some_and(|writes| writes.iter().any(touches))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moderation_record_writes_are_detected_including_batches() {
+        use serde_json::json;
+
+        // A block or listblock write invalidates cached push verdicts; anything
+        // else must not, or every post would flush the cache.
+        assert!(moderation_record_write(
+            &json!({ "collection": "app.bsky.graph.block" })
+        ));
+        assert!(moderation_record_write(
+            &json!({ "collection": "app.bsky.graph.listblock" })
+        ));
+        assert!(!moderation_record_write(
+            &json!({ "collection": "app.bsky.feed.post" })
+        ));
+        assert!(!moderation_record_write(&json!({})));
+
+        // applyWrites batches heterogeneous writes, so a block hidden among
+        // unrelated ones still counts.
+        assert!(moderation_record_write(&json!({
+            "writes": [
+                { "collection": "app.bsky.feed.like" },
+                { "collection": "app.bsky.graph.block" }
+            ]
+        })));
+        assert!(!moderation_record_write(&json!({
+            "writes": [{ "collection": "app.bsky.feed.like" }]
+        })));
+    }
 }

@@ -53,47 +53,61 @@ async fn sync_mutes_for_account(
     let (session_id, pds_url) = lookup_push_account(db_pool, did).await?;
     let (session, dpop) = resolve_background_session(state, did, &session_id, &pds_url).await?;
 
-    let base = session.pds_url.trim_end_matches('/');
     let client = crate::services::AtProtoClient::new(state.clone());
+
+    // Go through `proxy_request` rather than hand-rolling the call on
+    // `state.http_client`: it owns the `use_dpop_nonce` retry. Issuing the
+    // request directly made every 401 terminal, so the mandatory nonce
+    // challenge failed the whole sync and mute state silently stopped syncing.
+    let mut client_headers = reqwest::header::HeaderMap::new();
+    client_headers.insert(
+        "atproto-proxy",
+        HeaderValue::from_static("did:web:api.bsky.chat#bsky_chat"),
+    );
 
     let mut muted_ids: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
 
     loop {
-        let url = if let Some(ref c) = cursor {
-            format!(
-                "{}/xrpc/chat.bsky.convo.listConvos?limit=100&cursor={}",
-                base,
-                urlencoding::encode(c)
-            )
-        } else {
-            format!("{}/xrpc/chat.bsky.convo.listConvos?limit=100", base)
+        let query = match cursor.as_deref() {
+            Some(c) => format!("limit=100&cursor={}", urlencoding::encode(c)),
+            None => "limit=100".to_string(),
         };
 
-        let mut headers = client
-            .build_auth_headers_for_request(&session, "GET", &url, None, Some(&dpop))
-            .await
-            .map_err(|e| anyhow!("Failed to build auth headers: {}", e))?;
+        let response = client
+            .proxy_request(
+                &session,
+                reqwest::Method::GET,
+                "/xrpc/chat.bsky.convo.listConvos",
+                Some(&query),
+                None,
+                None,
+                Some(&client_headers),
+                "mute-sync",
+                Some(&dpop),
+            )
+            .await?;
 
-        headers.insert(
-            "atproto-proxy",
-            HeaderValue::from_static("did:web:api.bsky.chat#bsky_chat"),
-        );
+        let body_bytes = match response {
+            crate::services::ProxyResponse::Buffered { status, body, .. } => {
+                if !(200..300).contains(&status) {
+                    return Err(anyhow!(
+                        "listConvos returned {} for {}: {}",
+                        status,
+                        did,
+                        String::from_utf8_lossy(&body)
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    ));
+                }
+                body
+            }
+            crate::services::ProxyResponse::Streaming { .. } => {
+                return Err(anyhow!("Unexpected streaming response for listConvos"))
+            }
+        };
 
-        let response = state.http_client.get(&url).headers(headers).send().await?;
-
-        let status = response.status().as_u16();
-        if status != 200 {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "listConvos returned {} for {}: {}",
-                status,
-                did,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let body_bytes = response.bytes().await?;
         let page: ListConvosResponse = serde_json::from_slice(&body_bytes)?;
 
         for convo in &page.convos {

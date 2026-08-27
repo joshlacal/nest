@@ -288,8 +288,6 @@ pub struct PushAccountRow {
     pub account_did: String,
     pub session_id: String,
     pub pds_url: String,
-    pub last_actor_sync_at: Option<sqlx::types::time::OffsetDateTime>,
-    pub last_list_sync_at: Option<sqlx::types::time::OffsetDateTime>,
 }
 
 fn default_include() -> String {

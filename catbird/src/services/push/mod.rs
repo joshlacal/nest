@@ -1,10 +1,11 @@
 pub mod apns;
 pub mod decision;
-pub mod moderation_cache;
+pub mod moderation_verdict;
 pub mod preferences;
 pub mod queue;
 pub mod registry;
 pub mod subscriptions;
+pub mod thread_mutes;
 pub mod types;
 
 use std::collections::HashSet;
@@ -24,11 +25,12 @@ use crate::{
 use self::{
     apns::ApnsDelivery,
     decision::{PushDecisionEngine, QueueDisposition},
-    moderation_cache::ModerationCache,
+    moderation_verdict::ActorModerationResolver,
     preferences::PushPreferences,
     queue::PushQueue,
     registry::PushRegistry,
     subscriptions::PushSubscriptions,
+    thread_mutes::ThreadMuteStore,
 };
 
 #[derive(Clone)]
@@ -37,7 +39,8 @@ pub struct PushServices {
     pub registry: PushRegistry,
     pub preferences: PushPreferences,
     pub subscriptions: PushSubscriptions,
-    pub moderation_cache: ModerationCache,
+    pub thread_mutes: ThreadMuteStore,
+    pub moderation: ActorModerationResolver,
     pub queue: PushQueue,
     pub decision: PushDecisionEngine,
     pub apns: Option<ApnsDelivery>,
@@ -54,7 +57,8 @@ impl PushServices {
             registry: PushRegistry::new(db_pool.clone(), service_did),
             preferences: PushPreferences::new(db_pool.clone()),
             subscriptions: PushSubscriptions::new(db_pool.clone()),
-            moderation_cache: ModerationCache::new(db_pool.clone(), config.sync_interval_seconds),
+            thread_mutes: ThreadMuteStore::new(db_pool.clone()),
+            moderation: ActorModerationResolver::new(db_pool.clone(), config.verdict_ttl_seconds),
             queue: PushQueue::new(db_pool),
             decision: PushDecisionEngine::new(),
             apns: ApnsDelivery::new(&config.apns)?,
@@ -91,7 +95,8 @@ impl PushServices {
 
         tracing::info!("Push queue worker started");
 
-        // Purge lingering queue rows for revoked accounts every ~60s
+        // Purge lingering queue rows for revoked accounts, and reap cached
+        // moderation verdicts, every ~60s.
         let purge_interval = std::time::Duration::from_secs(60);
         let mut last_purge = tokio::time::Instant::now();
 
@@ -105,6 +110,23 @@ impl PushServices {
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "Failed to purge revoked account queue rows")
+                    }
+                }
+
+                // Cached verdicts are only useful while they can still be
+                // served: past STALE_VERDICT_CEILING even the offline fallback
+                // refuses them, so anything older is dead weight in a table
+                // that otherwise grows with every distinct actor a user hears
+                // from.
+                match self
+                    .moderation
+                    .prune_older_than(time::Duration::hours(1))
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(count = n, "Pruned stale moderation verdicts"),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to prune stale moderation verdicts")
                     }
                 }
             }
@@ -154,8 +176,8 @@ impl PushServices {
 
                         // Bound the whole decision. Nothing inside this path
                         // carries a timeout of its own, and it performs network
-                        // work (session refresh, moderation sync) while the
-                        // worker processes rows strictly sequentially — so one
+                        // work (session refresh, the moderation lookup) while
+                        // the worker processes rows strictly sequentially — so one
                         // hung upstream connection stops ALL push delivery
                         // indefinitely, with no error logged because nothing
                         // ever returns. That is how the queue reached 2000+
@@ -457,16 +479,17 @@ impl PushServices {
                 }
 
                 match self
-                    .moderation_cache
-                    .is_actor_muted_or_blocked(&event.recipient_did, &event.sender_did)
+                    .moderation
+                    .resolve(&state, &event.recipient_did, &event.sender_did)
                     .await
+                    .map(|moderation| moderation.verdict.suppresses("chat_message"))
                 {
                     Ok(false) => {}
                     Ok(true) => {
                         tracing::debug!(
                             did = %event.recipient_did,
                             actor = %event.sender_did,
-                            "Chat push fast-path dropped: actor_muted_or_blocked"
+                            "Chat push fast-path dropped: actor_moderated"
                         );
                         continue;
                     }

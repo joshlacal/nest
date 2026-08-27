@@ -60,7 +60,12 @@ Since July 2026, nest is the single push-notification owner for Catbird
   `decision.rs` (should-notify logic — use staleness guards, not
   notification-type exclusion), `preferences.rs`, `queue.rs`,
   `registry.rs` (device tokens), `subscriptions.rs` (activity
-  subscriptions), `moderation_cache.rs`.
+  subscriptions), `moderation_verdict.rs`, `thread_mutes.rs`.
+  Moderation is resolved per actor from `app.bsky.actor.defs#viewerState` via
+  one authenticated `getProfile`, cached briefly in `actor_moderation_verdict`.
+  Nest does **not** mirror mutes, blocks or moderation-list membership — doing
+  so put unbounded list pagination inside the decision path and wedged the
+  worker. See ADR-022.
 - **`services/chat_poll/`** — polls `chat.bsky.convo.getLog` for enrolled
   accounts and enqueues chat push (`poller.rs`, `scheduler.rs`,
   `rate_budget.rs` per-PDS budgets, `mute_sync.rs`). Dormant in prod as of

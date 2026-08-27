@@ -1,6 +1,4 @@
 use anyhow::Result;
-use reqwest::Url;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,6 +6,7 @@ use crate::config::AppState;
 
 use super::{
     apns::ApnsNotification,
+    moderation_verdict::Freshness,
     types::{PushPreferencesDocument, QueueRow, RegistrationRow},
     PushServices,
 };
@@ -39,11 +38,8 @@ impl PushDecisionEngine {
             return Ok(QueueDisposition::Drop("no_active_registrations"));
         }
 
-        services
-            .moderation_cache
-            .ensure_fresh(state, &row.recipient_did)
-            .await?;
-
+        // Preferences before any network call: no point asking the appview
+        // about a notification the recipient has switched off.
         let prefs = services
             .preferences
             .get_or_create(&row.recipient_did)
@@ -52,25 +48,43 @@ impl PushDecisionEngine {
             return Ok(QueueDisposition::Drop("preferences_disabled"));
         }
 
-        if services
-            .moderation_cache
-            .is_actor_muted_or_blocked(&row.recipient_did, &row.actor_did)
-            .await?
-        {
-            return Ok(QueueDisposition::Drop("actor_muted_or_blocked"));
+        // One authenticated `getProfile` answers the whole moderation question
+        // and supplies the display label. `viewerState` already reports mutes,
+        // blocks and list-based mutes/blocks, so Nest no longer mirrors any of
+        // it — the mirror had to page every member of every subscribed list
+        // inline here, and a list too large for the decision budget wedged the
+        // sequential worker and stopped all push delivery. See ADR-022.
+        //
+        // An `Err` here means the verdict is genuinely unknown: no cached
+        // verdict at any age and the appview unreachable. Propagating defers the
+        // event rather than delivering it, because a notification from someone
+        // the recipient blocked by list cannot be recalled. The queue's 24h
+        // staleness guard bounds that deferral.
+        let moderation = services
+            .moderation
+            .resolve(state, &row.recipient_did, &row.actor_did)
+            .await?;
+
+        // A stale verdict means the appview was unreachable and we fell back to
+        // a cached answer of unknown age. That is the deliberate availability
+        // trade (ADR-022), but it is exactly the case where a since-added list
+        // mute could be missed, so it must be visible rather than silent.
+        if moderation.freshness == Freshness::Stale {
+            tracing::warn!(
+                recipient = %row.recipient_did,
+                actor = %row.actor_did,
+                notification_type = %row.notification_type,
+                "Deciding push on stale moderation verdict; appview was unreachable"
+            );
         }
 
-        if services
-            .moderation_cache
-            .is_actor_list_filtered(&row.recipient_did, &row.actor_did)
-            .await?
-        {
-            return Ok(QueueDisposition::Drop("list_filtered"));
+        if moderation.verdict.suppresses(&row.notification_type) {
+            return Ok(QueueDisposition::Drop("actor_moderated"));
         }
 
         if let Some(thread_root_uri) = row.thread_root_uri.as_deref() {
             if services
-                .moderation_cache
+                .thread_mutes
                 .is_thread_muted(&row.recipient_did, thread_root_uri)
                 .await?
             {
@@ -81,7 +95,7 @@ impl PushDecisionEngine {
         let actor_label = if row.notification_type == "chat_message" {
             None
         } else {
-            Some(resolve_actor_label(&state.http_client, &row.actor_did).await)
+            moderation.display_label.clone()
         };
 
         let notification = build_notification(row, &prefs, actor_label.as_deref());
@@ -91,71 +105,6 @@ impl PushDecisionEngine {
             .collect();
 
         Ok(QueueDisposition::Deliver(deliveries))
-    }
-}
-
-async fn resolve_actor_label(http_client: &reqwest::Client, actor_did: &str) -> String {
-    match fetch_actor_label(http_client, actor_did).await {
-        Ok(Some(label)) => label,
-        Ok(None) => fallback_actor_label(actor_did),
-        Err(err) => {
-            tracing::debug!(
-                actor = %actor_did,
-                error = %err,
-                "Failed to hydrate push notification actor profile"
-            );
-            fallback_actor_label(actor_did)
-        }
-    }
-}
-
-async fn fetch_actor_label(
-    http_client: &reqwest::Client,
-    actor_did: &str,
-) -> Result<Option<String>> {
-    let mut url = Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile")?;
-    url.query_pairs_mut().append_pair("actor", actor_did);
-
-    let response = http_client.get(url).send().await?;
-    if !response.status().is_success() {
-        tracing::debug!(
-            actor = %actor_did,
-            status = %response.status(),
-            "Public AppView profile lookup failed for push notification actor"
-        );
-        return Ok(None);
-    }
-
-    let payload: Value = response.json().await?;
-    Ok(actor_label_from_profile_json(&payload))
-}
-
-fn actor_label_from_profile_json(profile: &Value) -> Option<String> {
-    profile
-        .get("displayName")
-        .and_then(Value::as_str)
-        .and_then(clean_profile_label)
-        .or_else(|| {
-            profile
-                .get("handle")
-                .and_then(Value::as_str)
-                .and_then(clean_profile_label)
-                .map(|handle| {
-                    if handle.starts_with('@') {
-                        handle
-                    } else {
-                        format!("@{handle}")
-                    }
-                })
-        })
-}
-
-fn clean_profile_label(value: &str) -> Option<String> {
-    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        None
-    } else {
-        Some(truncate(&collapsed, 80))
     }
 }
 
@@ -305,34 +254,6 @@ mod tests {
             created_at: OffsetDateTime::now_utc(),
             attempts: 0,
         }
-    }
-
-    #[test]
-    fn profile_label_prefers_display_name_over_handle() {
-        let profile = json!({
-            "did": "did:plc:alice123",
-            "handle": "alice.example",
-            "displayName": "Alice Example"
-        });
-
-        assert_eq!(
-            actor_label_from_profile_json(&profile).as_deref(),
-            Some("Alice Example")
-        );
-    }
-
-    #[test]
-    fn profile_label_falls_back_to_handle_when_display_name_is_blank() {
-        let profile = json!({
-            "did": "did:plc:alice123",
-            "handle": "alice.example",
-            "displayName": "   "
-        });
-
-        assert_eq!(
-            actor_label_from_profile_json(&profile).as_deref(),
-            Some("@alice.example")
-        );
     }
 
     #[test]

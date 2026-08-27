@@ -227,9 +227,7 @@ impl PushRegistry {
             SELECT
                 account_did,
                 session_id,
-                pds_url,
-                last_actor_sync_at,
-                last_list_sync_at
+                pds_url
             FROM push_accounts
             WHERE account_did = $1
             "#,
@@ -239,26 +237,6 @@ impl PushRegistry {
         .await?;
 
         Ok(row)
-    }
-
-    pub async fn mark_actor_sync(&self, did: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE push_accounts SET last_actor_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-        )
-        .bind(did)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn mark_list_sync(&self, did: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE push_accounts SET last_list_sync_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-        )
-        .bind(did)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn mark_auth_revoked(&self, did: &str) -> Result<()> {
