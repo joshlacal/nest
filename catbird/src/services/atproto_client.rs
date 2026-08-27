@@ -635,10 +635,10 @@ impl AtProtoClient {
 
         let dpop_proof = jacquard_oauth::dpop::build_dpop_proof(
             &dpop_data.dpop_key,
-            method.to_string().into(),
-            dpop_htu.to_string().into(),
-            nonce.map(|n| n.into()),
-            Some(ath.into()),
+            method,
+            dpop_htu,
+            nonce.as_deref(),
+            Some(ath.as_str()),
         )
         .map_err(|e| AppError::Internal(format!("Jacquard DPoP proof failed: {}", e)))?;
 

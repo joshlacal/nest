@@ -1,18 +1,19 @@
 //! Session migration CLI for Catbird BFF (nest/catbird).
 //!
-//! Exports/imports Redis sessions (still encrypted) for server migration.
-//! Sessions are transferred as raw bytes — no decryption needed.
+//! Exports/imports Redis sessions (still encrypted) for server migration,
+//! and verifies key count and sample data consistency across instances.
 //!
 //! Usage:
 //!   session_migrate export --redis-url redis://old:6379 --output sessions.json
 //!   session_migrate import --redis-url redis://new:6379 --input sessions.json
 //!   session_migrate verify --source redis://old:6379 --target redis://new:6379
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 const DEFAULT_PREFIX: &str = "catbird:session:";
 const DEFAULT_BATCH_SIZE: usize = 100;
@@ -22,7 +23,7 @@ const DEFAULT_BATCH_SIZE: usize = 100;
 #[derive(Parser)]
 #[command(
     name = "session_migrate",
-    about = "Export/import Catbird BFF sessions between Redis instances",
+    about = "Export, import, and verify Catbird BFF sessions in Redis",
     version
 )]
 struct Cli {
@@ -90,7 +91,7 @@ enum Command {
 
 // ── Export file format ───────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct ExportFile {
     version: u32,
     prefix: String,
@@ -98,7 +99,7 @@ struct ExportFile {
     keys: Vec<ExportedKey>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct ExportedKey {
     key: String,
     /// Raw value from Redis (encrypted sessions stay encrypted)
@@ -137,8 +138,9 @@ async fn scan_keys(
     batch_size: usize,
 ) -> Result<Vec<String>, anyhow::Error> {
     let pattern = format!("{prefix}*");
-    let mut keys: Vec<String> = Vec::new();
     let mut cursor: u64 = 0;
+    let mut all_keys = Vec::new();
+
     loop {
         let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
@@ -149,13 +151,16 @@ async fn scan_keys(
             .query_async(conn)
             .await?;
 
-        keys.extend(batch);
+        all_keys.extend(batch);
         cursor = next_cursor;
         if cursor == 0 {
             break;
         }
     }
-    Ok(keys)
+
+    all_keys.sort();
+    all_keys.dedup();
+    Ok(all_keys)
 }
 
 fn now_iso() -> String {
@@ -171,43 +176,46 @@ async fn run_export(
     batch_size: usize,
     dry_run: bool,
 ) -> Result<(), anyhow::Error> {
-    eprintln!("Connecting to {redis_url} …");
     let mut conn = connect(redis_url).await?;
-
-    eprintln!("Scanning for keys with prefix \"{prefix}\" …");
+    println!("Scanning keys with prefix '{prefix}'...");
     let keys = scan_keys(&mut conn, prefix, batch_size).await?;
-    eprintln!("Found {} keys", keys.len());
+    println!("Found {} keys", keys.len());
 
-    if dry_run {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for k in &keys {
-            *counts.entry(classify_key(k, prefix)).or_default() += 1;
+    let mut exported_keys = Vec::with_capacity(keys.len());
+
+    for chunk in keys.chunks(batch_size) {
+        let mut pipe = redis::pipe();
+        for key in chunk {
+            pipe.get(key).ttl(key);
         }
-        eprintln!("Dry-run breakdown:");
-        for (kt, n) in &counts {
-            eprintln!("  {kt}: {n}");
-        }
-        return Ok(());
-    }
+        let results: Vec<redis::Value> = pipe.query_async(&mut conn).await?;
 
-    let mut exported: Vec<ExportedKey> = Vec::with_capacity(keys.len());
-    let total = keys.len();
+        let mut it = results.into_iter();
+        for key in chunk {
+            let val_v = it.next().unwrap_or(redis::Value::Nil);
+            let ttl_v = it.next().unwrap_or(redis::Value::Nil);
 
-    for (i, key) in keys.iter().enumerate() {
-        let value: Option<String> = conn.get(key).await?;
-        let ttl: i64 = redis::cmd("TTL").arg(key).query_async(&mut conn).await?;
+            let value = match val_v {
+                redis::Value::Data(bytes) => {
+                    String::from_utf8(bytes).unwrap_or_else(|_| "<binary>".into())
+                }
+                redis::Value::Nil => continue,
+                _ => "<unsupported>".into(),
+            };
 
-        if let Some(v) = value {
-            exported.push(ExportedKey {
+            let ttl_seconds = match ttl_v {
+                redis::Value::Int(ttl) => ttl,
+                _ => -1,
+            };
+
+            let key_type = classify_key(key, prefix);
+
+            exported_keys.push(ExportedKey {
                 key: key.clone(),
-                value: v,
-                ttl_seconds: ttl,
-                key_type: classify_key(key, prefix),
+                value,
+                ttl_seconds,
+                key_type,
             });
-        }
-
-        if (i + 1) % 100 == 0 || i + 1 == total {
-            eprintln!("  exported {}/{total}", i + 1);
         }
     }
 
@@ -215,12 +223,18 @@ async fn run_export(
         version: 1,
         prefix: prefix.to_string(),
         exported_at: now_iso(),
-        keys: exported,
+        keys: exported_keys,
     };
 
-    let json = serde_json::to_string_pretty(&export)?;
-    std::fs::write(output, &json)?;
-    eprintln!("Wrote {} keys to {}", export.keys.len(), output.display());
+    let count = export.keys.len();
+    if dry_run {
+        println!("Dry run: would write {count} keys to {}", output.display());
+    } else {
+        let json = serde_json::to_string_pretty(&export)?;
+        tokio::fs::write(output, json).await?;
+        println!("Exported {count} keys to {}", output.display());
+    }
+
     Ok(())
 }
 
@@ -231,75 +245,64 @@ async fn run_import(
     batch_size: usize,
     overwrite: bool,
 ) -> Result<(), anyhow::Error> {
-    eprintln!("Reading {} …", input.display());
-    let data = std::fs::read_to_string(input)?;
+    let data = tokio::fs::read_to_string(input).await?;
     let export: ExportFile = serde_json::from_str(&data)?;
-
-    if export.version != 1 {
-        anyhow::bail!("Unsupported export version: {}", export.version);
-    }
-
-    eprintln!(
-        "Export contains {} keys (prefix \"{}\", exported at {})",
+    println!(
+        "Importing {} keys from {} (version={}, prefix='{}')",
         export.keys.len(),
-        export.prefix,
-        export.exported_at
+        input.display(),
+        export.version,
+        export.prefix
     );
 
     if dry_run {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for k in &export.keys {
-            *counts.entry(k.key_type.clone()).or_default() += 1;
-        }
-        eprintln!("Dry-run breakdown:");
-        for (kt, n) in &counts {
-            eprintln!("  {kt}: {n}");
-        }
+        println!(
+            "Dry run: would import {} keys to {redis_url}",
+            export.keys.len()
+        );
         return Ok(());
     }
 
-    eprintln!("Connecting to {redis_url} …");
     let mut conn = connect(redis_url).await?;
-
-    let total = export.keys.len();
-    let mut imported: usize = 0;
-    let mut skipped: usize = 0;
-    let mut failed: usize = 0;
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
 
     for chunk in export.keys.chunks(batch_size) {
-        for entry in chunk {
-            // Check existence unless --overwrite
-            if !overwrite {
-                let exists: bool = conn.exists(&entry.key).await?;
+        let mut pipe = redis::pipe();
+        let mut to_set = Vec::new();
+
+        if !overwrite {
+            let mut check_pipe = redis::pipe();
+            for item in chunk {
+                check_pipe.exists(&item.key);
+            }
+            let exists_res: Vec<bool> = check_pipe.query_async(&mut conn).await?;
+            for (item, exists) in chunk.iter().zip(exists_res) {
                 if exists {
                     skipped += 1;
-                    continue;
+                } else {
+                    to_set.push(item);
                 }
             }
+        } else {
+            to_set.extend(chunk.iter());
+        }
 
-            let res: Result<(), redis::RedisError> = if entry.ttl_seconds > 0 {
-                conn.set_ex(&entry.key, &entry.value, entry.ttl_seconds as u64)
-                    .await
-            } else {
-                conn.set(&entry.key, &entry.value).await
-            };
-
-            match res {
-                Ok(()) => imported += 1,
-                Err(e) => {
-                    eprintln!("  WARN: failed to import {}: {e}", entry.key);
-                    failed += 1;
-                }
+        for item in &to_set {
+            if item.ttl_seconds > 0 {
+                pipe.set_ex(&item.key, &item.value, item.ttl_seconds as u64);
+            } else if item.ttl_seconds == -1 {
+                pipe.set(&item.key, &item.value);
             }
         }
 
-        let done = imported + skipped + failed;
-        if done % 100 == 0 || done == total {
-            eprintln!("  progress: {done}/{total}");
+        if !to_set.is_empty() {
+            let _: () = pipe.query_async(&mut conn).await?;
+            imported += to_set.len();
         }
     }
 
-    eprintln!("Done: imported {imported}, skipped {skipped} (already exist), failed {failed}");
+    println!("Import complete: {imported} imported, {skipped} skipped");
     Ok(())
 }
 
@@ -310,84 +313,63 @@ async fn run_verify(
     spot_check: usize,
     batch_size: usize,
 ) -> Result<(), anyhow::Error> {
-    eprintln!("Connecting to source ({source_url}) and target ({target_url}) …");
     let mut src = connect(source_url).await?;
     let mut tgt = connect(target_url).await?;
 
-    eprintln!("Scanning source keys …");
+    println!("Scanning keys on source ({source_url})...");
     let src_keys = scan_keys(&mut src, prefix, batch_size).await?;
-    eprintln!("Scanning target keys …");
+    println!("Scanning keys on target ({target_url})...");
     let tgt_keys = scan_keys(&mut tgt, prefix, batch_size).await?;
 
-    let src_set: std::collections::HashSet<&str> = src_keys.iter().map(|s| s.as_str()).collect();
-    let tgt_set: std::collections::HashSet<&str> = tgt_keys.iter().map(|s| s.as_str()).collect();
+    let src_set: HashSet<_> = src_keys.iter().collect();
+    let tgt_set: HashSet<_> = tgt_keys.iter().collect();
 
-    let missing_from_target: Vec<&&str> = src_set.difference(&tgt_set).collect();
-    let extra_in_target: Vec<&&str> = tgt_set.difference(&src_set).collect();
+    let missing_on_target = src_set.difference(&tgt_set).count();
+    let extra_on_target = tgt_set.difference(&src_set).count();
 
-    eprintln!("Source keys: {}", src_keys.len());
-    eprintln!("Target keys: {}", tgt_keys.len());
+    println!("── Key Count Summary ──");
+    println!("  Source keys: {}", src_keys.len());
+    println!("  Target keys: {}", tgt_keys.len());
+    println!("  Missing on target: {missing_on_target}");
+    println!("  Extra on target:   {extra_on_target}");
 
-    if !missing_from_target.is_empty() {
-        eprintln!(
-            "⚠ {} keys in source missing from target:",
-            missing_from_target.len()
+    let mut mismatches = 0usize;
+
+    if spot_check > 0 && !src_keys.is_empty() {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        let sample_keys: Vec<_> = src_keys
+            .choose_multiple(&mut rng, spot_check.min(src_keys.len()))
+            .cloned()
+            .collect();
+
+        println!(
+            "── Spot-checking {} sampled keys for value equality ──",
+            sample_keys.len()
         );
-        for k in missing_from_target.iter().take(20) {
-            eprintln!("  - {k}");
-        }
-        if missing_from_target.len() > 20 {
-            eprintln!("  … and {} more", missing_from_target.len() - 20);
-        }
-    }
-
-    if !extra_in_target.is_empty() {
-        eprintln!(
-            "ℹ {} keys in target not in source (new sessions?):",
-            extra_in_target.len()
-        );
-        for k in extra_in_target.iter().take(10) {
-            eprintln!("  - {k}");
-        }
-    }
-
-    // Spot-check value equality
-    let common: Vec<&&str> = src_set.intersection(&tgt_set).collect();
-    let check_count = spot_check.min(common.len());
-
-    if check_count > 0 {
-        eprintln!("Spot-checking {check_count} keys for value equality …");
-        // Deterministic selection: evenly spaced indices
-        let step = if common.len() > check_count {
-            common.len() / check_count
-        } else {
-            1
-        };
-
-        let mut mismatches = 0usize;
-        for i in 0..check_count {
-            let key = common[i * step];
-            let src_val: Option<String> = src.get(*key).await?;
-            let tgt_val: Option<String> = tgt.get(*key).await?;
+        for key in &sample_keys {
+            let src_val: Option<String> = src.get(key).await?;
+            let tgt_val: Option<String> = tgt.get(key).await?;
 
             if src_val != tgt_val {
-                eprintln!("  ✗ mismatch: {key}");
+                println!("  MISMATCH: key={key}");
                 mismatches += 1;
             }
         }
-
         if mismatches == 0 {
-            eprintln!("  ✓ all {check_count} spot-checked keys match");
-        } else {
-            eprintln!("  ⚠ {mismatches}/{check_count} keys have mismatched values");
+            println!("  All spot-checked keys matched perfectly.");
         }
     }
 
-    if missing_from_target.is_empty() && extra_in_target.is_empty() {
-        eprintln!("✓ Source and target are in sync ({} keys)", src_keys.len());
+    if missing_on_target == 0 && extra_on_target == 0 && mismatches == 0 {
+        println!("\nVerification PASSED: Source and target Redis are consistent.");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Verification FAILED: {missing_on_target} missing, {extra_on_target} extra, \
+             {mismatches} value mismatches"
+        );
     }
-
-    Ok(())
 }
 
 // ── main ─────────────────────────────────────────────────────────────
@@ -423,5 +405,49 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_key() {
+        assert_eq!(
+            classify_key("catbird:session:session:user1", "catbird:session:"),
+            "session"
+        );
+        assert_eq!(
+            classify_key("catbird:session:session_index:idx1", "catbird:session:"),
+            "session_index"
+        );
+        assert_eq!(
+            classify_key("catbird:session:auth_req:req1", "catbird:session:"),
+            "auth_req"
+        );
+        assert_eq!(
+            classify_key("catbird:session:other_key", "catbird:session:"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn test_export_file_serde() {
+        let export = ExportFile {
+            version: 1,
+            prefix: "catbird:session:".into(),
+            exported_at: "2026-08-24T00:00:00Z".into(),
+            keys: vec![ExportedKey {
+                key: "catbird:session:session:1".into(),
+                value: "enc_data".into(),
+                ttl_seconds: 3600,
+                key_type: "session".into(),
+            }],
+        };
+
+        let json = serde_json::to_string(&export).unwrap();
+        let deserialized: ExportFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(export, deserialized);
     }
 }

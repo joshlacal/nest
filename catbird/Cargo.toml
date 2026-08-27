@@ -17,12 +17,12 @@ tower_governor = "0.4"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP Client
-reqwest = { version = "0.12", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
+reqwest = { version = "0.13", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
 
 # Jacquard (AT Protocol)
-jacquard-oauth = { version = "0.9", features = ["default"] }
-jacquard-common = "0.9"
-jacquard-identity = { version = "0.9", features = ["dns", "cache"] }
+jacquard-oauth = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["default"] }
+jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }
+jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["dns", "cache"] }
 jose-jwk = { version = "0.1", features = ["p256"] }
 catbird-atproto = { path = "../../catbird-atproto" }
 
@@ -38,9 +38,11 @@ serde_json = "1.0"
 p256 = { version = "0.13", features = ["jwk", "ecdsa", "pkcs8"] }
 base64 = "0.22"
 sha2 = "0.10"
+hmac = "0.12"
 rand = "0.8"
 subtle = "2.6"
 multibase = "0.9"
+
 # Session Storage
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "time", "chrono", "uuid", "json"] }
@@ -58,7 +60,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # CLI (for session_migrate binary)
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Utilities
 uuid = { version = "1.0", features = ["v4", "serde"] }
@@ -73,6 +75,7 @@ http = "1.0"
 bytes = "1.0"
 urlencoding = "2.1"
 time = "0.3"
+smol_str = { version = "0.3", features = ["serde"] }
 a2 = "0.10"
 
 [dev-dependencies]
@@ -82,6 +85,3 @@ wiremock = "0.6"
 testcontainers = "0.18"
 testcontainers-modules = { version = "0.6", features = ["redis"] }
 
-[patch.crates-io]
-# Patch jacquard-oauth to add transition:chat.bsky scope support
-jacquard-oauth = { path = "../patches/jacquard-oauth" }

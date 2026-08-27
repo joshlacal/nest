@@ -8,9 +8,18 @@ base_url = "http://localhost:3000"
 
 [redis]
 url = "redis://127.0.0.1:6379"
-key_prefix = "catbird:session:"
+# Key prefix for session storage. Must contain explicit ':v2:' segment (e.g. 'catbird:v2:session:' or '<tenant>:v2:session:').
+# Startup fails if set to legacy 'catbird:session:' or any unversioned prefix.
+key_prefix = "catbird:v2:session:"
 session_ttl_seconds = 2592000  # 30 days
 
+# Session Encryption Key (SESSION_ENCRYPTION_KEY):
+# - Required for AES-256-GCM session encryption and HMAC-SHA256 bearer key fingerprinting.
+# - Configured via direct SESSION_ENCRYPTION_KEY environment variable (NOT CATBIRD__ nested).
+# - Must be standard base64 encoding of exactly 32 random bytes (44 base64 chars).
+# - Generation: openssl rand -base64 32
+# - Key rotation: rotating this key changes HMAC fingerprints and encryption, forcing reauthentication.
+# - Custom tenant v2 prefixes are supported via key_prefix (must contain explicit ':v2:' segment).
 [oauth]
 client_id = "http://localhost:3000"
 redirect_uri = "http://localhost:3000/auth/callback"
@@ -25,4 +34,23 @@ redirect_uri = "http://localhost:3000/auth/callback"
 # ]
 # active_key_id = "catbird-key-2"  # Which key to use for signing
 
-scopes = ["atproto", "transition:generic", "transition:chat.bsky"]
+# Explicit initial scopes requested at login (full-client compatibility):
+# Deliberately does NOT request a chat-specific scope or JIT account/identity scopes.
+# Defaults to ["atproto", "transition:generic", "transition:chat.bsky"]
+# initial_scopes = ["atproto", "transition:generic", "transition:chat.bsky"]
+
+# Declared maximum scopes in client metadata (union of initial + optional progressive scopes).
+# Progressive requests request explicit subsets during authorization/upgrade.
+# Note: App-password management and account deletion scopes are excluded by design.
+# Defaults to union(initial_scopes, ["identity:handle", "account:email?action=manage", "account:status?action=manage"])
+# max_scopes = [
+#   "atproto",
+#   "transition:generic",
+#   "transition:chat.bsky",
+#   "identity:handle",
+#   "account:email?action=manage",
+#   "account:status?action=manage",
+# ]
+
+# Legacy compatibility alias (backward-compatible initial input when initial_scopes is absent; does not inherit optional max scopes)
+# scopes = ["atproto", "transition:generic", "transition:chat.bsky"]

@@ -708,6 +708,25 @@ pub(crate) async fn resolve_background_session(
         dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
     };
 
+    let granted_scopes: Vec<String> = if !session_data.scopes.is_empty() {
+        session_data
+            .scopes
+            .iter()
+            .map(|s| s.to_string_normalized().to_string())
+            .collect()
+    } else if let Some(scope_str) = &session_data.token_set.scope {
+        jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::from(scope_str.as_str()))
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .map(|s| s.to_string_normalized().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let session = CatbirdSession {
         id: uuid::Uuid::parse_str(session_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
         did: account_did.to_string(),
@@ -732,8 +751,8 @@ pub(crate) async fn resolve_background_session(
         access_token_expires_at: expires_at,
         created_at: Utc::now(),
         last_used_at: Utc::now(),
+        granted_scopes,
     };
-
     Ok((session, dpop))
 }
 

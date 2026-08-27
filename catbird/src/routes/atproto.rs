@@ -16,7 +16,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use std::sync::Arc;
 
 use crate::config::AppState;
-use crate::handlers::{atproto, push};
+use crate::handlers::{atproto, oauth_upgrade, push};
 use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, RateLimitState};
 
 /// Create the ATProto router
@@ -44,7 +44,13 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
                     ip_rate_limit,
                 )),
         )
-        .route("/callback", get(atproto::oauth_callback))
+        .route(
+            "/callback",
+            get(atproto::oauth_callback).layer(middleware::from_fn_with_state(
+                rate_limit_state.clone(),
+                ip_rate_limit,
+            )),
+        )
         .route(
             "/exchange",
             post(atproto::exchange_code)
@@ -54,20 +60,66 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
                     ip_rate_limit,
                 )),
         )
+        // Progressive OAuth scope upgrade routes
+        .route(
+            "/upgrade",
+            post(oauth_upgrade::upgrade_start)
+                .layer(DefaultBodyLimit::max(4096))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
+        )
+        .route(
+            "/upgrade/exchange",
+            post(oauth_upgrade::upgrade_exchange)
+                .layer(DefaultBodyLimit::max(4096))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
+        )
+        .route(
+            "/upgrade/commit",
+            post(oauth_upgrade::upgrade_commit)
+                .layer(DefaultBodyLimit::max(4096))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
+        )
         // Protected auth routes
         .route(
             "/logout",
-            post(atproto::logout).layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            )),
+            post(atproto::logout)
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
         )
         .route(
             "/session",
-            get(atproto::get_session).layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            )),
+            get(atproto::get_session)
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
         );
 
     // XRPC proxy routes - protected with auth and session-based rate limiting
@@ -258,4 +310,60 @@ async fn did_document(
         "authentication": [],
         "assertionMethod": []
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_callback_route_ip_rate_limit_enforced() {
+        let rate_limit_state = Arc::new(RateLimitState::default());
+
+        let app = Router::new().route(
+            "/auth/callback",
+            get(|req: Request<Body>| async move {
+                let uri = req.uri().to_string();
+                assert!(uri.contains("code=test_code"));
+                assert!(uri.contains("state=test_state"));
+                StatusCode::OK
+            })
+            .layer(middleware::from_fn_with_state(
+                rate_limit_state.clone(),
+                ip_rate_limit,
+            )),
+        );
+
+        // First 20 requests from same IP should succeed and pass query params through
+        for _ in 0..20 {
+            let req = Request::builder()
+                .uri("/auth/callback?code=test_code&state=test_state")
+                .header("x-forwarded-for", "198.51.100.42")
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        // 21st request from same IP should be rate limited with 429
+        let req = Request::builder()
+            .uri("/auth/callback?code=test_code&state=test_state")
+            .header("x-forwarded-for", "198.51.100.42")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Request from a different IP should still succeed
+        let req = Request::builder()
+            .uri("/auth/callback?code=test_code&state=test_state")
+            .header("x-forwarded-for", "198.51.100.43")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
 }

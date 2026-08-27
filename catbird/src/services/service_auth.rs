@@ -202,7 +202,7 @@ impl ServiceAuthProvider {
 
     async fn resolve_dpop_data(&self, session: &CatbirdSession) -> JacquardDpopData {
         if let Some(jacquard_client) = &self.state.jacquard_client {
-            if let Ok(did) = jacquard_common::types::did::Did::new(&session.did) {
+            if let Ok(did) = jacquard_common::types::did::Did::new(session.did.as_str()) {
                 if let Ok(session_data) = jacquard_client
                     .registry
                     .get(&did, &session.id.to_string(), true)
@@ -360,6 +360,7 @@ mod tests {
             key_store: None,
             jacquard_client: None,
             catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
@@ -379,6 +380,7 @@ mod tests {
             access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
             created_at: Utc::now(),
             last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".to_string()],
         }
     }
 

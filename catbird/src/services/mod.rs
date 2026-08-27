@@ -7,6 +7,7 @@ pub mod chat_poll;
 mod crypto;
 mod dpop_nonce_cache;
 mod mls_auth;
+pub mod oauth_upgrade;
 pub mod push;
 pub(crate) mod redis_auth_store;
 pub mod redis_crypto;
@@ -22,8 +23,17 @@ pub use mls_auth::{
     public_p256_jwk_from_verifying_key, verify_dpop_proof, DpopProofClaims, DpopProofHeader,
     MlsAuthService, PublicP256Jwk, CHAT_ENDPOINTS,
 };
+pub use oauth_upgrade::{
+    is_allowed_upgrade_scope, is_valid_browser_nonce, validate_additional_scopes,
+    OAuthUpgradeService, StagedCandidateSession, UpgradeCallbackResult, UpgradeError,
+    UpgradeExchangeResult, UpgradeExchangeState, UpgradeFlowState, UpgradeReceipt,
+    UpgradeStartResult, ALLOWED_UPGRADE_SCOPES, DEFAULT_UPGRADE_CALLBACK_URL,
+    UPGRADE_CANDIDATE_TTL_SECONDS, UPGRADE_EXCHANGE_TTL_SECONDS, UPGRADE_FLOW_TTL_SECONDS,
+    UPGRADE_RECEIPT_TTL_SECONDS,
+};
 pub use push::PushServices;
 pub use redis_auth_store::RedisAuthStore;
 pub use service_auth::{
     ServiceAuthProvider, CIRCLE_APPVIEW_SERVICE_REF, CIRCLE_ENDPOINTS, MLS_APPVIEW_SERVICE_REF,
 };
+pub use ssrf::validate_pds_url;

@@ -269,9 +269,13 @@ mod tests {
         assert!(res.is_err());
         match res.unwrap_err() {
             catbird::error::AppError::BadRequest(msg) => {
+                // The OAuth upgrade work folded the native-callback check into a
+                // single rule covering external, native and loopback redirects.
+                // The requirement asserted here is unchanged: a native callback
+                // without browser_nonce must be refused.
                 assert!(
-                    msg.contains("Native callback requires browser_nonce"),
-                    "Expected native callback check, got: {}",
+                    msg.contains("browser_nonce"),
+                    "Expected native callback to require browser_nonce, got: {}",
                     msg
                 );
             }
@@ -890,6 +894,7 @@ mod tests {
             key_store: None,
             jacquard_client: None,
             catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
@@ -907,6 +912,7 @@ mod tests {
             access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
             created_at: Utc::now(),
             last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
         };
 
         let mut headers = HeaderMap::new();

@@ -14,6 +14,8 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
 use futures_util::StreamExt;
+use jacquard_common::types::{did::Did, string::Handle};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,11 +26,32 @@ use crate::metrics;
 use crate::middleware::JacquardDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{
-    CatbirdSession, ExchangeRequest, ExchangeResponse, LogoutResponse, OAuthCallback, SessionInfo,
+    oauth_upgrade::FIXED_UPGRADE_CALLBACK_URL, CatbirdSession, ExchangeRequest, ExchangeResponse,
+    LogoutResponse, OAuthCallback, SessionInfo,
 };
 use crate::services::{
     AtProtoClient, MlsAuthService, ProxyResponse, ServiceAuthProvider, CIRCLE_ENDPOINTS,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OAuthMode {
+    #[serde(rename = "exchange")]
+    Exchange,
+    #[serde(rename = "direct")]
+    Direct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthFlowRecord {
+    pub version: u32,
+    pub mode: OAuthMode,
+    pub client_selector: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_nonce: Option<String>,
+    pub created_at: i64,
+}
 
 /// Handle login initiation (Redirect flow)
 ///
@@ -37,7 +60,7 @@ pub async fn login(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> AppResult<Response> {
-    let identifier = params
+    let raw_identifier = params
         .get("identifier")
         .or_else(|| params.get("pds"))
         .or_else(|| params.get("issuer"))
@@ -46,41 +69,47 @@ pub async fn login(
     let redirect_to = params.get("redirect_to").cloned();
     let browser_nonce = params.get("browser_nonce").cloned();
 
-    // Select the appropriate OAuth client based on the client parameter.
-    // The chosen selector is persisted to Redis so the callback handler can
-    // redeem the authorization code with the EXACT same client_id that
-    // initiated the PAR request (PDS binds codes to client_id).
-    let is_catmos = matches!(client.as_deref(), Some("catmos-web") | Some("catmos"));
-    let client_selector = if is_catmos { "catmos" } else { "default" };
+    // Admission validation:
+    // 1. If explicit pds or issuer param was used, or raw_identifier parses as URL / starts with http(s):
+    //    it must pass SSRF validate_pds_url before start_auth.
+    // 2. Otherwise (identifier parameter), it MUST parse as either Handle or DID.
+    let is_explicit_url = params.contains_key("pds")
+        || params.contains_key("issuer")
+        || raw_identifier.starts_with("http://")
+        || raw_identifier.starts_with("https://");
 
-    // FIX 3: The native callback (ALLOWED_EXACT_REDIRECT_URLS) is valid ONLY in
-    // exchange-code mode. If requested without browser_nonce, reject with 400.
-    if let Some(ref r) = redirect_to {
-        if ALLOWED_EXACT_REDIRECT_URLS.contains(&r.as_str()) && browser_nonce.is_none() {
+    if is_explicit_url {
+        crate::services::validate_pds_url(raw_identifier)?;
+    } else {
+        let is_did = Did::new(raw_identifier.as_str()).is_ok();
+        let is_handle = Handle::new(raw_identifier.as_str()).is_ok();
+        if !is_did && !is_handle {
             return Err(AppError::BadRequest(
-                "Native callback requires browser_nonce".into(),
+                "Invalid identifier: must be a valid Handle or DID".into(),
             ));
         }
     }
+    let identifier = raw_identifier;
 
-    // ADR-014 validations BEFORE any Redis write or PDS redirect:
-    // If browser_nonce is supplied:
-    // 1. Encryption key MUST be configured (fail closed, no plaintext fallback)
-    // 2. Must be exactly 43 base64url characters
-    // 3. redirect_to must be present
-    // 4. redirect_to must pass is_allowed_redirect
-    if let Some(ref nonce) = browser_nonce {
-        if state.session_encryption_key.is_none() {
-            return Err(AppError::Internal(
-                "Session encryption key not configured; cannot admit exchange flow".into(),
-            ));
-        }
+    // Select the appropriate OAuth client based on the client parameter.
+    let is_catmos = matches!(client.as_deref(), Some("catmos-web") | Some("catmos"));
+    let client_selector = if is_catmos { "catmos" } else { "default" };
+
+    // Encryption key MUST be configured (fail closed, no plaintext fallback)
+    let enc_key = state.session_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("Session encryption key not configured; cannot admit OAuth flow".into())
+    })?;
+
+    // Mode determination & redirect validation:
+    // Require exchange mode (browser_nonce + redirect_to) for every external/native/loopback redirect;
+    // direct mode only when no redirect is requested (cookie-based direct session, no session ID in Location).
+    let mode = if let Some(nonce) = &browser_nonce {
         if !is_valid_base64url_43(nonce) {
             return Err(AppError::BadRequest(
                 "Invalid browser_nonce: must be exactly 43 base64url characters".into(),
             ));
         }
-        let Some(ref r) = redirect_to else {
+        let Some(r) = &redirect_to else {
             return Err(AppError::BadRequest(
                 "Missing redirect_to: required when browser_nonce is supplied".into(),
             ));
@@ -88,7 +117,18 @@ pub async fn login(
         if !is_allowed_redirect(r) {
             return Err(AppError::BadRequest("Disallowed redirect_to URL".into()));
         }
-    }
+        OAuthMode::Exchange
+    } else {
+        // Direct mode: external, native, and loopback redirects require exchange mode + browser_nonce
+        if let Some(_r) = &redirect_to {
+            return Err(AppError::BadRequest(
+                "External, native, and loopback redirects require exchange mode with browser_nonce"
+                    .into(),
+            ));
+        }
+        OAuthMode::Direct
+    };
+
     tracing::info!(
         "Login request for identifier: {}, client: {:?}, redirect_to: {:?}, selector: {}",
         identifier,
@@ -115,107 +155,91 @@ pub async fn login(
     // Generate a clean UUID for the OAuth state (= Jacquard session_id).
     let session_nonce = uuid::Uuid::new_v4().to_string();
 
-    // Persist session state to Redis.
-    // Contract Rule 2: Fail closed in exchange mode on ANY persistence error.
-    // FIX 4: Persist explicit oauth_mode:"exchange" marker for admitted exchange flows.
-    // Absent browser_nonce: maintain legacy tolerant error handling.
-    if let Some(ref nonce) = browser_nonce {
-        let mut conn = state.redis.clone();
+    // Persist versioned AES-GCM-encrypted flow record under v2 prefix keyed by HMAC/state fingerprint
+    let state_fp = crate::services::redis_auth_store::fingerprint_id(enc_key, &session_nonce);
+    let flow_record = OAuthFlowRecord {
+        version: 2,
+        mode,
+        client_selector: client_selector.to_string(),
+        redirect_to,
+        browser_nonce,
+        created_at: chrono::Utc::now().timestamp(),
+    };
 
-        // 1. oauth_mode marker
-        let mode_key = format!("oauth_mode:{}", session_nonce);
-        redis::cmd("SET")
-            .arg(&mode_key)
-            .arg("exchange")
-            .arg("EX")
-            .arg(600)
-            .query_async::<_, ()>(&mut conn)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to persist oauth_mode: {}", e)))?;
+    let flow_json = serde_json::to_string(&flow_record).map_err(|e| {
+        tracing::error!(error = %e, "Failed to serialize OAuthFlowRecord");
+        AppError::Internal("Serialization error during login".into())
+    })?;
 
-        // 2. oauth_client
-        let client_key = format!("oauth_client:{}", session_nonce);
-        redis::cmd("SET")
-            .arg(&client_key)
-            .arg(client_selector)
-            .arg("EX")
-            .arg(600)
-            .query_async::<_, ()>(&mut conn)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to persist oauth_client: {}", e)))?;
+    let sealed_flow =
+        crate::services::redis_crypto::seal_strict(enc_key, &flow_json).map_err(|e| {
+            tracing::error!(error = %e, "Failed to seal OAuthFlowRecord");
+            AppError::Internal("Encryption error during login".into())
+        })?;
 
-        // 3. oauth_redirect
-        if let Some(ref r) = redirect_to {
-            let redirect_key = format!("oauth_redirect:{}", session_nonce);
-            redis::cmd("SET")
-                .arg(&redirect_key)
-                .arg(r.as_str())
-                .arg("EX")
-                .arg(600)
-                .query_async::<_, ()>(&mut conn)
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to persist oauth_redirect: {}", e))
-                })?;
+    let flow_key = format!("{}oauth_flow:{}", &state.config.redis.key_prefix, state_fp);
+    let mut conn = state.redis.clone();
+    redis::cmd("SET")
+        .arg(&flow_key)
+        .arg(&sealed_flow)
+        .arg("EX")
+        .arg(600)
+        .query_async::<_, ()>(&mut conn)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist OAuthFlowRecord to Redis");
+            AppError::Internal("Database error during login".into())
+        })?;
+
+    // Explicit normalized initial scopes requested at login (never empty/max)
+    let requested_scopes = if is_catmos {
+        if state.catmos_oauth_scopes.is_empty() {
+            return Err(AppError::Internal(
+                "Configured catmos OAuth scopes must not be empty".into(),
+            ));
         }
-
-        // 4. oauth_nonce
-        let nonce_key = format!("oauth_nonce:{}", session_nonce);
-        redis::cmd("SET")
-            .arg(&nonce_key)
-            .arg(nonce.as_str())
-            .arg("EX")
-            .arg(600)
-            .query_async::<_, ()>(&mut conn)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to persist oauth_nonce: {}", e)))?;
+        state.catmos_oauth_scopes.clone()
     } else {
-        {
-            let mut conn = state.redis.clone();
-            let key = format!("oauth_client:{}", session_nonce);
-            if let Err(e) = redis::cmd("SET")
-                .arg(&key)
-                .arg(client_selector)
-                .arg("EX")
-                .arg(600)
-                .query_async::<_, ()>(&mut conn)
-                .await
-            {
-                // Don't fail login — callback will fall back to legacy inference.
-                tracing::warn!("Failed to persist oauth_client selector to Redis: {}", e);
-            }
+        let initial_scopes = crate::config::OAuthConfig::parse_and_validate_scopes(
+            &state.config.oauth.initial_scopes,
+        )
+        .map_err(|e| AppError::Internal(format!("Invalid initial OAuth scopes: {}", e)))?;
+        if initial_scopes.is_empty() {
+            return Err(AppError::Internal(
+                "Configured initial OAuth scopes must not be empty".into(),
+            ));
         }
+        initial_scopes
+    };
 
-        // Store redirect_to in Redis so the callback can look it up.
-        if let Some(ref r) = redirect_to {
-            let mut conn = state.redis.clone();
-            let key = format!("oauth_redirect:{}", session_nonce);
-            let _: Result<(), _> = redis::cmd("SET")
-                .arg(&key)
-                .arg(r.as_str())
-                .arg("EX")
-                .arg(600) // 10 minute TTL
-                .query_async(&mut conn)
-                .await;
-        }
-    }
+    let scopes = jacquard_oauth::scopes::Scopes::from_scopes(
+        requested_scopes.into_iter().map(|s| s.convert()),
+    )
+    .map_err(|e| AppError::Internal(format!("Failed to construct Scopes: {e}")))?;
 
     let options = AuthorizeOptions {
         state: Some(session_nonce.into()),
+        scopes,
         ..Default::default()
     };
 
     let auth_url = jacquard_client
         .start_auth(identifier, options)
         .await
-        .map_err(|e| AppError::OAuth(format!("Authorization failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Jacquard start_auth failed");
+            AppError::OAuth("Authorization initiation failed".into())
+        })?;
 
     // Redirect to the PDS authorization URL
     Ok(Response::builder()
         .status(StatusCode::FOUND)
         .header("Location", auth_url.as_str())
         .body(Body::empty())
-        .unwrap())
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to build redirect response");
+            AppError::Internal("Failed to build redirect response".into())
+        })?)
 }
 
 /// Handle OAuth callback
@@ -228,55 +252,22 @@ pub async fn oauth_callback(
 ) -> AppResult<(CookieJar, Response)> {
     tracing::info!("OAuth callback received");
 
-    // FIX 4: Check if this session was admitted as an exchange flow
-    let stored_mode: Option<String> = {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_mode:{}", &callback.state);
-        redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .ok()
-    };
-    if stored_mode.is_some() {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_mode:{}", &callback.state);
-        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+    // Early branch for progressive OAuth upgrade callback flows
+    if callback.state.starts_with("upg_") {
+        return handle_upgrade_callback(state, callback, jar).await;
     }
 
-    // Check if this session has a stored redirect_to
-    let redirect_to: Option<String> = {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_redirect:{}", &callback.state);
-        redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .ok()
-    };
-    // Clean up the redirect key (one-time use)
-    if redirect_to.is_some() {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_redirect:{}", &callback.state);
-        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
-    }
+    let enc_key = state.session_encryption_key.as_ref().ok_or_else(|| {
+        tracing::error!("OAuth callback: session encryption key not configured");
+        AppError::Internal("Session encryption key not configured".into())
+    })?;
 
-    // Check if this session has a stored browser_nonce (ADR-014 exchange flow)
-    let stored_nonce: Option<String> = {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_nonce:{}", &callback.state);
-        redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .ok()
-    };
-    // Clean up the nonce key (one-time use)
-    if stored_nonce.is_some() {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_nonce:{}", &callback.state);
-        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
-    }
+    let state_fp = crate::services::redis_auth_store::fingerprint_id(enc_key, &callback.state);
+    let flow_key = format!("{}oauth_flow:{}", &state.config.redis.key_prefix, state_fp);
+    let claim_key = format!("{}oauth_claim:{}", &state.config.redis.key_prefix, state_fp);
+
+    let mut conn = state.redis.clone();
+
     // Deny/cancel path: the provider redirects back without a code
     // (RFC 6749 §4.1.2.1 — `error` + optional `error_description` instead).
     let Some(code) = callback.code else {
@@ -286,70 +277,199 @@ pub async fn oauth_callback(
             description = callback.error_description.as_deref().unwrap_or(""),
             "OAuth callback without authorization code; aborting login"
         );
-        metrics::record_oauth_login(false);
-        // The selector key is one-time; the flow is dead, so drop it.
-        let mut conn = state.redis.clone();
-        let _: Result<(), _> = redis::cmd("DEL")
-            .arg(format!("oauth_client:{}", &callback.state))
-            .query_async(&mut conn)
-            .await;
-        let target = match redirect_to.as_deref() {
-            Some(r) if is_allowed_redirect(r) => format!("{}?error={}", r, err),
-            _ => format!("https://catbird.blue/oauth/callback#error={}", err),
+
+        let redirect_to: Option<String> = match redis::cmd("GET")
+            .arg(&flow_key)
+            .query_async::<_, Option<String>>(&mut conn)
+            .await
+        {
+            Ok(Some(sealed)) => {
+                if let Ok(plaintext) = crate::services::redis_crypto::open_strict(enc_key, &sealed)
+                {
+                    serde_json::from_str::<OAuthFlowRecord>(&plaintext)
+                        .ok()
+                        .and_then(|rec| rec.redirect_to)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
+
+        if let Err(e) = redis::cmd("DEL")
+            .arg(&flow_key)
+            .arg(&claim_key)
+            .query_async::<_, ()>(&mut conn)
+            .await
+        {
+            tracing::error!(error = %e, "OAuth denial state cleanup failed");
+            return Err(AppError::AuthTemporarilyUnavailable(
+                "OAuth callback temporarily unavailable; please retry".into(),
+            ));
+        }
+        metrics::record_oauth_login(false);
+
+        let target = build_error_redirect(redirect_to.as_deref(), err);
         return Ok((
             jar,
             Response::builder()
                 .status(StatusCode::FOUND)
                 .header("Location", target)
                 .body(Body::empty())
-                .unwrap(),
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to build redirect response");
+                    AppError::Internal("Failed to build redirect response".into())
+                })?,
         ));
     };
 
-    // Read back the client selector persisted by the login handler. This is
-    // the authoritative source for which jacquard_client to use — the PDS
-    // binds the authorization code to the client_id that issued the PAR
-    // request, so login and callback MUST use the same client.
-    let stored_selector: Option<String> = {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_client:{}", &callback.state);
-        redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .ok()
-    };
-    // Clean up the selector key (one-time use)
-    if stored_selector.is_some() {
-        let mut conn = state.redis.clone();
-        let key = format!("oauth_client:{}", &callback.state);
-        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+    // Claim callback atomically for concurrency
+    let claim_acquired: Option<String> = redis::cmd("SET")
+        .arg(&claim_key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(30)
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Redis error attempting to claim OAuth callback");
+            AppError::AuthTemporarilyUnavailable(
+                "OAuth callback temporarily unavailable; please retry".into(),
+            )
+        })?;
+
+    if claim_acquired.is_none() {
+        tracing::warn!("OAuth callback claim conflict: callback already in progress");
+        return Err(AppError::Upstream {
+            status: 409,
+            message: "OAuth callback already in progress".into(),
+        });
     }
 
-    // Determine which Jacquard client to use.
-    // Preferred: the selector persisted at login time.
-    // Legacy fallback (for sessions started before this deploy OR the old
-    // JSON-state format): infer from redirect_to presence or JSON-state
-    // payload. Remove once in-flight legacy sessions have drained from
-    // prod logs.
-    let is_catmos = match stored_selector.as_deref() {
-        Some("catmos") => true,
-        Some("default") => false,
-        Some(other) => {
-            tracing::warn!(
-                "Unrecognized oauth_client selector {:?} in Redis; falling back to legacy inference",
-                other
-            );
-            legacy_infer_catmos(&redirect_to, &callback.state)
+    // Read flow record using GET (retain state on transient failure)
+    let sealed_flow: Option<String> = redis::cmd("GET")
+        .arg(&flow_key)
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Redis error retrieving oauth_flow");
+            AppError::AuthTemporarilyUnavailable(
+                "OAuth callback temporarily unavailable; please retry".into(),
+            )
+        })?;
+
+    let Some(sealed_str) = sealed_flow else {
+        let _ = redis::cmd("DEL")
+            .arg(&claim_key)
+            .query_async::<_, ()>(&mut conn)
+            .await;
+        tracing::error!(
+            "OAuth session expired or invalid: missing flow record for state {}",
+            &callback.state
+        );
+        return Err(AppError::Unauthorized(
+            "OAuth session expired or invalid".into(),
+        ));
+    };
+
+    let flow_json = match crate::services::redis_crypto::open_strict(enc_key, &sealed_str) {
+        Ok(json) => json,
+        Err(e) => {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!(error = %e, "Failed to decrypt OAuth flow record");
+            return Err(AppError::Unauthorized(
+                "OAuth session expired or invalid".into(),
+            ));
         }
-        None => {
-            tracing::info!(
-                "No oauth_client selector in Redis for state {}; using legacy inference (pre-deploy in-flight session or JSON-state legacy)",
-                &callback.state
-            );
-            legacy_infer_catmos(&redirect_to, &callback.state)
+    };
+
+    let flow_record: OAuthFlowRecord = match serde_json::from_str(&flow_json) {
+        Ok(rec) => rec,
+        Err(e) => {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!(error = %e, "Failed to deserialize OAuth flow record");
+            return Err(AppError::Unauthorized(
+                "OAuth session expired or invalid".into(),
+            ));
         }
+    };
+
+    if flow_record.version != 2 {
+        let _ = redis::cmd("DEL")
+            .arg(&claim_key)
+            .query_async::<_, ()>(&mut conn)
+            .await;
+        tracing::error!(
+            "Unsupported OAuth flow record version: {}",
+            flow_record.version
+        );
+        return Err(AppError::Unauthorized(
+            "OAuth session expired or invalid: unsupported version".into(),
+        ));
+    }
+
+    let is_catmos = flow_record.client_selector == "catmos";
+    let is_exchange_mode = matches!(flow_record.mode, OAuthMode::Exchange);
+
+    // Validate mode-specific invariants BEFORE calling jacquard_client.callback
+    let validated_canonical_origin = if is_exchange_mode {
+        let (Some(r), Some(nonce)) = (&flow_record.redirect_to, &flow_record.browser_nonce) else {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!("Exchange flow state missing redirect_to or nonce in flow record");
+            return Err(AppError::Unauthorized(
+                "OAuth session expired or invalid: missing exchange flow state".into(),
+            ));
+        };
+
+        if !is_allowed_redirect(r) || !is_valid_base64url_43(nonce) {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!(
+                "Exchange flow state invalid: disallowed redirect URL or malformed nonce"
+            );
+            return Err(AppError::BadRequest(
+                "Invalid exchange flow state: disallowed redirect or invalid nonce".into(),
+            ));
+        }
+
+        let canonical_origin = match canonicalize_origin(r) {
+            Some(o) => o,
+            None => {
+                let _ = redis::cmd("DEL")
+                    .arg(&claim_key)
+                    .query_async::<_, ()>(&mut conn)
+                    .await;
+                tracing::error!("Invalid redirect_to origin in exchange flow");
+                return Err(AppError::BadRequest("Invalid redirect_to origin".into()));
+            }
+        };
+
+        Some(canonical_origin)
+    } else {
+        // Direct mode: no external, native, or loopback redirect allowed
+        if let Some(r) = &flow_record.redirect_to {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!("Direct mode callback disallowed with redirect_to: {}", r);
+            return Err(AppError::BadRequest(
+                "External, native, and loopback redirects require exchange mode".into(),
+            ));
+        }
+        None
     };
 
     let jacquard_client = if is_catmos {
@@ -368,123 +488,403 @@ pub async fn oauth_callback(
     };
 
     use jacquard_oauth::types::CallbackParams;
-
     let params = CallbackParams {
         code: code.into(),
-        state: Some(callback.state.into()),
+        state: Some(callback.state.clone().into()),
         iss: callback.iss.map(|s| s.into()),
     };
 
-    let oauth_session = jacquard_client
-        .callback(params)
-        .await
-        .map_err(|e| AppError::OAuth(format!("Callback failed: {}", e)))?;
+    let oauth_session = match jacquard_client.callback(params).await {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::error!(error = %e, "Jacquard OAuth callback exchange failed");
+            // Release claim on transient token failure, but retain flow record state for retry
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            return Err(AppError::OAuth(
+                "OAuth authorization callback failed".into(),
+            ));
+        }
+    };
 
     // Jacquard stores the session in RedisAuthStore automatically.
-    // Extract the session_id (now a clean UUID) and DID from the session data.
+    // Extract session_id, DID, and host_url (PDS URL).
     let session_data = oauth_session.data.read().await;
     let did = session_data.account_did.as_str().to_string();
     let session_id = session_data.session_id.to_string();
     let pds_url = session_data.host_url.to_string();
     drop(session_data);
 
-    // Resolve handle from DID
-    let handle = resolve_handle_for_did(&did, &pds_url).await;
-    tracing::info!("Resolved handle for DID {}: {}", &did, &handle);
+    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
+        state
+            .push_db
+            .as_ref()
+            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
+    });
 
-    // Record successful OAuth login
-    metrics::record_oauth_login(true);
+    let mut stored_exchange_key: Option<String> = None;
 
-    // Set cookie — session_id is the Jacquard state/session identifier (clean UUID)
-    let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.clone()))
-        .path("/")
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict)
-        .max_age(time::Duration::days(30))
-        .build();
+    // Post-callback finalization with unified compensation path
+    let finalize_res: Result<(CookieJar, Response), AppError> = async {
+        // 1. Validate PDS URL with SSRF protection before handle resolution, exchange key persistence, or push activation
+        crate::services::validate_pds_url(&pds_url).map_err(|e| {
+            tracing::warn!(
+                did = %did,
+                pds_url = %pds_url,
+                error = %e,
+                "SSRF validation rejected PDS URL after OAuth callback"
+            );
+            e
+        })?;
 
-    // Mode selection (Contract Rule 1 & FIX 4):
-    // If the flow was admitted in exchange mode (stored_mode == "exchange"),
-    // it MUST complete in exchange mode or FAIL CLOSED (refusing downgrade).
-    let is_exchange_mode = stored_mode.as_deref() == Some("exchange");
+        // 2. Resolve handle from DID using validated base and state.http_client
+        let handle = resolve_handle_for_did(&state.http_client, &did, &pds_url).await;
+        tracing::info!(did = %did, handle = %handle, "Resolved handle for DID");
 
-    let app_redirect = if is_exchange_mode {
-        let (Some(ref r), Some(ref nonce)) = (&redirect_to, &stored_nonce) else {
-            tracing::error!("Exchange flow state missing from Redis for state");
-            return Err(AppError::Internal(
-                "Exchange flow state missing; refusing downgrade to session-bearing redirect"
-                    .into(),
-            ));
+        // 3. Complete mode-specific seal/exchange Redis operations and redirect builds BEFORE push activation
+        let (cookie_jar_out, app_redirect) = if is_exchange_mode {
+            let r = flow_record
+                .redirect_to
+                .as_ref()
+                .expect("validated prior to callback");
+            let nonce = flow_record
+                .browser_nonce
+                .as_ref()
+                .expect("validated prior to callback");
+            let canonical_origin = validated_canonical_origin.expect("validated prior to callback");
+
+            let exchange_code = generate_exchange_code();
+            let exchange_key = compute_exchange_redis_key(&exchange_code, nonce, &canonical_origin);
+
+            let sealed_session_id = crate::services::redis_crypto::seal(
+                enc_key,
+                session_id.as_bytes(),
+            )
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to seal session_id for exchange record");
+                AppError::Internal("Failed to secure session".into())
+            })?;
+
+            redis::cmd("SET")
+                .arg(&exchange_key)
+                .arg(&sealed_session_id)
+                .arg("EX")
+                .arg(60) // 60s TTL
+                .query_async::<_, ()>(&mut conn)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to store exchange key in Redis");
+                    AppError::Internal("Database error storing exchange key".into())
+                })?;
+
+            stored_exchange_key = Some(exchange_key);
+
+            let redirect_url =
+                build_success_redirect_url(r, "code", &exchange_code).ok_or_else(|| {
+                    tracing::error!("Failed to build exchange success redirect URL");
+                    AppError::Internal("Failed to build redirect response".into())
+                })?;
+
+            (jar, redirect_url)
+        } else {
+            // Direct mode: set HttpOnly, SameSite=Strict cookie. No session ID in Location!
+            let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.clone()))
+                .path("/")
+                .http_only(true)
+                .secure(true)
+                .same_site(SameSite::Strict)
+                .max_age(time::Duration::days(30))
+                .build();
+
+            let redirect_target = "/";
+
+            (jar.add(cookie), redirect_target.to_string())
         };
 
-        if !is_allowed_redirect(r) || !is_valid_base64url_43(nonce) {
-            tracing::error!("Exchange flow state invalid for state");
-            return Err(AppError::Internal(
-                "Exchange flow state invalid; refusing downgrade to session-bearing redirect"
-                    .into(),
-            ));
-        }
-
-        let canonical_origin = canonicalize_origin(r)
-            .ok_or_else(|| AppError::Internal("Invalid redirect_to origin".into()))?;
-
-        let exchange_code = generate_exchange_code();
-        let exchange_key = compute_exchange_redis_key(&exchange_code, nonce, &canonical_origin);
-
-        // FIX 1 + FIX 2 (Amended): Seal session_id directly with AES-256-GCM (fail closed, no fallback).
-        let enc_key = state.session_encryption_key.as_ref().ok_or_else(|| {
-            AppError::Internal("Session encryption key required for exchange record".into())
-        })?;
-        let sealed_session_id = crate::services::redis_crypto::seal(enc_key, session_id.as_bytes())
-            .map_err(|e| AppError::Internal(format!("Failed to seal session_id: {}", e)))?;
-
-        let mut conn = state.redis.clone();
-        redis::cmd("SET")
-            .arg(&exchange_key)
-            .arg(&sealed_session_id)
-            .arg("EX")
-            .arg(60) // 60s TTL
-            .query_async::<_, ()>(&mut conn)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to store exchange key in Redis: {}", e))
-            })?;
-        format!("{}?code={}", r, exchange_code)
-    } else if let Some(ref r) = redirect_to {
-        // catmos-web: redirect_to was stored in Redis during login (no browser_nonce)
-        if is_allowed_redirect(r) {
-            format!("{}?session_id={}", r, session_id)
-        } else {
-            tracing::warn!("Rejected redirect_to from Redis: {}", r);
-            format!(
-                "https://catbird.blue/oauth/callback#session_id={}",
-                session_id
-            )
-        }
-    } else {
-        // Legacy / iOS: no redirect_to stored in Redis
-        build_app_redirect(&session_id, &session_id)
-    };
-    Ok((
-        jar.add(cookie),
-        Response::builder()
+        // 4. Construct response
+        let response = Response::builder()
             .status(StatusCode::FOUND)
             .header("Location", app_redirect)
             .body(Body::empty())
-            .unwrap(),
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to build redirect response");
+                AppError::Internal("Failed to build redirect response".into())
+            })?;
+
+        // 5. Push activation only after exchange/response construction
+        if let Some(registry) = &push_registry {
+            registry
+                .activate_account_session(&did, &session_id, &pds_url)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        did = %did,
+                        session_id = %session_id,
+                        error = %e,
+                        "Push account session activation failed"
+                    );
+                    AppError::AuthTemporarilyUnavailable(
+                        "Push session activation temporarily unavailable; please retry".into(),
+                    )
+                })?;
+        }
+
+        Ok((cookie_jar_out, response))
+    }
+    .await;
+
+    match finalize_res {
+        Ok((cookie_jar_out, response)) => {
+            // After final success, flow/claim cleanup is best-effort
+            if let Err(e) = redis::cmd("DEL")
+                .arg(&flow_key)
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await
+            {
+                tracing::warn!(error = %e, "OAuth callback state cleanup failed after success (ignored)");
+            }
+
+            metrics::record_oauth_login(true);
+            Ok((cookie_jar_out, response))
+        }
+        Err(err) => {
+            tracing::error!(
+                did = %did,
+                session_id = %session_id,
+                error = %err,
+                "Post-callback finalization failed; executing unified compensation path"
+            );
+
+            // One unified compensation path:
+            // 1. Delete exchange if stored
+            if let Some(ex_key) = &stored_exchange_key {
+                let _ = redis::cmd("DEL")
+                    .arg(ex_key)
+                    .query_async::<_, ()>(&mut conn)
+                    .await;
+            }
+
+            // 2. CAS-revoke possible push row
+            if let Some(registry) = &push_registry {
+                let _ = registry
+                    .mark_auth_revoked_if_session(&did, &session_id)
+                    .await;
+            }
+
+            // 3. Revoke/delete session locally and with auth server
+            cleanup_new_session(&state, jacquard_client, &did, &session_id).await;
+
+            // 4. Release claim key
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+
+            metrics::record_oauth_login(false);
+            Err(err)
+        }
+    }
+}
+/// Handle progressive OAuth scope upgrade callback
+async fn handle_upgrade_callback(
+    state: Arc<AppState>,
+    callback: OAuthCallback,
+    jar: CookieJar,
+) -> AppResult<(CookieJar, Response)> {
+    let upgrade_service = crate::handlers::oauth_upgrade::get_upgrade_service(&state)?;
+
+    // User cancellation or provider error path
+    let Some(code) = callback.code else {
+        tracing::warn!("OAuth upgrade callback denied or cancelled by user");
+        if let Err(e) = upgrade_service.cancel_or_deny_flow(&callback.state).await {
+            tracing::error!(error = %e, "OAuth upgrade cleanup failed");
+            return Err(AppError::AuthTemporarilyUnavailable(
+                "OAuth upgrade temporarily unavailable; please retry".into(),
+            ));
+        }
+        let target = format!("{FIXED_UPGRADE_CALLBACK_URL}?error=access_denied");
+        return Ok((
+            jar,
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("Location", target)
+                .body(Body::empty())
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to build redirect response");
+                    AppError::Internal("Failed to build redirect response".into())
+                })?,
+        ));
+    };
+
+    let jacquard_client = state
+        .jacquard_client
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+
+    use jacquard_oauth::types::CallbackParams;
+    let params = CallbackParams {
+        code: code.into(),
+        state: Some(callback.state.clone().into()),
+        iss: callback.iss.map(|s| s.into()),
+    };
+    let oauth_session = match jacquard_client.callback(params).await {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::error!(error = %e, "Jacquard callback failed for upgrade");
+            if let Err(cleanup) = upgrade_service.cancel_or_deny_flow(&callback.state).await {
+                tracing::error!(error = %cleanup, "OAuth upgrade cleanup failed");
+                return Err(AppError::AuthTemporarilyUnavailable(
+                    "OAuth upgrade temporarily unavailable; please retry".into(),
+                ));
+            }
+            let target = format!("{FIXED_UPGRADE_CALLBACK_URL}?error=invalid_grant");
+            return Ok((
+                jar,
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("Location", target)
+                    .body(Body::empty())
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "Failed to build redirect response");
+                        AppError::Internal("Failed to build redirect response".into())
+                    })?,
+            ));
+        }
+    };
+
+    let session_data = oauth_session.data.read().await.clone();
+
+    // Clean up the stray session created by callback() in store & registry cache so the upgrade service manages the session lifecycle.
+    let _ = oauth_session
+        .registry
+        .del(&session_data.account_did, session_data.session_id.as_str())
+        .await;
+
+    let granted_scopes = session_data
+        .scopes
+        .iter()
+        .map(|s| s.to_string_normalized().to_string())
+        .collect::<Vec<_>>();
+
+    let result = match upgrade_service
+        .complete_callback(&callback.state, session_data, granted_scopes)
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!(error = %e, "OAuth upgrade complete_callback failed");
+            if let Err(cleanup) = upgrade_service.cancel_or_deny_flow(&callback.state).await {
+                tracing::error!(error = %cleanup, "OAuth upgrade cleanup failed");
+                return Err(AppError::AuthTemporarilyUnavailable(
+                    "OAuth upgrade temporarily unavailable; please retry".into(),
+                ));
+            }
+            let target = format!("{FIXED_UPGRADE_CALLBACK_URL}?error=invalid_grant");
+            return Ok((
+                jar,
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("Location", target)
+                    .body(Body::empty())
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "Failed to build redirect response");
+                        AppError::Internal("Failed to build redirect response".into())
+                    })?,
+            ));
+        }
+    };
+
+    let mut url = url::Url::parse(FIXED_UPGRADE_CALLBACK_URL).expect("fixed callback URL is valid");
+    url.query_pairs_mut()
+        .append_pair("code", &result.exchange_code);
+    let target = url.to_string();
+
+    // Fixed app callback with code parameter only, CookieJar untouched (no cookie set)
+    Ok((
+        jar,
+        Response::builder()
+            .status(StatusCode::FOUND)
+            .header("Location", target)
+            .body(Body::empty())
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to build redirect response");
+                AppError::Internal("Failed to build redirect response".into())
+            })?,
     ))
 }
 
+/// Build a provider-error redirect without interpolating request data into a URL.
+fn build_error_redirect(redirect_to: Option<&str>, error: &str) -> String {
+    let target = redirect_to
+        .filter(|r| is_allowed_redirect(r))
+        .and_then(|r| url::Url::parse(r).ok())
+        .filter(|u| u.username().is_empty() && u.password().is_none() && u.fragment().is_none())
+        .map(|mut url| {
+            let retained_pairs: Vec<(String, String)> = url
+                .query_pairs()
+                .filter(|(k, _)| k != "session_id" && k != "code" && k != "error")
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(retained_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .append_pair("error", error);
+            url.to_string()
+        });
+    target.unwrap_or_else(|| {
+        let mut url = url::Url::parse("https://catbird.blue/oauth/callback")
+            .expect("fixed callback URL is valid");
+        url.query_pairs_mut().append_pair("error", error);
+        url.to_string()
+    })
+}
+
+/// Helper to clean up a newly created session from Jacquard and RedisAuthStore on post-callback failure.
+async fn cleanup_new_session(
+    state: &Arc<AppState>,
+    jacquard_client: &Arc<crate::config::JacquardOAuthClient>,
+    did: &str,
+    session_id: &str,
+) {
+    if let Ok(parsed_did) = jacquard_common::types::did::Did::new(did) {
+        let revoked = match jacquard_client.restore(&parsed_did, session_id).await {
+            Ok(oauth_session) => oauth_session.logout().await,
+            Err(_) => jacquard_client.revoke(&parsed_did, session_id).await,
+        };
+        if let Err(e) = revoked {
+            tracing::warn!(
+                did = %did,
+                session_id = %session_id,
+                error = %e,
+                "Best-effort Jacquard session revocation failed after callback error"
+            );
+        }
+        if let Some(store) = state.auth_store.as_ref() {
+            use jacquard_oauth::authstore::ClientAuthStore;
+            if let Err(e) = store.delete_session(&parsed_did, session_id).await {
+                tracing::warn!(
+                    did = %did,
+                    session_id = %session_id,
+                    error = %e,
+                    "Best-effort RedisAuthStore session deletion failed after callback error"
+                );
+            }
+        }
+    }
+}
+
 /// Resolve a handle for a DID by calling com.atproto.repo.describeRepo on the PDS.
-async fn resolve_handle_for_did(did: &str, pds_url: &str) -> String {
+async fn resolve_handle_for_did(http_client: &reqwest::Client, did: &str, pds_url: &str) -> String {
     let describe_url = format!(
         "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
         pds_url.trim_end_matches('/'),
         did
     );
 
-    match reqwest::get(&describe_url).await {
+    match http_client.get(&describe_url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(json) => json
                 .get("handle")
@@ -495,25 +895,6 @@ async fn resolve_handle_for_did(did: &str, pds_url: &str) -> String {
         },
         _ => did.to_string(),
     }
-}
-
-/// Legacy inference of the catmos client from callback signals.
-///
-/// Used only when `oauth_client:{state}` is absent from Redis (in-flight
-/// sessions started before the selector-persistence fix deployed, or the old
-/// JSON-state callback format). Should be removed after enough time has
-/// passed for any in-flight sessions to drain (600s TTL + safety margin).
-fn legacy_infer_catmos(redirect_to: &Option<String>, state_str: &str) -> bool {
-    redirect_to.is_some()
-        || (state_str.starts_with('{')
-            && serde_json::from_str::<serde_json::Value>(state_str)
-                .ok()
-                .and_then(|v| {
-                    v.get("client")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c == "catmos-web" || c == "catmos")
-                })
-                .unwrap_or(false))
 }
 
 /// Allowed exact redirect URLs for OAuth callback (native app registered callback).
@@ -534,6 +915,11 @@ pub fn is_allowed_redirect(r: &str) -> bool {
     let Ok(u) = url::Url::parse(r) else {
         return false;
     };
+
+    // Reject URLs with embedded credentials (userinfo) or fragments
+    if !u.username().is_empty() || u.password().is_some() || u.fragment().is_some() {
+        return false;
+    }
 
     // Allow loopback (dev)
     if u.scheme() == "http"
@@ -562,21 +948,41 @@ pub fn is_allowed_redirect(r: &str) -> bool {
     false
 }
 
-pub fn build_app_redirect(state_str: &str, session_id: &str) -> String {
-    if state_str.starts_with('{') {
-        if let Ok(state_json) = serde_json::from_str::<serde_json::Value>(state_str) {
-            if let Some(redirect_to) = state_json.get("redirect_to").and_then(|v| v.as_str()) {
-                if is_allowed_redirect(redirect_to) {
-                    return format!("{}?session_id={}", redirect_to, session_id);
-                }
-                tracing::warn!("Rejected redirect_to: {}", redirect_to);
+/// Build a success redirect URL by parsing the target URL and appending the given parameter (code or session_id).
+/// Preserves any existing query parameters safely and verifies that the URL is allowed and contains no fragments or credentials.
+pub fn build_success_redirect_url(
+    target: &str,
+    param_name: &str,
+    param_value: &str,
+) -> Option<String> {
+    if !is_allowed_redirect(target) {
+        return None;
+    }
+    let mut url = url::Url::parse(target).ok()?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let retained_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "session_id" && k != "code" && k != "error")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(retained_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .append_pair(param_name, param_value);
+    Some(url.to_string())
+}
+/// Helper used for legacy/backward-compatible app redirects.
+pub fn build_app_redirect(state: &str, session_id: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(state) {
+        if let Some(r) = val.get("redirect_to").and_then(|v| v.as_str()) {
+            if let Some(url) = build_success_redirect_url(r, "session_id", session_id) {
+                return url;
             }
         }
     }
-    format!(
-        "https://catbird.blue/oauth/callback#session_id={}",
-        session_id
-    )
+    format!("https://catbird.blue/oauth/callback#session_id={session_id}")
 }
 
 /// Handle logout
@@ -592,22 +998,89 @@ pub async fn logout(
         .as_ref()
         .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
 
-    // Revoke via Jacquard (handles token revocation at auth server + store cleanup)
-    let did = jacquard_common::types::did::Did::new(&session.did)
+    let did = jacquard_common::types::did::Did::new(session.did.as_str())
         .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
+    let session_id_str = session.id.to_string();
 
-    if let Err(e) = jacquard_client.revoke(&did, &session.id.to_string()).await {
-        tracing::warn!("Failed to revoke Jacquard session: {}", e);
-        // Continue with logout even if revocation fails
+    // 1. Session-scoped push revocation must succeed first
+    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
+        state
+            .push_db
+            .as_ref()
+            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
+    });
+
+    if let Some(registry) = push_registry {
+        registry
+            .mark_auth_revoked_if_session(&session.did, &session_id_str)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    did = %session.did,
+                    session_id = %session.id,
+                    error = %e,
+                    "Database error marking push auth revoked on logout"
+                );
+                AppError::AuthTemporarilyUnavailable(
+                    "Logout temporarily unavailable; please retry".into(),
+                )
+            })?;
+    }
+
+    // 2. Restore OAuthSession and perform remote authorization-server logout/revocation
+    let remote_logout_res = match jacquard_client.restore(&did, &session_id_str).await {
+        Ok(oauth_session) => oauth_session.logout().await,
+        Err(e) => {
+            tracing::warn!(
+                did = %session.did,
+                session_id = %session.id,
+                error = %e,
+                "Failed to restore OAuthSession for remote logout; falling back to direct revoke"
+            );
+            jacquard_client.revoke(&did, &session_id_str).await
+        }
+    };
+
+    if let Err(e) = remote_logout_res {
+        tracing::error!(
+            did = %session.did,
+            session_id = %session.id,
+            error = %e,
+            "Failed to revoke OAuth session with authorization server on logout"
+        );
+        return Err(AppError::AuthTemporarilyUnavailable(
+            "Logout temporarily unavailable; please retry".into(),
+        ));
+    }
+
+    // 3. Mandatory local delete from auth_store
+    if let Some(store) = state.auth_store.as_ref() {
+        use jacquard_oauth::authstore::ClientAuthStore;
+        store
+            .delete_session(&did, &session_id_str)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    did = %session.did,
+                    session_id = %session.id,
+                    error = %e,
+                    "Failed mandatory local session delete on logout"
+                );
+                AppError::AuthTemporarilyUnavailable(
+                    "Logout temporarily unavailable; please retry".into(),
+                )
+            })?;
     }
 
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
         .http_only(true)
+        .same_site(SameSite::Strict)
+        .secure(true)
         .max_age(time::Duration::ZERO)
         .build();
 
-    tracing::info!("User {} logged out successfully", session.did);
+    tracing::info!(did = %session.did, "User logged out successfully");
 
     Ok((
         jar.remove(cookie),
@@ -624,6 +1097,7 @@ pub async fn get_session(Extension(session): Extension<CatbirdSession>) -> Json<
         did: session.did,
         handle: session.handle,
         created_at: session.created_at,
+        granted_scopes: session.granted_scopes,
     })
 }
 
@@ -1054,22 +1528,14 @@ pub async fn proxy_xrpc(
                 body_shape = ?response_shape,
                 "[BFF-RESP] PDS response (buffered)"
             );
-
-            // Log error response bodies for debugging (truncated, no PII)
             if status >= 400 {
-                if let Ok(error_text) = std::str::from_utf8(&response_body) {
-                    let truncated = if error_text.len() > 200 {
-                        &error_text[..200]
-                    } else {
-                        error_text
-                    };
-                    tracing::warn!(
-                        request_id = %request_id,
-                        status = status,
-                        error_body = %truncated,
-                        "[BFF-RESP-ERR] PDS error response body"
-                    );
-                }
+                tracing::warn!(
+                    request_id = %request_id,
+                    lexicon = %lexicon,
+                    status = status,
+                    body_bytes = response_body.len(),
+                    "[BFF-RESP-ERR] PDS error response"
+                );
             }
 
             if (200..300).contains(&status) {
@@ -1229,7 +1695,8 @@ async fn apply_moderation_mutation(
 ///
 /// `applyWrites` batches heterogeneous writes, so every entry is checked.
 fn moderation_record_write(body: &Value) -> bool {
-    const MODERATION_COLLECTIONS: [&str; 2] = ["app.bsky.graph.block", "app.bsky.graph.listblock"];
+    const MODERATION_COLLECTIONS: [&str; 2] =
+        ["app.bsky.graph.block", "app.bsky.graph.listblock"];
 
     let touches = |value: &Value| {
         value
@@ -1250,6 +1717,7 @@ fn moderation_record_write(body: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OAuthConfig;
 
     #[test]
     fn moderation_record_writes_are_detected_including_batches() {
@@ -1279,5 +1747,484 @@ mod tests {
         assert!(!moderation_record_write(&json!({
             "writes": [{ "collection": "app.bsky.feed.like" }]
         })));
+    }
+
+    #[test]
+    fn test_is_allowed_redirect_behavior() {
+        // Allowed exact native callback
+        assert!(is_allowed_redirect("https://catbird.blue/oauth/callback"));
+
+        // Allowed production origins
+        assert!(is_allowed_redirect("https://catmos.catbird.blue/callback"));
+        assert!(is_allowed_redirect("https://catmos.catbird.blue/"));
+        assert!(is_allowed_redirect("https://catmos.pages.dev/callback"));
+        assert!(is_allowed_redirect(
+            "https://preview-123.catmos.pages.dev/callback"
+        ));
+
+        // Allowed dev loopback
+        assert!(is_allowed_redirect("http://127.0.0.1:8080/callback"));
+        assert!(is_allowed_redirect("http://127.0.0.1:3000/"));
+        assert!(is_allowed_redirect("http://[::1]:8080/callback"));
+        assert!(is_allowed_redirect("http://localhost:8080/callback"));
+
+        // Rejection: embedded fragment
+        assert!(!is_allowed_redirect(
+            "https://catmos.catbird.blue/callback#bad"
+        ));
+        assert!(!is_allowed_redirect(
+            "http://localhost:8080/callback#token=123"
+        ));
+
+        // Rejection: embedded credentials (userinfo)
+        assert!(!is_allowed_redirect(
+            "https://admin:secret@catmos.catbird.blue/callback"
+        ));
+        assert!(!is_allowed_redirect("http://user@127.0.0.1:8080/callback"));
+
+        // Rejection: near misses and subdomain attacks
+        assert!(!is_allowed_redirect(
+            "https://catbird.blue/oauth/callback/../evil"
+        ));
+        assert!(!is_allowed_redirect("https://catbird.blue/other"));
+        assert!(!is_allowed_redirect("https://catbird.blue/"));
+        assert!(!is_allowed_redirect("https://catbird.blue"));
+        assert!(!is_allowed_redirect(
+            "https://catmos.catbird.blue.evil.com/"
+        ));
+        assert!(!is_allowed_redirect(
+            "https://catbird.blue.evil.com/oauth/callback"
+        ));
+        assert!(!is_allowed_redirect("https://evil.com/callback"));
+        assert!(!is_allowed_redirect(""));
+        assert!(!is_allowed_redirect("not-a-url"));
+    }
+
+    #[test]
+    fn test_build_success_redirect_url_behavior() {
+        // Append code to clean URL
+        let url = build_success_redirect_url(
+            "https://catmos.catbird.blue/callback",
+            "code",
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V",
+        );
+        assert_eq!(
+            url,
+            Some("https://catmos.catbird.blue/callback?code=A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V".to_string())
+        );
+
+        // Append code while preserving existing query params
+        let url = build_success_redirect_url(
+            "https://catmos.catbird.blue/callback?tab=chat&mode=dark",
+            "code",
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V",
+        );
+        assert_eq!(
+            url,
+            Some("https://catmos.catbird.blue/callback?tab=chat&mode=dark&code=A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V".to_string())
+        );
+
+        // Append session_id while preserving existing query params
+        let url = build_success_redirect_url(
+            "https://catmos.catbird.blue/callback?tab=chat",
+            "session_id",
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+        assert_eq!(
+            url,
+            Some("https://catmos.catbird.blue/callback?tab=chat&session_id=550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+        let url = build_success_redirect_url(
+            "https://catmos.catbird.blue/callback?code=old1&code=old2&tab=chat&session_id=old_sess&error=old_err",
+            "code",
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V",
+        );
+        assert_eq!(
+            url,
+            Some("https://catmos.catbird.blue/callback?tab=chat&code=A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V".to_string())
+        );
+
+        let url = build_success_redirect_url(
+            "https://catmos.catbird.blue/callback?session_id=old1&session_id=old2&mode=dark",
+            "session_id",
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+        assert_eq!(
+            url,
+            Some("https://catmos.catbird.blue/callback?mode=dark&session_id=550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+
+        // Rejection on disallowed URL
+        assert_eq!(
+            build_success_redirect_url("https://evil.com/callback", "code", "abc"),
+            None
+        );
+
+        // Rejection on URL with fragment
+        assert_eq!(
+            build_success_redirect_url("https://catmos.catbird.blue/callback#frag", "code", "abc"),
+            None
+        );
+
+        // Rejection on URL with credentials
+        assert_eq!(
+            build_success_redirect_url(
+                "https://user:pass@catmos.catbird.blue/callback",
+                "code",
+                "abc"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_initial_scopes_validation_for_login() {
+        let initial_scope_strings = crate::config::default_initial_scopes();
+        let parsed = OAuthConfig::parse_and_validate_scopes(&initial_scope_strings)
+            .expect("default initial scopes should parse");
+        assert!(!parsed.is_empty());
+
+        let normalized = OAuthConfig::parse_and_normalize_scopes(&initial_scope_strings)
+            .expect("normalize initial scopes");
+        assert_eq!(
+            normalized,
+            vec!["atproto", "transition:generic", "transition:chat.bsky"]
+        );
+
+        // Must not contain max / progressive scopes like identity:handle or account:email
+        assert!(!normalized.iter().any(|s| s.starts_with("identity:")));
+        assert!(!normalized.iter().any(|s| s.starts_with("account:")));
+    }
+
+    #[test]
+    fn test_upgrade_state_prefix_detection() {
+        let upg_state = "upg_550e8400e29b41d4a716446655440000";
+        assert!(upg_state.starts_with("upg_"));
+
+        let normal_uuid_state = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(!normal_uuid_state.starts_with("upg_"));
+
+        let legacy_json_state = r#"{"client":"catmos"}"#;
+        assert!(!legacy_json_state.starts_with("upg_"));
+    }
+
+    #[test]
+    fn test_error_redirect_encodes_and_preserves_query() {
+        let target = build_error_redirect(
+            Some("https://catmos.catbird.blue/callback?state=abc"),
+            "provider error&bad",
+        );
+        assert_eq!(
+            target,
+            "https://catmos.catbird.blue/callback?state=abc&error=provider+error%26bad"
+        );
+        assert_eq!(
+            build_error_redirect(Some("https://evil.example/"), "x"),
+            "https://catbird.blue/oauth/callback?error=x"
+        );
+        assert_eq!(
+            build_error_redirect(
+                Some("https://catmos.catbird.blue/callback#frag"),
+                "access_denied"
+            ),
+            "https://catbird.blue/oauth/callback?error=access_denied"
+        );
+        let target = build_error_redirect(
+            Some("https://catmos.catbird.blue/callback?error=old1&error=old2&code=bad&session_id=fake&tab=chat"),
+            "access_denied",
+        );
+        assert_eq!(
+            target,
+            "https://catmos.catbird.blue/callback?tab=chat&error=access_denied"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_origin_behavior() {
+        assert_eq!(
+            canonicalize_origin("https://catbird.blue/oauth/callback"),
+            Some("https://catbird.blue".to_string())
+        );
+        assert_eq!(
+            canonicalize_origin("https://CATBIRD.BLUE/oauth/callback/"),
+            Some("https://catbird.blue".to_string())
+        );
+        assert_eq!(
+            canonicalize_origin("https://catbird.blue:443"),
+            Some("https://catbird.blue".to_string())
+        );
+        assert_eq!(
+            canonicalize_origin("http://127.0.0.1:80/callback"),
+            Some("http://127.0.0.1".to_string())
+        );
+        assert_eq!(
+            canonicalize_origin("http://127.0.0.1:8080/callback"),
+            Some("http://127.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            canonicalize_origin("http://[::1]:8080/callback"),
+            Some("http://[::1]:8080".to_string())
+        );
+        assert_eq!(canonicalize_origin("not-a-valid-url"), None);
+    }
+
+    #[test]
+    fn test_base64url_43_and_exchange_code_generation() {
+        // Exactly 43 base64url chars
+        let code = generate_exchange_code();
+        assert_eq!(code.len(), 43);
+        assert!(is_valid_base64url_43(&code));
+
+        // Rejection of invalid lengths/characters
+        assert!(!is_valid_base64url_43("short"));
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1+"
+        )); // '+'
+        assert!(!is_valid_base64url_43(
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1="
+        )); // '='
+    }
+
+    #[test]
+    fn test_compute_exchange_redis_key_structure() {
+        let code = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V";
+        let nonce = "B1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V";
+        let origin = "https://catbird.blue";
+        let key = compute_exchange_redis_key(code, nonce, origin);
+
+        assert!(key.starts_with("exchange:"));
+        // Does not leak raw code, nonce, or origin in plaintext
+        assert!(!key.contains(code));
+        assert!(!key.contains(nonce));
+        assert!(!key.contains(origin));
+    }
+
+    #[test]
+    fn test_default_and_catmos_explicit_scope_subsets() {
+        use jacquard_common::IntoStatic;
+        use jacquard_oauth::scopes::Scope;
+
+        // Default client scopes
+        let default_initial = crate::config::default_initial_scopes();
+        let default_parsed = OAuthConfig::parse_and_validate_scopes(&default_initial).unwrap();
+        let default_names: Vec<String> = default_parsed
+            .iter()
+            .map(|s| s.to_string_normalized().to_string())
+            .collect();
+
+        // Catmos client scopes
+        let catmos_str = "atproto transition:generic";
+        let catmos_parsed: Vec<Scope> = catmos_str
+            .split_whitespace()
+            .map(|s| Scope::<smol_str::SmolStr>::parse(s).unwrap().into_static())
+            .collect();
+        let catmos_names: Vec<String> = catmos_parsed
+            .iter()
+            .map(|s| s.to_string_normalized().to_string())
+            .collect();
+        // Verify default contains chat scope, but catmos subset does not
+        assert!(default_names.contains(&"transition:chat.bsky".to_string()));
+        assert!(!catmos_names.contains(&"transition:chat.bsky".to_string()));
+
+        // Both contain basic atproto access
+        assert!(default_names.contains(&"atproto".to_string()));
+        assert!(catmos_names.contains(&"atproto".to_string()));
+    }
+
+    #[test]
+    fn test_pds_url_validation_behavior() {
+        // Valid HTTPS PDS URLs
+        assert!(crate::services::validate_pds_url("https://bsky.social").is_ok());
+        assert!(crate::services::validate_pds_url("https://pds.example.com").is_ok());
+
+        // SSRF blocked URLs
+        assert!(crate::services::validate_pds_url("http://bsky.social").is_err());
+        // Loopback is deliberately permitted in debug builds so WireMock-backed
+        // tests can target 127.0.0.1; release builds block it via
+        // `is_private_ipv4`. Same guard as `ssrf::tests::test_blocks_private_ipv4`.
+        #[cfg(not(debug_assertions))]
+        assert!(crate::services::validate_pds_url("https://127.0.0.1").is_err());
+        assert!(crate::services::validate_pds_url("https://10.0.0.1").is_err());
+        assert!(crate::services::validate_pds_url("https://169.254.169.254").is_err());
+        assert!(crate::services::validate_pds_url("https://[::1]").is_err());
+    }
+
+    #[test]
+    fn test_logout_cookie_clearing() {
+        let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
+            .path("/")
+            .http_only(true)
+            .max_age(time::Duration::ZERO)
+            .build();
+        assert_eq!(cookie.name(), SESSION_COOKIE_NAME);
+        assert_eq!(cookie.value(), "");
+        assert_eq!(cookie.max_age(), Some(time::Duration::ZERO));
+    }
+
+    #[test]
+    fn test_describe_repo_url_formatting() {
+        let pds_url = "https://pds.example.com/";
+        let did = "did:plc:1234567890abcdef";
+        let describe_url = format!(
+            "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
+            pds_url.trim_end_matches('/'),
+            did
+        );
+        assert_eq!(
+            describe_url,
+            "https://pds.example.com/xrpc/com.atproto.repo.describeRepo?repo=did:plc:1234567890abcdef"
+        );
+    }
+    #[test]
+    fn test_login_identifier_admission_rules() {
+        // Valid DIDs
+        assert!(Did::new("did:plc:ragtjsm2j2vknq6z").is_ok());
+        assert!(Did::new("did:web:example.com").is_ok());
+
+        // Valid Handles
+        assert!(Handle::new("alice.bsky.social").is_ok());
+        assert!(Handle::new("bob.test.com").is_ok());
+
+        // Valid PDS / Issuer URLs
+        assert!(crate::services::validate_pds_url("https://bsky.social").is_ok());
+        assert!(crate::services::validate_pds_url("https://pds.example.com").is_ok());
+
+        // Invalid Handle / DID syntax
+        assert!(Did::new("not_a_did").is_err());
+        assert!(Handle::new("bad!handle").is_err());
+        assert!(Handle::new("").is_err());
+
+        // SSRF blocked URLs
+        // Loopback is permitted in debug builds for WireMock-backed tests; see
+        // `ssrf::tests::test_blocks_private_ipv4`.
+        #[cfg(not(debug_assertions))]
+        assert!(crate::services::validate_pds_url("http://127.0.0.1").is_err());
+        assert!(crate::services::validate_pds_url("https://10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_oauth_flow_record_sealing_and_strict_deserialization() {
+        let key = [0x42u8; 32];
+        let record = OAuthFlowRecord {
+            version: 2,
+            mode: OAuthMode::Exchange,
+            client_selector: "catmos".to_string(),
+            redirect_to: Some("https://catmos.catbird.blue/callback".to_string()),
+            browser_nonce: Some("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string()),
+            created_at: 1700000000,
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        let sealed = crate::services::redis_crypto::seal_strict(&key, &json).unwrap();
+
+        let opened = crate::services::redis_crypto::open_strict(&key, &sealed).unwrap();
+        let recovered: OAuthFlowRecord = serde_json::from_str(&opened).unwrap();
+
+        assert_eq!(recovered.version, 2);
+        assert_eq!(recovered.mode, OAuthMode::Exchange);
+        assert_eq!(recovered.client_selector, "catmos");
+        assert_eq!(
+            recovered.redirect_to,
+            Some("https://catmos.catbird.blue/callback".to_string())
+        );
+        assert_eq!(
+            recovered.browser_nonce,
+            Some("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string())
+        );
+
+        // Corrupt sealed ciphertext fails strictly
+        let corrupt = format!("{sealed}corrupt");
+        assert!(crate::services::redis_crypto::open_strict(&key, &corrupt).is_err());
+    }
+
+    #[test]
+    fn test_oauth_flow_key_and_claim_key_structure() {
+        let key = [0x55u8; 32];
+        let state = "550e8400-e29b-41d4-a716-446655440000";
+        let fp = crate::services::redis_auth_store::fingerprint_id(&key, state);
+        let prefix = "catbird:v2:session:";
+
+        let flow_key = format!("{}oauth_flow:{}", prefix, fp);
+        let claim_key = format!("{}oauth_claim:{}", prefix, fp);
+
+        assert!(flow_key.starts_with("catbird:v2:session:oauth_flow:"));
+        assert!(claim_key.starts_with("catbird:v2:session:oauth_claim:"));
+        assert!(!flow_key.contains(state));
+        assert!(!claim_key.contains(state));
+    }
+
+    #[test]
+    fn test_login_mode_determination_exchange_vs_direct() {
+        let valid_nonce = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+        let invalid_nonce = "too-short";
+        let allowed_redirect = "https://catmos.catbird.blue/callback";
+        let loopback_redirect = "http://127.0.0.1:8080/callback";
+        let disallowed_redirect = "https://evil.com/callback";
+
+        // 1. Valid nonce + allowed redirect -> Exchange mode
+        assert!(is_valid_base64url_43(valid_nonce));
+        assert!(is_allowed_redirect(allowed_redirect));
+        assert!(is_allowed_redirect(loopback_redirect));
+
+        // 2. Invalid nonce -> Rejection
+        assert!(!is_valid_base64url_43(invalid_nonce));
+
+        // 3. Valid nonce + disallowed redirect -> Rejection
+        assert!(!is_allowed_redirect(disallowed_redirect));
+
+        // 4. Missing nonce + any redirect -> Rejection (redirects require exchange mode)
+        // Direct mode is strictly only when no redirect is requested
+        let direct_flow = OAuthFlowRecord {
+            version: 2,
+            mode: OAuthMode::Direct,
+            client_selector: "default".to_string(),
+            redirect_to: None,
+            browser_nonce: None,
+            created_at: 1700000000,
+        };
+        assert_eq!(direct_flow.mode, OAuthMode::Direct);
+        assert!(direct_flow.redirect_to.is_none());
+        assert!(direct_flow.browser_nonce.is_none());
+    }
+
+    #[test]
+    fn test_direct_mode_callback_cookie_and_location_invariants() {
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+
+        // Direct mode sets HttpOnly, SameSite=Strict cookie with session_id
+        let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id))
+            .path("/")
+            .http_only(true)
+            .secure(true)
+            .same_site(SameSite::Strict)
+            .max_age(time::Duration::days(30))
+            .build();
+
+        assert_eq!(cookie.name(), SESSION_COOKIE_NAME);
+        assert_eq!(cookie.value(), session_id);
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
+        assert_eq!(cookie.secure(), Some(true));
+
+        // Direct mode location is strictly "/" (never contains session_id)
+        let location = "/";
+        assert!(!location.contains(session_id));
+        assert_eq!(location, "/");
+    }
+
+    #[test]
+    fn test_logout_cookie_revocation_attributes() {
+        let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
+            .path("/")
+            .http_only(true)
+            .same_site(SameSite::Strict)
+            .secure(true)
+            .max_age(time::Duration::ZERO)
+            .build();
+
+        assert_eq!(cookie.name(), SESSION_COOKIE_NAME);
+        assert_eq!(cookie.value(), "");
+        assert_eq!(cookie.max_age(), Some(time::Duration::ZERO));
+        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
     }
 }

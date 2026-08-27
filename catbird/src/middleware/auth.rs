@@ -91,18 +91,32 @@ fn classify_auth_error(error: AppError) -> AppError {
     }
 }
 
-/// Extract session ID from request (cookie or Authorization header)
-fn extract_session_id(req: &Request<Body>) -> Option<String> {
-    // Try Authorization header first (for mobile apps)
+/// Extract session ID from request (cookie or Authorization header).
+///
+/// Authorization rules:
+/// - If `Authorization` header is present:
+///   - It MUST be a valid, non-empty "Bearer <token>" header.
+///   - If malformed, empty, or using an unsupported scheme, an `InvalidSession` (401) error is returned immediately.
+///   - Under no circumstances does a request with a present `Authorization` header fall back to cookie authentication.
+/// - If `Authorization` header is absent:
+///   - Fall back to checking the `catbird_session` cookie.
+///   - If cookie is missing or empty, returns an `AuthenticationRequired` (401) error.
+fn extract_session_id(req: &Request<Body>) -> Result<String, AppError> {
     if let Some(auth_header) = req.headers().get(AUTH_HEADER_NAME) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                return Some(token.to_string());
-            }
-        }
+        let auth_str = auth_header
+            .to_str()
+            .map_err(|_| classify_auth_error(AppError::InvalidSession))?;
+
+        let token = auth_str
+            .strip_prefix("Bearer ")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| classify_auth_error(AppError::InvalidSession))?;
+
+        return Ok(token.to_string());
     }
 
-    // Fall back to cookie
+    // Fall back to cookie only when Authorization header is absent
     let cookies = req
         .headers()
         .get_all("cookie")
@@ -111,15 +125,21 @@ fn extract_session_id(req: &Request<Body>) -> Option<String> {
         .collect::<Vec<_>>()
         .join("; ");
 
-    // Simple cookie parsing
     for cookie in cookies.split(';') {
         let parts: Vec<&str> = cookie.trim().splitn(2, '=').collect();
         if parts.len() == 2 && parts[0] == SESSION_COOKIE_NAME {
-            return Some(parts[1].to_string());
+            let token = parts[1].trim();
+            if !token.is_empty() {
+                return Ok(token.to_string());
+            }
         }
     }
 
-    None
+    Err(atproto_auth_error(
+        StatusCode::UNAUTHORIZED,
+        "AuthenticationRequired",
+        "Missing authentication session.",
+    ))
 }
 
 /// Authentication middleware
@@ -127,21 +147,18 @@ fn extract_session_id(req: &Request<Body>) -> Option<String> {
 /// This middleware:
 /// 1. Extracts the session ID from cookie or Authorization header
 /// 2. Validates the session via Jacquard SessionRegistry (with automatic token refresh)
-/// 3. Attempts legacy session migration if Jacquard lookup fails
-/// 4. Injects the session into request extensions
+/// 3. Injects the session into request extensions
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let session_id = extract_session_id(&req).ok_or_else(|| {
-        atproto_auth_error(
-            StatusCode::UNAUTHORIZED,
-            "AuthenticationRequired",
-            "Missing authentication session.",
-        )
-    })?;
+    let session_id = extract_session_id(&req)?;
 
+    // Strict rejection of non-UUID session IDs — never fabricate or proceed with malformed identity
+    if uuid::Uuid::parse_str(&session_id).is_err() {
+        return Err(classify_auth_error(AppError::InvalidSession));
+    }
     let auth_store = state.auth_store.as_ref().ok_or_else(|| {
         classify_auth_error(AppError::Internal("Auth store not configured".into()))
     })?;
@@ -149,36 +166,10 @@ pub async fn auth_middleware(
         classify_auth_error(AppError::Internal("Jacquard client not configured".into()))
     })?;
 
-    // Try Jacquard path (new sessions + already-migrated sessions)
-    let (session, dpop_data) = match resolve_session_via_jacquard(
-        auth_store,
-        jacquard_client,
-        &session_id,
-    )
-    .await
-    {
-        Ok((session, dpop_data)) => (session, dpop_data),
-        Err(AppError::InvalidSession) => {
-            // Session not found — attempt legacy migration
-            tracing::debug!(session_id = %session_id, "Jacquard session not found, attempting legacy migration");
-            match auth_store.try_migrate_legacy_session(&session_id).await {
-                Ok(Some(_)) => {
-                    tracing::info!(session_id = %session_id, "Legacy session migrated, retrying Jacquard lookup");
-                    resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
-                        .await
-                        .map_err(classify_auth_error)?
-                }
-                Ok(None) => return Err(classify_auth_error(AppError::InvalidSession)),
-                Err(e) => {
-                    tracing::warn!(session_id = %session_id, error = %e, "Legacy session migration failed");
-                    return Err(classify_auth_error(AppError::InvalidSession));
-                }
-            }
-        }
-        Err(e) => {
-            return Err(classify_auth_error(e));
-        }
-    };
+    let (session, dpop_data) =
+        resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
+            .await
+            .map_err(classify_auth_error)?;
 
     req.extensions_mut().insert(session);
     req.extensions_mut().insert(dpop_data);
@@ -197,16 +188,17 @@ async fn resolve_session_via_jacquard(
 ) -> Result<(CatbirdSession, JacquardDpopData), AppError> {
     use jacquard_common::types::did::Did;
 
+    // Strict UUID validation — reject malformed session IDs immediately
+    let session_uuid = uuid::Uuid::parse_str(session_id).map_err(|_| AppError::InvalidSession)?;
+
     // Step 1: Look up DID from session index
     let did_str = auth_store
         .lookup_did_for_session(session_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Session index lookup failed: {e}")))?
+        .map_err(AppError::Redis)?
         .ok_or(AppError::InvalidSession)?;
 
-    let did = Did::new(&did_str)
-        .map_err(|e| AppError::Internal(format!("Invalid DID in session index: {e}")))?;
-
+    let did = Did::new(did_str.as_str()).map_err(|_| AppError::InvalidSession)?;
     // Step 2: Get session from registry (auto_refresh=true triggers token refresh if needed)
     let session_data = jacquard_client
         .registry
@@ -237,8 +229,14 @@ async fn resolve_session_via_jacquard(
     // Try to resolve handle (best effort)
     let handle = did_str.clone(); // Will be enriched by handler if needed
 
+    // Extract and validate authoritative granted scopes returned by PDS/OAuth server.
+    // Authenticate only sessions with authoritative parseable nonempty granted scopes containing `atproto`.
+    // No unwrap_or_default or legacy empty acceptance.
+    let token_scope_str = session_data.token_set.scope.as_ref().map(|s| s.as_str());
+    let granted_scopes =
+        validate_authoritative_granted_scopes(&session_data.scopes, token_scope_str)?;
     let session = CatbirdSession {
-        id: uuid::Uuid::parse_str(session_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+        id: session_uuid,
         did: did_str,
         handle,
         pds_url: session_data.host_url.to_string(),
@@ -257,37 +255,234 @@ async fn resolve_session_via_jacquard(
         access_token_expires_at: expires_at,
         created_at: Utc::now(), // Not tracked in Jacquard session
         last_used_at: Utc::now(),
+        granted_scopes,
     };
 
     Ok((session, dpop_data))
+}
+
+/// Validates authoritative granted scopes returned by PDS/OAuth server.
+///
+/// Enforces that:
+/// 1. Scopes are non-empty and parseable without falling back to defaults.
+/// 2. Scopes explicitly contain the required `atproto` scope.
+fn validate_authoritative_granted_scopes(
+    scopes: &jacquard_oauth::scopes::Scopes,
+    token_scope: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    use jacquard_oauth::scopes::{Scope, Scopes};
+
+    let parsed_scopes: Scopes = if !scopes.is_empty() {
+        scopes.clone()
+    } else if let Some(scope_str) = token_scope {
+        Scopes::new(smol_str::SmolStr::from(scope_str)).map_err(|_| AppError::InvalidSession)?
+    } else {
+        return Err(AppError::InvalidSession);
+    };
+
+    if parsed_scopes.is_empty() {
+        return Err(AppError::InvalidSession);
+    }
+
+    if !parsed_scopes.grants(&Scope::atproto()) && !parsed_scopes.iter().any(|s| matches!(s, Scope::Atproto)) {
+        return Err(AppError::InvalidSession);
+    }
+
+    Ok(parsed_scopes
+        .iter()
+        .map(|s| s.to_string_normalized().to_string())
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::Request;
+    use jacquard_oauth::scopes::{Scope, TransitionScope};
 
     #[test]
     fn extracts_session_from_bearer_header() {
         let request = Request::builder()
-            .header(AUTH_HEADER_NAME, "Bearer abc123")
-            .body(Body::empty())
-            .expect("request");
-
-        assert_eq!(extract_session_id(&request), Some("abc123".to_string()));
-    }
-
-    #[test]
-    fn extracts_session_from_cookie() {
-        let request = Request::builder()
-            .header("cookie", "foo=bar; catbird_session=cookie-token; baz=1")
+            .header(
+                AUTH_HEADER_NAME,
+                "Bearer 550e8400-e29b-41d4-a716-446655440000",
+            )
             .body(Body::empty())
             .expect("request");
 
         assert_eq!(
-            extract_session_id(&request),
-            Some("cookie-token".to_string())
+            extract_session_id(&request).unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
         );
+    }
+
+    #[test]
+    fn extracts_session_from_cookie_when_header_absent() {
+        let request = Request::builder()
+            .header(
+                "cookie",
+                "foo=bar; catbird_session=550e8400-e29b-41d4-a716-446655440000; baz=1",
+            )
+            .body(Body::empty())
+            .expect("request");
+
+        assert_eq!(
+            extract_session_id(&request).unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn missing_header_and_missing_cookie_returns_authentication_required() {
+        let request = Request::builder().body(Body::empty()).expect("request");
+
+        let err = extract_session_id(&request).unwrap_err();
+        match err {
+            AppError::AtprotoResponse { status, error, .. } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(error, "AuthenticationRequired");
+            }
+            other => panic!("expected AuthenticationRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn valid_cookie_with_invalid_bearer_returns_401_and_never_authenticates_cookie() {
+        // Case 1: Empty Bearer token with valid cookie
+        let request = Request::builder()
+            .header(AUTH_HEADER_NAME, "Bearer ")
+            .header(
+                "cookie",
+                "catbird_session=550e8400-e29b-41d4-a716-446655440000",
+            )
+            .body(Body::empty())
+            .expect("request");
+
+        let err = extract_session_id(&request).unwrap_err();
+        match err {
+            AppError::AtprotoResponse { status, error, .. } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(error, "InvalidToken");
+            }
+            other => panic!("expected InvalidToken, got {:?}", other),
+        }
+
+        // Case 2: Unsupported auth scheme (Basic) with different valid cookie
+        let request_basic = Request::builder()
+            .header(AUTH_HEADER_NAME, "Basic dXNlcjpwYXNz")
+            .header(
+                "cookie",
+                "catbird_session=660e8400-e29b-41d4-a716-446655440000",
+            )
+            .body(Body::empty())
+            .expect("request");
+
+        let err = extract_session_id(&request_basic).unwrap_err();
+        match err {
+            AppError::AtprotoResponse { status, error, .. } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(error, "InvalidToken");
+            }
+            other => panic!("expected InvalidToken, got {:?}", other),
+        }
+
+        // Case 3: Malformed Authorization header with different valid cookie
+        let request_malformed = Request::builder()
+            .header(AUTH_HEADER_NAME, "not-a-valid-bearer")
+            .header(
+                "cookie",
+                "catbird_session=770e8400-e29b-41d4-a716-446655440000",
+            )
+            .body(Body::empty())
+            .expect("request");
+
+        let err = extract_session_id(&request_malformed).unwrap_err();
+        match err {
+            AppError::AtprotoResponse { status, error, .. } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(error, "InvalidToken");
+            }
+            other => panic!("expected InvalidToken, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn valid_bearer_takes_precedence_over_different_valid_cookie() {
+        let request = Request::builder()
+            .header(
+                AUTH_HEADER_NAME,
+                "Bearer 550e8400-e29b-41d4-a716-446655440000",
+            )
+            .header(
+                "cookie",
+                "catbird_session=660e8400-e29b-41d4-a716-446655440000",
+            )
+            .body(Body::empty())
+            .expect("request");
+
+        assert_eq!(
+            extract_session_id(&request).unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn scope_validation_accepts_authoritative_atproto_scope() {
+        let scopes = jacquard_oauth::scopes::Scopes::atproto();
+        let granted = validate_authoritative_granted_scopes(&scopes, None).unwrap();
+        assert_eq!(granted, vec!["atproto"]);
+    }
+
+    #[test]
+    fn scope_validation_accepts_atproto_with_additional_scopes() {
+        let scopes = jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("atproto transition:generic")).unwrap();
+        let granted = validate_authoritative_granted_scopes(&scopes, None).unwrap();
+        assert_eq!(granted, vec!["atproto", "transition:generic"]);
+    }
+
+    #[test]
+    fn scope_validation_accepts_parseable_token_scope_with_atproto() {
+        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        let granted =
+            validate_authoritative_granted_scopes(&empty_scopes, Some("atproto transition:generic")).unwrap();
+        assert_eq!(granted, vec!["atproto", "transition:generic"]);
+    }
+
+    #[test]
+    fn scope_validation_rejects_empty_scopes() {
+        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        assert!(matches!(
+            validate_authoritative_granted_scopes(&empty_scopes, None),
+            Err(AppError::InvalidSession)
+        ));
+        assert!(matches!(
+            validate_authoritative_granted_scopes(&empty_scopes, Some("")),
+            Err(AppError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn scope_validation_rejects_unparseable_token_scope_without_defaulting() {
+        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        assert!(matches!(
+            validate_authoritative_granted_scopes(&empty_scopes, Some("invalid:::scope;;;")),
+            Err(AppError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn scope_validation_rejects_scopes_missing_atproto() {
+        let scopes = jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("transition:generic")).unwrap();
+        assert!(matches!(
+            validate_authoritative_granted_scopes(&scopes, None),
+            Err(AppError::InvalidSession)
+        ));
+
+        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        assert!(matches!(
+            validate_authoritative_granted_scopes(&empty_scopes, Some("transition:generic")),
+            Err(AppError::InvalidSession)
+        ));
     }
 
     #[test]
@@ -322,5 +517,51 @@ mod tests {
             }
             _ => panic!("expected AtprotoResponse"),
         }
+    }
+
+    #[test]
+    fn classifies_transient_redis_error_as_temporarily_unavailable() {
+        let redis_err = redis::RedisError::from((redis::ErrorKind::IoError, "connection refused"));
+        let mapped = classify_auth_error(AppError::Redis(redis_err));
+        match mapped {
+            AppError::AtprotoResponse {
+                status,
+                error,
+                message: _,
+            } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error, "TemporarilyUnavailable");
+            }
+            _ => panic!("expected AtprotoResponse"),
+        }
+    }
+
+    #[test]
+    fn pre_v2_legacy_bearer_token_rejected_as_invalid_session() {
+        let legacy_tokens = vec![
+            "legacy_token_12345",
+            "catbird_session_abc",
+            "not-a-valid-uuid",
+            "12345",
+        ];
+
+        for token in legacy_tokens {
+            assert!(uuid::Uuid::parse_str(token).is_err());
+            let mapped = classify_auth_error(AppError::InvalidSession);
+            match mapped {
+                AppError::AtprotoResponse { status, error, .. } => {
+                    assert_eq!(status, StatusCode::UNAUTHORIZED);
+                    assert_eq!(error, "InvalidToken");
+                }
+                _ => panic!("expected InvalidToken 401 response"),
+            }
+        }
+    }
+
+    #[test]
+    fn non_uuid_session_string_fails_uuid_validation() {
+        assert!(uuid::Uuid::parse_str("not-a-uuid").is_err());
+        assert!(uuid::Uuid::parse_str("12345").is_err());
+        assert!(uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").is_ok());
     }
 }
