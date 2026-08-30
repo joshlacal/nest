@@ -934,11 +934,19 @@ async fn cleanup_new_session(
     session_id: &str,
 ) {
     if let Ok(parsed_did) = jacquard_common::types::did::Did::new(did) {
-        let revoked = match jacquard_client.restore(&parsed_did, session_id).await {
-            Ok(oauth_session) => oauth_session.logout().await,
-            Err(_) => jacquard_client.revoke(&parsed_did, session_id).await,
-        };
         let session_fp = redact_session_id(session_id);
+        let revoked = match jacquard_client.restore(&parsed_did, session_id).await {
+            Ok(oauth_session) => oauth_session.logout().await.map_err(|e| e.to_string()),
+            Err(e) => {
+                tracing::warn!(
+                    did = %did,
+                    session_fp = %session_fp,
+                    error = %e,
+                    "Could not restore OAuthSession for remote revocation after callback error"
+                );
+                Err("missing OAuthSession".to_string())
+            }
+        };
         if let Err(e) = revoked {
             tracing::warn!(
                 did = %did,
@@ -1144,25 +1152,28 @@ pub async fn logout(
         }
     }
 
-    // 4. Best-effort remote authorization-server logout/revocation using preserved session
     // 4. Remote authorization-server logout/revocation: local-first ordering is preserved (local deletion already succeeded in step 2).
-    // Attempt remote revocation via restored session first; if that fails or was absent, fall back to direct jacquard_client.revoke(&did, &session_id_str).
+    // Genuine oauth_session.logout() is the only remote revocation arm.
+    // If no preserved session was available or if remote logout fails, persist a durable retry marker in Redis.
     let remote_revoked = match preserved_oauth_session {
-        Some(oauth_session) => match oauth_session.logout().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    did = %session.did,
-                    session_fp = %session_fp,
-                    error = %e,
-                    "Preserved OAuthSession logout failed; falling back to direct jacquard_client.revoke"
-                );
-                jacquard_client.revoke(&did, &session_id_str).await
-            }
-        },
-        None => jacquard_client.revoke(&did, &session_id_str).await,
+        Some(oauth_session) => oauth_session.logout().await.map_err(|e| {
+            tracing::warn!(
+                did = %session.did,
+                session_fp = %session_fp,
+                error = %e,
+                "Preserved OAuthSession remote logout/revocation failed"
+            );
+            e.to_string()
+        }),
+        None => {
+            tracing::warn!(
+                did = %session.did,
+                session_fp = %session_fp,
+                "Could not restore OAuthSession for remote revocation before local delete"
+            );
+            Err("missing preserved OAuth session".to_string())
+        }
     };
-
     if let Err(e) = remote_revoked {
         tracing::warn!(
             did = %session.did,
@@ -2385,31 +2396,143 @@ mod tests {
         assert_ne!(cookie_mismatch, flow_record.browser_nonce.as_deref());
     }
 
-    #[test]
-    fn test_logout_remote_revocation_fallback_and_retry_marker_logic() {
-        let did = "did:plc:alice";
-        let session_id = "550e8400-e29b-41d4-a716-446655440000";
-        let session_fp = redact_session_id(session_id);
-        let prefix = "catbird:v2:session:";
-        let retry_key = format!("{}revoke_retry:{}_{}", prefix, did, session_fp);
-        assert_eq!(
-            retry_key,
-            format!("catbird:v2:session:revoke_retry:did:plc:alice_{session_fp}")
+    #[tokio::test]
+    #[ignore = "requires running Redis (REDIS_URL)"]
+    async fn test_logout_remote_revocation_fallback_and_retry_marker_logic() {
+        use axum::extract::State;
+        use axum::Extension;
+        use axum_extra::extract::CookieJar;
+        use chrono::Utc;
+        use jacquard_common::IntoStatic;
+        use uuid::Uuid;
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str())
+            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("REDIS_URL connection must succeed when test is executed");
+
+        let test_id = Uuid::new_v4().simple().to_string();
+        let prefix = format!("catbird:v2:test_{test_id}:");
+        let key = [0x42u8; 32];
+        let auth_store = Arc::new(
+            crate::services::RedisAuthStore::from_key(redis.clone(), prefix.clone(), 86400, key)
+                .expect("auth store creation"),
         );
 
-        // Fallback decision simulation:
-        // When preserved session is None, client.revoke is invoked directly.
-        let preserved_session: Option<bool> = None;
-        let mut fallback_attempted = false;
-        let res: Result<(), &str> = match preserved_session {
-            Some(_) => Ok(()),
-            None => {
-                fallback_attempted = true;
-                Err("transient network failure")
-            }
+        let mut config = crate::config::AppConfig::test_default();
+        config.server.base_url = "https://catbird.test".to_string();
+        config.oauth.scopes = vec!["atproto".to_string()];
+
+        let signing_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let key_store = crate::services::KeyStore::from_key("catbird-test-key", signing_key);
+
+        let scopes = vec![
+            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse("atproto")
+                .unwrap()
+                .into_static(),
+        ];
+
+        let state_proto = crate::config::AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            raw_http_client: crate::services::build_hardened_raw_http_client()
+                .expect("hardened raw client"),
+            redis: redis.clone(),
+            push_db: None,
+            key_store: Some(Arc::new(key_store.clone())),
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: Some(auth_store.clone()),
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: Some(key),
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         };
-        assert!(fallback_attempted);
-        assert!(res.is_err());
+
+        let jacquard_client = crate::config::AppState::build_jacquard_client(
+            &state_proto,
+            &key_store,
+            &auth_store,
+            "https://catbird.test/client-metadata.json",
+            "https://catbird.test/auth/callback",
+            &scopes,
+        )
+        .expect("build jacquard client");
+
+        let state = Arc::new(crate::config::AppState {
+            jacquard_client: Some(Arc::new(jacquard_client)),
+            ..state_proto
+        });
+
+        let did = "did:plc:test_logout_user";
+        let session_id = Uuid::new_v4();
+        let session_id_str = session_id.to_string();
+        let session_fp = redact_session_id(&session_id_str);
+
+        let session = crate::models::CatbirdSession {
+            id: session_id,
+            did: did.to_string(),
+            handle: "user.test".to_string(),
+            pds_url: "https://pds.test".to_string(),
+            access_token: "mock_access".to_string(),
+            refresh_token: "mock_refresh".to_string(),
+            scopes: vec!["atproto".to_string()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".to_string()],
+        };
+
+        let jar = CookieJar::new();
+
+        // 1. Invoke the real logout handler.
+        // Because no OAuth session was pre-installed in the mock auth server, restore fails/returns None.
+        // This MUST treat remote revocation as failed and persist the durable retry marker to Redis.
+        let (_, Json(resp)) = logout(State(state.clone()), Extension(session.clone()), jar)
+            .await
+            .expect("logout handler must succeed");
+
+        assert!(resp.success);
+        assert_eq!(resp.message, "Logged out");
+
+        // 2. Verify that the durable retry marker was written to Redis with the expected key, session_id, and 7-day TTL
+        let retry_key = format!("{}revoke_retry:{}_{}", prefix, did, session_fp);
+        let mut conn = redis.clone();
+        let stored_val: Option<String> = redis::cmd("GET")
+            .arg(&retry_key)
+            .query_async(&mut conn)
+            .await
+            .expect("GET retry_key");
+
+        assert_eq!(
+            stored_val,
+            Some(session_id_str.clone()),
+            "Durable retry marker MUST be written to Redis when remote revocation fails"
+        );
+
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&retry_key)
+            .query_async(&mut conn)
+            .await
+            .expect("TTL retry_key");
+        assert!(
+            ttl > 0 && ttl <= 86400 * 7,
+            "Retry marker TTL must be set up to 7 days, got {ttl}"
+        );
+
+        // Cleanup
+        let _: () = redis::cmd("DEL")
+            .arg(&retry_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 
     #[test]

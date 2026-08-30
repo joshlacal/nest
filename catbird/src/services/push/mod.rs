@@ -164,9 +164,9 @@ pub struct PushServices {
 
 impl PushServices {
     pub fn new(db_pool: Pool<Postgres>, config: PushConfig) -> Result<Self> {
-        let service_did = config
+        config
             .service_did
-            .clone()
+            .as_ref()
             .ok_or_else(|| anyhow!("push.service_did must be configured when push is enabled"))?;
 
         let apns = ApnsDelivery::new(&config.apns)?.map(|d| Arc::new(d) as Arc<dyn ApnsSender>);

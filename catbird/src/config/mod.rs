@@ -1102,7 +1102,7 @@ impl AppState {
     /// Build a client whose PAR requests exactly `scopes`, reusing an existing
     /// `RedisAuthStore` so a later callback resolves through any client backed by
     /// the same store.
-    fn build_jacquard_client(
+    pub(crate) fn build_jacquard_client(
         state: &AppState,
         key_store: &crate::services::KeyStore,
         existing_store: &crate::services::RedisAuthStore,
@@ -1155,8 +1155,8 @@ impl AppState {
     /// Nest handles low-volume OAuth login flows where correctness matters more
     /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
     /// stale identity data to persist indefinitely when users retried login.
-    fn build_resolver() -> jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient>
-    {
+    pub(crate) fn build_resolver(
+    ) -> jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient> {
         let resolver_client = crate::services::build_hardened_http_client()
             .expect("Failed to build hardened HTTP client for identity resolver");
         let hardened_client = crate::services::HardenedHttpClient::new(resolver_client);

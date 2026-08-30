@@ -505,17 +505,21 @@ pub async fn upgrade_commit(
             "Logout won race during upgrade commit; performing candidate compensation"
         );
 
-        // Compensation 1: Revoke candidate session at Jacquard / Auth server (remote + local)
+        // Compensation 1: Revoke candidate session at Auth server (remote)
         if let Some(jacquard_client) = &state.jacquard_client {
             let revoked = match jacquard_client
                 .restore(&parsed_did, &receipt.candidate_session_id)
                 .await
             {
-                Ok(oauth_session) => oauth_session.logout().await,
-                Err(_) => {
-                    jacquard_client
-                        .revoke(&parsed_did, &receipt.candidate_session_id)
-                        .await
+                Ok(oauth_session) => oauth_session.logout().await.map_err(|e| e.to_string()),
+                Err(e) => {
+                    tracing::warn!(
+                        did = %receipt.did,
+                        candidate_fp = %candidate_fp,
+                        error = %e,
+                        "Could not restore candidate OAuthSession for remote revocation during compensation"
+                    );
+                    Err("missing candidate OAuthSession".to_string())
                 }
             };
             if let Err(e) = revoked {

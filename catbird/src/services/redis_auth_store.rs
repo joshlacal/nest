@@ -2428,53 +2428,119 @@ mod tests {
         assert!(store.contains_key(&did_idx_key));
     }
 
-    #[allow(clippy::unnecessary_literal_unwrap)]
-    #[test]
-    fn test_resolve_session_recovery_and_install_script_fails_closed_on_retired_verdict() {
+    #[tokio::test]
+    #[ignore = "requires running Redis (REDIS_URL)"]
+    async fn test_resolve_session_recovery_and_install_script_fails_closed_on_retired_verdict() {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str())
+            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
+        let redis_mgr = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("REDIS_URL connection must succeed when test is executed");
+
+        let test_id = uuid::Uuid::new_v4().simple().to_string();
+        let prefix = format!("catbird:v2:test_{test_id}:");
         let key = TEST_KEY;
-        let prefix = "catbird:v2:session:";
         let did = "did:plc:retired_verdict_user";
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
         let hmac_fp = fingerprint_id(&key, session_id);
         let sha256_fp = crate::services::push::registry::session_fingerprint(session_id);
 
-        let mut store: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let store = RedisAuthStore::from_key(redis_mgr.clone(), prefix.clone(), 86400, key)
+            .expect("store creation");
 
-        // Session blob exists, but tombstone also exists in Redis
+        let mut conn = redis_mgr.clone();
+
+        // Prepare session payload
         let session = make_test_session_data(did, session_id);
         let enc = seal_strict(&key, &serde_json::to_string(&session).unwrap()).unwrap();
         let sess_key = format!("{prefix}session:{did}_{hmac_fp}");
         let ret_key = format!("{prefix}upgrade_retired:{hmac_fp}");
-        store.insert(sess_key, enc);
-        store.insert(ret_key.clone(), "logout".to_string());
+        let fp_index_key = store.session_fp_index_key(&sha256_fp);
+        let did_index_key = store.did_index_key(did);
 
-        // 1. Simulation of retirement check with error -> fails closed (treated as retired)
-        let mock_redis_query_result: Result<bool, &str> = Err("redis connection error");
-        let is_retired_error_fallback: bool = mock_redis_query_result.unwrap_or(true);
-        assert!(
-            is_retired_error_fallback,
-            "Error checking retirement MUST fail closed (treat as retired)"
-        );
+        // 1. Insert session blob, legacy did_index, and retirement tombstone into real Redis (without installing fp index)
+        let _: () = redis::cmd("SETEX")
+            .arg(&sess_key)
+            .arg(3600)
+            .arg(&enc)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SETEX")
+            .arg(&did_index_key)
+            .arg(3600)
+            .arg(&hmac_fp)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SETEX")
+            .arg(&ret_key)
+            .arg(3600)
+            .arg("logout")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
 
-        // 2. Simulation of LUA_INSTALL_FP_INDEX_SCRIPT verdict
-        // If KEYS[4] (retired_key) exists in store, the Lua script returns 1 (retired).
-        let lua_install_verdict = if store.contains_key(&ret_key) {
-            1i32
-        } else {
-            0i32
-        };
-        assert_eq!(lua_install_verdict, 1);
-
-        // 3. Gating return on install script verdict: verdict != 0 MUST return None
-        let resolved: Option<ClientSessionData> = if lua_install_verdict == 0 {
-            Some(session)
-        } else {
-            None
-        };
+        // 2. Invoke real resolve_session_for_did_with_fingerprint — MUST return None (fails closed on retirement)
+        let resolved = store
+            .resolve_session_for_did_with_fingerprint(did, &sha256_fp)
+            .await
+            .expect("resolve_session_for_did_with_fingerprint query");
         assert!(
             resolved.is_none(),
             "Retired session MUST NOT be returned even on fallback recovery"
         );
+
+        // 3. Verify fp_index_key was NOT installed while retired
+        let fp_index_exists: bool = redis::cmd("EXISTS")
+            .arg(&fp_index_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            !fp_index_exists,
+            "Fingerprint index MUST NOT be installed for a retired session"
+        );
+
+        // 4. Remove retirement tombstone; now recovery should succeed and self-heal the index
+        let _: () = redis::cmd("DEL")
+            .arg(&ret_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let resolved_active = store
+            .resolve_session_for_did_with_fingerprint(did, &sha256_fp)
+            .await
+            .expect("resolve_session_for_did_with_fingerprint query");
+        assert!(
+            resolved_active.is_some(),
+            "Active unretired session MUST be recovered and returned"
+        );
+        assert_eq!(resolved_active.unwrap().account_did.as_str(), did);
+
+        // 5. Verify fp_index was installed during self-heal
+        let fp_index_installed: bool = redis::cmd("EXISTS")
+            .arg(&fp_index_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            fp_index_installed,
+            "Fingerprint index MUST be installed after unretired recovery"
+        );
+
+        // Cleanup
+        let _: () = redis::cmd("DEL")
+            .arg(&sess_key)
+            .arg(&ret_key)
+            .arg(&fp_index_key)
+            .arg(format!("{prefix}did_to_session:{did}"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 
     #[test]
