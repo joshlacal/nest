@@ -73,14 +73,25 @@ async fn main() -> anyhow::Result<()> {
         push.spawn_worker(state.clone());
     }
 
-    if state.config.push.chat_poll_enabled {
-        if let Some(push_db) = state.push_db.clone() {
-            let chat_poll = crate::services::chat_poll::ChatPollService::new(push_db);
-            chat_poll.spawn(state.clone());
-            tracing::info!("Chat poll service started");
-        }
-    }
+    let chat_gate_open = state.config.push.is_chat_poll_release_gate_open();
+    metrics::set_chat_poll_enabled_metric(chat_gate_open);
 
+    if state.config.push.chat_poll_enabled {
+        if chat_gate_open {
+            tracing::warn!("CHAT POLL IS ENABLED via configuration and release gate is OPEN");
+            if let Some(push_db) = state.push_db.clone() {
+                let chat_poll = crate::services::chat_poll::ChatPollService::new(push_db);
+                chat_poll.spawn(state.clone());
+                tracing::info!("Chat poll service started");
+            }
+        } else {
+            tracing::error!(
+                "CHAT POLL is enabled in config (chat_poll_enabled=true), but independent release gate is CLOSED (NEST_CHAT_POLL_RELEASE_GATE != 'open'). Service will NOT start."
+            );
+        }
+    } else {
+        tracing::info!("Chat poll is disabled by default (security gate closed)");
+    }
     // Start background task to update active sessions gauge
     let metrics_state = state.clone();
     let key_prefix = app_config.redis.key_prefix.clone();

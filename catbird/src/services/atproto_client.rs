@@ -21,11 +21,11 @@ pub const STREAM_THRESHOLD: usize = 1 * 1024 * 1024;
 
 /// Response from proxy request - either buffered bytes or a streaming body
 pub enum ProxyResponse {
-    /// Buffered response for smaller payloads (can be inspected/modified)
     Buffered {
         status: u16,
         headers: HeaderMap,
         body: bytes::Bytes,
+        bytes_transferred: usize,
     },
     /// Streaming response for larger payloads (passed through directly)
     Streaming {
@@ -36,6 +36,7 @@ pub enum ProxyResponse {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         rate_limit: Option<Arc<crate::middleware::RateLimitState>>,
         session_id: Option<String>,
+        bytes_transferred: usize,
     },
 }
 
@@ -53,6 +54,46 @@ impl ProxyResponse {
         match self {
             ProxyResponse::Buffered { headers, .. } => headers,
             ProxyResponse::Streaming { headers, .. } => headers,
+        }
+    }
+
+    /// Total bytes transferred / consumed across all attempts (including any prior nonce challenge)
+    pub fn bytes_transferred(&self) -> usize {
+        match self {
+            ProxyResponse::Buffered { bytes_transferred, .. } => *bytes_transferred,
+            ProxyResponse::Streaming { bytes_transferred, .. } => *bytes_transferred,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyResponse::Buffered {
+                status,
+                headers,
+                body,
+                bytes_transferred,
+            } => f
+                .debug_struct("ProxyResponse::Buffered")
+                .field("status", status)
+                .field("headers", headers)
+                .field("body_len", &body.len())
+                .field("bytes_transferred", bytes_transferred)
+                .finish(),
+            ProxyResponse::Streaming {
+                status,
+                headers,
+                max_bytes,
+                bytes_transferred,
+                ..
+            } => f
+                .debug_struct("ProxyResponse::Streaming")
+                .field("status", status)
+                .field("headers", headers)
+                .field("max_bytes", max_bytes)
+                .field("bytes_transferred", bytes_transferred)
+                .finish(),
         }
     }
 }
@@ -83,6 +124,37 @@ impl AtProtoClient {
         client_headers: Option<&HeaderMap>,
         request_id: &str,
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+    ) -> AppResult<ProxyResponse> {
+        self.proxy_request_with_limit(
+            session,
+            method,
+            path,
+            query_string,
+            body,
+            content_type,
+            client_headers,
+            request_id,
+            jacquard_dpop,
+            MAX_RESPONSE_SIZE,
+        )
+        .await
+    }
+
+    /// Proxy a raw request to the PDS with an explicit maximum response size limit.
+    /// Handles DPoP nonce retry automatically with remaining cumulative budget.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn proxy_request_with_limit(
+        &self,
+        session: &CatbirdSession,
+        method: reqwest::Method,
+        path: &str,
+        query_string: Option<&str>,
+        body: Option<bytes::Bytes>,
+        content_type: Option<&str>,
+        client_headers: Option<&HeaderMap>,
+        request_id: &str,
+        jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        max_bytes: usize,
     ) -> AppResult<ProxyResponse> {
         // SSRF protection & endpoint origin binding: validate PDS URL and target URL
         validate_pds_url(&session.pds_url)?;
@@ -176,6 +248,12 @@ impl AtProtoClient {
 
         // Check if we got a DPoP nonce error (401 with use_dpop_nonce)
         if status == 401 {
+            let challenge_limit = max_bytes.min(STREAM_THRESHOLD);
+            if challenge_limit == 0 {
+                return Err(AppError::ResponseTooLarge(format!(
+                    "Cumulative response size exceeded maximum allowed limit of {max_bytes} bytes"
+                )));
+            }
             let permit = if content_length.is_none() {
                 Some(self.state.active_stream_semaphore.clone().try_acquire_owned().map_err(|_| {
                     tracing::warn!(
@@ -190,7 +268,7 @@ impl AtProtoClient {
             let error_body = self
                 .read_response_with_limit(
                     response,
-                    STREAM_THRESHOLD,
+                    challenge_limit,
                     request_id,
                     Some(&session.id.to_string()),
                     permit,
@@ -201,10 +279,10 @@ impl AtProtoClient {
                     if let Some(nonce_value) = response_headers.get("dpop-nonce") {
                         if let Ok(nonce) = nonce_value.to_str() {
                             let initial_bytes = error_body.len();
-                            let remaining_budget = MAX_RESPONSE_SIZE.saturating_sub(initial_bytes);
+                            let remaining_budget = max_bytes.saturating_sub(initial_bytes);
                             if remaining_budget == 0 {
                                 return Err(AppError::ResponseTooLarge(format!(
-                                    "Cumulative response size exceeded maximum allowed limit of {MAX_RESPONSE_SIZE} bytes across attempts"
+                                    "Cumulative response size exceeded maximum allowed limit of {max_bytes} bytes across attempts"
                                 )));
                             }
                             let retry_body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
@@ -219,7 +297,7 @@ impl AtProtoClient {
                             );
 
                             // Retry with the nonce - use streaming-aware version with remaining cumulative budget.
-                            return self
+                            let mut retry_response = self
                                 .do_proxy_request(
                                     session,
                                     method,
@@ -234,7 +312,18 @@ impl AtProtoClient {
                                     origin.as_deref(),
                                     remaining_budget,
                                 )
-                                .await;
+                                .await?;
+
+                            match &mut retry_response {
+                                ProxyResponse::Buffered { bytes_transferred, .. } => {
+                                    *bytes_transferred = bytes_transferred.saturating_add(initial_bytes);
+                                }
+                                ProxyResponse::Streaming { bytes_transferred, .. } => {
+                                    *bytes_transferred = bytes_transferred.saturating_add(initial_bytes);
+                                }
+                            }
+
+                            return Ok(retry_response);
                         }
                     }
                     tracing::warn!(
@@ -244,25 +333,27 @@ impl AtProtoClient {
                 }
             }
 
+            let initial_bytes = error_body.len();
             return Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
                 body: error_body,
+                bytes_transferred: initial_bytes,
             });
         }
 
         // For non-401 responses on attempt 1: apply size limits and streaming/buffering decision
         if let Some(len) = content_length {
-            if len > MAX_RESPONSE_SIZE {
+            if len > max_bytes {
                 tracing::warn!(
                     request_id = %request_id,
                     content_length = len,
-                    max_size = MAX_RESPONSE_SIZE,
+                    max_size = max_bytes,
                     "[BFF-UPSTREAM-ERR] Response too large"
                 );
                 return Err(AppError::ResponseTooLarge(format!(
                     "Response size {} bytes exceeds maximum allowed {} bytes",
-                    len, MAX_RESPONSE_SIZE
+                    len, max_bytes
                 )));
             }
         }
@@ -286,7 +377,7 @@ impl AtProtoClient {
                 status = status,
                 elapsed_ms = elapsed_ms,
                 content_length = ?content_length,
-                max_bytes = MAX_RESPONSE_SIZE,
+                max_bytes = max_bytes,
                 streaming = true,
                 "[BFF-UPSTREAM-RECV] Response from PDS (streaming)"
             );
@@ -306,10 +397,11 @@ impl AtProtoClient {
                 status,
                 headers: response_headers,
                 body: response,
-                max_bytes: MAX_RESPONSE_SIZE,
+                max_bytes,
                 permit: Some(permit),
                 rate_limit: Some(self.state.rate_limit.clone()),
                 session_id: Some(session.id.to_string()),
+                bytes_transferred: 0,
             })
         } else {
             let permit = if content_length.is_none() {
@@ -327,7 +419,7 @@ impl AtProtoClient {
             let body = self
                 .read_response_with_limit(
                     response,
-                    MAX_RESPONSE_SIZE,
+                    max_bytes,
                     request_id,
                     Some(&session.id.to_string()),
                     permit,
@@ -344,10 +436,12 @@ impl AtProtoClient {
                 "[BFF-UPSTREAM-RECV] Response from PDS (buffered)"
             );
 
+            let body_len = body.len();
             Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
                 body,
+                bytes_transferred: body_len,
             })
         }
     }
@@ -498,6 +592,7 @@ impl AtProtoClient {
                 permit: Some(permit),
                 rate_limit: Some(self.state.rate_limit.clone()),
                 session_id: Some(session.id.to_string()),
+                bytes_transferred: 0,
             })
         } else {
             // Buffer small JSON responses. If content_length is unknown (None), acquire semaphore permit before buffering.
@@ -562,10 +657,12 @@ impl AtProtoClient {
                 }
             }
 
+            let body_len = body.len();
             Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
                 body,
+                bytes_transferred: body_len,
             })
         }
     }
@@ -1013,5 +1110,226 @@ mod tests {
         // Drop stream releases semaphore permit
         drop(bounded);
         assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running Redis (REDIS_URL)"]
+    async fn test_proxy_request_with_limit_bounds_dpop_challenge_and_tracks_cumulative_bytes() {
+        use chrono::Utc;
+        use uuid::Uuid;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+
+        let error_body = serde_json::json!({
+            "error": "use_dpop_nonce",
+            "message": "Use DPoP nonce"
+        });
+        let error_body_bytes = serde_json::to_vec(&error_body).unwrap();
+        let error_len = error_body_bytes.len();
+
+        let success_body = serde_json::json!({
+            "convos": []
+        });
+        let success_body_bytes = serde_json::to_vec(&success_body).unwrap();
+        let success_len = success_body_bytes.len();
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.listConvos"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("dpop-nonce", "fresh-nonce-test-123")
+                    .set_body_json(error_body),
+            )
+            .up_to_n_times(1)
+            .mount(&pds)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.listConvos"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(success_body),
+            )
+            .mount(&pds)
+            .await;
+
+        let config = crate::config::AppConfig::test_default();
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str())
+            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("REDIS_URL connection must succeed when test is executed");
+
+        let state = Arc::new(crate::config::AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            raw_http_client: crate::services::build_hardened_raw_http_client().expect("hardened raw client"),
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+        });
+
+        let session = crate::models::CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:test_dpop_challenge_user".to_string(),
+            handle: "user.test".to_string(),
+            pds_url: pds.uri(),
+            access_token: "mock_token".to_string(),
+            refresh_token: "mock_refresh".to_string(),
+            scopes: vec!["atproto".to_string()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".to_string()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = crate::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        let client = AtProtoClient::new(state.clone());
+        let response = client
+            .proxy_request_with_limit(
+                &session,
+                reqwest::Method::GET,
+                "/xrpc/chat.bsky.convo.listConvos",
+                None,
+                None,
+                None,
+                None,
+                "test_dpop_req",
+                Some(&dpop_data),
+                10000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let total_transferred = response.bytes_transferred();
+        assert_eq!(
+            total_transferred,
+            error_len + success_len,
+            "ProxyResponse bytes_transferred must be cumulative across 401 challenge and retry attempt"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running Redis (REDIS_URL)"]
+    async fn test_proxy_request_with_limit_rejects_when_dpop_challenge_exceeds_budget() {
+        use chrono::Utc;
+        use uuid::Uuid;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+
+        let large_error_body = serde_json::json!({
+            "error": "use_dpop_nonce",
+            "padding": "a".repeat(400)
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.listConvos"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("dpop-nonce", "fresh-nonce-test-456")
+                    .set_body_json(large_error_body),
+            )
+            .mount(&pds)
+            .await;
+
+        let config = crate::config::AppConfig::test_default();
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str())
+            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("REDIS_URL connection must succeed when test is executed");
+
+        let state = Arc::new(crate::config::AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            raw_http_client: crate::services::build_hardened_raw_http_client().expect("hardened raw client"),
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+        });
+
+        let session = crate::models::CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:test_dpop_budget_user".to_string(),
+            handle: "user.test".to_string(),
+            pds_url: pds.uri(),
+            access_token: "mock_token".to_string(),
+            refresh_token: "mock_refresh".to_string(),
+            scopes: vec!["atproto".to_string()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".to_string()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = crate::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        let client = AtProtoClient::new(state.clone());
+        // Limit is only 200 bytes, while the 401 challenge body is > 400 bytes.
+        // Bounding by min(max_bytes, STREAM_THRESHOLD) must abort with ResponseTooLarge before buffering 1MB.
+        let res = client
+            .proxy_request_with_limit(
+                &session,
+                reqwest::Method::GET,
+                "/xrpc/chat.bsky.convo.listConvos",
+                None,
+                None,
+                None,
+                None,
+                "test_dpop_req_exceeded",
+                Some(&dpop_data),
+                200,
+            )
+            .await;
+
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            AppError::ResponseTooLarge(msg) => {
+                assert!(msg.contains("exceeded maximum size") || msg.contains("exceeds maximum allowed"));
+            }
+            other => panic!("Expected ResponseTooLarge, got {:?}", other),
+        }
     }
 }

@@ -1605,6 +1605,7 @@ pub async fn proxy_xrpc(
             status,
             headers: resp_headers,
             body: response_body,
+            ..
         } => {
             let response_shape = json_shape(&response_body);
             tracing::info!(
@@ -1659,6 +1660,7 @@ pub async fn proxy_xrpc(
             permit,
             rate_limit,
             session_id,
+            ..
         } => {
             tracing::info!(
                 request_id = %request_id,
@@ -1666,7 +1668,6 @@ pub async fn proxy_xrpc(
                 max_bytes = max_bytes,
                 "[BFF-RESP] PDS response (streaming)"
             );
-
             let mut response = Response::builder()
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {

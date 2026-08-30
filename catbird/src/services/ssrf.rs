@@ -217,6 +217,30 @@ pub fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
+/// Builds the canonical hardened reqwest client with automatic decompression disabled (no gzip/brotli/deflate).
+/// Enforces:
+/// - Safe DNS resolution with SSRF and DNS rebinding protection (SafeDnsResolver)
+/// - No proxy (`no_proxy()`)
+/// - No automatic redirects (`Policy::none()`)
+/// - Automatic decompression disabled (`no_gzip()`, `no_brotli()`, `no_deflate()`)
+/// - Strict connection and request timeouts
+/// - Connection pool limits
+pub fn build_hardened_raw_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("Catbird/0.1.0")
+        .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+}
+
 /// Maximum response size allowed for OAuth metadata and token responses (2MB)
 pub const MAX_OAUTH_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 

@@ -97,6 +97,10 @@ pub async fn update_mute_status(
     Extension(session): Extension<CatbirdSession>,
     Json(input): Json<UpdateMuteStatusInput>,
 ) -> AppResult<Json<UpdateMuteStatusOutput>> {
+    if input.muted && !crate::services::chat_poll::scheduler::is_valid_convo_id(&input.convo_id) {
+        return Err(AppError::BadRequest("Invalid conversation ID format or length".into()));
+    }
+
     let push_db = state
         .push_db
         .as_ref()
@@ -107,7 +111,14 @@ pub async fn update_mute_status(
     scheduler
         .set_convo_muted(&session.did, &input.convo_id, input.muted)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("quota exceeded") || msg.contains("Invalid conversation ID") {
+                AppError::BadRequest(msg)
+            } else {
+                AppError::Internal(msg)
+            }
+        })?;
 
     Ok(Json(UpdateMuteStatusOutput { success: true }))
 }

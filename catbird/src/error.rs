@@ -40,6 +40,8 @@ pub enum AppError {
     #[error("Authentication temporarily unavailable: {0}")]
     AuthTemporarilyUnavailable(String),
 
+    #[error("Service temporarily unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("ATProto error: {error} - {message}")]
     AtprotoResponse {
         status: StatusCode,
@@ -103,6 +105,22 @@ pub fn sanitize_error_message(msg: &str) -> String {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::RateLimitExceeded { retry_after } = &self {
+            tracing::warn!("Rate limit exceeded, retry after {} seconds", retry_after);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
+                Json(json!({
+                    "error": "rate_limit_exceeded",
+                    "message": format!(
+                        "Too many requests. Please retry after {} seconds.",
+                        retry_after
+                    ),
+                })),
+            )
+                .into_response();
+        }
+
         let (status, error_type, message) = match &self {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
@@ -127,7 +145,7 @@ impl IntoResponse for AppError {
                 "token_refresh_failed",
                 msg.clone(),
             ),
-            AppError::AuthTemporarilyUnavailable(msg) => (
+            AppError::AuthTemporarilyUnavailable(msg) | AppError::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "TemporarilyUnavailable",
                 msg.clone(),
@@ -285,5 +303,37 @@ mod tests {
         let sanitized_json = sanitize_error_message(raw_json);
         assert!(!sanitized_json.contains("secret_refresh_token_value"));
         assert!(sanitized_json.contains(r#""refresh_token": "[REDACTED]""#));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_exceeded_returns_429_with_retry_after_header() {
+        let err = AppError::RateLimitExceeded { retry_after: 30 };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "30"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["error"], "rate_limit_exceeded");
+        assert_eq!(json["message"], "Too many requests. Please retry after 30 seconds.");
+    }
+
+    #[tokio::test]
+    async fn test_service_unavailable_returns_503() {
+        let err = AppError::ServiceUnavailable("Stream concurrency limit reached".into());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["error"], "TemporarilyUnavailable");
+        assert_eq!(json["message"], "Stream concurrency limit reached");
     }
 }

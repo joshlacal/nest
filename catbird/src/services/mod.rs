@@ -44,6 +44,7 @@ pub use service_auth::{
     ServiceAuthProvider, CIRCLE_APPVIEW_SERVICE_REF, CIRCLE_ENDPOINTS, MLS_APPVIEW_SERVICE_REF,
 };
 pub use ssrf::{
-    build_hardened_http_client, resolve_and_validate_public_url, validate_pds_url,
-    HardenedHttpClient, HardenedHttpClientError, SafeDnsResolver, MAX_OAUTH_RESPONSE_SIZE,
+    build_hardened_http_client, build_hardened_raw_http_client, resolve_and_validate_public_url,
+    validate_pds_url, HardenedHttpClient, HardenedHttpClientError, SafeDnsResolver,
+    MAX_OAUTH_RESPONSE_SIZE,
 };

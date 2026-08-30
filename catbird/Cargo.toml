@@ -18,7 +18,8 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP Client
 reqwest = { version = "0.13", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
-
+flate2 = "1.0"
+brotli = "8.0"
 # Jacquard (AT Protocol)
 jacquard-oauth = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["default"] }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }

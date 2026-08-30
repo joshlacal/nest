@@ -59,6 +59,11 @@ lazy_static! {
         Opts::new("catbird_rate_limit_exceeded_total", "Total rate limit exceeded events"),
         &["endpoint"]
     ).unwrap();
+
+    pub static ref CHAT_POLL_ENABLED_GAUGE: Gauge = Gauge::new(
+        "catbird_chat_poll_enabled",
+        "Whether chat polling subsystem is active and release gate is open (0 = disabled, 1 = enabled)"
+    ).unwrap();
 }
 
 /// Register all metrics with the registry
@@ -85,6 +90,9 @@ pub fn register_metrics() {
     REGISTRY
         .register(Box::new(RATE_LIMIT_EXCEEDED_TOTAL.clone()))
         .unwrap();
+    REGISTRY
+        .register(Box::new(CHAT_POLL_ENABLED_GAUGE.clone()))
+        .unwrap();
 }
 
 /// Handler for /metrics endpoint - returns Prometheus text format
@@ -104,6 +112,11 @@ pub fn record_http_request(method: &str, path: &str, status: u16, duration_secs:
     HTTP_REQUEST_DURATION
         .with_label_values(&[method, path])
         .observe(duration_secs);
+}
+
+/// Update the chat poll enabled gauge metric
+pub fn set_chat_poll_enabled_metric(enabled: bool) {
+    CHAT_POLL_ENABLED_GAUGE.set(if enabled { 1.0 } else { 0.0 });
 }
 
 /// Record a proxy request metric

@@ -890,7 +890,8 @@ mod tests {
 
         let state = Arc::new(AppState {
             config: Arc::new(config),
-            http_client,
+            http_client: http_client.clone(),
+            raw_http_client: http_client,
             redis,
             push_db: None,
             key_store: None,
@@ -955,6 +956,257 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["feed"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running PostgreSQL (DATABASE_URL)"]
+    async fn test_task3_sql_migration_backfills_invalid_and_overquota_rows() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/test_nest_task3".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await
+            .expect("DATABASE_URL connection must succeed when test is executed");
+
+        let did = format!("did:plc:migtest_{}", uuid::Uuid::new_v4());
+
+        // Clean up
+        sqlx::query("DELETE FROM chat_muted_convos WHERE account_did = $1").bind(&did).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM activity_subscriptions WHERE subscriber_did = $1").bind(&did).execute(&pool).await.unwrap();
+
+        // 1. Seed invalid rows into chat_muted_convos
+        sqlx::query("INSERT INTO chat_muted_convos (account_did, convo_id) VALUES ($1, 'invalid space convo')")
+            .bind(&did).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_muted_convos (account_did, convo_id) VALUES ($1, 'valid_convo_1')")
+            .bind(&did).execute(&pool).await.unwrap();
+
+        // 2. Seed invalid rows into activity_subscriptions
+        sqlx::query(
+            "INSERT INTO activity_subscriptions (subscriber_did, subject_did, include_posts, include_replies, created_at, updated_at) \
+             VALUES ($1, 'not_a_valid_did', TRUE, TRUE, NOW(), NOW())"
+        ).bind(&did).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO activity_subscriptions (subscriber_did, subject_did, include_posts, include_replies, created_at, updated_at) \
+             VALUES ($1, 'did:plc:validsubject1', TRUE, TRUE, NOW(), NOW())"
+        ).bind(&did).execute(&pool).await.unwrap();
+
+        // Run the backfill cleanup migration logic
+        let migration_sql = include_str!("../migrations/20260830010000_chat_activity_limits.up.sql");
+        sqlx::raw_sql(migration_sql).execute(&pool).await.unwrap();
+
+        // Verify invalid rows are gone
+        let invalid_mute: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = 'invalid space convo')")
+            .bind(&did).fetch_one(&pool).await.unwrap();
+        assert!(!invalid_mute, "Invalid chat mute row must be removed by backfill");
+
+        let valid_mute: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = 'valid_convo_1')")
+            .bind(&did).fetch_one(&pool).await.unwrap();
+        assert!(valid_mute, "Valid chat mute row must survive migration");
+
+        let invalid_sub: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = 'not_a_valid_did')")
+            .bind(&did).fetch_one(&pool).await.unwrap();
+        assert!(!invalid_sub, "Invalid activity subscription row must be removed by backfill");
+
+        let valid_sub: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = 'did:plc:validsubject1')")
+            .bind(&did).fetch_one(&pool).await.unwrap();
+        assert!(valid_sub, "Valid activity subscription row must survive migration");
+
+        // Clean up
+        sqlx::query("DELETE FROM chat_muted_convos WHERE account_did = $1").bind(&did).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM activity_subscriptions WHERE subscriber_did = $1").bind(&did).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running PostgreSQL and Redis (DATABASE_URL and REDIS_URL)"]
+    async fn test_task3_handlers_allow_legacy_delete_and_reject_invalid_create() {
+        use axum::extract::State;
+        use axum::Extension;
+        use axum::Json;
+        use catbird::config::{AppConfig, AppState};
+        use catbird::handlers::chat_poll::UpdateMuteStatusInput;
+        use catbird::models::CatbirdSession;
+        use catbird::services::push::types::{ActivitySubscriptionPreference, PutActivitySubscriptionInput};
+        use catbird::services::push::PushServices;
+        use chrono::Utc;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/test_nest_task3".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await
+            .expect("DATABASE_URL connection must succeed when test is executed");
+
+        let mut config = AppConfig::test_default();
+        config.push.service_did = Some("did:web:api.catbird.blue".to_string());
+
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str())
+            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("REDIS_URL connection must succeed when test is executed");
+
+        let push_services = PushServices::new(pool.clone(), config.push.clone()).unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            raw_http_client: catbird::services::build_hardened_raw_http_client().expect("hardened raw client"),
+            redis,
+            push_db: Some(pool.clone()),
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: Some(Arc::new(push_services)),
+            dpop_nonce_cache: Arc::new(catbird::services::DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+        });
+
+        let test_did = format!("did:plc:hdlr_legacy_{}", Uuid::new_v4());
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: test_did.clone(),
+            handle: "handler_test.bsky.social".to_string(),
+            pds_url: "https://pds.example.com".to_string(),
+            access_token: "mock_token".to_string(),
+            refresh_token: "mock_refresh".to_string(),
+            scopes: vec!["atproto".to_string()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".to_string()],
+        };
+
+        sqlx::query("DELETE FROM chat_muted_convos WHERE account_did = $1").bind(&test_did).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM activity_subscriptions WHERE subscriber_did = $1").bind(&test_did).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM push_accounts WHERE account_did = $1").bind(&test_did).execute(&pool).await.unwrap();
+        // 1. Direct seed legacy invalid-format rows (representing pre-migration legacy state)
+        let legacy_invalid_did = "bad:legacy:format!";
+        let legacy_invalid_convo = "legacy bad convo id!";
+
+        sqlx::query(
+            "INSERT INTO activity_subscriptions (subscriber_did, subject_did, include_posts, include_replies, created_at, updated_at) \
+             VALUES ($1, $2, TRUE, TRUE, NOW(), NOW())"
+        )
+        .bind(&test_did)
+        .bind(legacy_invalid_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO chat_muted_convos (account_did, convo_id) VALUES ($1, $2)")
+            .bind(&test_did)
+            .bind(legacy_invalid_convo)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 2. Test handlers::push::put_activity_subscription
+        // A: Invalid DID format creation is rejected with 400 Bad Request
+        let invalid_create_input = PutActivitySubscriptionInput {
+            subject: "invalid:did:format!".to_string(),
+            activity_subscription: ActivitySubscriptionPreference {
+                post: true,
+                reply: false,
+            },
+        };
+        let create_err = catbird::handlers::push::put_activity_subscription(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(invalid_create_input),
+        )
+        .await
+        .unwrap_err();
+        match create_err {
+            catbird::error::AppError::BadRequest(msg) => {
+                assert!(msg.contains("Invalid subject DID"), "Expected BadRequest for invalid subject DID, got: {msg}");
+            }
+            other => panic!("Expected AppError::BadRequest, got: {:?}", other),
+        }
+
+        // B: Deletion/unsubscribing legacy invalid row succeeds and removes it from the database
+        let delete_legacy_input = PutActivitySubscriptionInput {
+            subject: legacy_invalid_did.to_string(),
+            activity_subscription: ActivitySubscriptionPreference {
+                post: false,
+                reply: false,
+            },
+        };
+        let delete_res = catbird::handlers::push::put_activity_subscription(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(delete_legacy_input),
+        )
+        .await;
+        assert!(delete_res.is_ok(), "Deleting subscription with legacy invalid DID format must succeed");
+
+        let sub_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = $2)"
+        )
+        .bind(&test_did)
+        .bind(legacy_invalid_did)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!sub_exists, "Legacy activity subscription row must be deleted from database");
+
+        // 3. Test handlers::chat_poll::update_mute_status
+        // A: Invalid convo_id format muting is rejected with 400 Bad Request
+        let invalid_mute_input = UpdateMuteStatusInput {
+            convo_id: "invalid convo id with spaces!".to_string(),
+            muted: true,
+        };
+        let mute_err = catbird::handlers::chat_poll::update_mute_status(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(invalid_mute_input),
+        )
+        .await
+        .unwrap_err();
+        match mute_err {
+            catbird::error::AppError::BadRequest(msg) => {
+                assert!(msg.contains("Invalid conversation ID"), "Expected BadRequest for invalid convo_id, got: {msg}");
+            }
+            other => panic!("Expected AppError::BadRequest, got: {:?}", other),
+        }
+
+        // B: Unmuting legacy invalid convo_id succeeds and removes it from the database
+        let unmute_legacy_input = UpdateMuteStatusInput {
+            convo_id: legacy_invalid_convo.to_string(),
+            muted: false,
+        };
+        let unmute_res = catbird::handlers::chat_poll::update_mute_status(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(unmute_legacy_input),
+        )
+        .await;
+        assert!(unmute_res.is_ok(), "Unmuting legacy invalid convo_id must succeed");
+
+        let mute_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2)"
+        )
+        .bind(&test_did)
+        .bind(legacy_invalid_convo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!mute_exists, "Legacy chat mute row must be deleted from database");
+
+        // Clean up
+        sqlx::query("DELETE FROM chat_muted_convos WHERE account_did = $1").bind(&test_did).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM activity_subscriptions WHERE subscriber_did = $1").bind(&test_did).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM push_accounts WHERE account_did = $1").bind(&test_did).execute(&pool).await.unwrap();
     }
 }
 /// Tests that require a running Redis instance

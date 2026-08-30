@@ -354,7 +354,8 @@ mod tests {
 
         Arc::new(AppState {
             config: Arc::new(config),
-            http_client,
+            http_client: http_client.clone(),
+            raw_http_client: http_client,
             redis,
             push_db: None,
             key_store: None,

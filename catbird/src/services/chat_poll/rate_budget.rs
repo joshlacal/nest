@@ -2,6 +2,40 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Minimum backoff duration for a PDS host after 429 (60 seconds).
+pub const MIN_RETRY_AFTER_SECS: u64 = 60;
+
+/// Maximum allowed backoff duration for a PDS host (1 hour / 3600 seconds) to prevent worker paralysis.
+pub const MAX_RETRY_AFTER_SECS: u64 = 3600;
+
+/// Default backoff duration when Retry-After is absent or unparseable.
+pub const DEFAULT_RETRY_AFTER_SECS: u64 = 60;
+
+/// Parse and clamp a Retry-After header or string payload to [MIN_RETRY_AFTER_SECS, MAX_RETRY_AFTER_SECS].
+/// Never panics on overflow or negative values.
+pub fn parse_and_clamp_retry_after(raw: Option<&str>) -> u64 {
+    let Some(raw_str) = raw else {
+        return DEFAULT_RETRY_AFTER_SECS;
+    };
+    let trimmed = raw_str.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_RETRY_AFTER_SECS;
+    }
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return secs.clamp(MIN_RETRY_AFTER_SECS, MAX_RETRY_AFTER_SECS);
+    }
+    if let Ok(signed) = trimmed.parse::<i64>() {
+        if signed <= 0 {
+            return MIN_RETRY_AFTER_SECS;
+        }
+        return (signed as u64).clamp(MIN_RETRY_AFTER_SECS, MAX_RETRY_AFTER_SECS);
+    }
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return MAX_RETRY_AFTER_SECS;
+    }
+    DEFAULT_RETRY_AFTER_SECS
+}
+
 pub struct PdsRateBudget {
     buckets: Mutex<HashMap<String, TokenBucket>>,
     global_bucket: Mutex<TokenBucket>,
@@ -42,8 +76,13 @@ impl TokenBucket {
     }
 
     fn backoff(&mut self, duration: Duration) {
+        let max_duration = Duration::from_secs(MAX_RETRY_AFTER_SECS);
+        let safe_duration = duration.min(max_duration);
         self.tokens = 0.0;
-        self.last_refill = Instant::now() + duration;
+        let now = Instant::now();
+        self.last_refill = now
+            .checked_add(safe_duration)
+            .unwrap_or_else(|| now + max_duration);
     }
 }
 
@@ -88,9 +127,57 @@ impl PdsRateBudget {
     /// `duration`, effectively preventing any requests to that host until the
     /// duration has elapsed.
     pub fn backoff_host(&self, pds_host: &str, duration: Duration) {
+        let max_duration = Duration::from_secs(MAX_RETRY_AFTER_SECS);
+        let safe_duration = duration.min(max_duration);
         let mut buckets = self.buckets.lock().unwrap();
-        if let Some(bucket) = buckets.get_mut(pds_host) {
-            bucket.backoff(duration);
-        }
+        let bucket = buckets
+            .entry(pds_host.to_string())
+            .or_insert_with(|| TokenBucket::new(50.0, 10.0));
+        bucket.backoff(safe_duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_and_clamp_retry_after_boundaries() {
+        assert_eq!(parse_and_clamp_retry_after(None), 60);
+        assert_eq!(parse_and_clamp_retry_after(Some("")), 60);
+        assert_eq!(parse_and_clamp_retry_after(Some("invalid")), 60);
+        assert_eq!(parse_and_clamp_retry_after(Some("-5")), 60);
+        assert_eq!(parse_and_clamp_retry_after(Some("0")), 60);
+        // Boundary below 60
+        assert_eq!(parse_and_clamp_retry_after(Some("59")), 60);
+        // Exactly at min limit
+        assert_eq!(parse_and_clamp_retry_after(Some("60")), 60);
+        // Middle valid values
+        assert_eq!(parse_and_clamp_retry_after(Some("120")), 120);
+        assert_eq!(parse_and_clamp_retry_after(Some("3599")), 3599);
+        // Exactly at max limit
+        assert_eq!(parse_and_clamp_retry_after(Some("3600")), 3600);
+        // Boundary above 3600
+        assert_eq!(parse_and_clamp_retry_after(Some("3601")), 3600);
+        // Extreme values near i64::MAX and u64::MAX
+        assert_eq!(parse_and_clamp_retry_after(Some(&i64::MAX.to_string())), 3600);
+        assert_eq!(parse_and_clamp_retry_after(Some(&u64::MAX.to_string())), 3600);
+        assert_eq!(
+            parse_and_clamp_retry_after(Some("999999999999999999999999999999")),
+            3600
+        );
+    }
+
+    #[test]
+    fn test_backoff_never_panics_on_extreme_duration() {
+        let mut bucket = TokenBucket::new(10.0, 1.0);
+        // Must not panic on Duration::MAX
+        bucket.backoff(Duration::MAX);
+        assert_eq!(bucket.tokens, 0.0);
+        assert!(!bucket.try_consume());
+
+        let pds_budget = PdsRateBudget::new(20.0);
+        pds_budget.backoff_host("test.pds", Duration::MAX);
+        assert!(!pds_budget.try_acquire("test.pds"));
     }
 }

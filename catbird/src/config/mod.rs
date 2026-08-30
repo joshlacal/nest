@@ -179,6 +179,19 @@ impl PushConfig {
     pub fn is_enabled(&self) -> bool {
         self.database_url.is_some() && self.service_did.is_some()
     }
+
+    /// Independent release gate verification for chat polling beyond config boolean default.
+    ///
+    /// Chat polling remains disabled by default. Even if `chat_poll_enabled` is set in config,
+    /// the subsystem requires an explicit independent deployment gate confirmation via
+    /// `NEST_CHAT_POLL_RELEASE_GATE="open"` or `CATBIRD_CHAT_POLL_RELEASE_GATE="open"`.
+    pub fn is_chat_poll_release_gate_open(&self) -> bool {
+        if !self.chat_poll_enabled {
+            return false;
+        }
+        std::env::var("NEST_CHAT_POLL_RELEASE_GATE").as_deref() == Ok("open")
+            || std::env::var("CATBIRD_CHAT_POLL_RELEASE_GATE").as_deref() == Ok("open")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -602,6 +615,30 @@ impl AppConfig {
 
         Ok(app_config)
     }
+
+    /// Provide a valid default AppConfig for test environments without panicking on unset env vars.
+    pub fn test_default() -> Self {
+        let config = config::Config::builder()
+            .set_default("server.host", default_host())
+            .unwrap()
+            .set_default("server.port", default_port())
+            .unwrap()
+            .set_default("server.base_url", "https://api.catbird.blue")
+            .unwrap()
+            .set_default("redis.url", default_redis_url())
+            .unwrap()
+            .set_default("redis.key_prefix", default_key_prefix())
+            .unwrap()
+            .set_default("redis.session_ttl_seconds", default_session_ttl())
+            .unwrap()
+            .set_default("oauth.client_id", "https://api.catbird.blue")
+            .unwrap()
+            .set_default("oauth.redirect_uri", "https://api.catbird.blue/callback")
+            .unwrap()
+            .build()
+            .unwrap();
+        config.try_deserialize().unwrap()
+    }
 }
 
 /// Concrete Jacquard OAuth client type used throughout nest.
@@ -615,6 +652,7 @@ pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
+    pub raw_http_client: reqwest::Client,
     pub redis: redis::aio::ConnectionManager,
     pub push_db: Option<Pool<Postgres>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
@@ -674,7 +712,8 @@ impl AppState {
 
         let http_client = crate::services::build_hardened_http_client()
             .map_err(|e| anyhow::anyhow!("Failed to build hardened HTTP client: {e}"))?;
-
+        let raw_http_client = crate::services::build_hardened_raw_http_client()
+            .map_err(|e| anyhow::anyhow!("Failed to build hardened raw HTTP client: {e}"))?;
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
         let redis = redis::aio::ConnectionManager::new(redis_client).await?;
 
@@ -729,6 +768,7 @@ impl AppState {
         let mut state = Self {
             config: Arc::new(config),
             http_client,
+            raw_http_client,
             redis,
             push_db,
             key_store: None,
@@ -967,6 +1007,36 @@ mod tests {
         assert!(!initial.contains(&"identity:handle".to_string()));
         assert!(!initial.contains(&"account:email?action=manage".to_string()));
         assert!(!initial.contains(&"account:status?action=manage".to_string()));
+    }
+
+    #[test]
+    fn chat_poll_disabled_by_default_security_gate() {
+        let push_config = PushConfig::default();
+        assert!(
+            !push_config.chat_poll_enabled,
+            "chat_poll_enabled MUST be false by default until release gate opens"
+        );
+    }
+
+    #[test]
+    fn test_chat_poll_release_gate_environment_override() {
+        let mut push_config = PushConfig::default();
+        assert!(!push_config.is_chat_poll_release_gate_open());
+
+        push_config.chat_poll_enabled = true;
+        // Without env var, gate is still closed
+        std::env::remove_var("NEST_CHAT_POLL_RELEASE_GATE");
+        std::env::remove_var("CATBIRD_CHAT_POLL_RELEASE_GATE");
+        assert!(!push_config.is_chat_poll_release_gate_open());
+
+        // With env var open, gate is open
+        std::env::set_var("NEST_CHAT_POLL_RELEASE_GATE", "open");
+        assert!(push_config.is_chat_poll_release_gate_open());
+        std::env::remove_var("NEST_CHAT_POLL_RELEASE_GATE");
+
+        std::env::set_var("CATBIRD_CHAT_POLL_RELEASE_GATE", "open");
+        assert!(push_config.is_chat_poll_release_gate_open());
+        std::env::remove_var("CATBIRD_CHAT_POLL_RELEASE_GATE");
     }
 
     #[test]
