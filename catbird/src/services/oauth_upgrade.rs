@@ -38,6 +38,7 @@ pub const ALLOWED_UPGRADE_SCOPES: &[&str] = &[
     "identity:handle",
     "account:email?action=manage",
     "account:status?action=manage",
+    crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE,
 ];
 
 /// TTL for pending upgrade flow state (10 minutes)
@@ -355,11 +356,9 @@ pub fn validate_additional_scopes(scopes: &[String]) -> Result<(), UpgradeError>
     }
     for scope in scopes {
         let trimmed = scope.trim();
-        if trimmed.is_empty()
-            || trimmed.contains(' ')
-            || trimmed.contains('*')
-            || !is_allowed_upgrade_scope(trimmed)
-        {
+        // Exact membership in the const allowlist is the gate; no wildcard or
+        // separator characters can smuggle past it, so no substring checks.
+        if trimmed.is_empty() || trimmed.contains(' ') || !is_allowed_upgrade_scope(trimmed) {
             return Err(UpgradeError::DisallowedScope(scope.clone()));
         }
     }

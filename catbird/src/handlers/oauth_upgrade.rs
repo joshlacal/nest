@@ -219,10 +219,14 @@ pub async fn upgrade_start(
             ));
         }
 
+        // Account-deletion / app-password exclusion. `space:` scopes carry
+        // record/space `delete` verbs that are unrelated to account deletion,
+        // and are already gated by the exact-match allowlist above.
         let scope_lower = scope.to_ascii_lowercase();
-        if scope_lower.contains("app_password")
-            || scope_lower.contains("app-password")
-            || scope_lower.contains("delete")
+        if !scope_lower.starts_with("space:")
+            && (scope_lower.contains("app_password")
+                || scope_lower.contains("app-password")
+                || scope_lower.contains("delete"))
         {
             return Err(AppError::BadRequest(format!(
                 "Scope '{scope}' is excluded by policy"
@@ -618,6 +622,7 @@ mod tests {
                 "identity:handle",
                 "account:email?action=manage",
                 "account:status?action=manage",
+                crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE,
             ]
         );
     }

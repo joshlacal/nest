@@ -554,13 +554,15 @@ pub fn default_initial_scopes() -> Vec<String> {
     ]
 }
 
-/// Default optional progressive scopes (identity and account management).
-/// App-password management and account deletion are excluded by design.
+/// Default optional progressive scopes (identity, account management, and
+/// Circle Spaces). App-password management and account deletion are excluded
+/// by design.
 pub fn default_optional_scopes() -> Vec<String> {
     vec![
         "identity:handle".to_string(),
         "account:email?action=manage".to_string(),
         "account:status?action=manage".to_string(),
+        crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE.to_string(),
     ]
 }
 
@@ -1280,6 +1282,7 @@ mod tests {
                 "identity:handle".to_string(),
                 "account:email?action=manage".to_string(),
                 "account:status?action=manage".to_string(),
+                crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE.to_string(),
             ]
         );
 
@@ -1287,6 +1290,9 @@ mod tests {
         assert!(config.is_scope_allowed("atproto").unwrap());
         assert!(!config
             .is_scope_allowed("account:repo?action=manage")
+            .unwrap());
+        assert!(config
+            .is_scope_allowed(crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE)
             .unwrap());
     }
 
@@ -1341,6 +1347,7 @@ mod tests {
                 "identity:handle".to_string(),
                 "account:email?action=manage".to_string(),
                 "account:status?action=manage".to_string(),
+                crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE.to_string(),
             ]
         );
         assert_eq!(config.scopes, config.max_scopes);

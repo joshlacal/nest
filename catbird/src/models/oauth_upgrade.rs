@@ -9,8 +9,16 @@ use uuid::Uuid;
 /// Maximum number of additional scopes allowed in a single upgrade request
 pub const MAX_ADDITIONAL_SCOPES: usize = 16;
 
-/// Maximum length of an individual scope string
-pub const MAX_SCOPE_LEN: usize = 128;
+/// Maximum length of an individual scope string.
+/// 256 accommodates parameterized `space:` scopes (the Circle scope is ~150 chars).
+pub const MAX_SCOPE_LEN: usize = 256;
+
+/// Circle Space scope, in jacquard-normalized form (params sorted, defaults omitted).
+/// Grants record read_self/create/update/delete on any collection in
+/// `blue.catbird.circle` spaces under any authority, plus space
+/// create/update/delete management. Requested just-in-time when the user
+/// first creates or writes to a Circle.
+pub const CIRCLE_SPACE_SCOPE: &str = "space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update";
 
 /// Minimum length of browser nonce
 pub const MIN_BROWSER_NONCE_LEN: usize = 16;
@@ -29,6 +37,7 @@ pub const ALLOWLISTED_UPGRADE_SCOPES: &[&str] = &[
     "identity:handle",
     "account:email?action=manage",
     "account:status?action=manage",
+    CIRCLE_SPACE_SCOPE,
 ];
 
 /// Request payload for initiating progressive OAuth upgrade (`POST /auth/upgrade`).
