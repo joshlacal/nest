@@ -28,6 +28,8 @@ impl ThreadMuteStore {
     }
 
     pub async fn mute_thread(&self, user_did: &str, thread_root_uri: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, user_did).await?;
         sqlx::query(
             r#"
             INSERT INTO thread_mutes (user_did, thread_root_uri)
@@ -37,17 +39,21 @@ impl ThreadMuteStore {
         )
         .bind(user_did)
         .bind(thread_root_uri)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn unmute_thread(&self, user_did: &str, thread_root_uri: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, user_did).await?;
         sqlx::query("DELETE FROM thread_mutes WHERE user_did = $1 AND thread_root_uri = $2")
             .bind(user_did)
             .bind(thread_root_uri)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 

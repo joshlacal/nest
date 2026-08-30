@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::config::AppState;
 use crate::handlers::{atproto, oauth_upgrade, push};
-use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, RateLimitState};
+use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit};
 
 /// Create the ATProto router
 ///
@@ -26,12 +26,7 @@ use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit, Rate
 /// - /xrpc/* - AT Protocol XRPC proxy
 /// - /.well-known/* - OAuth metadata
 pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
-    // Create rate limit state with default configuration
-    let rate_limit_state = Arc::new(RateLimitState::default());
-
-    // Start background cleanup task for rate limiter
-    rate_limit_state.clone().start_cleanup_task();
-
+    let rate_limit_state = state.rate_limit.clone();
     // Auth routes (some protected, some public)
     // Login has stricter IP-based rate limiting
     let auth_routes = Router::new()
@@ -315,13 +310,15 @@ async fn did_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::RateLimitState;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-
     #[tokio::test]
     async fn test_callback_route_ip_rate_limit_enforced() {
-        let rate_limit_state = Arc::new(RateLimitState::default());
+        let trusted_net: ipnet::IpNet = "10.0.0.0/8".parse().unwrap();
+        let rate_limit_state = Arc::new(RateLimitState::with_trusted_proxies(vec![trusted_net]));
+        let proxy_peer = std::net::SocketAddr::from(([10, 0, 0, 1], 12345));
 
         let app = Router::new().route(
             "/auth/callback",
@@ -337,11 +334,12 @@ mod tests {
             )),
         );
 
-        // First 20 requests from same IP should succeed and pass query params through
+        // First 20 requests from same IP through trusted proxy should succeed and pass query params through
         for _ in 0..20 {
             let req = Request::builder()
                 .uri("/auth/callback?code=test_code&state=test_state")
                 .header("x-forwarded-for", "198.51.100.42")
+                .extension(axum::extract::ConnectInfo(proxy_peer))
                 .body(Body::empty())
                 .unwrap();
             let res = app.clone().oneshot(req).await.unwrap();
@@ -352,15 +350,17 @@ mod tests {
         let req = Request::builder()
             .uri("/auth/callback?code=test_code&state=test_state")
             .header("x-forwarded-for", "198.51.100.42")
+            .extension(axum::extract::ConnectInfo(proxy_peer))
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        // Request from a different IP should still succeed
+        // Request from a different IP through trusted proxy should still succeed
         let req = Request::builder()
             .uri("/auth/callback?code=test_code&state=test_state")
             .header("x-forwarded-for", "198.51.100.43")
+            .extension(axum::extract::ConnectInfo(proxy_peer))
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();

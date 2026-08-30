@@ -54,6 +54,12 @@ pub async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRes
             "redis not ready",
         );
     }
+    if !state.is_session_index_ready() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "session index reconciling",
+        );
+    }
 
     (axum::http::StatusCode::OK, "ready")
 }

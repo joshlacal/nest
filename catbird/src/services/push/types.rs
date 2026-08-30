@@ -227,6 +227,42 @@ pub struct RegisterPushInput {
     #[serde(rename = "ageRestricted")]
     pub age_restricted: Option<bool>,
 }
+impl RegisterPushInput {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let trimmed_token = self.token.trim();
+        if trimmed_token.is_empty() {
+            return Err(anyhow::anyhow!("Device token cannot be empty"));
+        }
+        if self.token.len() > 512 {
+            return Err(anyhow::anyhow!(
+                "Device token exceeds maximum length of 512"
+            ));
+        }
+        if self.token.chars().any(|c| c.is_control()) {
+            return Err(anyhow::anyhow!(
+                "Device token contains invalid control characters"
+            ));
+        }
+        let trimmed_platform = self.platform.trim();
+        if trimmed_platform.is_empty() {
+            return Err(anyhow::anyhow!("Platform cannot be empty"));
+        }
+        if self.platform.len() > 32 {
+            return Err(anyhow::anyhow!("Platform exceeds maximum length of 32"));
+        }
+        let trimmed_app_id = self.app_id.trim();
+        if trimmed_app_id.is_empty() {
+            return Err(anyhow::anyhow!("App ID cannot be empty"));
+        }
+        if self.app_id.len() > 128 {
+            return Err(anyhow::anyhow!("App ID exceeds maximum length of 128"));
+        }
+        if self.service_did.len() > 256 {
+            return Err(anyhow::anyhow!("Service DID exceeds maximum length of 256"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnregisterPushInput {
@@ -236,6 +272,23 @@ pub struct UnregisterPushInput {
     pub platform: String,
     #[serde(rename = "appId")]
     pub app_id: String,
+}
+impl UnregisterPushInput {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let trimmed_token = self.token.trim();
+        if trimmed_token.is_empty() || self.token.len() > 512 {
+            return Err(anyhow::anyhow!("Invalid device token"));
+        }
+        let trimmed_platform = self.platform.trim();
+        if trimmed_platform.is_empty() || self.platform.len() > 32 {
+            return Err(anyhow::anyhow!("Invalid platform"));
+        }
+        let trimmed_app_id = self.app_id.trim();
+        if trimmed_app_id.is_empty() || self.app_id.len() > 128 {
+            return Err(anyhow::anyhow!("Invalid app ID"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,8 +327,13 @@ pub struct QueueRow {
     pub event_timestamp: i64,
     pub created_at: sqlx::types::time::OffsetDateTime,
     pub attempts: i32,
+    #[sqlx(default)]
+    pub lease_token: Option<uuid::Uuid>,
+    #[sqlx(default)]
+    pub lease_version: i64,
+    #[sqlx(default)]
+    pub auth_generation: i64,
 }
-
 #[derive(Debug, Clone, FromRow)]
 pub struct ActivitySubscriptionRow {
     pub subject_did: String,
@@ -288,6 +346,8 @@ pub struct PushAccountRow {
     pub account_did: String,
     pub session_id: String,
     pub pds_url: String,
+    #[sqlx(default)]
+    pub auth_generation: i64,
 }
 
 fn default_include() -> String {

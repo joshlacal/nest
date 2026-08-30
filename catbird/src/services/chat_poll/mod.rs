@@ -60,6 +60,7 @@ impl ChatPollService {
 
     /// Main poll loop: claim due accounts and poll each one.
     async fn run_poll_loop(self, state: Arc<AppState>) {
+        state.wait_for_session_index_readiness().await;
         let batch_size: i64 = 50;
         let idle_sleep = std::time::Duration::from_secs(2);
 
@@ -107,6 +108,7 @@ async fn run_mute_sync_loop(
     db_pool: Pool<Postgres>,
     scheduler: ChatPollScheduler,
 ) {
+    state.wait_for_session_index_readiness().await;
     let interval = std::time::Duration::from_secs(600);
 
     tracing::info!("Chat mute sync loop started (interval=600s)");

@@ -14,9 +14,7 @@ use crate::config::AppState;
 /// row fail to deserialize at once, deferring every notification until the 24h
 /// staleness guard dropped it. A schema change must not be able to cause an
 /// outage.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 pub struct ModerationVerdict {
     pub muted: bool,
@@ -29,35 +27,115 @@ pub struct ModerationVerdict {
 }
 
 impl ModerationVerdict {
-    /// Parse `app.bsky.actor.defs#viewerState`. Absent/!=true fields are false.
+    /// Parse `app.bsky.actor.defs#viewerState`.
+    /// Requires that `viewer` is present and is a JSON Object. Fails closed (returns Err) on non-object / missing viewer.
+    /// Absent optional booleans in valid object default to false.
     /// `mutedByList`/`blockingByList` are OBJECTS in the lexicon (listViewBasic):
     /// presence of the object means true, absence means false.
-    pub fn from_viewer_json(viewer: Option<&serde_json::Value>) -> Self {
-        let Some(viewer) = viewer.and_then(serde_json::Value::as_object) else {
-            return Self::default();
+    pub fn try_from_viewer_json(viewer: Option<&serde_json::Value>) -> Result<Self> {
+        let Some(viewer_val) = viewer else {
+            return Err(anyhow!("viewerState is missing"));
+        };
+        let Some(viewer) = viewer_val.as_object() else {
+            return Err(anyhow!("viewerState is not a JSON object"));
         };
 
-        // `muted` is a boolean in the lexicon, `blocking` an at-uri string and
-        // `blockedBy` a boolean. The three suppression-critical fields are read
-        // tolerantly of either shape, so a present-but-unexpected value is
-        // never silently read as "not moderated". The two `mutedOnly*` scoping
-        // flags below are plain booleans: they only ever narrow suppression, so
-        // reading an odd shape as false cannot leak a notification.
-        let muted = viewer.get("muted").is_some_and(truthy);
-        let muted_by_list = viewer.get("mutedByList").is_some_and(Value::is_object);
-        let blocking = viewer.get("blocking").is_some_and(truthy);
-        let blocked_by = viewer.get("blockedBy").is_some_and(truthy);
-        let blocking_by_list = viewer.get("blockingByList").is_some_and(Value::is_object);
-        let muted_only_reposts = viewer
-            .get("mutedOnlyReposts")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let muted_only_quoteposts = viewer
-            .get("mutedOnlyQuoteposts")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let mut muted = false;
+        if let Some(val) = viewer.get("muted") {
+            match val {
+                Value::Bool(b) => muted = *b,
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.muted must be a boolean, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
 
-        Self {
+        let mut muted_by_list = false;
+        if let Some(val) = viewer.get("mutedByList") {
+            match val {
+                Value::Object(_) => muted_by_list = true,
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.mutedByList must be an object, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
+
+        let mut blocking = false;
+        if let Some(val) = viewer.get("blocking") {
+            match val {
+                Value::String(s) => {
+                    if s.trim().is_empty() {
+                        return Err(anyhow!("viewerState.blocking must not be an empty string"));
+                    }
+                    blocking = true;
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.blocking must be a non-empty string, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
+
+        let mut blocked_by = false;
+        if let Some(val) = viewer.get("blockedBy") {
+            match val {
+                Value::Bool(b) => blocked_by = *b,
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.blockedBy must be a boolean, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
+
+        let mut blocking_by_list = false;
+        if let Some(val) = viewer.get("blockingByList") {
+            match val {
+                Value::Object(_) => blocking_by_list = true,
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.blockingByList must be an object, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
+
+        let mut muted_only_reposts = false;
+        if let Some(val) = viewer.get("mutedOnlyReposts") {
+            match val {
+                Value::Bool(b) => muted_only_reposts = *b,
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.mutedOnlyReposts must be a boolean, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
+
+        let mut muted_only_quoteposts = false;
+        if let Some(val) = viewer.get("mutedOnlyQuoteposts") {
+            match val {
+                Value::Bool(b) => muted_only_quoteposts = *b,
+                _ => {
+                    return Err(anyhow!(
+                        "viewerState.mutedOnlyQuoteposts must be a boolean, got {:?}",
+                        val
+                    ))
+                }
+            }
+        }
+        Ok(Self {
             muted,
             muted_by_list,
             blocking,
@@ -65,9 +143,13 @@ impl ModerationVerdict {
             blocking_by_list,
             muted_only_reposts,
             muted_only_quoteposts,
-        }
+        })
     }
 
+    /// Parse `app.bsky.actor.defs#viewerState`. Defaults to `Self::default()` when missing or malformed.
+    pub fn from_viewer_json(viewer: Option<&serde_json::Value>) -> Self {
+        Self::try_from_viewer_json(viewer).unwrap_or_default()
+    }
     /// True when NO push may be delivered for this actor.
     /// muted || muted_by_list || blocking || blocked_by || blocking_by_list.
     /// NOTE: muted_only_reposts / muted_only_quoteposts are NOT blanket suppression;
@@ -99,16 +181,6 @@ impl ModerationVerdict {
             "quote" => self.muted_only_quoteposts,
             _ => false,
         }
-    }
-}
-
-/// Whether a viewer-state field asserts a relationship, tolerating either the
-/// boolean or the at-uri string shape the lexicon uses across these fields.
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Bool(flag) => *flag,
-        Value::String(uri) => !uri.is_empty(),
-        _ => false,
     }
 }
 
@@ -268,10 +340,19 @@ impl ActorModerationResolver {
     /// verdict serving for the rest of the TTL, and a second notification would
     /// still be delivered.
     pub async fn invalidate_recipient(&self, recipient_did: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, recipient_did).await?;
+        sqlx::query(
+            "UPDATE push_accounts SET moderation_generation = moderation_generation + 1 WHERE account_did = $1"
+        )
+        .bind(recipient_did)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM actor_moderation_verdict WHERE recipient_did = $1")
             .bind(recipient_did)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -297,7 +378,7 @@ impl ActorModerationResolver {
     ) -> Result<ActorModeration> {
         let account = sqlx::query(
             r#"
-            SELECT session_id, pds_url, auth_revoked_at
+            SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url, auth_revoked_at, moderation_generation
             FROM push_accounts
             WHERE account_did = $1
             "#,
@@ -323,32 +404,28 @@ impl ActorModerationResolver {
 
         let session_id = account.try_get::<String, _>("session_id")?;
         let pds_url = account.try_get::<String, _>("pds_url")?;
+        let captured_gen: i64 = account.try_get("moderation_generation").unwrap_or(1);
 
-        let (session, dpop) = match super::resolve_background_session(
-            state,
-            recipient_did,
-            &session_id,
-            &pds_url,
-        )
-        .await
-        {
-            Ok(res) => res,
-            Err(err) if super::is_auth_revocation_error(&err) => {
-                tracing::warn!(
-                    user_did = %recipient_did,
-                    error = %err,
-                    "Auth revoked for push account; marking revoked in push_accounts"
-                );
-                let _ = sqlx::query(
-                    "UPDATE push_accounts SET auth_revoked_at = NOW(), updated_at = NOW() WHERE account_did = $1",
-                )
-                .bind(recipient_did)
-                .execute(&self.db_pool)
-                .await;
-                return Err(err);
-            }
-            Err(err) => return Err(err),
-        };
+        let (session, dpop) =
+            match super::resolve_background_session(state, recipient_did, &session_id, &pds_url)
+                .await
+            {
+                Ok(res) => res,
+                Err(err) if super::is_auth_revocation_error(&err) => {
+                    tracing::warn!(
+                        user_did = %recipient_did,
+                        error = %err,
+                        "Auth revoked for push account; marking revoked in push_accounts"
+                    );
+                    let registry =
+                        super::registry::PushRegistry::new(self.db_pool.clone(), String::new());
+                    let _ = registry
+                        .mark_auth_revoked_if_session(recipient_did, &session_id)
+                        .await;
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
 
         let client = crate::services::AtProtoClient::new(state.clone());
         let query = format!("actor={}", urlencoding::encode(actor_did));
@@ -369,9 +446,7 @@ impl ActorModerationResolver {
         let body = match response {
             crate::services::ProxyResponse::Buffered { status, body, .. } => {
                 if !(200..300).contains(&status) {
-                    return Err(anyhow!(
-                        "app.bsky.actor.getProfile returned HTTP {status}"
-                    ));
+                    return Err(anyhow!("app.bsky.actor.getProfile returned HTTP {status}"));
                 }
                 body
             }
@@ -395,27 +470,60 @@ impl ActorModerationResolver {
                  cannot evaluate moderation"
             ));
         };
-        let verdict = ModerationVerdict::from_viewer_json(Some(viewer));
+        let verdict = ModerationVerdict::try_from_viewer_json(Some(viewer))
+            .map_err(|err| anyhow!("app.bsky.actor.getProfile returned malformed viewer state for {recipient_did}: {err}"))?;
         let display_label = actor_label_from_profile_json(&profile);
 
         let verdict_json = serde_json::to_value(verdict)?;
+
+        // Write must be serialized with invalidation: hold the account lock and
+        // discard the result if a newer moderation_generation was installed while
+        // this fetch was in flight (i.e., a mute/block landed mid-fetch).
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, recipient_did).await?;
+        let current_gen: Option<i64> = sqlx::query_scalar(
+            "SELECT moderation_generation FROM push_accounts WHERE account_did = $1",
+        )
+        .bind(recipient_did)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current_gen != Some(captured_gen) {
+            tx.commit().await?;
+            tracing::warn!(
+                recipient = %recipient_did,
+                actor = %actor_did,
+                captured_gen,
+                current_gen = ?current_gen,
+                "Discarding moderation fetch that began before an invalidation"
+            );
+            // Return the (possibly fresh) verdict for this call, but do NOT persist it:
+            // the caller may still use it, but the cache stays clean.
+            return Ok(ActorModeration {
+                verdict,
+                display_label,
+                freshness: Freshness::Live,
+            });
+        }
         sqlx::query(
             r#"
-            INSERT INTO actor_moderation_verdict (recipient_did, actor_did, verdict, display_label, fetched_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO actor_moderation_verdict (recipient_did, actor_did, verdict, display_label, fetched_at, generation)
+            VALUES ($1, $2, $3, $4, NOW(), $5)
             ON CONFLICT (recipient_did, actor_did)
             DO UPDATE
             SET verdict = EXCLUDED.verdict,
                 display_label = EXCLUDED.display_label,
-                fetched_at = NOW()
+                fetched_at = NOW(),
+                generation = EXCLUDED.generation
             "#,
         )
         .bind(recipient_did)
         .bind(actor_did)
         .bind(verdict_json)
         .bind(&display_label)
-        .execute(&self.db_pool)
+        .bind(captured_gen)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(ActorModeration {
             verdict,
@@ -465,16 +573,37 @@ fn truncate(value: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn test_try_from_viewer_json_malformed_non_object_fails() {
+        // Non-object viewer values must fail closed rather than returning an all-false default
+        assert!(ModerationVerdict::try_from_viewer_json(None).is_err());
+        assert!(ModerationVerdict::try_from_viewer_json(Some(&json!("string"))).is_err());
+        assert!(ModerationVerdict::try_from_viewer_json(Some(&json!(12345))).is_err());
+        assert!(ModerationVerdict::try_from_viewer_json(Some(&json!(true))).is_err());
+        assert!(ModerationVerdict::try_from_viewer_json(Some(&json!(false))).is_err());
+        assert!(ModerationVerdict::try_from_viewer_json(Some(&json!([{"muted": true}]))).is_err());
+        assert!(ModerationVerdict::try_from_viewer_json(Some(&json!(null))).is_err());
+    }
 
     #[test]
-    fn test_from_viewer_json_none() {
-        let verdict = ModerationVerdict::from_viewer_json(None);
+    fn test_try_from_viewer_json_valid_empty_object_accepted() {
+        // Valid object with absent optional booleans must succeed with defaults
+        let empty_obj = json!({});
+        let verdict = ModerationVerdict::try_from_viewer_json(Some(&empty_obj))
+            .expect("empty object is valid viewerState");
         assert_eq!(verdict, ModerationVerdict::default());
         assert!(!verdict.suppresses_all());
-        assert!(!verdict.suppresses("repost"));
-        assert!(!verdict.suppresses("quote"));
-        assert!(!verdict.suppresses("like"));
-        assert!(!verdict.suppresses("reply"));
+    }
+    #[test]
+    fn test_malformed_profile_viewer_fails_closed() {
+        let malformed_profile = json!({
+            "did": "did:plc:actor",
+            "handle": "actor.bsky.social",
+            "viewer": "not-an-object"
+        });
+        let viewer = malformed_profile.get("viewer");
+        let result = ModerationVerdict::try_from_viewer_json(viewer);
+        assert!(result.is_err());
     }
 
     #[test]

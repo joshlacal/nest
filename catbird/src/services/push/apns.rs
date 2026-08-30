@@ -20,6 +20,15 @@ pub struct ApnsNotification {
     pub thread_id: Option<String>,
 }
 
+#[async_trait::async_trait]
+pub trait ApnsSender: Send + Sync {
+    async fn send(
+        &self,
+        registration: &RegistrationRow,
+        notification: &ApnsNotification,
+    ) -> Result<&'static str>;
+}
+
 /// The two APNs environments. Sandbox tokens (Xcode debug builds) and
 /// production tokens (TestFlight/App Store builds) are not interchangeable —
 /// each device token is only valid against the endpoint matching how the app
@@ -205,6 +214,17 @@ impl ApnsDelivery {
         }
 
         Ok(payload)
+    }
+}
+
+#[async_trait::async_trait]
+impl ApnsSender for ApnsDelivery {
+    async fn send(
+        &self,
+        registration: &RegistrationRow,
+        notification: &ApnsNotification,
+    ) -> Result<&'static str> {
+        self.send(registration, notification).await
     }
 }
 

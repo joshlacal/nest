@@ -22,8 +22,74 @@ use jacquard_oauth::request::{par, OAuthMetadata};
 use jacquard_oauth::resolver::OAuthResolver;
 use jacquard_oauth::scopes::{Scope, Scopes};
 use smol_str::{SmolStr, ToSmolStr};
+use url::Url;
 
 use crate::config::JacquardOAuthClient;
+use crate::services::validate_pds_url;
+
+/// Validates that an OAuth server's discovered endpoints are valid public HTTPS URLs
+/// and strictly bound to the issuer's origin to prevent SSRF and proof exfiltration.
+pub fn validate_oauth_server_endpoints(
+    issuer: &str,
+    auth_endpoint: &str,
+    token_endpoint: &str,
+    par_endpoint: Option<&str>,
+    revocation_endpoint: Option<&str>,
+) -> Result<()> {
+    validate_pds_url(issuer).map_err(|e| anyhow!("Invalid OAuth issuer URL: {e}"))?;
+    validate_pds_url(auth_endpoint)
+        .map_err(|e| anyhow!("Invalid OAuth authorization endpoint: {e}"))?;
+    validate_pds_url(token_endpoint).map_err(|e| anyhow!("Invalid OAuth token endpoint: {e}"))?;
+
+    let issuer_url = Url::parse(issuer).map_err(|e| anyhow!("Failed to parse issuer URL: {e}"))?;
+    let auth_url =
+        Url::parse(auth_endpoint).map_err(|e| anyhow!("Failed to parse auth endpoint: {e}"))?;
+    let token_url =
+        Url::parse(token_endpoint).map_err(|e| anyhow!("Failed to parse token endpoint: {e}"))?;
+
+    if auth_url.origin() != issuer_url.origin() {
+        return Err(anyhow!(
+            "OAuth authorization endpoint origin ({}) does not match issuer origin ({})",
+            auth_url.origin().ascii_serialization(),
+            issuer_url.origin().ascii_serialization()
+        ));
+    }
+
+    if token_url.origin() != issuer_url.origin() {
+        return Err(anyhow!(
+            "OAuth token endpoint origin ({}) does not match issuer origin ({})",
+            token_url.origin().ascii_serialization(),
+            issuer_url.origin().ascii_serialization()
+        ));
+    }
+
+    if let Some(par) = par_endpoint {
+        validate_pds_url(par).map_err(|e| anyhow!("Invalid OAuth PAR endpoint: {e}"))?;
+        let par_url = Url::parse(par).map_err(|e| anyhow!("Failed to parse PAR endpoint: {e}"))?;
+        if par_url.origin() != issuer_url.origin() {
+            return Err(anyhow!(
+                "OAuth PAR endpoint origin ({}) does not match issuer origin ({})",
+                par_url.origin().ascii_serialization(),
+                issuer_url.origin().ascii_serialization()
+            ));
+        }
+    }
+
+    if let Some(rev) = revocation_endpoint {
+        validate_pds_url(rev).map_err(|e| anyhow!("Invalid OAuth revocation endpoint: {e}"))?;
+        let rev_url =
+            Url::parse(rev).map_err(|e| anyhow!("Failed to parse revocation endpoint: {e}"))?;
+        if rev_url.origin() != issuer_url.origin() {
+            return Err(anyhow!(
+                "OAuth revocation endpoint origin ({}) does not match issuer origin ({})",
+                rev_url.origin().ascii_serialization(),
+                issuer_url.origin().ascii_serialization()
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// Push an authorization request that asks for exactly `scopes`, returning the
 /// authorization URL to redirect the user to.
@@ -45,6 +111,11 @@ pub async fn start_auth_with_scopes(
         ));
     }
 
+    // If identifier is an explicit URL, validate it against SSRF first
+    if identifier.starts_with("http://") || identifier.starts_with("https://") {
+        validate_pds_url(identifier).map_err(|e| anyhow!("Invalid PDS identifier URL: {e}"))?;
+    }
+
     let client_data = &client.registry.client_data;
 
     let mut config = client_data.config.clone();
@@ -62,6 +133,21 @@ pub async fn start_auth_with_scopes(
         .resolve_oauth(identifier)
         .await
         .map_err(|e| anyhow!("identity resolution failed: {e:?}"))?;
+
+    // SSRF protection & endpoint-origin binding on discovered OAuth server metadata
+    validate_oauth_server_endpoints(
+        server_metadata.issuer.as_str(),
+        server_metadata.authorization_endpoint.as_str(),
+        server_metadata.token_endpoint.as_str(),
+        server_metadata
+            .pushed_authorization_request_endpoint
+            .as_ref()
+            .map(|s| s.as_str()),
+        server_metadata
+            .revocation_endpoint
+            .as_ref()
+            .map(|s| s.as_str()),
+    )?;
 
     // Matches `start_auth`: a login hint is only sent when the identifier
     // actually resolved to an identity, never for a bare PDS host.
@@ -98,4 +184,100 @@ pub async fn start_auth_with_scopes(
         urlencoding::encode(metadata.client_metadata.client_id.as_str()),
         urlencoding::encode(auth_req_info.request_uri.as_str()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_oauth_server_endpoints_success() {
+        let res = validate_oauth_server_endpoints(
+            "https://bsky.social",
+            "https://bsky.social/oauth/authorize",
+            "https://bsky.social/oauth/token",
+            Some("https://bsky.social/oauth/par"),
+            Some("https://bsky.social/oauth/revoke"),
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_validate_oauth_server_endpoints_rejects_private_or_invalid_endpoints() {
+        // Private IP in issuer
+        assert!(validate_oauth_server_endpoints(
+            "https://10.0.0.1",
+            "https://10.0.0.1/oauth/authorize",
+            "https://10.0.0.1/oauth/token",
+            None,
+            None,
+        )
+        .is_err());
+
+        // Private IP in auth endpoint
+        assert!(validate_oauth_server_endpoints(
+            "https://bsky.social",
+            "https://192.168.1.1/oauth/authorize",
+            "https://bsky.social/oauth/token",
+            None,
+            None,
+        )
+        .is_err());
+
+        // HTTP endpoint
+        assert!(validate_oauth_server_endpoints(
+            "http://bsky.social",
+            "http://bsky.social/oauth/authorize",
+            "http://bsky.social/oauth/token",
+            None,
+            None,
+        )
+        .is_err());
+
+        // Private IP in revocation endpoint
+        assert!(validate_oauth_server_endpoints(
+            "https://bsky.social",
+            "https://bsky.social/oauth/authorize",
+            "https://bsky.social/oauth/token",
+            None,
+            Some("https://127.0.0.1/oauth/revoke"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_validate_oauth_server_endpoints_rejects_origin_mismatch() {
+        // Mismatched token endpoint origin
+        let err = validate_oauth_server_endpoints(
+            "https://bsky.social",
+            "https://bsky.social/oauth/authorize",
+            "https://evil.attacker.com/oauth/token",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not match issuer origin"));
+
+        // Mismatched PAR endpoint origin
+        let err = validate_oauth_server_endpoints(
+            "https://bsky.social",
+            "https://bsky.social/oauth/authorize",
+            "https://bsky.social/oauth/token",
+            Some("https://evil.attacker.com/oauth/par"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not match issuer origin"));
+
+        // Mismatched revocation endpoint origin
+        let err = validate_oauth_server_endpoints(
+            "https://bsky.social",
+            "https://bsky.social/oauth/authorize",
+            "https://bsky.social/oauth/token",
+            None,
+            Some("https://evil.attacker.com/oauth/revoke"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not match issuer origin"));
+    }
 }

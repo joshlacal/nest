@@ -104,6 +104,332 @@ pub fn validate_pds_url(url: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Validate a URL and resolve its hostname to IP addresses, ensuring that
+/// every resolved address is a non-private, non-restricted public IP.
+/// Returns the parsed Url and the first validated SocketAddr.
+pub async fn resolve_and_validate_public_url(url: &str) -> AppResult<(Url, std::net::SocketAddr)> {
+    validate_pds_url(url)?;
+    let parsed = Url::parse(url).map_err(|e| AppError::BadRequest(format!("Invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::BadRequest("URL has no host".into()))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    // If host is an IP literal, it was already validated by validate_pds_url
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok((parsed, std::net::SocketAddr::new(ip, port)));
+    }
+
+    #[cfg(debug_assertions)]
+    if is_localhost_hostname(host) {
+        let addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        return Ok((parsed, addr));
+    }
+
+    // Resolve DNS asynchronously
+    let addrs = match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(host = %host, port = port, error = %e, "DNS lookup failed");
+            return Err(AppError::BadRequest(format!(
+                "DNS resolution failed for host {host}"
+            )));
+        }
+    };
+
+    if addrs.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "No DNS records found for host {host}"
+        )));
+    }
+
+    for addr in &addrs {
+        if is_private_ip(&addr.ip()) {
+            tracing::warn!(host = %host, ip = %addr.ip(), "SSRF: Host resolved to private/restricted IP");
+            return Err(AppError::BadRequest(
+                "Resolved destination address is in a private or restricted range".into(),
+            ));
+        }
+    }
+
+    Ok((parsed, addrs[0]))
+}
+/// A secure DNS resolver implementing reqwest's `Resolve` trait.
+/// Enforces that all resolved IP addresses are public, non-private, non-loopback,
+/// non-restricted addresses. If ANY resolved IP is in a restricted range,
+/// resolution fails immediately to prevent DNS rebinding and SSRF.
+#[derive(Clone, Debug, Default)]
+pub struct SafeDnsResolver;
+
+impl reqwest::dns::Resolve for SafeDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            #[cfg(debug_assertions)]
+            if is_localhost_hostname(&host) {
+                let addrs: Vec<std::net::SocketAddr> = vec![std::net::SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    0,
+                )];
+                let iter: Box<dyn Iterator<Item = std::net::SocketAddr> + Send + 'static> =
+                    Box::new(addrs.into_iter());
+                return Ok(iter);
+            }
+
+            let addrs = match tokio::net::lookup_host((host.as_str(), 0)).await {
+                Ok(addrs) => addrs.collect::<Vec<_>>(),
+                Err(e) => {
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            };
+
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No DNS records found for host {host}"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+
+            for addr in &addrs {
+                if is_private_ip(&addr.ip()) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "SSRF: Host {host} resolved to restricted/private IP {}",
+                            addr.ip()
+                        ),
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
+            let iter: Box<dyn Iterator<Item = std::net::SocketAddr> + Send + 'static> =
+                Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+/// Builds the canonical hardened reqwest client used for all outbound PDS, OAuth, and AppView requests.
+/// Enforces:
+/// - Safe DNS resolution with SSRF and DNS rebinding protection (SafeDnsResolver)
+/// - No proxy (`no_proxy()`)
+/// - No automatic redirects (`Policy::none()`)
+/// - Strict connection and request timeouts
+/// - Connection pool limits
+pub fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("Catbird/0.1.0")
+        .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .build()
+}
+
+/// Builds the canonical hardened reqwest client with automatic decompression disabled (no gzip/brotli/deflate).
+/// Enforces:
+/// - Safe DNS resolution with SSRF and DNS rebinding protection (SafeDnsResolver)
+/// - No proxy (`no_proxy()`)
+/// - No automatic redirects (`Policy::none()`)
+/// - Automatic decompression disabled (`no_gzip()`, `no_brotli()`, `no_deflate()`)
+/// - Strict connection and request timeouts
+/// - Connection pool limits
+pub fn build_hardened_raw_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("Catbird/0.1.0")
+        .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+}
+
+/// Maximum response size allowed for OAuth metadata and token responses (2MB)
+pub const MAX_OAUTH_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
+
+/// Hardened HTTP client for all Jacquard OAuth, identity resolution, and metadata fetches.
+/// Enforces:
+/// 1. Pre-fetch and pre-send URL and scheme validation (strict HTTPS required; HTTP only for localhost in debug).
+/// 2. Literal IP destination validation (rejects private, loopback, link-local, multicast, documentation literal socket addresses).
+/// 3. Bounded response streaming and buffering up to `MAX_OAUTH_RESPONSE_SIZE` (2 MiB) to prevent memory exhaustion.
+/// 4. Discovered OAuth server metadata validation across all lifecycle endpoints (issuer, auth, token, par, revocation)
+///    matching issuer origin before handing back to Jacquard.
+/// Typed error returned by `HardenedHttpClient` when outbound requests violate policy.
+#[derive(Debug, thiserror::Error)]
+pub enum HardenedHttpClientError {
+    #[error("SSRF policy rejected request: {0}")]
+    Ssrf(String),
+
+    #[error("Response body exceeded maximum allowed limit ({max_size} bytes)")]
+    ResponseTooLarge { max_size: usize },
+
+    #[error("Invalid OAuth server metadata endpoints: {0}")]
+    InvalidOAuthMetadata(String),
+
+    #[error("HTTP request error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error("HTTP response build error: {0}")]
+    Http(#[from] http::Error),
+}
+
+#[derive(Clone, Debug)]
+pub struct HardenedHttpClient {
+    inner: reqwest::Client,
+    max_response_size: usize,
+}
+
+impl HardenedHttpClient {
+    pub fn new(inner: reqwest::Client) -> Self {
+        Self {
+            inner,
+            max_response_size: MAX_OAUTH_RESPONSE_SIZE,
+        }
+    }
+
+    pub fn with_max_response_size(inner: reqwest::Client, max_response_size: usize) -> Self {
+        Self {
+            inner,
+            max_response_size,
+        }
+    }
+
+    pub fn inner(&self) -> &reqwest::Client {
+        &self.inner
+    }
+}
+
+impl Default for HardenedHttpClient {
+    fn default() -> Self {
+        let inner = build_hardened_http_client().expect("Failed to build hardened reqwest client");
+        Self::new(inner)
+    }
+}
+
+impl jacquard_common::http_client::HttpClient for HardenedHttpClient {
+    type Error = HardenedHttpClientError;
+
+    async fn send_http(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> core::result::Result<http::Response<Vec<u8>>, Self::Error> {
+        let (parts, body) = request.into_parts();
+        let uri_str = parts.uri.to_string();
+
+        // 1. SSRF and scheme validation: validate URI scheme and host before sending
+        if let Err(e) = validate_pds_url(&uri_str) {
+            tracing::warn!(uri = %uri_str, error = %e, "HardenedHttpClient: Request rejected by URL/SSRF policy");
+            return Err(HardenedHttpClientError::Ssrf(e.to_string()));
+        }
+
+        let mut req = self.inner.request(parts.method, &uri_str).body(body);
+        for (name, value) in parts.headers.iter() {
+            req = req.header(name.as_str(), value.as_bytes());
+        }
+
+        let resp = req.send().await?;
+
+        // 2. Bounded body reading
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        if let Some(content_length) = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if content_length > self.max_response_size {
+                tracing::warn!(
+                    uri = %uri_str,
+                    content_length = content_length,
+                    max_size = self.max_response_size,
+                    "HardenedHttpClient: Response Content-Length exceeded maximum allowed limit"
+                );
+                return Err(HardenedHttpClientError::ResponseTooLarge {
+                    max_size: self.max_response_size,
+                });
+            }
+        }
+
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut body_bytes = Vec::new();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            if body_bytes.len() + chunk.len() > self.max_response_size {
+                tracing::warn!(
+                    uri = %uri_str,
+                    max_size = self.max_response_size,
+                    "HardenedHttpClient: Response body stream exceeded maximum allowed limit"
+                );
+                return Err(HardenedHttpClientError::ResponseTooLarge {
+                    max_size: self.max_response_size,
+                });
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+
+        // 3. Lifecycle OAuth metadata endpoint validation
+        if uri_str.contains("/.well-known/oauth-authorization-server") && status.is_success() {
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                let issuer = json_val.get("issuer").and_then(|v| v.as_str());
+                let auth_endpoint = json_val
+                    .get("authorization_endpoint")
+                    .and_then(|v| v.as_str());
+                let token_endpoint = json_val.get("token_endpoint").and_then(|v| v.as_str());
+                let par_endpoint = json_val
+                    .get("pushed_authorization_request_endpoint")
+                    .and_then(|v| v.as_str());
+                let revocation_endpoint =
+                    json_val.get("revocation_endpoint").and_then(|v| v.as_str());
+
+                if let (Some(iss), Some(auth_ep), Some(tok_ep)) =
+                    (issuer, auth_endpoint, token_endpoint)
+                {
+                    if let Err(val_err) =
+                        crate::services::oauth_authorize::validate_oauth_server_endpoints(
+                            iss,
+                            auth_ep,
+                            tok_ep,
+                            par_endpoint,
+                            revocation_endpoint,
+                        )
+                    {
+                        tracing::error!(
+                            uri = %uri_str,
+                            error = %val_err,
+                            "HardenedHttpClient: Discovered OAuth server metadata failed endpoint validation"
+                        );
+                        return Err(HardenedHttpClientError::InvalidOAuthMetadata(
+                            val_err.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in headers.iter() {
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
+
+        builder
+            .body(body_bytes)
+            .map_err(HardenedHttpClientError::from)
+    }
+}
+
 /// Check if an IP address is in a private, loopback, or otherwise restricted range
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -453,5 +779,74 @@ mod tests {
         assert!(validate_pds_url("https://172.15.255.255").is_ok());
         // 172.32.0.0+ is NOT private
         assert!(validate_pds_url("https://172.32.0.1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_and_validate_public_url() {
+        // IP literal public
+        let (url, addr) = resolve_and_validate_public_url("https://8.8.8.8:8443/xrpc")
+            .await
+            .unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(addr.ip(), IpAddr::from([8, 8, 8, 8]));
+        assert_eq!(addr.port(), 8443);
+
+        // Private IP rejected
+        assert!(resolve_and_validate_public_url("https://10.0.0.1/xrpc")
+            .await
+            .is_err());
+        assert!(resolve_and_validate_public_url("https://192.168.1.1/xrpc")
+            .await
+            .is_err());
+        assert!(
+            resolve_and_validate_public_url("https://169.254.169.254/latest/meta-data")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_safe_dns_resolver_rejects_private_ips_and_builds_client() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let resolver = SafeDnsResolver;
+
+        // Resolving localhost or private IPs via SafeDnsResolver
+        let _res = resolver
+            .resolve(reqwest::dns::Name::from_str("127.0.0.1").unwrap())
+            .await;
+        // In debug mode it might allow localhost or resolve it; let's test private IP literal domain/name
+        let private_res = resolver
+            .resolve(reqwest::dns::Name::from_str("10.254.254.254").unwrap())
+            .await;
+        assert!(private_res.is_err());
+
+        let client = build_hardened_http_client();
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hardened_http_client_typed_errors_no_panic() {
+        use jacquard_common::http_client::HttpClient;
+
+        let client = HardenedHttpClient::new(reqwest::Client::new());
+
+        // 1. SSRF rejection returns typed error without panic
+        let bad_request = http::Request::builder()
+            .method("GET")
+            .uri("http://10.0.0.1/resource")
+            .body(Vec::new())
+            .unwrap();
+        let err = client.send_http(bad_request).await.unwrap_err();
+        assert!(matches!(err, HardenedHttpClientError::Ssrf(_)));
+
+        // 2. Non-HTTPS scheme rejection returns typed error without panic
+        let http_request = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com/oauth")
+            .body(Vec::new())
+            .unwrap();
+        let err2 = client.send_http(http_request).await.unwrap_err();
+        assert!(matches!(err2, HardenedHttpClientError::Ssrf(_)));
     }
 }

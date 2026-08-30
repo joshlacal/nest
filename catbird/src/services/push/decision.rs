@@ -14,6 +14,7 @@ use super::{
 #[derive(Clone, Default)]
 pub struct PushDecisionEngine;
 
+#[derive(Debug)]
 pub enum QueueDisposition {
     Drop(&'static str),
     Deliver(Vec<(RegistrationRow, ApnsNotification)>),
@@ -253,6 +254,9 @@ mod tests {
             event_timestamp: 1_771_234_567,
             created_at: OffsetDateTime::now_utc(),
             attempts: 0,
+            lease_token: None,
+            lease_version: 0,
+            auth_generation: 1,
         }
     }
 

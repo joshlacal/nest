@@ -45,7 +45,9 @@ use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 use catbird::config::{AppConfig, AppState, JacquardOAuthClient};
 use catbird::models::{ALLOWLISTED_UPGRADE_SCOPES, FIXED_UPGRADE_CALLBACK_URL};
 use catbird::routes::atproto::create_router;
-use catbird::services::{OAuthUpgradeService, RedisAuthStore, DEFAULT_UPGRADE_CALLBACK_URL};
+use catbird::services::{
+    HardenedHttpClient, OAuthUpgradeService, RedisAuthStore, DEFAULT_UPGRADE_CALLBACK_URL,
+};
 
 /// Test encryption key for deterministic AES-256-GCM fixture storage
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42u8; 32];
@@ -81,14 +83,16 @@ fn create_test_session_data_with_pds(
     pds_url: &str,
 ) -> ClientSessionData {
     let did = Did::new_owned(did_str.to_string()).expect("valid DID");
-    let scopes_obj = jacquard_oauth::scopes::Scopes::from_scopes(
-        scopes.into_iter().map(|s| s.convert()),
-    ).expect("valid scopes");
+    let scopes_obj =
+        jacquard_oauth::scopes::Scopes::from_scopes(scopes.into_iter().map(|s| s.convert()))
+            .expect("valid scopes");
 
     ClientSessionData {
         account_did: did.clone(),
         session_id: session_id.to_string().into(),
-        host_url: jacquard_common::deps::fluent_uri::Uri::parse(pds_url).expect("valid PDS URI").to_owned(),
+        host_url: jacquard_common::deps::fluent_uri::Uri::parse(pds_url)
+            .expect("valid PDS URI")
+            .to_owned(),
         authserver_url: pds_url.to_string().into(),
         authserver_token_endpoint: "".into(),
         authserver_revocation_endpoint: None,
@@ -144,12 +148,7 @@ async fn seed_active_session_with_pds(
         .expect("seed active session");
 }
 
-async fn seed_active_session(
-    state: &AppState,
-    session_id: &str,
-    did: &str,
-    scopes: Vec<Scope>,
-) {
+async fn seed_active_session(state: &AppState, session_id: &str, did: &str, scopes: Vec<Scope>) {
     seed_active_session_with_pds(state, session_id, did, scopes, "https://pds.example.com").await;
 }
 
@@ -249,15 +248,16 @@ enum RedisGuard {
     Container(ContainerAsync<Redis>),
 }
 
-fn build_mock_resolver(mock: &MockServer) -> JacquardResolver<reqwest::Client> {
-    let plc_base = jacquard_common::deps::fluent_uri::Uri::parse(format!("{}/", mock.uri()).as_str())
-        .expect("valid mock plc url")
-        .to_owned();
+fn build_mock_resolver(mock: &MockServer) -> JacquardResolver<HardenedHttpClient> {
+    let plc_base =
+        jacquard_common::deps::fluent_uri::Uri::parse(format!("{}/", mock.uri()).as_str())
+            .expect("valid mock plc url")
+            .to_owned();
     let opts = ResolverOptions {
         plc_source: PlcSource::PlcDirectory { base: plc_base },
         ..ResolverOptions::default()
     };
-    JacquardResolver::new(reqwest::Client::new(), opts)
+    JacquardResolver::new(HardenedHttpClient::new(reqwest::Client::new()), opts)
 }
 
 /// Formats received mock requests for diagnostic assertion output.
@@ -409,7 +409,7 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
 
 /// Set up an isolated Redis-backed AppState and TestServer with optional custom resolver.
 async fn setup_test_server_with_resolver(
-    custom_resolver: Option<JacquardResolver<reqwest::Client>>,
+    custom_resolver: Option<JacquardResolver<HardenedHttpClient>>,
 ) -> (Arc<AppState>, TestServer, OAuthUpgradeService, RedisGuard) {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let (redis_url, redis_guard) = if let Some((url, local)) = start_local_redis().await {
@@ -475,10 +475,13 @@ async fn setup_test_server_with_resolver(
         jacquard_common::deps::fluent_uri::Uri::parse(state_obj.config.oauth.redirect_uri.as_str())
             .expect("valid redirect_uri URL")
             .to_owned();
-    let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(format!(
-        "{}/.well-known/jwks.json",
-        state_obj.config.server.base_url.trim_end_matches('/')
-    ).as_str())
+    let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
+        format!(
+            "{}/.well-known/jwks.json",
+            state_obj.config.server.base_url.trim_end_matches('/')
+        )
+        .as_str(),
+    )
     .expect("valid jwks_uri URL")
     .to_owned();
 
@@ -487,19 +490,23 @@ async fn setup_test_server_with_resolver(
         .oauth
         .max_scopes
         .iter()
-        .filter_map(|s| Scope::<smol_str::SmolStr>::parse(s).ok().map(|sc| sc.into_static()))
+        .filter_map(|s| {
+            Scope::<smol_str::SmolStr>::parse(s)
+                .ok()
+                .map(|sc| sc.into_static())
+        })
         .collect();
-    let scopes = Scopes::from_scopes(scopes.into_iter().map(|s| s.convert())).expect("valid scopes");
+    let scopes =
+        Scopes::from_scopes(scopes.into_iter().map(|s| s.convert())).expect("valid scopes");
 
-    let metadata = AtprotoClientMetadata::new(
-        vec![redirect_uri],
-        client_id,
-        Some(scopes),
-    )
-    .with_jwks_uri(jwks_uri);
+    let metadata = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes))
+        .with_jwks_uri(jwks_uri);
     let client_data = ClientData::new(keyset, metadata);
     let resolver = custom_resolver.unwrap_or_else(|| {
-        JacquardResolver::new(reqwest::Client::new(), ResolverOptions::default())
+        JacquardResolver::new(
+            HardenedHttpClient::new(reqwest::Client::new()),
+            ResolverOptions::default(),
+        )
     });
     let jacquard_client = JacquardOAuthClient::new_from_resolver(store, resolver, client_data);
     state_obj.jacquard_client = Some(Arc::new(jacquard_client));

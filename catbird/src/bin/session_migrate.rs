@@ -87,6 +87,24 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
     },
+    /// Backfill session_fp_index and did_index for existing active sessions
+    Backfill {
+        /// Redis connection URL
+        #[arg(long)]
+        redis_url: String,
+        /// Key prefix (default: "catbird:v2:session:")
+        #[arg(long, default_value = "catbird:v2:session:")]
+        prefix: String,
+        /// Session encryption key (32-byte hex or base64 string)
+        #[arg(long, env = "SESSION_ENCRYPTION_KEY")]
+        encryption_key: Option<String>,
+        /// Keys per SCAN iteration
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+        /// Print what would be backfilled without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 // ── Export file format ───────────────────────────────────────────────
@@ -112,9 +130,80 @@ struct ExportedKey {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// Redact userinfo and query parameters from a Redis connection URL for safe display/logging.
+pub fn redact_redis_url(raw: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(raw) {
+        let scheme = parsed.scheme();
+        let host = match parsed.host_str() {
+            Some(h) => h,
+            None => return "<invalid-redis-url>".to_string(),
+        };
+        let port_part = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = parsed.path().trim_start_matches('/');
+        let db_part = match path.parse::<u32>() {
+            Ok(db) => format!("/{db}"),
+            Err(_) => String::new(),
+        };
+        format!("{scheme}://{host}{port_part}{db_part}")
+    } else {
+        "<invalid-redis-url>".to_string()
+    }
+}
+
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+/// Securely writes export data to a file with owner-only permissions (mode 0600 on Unix),
+/// exclusive creation semantics (no overwrite), and symlink rejection.
+fn write_secure_export_file(output: &std::path::Path, data: &[u8]) -> Result<(), anyhow::Error> {
+    if let Ok(meta) = std::fs::symlink_metadata(output) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("Refusing to write to symlink: {}", output.display());
+        }
+        anyhow::bail!(
+            "Export destination '{}' already exists. Overwriting is not permitted.",
+            output.display()
+        );
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+
+    let mut file = opts.open(output).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create private export file '{}': {e}",
+            output.display()
+        )
+    })?;
+
+    let write_res = (|| -> std::io::Result<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        drop(file);
+        let _ = std::fs::remove_file(output);
+        return Err(anyhow::anyhow!(
+            "Failed writing export file '{}': {e}",
+            output.display()
+        ));
+    }
+
+    Ok(())
+}
+
 async fn connect(url: &str) -> Result<redis::aio::ConnectionManager, anyhow::Error> {
-    let client = redis::Client::open(url)?;
-    let conn = redis::aio::ConnectionManager::new(client).await?;
+    let safe_url = redact_redis_url(url);
+    let client = redis::Client::open(url)
+        .map_err(|_| anyhow::anyhow!("Failed to open Redis connection at {safe_url}"))?;
+    let conn = redis::aio::ConnectionManager::new(client)
+        .await
+        .map_err(|_| anyhow::anyhow!("Failed to connect to Redis at {safe_url}"))?;
     Ok(conn)
 }
 
@@ -122,7 +211,10 @@ fn classify_key(key: &str, prefix: &str) -> String {
     let suffix = key.strip_prefix(prefix).unwrap_or(key);
     if suffix.starts_with("session:") {
         "session".into()
-    } else if suffix.starts_with("session_index:") {
+    } else if suffix.starts_with("session_index:")
+        || suffix.starts_with("session_fp_index:")
+        || suffix.starts_with("did_index:")
+    {
         "session_index".into()
     } else if suffix.starts_with("auth_req:") {
         "auth_req".into()
@@ -231,7 +323,7 @@ async fn run_export(
         println!("Dry run: would write {count} keys to {}", output.display());
     } else {
         let json = serde_json::to_string_pretty(&export)?;
-        tokio::fs::write(output, json).await?;
+        write_secure_export_file(output, json.as_bytes())?;
         println!("Exported {count} keys to {}", output.display());
     }
 
@@ -257,8 +349,9 @@ async fn run_import(
 
     if dry_run {
         println!(
-            "Dry run: would import {} keys to {redis_url}",
-            export.keys.len()
+            "Dry run: would import {} keys to {}",
+            export.keys.len(),
+            redact_redis_url(redis_url)
         );
         return Ok(());
     }
@@ -316,9 +409,15 @@ async fn run_verify(
     let mut src = connect(source_url).await?;
     let mut tgt = connect(target_url).await?;
 
-    println!("Scanning keys on source ({source_url})...");
+    println!(
+        "Scanning keys on source ({})...",
+        redact_redis_url(source_url)
+    );
     let src_keys = scan_keys(&mut src, prefix, batch_size).await?;
-    println!("Scanning keys on target ({target_url})...");
+    println!(
+        "Scanning keys on target ({})...",
+        redact_redis_url(target_url)
+    );
     let tgt_keys = scan_keys(&mut tgt, prefix, batch_size).await?;
 
     let src_set: HashSet<_> = src_keys.iter().collect();
@@ -371,6 +470,186 @@ async fn run_verify(
         );
     }
 }
+async fn run_backfill(
+    redis_url: &str,
+    prefix: &str,
+    encryption_key: Option<&str>,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<(), anyhow::Error> {
+    let mut conn = connect(redis_url).await?;
+    println!("Scanning session keys with prefix '{prefix}' for backfill...");
+    let pattern = format!("{prefix}session:*");
+    let mut cursor: u64 = 0;
+    let mut session_keys = Vec::new();
+
+    loop {
+        let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(batch_size)
+            .query_async(&mut conn)
+            .await?;
+
+        session_keys.extend(batch);
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+    session_keys.sort();
+    session_keys.dedup();
+    println!(
+        "Found {} session keys to inspect for backfill",
+        session_keys.len()
+    );
+
+    let raw_key = encryption_key
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SESSION_ENCRYPTION_KEY").ok())
+        .or_else(|| std::env::var("CATBIRD_SESSION_ENCRYPTION_KEY").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Encryption key is required for backfill to compute SHA-256 session fingerprints (set --encryption-key or SESSION_ENCRYPTION_KEY / CATBIRD_SESSION_ENCRYPTION_KEY)")
+        })?;
+    let key_bytes = parse_encryption_key(&raw_key)?;
+    let mut backfilled = 0usize;
+    let mut skipped = 0usize;
+
+    for chunk in session_keys.chunks(batch_size) {
+        let mut pipe = redis::pipe();
+        for k in chunk {
+            pipe.get(k).ttl(k);
+        }
+        let results: Vec<redis::Value> = pipe.query_async(&mut conn).await?;
+        let mut it = results.into_iter();
+
+        for k in chunk {
+            let val_v = it.next().unwrap_or(redis::Value::Nil);
+            let ttl_v = it.next().unwrap_or(redis::Value::Nil);
+
+            let ttl_seconds = match ttl_v {
+                redis::Value::Int(ttl) => ttl,
+                _ => -1,
+            };
+
+            if ttl_seconds <= 0 {
+                skipped += 1;
+                continue;
+            }
+
+            let encrypted_data = match val_v {
+                redis::Value::Data(bytes) => bytes,
+                _ => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Extract did and hmac_fp from session key: {prefix}session:{did}_{hmac_fp}
+            let suffix = k.strip_prefix(prefix).unwrap_or(k);
+            let rest = match suffix.strip_prefix("session:") {
+                Some(r) => r,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
+            if parts.len() != 2 {
+                skipped += 1;
+                continue;
+            }
+            let hmac_fp = parts[0];
+            let did = parts[1];
+
+            // Check if retired
+            let retired_key = format!("{prefix}upgrade_retired:{hmac_fp}");
+            let is_retired: bool = redis::cmd("EXISTS")
+                .arg(&retired_key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(false);
+
+            if is_retired {
+                skipped += 1;
+                continue;
+            }
+
+            let enc_str = String::from_utf8_lossy(&encrypted_data);
+            let json = catbird::services::redis_crypto::open_strict(&key_bytes, &enc_str)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt session record '{k}': {e}"))?;
+            let val = serde_json::from_str::<serde_json::Value>(&json).map_err(|e| {
+                anyhow::anyhow!("Failed to parse decrypted session JSON for '{k}': {e}")
+            })?;
+            let sid = val
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Session record '{k}' missing 'session_id' field in payload")
+                })?;
+
+            let sha256_fp = catbird::services::push::registry::session_fingerprint(sid);
+            let did_index_key = format!("{prefix}did_index:{did}");
+            let fp_index_key = format!("{prefix}session_fp_index:{sha256_fp}");
+
+            if !dry_run {
+                let mut pipe = redis::pipe();
+                pipe.set_ex(&did_index_key, hmac_fp, ttl_seconds as u64);
+                pipe.set_ex(&fp_index_key, hmac_fp, ttl_seconds as u64);
+                let _: () = pipe.query_async(&mut conn).await?;
+            }
+
+            backfilled += 1;
+        }
+    }
+
+    if !dry_run && backfilled == 0 {
+        anyhow::bail!(
+            "Backfill installed 0 fingerprint indexes (inspected {} keys, skipped {})",
+            session_keys.len(),
+            skipped
+        );
+    }
+
+    if dry_run {
+        println!("Dry run: would backfill {backfilled} sessions (skipped {skipped})");
+    } else {
+        println!("Successfully backfilled {backfilled} sessions (skipped {skipped})");
+    }
+
+    Ok(())
+}
+
+fn parse_encryption_key(raw_key: &str) -> anyhow::Result<[u8; 32]> {
+    use base64::Engine;
+    let trimmed = raw_key.trim();
+    let bytes = if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        let mut b = Vec::with_capacity(32);
+        for i in (0..64).step_by(2) {
+            let byte = u8::from_str_radix(&trimmed[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("Invalid hex character in encryption key: {e}"))?;
+            b.push(byte);
+        }
+        b
+    } else if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(trimmed) {
+        b
+    } else {
+        anyhow::bail!("Encryption key must be 32 bytes (64 hex characters or base64)");
+    };
+
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "Encryption key must be exactly 32 bytes (got {} bytes)",
+            bytes.len()
+        );
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&bytes);
+    Ok(key_bytes)
+}
 
 // ── main ─────────────────────────────────────────────────────────────
 
@@ -400,8 +679,23 @@ async fn main() {
             spot_check,
             batch_size,
         } => run_verify(&source, &target, &prefix, spot_check, batch_size).await,
+        Command::Backfill {
+            redis_url,
+            prefix,
+            encryption_key,
+            batch_size,
+            dry_run,
+        } => {
+            run_backfill(
+                &redis_url,
+                &prefix,
+                encryption_key.as_deref(),
+                batch_size,
+                dry_run,
+            )
+            .await
+        }
     };
-
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
@@ -420,6 +714,14 @@ mod tests {
         );
         assert_eq!(
             classify_key("catbird:session:session_index:idx1", "catbird:session:"),
+            "session_index"
+        );
+        assert_eq!(
+            classify_key("catbird:session:session_fp_index:sha1", "catbird:session:"),
+            "session_index"
+        );
+        assert_eq!(
+            classify_key("catbird:session:did_index:did1", "catbird:session:"),
             "session_index"
         );
         assert_eq!(
@@ -449,5 +751,162 @@ mod tests {
         let json = serde_json::to_string(&export).unwrap();
         let deserialized: ExportFile = serde_json::from_str(&json).unwrap();
         assert_eq!(export, deserialized);
+    }
+
+    #[test]
+    fn test_redact_redis_url() {
+        assert_eq!(
+            redact_redis_url("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://default:secretpass@127.0.0.1:6379/2?foo=bar#frag"),
+            "redis://127.0.0.1:6379/2"
+        );
+        assert_eq!(
+            redact_redis_url("redis://default:secretpass@127.0.0.1:6379/0/SENTINEL_TOKEN?token=SENTINEL_QUERY#SENTINEL_FRAG"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://:pass@localhost:6379/notanumber/SENTINEL"),
+            "redis://localhost:6379"
+        );
+        assert_eq!(redact_redis_url("not a url"), "<invalid-redis-url>");
+    }
+
+    #[tokio::test]
+    async fn test_connect_error_sanitizes_sentinels() {
+        let sentinel_url = "redis://default:SECRET_PASSWORD@127.0.0.1:6379/0/SECRET_SENTINEL?token=SECRET_QUERY#SECRET_FRAG";
+        let err = match connect(sentinel_url).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected connection failure for invalid sentinel path/port"),
+        };
+        assert!(
+            !err.contains("SECRET_PASSWORD"),
+            "Error must not contain password: {err}"
+        );
+        assert!(
+            !err.contains("SECRET_SENTINEL"),
+            "Error must not contain sentinel path: {err}"
+        );
+        assert!(
+            !err.contains("SECRET_QUERY"),
+            "Error must not contain query params: {err}"
+        );
+        assert!(
+            !err.contains("SECRET_FRAG"),
+            "Error must not contain fragments: {err}"
+        );
+        assert!(
+            err.contains("redis://127.0.0.1:6379"),
+            "Error must contain safe redacted URL: {err}"
+        );
+    }
+
+    #[test]
+    fn test_write_secure_export_file_mode_and_create_new() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_export_mode_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let export_path = temp_dir.join("sessions_export.json");
+        let data = b"{\"version\":1,\"keys\":[]}";
+
+        // First write succeeds
+        let res = write_secure_export_file(&export_path, data);
+        assert!(res.is_ok(), "Initial write should succeed: {:?}", res);
+        assert!(export_path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::symlink_metadata(&export_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "Export file must be created with mode 0600 (owner read/write only)"
+            );
+        }
+
+        // Second write must fail because file exists and overwrite is not permitted
+        let res2 = write_secure_export_file(&export_path, data);
+        assert!(res2.is_err(), "Second write must fail on existing file");
+        assert!(res2.unwrap_err().to_string().contains("already exists"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_write_secure_export_file_rejects_symlink() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_export_symlink_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target_file = temp_dir.join("legit_target.txt");
+        std::fs::write(&target_file, b"original target").unwrap();
+
+        let symlink_path = temp_dir.join("malicious_symlink.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_file, &symlink_path).unwrap();
+
+        #[cfg(unix)]
+        {
+            let res = write_secure_export_file(&symlink_path, b"malicious overwrite");
+            assert!(res.is_err(), "Must reject writing to symlink");
+            assert!(res.unwrap_err().to_string().contains("symlink"));
+            assert_eq!(std::fs::read(&target_file).unwrap(), b"original target");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_missing_encryption_key_fails_closed() {
+        let res = run_backfill("redis://127.0.0.1:6379", "catbird:session:", None, 10, true).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Encryption key is required"),
+            "Unexpected error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_invalid_encryption_key_fails_closed() {
+        let res = run_backfill(
+            "redis://127.0.0.1:6379",
+            "catbird:session:",
+            Some("not-valid-hex-or-b64"),
+            10,
+            true,
+        )
+        .await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Encryption key must be 32 bytes"),
+            "Unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_encryption_key_hex_and_base64() {
+        use base64::Engine;
+        // 32-byte hex string (64 hex characters)
+        let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed_hex =
+            parse_encryption_key(hex_key).expect("64-char hex key must parse to 32 bytes");
+        assert_eq!(parsed_hex[0], 0x01);
+        assert_eq!(parsed_hex[15], 0xef);
+        assert_eq!(parsed_hex[31], 0xef);
+
+        // 32-byte base64 string (44 characters)
+        let raw_32 = [42u8; 32];
+        let b64_key = base64::engine::general_purpose::STANDARD.encode(raw_32);
+        let parsed_b64 =
+            parse_encryption_key(&b64_key).expect("44-char base64 key must parse to 32 bytes");
+        assert_eq!(parsed_b64, raw_32);
+
+        // Invalid length or chars fails
+        assert!(parse_encryption_key("not-a-valid-key").is_err());
+        assert!(parse_encryption_key("012345").is_err());
     }
 }

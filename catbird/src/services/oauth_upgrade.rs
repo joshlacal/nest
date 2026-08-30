@@ -29,8 +29,7 @@ use uuid::Uuid;
 use sha2::Digest;
 
 use super::redis_auth_store::{fingerprint_id, RedisAuthStore};
-use super::redis_crypto::{open_strict, seal_strict};
-
+use super::redis_crypto::{open_v2_with_metadata, seal_v2_with_metadata, EnvelopeMetadata};
 /// Fixed server-side callback URL for progressive OAuth scope upgrades
 pub const DEFAULT_UPGRADE_CALLBACK_URL: &str = "https://catbird.blue/oauth/permission-callback";
 
@@ -79,7 +78,9 @@ const LUA_COMMIT_SCRIPT: &str = r#"
 -- 6: old_session_key (hashed)
 -- 7: old_session_index_key (hashed)
 -- 8: pending_upgrade_key (hashed)
-
+-- 9: new_fp_index_key (hashed)
+-- 10: old_fp_index_key (hashed)
+-- 11: did_index_key
 -- ARGV:
 -- 1: candidate_fingerprint (HMAC fingerprint of candidate_session_id)
 -- 2: old_fingerprint (HMAC fingerprint of old_session_id)
@@ -128,12 +129,16 @@ end
 
 redis.call('SETEX', KEYS[4], tonumber(ARGV[6]), ARGV[4])
 redis.call('SETEX', KEYS[5], tonumber(ARGV[7]), ARGV[3])
+redis.call('SETEX', KEYS[9], tonumber(ARGV[6]), ARGV[1])
+if KEYS[11] and KEYS[11] ~= '' then
+    redis.call('SETEX', KEYS[11], tonumber(ARGV[6]), ARGV[1])
+end
 redis.call('DEL', KEYS[6])
 redis.call('DEL', KEYS[7])
+redis.call('DEL', KEYS[10])
 redis.call('SETEX', KEYS[3], tonumber(ARGV[8]), ARGV[1])
 redis.call('SETEX', KEYS[2], tonumber(ARGV[9]), ARGV[5])
 redis.call('DEL', KEYS[1])
-
 if ARGV[10] and ARGV[10] ~= '' then
     local current_pending = redis.call('GET', KEYS[8])
     if current_pending == ARGV[10] then
@@ -291,7 +296,6 @@ pub struct StagedCandidateSession {
     pub created_at: u64,
     pub expected_old_session_blob: String,
 }
-
 
 /// Exchange state stored under a composite key (old_session_id:code:browser_nonce).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -510,6 +514,13 @@ impl OAuthUpgradeService {
             self.fingerprint(session_id)
         )
     }
+    pub fn session_fp_index_key(&self, session_id: &str) -> String {
+        let sha256_fp = crate::services::push::registry::session_fingerprint(session_id);
+        format!("{}session_fp_index:{}", self.key_prefix, sha256_fp)
+    }
+    pub fn did_index_key(&self, did: &str) -> String {
+        format!("{}did_index:{}", self.key_prefix, did)
+    }
 
     fn enc_key(&self) -> &[u8; 32] {
         &self.encryption_key
@@ -598,13 +609,18 @@ impl OAuthUpgradeService {
         };
 
         let json = serde_json::to_string(&flow_state)?;
-        let encrypted = seal_strict(self.enc_key(), &json)
+        let flow_k = self.flow_key(&state);
+        let flow_meta = EnvelopeMetadata::new(
+            "upgrade_flow",
+            &flow_k,
+            Some(&flow_state.old_did),
+            Some(&self.fingerprint(&flow_state.old_session_id)),
+        );
+        let encrypted = seal_v2_with_metadata(self.enc_key(), &json, &flow_meta)
             .map_err(|e| UpgradeError::Internal(format!("Failed to seal flow: {e}")))?;
-
         // Atomically claim/store flow + pending pointer via Lua script
         let state_fp = self.fingerprint(&state);
         let pending_key = self.pending_upgrade_key(old_session_id);
-        let flow_k = self.flow_key(&state);
         let retired_k = self.retired_key(old_session_id);
         let flow_key_prefix = format!("{}upgrade_flow:", self.key_prefix);
 
@@ -647,10 +663,25 @@ impl OAuthUpgradeService {
             return Ok(None);
         };
 
-        let json = open_strict(self.enc_key(), &encrypted)
-            .map_err(|e| UpgradeError::Internal(format!("Failed to open flow: {e}")))?;
+        let (json, metadata, _) =
+            open_v2_with_metadata(self.enc_key(), &encrypted, "upgrade_flow", &flow_k)
+                .map_err(|e| UpgradeError::Internal(format!("Failed to open flow: {e}")))?;
         let flow: UpgradeFlowState = serde_json::from_str(&json)?;
-
+        if let Some(meta_did) = metadata.did {
+            if meta_did != flow.old_did {
+                return Err(UpgradeError::Internal(
+                    "Flow DID mismatch with envelope metadata".into(),
+                ));
+            }
+        }
+        if let Some(meta_lineage) = metadata.lineage {
+            let expected_lineage_fp = self.fingerprint(&flow.old_session_id);
+            if meta_lineage != expected_lineage_fp {
+                return Err(UpgradeError::Internal(
+                    "Flow lineage mismatch with envelope metadata".into(),
+                ));
+            }
+        }
         // Clean up pending pointer safely only if it still points to this consumed state via atomic CAD
         let state_fp = self.fingerprint(state);
         let pending_k = self.pending_upgrade_key(&flow.old_session_id);
@@ -682,11 +713,27 @@ impl OAuthUpgradeService {
             return Err(UpgradeError::InvalidFlowState);
         };
 
-        let json = open_strict(self.enc_key(), &encrypted)
-            .map_err(|e| UpgradeError::Internal(format!("Failed to open flow: {e}")))?;
+        let (json, metadata, _) =
+            open_v2_with_metadata(self.enc_key(), &encrypted, "upgrade_flow", &flow_k)
+                .map_err(|e| UpgradeError::Internal(format!("Failed to open flow: {e}")))?;
         let flow: UpgradeFlowState = serde_json::from_str(&json)?;
         if flow.expected_old_session_blob.is_empty() {
             return Err(UpgradeError::InvalidFlowState);
+        }
+        if let Some(meta_did) = metadata.did {
+            if meta_did != flow.old_did {
+                return Err(UpgradeError::Internal(
+                    "Flow DID mismatch with envelope metadata".into(),
+                ));
+            }
+        }
+        if let Some(meta_lineage) = metadata.lineage {
+            let expected_lineage_fp = self.fingerprint(&flow.old_session_id);
+            if meta_lineage != expected_lineage_fp {
+                return Err(UpgradeError::Internal(
+                    "Flow lineage mismatch with envelope metadata".into(),
+                ));
+            }
         }
 
         let state_fp = self.fingerprint(state);
@@ -762,10 +809,9 @@ impl OAuthUpgradeService {
 
         // Require session_data.scopes agrees with the passed grants
         for grant in &parsed_granted {
-            let in_session = session_data
-                .scopes
-                .iter()
-                .any(|s| s.to_string_normalized() == grant.to_string_normalized() || s.grants(grant));
+            let in_session = session_data.scopes.iter().any(|s| {
+                s.to_string_normalized() == grant.to_string_normalized() || s.grants(grant)
+            });
             if !in_session {
                 return Err(UpgradeError::ScopeDowngrade(format!(
                     "session_data.scopes missing granted scope '{}'",
@@ -807,14 +853,18 @@ impl OAuthUpgradeService {
             expected_old_session_blob: flow.expected_old_session_blob,
         };
         let staged_json = serde_json::to_string(&staged_candidate)?;
-        let staged_encrypted = seal_strict(self.enc_key(), &staged_json)
-            .map_err(|e| UpgradeError::Internal(format!("Failed to seal candidate: {e}")))?;
-
-        // Save staged candidate outside ordinary session/index
         let cand_key = self.candidate_key(&candidate_session_id);
+        let cand_meta = EnvelopeMetadata::new(
+            "upgrade_candidate",
+            &cand_key,
+            Some(&flow.old_did),
+            Some(&self.fingerprint(&flow.old_session_id)),
+        );
+        let staged_encrypted = seal_v2_with_metadata(self.enc_key(), &staged_json, &cand_meta)
+            .map_err(|e| UpgradeError::Internal(format!("Failed to seal candidate: {e}")))?;
+        // Save staged candidate outside ordinary session/index
         conn.set_ex::<_, _, ()>(&cand_key, staged_encrypted, UPGRADE_CANDIDATE_TTL_SECONDS)
             .await?;
-
         // Save exchange state under composite key
         let exchange_state = UpgradeExchangeState {
             candidate_session_id: candidate_session_id.clone(),
@@ -825,16 +875,21 @@ impl OAuthUpgradeService {
         };
 
         let exchange_json = serde_json::to_string(&exchange_state)?;
-        let exchange_encrypted = seal_strict(self.enc_key(), &exchange_json)
-            .map_err(|e| UpgradeError::Internal(format!("Failed to seal exchange: {e}")))?;
         let ex_key = self.exchange_key(
             &exchange_state.old_session_id,
             &exchange_code,
             &flow.browser_nonce,
         );
+        let ex_meta = EnvelopeMetadata::new(
+            "upgrade_exchange",
+            &ex_key,
+            Some(&exchange_state.did),
+            Some(&self.fingerprint(&exchange_state.old_session_id)),
+        );
+        let exchange_encrypted = seal_v2_with_metadata(self.enc_key(), &exchange_json, &ex_meta)
+            .map_err(|e| UpgradeError::Internal(format!("Failed to seal exchange: {e}")))?;
         conn.set_ex::<_, _, ()>(&ex_key, exchange_encrypted, UPGRADE_EXCHANGE_TTL_SECONDS)
             .await?;
-
         Ok(UpgradeCallbackResult {
             exchange_code,
             candidate_session_id,
@@ -860,17 +915,25 @@ impl OAuthUpgradeService {
             return Err(UpgradeError::ExchangeNotFound);
         };
 
-        let json = open_strict(self.enc_key(), &encrypted)
-            .map_err(|e| UpgradeError::Internal(format!("Failed to open exchange: {e}")))?;
+        let (json, metadata, _) =
+            open_v2_with_metadata(self.enc_key(), &encrypted, "upgrade_exchange", &ex_key)
+                .map_err(|e| UpgradeError::Internal(format!("Failed to open exchange: {e}")))?;
         let state: UpgradeExchangeState = serde_json::from_str(&json)?;
-
+        if state.old_session_id != old_session_id {
+            return Err(UpgradeError::ExchangeNotFound);
+        }
+        if let Some(meta_lineage) = metadata.lineage {
+            let expected_lineage_fp = self.fingerprint(&state.old_session_id);
+            if meta_lineage != expected_lineage_fp {
+                return Err(UpgradeError::ExchangeNotFound);
+            }
+        }
         Ok(UpgradeExchangeResult {
             candidate_session_id: state.candidate_session_id,
             did: state.did,
             granted_scopes: state.granted_scopes,
         })
     }
-
     /// Commit the candidate session (`POST /auth/upgrade/commit`).
     ///
     /// Atomically activates candidate session into ordinary session storage & index,
@@ -900,11 +963,31 @@ impl OAuthUpgradeService {
             }
         };
 
-        let cand_json = open_strict(self.enc_key(), &cand_encrypted)
-            .map_err(|e| UpgradeError::Internal(format!("Candidate decryption failed: {e}")))?;
+        let (cand_json, cand_meta, _) = open_v2_with_metadata(
+            self.enc_key(),
+            &cand_encrypted,
+            "upgrade_candidate",
+            &cand_k,
+        )
+        .map_err(|e| UpgradeError::Internal(format!("Candidate decryption failed: {e}")))?;
         let candidate: StagedCandidateSession = serde_json::from_str(&cand_json)?;
         if candidate.expected_old_session_blob.is_empty() {
             return Err(UpgradeError::OldSessionInactive);
+        }
+        if let Some(meta_did) = cand_meta.did {
+            if meta_did != candidate.did {
+                return Err(UpgradeError::Internal(
+                    "Candidate DID mismatch with envelope metadata".into(),
+                ));
+            }
+        }
+        if let Some(meta_lineage) = cand_meta.lineage {
+            let expected_cand_lineage_fp = self.fingerprint(&candidate.old_session_id);
+            if meta_lineage != expected_cand_lineage_fp {
+                return Err(UpgradeError::Internal(
+                    "Candidate lineage mismatch with envelope metadata".into(),
+                ));
+            }
         }
         let receipt = UpgradeReceipt {
             status: "committed".to_string(),
@@ -915,20 +998,31 @@ impl OAuthUpgradeService {
             committed_at: current_timestamp_secs(),
         };
         let receipt_json = serde_json::to_string(&receipt)?;
-        let encrypted_receipt = seal_strict(self.enc_key(), &receipt_json)
+        let receipt_k = self.receipt_key(candidate_session_id);
+        let receipt_meta = EnvelopeMetadata::new(
+            "upgrade_receipt",
+            &receipt_k,
+            Some(&receipt.did),
+            Some(&self.fingerprint(&receipt.old_session_id)),
+        );
+        let encrypted_receipt = seal_v2_with_metadata(self.enc_key(), &receipt_json, &receipt_meta)
             .map_err(|e| UpgradeError::Internal(format!("Receipt encryption failed: {e}")))?;
 
-        // Re-encrypt the session data for standard session storage
-        let encrypted_session = seal_strict(self.enc_key(), &candidate.session_data_json)
-            .map_err(|e| UpgradeError::Internal(format!("Session encryption failed: {e}")))?;
-
-        let retired_k = self.retired_key(&candidate.old_session_id);
         let new_session_k = self.session_key(&candidate.did, candidate_session_id);
+        let session_meta =
+            EnvelopeMetadata::new("session", &new_session_k, Some(&candidate.did), None);
+        let encrypted_session =
+            seal_v2_with_metadata(self.enc_key(), &candidate.session_data_json, &session_meta)
+                .map_err(|e| UpgradeError::Internal(format!("Session encryption failed: {e}")))?;
+        let retired_k = self.retired_key(&candidate.old_session_id);
         let new_index_k = self.session_index_key(candidate_session_id);
         let old_session_k = self.session_key(&candidate.did, &candidate.old_session_id);
         let old_index_k = self.session_index_key(&candidate.old_session_id);
         let pending_k = self.pending_upgrade_key(&candidate.old_session_id);
         let receipt_k = self.receipt_key(candidate_session_id);
+        let new_fp_index_k = self.session_fp_index_key(candidate_session_id);
+        let old_fp_index_k = self.session_fp_index_key(&candidate.old_session_id);
+        let did_index_k = self.did_index_key(&candidate.did);
 
         let cand_fp = self.fingerprint(candidate_session_id);
         let old_fp = self.fingerprint(&candidate.old_session_id);
@@ -948,6 +1042,9 @@ impl OAuthUpgradeService {
             .key(&old_session_k)
             .key(&old_index_k)
             .key(&pending_k)
+            .key(&new_fp_index_k)
+            .key(&old_fp_index_k)
+            .key(&did_index_k)
             .arg(&cand_fp)
             .arg(&old_fp)
             .arg(&candidate.did)
@@ -964,10 +1061,25 @@ impl OAuthUpgradeService {
 
         match script_res.0 {
             0 | 1 => {
-                let json = open_strict(self.enc_key(), &script_res.1).map_err(|e| {
+                let (json, metadata, _) = open_v2_with_metadata(
+                    self.enc_key(),
+                    &script_res.1,
+                    "upgrade_receipt",
+                    &receipt_k,
+                )
+                .map_err(|e| {
                     UpgradeError::Internal(format!("Commit receipt decryption failed: {e}"))
                 })?;
                 let final_receipt: UpgradeReceipt = serde_json::from_str(&json)?;
+                if let Some(meta_lineage) = metadata.lineage {
+                    let expected_receipt_lineage_fp =
+                        self.fingerprint(&final_receipt.old_session_id);
+                    if meta_lineage != expected_receipt_lineage_fp {
+                        return Err(UpgradeError::Internal(
+                            "Receipt lineage mismatch with envelope metadata".into(),
+                        ));
+                    }
+                }
                 Ok(final_receipt)
             }
             2 => Err(UpgradeError::CompetingCandidateWon),
@@ -996,13 +1108,31 @@ impl OAuthUpgradeService {
 
         let data: Option<String> = conn.get(&receipt_k).await?;
         if let Some(encrypted) = data {
-            let json = open_strict(self.enc_key(), &encrypted)
-                .map_err(|e| UpgradeError::Internal(format!("Receipt decryption failed: {e}")))?;
-            return Ok(Some(serde_json::from_str(&json)?));
+            let (json, metadata, _) =
+                open_v2_with_metadata(self.enc_key(), &encrypted, "upgrade_receipt", &receipt_k)
+                    .map_err(|e| {
+                        UpgradeError::Internal(format!("Receipt decryption failed: {e}"))
+                    })?;
+            let receipt: UpgradeReceipt = serde_json::from_str(&json)?;
+            if let Some(meta_did) = metadata.did {
+                if meta_did != receipt.did {
+                    return Err(UpgradeError::Internal(
+                        "Receipt DID mismatch with envelope metadata".into(),
+                    ));
+                }
+            }
+            if let Some(meta_lineage) = metadata.lineage {
+                let expected_receipt_lineage_fp = self.fingerprint(&receipt.old_session_id);
+                if meta_lineage != expected_receipt_lineage_fp {
+                    return Err(UpgradeError::Internal(
+                        "Receipt lineage mismatch with envelope metadata".into(),
+                    ));
+                }
+            }
+            return Ok(Some(receipt));
         }
         Ok(None)
     }
-
     /// Check if a session has an active pending upgrade.
     pub async fn is_pending_upgrade(&self, old_session_id: &str) -> Result<bool, UpgradeError> {
         let mut conn = self.redis.clone();
@@ -1030,6 +1160,7 @@ impl OAuthUpgradeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::redis_crypto::{open_strict, seal_strict, V2_PREFIX};
     const TEST_KEY: [u8; 32] = [0x42u8; 32];
 
     #[test]
@@ -1407,7 +1538,8 @@ mod tests {
         };
         sim.store
             .insert(flow_k.clone(), "encrypted_flow_data".into());
-        sim.store.insert(hmac_pending_k.clone(), fp_valid_state.clone());
+        sim.store
+            .insert(hmac_pending_k.clone(), fp_valid_state.clone());
 
         let res = sim.consume(&flow_k, &hmac_pending_k, &fp_valid_state);
         assert_eq!(res.as_deref(), Some("encrypted_flow_data"));
@@ -1848,7 +1980,10 @@ mod tests {
             "created_at": 1700000000
         }"#;
         let res = serde_json::from_str::<UpgradeFlowState>(legacy_flow_json);
-        assert!(res.is_err(), "Legacy flow missing expected_old_session_blob must be rejected");
+        assert!(
+            res.is_err(),
+            "Legacy flow missing expected_old_session_blob must be rejected"
+        );
 
         // Legacy UpgradeFlowState with old_session_version alias must also fail deserialization
         let alias_flow_json = r#"{
@@ -1861,7 +1996,10 @@ mod tests {
             "old_session_version": "v1"
         }"#;
         let res_alias = serde_json::from_str::<UpgradeFlowState>(alias_flow_json);
-        assert!(res_alias.is_err(), "Alias old_session_version must not deserialize");
+        assert!(
+            res_alias.is_err(),
+            "Alias old_session_version must not deserialize"
+        );
 
         // Legacy StagedCandidateSession missing expected_old_session_blob must fail deserialization
         let legacy_cand_json = r#"{
@@ -1874,7 +2012,10 @@ mod tests {
             "created_at": 1700000000
         }"#;
         let res_cand = serde_json::from_str::<StagedCandidateSession>(legacy_cand_json);
-        assert!(res_cand.is_err(), "Legacy candidate missing expected_old_session_blob must be rejected");
+        assert!(
+            res_cand.is_err(),
+            "Legacy candidate missing expected_old_session_blob must be rejected"
+        );
 
         // Commit simulation strictly rejects empty expected_old_session_blob
         let mut sim = CommitSim {
@@ -1892,8 +2033,10 @@ mod tests {
         let pending_k_hashed = format!("catbird:v2:upgrade_pending:{}", fp_old);
 
         sim.store.insert(cand_k.clone(), "candidate_blob".into());
-        sim.store.insert(old_sess_k_hashed.clone(), "sealed_old_blob".into());
-        sim.store.insert(old_idx_k_hashed.clone(), "did:plc:123".into());
+        sim.store
+            .insert(old_sess_k_hashed.clone(), "sealed_old_blob".into());
+        sim.store
+            .insert(old_idx_k_hashed.clone(), "did:plc:123".into());
 
         let (status, resp) = sim.commit(
             &cand_k,
@@ -1952,10 +2095,16 @@ mod tests {
 
         // A stale cleanup for Flow 1 (which checked its expired flow_k and attempts CAD with fp_state1)
         let deleted = sim.cad(&pending_k, &fp_state1);
-        assert_eq!(deleted, 0, "Stale cleanup must NOT delete newer pending pointer");
+        assert_eq!(
+            deleted, 0,
+            "Stale cleanup must NOT delete newer pending pointer"
+        );
 
         // Newer pointer fp_state2 remains intact in pending_k
-        assert_eq!(sim.store.get(&pending_k).map(|s| s.as_str()), Some(fp_state2.as_str()));
+        assert_eq!(
+            sim.store.get(&pending_k).map(|s| s.as_str()),
+            Some(fp_state2.as_str())
+        );
 
         // Cleanup with matching fp_state2 succeeds
         let deleted2 = sim.cad(&pending_k, &fp_state2);
@@ -1986,5 +2135,62 @@ mod tests {
         assert_eq!(staged.flow_state, fp_state);
         assert_ne!(staged.flow_state, raw_state);
         assert!(!staged.flow_state.contains(raw_state));
+    }
+    #[test]
+    fn test_no_raw_session_bearer_in_envelope_lineage_metadata() {
+        let old_session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let old_did = "did:plc:ragtjsm2j2vknq6z";
+        let state = "oauth_upgrade_state_12345";
+        let flow_key = format!(
+            "catbird:v2:upgrade_flow:{}",
+            fingerprint_id(&TEST_KEY, state)
+        );
+        let lineage_fp = fingerprint_id(&TEST_KEY, old_session_id);
+
+        // Construct envelope metadata as OAuthUpgradeService does
+        let meta =
+            EnvelopeMetadata::new("upgrade_flow", &flow_key, Some(old_did), Some(&lineage_fp));
+
+        let flow_state = UpgradeFlowState {
+            state: state.to_string(),
+            old_session_id: old_session_id.to_string(),
+            old_did: old_did.to_string(),
+            requested_scopes: vec!["identity:handle".to_string()],
+            browser_nonce: "test_nonce".to_string(),
+            created_at: 1700000000,
+            expected_old_session_blob: "old_blob".to_string(),
+        };
+        let flow_json = serde_json::to_string(&flow_state).unwrap();
+        let sealed = seal_v2_with_metadata(&TEST_KEY, &flow_json, &meta).unwrap();
+
+        // Inspect clear v2 header
+        let rest = &sealed[V2_PREFIX.len()..];
+        let (header_b64, _) = rest.split_once(':').unwrap();
+        let header_bytes = base64::engine::general_purpose::STANDARD
+            .decode(header_b64)
+            .unwrap();
+        let header_str = String::from_utf8(header_bytes).unwrap();
+
+        // The clear header must NEVER contain the raw session ID bearer UUID
+        assert!(
+            !header_str.contains(old_session_id),
+            "Clear envelope metadata header must not leak raw session ID bearer"
+        );
+        // The clear header MUST contain the HMAC fingerprint
+        assert!(
+            header_str.contains(&lineage_fp),
+            "Clear envelope metadata header must contain HMAC-SHA256 fingerprint"
+        );
+
+        // Decrypt and verify inner lineage comparison
+        let (decrypted_json, decrypted_meta, _) =
+            open_v2_with_metadata(&TEST_KEY, &sealed, "upgrade_flow", &flow_key).unwrap();
+        let decrypted_flow: UpgradeFlowState = serde_json::from_str(&decrypted_json).unwrap();
+        assert_eq!(decrypted_flow.old_session_id, old_session_id);
+        let computed_lineage_fp = fingerprint_id(&TEST_KEY, &decrypted_flow.old_session_id);
+        assert_eq!(
+            decrypted_meta.lineage.as_deref(),
+            Some(computed_lineage_fp.as_str())
+        );
     }
 }

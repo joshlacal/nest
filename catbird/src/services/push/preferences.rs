@@ -42,6 +42,8 @@ impl PushPreferences {
 
     pub async fn put(&self, did: &str, prefs: &PushPreferencesDocument) -> Result<()> {
         let payload = serde_json::to_value(prefs)?;
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
         sqlx::query(
             r#"
             INSERT INTO push_preferences (account_did, preferences_json, created_at, updated_at)
@@ -54,8 +56,9 @@ impl PushPreferences {
         )
         .bind(did)
         .bind(payload)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 

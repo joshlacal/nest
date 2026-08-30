@@ -15,7 +15,10 @@ pub mod redis_crypto;
 pub mod service_auth;
 mod ssrf;
 
-pub use atproto_client::{AtProtoClient, ProxyResponse};
+pub use atproto_client::{
+    bounded_byte_stream, bounded_byte_stream_with_accounting, bounded_byte_stream_with_permit,
+    filter_client_headers, AtProtoClient, ProxyResponse, MAX_RESPONSE_SIZE,
+};
 pub use crypto::KeyStore;
 pub use dpop_nonce_cache::DpopNonceCache;
 pub use mls_auth::{
@@ -33,8 +36,13 @@ pub use oauth_upgrade::{
     UPGRADE_RECEIPT_TTL_SECONDS,
 };
 pub use push::PushServices;
-pub use redis_auth_store::RedisAuthStore;
+pub use redis_auth_store::{ReconciliationOutcome, RedisAuthStore};
+pub use redis_crypto::{build_aad, open_v2_with_metadata, seal_v2_with_metadata, EnvelopeMetadata};
 pub use service_auth::{
     ServiceAuthProvider, CIRCLE_APPVIEW_SERVICE_REF, CIRCLE_ENDPOINTS, MLS_APPVIEW_SERVICE_REF,
 };
-pub use ssrf::validate_pds_url;
+pub use ssrf::{
+    build_hardened_http_client, build_hardened_raw_http_client, resolve_and_validate_public_url,
+    validate_pds_url, HardenedHttpClient, HardenedHttpClientError, SafeDnsResolver,
+    MAX_OAUTH_RESPONSE_SIZE,
+};

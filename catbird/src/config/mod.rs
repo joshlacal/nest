@@ -148,7 +148,7 @@ fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PushConfig {
     /// Shared Postgres URL used by Nest and catbird-firehose
     #[serde(default)]
@@ -167,17 +167,64 @@ pub struct PushConfig {
     /// Max queue rows to lease per poll
     #[serde(default = "default_push_queue_batch_size")]
     pub queue_batch_size: u32,
+    /// Max active devices per account (default: 10)
+    #[serde(default = "default_max_active_devices_per_account")]
+    pub max_active_devices_per_account: i64,
+    /// Max inactive devices retained per account before pruning (default: 20)
+    #[serde(default = "default_max_inactive_devices_per_account")]
+    pub max_inactive_devices_per_account: i64,
+    /// Max active devices to fan out to per notification (default: 10)
+    #[serde(default = "default_max_fanout_per_notification")]
+    pub max_fanout_per_notification: i64,
+    /// APNs send timeout in seconds (default: 10)
+    #[serde(default = "default_push_send_timeout_seconds")]
+    pub send_timeout_seconds: u64,
     /// APNs delivery configuration
     #[serde(default)]
     pub apns: ApnsConfig,
     /// Enable the chat poll background service
     #[serde(default)]
     pub chat_poll_enabled: bool,
+    /// When true (Phase 2), writers bind the SHA-256 fingerprint into session_id instead of raw plaintext bearer strings
+    #[serde(default)]
+    pub phase2_writers: bool,
 }
 
 impl PushConfig {
     pub fn is_enabled(&self) -> bool {
         self.database_url.is_some() && self.service_did.is_some()
+    }
+
+    /// Independent release gate verification for chat polling beyond config boolean default.
+    ///
+    /// Chat polling remains disabled by default. Even if `chat_poll_enabled` is set in config,
+    /// the subsystem requires an explicit independent deployment gate confirmation via
+    /// `NEST_CHAT_POLL_RELEASE_GATE="open"` or `CATBIRD_CHAT_POLL_RELEASE_GATE="open"`.
+    pub fn is_chat_poll_release_gate_open(&self) -> bool {
+        if !self.chat_poll_enabled {
+            return false;
+        }
+        std::env::var("NEST_CHAT_POLL_RELEASE_GATE").as_deref() == Ok("open")
+            || std::env::var("CATBIRD_CHAT_POLL_RELEASE_GATE").as_deref() == Ok("open")
+    }
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            database_url: None,
+            service_did: None,
+            verdict_ttl_seconds: default_push_verdict_ttl_seconds(),
+            queue_poll_interval_ms: default_push_queue_poll_interval_ms(),
+            queue_batch_size: default_push_queue_batch_size(),
+            max_active_devices_per_account: default_max_active_devices_per_account(),
+            max_inactive_devices_per_account: default_max_inactive_devices_per_account(),
+            max_fanout_per_notification: default_max_fanout_per_notification(),
+            send_timeout_seconds: default_push_send_timeout_seconds(),
+            apns: Default::default(),
+            chat_poll_enabled: false,
+            phase2_writers: false,
+        }
     }
 }
 
@@ -213,6 +260,22 @@ fn default_push_queue_batch_size() -> u32 {
     32
 }
 
+fn default_max_active_devices_per_account() -> i64 {
+    10
+}
+
+fn default_max_inactive_devices_per_account() -> i64 {
+    20
+}
+
+fn default_max_fanout_per_notification() -> i64 {
+    10
+}
+
+fn default_push_send_timeout_seconds() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Host to bind to
@@ -229,6 +292,9 @@ pub struct ServerConfig {
     /// Allowed CORS origins (empty = permissive in dev)
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Trusted reverse proxy CIDRs (empty = none trusted; forwarding headers ignored)
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,6 +308,26 @@ pub struct RedisConfig {
     /// Session TTL in seconds
     #[serde(default = "default_session_ttl")]
     pub session_ttl_seconds: u64,
+}
+
+/// Redact userinfo and query parameters from a Redis connection URL for safe logging.
+pub fn redact_redis_url(raw: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(raw) {
+        let scheme = parsed.scheme();
+        let host = match parsed.host_str() {
+            Some(h) => h,
+            None => return "<invalid-redis-url>".to_string(),
+        };
+        let port_part = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = parsed.path().trim_start_matches('/');
+        let db_part = match path.parse::<u32>() {
+            Ok(db) => format!("/{db}"),
+            Err(_) => String::new(),
+        };
+        format!("{scheme}://{host}{port_part}{db_part}")
+    } else {
+        "<invalid-redis-url>".to_string()
+    }
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawOAuthConfig")]
@@ -416,7 +502,9 @@ impl OAuthConfig {
             .map_err(|e| format!("Invalid scope '{scope_str}': {e:?}"))?;
         let normalized = parsed.to_string_normalized();
         let max_normalized = self.normalized_max_scopes()?;
-        Ok(max_normalized.iter().any(|s| s.as_str() == normalized.as_str()))
+        Ok(max_normalized
+            .iter()
+            .any(|s| s.as_str() == normalized.as_str()))
     }
 }
 
@@ -599,11 +687,35 @@ impl AppConfig {
 
         Ok(app_config)
     }
+
+    /// Provide a valid default AppConfig for test environments without panicking on unset env vars.
+    pub fn test_default() -> Self {
+        let config = config::Config::builder()
+            .set_default("server.host", default_host())
+            .unwrap()
+            .set_default("server.port", default_port())
+            .unwrap()
+            .set_default("server.base_url", "https://api.catbird.blue")
+            .unwrap()
+            .set_default("redis.url", default_redis_url())
+            .unwrap()
+            .set_default("redis.key_prefix", default_key_prefix())
+            .unwrap()
+            .set_default("redis.session_ttl_seconds", default_session_ttl())
+            .unwrap()
+            .set_default("oauth.client_id", "https://api.catbird.blue")
+            .unwrap()
+            .set_default("oauth.redirect_uri", "https://api.catbird.blue/callback")
+            .unwrap()
+            .build()
+            .unwrap();
+        config.try_deserialize().unwrap()
+    }
 }
 
 /// Concrete Jacquard OAuth client type used throughout nest.
 pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
-    jacquard_identity::JacquardResolver<reqwest::Client>,
+    jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient>,
     crate::services::RedisAuthStore,
 >;
 
@@ -612,26 +724,32 @@ pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
+    pub raw_http_client: reqwest::Client,
     pub redis: redis::aio::ConnectionManager,
     pub push_db: Option<Pool<Postgres>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
-    /// Jacquard OAuth client (primary — Catbird iOS)
     pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Jacquard OAuth client for catmos-web
     pub catmos_jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Scopes configured for catmos-web OAuth client
     pub catmos_oauth_scopes: Vec<jacquard_oauth::scopes::Scope>,
+    /// Trusted reverse proxy CIDRs (empty = none trusted; forwarding headers ignored)
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Redis-backed auth store for Jacquard sessions
     pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
     /// Push subsystem managers (only present when push is configured)
     pub push: Option<Arc<crate::services::push::PushServices>>,
-    /// Process-wide per-origin DPoP nonce cache, shared by the XRPC proxy
-    /// path and the chat poller so a nonce learned via one saves the other
-    /// a guaranteed `use_dpop_nonce` round trip. See
-    /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
+    /// Process-wide per-origin DPoP nonce cache
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
     /// AES-256-GCM encryption key for Redis session records
     pub session_encryption_key: Option<[u8; 32]>,
+    /// Concurrency semaphore for active outbound proxy streams
+    pub active_stream_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Rate limit state for session, IP, and byte rate limiting
+    pub rate_limit: Arc<crate::middleware::RateLimitState>,
+    /// Session index readiness signal for background workers
+    pub session_index_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub session_index_readiness: Arc<tokio::sync::Notify>,
 }
 
 fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Error> {
@@ -648,6 +766,13 @@ fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Err
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         validate_configured_oauth_scopes(&config.oauth.scopes)?;
+        let mut parsed_trusted_proxies = Vec::new();
+        for cidr_str in &config.server.trusted_proxies {
+            let net: ipnet::IpNet = cidr_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid trusted_proxies CIDR '{cidr_str}': {e}"))?;
+            parsed_trusted_proxies.push(net);
+        }
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
                 let pool = PgPoolOptions::new()
@@ -660,14 +785,10 @@ impl AppState {
             None => None,
         };
 
-        let http_client = reqwest::Client::builder()
-            .user_agent("Catbird/0.1.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(10)
-            .build()?;
-
+        let http_client = crate::services::build_hardened_http_client()
+            .map_err(|e| anyhow::anyhow!("Failed to build hardened HTTP client: {e}"))?;
+        let raw_http_client = crate::services::build_hardened_raw_http_client()
+            .map_err(|e| anyhow::anyhow!("Failed to build hardened raw HTTP client: {e}"))?;
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
         let redis = redis::aio::ConnectionManager::new(redis_client).await?;
 
@@ -714,20 +835,32 @@ impl AppState {
             anyhow::bail!("CATMOS_OAUTH_SCOPES must contain mandatory 'atproto' scope");
         }
 
+        let rate_limit = Arc::new(crate::middleware::RateLimitState::with_trusted_proxies(
+            parsed_trusted_proxies.clone(),
+        ));
+        rate_limit.clone().start_cleanup_task();
+
         let mut state = Self {
             config: Arc::new(config),
             http_client,
+            raw_http_client,
             redis,
             push_db,
             key_store: None,
             jacquard_client: None,
             catmos_jacquard_client: None,
             catmos_oauth_scopes,
+            trusted_proxies: parsed_trusted_proxies,
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             session_encryption_key,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit,
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         };
+
         // Initialize KeyStore first (needed by OAuth client)
         match crate::services::KeyStore::from_config(&state) {
             Ok(store) => {
@@ -741,14 +874,12 @@ impl AppState {
                 );
             }
         }
-
-        // Initialize Jacquard auth store + OAuth client
         if let Some(ref key_store) = state.key_store {
             match Self::init_jacquard(&state, key_store).await {
                 Ok((store, client)) => {
                     state.auth_store = Some(Arc::new(store));
                     state.jacquard_client = Some(Arc::new(client));
-                    tracing::info!("Jacquard OAuthClient initialized successfully");
+                    tracing::info!("Jacquard OAuthClient and RedisAuthStore initialized");
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -804,6 +935,98 @@ impl AppState {
         Ok(())
     }
 
+    pub fn is_session_index_ready(&self) -> bool {
+        self.session_index_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn wait_for_session_index_readiness(&self) {
+        if self.is_session_index_ready() {
+            return;
+        }
+        while !self.is_session_index_ready() {
+            let notified = self.session_index_readiness.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_session_index_ready() {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    /// Reconcile pre-existing sessions at startup before background workers consume.
+    /// Always releases session index readiness on completion or failure so workers are never parked forever.
+    pub async fn reconcile_session_indexes(
+        &self,
+    ) -> Result<crate::services::ReconciliationOutcome, anyhow::Error> {
+        let Some(auth_store) = self.auth_store.as_ref() else {
+            self.session_index_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.session_index_readiness.notify_waiters();
+            return Ok(crate::services::ReconciliationOutcome {
+                reconciled: 0,
+                skipped: 0,
+                failed: 0,
+                total_scanned: 0,
+                is_complete: true,
+            });
+        };
+
+        let mut attempts = 0usize;
+        let max_attempts = 3usize;
+        let mut last_error = None;
+
+        while attempts < max_attempts {
+            attempts += 1;
+            match auth_store.reconcile_legacy_sessions().await {
+                Ok(outcome) => {
+                    self.session_index_ready
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.session_index_readiness.notify_waiters();
+                    tracing::info!(
+                        reconciled = outcome.reconciled,
+                        attempts = attempts,
+                        is_complete = outcome.is_complete,
+                        "Session index reconciliation complete; background workers unblocked"
+                    );
+                    return Ok(outcome);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        attempt = attempts,
+                        error = %err,
+                        "Session index reconciliation attempt failed"
+                    );
+                    last_error = Some(err);
+                    if attempts < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            50 * (1 << (attempts - 1)),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        // Reconciliation failed after retries: always release readiness so background workers are never parked forever.
+        // The background resolver has fail-closed and self-healing mechanisms for individual session lookups.
+        self.session_index_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.session_index_readiness.notify_waiters();
+
+        let final_err = last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string());
+        tracing::error!(
+            error = %final_err,
+            "Session index reconciliation failed after max retries; background workers unblocked (resolver fails safe)"
+        );
+        Err(anyhow::anyhow!(
+            "Session index reconciliation failed: {final_err}"
+        ))
+    }
+
     /// Build the Jacquard RedisAuthStore and OAuthClient from current state.
     async fn init_jacquard(
         state: &AppState,
@@ -822,16 +1045,21 @@ impl AppState {
 
         let keyset = key_store.to_jacquard_keyset()?;
         // Build AtprotoClientMetadata for confidential client
-        let client_id = jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.client_id.as_str())
-            .map_err(|e| anyhow::anyhow!("Invalid client_id URI: {e:?}"))?
-            .to_owned();
-        let redirect_uri = jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.redirect_uri.as_str())
-            .map_err(|e| anyhow::anyhow!("Invalid redirect_uri: {e:?}"))?
-            .to_owned();
-        let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(format!(
-            "{}/.well-known/jwks.json",
-            state.config.server.base_url.trim_end_matches('/')
-        ).as_str())
+        let client_id =
+            jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.client_id.as_str())
+                .map_err(|e| anyhow::anyhow!("Invalid client_id URI: {e:?}"))?
+                .to_owned();
+        let redirect_uri =
+            jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.redirect_uri.as_str())
+                .map_err(|e| anyhow::anyhow!("Invalid redirect_uri: {e:?}"))?
+                .to_owned();
+        let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
+            format!(
+                "{}/.well-known/jwks.json",
+                state.config.server.base_url.trim_end_matches('/')
+            )
+            .as_str(),
+        )
         .map_err(|e| anyhow::anyhow!("Invalid jwks_uri: {e:?}"))?
         .to_owned();
 
@@ -848,12 +1076,8 @@ impl AppState {
             .collect::<Result<Vec<_>, _>>()?;
         let scopes = Scopes::from_scopes(scopes.into_iter().map(|s| s.convert()))
             .map_err(|e| anyhow::anyhow!("Invalid scopes: {e:?}"))?;
-        let metadata = AtprotoClientMetadata::new(
-            vec![redirect_uri],
-            client_id,
-            Some(scopes),
-        )
-        .with_jwks_uri(jwks_uri);
+        let metadata = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes))
+            .with_jwks_uri(jwks_uri);
 
         let client_data = ClientData::new(Some(keyset), metadata);
         let resolver = Self::build_resolver();
@@ -918,19 +1142,13 @@ impl AppState {
     /// Nest handles low-volume OAuth login flows where correctness matters more
     /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
     /// stale identity data to persist indefinitely when users retried login.
-    fn build_resolver() -> jacquard_identity::JacquardResolver<reqwest::Client> {
-        // `reqwest::Client::new()` has NO timeout: a hung identity lookup
-        // waits forever. This resolver is reached from background workers that
-        // process work sequentially, so one unbounded request stalls the whole
-        // pipeline behind it.
-        let resolver_client = reqwest::Client::builder()
-            .user_agent("Catbird/0.1.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+    fn build_resolver() -> jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient>
+    {
+        let resolver_client = crate::services::build_hardened_http_client()
+            .expect("Failed to build hardened HTTP client for identity resolver");
+        let hardened_client = crate::services::HardenedHttpClient::new(resolver_client);
         let resolver = jacquard_identity::JacquardResolver::new(
-            resolver_client,
+            hardened_client,
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         resolver.with_system_dns()
@@ -961,6 +1179,36 @@ mod tests {
         assert!(!initial.contains(&"identity:handle".to_string()));
         assert!(!initial.contains(&"account:email?action=manage".to_string()));
         assert!(!initial.contains(&"account:status?action=manage".to_string()));
+    }
+
+    #[test]
+    fn chat_poll_disabled_by_default_security_gate() {
+        let push_config = PushConfig::default();
+        assert!(
+            !push_config.chat_poll_enabled,
+            "chat_poll_enabled MUST be false by default until release gate opens"
+        );
+    }
+
+    #[test]
+    fn test_chat_poll_release_gate_environment_override() {
+        let mut push_config = PushConfig::default();
+        assert!(!push_config.is_chat_poll_release_gate_open());
+
+        push_config.chat_poll_enabled = true;
+        // Without env var, gate is still closed
+        std::env::remove_var("NEST_CHAT_POLL_RELEASE_GATE");
+        std::env::remove_var("CATBIRD_CHAT_POLL_RELEASE_GATE");
+        assert!(!push_config.is_chat_poll_release_gate_open());
+
+        // With env var open, gate is open
+        std::env::set_var("NEST_CHAT_POLL_RELEASE_GATE", "open");
+        assert!(push_config.is_chat_poll_release_gate_open());
+        std::env::remove_var("NEST_CHAT_POLL_RELEASE_GATE");
+
+        std::env::set_var("CATBIRD_CHAT_POLL_RELEASE_GATE", "open");
+        assert!(push_config.is_chat_poll_release_gate_open());
+        std::env::remove_var("CATBIRD_CHAT_POLL_RELEASE_GATE");
     }
 
     #[test]
@@ -1484,6 +1732,35 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_redis_url() {
+        assert_eq!(
+            redact_redis_url("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://default:secretpass@127.0.0.1:6379/2?foo=bar#frag"),
+            "redis://127.0.0.1:6379/2"
+        );
+        assert_eq!(
+            redact_redis_url("rediss://user:token@prod.redis.cache.amazonaws.com:6380/0"),
+            "rediss://prod.redis.cache.amazonaws.com:6380/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://:onlypass@localhost:6379"),
+            "redis://localhost:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://default:secretpass@127.0.0.1:6379/0/SENTINEL_TOKEN?token=SENTINEL_QUERY#SENTINEL_FRAG"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://:pass@localhost:6379/notanumber/SENTINEL"),
+            "redis://localhost:6379"
+        );
+        assert_eq!(redact_redis_url("not a url"), "<invalid-redis-url>");
+    }
+
+    #[test]
     fn test_redis_key_prefix_rejects_legacy_and_unversioned() {
         // Legacy prefix
         let legacy_config = base_test_config_builder()
@@ -1619,5 +1896,79 @@ mod tests {
 
         let custom = validate_catmos_scopes("atproto transition:generic identity:handle").unwrap();
         assert_eq!(custom.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_session_indexes_releases_readiness_on_failure() {
+        let session_index_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session_index_readiness = Arc::new(tokio::sync::Notify::new());
+
+        assert!(!session_index_ready.load(std::sync::atomic::Ordering::Acquire));
+
+        // Spawn a background waiter using the safe pinned-enable pattern
+        let waiter_ready = session_index_ready.clone();
+        let waiter_notify = session_index_readiness.clone();
+        let waiter = tokio::spawn(async move {
+            while !waiter_ready.load(std::sync::atomic::Ordering::Acquire) {
+                let notified = waiter_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if waiter_ready.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+            true
+        });
+
+        // Simulate reconciliation failure and ensure readiness is unconditionally set
+        session_index_ready.store(true, std::sync::atomic::Ordering::Release);
+        session_index_readiness.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), waiter).await;
+        assert!(
+            result.is_ok(),
+            "Waiter must not be parked when reconciliation completes or fails"
+        );
+        assert!(
+            result.unwrap().unwrap(),
+            "Waiter must observe readiness as true"
+        );
+        assert!(session_index_ready.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_session_index_readiness_no_lost_wakeup() {
+        let session_index_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session_index_readiness = Arc::new(tokio::sync::Notify::new());
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let ready = session_index_ready.clone();
+            let notify = session_index_readiness.clone();
+            handles.push(tokio::spawn(async move {
+                while !ready.load(std::sync::atomic::Ordering::Acquire) {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if ready.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    notified.await;
+                }
+                true
+            }));
+        }
+
+        tokio::task::yield_now().await;
+
+        session_index_ready.store(true, std::sync::atomic::Ordering::Release);
+        session_index_readiness.notify_waiters();
+
+        for handle in handles {
+            let res = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+            assert!(res.is_ok(), "Waiter must not be parked due to lost wakeup");
+            assert!(res.unwrap().unwrap(), "Waiter must observe readiness");
+        }
     }
 }

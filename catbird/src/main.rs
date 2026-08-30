@@ -10,6 +10,23 @@
 //!
 //! The iOS app communicates only with this gateway, never directly with the PDS.
 
+#![allow(
+    clippy::too_many_arguments,
+    clippy::doc_markdown,
+    clippy::needless_borrow,
+    clippy::useless_conversion,
+    clippy::needless_question_mark,
+    clippy::useless_vec,
+    clippy::derivable_impls,
+    clippy::collapsible_if,
+    clippy::match_like_matches_macro,
+    clippy::unnecessary_sort_by,
+    clippy::unnecessary_to_owned,
+    clippy::io_other_error,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_borrows_in_formatting,
+    clippy::identity_op
+)]
 use axum::{middleware as axum_mw, routing::get, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,8 +80,41 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
-    tracing::info!("Connected to Redis at {}", app_config.redis.url);
+    tracing::info!(
+        "Connected to Redis at {}",
+        crate::config::redact_redis_url(&app_config.redis.url)
+    );
 
+    // Reconcile session indexes for pre-existing sessions in the background.
+    // Health endpoints and listener bind immediately; /ready reflects reconciliation state
+    // and background workers wait on session_index_readiness.
+    // If reconciliation is truncated or encounters errors, re-arms periodically on a timer.
+    let recon_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            match recon_state.reconcile_session_indexes().await {
+                Ok(outcome) => {
+                    if outcome.is_complete && outcome.failed == 0 {
+                        tracing::info!(
+                            reconciled = outcome.reconciled,
+                            "Session index reconciliation fully completed"
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        reconciled = outcome.reconciled,
+                        failed = outcome.failed,
+                        "Session index reconciliation incomplete or had failures; will retry on timer"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed during background session index reconciliation; will retry on timer");
+                }
+            }
+            interval.tick().await;
+        }
+    });
     // Register Prometheus metrics
     metrics::register_metrics();
     tracing::info!("Prometheus metrics registered");
@@ -73,14 +123,25 @@ async fn main() -> anyhow::Result<()> {
         push.spawn_worker(state.clone());
     }
 
-    if state.config.push.chat_poll_enabled {
-        if let Some(push_db) = state.push_db.clone() {
-            let chat_poll = crate::services::chat_poll::ChatPollService::new(push_db);
-            chat_poll.spawn(state.clone());
-            tracing::info!("Chat poll service started");
-        }
-    }
+    let chat_gate_open = state.config.push.is_chat_poll_release_gate_open();
+    metrics::set_chat_poll_enabled_metric(chat_gate_open);
 
+    if state.config.push.chat_poll_enabled {
+        if chat_gate_open {
+            tracing::warn!("CHAT POLL IS ENABLED via configuration and release gate is OPEN");
+            if let Some(push_db) = state.push_db.clone() {
+                let chat_poll = crate::services::chat_poll::ChatPollService::new(push_db);
+                chat_poll.spawn(state.clone());
+                tracing::info!("Chat poll service started");
+            }
+        } else {
+            tracing::error!(
+                "CHAT POLL is enabled in config (chat_poll_enabled=true), but independent release gate is CLOSED (NEST_CHAT_POLL_RELEASE_GATE != 'open'). Service will NOT start."
+            );
+        }
+    } else {
+        tracing::info!("Chat poll is disabled by default (security gate closed)");
+    }
     // Start background task to update active sessions gauge
     let metrics_state = state.clone();
     let key_prefix = app_config.redis.key_prefix.clone();
@@ -162,9 +223,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

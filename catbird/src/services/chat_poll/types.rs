@@ -86,6 +86,7 @@ pub struct ChatPushEvent {
     pub message_id: String,
     pub message_text: String,
     pub sent_at: String,
+    pub auth_generation: i64,
 }
 
 impl ChatPushEvent {

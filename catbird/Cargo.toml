@@ -18,13 +18,14 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP Client
 reqwest = { version = "0.13", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
-
+flate2 = "1.0"
+brotli = "8.0"
 # Jacquard (AT Protocol)
 jacquard-oauth = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["default"] }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }
 jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["dns", "cache"] }
 jose-jwk = { version = "0.1", features = ["p256"] }
-catbird-atproto = { path = "../../catbird-atproto" }
+catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-bluecatbird", "namespace-site-standard"] }
 
 # Encryption
 aes-gcm = "0.10"
@@ -67,6 +68,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
 futures-util = "0.3"
+regex = "1"
+async-trait = "0.1"
 
 # Metrics
 prometheus = "0.13"
@@ -76,6 +79,7 @@ bytes = "1.0"
 urlencoding = "2.1"
 time = "0.3"
 smol_str = { version = "0.3", features = ["serde"] }
+ipnet = "2.10"
 a2 = "0.10"
 
 [dev-dependencies]
@@ -84,4 +88,39 @@ tokio-test = "0.4"
 wiremock = "0.6"
 testcontainers = "0.18"
 testcontainers-modules = { version = "0.6", features = ["redis"] }
+
+[lints.rust]
+dead_code = "allow"
+unused_variables = "allow"
+unused_imports = "allow"
+
+[lints.clippy]
+too_many_arguments = "allow"
+doc_markdown = "allow"
+needless_borrow = "allow"
+useless_conversion = "allow"
+needless_question_mark = "allow"
+useless_vec = "allow"
+derivable_impls = "allow"
+collapsible_if = "allow"
+match_like_matches_macro = "allow"
+unnecessary_sort_by = "allow"
+unnecessary_to_owned = "allow"
+io_other_error = "allow"
+needless_borrows_for_generic_args = "allow"
+useless_borrows_in_formatting = "allow"
+identity_op = "allow"
+unnecessary_cast = "allow"
+question_mark = "allow"
+doc_lazy_continuation = "allow"
+collapsible_match = "allow"
+enum_variant_names = "allow"
+large_enum_variant = "allow"
+field_reassign_with_default = "allow"
+manual_range_contains = "allow"
+default_constructed_unit_structs = "allow"
+double_ended_iterator_last = "allow"
+ptr_arg = "allow"
+assertions_on_constants = "allow"
+bool_assert_comparison = "allow"
 

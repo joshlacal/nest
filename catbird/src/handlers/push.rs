@@ -32,6 +32,9 @@ pub async fn register_push(
     Extension(session): Extension<CatbirdSession>,
     Json(input): Json<RegisterPushInput>,
 ) -> AppResult<StatusCode> {
+    input
+        .validate()
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
     push.registry.validate_service_did(&input.service_did)?;
     push.registry
@@ -47,13 +50,15 @@ pub async fn unregister_push(
     Extension(session): Extension<CatbirdSession>,
     Json(input): Json<UnregisterPushInput>,
 ) -> AppResult<StatusCode> {
+    input
+        .validate()
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
     push.registry.validate_service_did(&input.service_did)?;
     push.registry
         .deactivate_registration(&session, &input)
         .await
         .map_err(internal_error)?;
-
     if let Some(push_db) = state.push_db.as_ref() {
         let scheduler =
             crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
@@ -114,30 +119,24 @@ pub async fn list_activity_subscriptions(
         .await
         .map_err(internal_error)?;
 
-    let mut subscriptions = push
+    let cursor = query.cursor.as_deref();
+    let limit = query.limit.unwrap_or(50) as usize;
+
+    let (subscriptions, next_cursor) = push
         .subscriptions
-        .list_profiles_json(&state.http_client, &session.did)
-        .await
-        .map_err(internal_error)?;
-
-    let offset = query
-        .cursor
-        .as_deref()
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .unwrap_or(0);
-    let limit = query.limit.unwrap_or(50).max(1);
-    let total = subscriptions.len();
-
-    let next_offset = offset.saturating_add(limit);
-    let slice = subscriptions
-        .drain(offset.min(total)..total.min(next_offset))
-        .collect::<Vec<_>>();
-
-    let cursor = (next_offset < total).then(|| next_offset.to_string());
-
+        .list_paginated_profiles(
+            &state.http_client,
+            &session.did,
+            limit,
+            cursor,
+            Some(state.active_stream_semaphore.clone()),
+            Some(state.rate_limit.clone()),
+            Some(session.id.to_string()),
+        )
+        .await?;
     Ok(Json(json!({
-        "cursor": cursor,
-        "subscriptions": slice,
+        "cursor": next_cursor,
+        "subscriptions": subscriptions,
     })))
 }
 
@@ -146,6 +145,13 @@ pub async fn put_activity_subscription(
     Extension(session): Extension<CatbirdSession>,
     Json(input): Json<PutActivitySubscriptionInput>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let is_delete = !input.activity_subscription.post && !input.activity_subscription.reply;
+    if !is_delete && !crate::services::push::subscriptions::is_valid_subject_did(&input.subject) {
+        return Err(AppError::BadRequest(
+            "Invalid subject DID format or length".into(),
+        ));
+    }
+
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
     push.registry
         .touch_account_session(&session)
@@ -156,7 +162,14 @@ pub async fn put_activity_subscription(
         .subscriptions
         .put(&session.did, &input.subject, &input.activity_subscription)
         .await
-        .map_err(internal_error)?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("quota exceeded") || msg.contains("Invalid subject DID") {
+                AppError::BadRequest(msg)
+            } else {
+                AppError::Internal(msg)
+            }
+        })?;
 
     Ok(Json(json!({
         "subject": input.subject,

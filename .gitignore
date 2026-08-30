@@ -10,3 +10,17 @@ circle-appview/target/**
 patches/jacquard-oauth/target/**
 .claude/
 .DS_Store
+
+# Secrets and local configurations
+.env
+.env.*
+.env.local
+*.env
+!.env.example
+config/local.*
+*.pem
+*.p8
+*.key
+sessions.json
+*export*.json
+artifacts/
