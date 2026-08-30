@@ -1079,6 +1079,43 @@ async fn space_lock_manager_concurrent_acquire_drop_race_maintains_mutual_exclus
 }
 
 #[tokio::test]
+async fn space_lock_manager_cancellation_decrements_waiter_count() {
+    let lock_mgr = Arc::new(access::SpaceLockManager::with_capacity(10));
+    let space = "at://did:plc:cancel-test/space/test";
+
+    // First acquire the lock so subsequent acquires must wait
+    let guard = lock_mgr.acquire(space).await;
+    assert_eq!(lock_mgr.waiter_count(space).await, 1);
+
+    // Spawn an acquire that will block and then cancel it via abort
+    let mgr_clone = lock_mgr.clone();
+    let s = space.to_string();
+    let waiter_handle = tokio::spawn(async move {
+        let _ = mgr_clone.acquire(&s).await;
+    });
+
+    // Give it a moment to enter acquire and increment waiters
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(lock_mgr.waiter_count(space).await, 2);
+
+    // Abort the waiting acquire
+    waiter_handle.abort();
+    let _ = waiter_handle.await;
+
+    // The waiter count must decrement back to 1 (only guard remains)
+    assert_eq!(
+        lock_mgr.waiter_count(space).await,
+        1,
+        "Cancelled waiter must decrement count"
+    );
+
+    drop(guard);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    lock_mgr.clean_idle().await;
+    assert_eq!(lock_mgr.lock_count().await, 0);
+}
+
+#[tokio::test]
 async fn did_resolver_and_profile_hydrator_cache_capacity_and_ttl_eviction() {
     use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
     use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;

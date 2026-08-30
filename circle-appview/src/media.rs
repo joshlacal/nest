@@ -105,8 +105,18 @@ pub async fn get_media(
         .clone()
         .try_acquire_owned()
         .map_err(|_| {
-            AppError::InvalidRequest("Aggregate concurrent media transfer limit reached".into())
+            AppError::TooManyRequests("Aggregate concurrent media transfer limit reached".into())
         })?;
+
+    // Pre-reserve maximum blob byte budget before fetching to bound peak resident memory
+    let prev_bytes = ACTIVE_MEDIA_BYTES.fetch_add(MAX_MEDIA_BLOB_BYTES, Ordering::SeqCst);
+    if prev_bytes + MAX_MEDIA_BLOB_BYTES > MAX_AGGREGATE_MEDIA_BYTES {
+        ACTIVE_MEDIA_BYTES.fetch_sub(MAX_MEDIA_BLOB_BYTES, Ordering::SeqCst);
+        return Err(AppError::TooManyRequests(
+            "Aggregate active media byte budget exceeded".into(),
+        ));
+    }
+    let mut byte_guard = MediaByteGuard(MAX_MEDIA_BLOB_BYTES);
     // 5. Obtain active Space credential from CredentialStore
     let credential = state
         .credential_store
@@ -142,7 +152,7 @@ pub async fn get_media(
         Err(_) => return Err(AppError::NotFound("Not Found".into())),
     };
 
-    // 8. Layered enforcement: per-response streaming cap and aggregate byte budget
+    // 8. Layered enforcement: per-response streaming cap and release unused byte budget
     if bytes.len() > MAX_MEDIA_BLOB_BYTES {
         return Err(AppError::InvalidRequest(
             "Media blob size exceeds maximum permitted size".into(),
@@ -150,15 +160,11 @@ pub async fn get_media(
     }
 
     let byte_len = bytes.len();
-    let prev_bytes = ACTIVE_MEDIA_BYTES.fetch_add(byte_len, Ordering::SeqCst);
-    if prev_bytes + byte_len > MAX_AGGREGATE_MEDIA_BYTES {
-        ACTIVE_MEDIA_BYTES.fetch_sub(byte_len, Ordering::SeqCst);
-        return Err(AppError::InvalidRequest(
-            "Aggregate active media byte budget exceeded".into(),
-        ));
+    let unused = MAX_MEDIA_BLOB_BYTES.saturating_sub(byte_len);
+    if unused > 0 {
+        ACTIVE_MEDIA_BYTES.fetch_sub(unused, Ordering::SeqCst);
+        byte_guard.0 = byte_len;
     }
-    let byte_guard = MediaByteGuard(byte_len);
-
     let content_type_str = content_type
         .as_deref()
         .unwrap_or("application/octet-stream");

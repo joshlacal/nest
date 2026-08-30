@@ -1506,7 +1506,7 @@ impl SpaceClient {
             HYDRATION_SEMAPHORE.acquire(),
         )
         .await
-        .map_err(|_| AppError::InvalidRequest("Concurrent member hydration limit reached".into()))?
+        .map_err(|_| AppError::TooManyRequests("Concurrent member hydration limit reached".into()))?
         .map_err(|_| AppError::Internal("Member hydration semaphore closed".into()))?;
 
         let deps = {

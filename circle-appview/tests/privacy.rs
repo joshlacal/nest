@@ -3467,3 +3467,182 @@ async fn revocation_durability_commits_state_flip_and_credentials_before_purge(p
             .unwrap();
     assert_eq!(record_count.0, 0, "circle_records must be purged");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_fails_closed(
+    pool: PgPool,
+) {
+    use circle_appview::access::{refresh_member_cache, verify_member_access};
+    use circle_appview::space_client::{SpaceAppAccess, SpaceConfig};
+
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // 1. Setup active circle with cached member and metadata
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted, access_epoch)
+        VALUES ($1, '3l7revokefail', $2, 'Revoke Fail Space', now(), true, 1)
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
+        VALUES ($1, $2, now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count, access_epoch, app_access_granted, generation)
+        VALUES ($1, now(), 1, 1, true, 1)
+        "#,
+    )
+    .bind(SPACE_1)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed credential in store
+    let p256_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            circle_appview::access::ActiveSpaceCredential {
+                token: "dpop_token_active".into(),
+                dpop_key: p256_key,
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await;
+
+    // 2. Configure upstream space config with explicit revocation (empty allow list)
+    setup.mock_transport.set_space_config(
+        SPACE_1,
+        SpaceConfig {
+            authority: ALICE_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-1".to_string(),
+            app_access: SpaceAppAccess::AllowList(vec![]), // Explicitly revokes
+            user_policy: None,
+            name: Some("Revoked Space".into()),
+            description: None,
+        },
+    );
+
+    // 3. Trigger refresh_member_cache -> must return Forbidden("Space appAccess revoked")
+    let refresh_res = refresh_member_cache(&setup.state, SPACE_1).await;
+    assert!(refresh_res.is_err(), "Must fail when app access revoked");
+
+    // 4. Verify in-memory credentials were removed
+    assert!(
+        setup.state.credential_store.get(SPACE_1).await.is_none(),
+        "Credential store must be purged"
+    );
+
+    // 5. Verify database gate flag is durably false and access_epoch was bumped
+    let (app_access_granted, deleted_at, access_epoch): (
+        bool,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT app_access_granted, deleted_at, access_epoch FROM circles WHERE space_uri = $1",
+    )
+    .bind(SPACE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        !app_access_granted,
+        "app_access_granted must be durably false"
+    );
+    assert!(deleted_at.is_some(), "deleted_at must be populated");
+    assert!(access_epoch > 1, "access_epoch must be bumped");
+
+    // 6. Verify subsequent verify_member_access immediately denies and does NOT authorize from cache
+    let access_res = verify_member_access(&setup.state, SPACE_1, BOB_DID).await;
+    assert!(
+        access_res.is_err(),
+        "verify_member_access must immediately deny revoked circle, never serving from cache"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_space_purges_member_cache_and_expired_tombstones_are_cleaned(pool: PgPool) {
+    use circle_appview::purge::{delete_space, purge_expired_tombstones};
+
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // 1. Setup circle with member cache
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted)
+        VALUES ($1, '3l7cascade', $2, 'Cascade Space', now(), true)
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
+        VALUES ($1, $2, now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2. delete_space
+    delete_space(&pool, &setup.state.credential_store, SPACE_1)
+        .await
+        .unwrap();
+
+    // 3. Verify circle_member_cache is purged
+    let member_count: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM circle_member_cache WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        member_count.0, 0,
+        "circle_member_cache must be purged in delete_space cascade"
+    );
+
+    // 4. Manually backdate tombstone to 40 days ago
+    sqlx::query("UPDATE circles SET deleted_at = now() - INTERVAL '40 days' WHERE space_uri = $1")
+        .bind(SPACE_1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 5. Purge tombstones older than 30 days
+    let purged = purge_expired_tombstones(&pool, 30).await.unwrap();
+    assert_eq!(purged, 1, "Must purge 1 expired tombstone");
+
+    let remaining: (i64,) = sqlx::query_as("SELECT count(*) FROM circles WHERE space_uri = $1")
+        .bind(SPACE_1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining.0, 0, "Tombstone row must be completely removed");
+}

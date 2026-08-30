@@ -546,6 +546,15 @@ impl DidResolver {
         }
     }
 
+    /// Return total fresh resolution tracked entries count.
+    pub fn fresh_resolution_count(&self) -> usize {
+        if let Ok(last_map) = self.last_fresh_resolution.read() {
+            last_map.len()
+        } else {
+            0
+        }
+    }
+
     /// Insert or override a DID document directly in cache (useful for testing)
     pub fn insert_cached(&self, did: String, doc: DidDocument) {
         self.insert_cached_with_ttl(
@@ -584,10 +593,22 @@ impl DidResolver {
         // Check per-issuer cooldown: if fresh resolution was performed very recently,
         // serve cached document to mitigate flood of unauthenticated invalid-signature requests.
         if let Ok(mut last_map) = self.last_fresh_resolution.write() {
-            if let Some(last_time) = last_map.get(did) {
-                if last_time.elapsed()
-                    < std::time::Duration::from_secs(FRESH_RESOLUTION_COOLDOWN_SECS as u64)
+            let now = std::time::Instant::now();
+            let cooldown = std::time::Duration::from_secs(FRESH_RESOLUTION_COOLDOWN_SECS as u64);
+            // Prune expired cooldowns
+            last_map.retain(|_, t| now.saturating_duration_since(*t) < cooldown);
+            // Enforce capacity bound
+            if last_map.len() >= self.capacity && !last_map.contains_key(did) {
+                if let Some(oldest_key) = last_map
+                    .iter()
+                    .min_by_key(|(_, t)| *t)
+                    .map(|(k, _)| k.clone())
                 {
+                    last_map.remove(&oldest_key);
+                }
+            }
+            if let Some(last_time) = last_map.get(did) {
+                if now.saturating_duration_since(*last_time) < cooldown {
                     if let Ok(cache) = self.cache.read() {
                         if let Some((doc, _)) = cache.get(did) {
                             return Ok(doc.clone());
@@ -595,7 +616,7 @@ impl DidResolver {
                     }
                 }
             }
-            last_map.insert(did.to_string(), std::time::Instant::now());
+            last_map.insert(did.to_string(), now);
         }
 
         // Acquire admission permit to bound concurrent upstream resolution calls

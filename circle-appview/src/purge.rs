@@ -81,7 +81,7 @@ pub async fn revoke_app_access(
     // 1. Transaction 1: Commit the state flip and gate flag immediately
     let mut tx = pool.begin().await?;
 
-    let new_epoch: (i64,) = sqlx::query_as(
+    let epoch_row: Option<(i64,)> = sqlx::query_as(
         r#"
         UPDATE circles
         SET app_access_granted = false,
@@ -93,8 +93,30 @@ pub async fn revoke_app_access(
         "#,
     )
     .bind(space)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+
+    let new_epoch = match epoch_row {
+        Some((e,)) => e,
+        None => {
+            let inserted: (i64,) = sqlx::query_as(
+                r#"
+                INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at, app_access_granted, app_access_revoked_at, access_epoch)
+                VALUES ($1, 'unknown', '', 'Unknown', now(), now(), false, now(), 1)
+                ON CONFLICT (space_uri) DO UPDATE
+                SET app_access_granted = false,
+                    app_access_revoked_at = now(),
+                    access_epoch = circles.access_epoch + 1,
+                    deleted_at = COALESCE(circles.deleted_at, now())
+                RETURNING access_epoch
+                "#,
+            )
+            .bind(space)
+            .fetch_one(&mut *tx)
+            .await?;
+            inserted.0
+        }
+    };
 
     sqlx::query(
         r#"
@@ -109,7 +131,7 @@ pub async fn revoke_app_access(
         "#,
     )
     .bind(space)
-    .bind(new_epoch.0)
+    .bind(new_epoch)
     .execute(&mut *tx)
     .await?;
 
@@ -284,6 +306,10 @@ pub async fn delete_space(
         .bind(space)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM circle_records WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
@@ -317,6 +343,17 @@ pub async fn delete_space(
     credentials.remove(space).await;
     tx.commit().await?;
     Ok(())
+}
+
+/// Bounded tombstone retention: purge circles whose tombstone (deleted_at) is older than max_age_days.
+pub async fn purge_expired_tombstones(pool: &PgPool, max_age_days: i32) -> Result<u64, PurgeError> {
+    let res = sqlx::query(
+        "DELETE FROM circles WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => $1)",
+    )
+    .bind(max_age_days)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Account deactivation hides that author's records without exposing a public tombstone.

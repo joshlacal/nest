@@ -91,6 +91,44 @@ struct SpaceLockEntry {
     waiters: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+fn decrement_waiters(
+    space: &str,
+    locks: &Arc<RwLock<HashMap<String, SpaceLockEntry>>>,
+    waiters: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let remaining = waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    if remaining <= 1 {
+        let locks = locks.clone();
+        let space = space.to_string();
+        let waiters = waiters.clone();
+        tokio::spawn(async move {
+            let mut map = locks.write().await;
+            if waiters.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                if let Some(entry) = map.get(&space) {
+                    if Arc::ptr_eq(&entry.waiters, &waiters) {
+                        map.remove(&space);
+                    }
+                }
+            }
+        });
+    }
+}
+
+struct WaiterGuard {
+    space: String,
+    locks: Arc<RwLock<HashMap<String, SpaceLockEntry>>>,
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+    active: bool,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if self.active {
+            decrement_waiters(&self.space, &self.locks, &self.waiters);
+        }
+    }
+}
+
 pub struct SpaceLockGuard {
     _guard: OwnedMutexGuard<()>,
     space: String,
@@ -100,24 +138,7 @@ pub struct SpaceLockGuard {
 
 impl Drop for SpaceLockGuard {
     fn drop(&mut self) {
-        let remaining = self
-            .waiters
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if remaining <= 1 {
-            let locks = self.locks.clone();
-            let space = self.space.clone();
-            let waiters = self.waiters.clone();
-            tokio::spawn(async move {
-                let mut map = locks.write().await;
-                if waiters.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    if let Some(entry) = map.get(&space) {
-                        if Arc::ptr_eq(&entry.waiters, &waiters) {
-                            map.remove(&space);
-                        }
-                    }
-                }
-            });
-        }
+        decrement_waiters(&self.space, &self.locks, &self.waiters);
     }
 }
 
@@ -162,7 +183,14 @@ impl SpaceLockManager {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             (entry.mutex.clone(), entry.waiters.clone())
         };
+        let mut waiter_guard = WaiterGuard {
+            space: space.to_string(),
+            locks: self.locks.clone(),
+            waiters: waiters.clone(),
+            active: true,
+        };
         let guard = mutex.lock_owned().await;
+        waiter_guard.active = false;
         SpaceLockGuard {
             _guard: guard,
             space: space.to_string(),
@@ -530,10 +558,31 @@ pub async fn refresh_member_cache(
         .is_explicit_revocation(expected_client_id)
     {
         tracing::warn!(space_uri = %space_uri, "Space appAccess explicitly omits client_id, revoking");
-        if let Err(e) =
-            crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await
-        {
-            tracing::error!(error = %e, space_uri = %space_uri, "Failed to revoke app access and purge circle data");
+        let mut revoke_res =
+            crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await;
+        if revoke_res.is_err() {
+            // Immediate retry for durability
+            revoke_res =
+                crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri)
+                    .await;
+        }
+        // Guarantee in-memory credential removal regardless of DB outcome
+        state.credential_store.remove(space_uri).await;
+
+        if let Err(e) = revoke_res {
+            tracing::error!(error = %e, space_uri = %space_uri, "Failed to revoke app access and purge circle data; writing durable invalidation marker");
+            let _ = sqlx::query(
+                "UPDATE circles SET app_access_granted = false, deleted_at = COALESCE(deleted_at, now()), access_epoch = access_epoch + 1 WHERE space_uri = $1",
+            )
+            .bind(space_uri)
+            .execute(&state.db)
+            .await;
+            let _ = sqlx::query(
+                "UPDATE circle_member_cache_meta SET app_access_granted = false, member_count = 0, last_refreshed_at = now() WHERE space_uri = $1",
+            )
+            .bind(space_uri)
+            .execute(&state.db)
+            .await;
         }
         return Err(AppError::Forbidden("Space appAccess revoked".into()));
     } else if !space_config.app_access.grants_access(expected_client_id) {
