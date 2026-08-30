@@ -417,8 +417,12 @@ impl ActorModerationResolver {
                         error = %err,
                         "Auth revoked for push account; marking revoked in push_accounts"
                     );
-                    let registry =
-                        super::registry::PushRegistry::new(self.db_pool.clone(), String::new());
+                    let registry = state.push_registry().unwrap_or_else(|| {
+                        super::registry::PushRegistry::with_config(
+                            self.db_pool.clone(),
+                            &state.config.push,
+                        )
+                    });
                     let _ = registry
                         .mark_auth_revoked_if_session(recipient_did, &session_id)
                         .await;

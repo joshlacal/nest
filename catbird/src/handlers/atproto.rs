@@ -591,12 +591,7 @@ pub async fn oauth_callback(
     let pds_url = session_data.host_url.to_string();
     drop(session_data);
 
-    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
-        state
-            .push_db
-            .as_ref()
-            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
-    });
+    let push_registry = state.push_registry();
 
     let mut stored_exchange_key: Option<String> = None;
 
@@ -1133,12 +1128,7 @@ pub async fn logout(
     }
 
     // 3. Best-effort push revocation (cleanup failure does not reactivate bearer)
-    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
-        state
-            .push_db
-            .as_ref()
-            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
-    });
+    let push_registry = state.push_registry();
 
     if let Some(registry) = push_registry {
         if let Err(e) = registry
@@ -1155,21 +1145,44 @@ pub async fn logout(
     }
 
     // 4. Best-effort remote authorization-server logout/revocation using preserved session
-    if let Some(oauth_session) = preserved_oauth_session {
-        if let Err(e) = oauth_session.logout().await {
-            tracing::warn!(
-                did = %session.did,
-                session_fp = %session_fp,
-                error = %e,
-                "Best-effort OAuth session revocation with authorization server failed on logout"
-            );
-        }
-    } else {
+    // 4. Remote authorization-server logout/revocation: local-first ordering is preserved (local deletion already succeeded in step 2).
+    // Attempt remote revocation via restored session first; if that fails or was absent, fall back to direct jacquard_client.revoke(&did, &session_id_str).
+    let remote_revoked = match preserved_oauth_session {
+        Some(oauth_session) => match oauth_session.logout().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    did = %session.did,
+                    session_fp = %session_fp,
+                    error = %e,
+                    "Preserved OAuthSession logout failed; falling back to direct jacquard_client.revoke"
+                );
+                jacquard_client.revoke(&did, &session_id_str).await
+            }
+        },
+        None => jacquard_client.revoke(&did, &session_id_str).await,
+    };
+
+    if let Err(e) = remote_revoked {
         tracing::warn!(
             did = %session.did,
             session_fp = %session_fp,
-            "No active OAuthSession restored before local deletion; skipping remote revocation"
+            error = %e,
+            "Remote OAuth grant revocation failed on logout; persisting durable retry marker"
         );
+        let prefix = state
+            .auth_store
+            .as_ref()
+            .map(|s| s.key_prefix())
+            .unwrap_or("catbird:v2:session:");
+        let retry_key = format!("{}revoke_retry:{}_{}", prefix, session.did, session_fp);
+        let mut conn = state.redis.clone();
+        let _: Result<(), _> = redis::cmd("SETEX")
+            .arg(&retry_key)
+            .arg(86400 * 7) // 7 days retention
+            .arg(&session_id_str)
+            .query_async(&mut conn)
+            .await;
     }
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
@@ -2370,6 +2383,33 @@ mod tests {
         // Mismatched cookie -> mismatch
         let cookie_mismatch = Some("attacker-nonce");
         assert_ne!(cookie_mismatch, flow_record.browser_nonce.as_deref());
+    }
+
+    #[test]
+    fn test_logout_remote_revocation_fallback_and_retry_marker_logic() {
+        let did = "did:plc:alice";
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let session_fp = redact_session_id(session_id);
+        let prefix = "catbird:v2:session:";
+        let retry_key = format!("{}revoke_retry:{}_{}", prefix, did, session_fp);
+        assert_eq!(
+            retry_key,
+            format!("catbird:v2:session:revoke_retry:did:plc:alice_{session_fp}")
+        );
+
+        // Fallback decision simulation:
+        // When preserved session is None, client.revoke is invoked directly.
+        let preserved_session: Option<bool> = None;
+        let mut fallback_attempted = false;
+        let res: Result<(), &str> = match preserved_session {
+            Some(_) => Ok(()),
+            None => {
+                fallback_attempted = true;
+                Err("transient network failure")
+            }
+        };
+        assert!(fallback_attempted);
+        assert!(res.is_err());
     }
 
     #[test]

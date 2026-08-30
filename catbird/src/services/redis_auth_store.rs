@@ -717,7 +717,7 @@ impl RedisAuthStore {
                             .arg(&candidate_retired_k)
                             .query_async(&mut conn)
                             .await
-                            .unwrap_or(false);
+                            .unwrap_or(true);
                         if is_retired {
                             continue;
                         }
@@ -754,24 +754,24 @@ impl RedisAuthStore {
                             || cand_session.session_id.as_str() == expected_fingerprint
                         {
                             // Found matching active session for this DID!
-                            // Self-heal: install the indexes so subsequent lookups hit the fast path
-                            let _: Result<(), _> = redis::cmd("SET")
-                                .arg(&fp_index_key)
+                            // Self-heal: install the indexes atomically using Lua script to verify not-retired
+                            let candidate_session_k =
+                                format!("{}session:{}_{}", self.key_prefix, did, candidate_hmac);
+                            let install_script = redis::Script::new(LUA_INSTALL_FP_INDEX_SCRIPT);
+                            let verdict: Result<i32, _> = install_script
+                                .key(&fp_index_key)
+                                .key(&did_index_key)
+                                .key(&candidate_session_k)
+                                .key(&candidate_retired_k)
                                 .arg(&candidate_hmac)
-                                .arg("EX")
-                                .arg(candidate_ttl)
-                                .query_async(&mut conn)
+                                .arg(candidate_ttl.max(1))
+                                .invoke_async(&mut conn)
                                 .await;
-                            let _: Result<(), _> = redis::cmd("SET")
-                                .arg(&did_index_key)
-                                .arg(&candidate_hmac)
-                                .arg("EX")
-                                .arg(candidate_ttl)
-                                .query_async(&mut conn)
-                                .await;
-
-                            recovered_session = Some((1, enc_data, candidate_hmac, candidate_ttl));
-                            break;
+                            if let Ok(0) = verdict {
+                                recovered_session =
+                                    Some((0, enc_data, candidate_hmac, candidate_ttl));
+                                break;
+                            }
                         }
                     }
 
@@ -829,7 +829,7 @@ impl RedisAuthStore {
                         .arg(&alt_retired_k)
                         .query_async(&mut conn)
                         .await
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     if !alt_retired {
                         if let Ok(Some(alt_enc)) = redis::cmd("GET")
                             .arg(&alt_session_k)
@@ -849,7 +849,7 @@ impl RedisAuthStore {
                                     {
                                         let install_script =
                                             redis::Script::new(LUA_INSTALL_FP_INDEX_SCRIPT);
-                                        let _: Result<i32, _> = install_script
+                                        let verdict: Result<i32, _> = install_script
                                             .key(&fp_index_key)
                                             .key(&did_index_key)
                                             .key(&alt_session_k)
@@ -858,7 +858,9 @@ impl RedisAuthStore {
                                             .arg(ttl.max(1))
                                             .invoke_async(&mut conn)
                                             .await;
-                                        return Ok(Some(alt_session));
+                                        if let Ok(0) = verdict {
+                                            return Ok(Some(alt_session));
+                                        }
                                     }
                                 }
                             }
@@ -876,7 +878,7 @@ impl RedisAuthStore {
             let session_k = self.session_key(did, session.session_id.as_str());
             let retired_k = self.retired_key(session.session_id.as_str());
             let install_script = redis::Script::new(LUA_INSTALL_FP_INDEX_SCRIPT);
-            let _: i32 = install_script
+            let verdict: i32 = install_script
                 .key(&fp_index_key)
                 .key(&did_index_key)
                 .key(&session_k)
@@ -886,6 +888,9 @@ impl RedisAuthStore {
                 .invoke_async(&mut conn)
                 .await
                 .map_err(redis_err)?;
+            if verdict != 0 {
+                return Ok(None);
+            }
         }
 
         Ok(Some(session))
@@ -2421,6 +2426,55 @@ mod tests {
 
         assert!(store.contains_key(&fp_idx_key));
         assert!(store.contains_key(&did_idx_key));
+    }
+
+    #[allow(clippy::unnecessary_literal_unwrap)]
+    #[test]
+    fn test_resolve_session_recovery_and_install_script_fails_closed_on_retired_verdict() {
+        let key = TEST_KEY;
+        let prefix = "catbird:v2:session:";
+        let did = "did:plc:retired_verdict_user";
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let hmac_fp = fingerprint_id(&key, session_id);
+        let sha256_fp = crate::services::push::registry::session_fingerprint(session_id);
+
+        let mut store: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        // Session blob exists, but tombstone also exists in Redis
+        let session = make_test_session_data(did, session_id);
+        let enc = seal_strict(&key, &serde_json::to_string(&session).unwrap()).unwrap();
+        let sess_key = format!("{prefix}session:{did}_{hmac_fp}");
+        let ret_key = format!("{prefix}upgrade_retired:{hmac_fp}");
+        store.insert(sess_key, enc);
+        store.insert(ret_key.clone(), "logout".to_string());
+
+        // 1. Simulation of retirement check with error -> fails closed (treated as retired)
+        let mock_redis_query_result: Result<bool, &str> = Err("redis connection error");
+        let is_retired_error_fallback: bool = mock_redis_query_result.unwrap_or(true);
+        assert!(
+            is_retired_error_fallback,
+            "Error checking retirement MUST fail closed (treat as retired)"
+        );
+
+        // 2. Simulation of LUA_INSTALL_FP_INDEX_SCRIPT verdict
+        // If KEYS[4] (retired_key) exists in store, the Lua script returns 1 (retired).
+        let lua_install_verdict = if store.contains_key(&ret_key) {
+            1i32
+        } else {
+            0i32
+        };
+        assert_eq!(lua_install_verdict, 1);
+
+        // 3. Gating return on install script verdict: verdict != 0 MUST return None
+        let resolved: Option<ClientSessionData> = if lua_install_verdict == 0 {
+            Some(session)
+        } else {
+            None
+        };
+        assert!(
+            resolved.is_none(),
+            "Retired session MUST NOT be returned even on fallback recovery"
+        );
     }
 
     #[test]

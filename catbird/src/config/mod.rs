@@ -934,6 +934,19 @@ impl AppState {
         tracing::info!("Push services initialized successfully");
         Ok(())
     }
+    /// Returns the active `PushRegistry` if push services or `push_db` is available,
+    /// ensuring `phase2_writers` is configured from `config.push.phase2_writers`.
+    pub fn push_registry(&self) -> Option<crate::services::push::registry::PushRegistry> {
+        if let Some(push) = &self.push {
+            return Some(push.registry.clone());
+        }
+        self.push_db.as_ref().map(|db| {
+            crate::services::push::registry::PushRegistry::with_config(
+                db.clone(),
+                &self.config.push,
+            )
+        })
+    }
 
     pub fn is_session_index_ready(&self) -> bool {
         self.session_index_ready

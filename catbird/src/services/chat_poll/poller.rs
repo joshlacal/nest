@@ -1242,7 +1242,7 @@ mod tests {
             .expect("REDIS_URL connection must succeed when test is executed");
 
         // Rate limit state configured with only 250 bytes budget
-        let _rate_limit = Arc::new(crate::middleware::RateLimitState {
+        let rate_limit = Arc::new(crate::middleware::RateLimitState {
             session_limiter: Arc::new(crate::middleware::RateLimiter::new()),
             ip_limiter: Arc::new(crate::middleware::RateLimiter::new()),
             session_byte_limiter: Arc::new(crate::middleware::ByteRateLimiter::new()),
@@ -1277,7 +1277,7 @@ mod tests {
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             session_encryption_key: None,
             active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
-            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+            rate_limit,
             session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         });

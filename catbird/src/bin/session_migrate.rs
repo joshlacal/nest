@@ -571,7 +571,7 @@ async fn run_backfill(
                 .arg(&retired_key)
                 .query_async(&mut conn)
                 .await
-                .unwrap_or(false);
+                .unwrap_or(true);
 
             if is_retired {
                 skipped += 1;

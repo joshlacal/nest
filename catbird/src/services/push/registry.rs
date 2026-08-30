@@ -81,6 +81,18 @@ impl PushRegistry {
             phase2_writers,
         }
     }
+    pub fn with_config(db_pool: Pool<Postgres>, config: &crate::config::PushConfig) -> Self {
+        let service_did = config.service_did.clone().unwrap_or_default();
+        let mut registry = Self::with_limits(
+            db_pool,
+            service_did,
+            config.max_active_devices_per_account,
+            config.max_inactive_devices_per_account,
+            config.max_fanout_per_notification,
+        );
+        registry.set_phase2_writers(config.phase2_writers);
+        registry
+    }
     pub fn with_phase2_writers(mut self, enabled: bool) -> Self {
         self.phase2_writers = enabled;
         self
@@ -1519,6 +1531,17 @@ mod tests {
         let row = db.push_accounts.get(did).unwrap();
         assert_eq!(row.session_id, raw_session);
         assert_eq!(row.session_fingerprint.as_deref(), Some(fp.as_str()));
+    }
+    #[tokio::test]
+    async fn test_push_registry_with_config_honours_config_as_single_source_of_truth() {
+        let pool = Pool::<Postgres>::connect_lazy("postgres://localhost/test").unwrap();
+        let mut push_config = crate::config::PushConfig::default();
+        push_config.phase2_writers = true;
+        push_config.service_did = Some("did:web:push.config.test".to_string());
+
+        let registry = PushRegistry::with_config(pool, &push_config);
+        assert!(registry.phase2_writers_enabled());
+        assert_eq!(registry.service_did(), "did:web:push.config.test");
     }
     #[test]
     fn test_token_reassignment_deactivates_prior_owner_and_prevents_resumption() {

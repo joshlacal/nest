@@ -454,12 +454,7 @@ pub async fn upgrade_commit(
 
     // 4. Side effect: Conditionally update push registration
     // If push DB fails, return retryable 500 so commit retry completes side effect before success
-    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
-        state
-            .push_db
-            .as_ref()
-            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
-    });
+    let push_registry = state.push_registry();
 
     if let Some(registry) = &push_registry {
         registry

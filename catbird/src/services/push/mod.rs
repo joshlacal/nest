@@ -170,16 +170,7 @@ impl PushServices {
             .ok_or_else(|| anyhow!("push.service_did must be configured when push is enabled"))?;
 
         let apns = ApnsDelivery::new(&config.apns)?.map(|d| Arc::new(d) as Arc<dyn ApnsSender>);
-        let mut registry = PushRegistry::with_limits(
-            db_pool.clone(),
-            service_did,
-            config.max_active_devices_per_account,
-            config.max_inactive_devices_per_account,
-            config.max_fanout_per_notification,
-        );
-        if config.phase2_writers {
-            registry = registry.with_phase2_writers(true);
-        }
+        let registry = PushRegistry::with_config(db_pool.clone(), &config);
 
         Ok(Self {
             registry,
