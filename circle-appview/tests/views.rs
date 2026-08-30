@@ -8,8 +8,12 @@ use axum::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use catbird_atproto::generated::app_bsky::actor::get_profile::GetProfileOutput;
-use catbird_atproto::generated::app_bsky::actor::{ProfileAssociated, ProfileViewBasic, ProfileViewDetailed};
-use catbird_atproto::generated::app_bsky::feed::{PostViewEmbed, ThreadViewPostParent, ThreadViewPostRepliesItem};
+use catbird_atproto::generated::app_bsky::actor::{
+    ProfileAssociated, ProfileViewBasic, ProfileViewDetailed,
+};
+use catbird_atproto::generated::app_bsky::feed::{
+    PostViewEmbed, ThreadViewPostParent, ThreadViewPostRepliesItem,
+};
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
 use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
@@ -34,8 +38,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use sha2::{Digest, Sha256};
 use circle_appview::validator::{policy, validate_record, RecordCandidate, ValidationPolicy};
+use sha2::{Digest, Sha256};
 const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const ALICE_DID: &str = "did:plc:alice-circle-owner";
 const BOB_DID: &str = "did:plc:bob-circle-member";
@@ -46,11 +50,11 @@ const SPACE_2: &str = "at://did:plc:alice-circle-owner/space/blue.catbird.circle
 #[allow(dead_code)]
 struct ViewTestSetup {
     app: axum::Router,
+    state: AppState,
     alice_key: p256::ecdsa::SigningKey,
     bob_key: p256::ecdsa::SigningKey,
     charlie_key: p256::ecdsa::SigningKey,
 }
-
 fn compute_record_cid(val: &serde_json::Value) -> String {
     let bytes = serde_ipld_dagcbor::to_vec(val).unwrap();
     let (_, cid_str) = create_cid_bytes_from_data(&bytes);
@@ -88,7 +92,12 @@ fn validate_fixture_record(
         .expect("view test fixture record must be valid according to semantic validator");
 }
 
-async fn grant_active_member(pool: &PgPool, space_uri: &str, member_did: &str, _duration: Duration) {
+async fn grant_active_member(
+    pool: &PgPool,
+    space_uri: &str,
+    member_did: &str,
+    _duration: Duration,
+) {
     sqlx::query(
         r#"
         INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
@@ -141,6 +150,7 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
+        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
 
     let state = AppState::new(config, pool.clone());
@@ -221,6 +231,7 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
 
     ViewTestSetup {
         app,
+        state,
         alice_key,
         bob_key,
         charlie_key,
@@ -372,13 +383,22 @@ async fn feed_excludes_spaces_without_active_lease(pool: PgPool) {
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let feed_output: GetFeedOutput = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(feed_output.feed.len(), 1, "Unified feed must include only spaces with active lease");
+    assert_eq!(
+        feed_output.feed.len(),
+        1,
+        "Unified feed must include only spaces with active lease"
+    );
     assert_eq!(feed_output.feed[0].circle.uri.as_str(), SPACE_1);
-    assert_eq!(feed_output.feed[0].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post1"));
+    assert_eq!(
+        feed_output.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post1")
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn feed_with_specific_space_requires_active_lease_and_returns_access_removed_when_lost(pool: PgPool) {
+async fn feed_with_specific_space_requires_active_lease_and_returns_access_removed_when_lost(
+    pool: PgPool,
+) {
     let setup = setup_views_test(pool.clone()).await;
 
     sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
@@ -465,7 +485,9 @@ async fn feed_cursor_access_loss_returns_access_removed(pool: PgPool) {
     let token1 = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
     let req1 = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=1"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=1"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token1}"))
         .body(Body::empty())
         .unwrap();
@@ -541,7 +563,9 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let token1 = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
     let req1 = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=2"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=2"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token1}"))
         .body(Body::empty())
         .unwrap();
@@ -551,8 +575,14 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let body1 = to_bytes(resp1.into_body(), 1024 * 1024).await.unwrap();
     let page1: GetFeedOutput = serde_json::from_slice(&body1).unwrap();
     assert_eq!(page1.feed.len(), 2);
-    assert_eq!(page1.feed[0].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post5"));
-    assert_eq!(page1.feed[1].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post4"));
+    assert_eq!(
+        page1.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post5")
+    );
+    assert_eq!(
+        page1.feed[1].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post4")
+    );
     assert!(page1.cursor.is_some());
 
     let cursor1 = page1.cursor.unwrap();
@@ -561,7 +591,9 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let token2 = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
     let req2 = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=2&cursor={cursor1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=2&cursor={cursor1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token2}"))
         .body(Body::empty())
         .unwrap();
@@ -571,8 +603,14 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let body2 = to_bytes(resp2.into_body(), 1024 * 1024).await.unwrap();
     let page2: GetFeedOutput = serde_json::from_slice(&body2).unwrap();
     assert_eq!(page2.feed.len(), 2);
-    assert_eq!(page2.feed[0].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post3"));
-    assert_eq!(page2.feed[1].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post2"));
+    assert_eq!(
+        page2.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post3")
+    );
+    assert_eq!(
+        page2.feed[1].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post2")
+    );
     assert!(page2.cursor.is_some());
 
     let cursor2 = page2.cursor.unwrap();
@@ -581,7 +619,9 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let token3 = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
     let req3 = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=2&cursor={cursor2}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}&limit=2&cursor={cursor2}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token3}"))
         .body(Body::empty())
         .unwrap();
@@ -591,7 +631,10 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let body3 = to_bytes(resp3.into_body(), 1024 * 1024).await.unwrap();
     let page3: GetFeedOutput = serde_json::from_slice(&body3).unwrap();
     assert_eq!(page3.feed.len(), 1);
-    assert_eq!(page3.feed[0].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post1"));
+    assert_eq!(
+        page3.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post1")
+    );
     assert!(page3.cursor.is_none(), "Last page must have no next cursor");
 }
 
@@ -666,9 +709,15 @@ async fn feed_excludes_muted_circles_in_unified_feed_but_includes_in_specific_sp
 
     let resp_unified = setup.app.clone().oneshot(req_unified).await.unwrap();
     assert_eq!(resp_unified.status(), StatusCode::OK);
-    let body_unified = to_bytes(resp_unified.into_body(), 1024 * 1024).await.unwrap();
+    let body_unified = to_bytes(resp_unified.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let feed_unified: GetFeedOutput = serde_json::from_slice(&body_unified).unwrap();
-    assert_eq!(feed_unified.feed.len(), 0, "Unified feed must exclude muted circles");
+    assert_eq!(
+        feed_unified.feed.len(),
+        0,
+        "Unified feed must exclude muted circles"
+    );
 
     // 2. Circle-detail feed (space = SPACE_1) -> includes explicitly requested muted Space 1 with fresh token
     let token_specific = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
@@ -681,9 +730,15 @@ async fn feed_excludes_muted_circles_in_unified_feed_but_includes_in_specific_sp
 
     let resp_specific = setup.app.clone().oneshot(req_specific).await.unwrap();
     assert_eq!(resp_specific.status(), StatusCode::OK);
-    let body_specific = to_bytes(resp_specific.into_body(), 1024 * 1024).await.unwrap();
+    let body_specific = to_bytes(resp_specific.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let feed_specific: GetFeedOutput = serde_json::from_slice(&body_specific).unwrap();
-    assert_eq!(feed_specific.feed.len(), 1, "Direct Circle feed must remain accessible when muted");
+    assert_eq!(
+        feed_specific.feed.len(),
+        1,
+        "Direct Circle feed must remain accessible when muted"
+    );
     assert_eq!(feed_specific.feed[0].circle.muted, Some(true));
 }
 
@@ -737,8 +792,22 @@ async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
 
     let mut val_policy = policy(ALICE_DID, vec![BOB_DID]).with_space_uri(SPACE_1);
     val_policy.add_post(&root_uri, &root_cid);
-    validate_fixture_record(&root_uri, ALICE_DID, "app.bsky.feed.post", "3l7root", &root_json, &val_policy);
-    validate_fixture_record(&reply_uri, BOB_DID, "app.bsky.feed.post", "3l7reply", &reply_json, &val_policy);
+    validate_fixture_record(
+        &root_uri,
+        ALICE_DID,
+        "app.bsky.feed.post",
+        "3l7root",
+        &root_json,
+        &val_policy,
+    );
+    validate_fixture_record(
+        &reply_uri,
+        BOB_DID,
+        "app.bsky.feed.post",
+        "3l7reply",
+        &reply_json,
+        &val_policy,
+    );
 
     // Root post (parent_uri IS NULL)
     sqlx::query(
@@ -772,11 +841,16 @@ async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
     let feed: GetFeedOutput = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(feed.feed.len(), 1, "Feed must contain only top-level posts");
-    assert_eq!(feed.feed[0].post.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7root"));
+    assert_eq!(
+        feed.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7root")
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space_interactions(pool: PgPool) {
+async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space_interactions(
+    pool: PgPool,
+) {
     let setup = setup_views_test(pool.clone()).await;
 
     sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
@@ -868,8 +942,16 @@ async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space
     let feed: GetFeedOutput = serde_json::from_slice(&body).unwrap();
 
     let post = &feed.feed[0].post.post;
-    assert_eq!(post.reply_count, Some(1), "Reply count must isolate to Space 1 (cross-space reply excluded)");
-    assert_eq!(post.like_count, Some(1), "Like count must isolate to Space 1 (cross-space like excluded)");
+    assert_eq!(
+        post.reply_count,
+        Some(1),
+        "Reply count must isolate to Space 1 (cross-space reply excluded)"
+    );
+    assert_eq!(
+        post.like_count,
+        Some(1),
+        "Like count must isolate to Space 1 (cross-space like excluded)"
+    );
     assert!(post.viewer.as_ref().and_then(|v| v.like.as_ref()).is_some());
 
     // Also assert thread counts & traversal with standard at:// URI
@@ -877,14 +959,18 @@ async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space
     let thread_token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let thread_req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {thread_token}"))
         .body(Body::empty())
         .unwrap();
 
     let thread_resp = setup.app.clone().oneshot(thread_req).await.unwrap();
     assert_eq!(thread_resp.status(), StatusCode::OK);
-    let thread_body = to_bytes(thread_resp.into_body(), 1024 * 1024).await.unwrap();
+    let thread_body = to_bytes(thread_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let thread: GetPostThreadOutput = serde_json::from_slice(&thread_body).unwrap();
 
     assert_eq!(thread.thread.post.reply_count, Some(1));
@@ -893,7 +979,9 @@ async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_and_absolute_media_url(pool: PgPool) {
+async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_and_absolute_media_url(
+    pool: PgPool,
+) {
     let setup = setup_views_test(pool.clone()).await;
 
     sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
@@ -928,7 +1016,14 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
     });
     let cid = compute_record_cid(&post_json);
     let val_policy = policy(ALICE_DID, vec![BOB_DID]).with_space_uri(SPACE_1);
-    validate_fixture_record(&post_uri, ALICE_DID, "app.bsky.feed.post", "3l7imagepost", &post_json, &val_policy);
+    validate_fixture_record(
+        &post_uri,
+        ALICE_DID,
+        "app.bsky.feed.post",
+        "3l7imagepost",
+        &post_json,
+        &val_policy,
+    );
 
     sqlx::query(
         r#"
@@ -963,11 +1058,20 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
         Some(PostViewEmbed::ImagesView(images_view)) => {
             assert_eq!(images_view.images.len(), 1);
             assert_eq!(images_view.images[0].alt.as_str(), "Test image alt");
-            assert!(images_view.images[0].fullsize.as_str().starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
+            assert!(images_view.images[0]
+                .fullsize
+                .as_str()
+                .starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
             assert!(images_view.images[0].fullsize.as_str().contains(&blob_cid));
-            assert!(images_view.images[0].thumb.as_str().starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
+            assert!(images_view.images[0]
+                .thumb
+                .as_str()
+                .starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
 
-            let ar = images_view.images[0].aspect_ratio.as_ref().expect("Aspect ratio must be preserved");
+            let ar = images_view.images[0]
+                .aspect_ratio
+                .as_ref()
+                .expect("Aspect ratio must be preserved");
             assert_eq!(ar.width, 1200);
             assert_eq!(ar.height, 800);
         }
@@ -1020,7 +1124,9 @@ async fn thread_never_traverses_public_or_other_space_records(pool: PgPool) {
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -1034,7 +1140,10 @@ async fn thread_never_traverses_public_or_other_space_records(pool: PgPool) {
     assert_eq!(replies.len(), 1, "Only same-space reply must be returned");
     match &replies[0] {
         ThreadViewPostRepliesItem::ThreadViewPost(tvp) => {
-            assert_eq!(tvp.post.uri.as_str(), format!("at://{BOB_DID}/app.bsky.feed.post/3l7same"));
+            assert_eq!(
+                tvp.post.uri.as_str(),
+                format!("at://{BOB_DID}/app.bsky.feed.post/3l7same")
+            );
         }
         _ => panic!("Expected ThreadViewPost"),
     }
@@ -1092,21 +1201,33 @@ async fn thread_multi_level_parent_order_and_not_found_boundary(pool: PgPool) {
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let thread: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(thread.thread.post.uri.as_str(), format!("at://{BOB_DID}/app.bsky.feed.post/3l7postC"));
+    assert_eq!(
+        thread.thread.post.uri.as_str(),
+        format!("at://{BOB_DID}/app.bsky.feed.post/3l7postC")
+    );
 
     // Target post C's immediate parent must be B
     let parent_b = match thread.thread.parent {
         Some(ThreadViewPostParent::ThreadViewPost(b)) => b,
-        other => panic!("Expected ThreadViewPost for immediate parent B, got {:?}", other),
+        other => panic!(
+            "Expected ThreadViewPost for immediate parent B, got {:?}",
+            other
+        ),
     };
-    assert_eq!(parent_b.post.uri.as_str(), format!("at://{BOB_DID}/app.bsky.feed.post/3l7postB"));
+    assert_eq!(
+        parent_b.post.uri.as_str(),
+        format!("at://{BOB_DID}/app.bsky.feed.post/3l7postB")
+    );
 
     // B's parent must be A
     let parent_a = match parent_b.parent {
         Some(ThreadViewPostParent::ThreadViewPost(a)) => a,
         other => panic!("Expected ThreadViewPost for root parent A, got {:?}", other),
     };
-    assert_eq!(parent_a.post.uri.as_str(), format!("at://{ALICE_DID}/app.bsky.feed.post/3l7postA"));
+    assert_eq!(
+        parent_a.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7postA")
+    );
     assert!(parent_a.parent.is_none(), "Root post A must have no parent");
 }
 
@@ -1143,7 +1264,9 @@ async fn thread_excludes_replies_whose_root_or_parent_is_deleted(pool: PgPool) {
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -1153,7 +1276,10 @@ async fn thread_excludes_replies_whose_root_or_parent_is_deleted(pool: PgPool) {
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let thread: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
 
-    assert!(thread.thread.replies.is_none(), "Deleted reply tree must not be traversed");
+    assert!(
+        thread.thread.replies.is_none(),
+        "Deleted reply tree must not be traversed"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1169,7 +1295,9 @@ async fn thread_not_found_when_root_post_deleted_or_missing(pool: PgPool) {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={missing_std_uri}&space={SPACE_1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={missing_std_uri}&space={SPACE_1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -1205,7 +1333,9 @@ async fn thread_caps_traversal_at_node_budget_and_prevents_unbounded_expansion(p
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -1216,9 +1346,12 @@ async fn thread_caps_traversal_at_node_budget_and_prevents_unbounded_expansion(p
     let thread: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
 
     let replies = thread.thread.replies.expect("Replies must exist");
-    assert_eq!(replies.len(), 499, "Replies must be capped to budget (500 total nodes including root)");
+    assert_eq!(
+        replies.len(),
+        499,
+        "Replies must be capped to budget (500 total nodes including root)"
+    );
 }
-
 
 #[sqlx::test(migrations = "./migrations")]
 async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_likes(pool: PgPool) {
@@ -1295,7 +1428,9 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -1308,7 +1443,13 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
     // Assert Root aggregates: 1 like (Bob), 1 reply (Reply 1)
     assert_eq!(thread.thread.post.like_count, Some(1));
     assert_eq!(thread.thread.post.reply_count, Some(1));
-    assert!(thread.thread.post.viewer.as_ref().and_then(|v| v.like.as_ref()).is_some());
+    assert!(thread
+        .thread
+        .post
+        .viewer
+        .as_ref()
+        .and_then(|v| v.like.as_ref())
+        .is_some());
 
     // Assert Reply 1 aggregates: 2 likes (Bob, Alice), 1 reply (Reply 2)
     let replies = thread.thread.replies.expect("Replies must exist");
@@ -1317,9 +1458,25 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
         ThreadViewPostRepliesItem::ThreadViewPost(tvp) => tvp,
         _ => panic!("Expected ThreadViewPost"),
     };
-    assert_eq!(rep1_node.post.like_count, Some(2), "Reply 1 must have exactly 2 likes (Bob + Alice, not Root's like)");
-    assert_eq!(rep1_node.post.reply_count, Some(1), "Reply 1 must have exactly 1 child reply (Reply 2)");
-    assert!(rep1_node.post.viewer.as_ref().and_then(|v| v.like.as_ref()).is_some(), "Viewer Bob liked Reply 1");
+    assert_eq!(
+        rep1_node.post.like_count,
+        Some(2),
+        "Reply 1 must have exactly 2 likes (Bob + Alice, not Root's like)"
+    );
+    assert_eq!(
+        rep1_node.post.reply_count,
+        Some(1),
+        "Reply 1 must have exactly 1 child reply (Reply 2)"
+    );
+    assert!(
+        rep1_node
+            .post
+            .viewer
+            .as_ref()
+            .and_then(|v| v.like.as_ref())
+            .is_some(),
+        "Viewer Bob liked Reply 1"
+    );
 
     // Assert Reply 2 aggregates: 0 likes, 0 replies
     let rep1_replies = rep1_node.replies.as_ref().expect("Reply 2 must exist");
@@ -1330,7 +1487,12 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
     };
     assert_eq!(rep2_node.post.like_count, Some(0));
     assert_eq!(rep2_node.post.reply_count, Some(0));
-    assert!(rep2_node.post.viewer.as_ref().and_then(|v| v.like.as_ref()).is_none());
+    assert!(rep2_node
+        .post
+        .viewer
+        .as_ref()
+        .and_then(|v| v.like.as_ref())
+        .is_none());
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1366,17 +1528,24 @@ async fn thread_orphan_reply_with_deleted_root_or_parent_returns_not_found(pool:
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={reply_std_uri}&space={SPACE_1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={reply_std_uri}&space={SPACE_1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
 
     let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "Directly requesting orphan reply must return 404 NotFound");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "Directly requesting orphan reply must return 404 NotFound"
+    );
 }
 
 #[tokio::test]
-async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_failure_with_controlled_mock() {
+async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_failure_with_controlled_mock(
+) {
     let req_counter = Arc::new(AtomicUsize::new(0));
     let has_auth_header = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1404,7 +1573,10 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
                             did: Did::new(SmolStr::new("did:plc:alice-mock")).unwrap(),
                             handle: Handle::new(SmolStr::new("alice.mock")).unwrap(),
                             display_name: Some(SmolStr::new("Alice Mock")),
-                            avatar: Some(UriValue::new(SmolStr::new("https://cdn.bsky.app/avatar.jpg")).unwrap()),
+                            avatar: Some(
+                                UriValue::new(SmolStr::new("https://cdn.bsky.app/avatar.jpg"))
+                                    .unwrap(),
+                            ),
                             associated: Some(ProfileAssociated {
                                 chat: None,
                                 feedgens: None,
@@ -1485,51 +1657,94 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
     assert_eq!(profile1.did.as_str(), "did:plc:alice-mock");
     assert_eq!(profile1.handle.as_str(), "alice.mock");
     assert_eq!(profile1.display_name.as_deref(), Some("Alice Mock"));
-    assert_eq!(profile1.avatar.as_ref().unwrap().as_str(), "https://cdn.bsky.app/avatar.jpg");
+    assert_eq!(
+        profile1.avatar.as_ref().unwrap().as_str(),
+        "https://cdn.bsky.app/avatar.jpg"
+    );
     assert_eq!(profile1.pronouns.as_deref(), Some("she/her"));
-    assert!(profile1.viewer.is_none(), "Unauthenticated viewer state must remain empty");
+    assert!(
+        profile1.viewer.is_none(),
+        "Unauthenticated viewer state must remain empty"
+    );
     assert_eq!(req_counter.load(Ordering::SeqCst), 1);
-    assert!(!has_auth_header.load(Ordering::SeqCst), "Must not send private Authorization header");
+    assert!(
+        !has_auth_header.load(Ordering::SeqCst),
+        "Must not send private Authorization header"
+    );
 
     // 2. Second fetch for Alice -> cached (request count stays 1)
     let profile2 = hydrator.get_profile("did:plc:alice-mock").await;
     assert_eq!(profile2.did.as_str(), "did:plc:alice-mock");
-    assert_eq!(req_counter.load(Ordering::SeqCst), 1, "Must be served from 5-minute cache");
+    assert_eq!(
+        req_counter.load(Ordering::SeqCst),
+        1,
+        "Must be served from 5-minute cache"
+    );
 
     // 3. Batch fetch with concurrency -> Alice cached, Charlie fails (falls back), Mismatched fails (falls back)
-    let batch = hydrator.get_profiles(&["did:plc:alice-mock", "did:plc:charlie-error", "did:plc:mismatched"]).await;
+    let batch = hydrator
+        .get_profiles(&[
+            "did:plc:alice-mock",
+            "did:plc:charlie-error",
+            "did:plc:mismatched",
+        ])
+        .await;
     assert_eq!(batch.len(), 3);
-    assert_eq!(batch.get("did:plc:alice-mock").unwrap().handle.as_str(), "alice.mock");
-    assert_eq!(batch.get("did:plc:charlie-error").unwrap().handle.as_str(), "handle.invalid");
-    assert_eq!(batch.get("did:plc:charlie-error").unwrap().did.as_str(), "did:plc:charlie-error");
-    assert_eq!(batch.get("did:plc:mismatched").unwrap().handle.as_str(), "handle.invalid");
-    assert_eq!(batch.get("did:plc:mismatched").unwrap().did.as_str(), "did:plc:mismatched");
+    assert_eq!(
+        batch.get("did:plc:alice-mock").unwrap().handle.as_str(),
+        "alice.mock"
+    );
+    assert_eq!(
+        batch.get("did:plc:charlie-error").unwrap().handle.as_str(),
+        "handle.invalid"
+    );
+    assert_eq!(
+        batch.get("did:plc:charlie-error").unwrap().did.as_str(),
+        "did:plc:charlie-error"
+    );
+    assert_eq!(
+        batch.get("did:plc:mismatched").unwrap().handle.as_str(),
+        "handle.invalid"
+    );
+    assert_eq!(
+        batch.get("did:plc:mismatched").unwrap().did.as_str(),
+        "did:plc:mismatched"
+    );
 
     // 4. Cache expiry after 5 minutes -> set cached_at to 305 seconds in the past and verify a new network fetch is made
-    hydrator.set_cached_profile_with_time(
-        "did:plc:alice-mock",
-        ProfileViewBasic {
-            did: Did::new(SmolStr::new("did:plc:alice-mock")).unwrap(),
-            handle: Handle::new(SmolStr::new("alice.mock")).unwrap(),
-            display_name: None,
-            avatar: None,
-            associated: None,
-            viewer: None,
-            labels: None,
-            created_at: None,
-            pronouns: None,
-            status: None,
-            verification: None,
-            debug: None,
-            extra_data: None,
-        },
-        std::time::Instant::now() - std::time::Duration::from_secs(305),
-    ).await;
+    hydrator
+        .set_cached_profile_with_time(
+            "did:plc:alice-mock",
+            ProfileViewBasic {
+                did: Did::new(SmolStr::new("did:plc:alice-mock")).unwrap(),
+                handle: Handle::new(SmolStr::new("alice.mock")).unwrap(),
+                display_name: None,
+                avatar: None,
+                associated: None,
+                viewer: None,
+                labels: None,
+                created_at: None,
+                pronouns: None,
+                status: None,
+                verification: None,
+                debug: None,
+                extra_data: None,
+            },
+            std::time::Instant::now() - std::time::Duration::from_secs(305),
+        )
+        .await;
 
     let profile_after_expiry = hydrator.get_profile("did:plc:alice-mock").await;
     assert_eq!(profile_after_expiry.did.as_str(), "did:plc:alice-mock");
-    assert_eq!(profile_after_expiry.display_name.as_deref(), Some("Alice Mock"));
-    assert_eq!(req_counter.load(Ordering::SeqCst), 4, "Must re-fetch from server after 5-minute cache expiry");
+    assert_eq!(
+        profile_after_expiry.display_name.as_deref(),
+        Some("Alice Mock")
+    );
+    assert_eq!(
+        req_counter.load(Ordering::SeqCst),
+        4,
+        "Must re-fetch from server after 5-minute cache expiry"
+    );
 }
 
 #[tokio::test]
@@ -1550,7 +1765,12 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
                 // Record maximum concurrent active requests observed
                 let mut prev = max_seen.load(Ordering::SeqCst);
                 while current > prev {
-                    match max_seen.compare_exchange_weak(prev, current, Ordering::SeqCst, Ordering::SeqCst) {
+                    match max_seen.compare_exchange_weak(
+                        prev,
+                        current,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
                         Ok(_) => break,
                         Err(actual) => prev = actual,
                     }
@@ -1600,16 +1820,17 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let hydrator = Arc::new(ProfileHydrator::new(format!("http://{addr}"), reqwest::Client::new()));
+    let hydrator = Arc::new(ProfileHydrator::new(
+        format!("http://{addr}"),
+        reqwest::Client::new(),
+    ));
 
     // Issue 20 parallel requests across multiple concurrent tasks sharing the same ProfileHydrator
     let mut handles = Vec::new();
     for i in 1..=20 {
         let h = hydrator.clone();
         let did = format!("did:plc:concurrency-test-{i}");
-        handles.push(tokio::spawn(async move {
-            h.get_profile(&did).await
-        }));
+        handles.push(tokio::spawn(async move { h.get_profile(&did).await }));
     }
 
     for h in handles {
@@ -1618,7 +1839,10 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
     }
 
     let max_seen = max_concurrent_seen.load(Ordering::SeqCst);
-    assert!(max_seen <= 8, "Global concurrency ceiling of 8 permits must never be exceeded (saw {max_seen})");
+    assert!(
+        max_seen <= 8,
+        "Global concurrency ceiling of 8 permits must never be exceeded (saw {max_seen})"
+    );
     assert!(max_seen > 1, "Must have processed requests concurrently");
 }
 
@@ -1649,13 +1873,17 @@ fn test_circle_media_base_url_strict_https_origin_validation() {
     for (val, desc) in invalid_cases {
         std::env::set_var("CIRCLE_MEDIA_BASE_URL", val);
         let res = Config::from_env();
-        assert!(res.is_err(), "Invalid CIRCLE_MEDIA_BASE_URL ({desc}: {val}) must be rejected");
+        assert!(
+            res.is_err(),
+            "Invalid CIRCLE_MEDIA_BASE_URL ({desc}: {val}) must be rejected"
+        );
     }
 }
 
-
 #[sqlx::test(migrations = "./migrations")]
-async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direct_siblings(pool: PgPool) {
+async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direct_siblings(
+    pool: PgPool,
+) {
     let setup = setup_views_test(pool.clone()).await;
 
     sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
@@ -1710,13 +1938,18 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
         total_seeded += 1;
     }
 
-    assert_eq!(total_seeded, 511, "Seeded exactly 511 nodes (1 root + 50 L1 siblings + 460 L1_1 children)");
+    assert_eq!(
+        total_seeded, 511,
+        "Seeded exactly 511 nodes (1 root + 50 L1 siblings + 460 L1_1 children)"
+    );
 
     let root_std_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/3l7advroot");
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -1748,14 +1981,30 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
 
     // Strict assertions:
     // 1. Total thread nodes saturates at exactly 500 (MAX_THREAD_NODES bound, root included per implementation accounting)
-    assert_eq!(total_thread_nodes, 500, "Total thread nodes must saturate at exactly MAX_THREAD_NODES (500)");
-    assert_eq!(total_reply_nodes, 499, "Total reply nodes must be exactly 499 (500 max - 1 root)");
+    assert_eq!(
+        total_thread_nodes, 500,
+        "Total thread nodes must saturate at exactly MAX_THREAD_NODES (500)"
+    );
+    assert_eq!(
+        total_reply_nodes, 499,
+        "Total reply nodes must be exactly 499 (500 max - 1 root)"
+    );
     // 2. All 50 direct level-1 siblings are retained because the direct batch was charged before recursion
-    assert_eq!(direct_replies_count, 50, "All 50 direct level 1 siblings must be retained and not starved by child recursion");
+    assert_eq!(
+        direct_replies_count, 50,
+        "All 50 direct level 1 siblings must be retained and not starved by child recursion"
+    );
     // 3. First sibling gets exactly 449 children consuming the remaining budget (499 - 50 = 449)
     if let ThreadViewPostRepliesItem::ThreadViewPost(first_sibling) = &reply_items[0] {
-        let first_sibling_replies = first_sibling.replies.as_ref().expect("First sibling must have replies");
-        assert_eq!(first_sibling_replies.len(), 449, "First sibling must have exactly 449 child replies (449 remaining budget)");
+        let first_sibling_replies = first_sibling
+            .replies
+            .as_ref()
+            .expect("First sibling must have replies");
+        assert_eq!(
+            first_sibling_replies.len(),
+            449,
+            "First sibling must have exactly 449 child replies (449 remaining budget)"
+        );
     } else {
         panic!("Expected first reply item to be a ThreadViewPost");
     }
@@ -1772,7 +2021,11 @@ async fn list_circles_returns_member_count_and_omits_members_array(pool: PgPool)
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
     // 1. Owner query (ALICE)
-    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let alice_token = mint_jwt(
+        ALICE_DID,
+        "blue.catbird.circle.listCircles",
+        &setup.alice_key,
+    );
     let alice_req = Request::builder()
         .method("GET")
         .uri("/xrpc/blue.catbird.circle.listCircles")
@@ -1832,7 +2085,11 @@ async fn list_circles_excludes_deleted_and_non_members(pool: PgPool) {
     grant_active_member(&pool, SPACE_2, ALICE_DID, Duration::hours(1)).await;
 
     // Query as ALICE
-    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let alice_token = mint_jwt(
+        ALICE_DID,
+        "blue.catbird.circle.listCircles",
+        &setup.alice_key,
+    );
     let req = Request::builder()
         .method("GET")
         .uri("/xrpc/blue.catbird.circle.listCircles")
@@ -1863,7 +2120,6 @@ async fn list_circles_excludes_deleted_and_non_members(pool: PgPool) {
     assert_eq!(list_out.circles.len(), 0);
 }
 
-
 #[sqlx::test(migrations = "./migrations")]
 async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
@@ -1871,11 +2127,31 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
     let fixed_time = Utc::now();
     // Create 5 circles for Alice: two sharing the exact same timestamp to test stability
     let spaces = [
-        ("at://did:plc:alice/space/blue.catbird.circle/circle-1", "Circle 1", fixed_time + Duration::seconds(10)),
-        ("at://did:plc:alice/space/blue.catbird.circle/circle-2", "Circle 2", fixed_time + Duration::seconds(20)),
-        ("at://did:plc:alice/space/blue.catbird.circle/circle-3", "Circle 3", fixed_time + Duration::seconds(20)), // Same timestamp as 2
-        ("at://did:plc:alice/space/blue.catbird.circle/circle-4", "Circle 4", fixed_time + Duration::seconds(30)),
-        ("at://did:plc:alice/space/blue.catbird.circle/circle-5", "Circle 5", fixed_time + Duration::seconds(40)),
+        (
+            "at://did:plc:alice/space/blue.catbird.circle/circle-1",
+            "Circle 1",
+            fixed_time + Duration::seconds(10),
+        ),
+        (
+            "at://did:plc:alice/space/blue.catbird.circle/circle-2",
+            "Circle 2",
+            fixed_time + Duration::seconds(20),
+        ),
+        (
+            "at://did:plc:alice/space/blue.catbird.circle/circle-3",
+            "Circle 3",
+            fixed_time + Duration::seconds(20),
+        ), // Same timestamp as 2
+        (
+            "at://did:plc:alice/space/blue.catbird.circle/circle-4",
+            "Circle 4",
+            fixed_time + Duration::seconds(30),
+        ),
+        (
+            "at://did:plc:alice/space/blue.catbird.circle/circle-5",
+            "Circle 5",
+            fixed_time + Duration::seconds(40),
+        ),
     ];
 
     for (space_uri, name, created_at) in &spaces {
@@ -1889,9 +2165,21 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
         .execute(&pool)
         .await
         .unwrap();
+
+        sqlx::query(
+            "INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count, access_epoch, app_access_granted) VALUES ($1, now(), 1, 1, true)"
+        )
+        .bind(space_uri)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
-    let alice_token = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let alice_token = mint_jwt(
+        ALICE_DID,
+        "blue.catbird.circle.listCircles",
+        &setup.alice_key,
+    );
 
     // Page 1: limit = 2
     let req1 = Request::builder()
@@ -1910,10 +2198,16 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
     let cur1 = page1.cursor.unwrap();
 
     // Page 2: limit = 2 with cursor from Page 1
-    let alice_token_p2 = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let alice_token_p2 = mint_jwt(
+        ALICE_DID,
+        "blue.catbird.circle.listCircles",
+        &setup.alice_key,
+    );
     let req2 = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.listCircles?limit=2&cursor={cur1}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.listCircles?limit=2&cursor={cur1}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {alice_token_p2}"))
         .body(Body::empty())
         .unwrap();
@@ -1927,10 +2221,16 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
     let cur2 = page2.cursor.unwrap();
 
     // Page 3: limit = 2 with cursor from Page 2
-    let alice_token_p3 = mint_jwt(ALICE_DID, "blue.catbird.circle.listCircles", &setup.alice_key);
+    let alice_token_p3 = mint_jwt(
+        ALICE_DID,
+        "blue.catbird.circle.listCircles",
+        &setup.alice_key,
+    );
     let req3 = Request::builder()
         .method("GET")
-        .uri(format!("/xrpc/blue.catbird.circle.listCircles?limit=2&cursor={cur2}"))
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.listCircles?limit=2&cursor={cur2}"
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {alice_token_p3}"))
         .body(Body::empty())
         .unwrap();
@@ -1944,12 +2244,189 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
 
     // Collect all URIs across pages
     let mut all_uris = Vec::new();
-    all_uris.extend(page1.circles.into_iter().map(|c| c.uri.as_str().to_string()));
-    all_uris.extend(page2.circles.into_iter().map(|c| c.uri.as_str().to_string()));
-    all_uris.extend(page3.circles.into_iter().map(|c| c.uri.as_str().to_string()));
-    assert_eq!(all_uris[0], "at://did:plc:alice/space/blue.catbird.circle/circle-5");
-    assert_eq!(all_uris[1], "at://did:plc:alice/space/blue.catbird.circle/circle-4");
-    assert_eq!(all_uris[2], "at://did:plc:alice/space/blue.catbird.circle/circle-3");
-    assert_eq!(all_uris[3], "at://did:plc:alice/space/blue.catbird.circle/circle-2");
-    assert_eq!(all_uris[4], "at://did:plc:alice/space/blue.catbird.circle/circle-1");
+    all_uris.extend(
+        page1
+            .circles
+            .into_iter()
+            .map(|c| c.uri.as_str().to_string()),
+    );
+    all_uris.extend(
+        page2
+            .circles
+            .into_iter()
+            .map(|c| c.uri.as_str().to_string()),
+    );
+    all_uris.extend(
+        page3
+            .circles
+            .into_iter()
+            .map(|c| c.uri.as_str().to_string()),
+    );
+    assert_eq!(
+        all_uris[0],
+        "at://did:plc:alice/space/blue.catbird.circle/circle-5"
+    );
+    assert_eq!(
+        all_uris[1],
+        "at://did:plc:alice/space/blue.catbird.circle/circle-4"
+    );
+    assert_eq!(
+        all_uris[2],
+        "at://did:plc:alice/space/blue.catbird.circle/circle-3"
+    );
+    assert_eq!(
+        all_uris[3],
+        "at://did:plc:alice/space/blue.catbird.circle/circle-2"
+    );
+    assert_eq!(
+        all_uris[4],
+        "at://did:plc:alice/space/blue.catbird.circle/circle-1"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn thread_view_unions_replies_under_both_parent_uri_spellings(pool: PgPool) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
+        .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let root_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3l7rootmixa");
+    let root_std_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/3l7rootmixa");
+    let root_json = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Root post for mixed parent spellings",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let root_cid = compute_record_cid(&root_json);
+    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7rootmixa', $5, now(), now())")
+        .bind(&root_uri).bind(&root_cid).bind(SPACE_1).bind(ALICE_DID).bind(&root_json).execute(&pool).await.unwrap();
+
+    // Reply 1 uses space-scoped parent_uri
+    let r1_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7ra");
+    let r1_std_uri = format!("at://{BOB_DID}/app.bsky.feed.post/3l7ra");
+    let r1_json = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Reply 1 (space-scoped parent)",
+        "createdAt": "2026-08-24T12:01:00.000Z",
+        "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &root_uri, "cid": &root_cid}}
+    });
+    let r1_cid = compute_record_cid(&r1_json);
+    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7ra', $5, now(), now(), $6, $6)")
+        .bind(&r1_uri).bind(&r1_cid).bind(SPACE_1).bind(BOB_DID).bind(&r1_json).bind(&root_uri).execute(&pool).await.unwrap();
+
+    // Reply 2 uses standard at:// parent_uri
+    let r2_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7rb");
+    let r2_json = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Reply 2 (standard at:// parent)",
+        "createdAt": "2026-08-24T12:02:00.000Z",
+        "reply": {"root": {"uri": &root_std_uri, "cid": &root_cid}, "parent": {"uri": &root_std_uri, "cid": &root_cid}}
+    });
+    let r2_cid = compute_record_cid(&r2_json);
+    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7rb', $5, now(), now(), $6, $6)")
+        .bind(&r2_uri).bind(&r2_cid).bind(SPACE_1).bind(BOB_DID).bind(&r2_json).bind(&root_std_uri).execute(&pool).await.unwrap();
+
+    // Nested child 1a under Reply 1 uses space-scoped parent_uri (r1_uri)
+    let r1a_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7raa");
+    let r1a_json = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Nested 1a (space-scoped parent r1)",
+        "createdAt": "2026-08-24T12:03:00.000Z",
+        "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &r1_uri, "cid": &r1_cid}}
+    });
+    let r1a_cid = compute_record_cid(&r1a_json);
+    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7raa', $5, now(), now(), $6, $7)")
+        .bind(&r1a_uri).bind(&r1a_cid).bind(SPACE_1).bind(BOB_DID).bind(&r1a_json).bind(&r1_uri).bind(&root_uri).execute(&pool).await.unwrap();
+
+    // Nested child 1b under Reply 1 uses standard at:// parent_uri (r1_std_uri)
+    let r1b_uri = format!("{SPACE_1}/{BOB_DID}/app.bsky.feed.post/3l7rab");
+    let r1b_json = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Nested 1b (standard at:// parent r1)",
+        "createdAt": "2026-08-24T12:04:00.000Z",
+        "reply": {"root": {"uri": &root_uri, "cid": &root_cid}, "parent": {"uri": &r1_std_uri, "cid": &r1_cid}}
+    });
+    let r1b_cid = compute_record_cid(&r1b_json);
+    sqlx::query("INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at, parent_uri, root_uri) VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7rab', $5, now(), now(), $6, $7)")
+        .bind(&r1b_uri).bind(&r1b_cid).bind(SPACE_1).bind(BOB_DID).bind(&r1b_json).bind(&r1_std_uri).bind(&root_uri).execute(&pool).await.unwrap();
+
+    let direct_res = circle_appview::thread::get_post_thread(
+        &setup.state,
+        BOB_DID,
+        &root_std_uri,
+        SPACE_1,
+        Some(10),
+        None,
+    )
+    .await;
+    if let Err(e) = &direct_res {
+        panic!("Direct get_post_thread failed: {e:?}");
+    }
+    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getPostThread?uri={root_std_uri}&space={SPACE_1}&depth=10"
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Status was {status}, body: {body_str}"
+    );
+    let thread_output: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
+
+    // Both root replies must be present
+    assert_eq!(
+        thread_output.thread.post.reply_count,
+        Some(2),
+        "Root reply_count must be 2"
+    );
+    let root_replies = thread_output
+        .thread
+        .replies
+        .as_ref()
+        .expect("Replies must be present");
+    assert_eq!(
+        root_replies.len(),
+        2,
+        "Both root replies must be assembled in the response"
+    );
+
+    // Find reply 1
+    let r1_node = root_replies
+        .iter()
+        .find(|r| match r {
+            ThreadViewPostRepliesItem::ThreadViewPost(tvp) => {
+                tvp.post.uri.as_str() == r1_std_uri || tvp.post.uri.as_str() == r1_uri
+            }
+            _ => false,
+        })
+        .expect("Reply 1 must be present in root replies");
+
+    if let ThreadViewPostRepliesItem::ThreadViewPost(tvp) = r1_node {
+        assert_eq!(
+            tvp.post.reply_count,
+            Some(2),
+            "Reply 1 reply_count must be 2"
+        );
+        let r1_replies = tvp
+            .replies
+            .as_ref()
+            .expect("Reply 1 replies must be present");
+        assert_eq!(
+            r1_replies.len(),
+            2,
+            "Both nested children (1a and 1b) under Reply 1 must be assembled"
+        );
+    }
 }

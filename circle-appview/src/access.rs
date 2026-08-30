@@ -83,39 +83,92 @@ impl CredentialStore {
     }
 }
 
+const DEFAULT_MAX_LOCK_ENTRIES: usize = 1000;
+
 #[derive(Clone)]
 struct SpaceLockEntry {
     mutex: Arc<Mutex<()>>,
     waiters: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[derive(Clone, Default)]
+pub struct SpaceLockGuard {
+    _guard: OwnedMutexGuard<()>,
+    space: String,
+    locks: Arc<RwLock<HashMap<String, SpaceLockEntry>>>,
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for SpaceLockGuard {
+    fn drop(&mut self) {
+        let remaining = self
+            .waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if remaining <= 1 {
+            let locks = self.locks.clone();
+            let space = self.space.clone();
+            let waiters = self.waiters.clone();
+            tokio::spawn(async move {
+                let mut map = locks.write().await;
+                if waiters.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    if let Some(entry) = map.get(&space) {
+                        if Arc::ptr_eq(&entry.waiters, &waiters) {
+                            map.remove(&space);
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SpaceLockManager {
     locks: Arc<RwLock<HashMap<String, SpaceLockEntry>>>,
+    max_capacity: usize,
+}
+
+impl Default for SpaceLockManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SpaceLockManager {
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_LOCK_ENTRIES)
+    }
+
+    pub fn with_capacity(max_capacity: usize) -> Self {
         Self {
             locks: Arc::new(RwLock::new(HashMap::new())),
+            max_capacity,
         }
     }
 
-    pub async fn acquire(&self, space: &str) -> OwnedMutexGuard<()> {
+    pub async fn acquire(&self, space: &str) -> SpaceLockGuard {
         let (mutex, waiters) = {
             let mut map = self.locks.write().await;
+            if map.len() >= self.max_capacity && !map.contains_key(space) {
+                map.retain(|_, v| v.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            }
             let entry = map
                 .entry(space.to_string())
                 .or_insert_with(|| SpaceLockEntry {
                     mutex: Arc::new(Mutex::new(())),
                     waiters: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 });
+            entry
+                .waiters
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             (entry.mutex.clone(), entry.waiters.clone())
         };
-        waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let guard = mutex.lock_owned().await;
-        waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        guard
+        SpaceLockGuard {
+            _guard: guard,
+            space: space.to_string(),
+            locks: self.locks.clone(),
+            waiters,
+        }
     }
 
     pub async fn waiter_count(&self, space: &str) -> usize {
@@ -125,6 +178,16 @@ impl SpaceLockManager {
         } else {
             0
         }
+    }
+
+    pub async fn lock_count(&self) -> usize {
+        let map = self.locks.read().await;
+        map.len()
+    }
+
+    pub async fn clean_idle(&self) {
+        let mut map = self.locks.write().await;
+        map.retain(|_, v| v.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 }
 
@@ -327,22 +390,28 @@ pub async fn verify_member_access(
     space_uri: &str,
     user_did: &str,
 ) -> Result<MemberAccessOutcome, AppError> {
-    // 1. Check if the circle exists and is not deleted
-    let space_row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
-        "SELECT deleted_at FROM circles WHERE space_uri = $1",
+    // 1. Check if the circle exists, is not deleted, and appAccess is granted
+    let space_row: Option<(Option<DateTime<Utc>>, bool, i64)> = sqlx::query_as(
+        "SELECT deleted_at, app_access_granted, access_epoch FROM circles WHERE space_uri = $1",
     )
     .bind(space_uri)
     .fetch_optional(&state.db)
     .await
     .map_err(AppError::Database)?;
 
-    if let Some((Some(_),)) = space_row {
-        return Err(AppError::NotFound("Circle deleted".into()));
-    }
+    let (circle_deleted, circle_app_access, circle_epoch) = match space_row {
+        None => return Err(AppError::NotFound("Circle not found".into())),
+        Some((deleted_at, app_access, epoch)) => (deleted_at.is_some(), app_access, epoch),
+    };
 
-    // 2. Check cache freshness metadata (TTL: 300 seconds)
-    let cache_meta: Option<(DateTime<Utc>, i32)> = sqlx::query_as(
-        "SELECT last_refreshed_at, member_count FROM circle_member_cache_meta WHERE space_uri = $1",
+    if circle_deleted || !circle_app_access {
+        return Err(AppError::NotFound(
+            "Circle deleted or appAccess revoked".into(),
+        ));
+    }
+    // 2. Check cache freshness and matching access epoch metadata (TTL: 300 seconds)
+    let cache_meta: Option<(DateTime<Utc>, i32, i64, bool)> = sqlx::query_as(
+        "SELECT last_refreshed_at, member_count, access_epoch, app_access_granted FROM circle_member_cache_meta WHERE space_uri = $1",
     )
     .bind(space_uri)
     .fetch_optional(&state.db)
@@ -350,9 +419,14 @@ pub async fn verify_member_access(
     .map_err(AppError::Database)?;
 
     let now = Utc::now();
-    let is_fresh = cache_meta.as_ref().is_some_and(|(refreshed_at, _)| {
-        now.signed_duration_since(*refreshed_at).num_seconds() < 300
-    });
+    let is_fresh =
+        cache_meta
+            .as_ref()
+            .is_some_and(|(refreshed_at, _, meta_epoch, meta_app_access)| {
+                *meta_app_access
+                    && *meta_epoch == circle_epoch
+                    && now.signed_duration_since(*refreshed_at).num_seconds() < 300
+            });
 
     if is_fresh {
         let is_cached: Option<(String,)> = sqlx::query_as(
@@ -440,6 +514,55 @@ pub async fn refresh_member_cache(
     state: &AppState,
     space_uri: &str,
 ) -> Result<Vec<String>, AppError> {
+    // 1. Verify appAccess with get_space on the owner's PDS before updating any cache
+    let space_config = match state.space_client.get_space(space_uri).await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(error = %e, "get_space failed during refresh_member_cache, denying non-destructively");
+            return Err(AppError::Forbidden(format!(
+                "Unable to verify appAccess: {e}"
+            )));
+        }
+    };
+    let expected_client_id = &state.oauth_service.client_id;
+    if space_config
+        .app_access
+        .is_explicit_revocation(expected_client_id)
+    {
+        tracing::warn!(space_uri = %space_uri, "Space appAccess explicitly omits client_id, revoking");
+        if let Err(e) =
+            crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await
+        {
+            tracing::error!(error = %e, space_uri = %space_uri, "Failed to revoke app access and purge circle data");
+        }
+        return Err(AppError::Forbidden("Space appAccess revoked".into()));
+    } else if !space_config.app_access.grants_access(expected_client_id) {
+        tracing::warn!(space_uri = %space_uri, "Space appAccess policy does not grant access, denying without purge");
+        return Err(AppError::Forbidden(
+            "Space appAccess policy denies access".into(),
+        ));
+    }
+
+    // Check if the circle is deleted or appAccess is not granted in the circles table
+    let circle_row: Option<(bool, Option<DateTime<Utc>>, i64)> = sqlx::query_as(
+        "SELECT app_access_granted, deleted_at, access_epoch FROM circles WHERE space_uri = $1",
+    )
+    .bind(space_uri)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    let (app_access_granted, is_deleted, current_epoch) = match circle_row {
+        Some((granted, deleted, epoch)) => (granted, deleted.is_some(), epoch),
+        None => return Err(AppError::NotFound("Circle not found".into())),
+    };
+
+    if !app_access_granted || is_deleted {
+        return Err(AppError::Forbidden(
+            "Circle is inactive or appAccess revoked".into(),
+        ));
+    }
+
     let member_dids = state
         .space_client
         .member_dids(space_uri)
@@ -450,6 +573,38 @@ pub async fn refresh_member_cache(
         })?;
 
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
+
+    // Fetch existing cached members to detect membership mutations
+    let existing_members: Vec<(String,)> =
+        sqlx::query_as("SELECT member_did FROM circle_member_cache WHERE space_uri = $1")
+            .bind(space_uri)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
+    let existing_set: std::collections::HashSet<String> =
+        existing_members.into_iter().map(|(d,)| d).collect();
+    let new_set: std::collections::HashSet<String> = member_dids.iter().cloned().collect();
+
+    let membership_changed = existing_set != new_set;
+
+    let target_epoch = if membership_changed {
+        let (new_epoch,): (i64,) = sqlx::query_as(
+            r#"
+            UPDATE circles
+            SET access_epoch = access_epoch + 1
+            WHERE space_uri = $1
+            RETURNING access_epoch
+            "#,
+        )
+        .bind(space_uri)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        new_epoch
+    } else {
+        current_epoch
+    };
 
     sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1")
         .bind(space_uri)
@@ -474,14 +629,15 @@ pub async fn refresh_member_cache(
 
     sqlx::query(
         r#"
-        INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count)
-        VALUES ($1, now(), $2)
+        INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count, access_epoch, app_access_granted, generation)
+        VALUES ($1, now(), $2, $3, true, 1)
         ON CONFLICT (space_uri) DO UPDATE
-        SET last_refreshed_at = now(), member_count = EXCLUDED.member_count
+        SET last_refreshed_at = now(), member_count = EXCLUDED.member_count, access_epoch = EXCLUDED.access_epoch, app_access_granted = true, generation = circle_member_cache_meta.generation + 1
         "#,
     )
     .bind(space_uri)
     .bind(member_dids.len() as i32)
+    .bind(target_epoch)
     .execute(&mut *tx)
     .await
     .map_err(AppError::Database)?;
@@ -495,15 +651,21 @@ pub async fn get_cached_member_count(
     pool: &PgPool,
     space_uri: &str,
 ) -> Result<Option<i64>, AppError> {
-    let row: Option<(i32,)> = sqlx::query_as(
-        "SELECT member_count FROM circle_member_cache_meta WHERE space_uri = $1",
-    )
-    .bind(space_uri)
-    .fetch_optional(pool)
-    .await
-    .map_err(AppError::Database)?;
+    let row: Option<(i32,)> =
+        sqlx::query_as("SELECT member_count FROM circle_member_cache_meta WHERE space_uri = $1")
+            .bind(space_uri)
+            .fetch_optional(pool)
+            .await
+            .map_err(AppError::Database)?;
 
     Ok(row.map(|(count,)| count as i64))
+}
+/// Computes an opaque, truncated SHA-256 fingerprint for a Space URI for safe operational logging.
+pub fn space_fingerprint(space_uri: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(space_uri.as_bytes());
+    let hex_part: String = hash[..6].iter().map(|b| format!("{:02x}", b)).collect();
+    format!("space_{hex_part}")
 }
 
 /// Activates a Circle by verifying Space on PDS and returning defs#circleSummary.
@@ -515,20 +677,16 @@ pub async fn activate_circle(
     let authority_did = extract_authority_did(space_uri)?;
 
     // 1. Independent verification via get_space on the owner's PDS
-    let space_config = state
-        .space_client
-        .get_space(space_uri)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "get_space failed on PDS");
-            AppError::NotFound(format!("Space not found or upstream unavailable: {e}"))
-        })?;
+    let space_config = state.space_client.get_space(space_uri).await.map_err(|e| {
+        tracing::warn!(error = %e, "get_space failed on PDS");
+        AppError::NotFound(format!("Space not found or upstream unavailable: {e}"))
+    })?;
 
     // Verify appAccess names this AppView's client_id
     let expected_client_id = &state.oauth_service.client_id;
-    if !space_config.app_access.iter().any(|c| c == expected_client_id) {
+    if !space_config.app_access.grants_access(expected_client_id) {
         return Err(AppError::Forbidden(
-            "Space appAccess does not name this Circle AppView client_id".into(),
+            "Space appAccess does not authorize this Circle AppView client_id".into(),
         ));
     }
 
@@ -571,8 +729,7 @@ pub async fn activate_circle(
     let (repo_service_endpoint, _) = resolve_pds_endpoint(&authority_doc, &authority_did)?;
     let author_vm = select_verification_method(&authority_doc, &authority_did, None)
         .map_err(AppError::Unauthorized)?;
-    let author_signing_key =
-        parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
+    let author_signing_key = parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
 
     let car_bytes = state
         .space_client
@@ -597,11 +754,12 @@ pub async fn activate_circle(
             AppError::Internal(format!("Could not read the Space: CAR decoding failed ({e})"))
         })?;
 
-    let (_commit, records, _lthash) = crate::commit::extract_and_validate_car(
+    let (_commit, records, _lthash) = crate::commit::extract_and_validate_car_with_policy(
         &car,
         space_uri,
         &authority_did,
         &author_signing_key,
+        &state.config.commit_verification_policy,
     )
     .map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "CAR validation failed during activation");
@@ -645,13 +803,16 @@ pub async fn activate_circle(
     // 5. INSERT the circles parent row.
     sqlx::query(
         r#"
-        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at)
-        VALUES ($1, $2, $3, $4, $5, NULL)
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at, app_access_granted, app_access_revoked_at, access_epoch)
+        VALUES ($1, $2, $3, $4, $5, NULL, true, NULL, 1)
         ON CONFLICT (space_uri) DO UPDATE
         SET circle_id = EXCLUDED.circle_id,
             authority_did = EXCLUDED.authority_did,
             display_name = EXCLUDED.display_name,
-            deleted_at = NULL
+            deleted_at = NULL,
+            app_access_granted = true,
+            app_access_revoked_at = NULL,
+            access_epoch = circles.access_epoch + 1
         "#,
     )
     .bind(space_uri)
@@ -662,26 +823,27 @@ pub async fn activate_circle(
     .execute(&state.db)
     .await
     .map_err(AppError::Database)?;
+    // 6. Now that the circle row exists, persist the member cache before syncing repo records
+    // so notification triggers correctly detect active members.
+    let members = refresh_member_cache(state, space_uri).await?;
 
-    // 6. Now that the circle row exists, sync the repo so children (circle_records, etc.) have their FK parent.
+    // 7. Sync the repo so children (circle_records, etc.) have their FK parent and notifications are generated.
     let sync_engine = crate::sync::SyncEngine::new(state);
     if let Err(e) = sync_engine.sync_repo(space_uri, &authority_did).await {
         tracing::warn!(error = %e, space_uri = %space_uri, "Space repo sync failed during activation");
     }
-    // 7. Now that the circle row exists, persist the member cache.
-    let members = refresh_member_cache(state, space_uri).await?;
 
-    let circle_tid = catbird_atproto::jacquard_common::types::string::Tid::new(
-        SmolStr::new(&circle_id),
-    ).map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
+    let circle_tid =
+        catbird_atproto::jacquard_common::types::string::Tid::new(SmolStr::new(&circle_id))
+            .map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
 
-    let space_ref = catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new(
-        SmolStr::new(space_uri),
-    ).map_err(|e| AppError::Internal(format!("Invalid space URI: {e}")))?;
+    let space_ref =
+        catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new(SmolStr::new(space_uri))
+            .map_err(|e| AppError::Internal(format!("Invalid space URI: {e}")))?;
 
-    let owner_did = catbird_atproto::jacquard_common::types::string::Did::new(
-        SmolStr::new(&authority_did),
-    ).map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
+    let owner_did =
+        catbird_atproto::jacquard_common::types::string::Did::new(SmolStr::new(&authority_did))
+            .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
 
     Ok(CircleSummary {
         circle_id: circle_tid,
@@ -755,12 +917,11 @@ pub async fn ensure_space_credential_from_parts(
     }
 
     if acting_user_did.is_none() {
-        let member_rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1",
-        )
-        .bind(space_uri)
-        .fetch_all(db)
-        .await?;
+        let member_rows: Vec<(String,)> =
+            sqlx::query_as("SELECT member_did FROM circle_member_cache WHERE space_uri = $1")
+                .bind(space_uri)
+                .fetch_all(db)
+                .await?;
 
         if !member_rows.is_empty() {
             let sessions = oauth_service.list_sessions().await?;
@@ -789,23 +950,17 @@ pub async fn ensure_space_credential_from_parts(
         .await?;
 
     // 4. Resolve that user's PDS endpoint from their DID document
-    let user_doc = did_resolver
-        .resolve(&user_did)
-        .await
-        .map_err(|e| match e {
-            AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
-            other => AppError::Internal(format!("Failed to resolve DID document for {user_did}: {other}")),
-        })?;
+    let user_doc = did_resolver.resolve(&user_did).await.map_err(|e| match e {
+        AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+        other => AppError::Internal(format!(
+            "Failed to resolve DID document for {user_did}: {other}"
+        )),
+    })?;
     let (user_pds_endpoint, _) = resolve_pds_endpoint(&user_doc, &user_did)?;
 
     // 5. Step 1: Mint delegation token from user's PDS
     let delegation_token = space_client
-        .get_delegation_token(
-            &user_pds_endpoint,
-            space_uri,
-            &access_token,
-            &dpop_key,
-        )
+        .get_delegation_token(&user_pds_endpoint, space_uri, &access_token, &dpop_key)
         .await?;
 
     // 6. Resolve space host endpoint and authority DID document
@@ -814,14 +969,15 @@ pub async fn ensure_space_credential_from_parts(
         .await
         .map_err(|e| match e {
             AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
-            other => AppError::Internal(format!("Failed to resolve DID document for {authority_did}: {other}")),
+            other => AppError::Internal(format!(
+                "Failed to resolve DID document for {authority_did}: {other}"
+            )),
         })?;
     let (space_host_endpoint, space_host_service) =
         resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
     // 7. Step 2: Sign client attestation and exchange for Space credential
-    let client_attestation = oauth_service
-        .sign_client_attestation(&space_host_service)?;
+    let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
 
     let (credential_jwt, ephemeral_dpop_key, expires_at) = space_client
         .exchange_credential(
@@ -841,7 +997,9 @@ pub async fn ensure_space_credential_from_parts(
     };
 
     // 8. Store in CredentialStore
-    credential_store.insert(space_uri.to_string(), cred.clone()).await;
+    credential_store
+        .insert(space_uri.to_string(), cred.clone())
+        .await;
 
     Ok(cred)
 }
@@ -855,8 +1013,15 @@ mod tests {
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::EncodedPoint;
     use std::sync::Arc;
+    fn setup_test_key() {
+        std::env::set_var(
+            "SESSION_ENCRYPTION_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+    }
 
-    const TEST_SPACE_URI: &str = "at://did:plc:authority-space-owner/space/blue.catbird.circle/3k2space1";
+    const TEST_SPACE_URI: &str =
+        "at://did:plc:authority-space-owner/space/blue.catbird.circle/3k2space1";
     const TEST_USER_DID: &str = "did:plc:alice-member-user";
     const TEST_AUTHORITY_DID: &str = "did:plc:authority-space-owner";
     const TEST_SPACE_HOST: &str = "https://space-host.example.com";
@@ -898,7 +1063,10 @@ mod tests {
             resolve_space_host_endpoint(&fallback, TEST_AUTHORITY_DID).unwrap();
         assert_eq!(endpoint, TEST_USER_PDS);
         assert_eq!(service, format!("{TEST_AUTHORITY_DID}#atproto_space_host"));
-        assert!(!service.starts_with('#'), "audience must be fully qualified");
+        assert!(
+            !service.starts_with('#'),
+            "audience must be fully qualified"
+        );
     }
 
     fn register_test_did_doc(
@@ -934,11 +1102,15 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_success_populates_store(pool: PgPool) {
+        setup_test_key();
         let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
@@ -1019,10 +1191,14 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_cached_does_not_rerun_chain(pool: PgPool) {
+        setup_test_key();
         let mock_transport = Arc::new(MockSpaceHostTransport::new());
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
@@ -1037,7 +1213,9 @@ mod tests {
             dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
             expires_at: Utc::now() + chrono::Duration::hours(2),
         };
-        credential_store.insert(TEST_SPACE_URI.to_string(), existing_cred.clone()).await;
+        credential_store
+            .insert(TEST_SPACE_URI.to_string(), existing_cred.clone())
+            .await;
 
         let http_client = reqwest::Client::new();
         let cred = ensure_space_credential_from_parts(
@@ -1060,11 +1238,15 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_app_not_authorized_surfaced(pool: PgPool) {
+        setup_test_key();
         let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
@@ -1093,7 +1275,8 @@ mod tests {
             Err(serde_json::json!({
                 "error": "AppNotAuthorized",
                 "message": "Client AppView not permitted to read Space"
-            }).to_string()),
+            })
+            .to_string()),
         );
 
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
@@ -1138,16 +1321,23 @@ mod tests {
                     "Error message must clearly identify AppNotAuthorized, got: {msg}"
                 );
             }
-            other => panic!("Expected AppError::Forbidden for AppNotAuthorized, got: {:?}", other),
+            other => panic!(
+                "Expected AppError::Forbidden for AppNotAuthorized, got: {:?}",
+                other
+            ),
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_no_usable_session_fails(pool: PgPool) {
+        setup_test_key();
         let mock_transport = Arc::new(MockSpaceHostTransport::new());
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
@@ -1173,20 +1363,28 @@ mod tests {
         match err {
             AppError::Forbidden(msg) => {
                 assert!(
-                    msg.contains("Circle authorization required") || msg.contains("no active OAuth session"),
+                    msg.contains("Circle authorization required")
+                        || msg.contains("no active OAuth session"),
                     "Error must indicate authorization is needed, got: {msg}"
                 );
             }
-            other => panic!("Expected AppError::Forbidden for missing session, got: {:?}", other),
+            other => panic!(
+                "Expected AppError::Forbidden for missing session, got: {:?}",
+                other
+            ),
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_db_failure_propagates_database_error(pool: PgPool) {
+        setup_test_key();
         let mock_transport = Arc::new(MockSpaceHostTransport::new());
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
@@ -1214,17 +1412,24 @@ mod tests {
 
         match err {
             AppError::Database(_) => {}
-            other => panic!("Expected AppError::Database for DB failure, got: {:?}", other),
+            other => panic!(
+                "Expected AppError::Database for DB failure, got: {:?}",
+                other
+            ),
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_did_resolver_failure_surfaces_as_internal(pool: PgPool) {
+        setup_test_key();
         let mock_transport = Arc::new(MockSpaceHostTransport::new());
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
         // Unmocked DID resolver pointing to unreachable endpoint to simulate PLC outage
-        let did_resolver = Arc::new(DidResolver::new("http://127.0.0.1:1".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "http://127.0.0.1:1".into(),
+            reqwest::Client::new(),
+        ));
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
@@ -1266,17 +1471,24 @@ mod tests {
                     "Error must indicate DID resolution failure as internal error, got: {msg}"
                 );
             }
-            other => panic!("Expected AppError::Internal for DID resolution outage, got: {:?}", other),
+            other => panic!(
+                "Expected AppError::Internal for DID resolution outage, got: {:?}",
+                other
+            ),
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_concurrent_runs_chain_once(pool: PgPool) {
+        setup_test_key();
         let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
@@ -1337,6 +1549,7 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
+            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let http_client = reqwest::Client::new();
@@ -1369,7 +1582,11 @@ mod tests {
 
         for handle in handles {
             let res = handle.await.unwrap();
-            assert!(res.is_ok(), "Concurrent ensure_space_credential must succeed: {:?}", res.err());
+            assert!(
+                res.is_ok(),
+                "Concurrent ensure_space_credential must succeed: {:?}",
+                res.err()
+            );
         }
 
         // The chain must have run exactly once due to the per-space lock and double-checked caching
@@ -1379,11 +1596,15 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_sync_lock_with_ensure_space_credential_from_parts_no_deadlock(pool: PgPool) {
+        setup_test_key();
         let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
 
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
@@ -1452,7 +1673,9 @@ mod tests {
 
     async fn start_mock_pds_tls_server() -> (String, tokio::task::JoinHandle<()>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -1511,7 +1734,8 @@ mod tests {
                                 { "did": TEST_USER_DID },
                                 { "did": TEST_AUTHORITY_DID }
                             ]
-                        }).to_string();
+                        })
+                        .to_string();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
@@ -1528,7 +1752,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn test_activate_circle_success_creates_circle_and_synced_records(pool: PgPool) {
-        use crate::commit::{mint_repo_car, mint_signed_commit, RepoRecord, LtHash};
+        setup_test_key();
+        use crate::commit::{mint_repo_car, mint_signed_commit, LtHash, RepoRecord};
 
         let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
 
@@ -1541,7 +1766,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), http_client.clone()));
+        let did_resolver = Arc::new(DidResolver::with_transport(
+            "https://plc.directory".into(),
+            http_client.clone(),
+            Arc::new(crate::auth::DefaultDidWebTransport::with_loopback(true)),
+        ));
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
@@ -1575,11 +1804,12 @@ mod tests {
 
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
-        let oauth_service = Arc::new(OAuthService::new(
+        let oauth_service = Arc::new(OAuthService::with_transport(
             pool.clone(),
             "https://circles.catbird.blue".into(),
             oauth_key,
             None,
+            Arc::new(crate::space_client::DefaultSpaceHostTransport::with_loopback(true)),
         ));
 
         space_client.set_deps(crate::space_client::SpaceClientDeps {
@@ -1640,8 +1870,14 @@ mod tests {
         };
 
         let mut lthash = LtHash::default();
-        lthash.add(&format!("{}/{}/{}", rec_meta.collection, rec_meta.rkey, rec_meta.cid));
-        lthash.add(&format!("{}/{}/{}", rec_post.collection, rec_post.rkey, rec_post.cid));
+        lthash.add(&format!(
+            "{}/{}/{}",
+            rec_meta.collection, rec_meta.rkey, rec_meta.cid
+        ));
+        lthash.add(&format!(
+            "{}/{}/{}",
+            rec_post.collection, rec_post.rkey, rec_post.cid
+        ));
 
         let commit = mint_signed_commit(
             TEST_SPACE_URI,
@@ -1671,6 +1907,8 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
+            commit_verification_policy:
+                crate::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
@@ -1724,7 +1962,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(post_record.is_some(), "Synced post record must exist in circle_records");
+        assert!(
+            post_record.is_some(),
+            "Synced post record must exist in circle_records"
+        );
         assert_eq!(post_record.unwrap().0, "3l7post222222");
 
         // Verify circle_member_cache has members
@@ -1740,8 +1981,11 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn test_activate_circle_ineligible_when_metadata_absent_leaves_no_circle_row(pool: PgPool) {
-        use crate::commit::{mint_repo_car, mint_signed_commit, RepoRecord, LtHash};
+    async fn test_activate_circle_ineligible_when_metadata_absent_leaves_no_circle_row(
+        pool: PgPool,
+    ) {
+        setup_test_key();
+        use crate::commit::{mint_repo_car, mint_signed_commit, LtHash, RepoRecord};
 
         let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
 
@@ -1754,7 +1998,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), http_client.clone()));
+        let did_resolver = Arc::new(DidResolver::with_transport(
+            "https://plc.directory".into(),
+            http_client.clone(),
+            Arc::new(crate::auth::DefaultDidWebTransport::with_loopback(true)),
+        ));
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
@@ -1788,11 +2036,12 @@ mod tests {
 
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
-        let oauth_service = Arc::new(OAuthService::new(
+        let oauth_service = Arc::new(OAuthService::with_transport(
             pool.clone(),
             "https://circles.catbird.blue".into(),
             oauth_key,
             None,
+            Arc::new(crate::space_client::DefaultSpaceHostTransport::with_loopback(true)),
         ));
 
         space_client.set_deps(crate::space_client::SpaceClientDeps {
@@ -1841,7 +2090,10 @@ mod tests {
         };
 
         let mut lthash = LtHash::default();
-        lthash.add(&format!("{}/{}/{}", rec_post.collection, rec_post.rkey, rec_post.cid));
+        lthash.add(&format!(
+            "{}/{}/{}",
+            rec_post.collection, rec_post.rkey, rec_post.cid
+        ));
 
         let commit = mint_signed_commit(
             TEST_SPACE_URI,
@@ -1871,6 +2123,8 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
+            commit_verification_policy:
+                crate::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
@@ -1898,7 +2152,9 @@ mod tests {
         match err {
             AppError::InvalidRequest(msg) => {
                 assert!(
-                    msg.contains("Space is not eligible: blue.catbird.circle.metadata record is absent"),
+                    msg.contains(
+                        "Space is not eligible: blue.catbird.circle.metadata record is absent"
+                    ),
                     "Error message must indicate space ineligibility, got: {msg}"
                 );
             }
@@ -1906,13 +2162,12 @@ mod tests {
         }
 
         // Verify NO circles row exists in DB
-        let circle_row: Option<(String,)> = sqlx::query_as(
-            "SELECT circle_id FROM circles WHERE space_uri = $1",
-        )
-        .bind(TEST_SPACE_URI)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+        let circle_row: Option<(String,)> =
+            sqlx::query_as("SELECT circle_id FROM circles WHERE space_uri = $1")
+                .bind(TEST_SPACE_URI)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
 
         assert!(circle_row.is_none(), "NO circles row must exist in DB");
     }

@@ -1,11 +1,11 @@
 use crate::access::CredentialStore;
 use crate::auth::DidResolver;
+use crate::commit::CommitVerificationPolicy;
 use crate::oauth::OAuthService;
 use crate::space_client::SpaceClient;
 use sqlx::PgPool;
 use std::env;
 use std::sync::Arc;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -22,8 +22,8 @@ pub struct Config {
     pub push_key_id: String,
     pub push_signing_key_path: Option<String>,
     pub push_signing_key_hex: Option<String>,
+    pub commit_verification_policy: CommitVerificationPolicy,
 }
-
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
         let host = env::var("CIRCLE_APPVIEW_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -37,27 +37,39 @@ impl Config {
             .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circles".to_string());
         let plc_directory_url =
             env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
-        let public_appview_url =
-            env::var("PUBLIC_APPVIEW_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
+        let public_appview_url = env::var("PUBLIC_APPVIEW_URL")
+            .unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
         let circle_media_base_url_raw = env::var("CIRCLE_MEDIA_BASE_URL")
             .unwrap_or_else(|_| "https://media.circles.catbird.blue".to_string());
         let circle_media_base_url = url::Url::parse(&circle_media_base_url_raw)
             .map_err(|e| anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must be a valid URL: {e}"))?;
         if circle_media_base_url.scheme() != "https" {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must use https scheme"));
+            return Err(anyhow::anyhow!(
+                "CIRCLE_MEDIA_BASE_URL must use https scheme"
+            ));
         }
-        if !circle_media_base_url.username().is_empty() || circle_media_base_url.password().is_some() {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain userinfo"));
+        if !circle_media_base_url.username().is_empty()
+            || circle_media_base_url.password().is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "CIRCLE_MEDIA_BASE_URL must not contain userinfo"
+            ));
         }
         if circle_media_base_url.query().is_some() {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a query component"));
+            return Err(anyhow::anyhow!(
+                "CIRCLE_MEDIA_BASE_URL must not contain a query component"
+            ));
         }
         if circle_media_base_url.fragment().is_some() {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a fragment component"));
+            return Err(anyhow::anyhow!(
+                "CIRCLE_MEDIA_BASE_URL must not contain a fragment component"
+            ));
         }
         let path = circle_media_base_url.path();
-        if path != "" && path != "/" {
-            return Err(anyhow::anyhow!("CIRCLE_MEDIA_BASE_URL must not contain a path component"));
+        if !path.is_empty() && path != "/" {
+            return Err(anyhow::anyhow!(
+                "CIRCLE_MEDIA_BASE_URL must not contain a path component"
+            ));
         }
 
         let appview_base_url = env::var("APPVIEW_BASE_URL")
@@ -98,6 +110,20 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
+        let commit_verification_policy = match env::var("COMMIT_VERIFICATION_POLICY")
+            .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
+            .as_deref()
+        {
+            Ok("explicit_migration_permit_v1") | Ok("migration_permit_v1") | Ok("v1") => {
+                CommitVerificationPolicy::ExplicitMigrationPermitV1
+            }
+            Ok(s) if s.starts_with("dual_read:") => {
+                let cutoff = s.trim_start_matches("dual_read:").to_string();
+                CommitVerificationPolicy::DualReadWithCutoff { cutoff_rev: cutoff }
+            }
+            _ => CommitVerificationPolicy::StrictV2,
+        };
+
         Ok(Self {
             host,
             port,
@@ -113,12 +139,13 @@ impl Config {
             push_key_id,
             push_signing_key_path,
             push_signing_key_hex,
+            commit_verification_policy,
         })
     }
 }
 
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(());
     }
     (0..s.len())
@@ -173,7 +200,6 @@ pub fn load_session_encryption_key_or_fail() -> [u8; 32] {
         }
     }
 }
-
 
 fn try_load_signing_key(path: Option<&str>, hex: Option<&str>) -> Option<p256::ecdsa::SigningKey> {
     if let Some(h) = hex {
@@ -315,11 +341,13 @@ impl AppState {
     pub fn with_did_resolver(config: Config, db: PgPool, did_resolver: Arc<DidResolver>) -> Self {
         let mut state = Self::new(config, db);
         state.did_resolver = did_resolver.clone();
-        state.space_client.set_deps(crate::space_client::SpaceClientDeps {
-            http_client: state.http_client.clone(),
-            did_resolver,
-            oauth_service: state.oauth_service.clone(),
-        });
+        state
+            .space_client
+            .set_deps(crate::space_client::SpaceClientDeps {
+                http_client: state.http_client.clone(),
+                did_resolver,
+                oauth_service: state.oauth_service.clone(),
+            });
         state
     }
     pub fn with_profile_hydrator(
@@ -347,8 +375,6 @@ impl AppState {
         state
     }
 
-
-
     pub fn with_oauth_service(mut self, oauth_service: Arc<OAuthService>) -> Self {
         self.oauth_service = oauth_service;
         self
@@ -356,7 +382,12 @@ impl AppState {
 
     pub fn did_document(&self) -> crate::auth::DidDocument {
         let base_did = if self.config.service_did.contains('#') {
-            self.config.service_did.split('#').next().unwrap().to_string()
+            self.config
+                .service_did
+                .split('#')
+                .next()
+                .unwrap()
+                .to_string()
         } else {
             self.config.service_did.clone()
         };
@@ -403,8 +434,8 @@ mod tests {
         let file = std::env::temp_dir().join(format!("circle-sec1-{}.pem", uuid::Uuid::new_v4()));
         std::fs::write(&file, pem.as_bytes()).expect("write key");
 
-        let loaded = try_load_signing_key(Some(file.to_str().unwrap()), None)
-            .expect("SEC1 PEM must load");
+        let loaded =
+            try_load_signing_key(Some(file.to_str().unwrap()), None).expect("SEC1 PEM must load");
         assert_eq!(
             loaded.to_bytes(),
             key.to_bytes(),
@@ -452,7 +483,7 @@ mod tests {
         assert!(super::parse_session_encryption_key("").is_err());
         assert!(super::parse_session_encryption_key("not-a-key").is_err());
         assert!(super::parse_session_encryption_key("0123456789abcdef").is_err()); // 8 bytes
-        // 31 bytes in hex (62 hex chars)
+                                                                                   // 31 bytes in hex (62 hex chars)
         let short_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
         assert!(super::parse_session_encryption_key(short_hex).is_err());
     }

@@ -3,17 +3,14 @@ use base64::Engine;
 use chrono::Utc;
 use circle_appview::{
     access::{self, ActiveSpaceCredential},
-    auth::{
-        DidDocument, DidResolver, DidService, PublicKeyJwk,
-        VerificationMethod,
-    },
+    auth::{DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod},
     config::{AppState, Config},
     db,
     error::AuthReason,
     routes::create_router,
     space_client::{
-        DefaultSpaceHostTransport, MockSpaceHostTransport, SpaceClient,
-        SpaceHostDnsResolver, SpaceHostTransport,
+        DefaultSpaceHostTransport, MockSpaceHostTransport, SpaceClient, SpaceHostDnsResolver,
+        SpaceHostTransport,
     },
 };
 use p256::ecdsa::signature::Signer;
@@ -64,6 +61,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
+        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
 
     let alice_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
@@ -72,7 +70,10 @@ async fn setup_test(pool: PgPool) -> TestSetup {
 
     let mock_transport = Arc::new(MockSpaceHostTransport::new());
     let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
-    let did_resolver = Arc::new(DidResolver::new("https://plc.directory".into(), reqwest::Client::new()));
+    let did_resolver = Arc::new(DidResolver::new(
+        "https://plc.directory".into(),
+        reqwest::Client::new(),
+    ));
     let credential_store = Arc::new(access::CredentialStore::new());
     let space_locks = Arc::new(access::SpaceLockManager::new());
     let profile_hydrator = Arc::new(circle_appview::hydration::ProfileHydrator::new(
@@ -86,6 +87,26 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         oauth_signing_key,
         None,
     ));
+    space_client.set_deps(circle_appview::space_client::SpaceClientDeps {
+        http_client: reqwest::Client::new(),
+        did_resolver: did_resolver.clone(),
+        oauth_service: oauth_service.clone(),
+    });
+
+    mock_transport.set_space_config(
+        &space_uri(),
+        circle_appview::space_client::SpaceConfig {
+            authority: AUTHORITY_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-test".to_string(),
+            app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
+                oauth_service.client_id.clone(),
+            ]),
+            user_policy: None,
+            name: Some("Test Circle".to_string()),
+            description: Some("Test Circle Desc".to_string()),
+        },
+    );
 
     let state = AppState {
         config: Arc::new(config),
@@ -99,7 +120,6 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         oauth_service,
         push_client: None,
     };
-
     // Register DID documents
     register_did_doc(&state.did_resolver, ALICE_DID, &alice_signing_key, None);
     register_did_doc(&state.did_resolver, BOB_DID, &bob_signing_key, None);
@@ -454,7 +474,9 @@ async fn check_member_access_and_cache_validation(pool: PgPool) {
         .expect("Alice should be granted member access via cache");
 
     // 4. Bob (not in cache and PDS lookup fails / not member) is denied
-    assert!(access::check_member_access(&setup.state, &space, BOB_DID).await.is_err());
+    assert!(access::check_member_access(&setup.state, &space, BOB_DID)
+        .await
+        .is_err());
 }
 
 #[derive(Clone)]
@@ -511,7 +533,7 @@ async fn unreadable_member_list_denies_without_signalling_removal(pool: PgPool) 
     let space = space_uri();
 
     sqlx::query(
-        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3k2space1tidx', $2, 'Test Circle', now())",
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3k2space1tidx', $2, 'Test Circle', now(), true)",
     )
     .bind(&space)
     .bind(AUTHORITY_DID)
@@ -552,27 +574,35 @@ async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
         authority: AUTHORITY_DID.to_string(),
         space_type: "blue.catbird.circle".to_string(),
         skey: "3k2space1tidx".to_string(),
-        app_access: vec![service_did.clone()],
+        app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
+            service_did.clone()
+        ]),
         user_policy: None,
         name: Some("Test".to_string()),
         description: None,
     };
 
     // Verify it is rejected because service_did is not the OAuth client_id
-    assert!(!space_config_only_service_did.app_access.iter().any(|c| c == expected_client_id));
+    assert!(!space_config_only_service_did
+        .app_access
+        .grants_access(expected_client_id));
 
     // A Space whose appAccess names the AppView client_id
     let space_config_client_id = circle_appview::space_client::SpaceConfig {
         authority: AUTHORITY_DID.to_string(),
         space_type: "blue.catbird.circle".to_string(),
         skey: "3k2space1tidx".to_string(),
-        app_access: vec![expected_client_id.clone()],
+        app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
+            expected_client_id.clone(),
+        ]),
         user_policy: None,
         name: Some("Test".to_string()),
         description: None,
     };
 
-    assert!(space_config_client_id.app_access.iter().any(|c| c == expected_client_id));
+    assert!(space_config_client_id
+        .app_access
+        .grants_access(expected_client_id));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -644,14 +674,27 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
 
     // Space 1: Stale cache (refreshed 10 minutes ago)
     let stale_time = Utc::now() - chrono::Duration::minutes(10);
-    sqlx::query("INSERT INTO circle_member_cache (space_uri, member_did, cached_at) VALUES ($1, $2, $3)")
-        .bind(&space1).bind(BOB_DID).bind(stale_time).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO circle_member_cache (space_uri, member_did, cached_at) VALUES ($1, $2, $3)",
+    )
+    .bind(&space1)
+    .bind(BOB_DID)
+    .bind(stale_time)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count) VALUES ($1, $2, 1)")
         .bind(&space1).bind(stale_time).execute(&pool).await.unwrap();
 
     // Space 2: Fresh cache (refreshed now)
-    sqlx::query("INSERT INTO circle_member_cache (space_uri, member_did, cached_at) VALUES ($1, $2, now())")
-        .bind(&space2).bind(BOB_DID).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO circle_member_cache (space_uri, member_did, cached_at) VALUES ($1, $2, now())",
+    )
+    .bind(&space2)
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count) VALUES ($1, now(), 1)")
         .bind(&space2).execute(&pool).await.unwrap();
 
@@ -712,7 +755,11 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
     .unwrap();
 
     // 1. Bob queries unified getFeed (space = None): Space 1 is stale & unreadable, so only Space 2 is returned
-    let feed_jwt = mint_service_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_signing_key);
+    let feed_jwt = mint_service_jwt(
+        BOB_DID,
+        "blue.catbird.circle.getFeed",
+        &setup.bob_signing_key,
+    );
     let req = Request::builder()
         .method("GET")
         .uri("/xrpc/blue.catbird.circle.getFeed")
@@ -723,14 +770,21 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
     let resp = setup.app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    println!("feed status: {status}, body: {}", String::from_utf8_lossy(&body));
+    println!(
+        "feed status: {status}, body: {}",
+        String::from_utf8_lossy(&body)
+    );
     assert_eq!(status, StatusCode::OK);
     let feed_output: GetFeedOutput = serde_json::from_slice(&body).unwrap();
     assert_eq!(feed_output.feed.len(), 1);
     assert_eq!(feed_output.feed[0].circle.uri.as_str(), space2);
 
     // 2. Bob queries listCircles: Space 1 is stale & unreadable, so only Space 2 is returned
-    let list_jwt = mint_service_jwt(BOB_DID, "blue.catbird.circle.listCircles", &setup.bob_signing_key);
+    let list_jwt = mint_service_jwt(
+        BOB_DID,
+        "blue.catbird.circle.listCircles",
+        &setup.bob_signing_key,
+    );
     let req = Request::builder()
         .method("GET")
         .uri("/xrpc/blue.catbird.circle.listCircles")
@@ -746,7 +800,11 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
     assert_eq!(list_output.circles[0].uri.as_str(), space2);
 
     // 3. Bob queries listNotifications: Space 1 is stale & unreadable, so only Space 2 notification is returned
-    let notif_jwt = mint_service_jwt(BOB_DID, "blue.catbird.circle.listNotifications", &setup.bob_signing_key);
+    let notif_jwt = mint_service_jwt(
+        BOB_DID,
+        "blue.catbird.circle.listNotifications",
+        &setup.bob_signing_key,
+    );
     let req = Request::builder()
         .method("GET")
         .uri("/xrpc/blue.catbird.circle.listNotifications")
@@ -893,7 +951,8 @@ async fn ssrf_safe_transport_dns_seam_validations() {
             &'a self,
             _host: &'a str,
             _port: u16,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>>
+        {
             let res = vec![self.addr];
             Box::pin(async move { Ok(res) })
         }
@@ -941,5 +1000,260 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     assert!(
         redirect_res.is_err(),
         "Redirect must be rejected by Policy::none()"
+    );
+}
+
+#[tokio::test]
+async fn space_lock_manager_idle_eviction_and_capacity_bounding() {
+    let lock_mgr = access::SpaceLockManager::with_capacity(5);
+
+    // Acquire and release a lock
+    {
+        let _guard = lock_mgr.acquire("at://did:plc:space1/space/1").await;
+        assert_eq!(lock_mgr.lock_count().await, 1);
+    }
+
+    // Give background drop a small tick or clean idle
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    lock_mgr.clean_idle().await;
+    assert_eq!(
+        lock_mgr.lock_count().await,
+        0,
+        "Idle lock must be evicted when released"
+    );
+
+    // Fill to capacity
+    let mut guards = Vec::new();
+    for i in 0..5 {
+        let space = format!("at://did:plc:space{i}/space/{i}");
+        guards.push(lock_mgr.acquire(&space).await);
+    }
+    assert_eq!(lock_mgr.lock_count().await, 5);
+
+    // Releasing guards evicts all
+    drop(guards);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    lock_mgr.clean_idle().await;
+    assert_eq!(lock_mgr.lock_count().await, 0);
+}
+
+#[tokio::test]
+async fn space_lock_manager_concurrent_acquire_drop_race_maintains_mutual_exclusion() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let lock_mgr = Arc::new(access::SpaceLockManager::with_capacity(10));
+    let inside_critical = Arc::new(AtomicUsize::new(0));
+    let violation_detected = Arc::new(AtomicBool::new(false));
+    let space = "at://did:plc:race-test/space/race";
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let mgr = lock_mgr.clone();
+        let inside = inside_critical.clone();
+        let violation = violation_detected.clone();
+        let s = space.to_string();
+
+        handles.push(tokio::spawn(async move {
+            for _ in 0..20 {
+                let guard = mgr.acquire(&s).await;
+                let current = inside.fetch_add(1, Ordering::SeqCst);
+                if current > 0 {
+                    violation.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                inside.fetch_sub(1, Ordering::SeqCst);
+                drop(guard);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    assert!(
+        !violation_detected.load(Ordering::SeqCst),
+        "Mutual exclusion violation: more than one task held the lock simultaneously"
+    );
+}
+
+#[tokio::test]
+async fn did_resolver_and_profile_hydrator_cache_capacity_and_ttl_eviction() {
+    use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
+    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+    use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+    use circle_appview::hydration::ProfileHydrator;
+
+    let http_client = reqwest::Client::new();
+
+    // 1. DidResolver strict capacity bounding test
+    let small_resolver =
+        DidResolver::with_capacity("https://plc.directory".into(), http_client.clone(), 5);
+    for i in 0..10 {
+        let did = format!("did:plc:boundeduser{i}");
+        let doc = DidDocument {
+            id: did.clone(),
+            verification_method: vec![],
+            service: vec![],
+        };
+        small_resolver.insert_cached_with_ttl(did, doc, chrono::Duration::hours(1));
+    }
+    assert_eq!(
+        small_resolver.cached_count(),
+        5,
+        "DidResolver must strictly bound cache to configured capacity"
+    );
+
+    // 2. DidResolver TTL expiration eviction test
+    let did_resolver = DidResolver::new("https://plc.directory".into(), http_client.clone());
+    for i in 0..50 {
+        let did = format!("did:plc:testuser{i}");
+        let doc = DidDocument {
+            id: did.clone(),
+            verification_method: vec![],
+            service: vec![],
+        };
+        did_resolver.insert_cached_with_ttl(did, doc, chrono::Duration::milliseconds(10));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let doc = DidDocument {
+        id: "did:plc:freshuser".into(),
+        verification_method: vec![],
+        service: vec![],
+    };
+    did_resolver.insert_cached("did:plc:freshuser".into(), doc);
+    assert!(
+        did_resolver.cached_count() <= 10,
+        "Expired entries must be evicted on insert"
+    );
+
+    // 3. ProfileHydrator strict capacity bounding test
+    let small_hydrator = ProfileHydrator::with_capacity(
+        "https://public.api.bsky.app".into(),
+        http_client.clone(),
+        5,
+    );
+    let now = std::time::Instant::now();
+    for i in 0..10 {
+        let did = format!("did:plc:boundedprofile{i}");
+        let profile = ProfileViewBasic {
+            did: Did::new(SmolStr::new(&did)).unwrap(),
+            handle: Handle::new(SmolStr::new(format!("bounded{i}.test"))).unwrap(),
+            display_name: Some(SmolStr::new(format!("Bounded {i}"))),
+            avatar: None,
+            associated: None,
+            viewer: None,
+            labels: None,
+            created_at: None,
+            pronouns: None,
+            status: None,
+            verification: None,
+            debug: None,
+            extra_data: None,
+        };
+        small_hydrator
+            .set_cached_profile_with_time(&did, profile, now)
+            .await;
+    }
+    assert_eq!(
+        small_hydrator.cached_count().await,
+        5,
+        "ProfileHydrator must strictly bound cache to configured capacity"
+    );
+
+    // 4. ProfileHydrator standard insertion and TTL eviction test
+    let hydrator = ProfileHydrator::new("https://public.api.bsky.app".into(), http_client);
+    for i in 0..50 {
+        let did = format!("did:plc:hydrated{i}");
+        let profile = ProfileViewBasic {
+            did: Did::new(SmolStr::new(&did)).unwrap(),
+            handle: Handle::new(SmolStr::new(format!("user{i}.test"))).unwrap(),
+            display_name: Some(SmolStr::new(format!("User {i}"))),
+            avatar: None,
+            associated: None,
+            viewer: None,
+            labels: None,
+            created_at: None,
+            pronouns: None,
+            status: None,
+            verification: None,
+            debug: None,
+            extra_data: None,
+        };
+        hydrator
+            .set_cached_profile_with_time(&did, profile, now)
+            .await;
+    }
+
+    assert_eq!(hydrator.cached_count().await, 50);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: PgPool) {
+    use circle_appview::space_client::SpaceClient;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let space = "at://did:plc:authspace/space/1";
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.simplespace.listMembers"))
+        .and(query_param("space", space))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "members": [{"did": "did:plc:user1"}],
+            "cursor": "repeated_cursor_token"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let did_resolver = Arc::new(DidResolver::new(mock_server.uri(), reqwest::Client::new()));
+    let alice_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let pds_service = vec![DidService {
+        id: "did:plc:authspace#atproto_pds".into(),
+        r#type: "AtprotoPersonalDataServer".into(),
+        service_endpoint: mock_server.uri(),
+    }];
+    register_did_doc(
+        &did_resolver,
+        "did:plc:authspace",
+        &alice_key,
+        Some(pds_service),
+    );
+
+    // Create OAuth service and pre-seed active session
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
+        pool,
+        "http://127.0.0.1:3002".into(),
+        signing_key,
+        None,
+    ));
+    let session = circle_appview::oauth::UserOAuthSession {
+        user_did: "did:plc:authspace".to_string(),
+        access_token: "mock-token".to_string(),
+        refresh_token: None,
+        token_endpoint: format!("{}/oauth/token", mock_server.uri()),
+        auth_server_iss: mock_server.uri(),
+        expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        scope: "blue.catbird.circle".to_string(),
+        dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+    };
+    let _ = oauth_service.store_session(session).await;
+
+    let space_client = SpaceClient::new();
+    space_client.set_deps(circle_appview::space_client::SpaceClientDeps {
+        http_client: reqwest::Client::new(),
+        did_resolver,
+        oauth_service,
+    });
+
+    let res = space_client.member_dids(space).await;
+    assert!(
+        res.is_err(),
+        "Repeated pagination cursor must fail closed: got {:?}",
+        res
     );
 }

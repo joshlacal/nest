@@ -6,14 +6,15 @@
 //! - OAuth 2.0 authorization-code flow with PAR and PKCE against user PDSes
 //! - User OAuth session management and token renewal
 
+use crate::auth::is_loopback_or_localhost;
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
+};
 use axum::{
     extract::{Query, State},
     response::Redirect,
     Json,
-};
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -46,6 +47,8 @@ pub const PENDING_STATE_TTL_SECS: i64 = 600;
 /// a live authorization against spaces-alpha.host.bsky.network proved.
 pub const CIRCLE_SCOPE: &str = "atproto space:blue.catbird.circle?authority=*&action=read";
 pub const CALLBACK_DEEP_LINK: &str = "blue.catbird://oauth/circle-appview";
+pub const MAX_OAUTH_METADATA_BYTES: usize = 256 * 1024; // 256 KiB
+pub const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1024; // 256 KiB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthClientMetadata {
@@ -213,20 +216,28 @@ pub fn decrypt_secret(
         aad: aad.as_bytes(),
     };
 
-    cipher
-        .decrypt(&nonce, payload)
-        .map_err(|e| AppError::Internal(format!("Session secret decryption failed for {user_did}: {e}")))
+    cipher.decrypt(&nonce, payload).map_err(|e| {
+        AppError::Internal(format!(
+            "Session secret decryption failed for {user_did}: {e}"
+        ))
+    })
 }
 
-pub fn decode_dpop_key(user_did: &str, key_bytes: &[u8]) -> Result<p256::ecdsa::SigningKey, AppError> {
+pub fn decode_dpop_key(
+    user_did: &str,
+    key_bytes: &[u8],
+) -> Result<p256::ecdsa::SigningKey, AppError> {
     if key_bytes.len() != 32 {
         return Err(AppError::Internal(format!(
             "Invalid dpop_key length for {user_did}: expected exactly 32 bytes, got {}",
             key_bytes.len()
         )));
     }
-    p256::ecdsa::SigningKey::from_slice(key_bytes)
-        .map_err(|e| AppError::Internal(format!("Corrupt dpop_key in oauth_sessions for {user_did}: {e}")))
+    p256::ecdsa::SigningKey::from_slice(key_bytes).map_err(|e| {
+        AppError::Internal(format!(
+            "Corrupt dpop_key in oauth_sessions for {user_did}: {e}"
+        ))
+    })
 }
 
 pub fn redact_oauth_error_body(body: &str) -> String {
@@ -248,9 +259,13 @@ pub fn redact_oauth_error_body(body: &str) -> String {
                 .split_whitespace()
                 .map(|word| {
                     if word.len() > 24
-                        && word
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '+')
+                        && word.chars().all(|c| {
+                            c.is_ascii_alphanumeric()
+                                || c == '.'
+                                || c == '_'
+                                || c == '-'
+                                || c == '+'
+                        })
                     {
                         "[REDACTED]".to_string()
                     } else {
@@ -280,7 +295,8 @@ pub struct OAuthService {
     pub db: PgPool,
     pub session_encryption_key: [u8; 32],
     user_locks: UserLockManager,
-    pending_states: Arc<RwLock<HashMap<String, PendingOAuthState>>>,
+    pub pending_states: Arc<RwLock<HashMap<String, PendingOAuthState>>>,
+    pub transport: Arc<crate::space_client::DefaultSpaceHostTransport>,
 }
 
 impl OAuthService {
@@ -294,12 +310,48 @@ impl OAuthService {
         Self::with_encryption_key(db, base_url, signing_key, key_id, session_encryption_key)
     }
 
+    pub fn with_transport(
+        db: PgPool,
+        base_url: String,
+        signing_key: p256::ecdsa::SigningKey,
+        key_id: Option<String>,
+        transport: Arc<crate::space_client::DefaultSpaceHostTransport>,
+    ) -> Self {
+        let session_encryption_key = crate::config::load_session_encryption_key_or_fail();
+        Self::with_encryption_key_and_transport(
+            db,
+            base_url,
+            signing_key,
+            key_id,
+            session_encryption_key,
+            transport,
+        )
+    }
+
     pub fn with_encryption_key(
         db: PgPool,
         base_url: String,
         signing_key: p256::ecdsa::SigningKey,
         key_id: Option<String>,
         session_encryption_key: [u8; 32],
+    ) -> Self {
+        Self::with_encryption_key_and_transport(
+            db,
+            base_url,
+            signing_key,
+            key_id,
+            session_encryption_key,
+            Arc::new(crate::space_client::DefaultSpaceHostTransport::new()),
+        )
+    }
+
+    pub fn with_encryption_key_and_transport(
+        db: PgPool,
+        base_url: String,
+        signing_key: p256::ecdsa::SigningKey,
+        key_id: Option<String>,
+        session_encryption_key: [u8; 32],
+        transport: Arc<crate::space_client::DefaultSpaceHostTransport>,
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let client_id = format!("{base_url}/oauth/client-metadata.json");
@@ -312,7 +364,10 @@ impl OAuthService {
         let y = URL_SAFE_NO_PAD.encode(ep.y().expect("y coordinate"));
 
         let key_id = key_id.unwrap_or_else(|| {
-            let thumbprint = Sha256::digest(format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{x}\",\"y\":\"{y}\"}}").as_bytes());
+            let thumbprint = Sha256::digest(
+                format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{x}\",\"y\":\"{y}\"}}")
+                    .as_bytes(),
+            );
             URL_SAFE_NO_PAD.encode(thumbprint)
         });
 
@@ -354,9 +409,9 @@ impl OAuthService {
             session_encryption_key,
             user_locks: UserLockManager::new(),
             pending_states: Arc::new(RwLock::new(HashMap::new())),
+            transport,
         }
     }
-
 
     /// Sign an `atproto-client-attestation+jwt` for a space host.
     pub fn sign_client_attestation(&self, space_host_service: &str) -> Result<String, AppError> {
@@ -406,7 +461,11 @@ impl OAuthService {
         self.sign_jwt(&header, &claims)
     }
 
-    fn sign_jwt(&self, header: &serde_json::Value, claims: &serde_json::Value) -> Result<String, AppError> {
+    fn sign_jwt(
+        &self,
+        header: &serde_json::Value,
+        claims: &serde_json::Value,
+    ) -> Result<String, AppError> {
         let header_str = serde_json::to_string(header)
             .map_err(|e| AppError::Internal(format!("JWT header serialization: {e}")))?;
         let claims_str = serde_json::to_string(claims)
@@ -429,14 +488,43 @@ impl OAuthService {
         did_resolver: &DidResolver,
         http_client: &reqwest::Client,
     ) -> Result<String, AppError> {
+        let _permit = crate::auth::public_flow_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                AppError::TooManyRequests("Public flow concurrency limit reached".into())
+            })?;
+
         let pds_endpoint = did_resolver
             .resolve_pds_endpoint(user_did)
             .await
-            .map_err(|e| AppError::Internal(format!("Resolving user PDS endpoint failed: {e:?}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("Resolving user PDS endpoint failed: {e:?}"))
+            })?;
 
         let (auth_endpoint, token_endpoint, par_endpoint, auth_issuer) = self
             .discover_oauth_metadata(&pds_endpoint, http_client)
             .await?;
+
+        let auth_issuer_val = auth_issuer
+            .clone()
+            .unwrap_or_else(|| pds_endpoint.trim_end_matches('/').to_string());
+        let expected_auth_origin = url::Url::parse(&auth_issuer_val)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid auth issuer URL: {e}")))?
+            .origin()
+            .ascii_serialization();
+
+        // Verify token_endpoint is origin-bound to auth_issuer
+        let token_url = url::Url::parse(&token_endpoint)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid token endpoint URL: {e}")))?;
+        let allow_loopback = self.transport.allows_loopback_for_test();
+        let is_token_loopback = (token_url.scheme() == "http" || token_url.scheme() == "https")
+            && is_loopback_or_localhost(token_url.host_str().unwrap_or(""));
+        if (!allow_loopback || !is_token_loopback) && token_url.scheme() != "https"
+            || token_url.origin().ascii_serialization() != expected_auth_origin
+        {
+            return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
+        }
 
         let mut verifier_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut verifier_bytes);
@@ -452,8 +540,19 @@ impl OAuthService {
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
 
         // Try PAR first if supported
-        let authorization_url = if let Some(par_url) = par_endpoint {
-            let client_assertion = self.create_client_assertion(&par_url)?;
+        let authorization_url = if let Some(par_url_str) = &par_endpoint {
+            let par_url = url::Url::parse(par_url_str)
+                .map_err(|e| AppError::InvalidRequest(format!("Invalid PAR endpoint URL: {e}")))?;
+            let is_par_loopback = (par_url.scheme() == "http" || par_url.scheme() == "https")
+                && is_loopback_or_localhost(par_url.host_str().unwrap_or(""));
+            if (!allow_loopback || !is_par_loopback) && par_url.scheme() != "https"
+                || par_url.origin().ascii_serialization() != expected_auth_origin
+            {
+                return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
+            }
+            let par_client = self.transport.build_pinned_client(&par_url).await?;
+
+            let client_assertion = self.create_client_assertion(&auth_issuer_val)?;
             let params = [
                 ("client_id", self.client_id.as_str()),
                 ("response_type", "code"),
@@ -469,17 +568,19 @@ impl OAuthService {
                 ("client_assertion", client_assertion.as_str()),
             ];
 
-            let res = http_client.post(&par_url).form(&params).send().await;
+            let res = par_client.post(par_url_str).form(&params).send().await;
             match res {
                 Ok(resp) if resp.status().is_success() => {
                     #[derive(Deserialize)]
                     struct ParResponse {
                         request_uri: String,
                     }
-                    let par: ParResponse = resp
-                        .json()
-                        .await
-                        .map_err(|e| AppError::Internal(format!("PAR response decode error: {e}")))?;
+                    let body_bytes =
+                        crate::auth::read_bounded_response_bytes(resp, MAX_OAUTH_RESPONSE_BYTES)
+                            .await?;
+                    let par: ParResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+                        AppError::Internal(format!("PAR response decode error: {e}"))
+                    })?;
                     format!(
                         "{}?client_id={}&request_uri={}",
                         auth_endpoint,
@@ -511,11 +612,12 @@ impl OAuthService {
                 url_encode(&code_challenge)
             )
         };
-
         {
             let mut lock = self.pending_states.write();
             let now = Utc::now();
-            lock.retain(|_, v| v.created_at + chrono::Duration::seconds(PENDING_STATE_TTL_SECS) > now);
+            lock.retain(|_, v| {
+                v.created_at + chrono::Duration::seconds(PENDING_STATE_TTL_SECS) > now
+            });
             lock.insert(
                 state.clone(),
                 PendingOAuthState {
@@ -539,7 +641,7 @@ impl OAuthService {
         &self,
         code: &str,
         state: &str,
-        http_client: &reqwest::Client,
+        _http_client: &reqwest::Client,
     ) -> Result<String, AppError> {
         // Look up pending state and mark it in-flight while the token exchange is in progress.
         // Single-use state vs transient failure recovery trade-off:
@@ -566,14 +668,18 @@ impl OAuthService {
         let pending = {
             let mut lock = self.pending_states.write();
             let now = Utc::now();
-            lock.retain(|_, v| v.created_at + chrono::Duration::seconds(PENDING_STATE_TTL_SECS) > now);
+            lock.retain(|_, v| {
+                v.created_at + chrono::Duration::seconds(PENDING_STATE_TTL_SECS) > now
+            });
 
-            let entry = lock
-                .get_mut(state)
-                .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::InvalidClaimsJson))?;
+            let entry = lock.get_mut(state).ok_or_else(|| {
+                AppError::Unauthorized(crate::error::AuthReason::InvalidClaimsJson)
+            })?;
 
             if entry.in_flight {
-                return Err(AppError::Unauthorized(crate::error::AuthReason::InvalidClaimsJson));
+                return Err(AppError::Unauthorized(
+                    crate::error::AuthReason::InvalidClaimsJson,
+                ));
             }
 
             entry.in_flight = true;
@@ -602,6 +708,12 @@ impl OAuthService {
             state_key: state.to_string(),
             succeeded: false,
         };
+        let _permit = crate::auth::public_flow_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                AppError::TooManyRequests("Public flow concurrency limit reached".into())
+            })?;
 
         let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
@@ -613,10 +725,25 @@ impl OAuthService {
                 "Authorization server issuer unknown; cannot build a client assertion".into(),
             )
         })?;
-        let client_assertion = self.create_client_assertion(&auth_server_iss)?;
+        let iss_url = url::Url::parse(&auth_server_iss).map_err(|e| {
+            AppError::InvalidRequest(format!("Invalid auth server issuer URL: {e}"))
+        })?;
+        let expected_origin = iss_url.origin().ascii_serialization();
+        let token_url = url::Url::parse(&pending.token_endpoint)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid token endpoint URL: {e}")))?;
+        let allow_loopback = self.transport.allows_loopback_for_test();
+        let is_token_loopback = (token_url.scheme() == "http" || token_url.scheme() == "https")
+            && is_loopback_or_localhost(token_url.host_str().unwrap_or(""));
+        if (!allow_loopback || !is_token_loopback) && token_url.scheme() != "https"
+            || token_url.origin().ascii_serialization() != expected_origin
+        {
+            return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
+        }
+        let token_client = self.transport.build_pinned_client(&token_url).await?;
 
+        let client_assertion = self.create_client_assertion(&auth_server_iss)?;
         let response = post_form_with_dpop(
-            http_client,
+            &token_client,
             &dpop_key,
             &pending.token_endpoint,
             &[
@@ -637,9 +764,23 @@ impl OAuthService {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body_bytes =
+                crate::auth::read_bounded_response_bytes(response, MAX_OAUTH_RESPONSE_BYTES)
+                    .await
+                    .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body_bytes);
             let redacted_desc = redact_oauth_error_body(&body);
-            tracing::warn!(%status, %redacted_desc, "Token exchange failed upstream");
+            let upstream_host = url::Url::parse(&pending.token_endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                operation = "token_exchange",
+                upstream_host = %upstream_host,
+                upstream_status = %status.as_u16(),
+                redacted_error = %redacted_desc,
+                "Token exchange failed upstream"
+            );
             return Err(AppError::Internal(format!(
                 "Token exchange returned {status}: {redacted_desc}"
             )));
@@ -654,12 +795,23 @@ impl OAuthService {
             sub: Option<String>,
         }
 
-        let token_data: TokenResponse = response
-            .json()
-            .await
+        let body_bytes =
+            crate::auth::read_bounded_response_bytes(response, MAX_OAUTH_RESPONSE_BYTES).await?;
+        let token_data: TokenResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| AppError::Internal(format!("Token response parse error: {e}")))?;
 
-        let user_did = token_data.sub.unwrap_or(pending.user_did);
+        // Enforce subject binding: token response subject, if provided, must match initiating user_did
+        if let Some(ref returned_sub) = token_data.sub {
+            if returned_sub != &pending.user_did {
+                tracing::warn!(
+                    returned_sub = %returned_sub,
+                    expected_did = %pending.user_did,
+                    "Token response subject does not match initiating OAuth state"
+                );
+                return Err(AppError::Unauthorized(crate::error::AuthReason::IdMismatch));
+            }
+        }
+        let user_did = pending.user_did;
         let expires_at = token_data
             .expires_in
             .map(|exp| Utc::now() + chrono::Duration::seconds(exp));
@@ -685,12 +837,11 @@ impl OAuthService {
     pub async fn get_valid_token(
         &self,
         user_did: &str,
-        http_client: &reqwest::Client,
+        _http_client: &reqwest::Client,
     ) -> Result<(String, p256::ecdsa::SigningKey), AppError> {
-        let session = self
-            .get_session(user_did)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::NoVerificationMethod))?;
+        let session = self.get_session(user_did).await?.ok_or_else(|| {
+            AppError::Unauthorized(crate::error::AuthReason::NoVerificationMethod)
+        })?;
 
         let expired = session
             .expires_at
@@ -709,10 +860,9 @@ impl OAuthService {
         let _guard = self.user_locks.acquire(user_did).await;
 
         // Re-read session under lock to check if another concurrent task already completed refresh.
-        let session = self
-            .get_session(user_did)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::NoVerificationMethod))?;
+        let session = self.get_session(user_did).await?.ok_or_else(|| {
+            AppError::Unauthorized(crate::error::AuthReason::NoVerificationMethod)
+        })?;
 
         let expired = session
             .expires_at
@@ -730,10 +880,26 @@ impl OAuthService {
         };
 
         let new_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
-        let client_assertion = self.create_client_assertion(&session.auth_server_iss)?;
+        let iss_url = url::Url::parse(&session.auth_server_iss).map_err(|e| {
+            AppError::InvalidRequest(format!("Invalid auth server issuer URL: {e}"))
+        })?;
+        let expected_origin = iss_url.origin().ascii_serialization();
 
+        let token_url = url::Url::parse(&session.token_endpoint)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid token endpoint URL: {e}")))?;
+        let allow_loopback = self.transport.allows_loopback_for_test();
+        let is_token_loopback = (token_url.scheme() == "http" || token_url.scheme() == "https")
+            && is_loopback_or_localhost(token_url.host_str().unwrap_or(""));
+        if (!allow_loopback || !is_token_loopback) && token_url.scheme() != "https"
+            || token_url.origin().ascii_serialization() != expected_origin
+        {
+            return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
+        }
+        let token_client = self.transport.build_pinned_client(&token_url).await?;
+
+        let client_assertion = self.create_client_assertion(&session.auth_server_iss)?;
         let response = post_form_with_dpop(
-            http_client,
+            &token_client,
             &new_dpop_key,
             &session.token_endpoint,
             &[
@@ -749,12 +915,25 @@ impl OAuthService {
         )
         .await
         .map_err(|e| AppError::Internal(format!("Token refresh request error: {e}")))?;
-
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body_bytes =
+                crate::auth::read_bounded_response_bytes(response, MAX_OAUTH_RESPONSE_BYTES)
+                    .await
+                    .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body_bytes);
             let redacted_desc = redact_oauth_error_body(&body);
-            tracing::warn!(%status, %redacted_desc, "Token refresh failed upstream");
+            let upstream_host = url::Url::parse(&session.token_endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                operation = "token_refresh",
+                upstream_host = %upstream_host,
+                upstream_status = %status.as_u16(),
+                redacted_error = %redacted_desc,
+                "Token refresh failed upstream"
+            );
             return Err(AppError::Internal(format!(
                 "Token refresh returned {status}: {redacted_desc}"
             )));
@@ -768,9 +947,9 @@ impl OAuthService {
             scope: Option<String>,
         }
 
-        let token_data: TokenResponse = response
-            .json()
-            .await
+        let body_bytes =
+            crate::auth::read_bounded_response_bytes(response, MAX_OAUTH_RESPONSE_BYTES).await?;
+        let token_data: TokenResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| AppError::Internal(format!("Token refresh parse error: {e}")))?;
 
         let expires_at = token_data
@@ -797,6 +976,7 @@ impl OAuthService {
     }
 
     /// Retrieve stored session for a user from Postgres.
+    #[allow(clippy::type_complexity)]
     pub async fn get_session(&self, user_did: &str) -> Result<Option<UserOAuthSession>, AppError> {
         let row: Option<(
             String,
@@ -953,6 +1133,7 @@ impl OAuthService {
     }
 
     /// All non-expired sessions from Postgres.
+    #[allow(clippy::type_complexity)]
     pub async fn list_sessions(&self) -> Result<Vec<UserOAuthSession>, AppError> {
         let rows: Vec<(
             String,
@@ -1046,60 +1227,207 @@ impl OAuthService {
     async fn discover_oauth_metadata(
         &self,
         pds_endpoint: &str,
-        http_client: &reqwest::Client,
+        _http_client: &reqwest::Client,
     ) -> Result<(String, String, Option<String>, Option<String>), AppError> {
+        let pds_url = url::Url::parse(pds_endpoint)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid PDS endpoint URL: {e}")))?;
+        if pds_url.scheme() != "https" {
+            return Err(AppError::InvalidRequest(
+                "PDS endpoint must use HTTPS".into(),
+            ));
+        }
+        let pds_origin = pds_url.origin().ascii_serialization();
         let pds_base = pds_endpoint.trim_end_matches('/');
+
         let well_known_auth = format!("{pds_base}/.well-known/oauth-authorization-server");
         let well_known_resource = format!("{pds_base}/.well-known/oauth-protected-resource");
 
-        let auth_res = http_client.get(&well_known_auth).send().await;
-        if let Ok(resp) = auth_res {
-            if resp.status().is_success() {
-                #[derive(Deserialize)]
-                struct AuthServerMetadata {
-                    issuer: Option<String>,
-                    authorization_endpoint: String,
-                    token_endpoint: String,
-                    pushed_authorization_request_endpoint: Option<String>,
+        // Helper closure to validate and check origin binding for endpoints
+        let validate_endpoints = |iss: &str,
+                                  auth_ep: &str,
+                                  tok_ep: &str,
+                                  par_ep: Option<&str>,
+                                  expected_origin: &str,
+                                  expected_base: &str|
+         -> bool {
+            let Ok(iss_url) = url::Url::parse(iss) else {
+                return false;
+            };
+            let Ok(auth_url) = url::Url::parse(auth_ep) else {
+                return false;
+            };
+            let Ok(tok_url) = url::Url::parse(tok_ep) else {
+                return false;
+            };
+
+            if iss_url.scheme() != "https"
+                || auth_url.scheme() != "https"
+                || tok_url.scheme() != "https"
+            {
+                return false;
+            }
+            if iss.trim_end_matches('/') != expected_base {
+                return false;
+            }
+            if iss_url.origin().ascii_serialization() != expected_origin
+                || auth_url.origin().ascii_serialization() != expected_origin
+                || tok_url.origin().ascii_serialization() != expected_origin
+            {
+                return false;
+            }
+
+            if let Some(par) = par_ep {
+                let Ok(par_url) = url::Url::parse(par) else {
+                    return false;
+                };
+                if par_url.scheme() != "https"
+                    || par_url.origin().ascii_serialization() != expected_origin
+                {
+                    return false;
                 }
-                if let Ok(meta) = resp.json::<AuthServerMetadata>().await {
-                    return Ok((
-                        meta.authorization_endpoint,
-                        meta.token_endpoint,
-                        meta.pushed_authorization_request_endpoint,
-                        meta.issuer,
-                    ));
+            }
+
+            true
+        };
+
+        if let Ok(auth_url) = url::Url::parse(&well_known_auth) {
+            if let Ok(client) = self.transport.build_pinned_client(&auth_url).await {
+                if let Ok(resp) = client.get(auth_url.as_str()).send().await {
+                    if resp.status().is_success() {
+                        #[derive(Deserialize)]
+                        struct AuthServerMetadata {
+                            issuer: Option<String>,
+                            authorization_endpoint: String,
+                            token_endpoint: String,
+                            pushed_authorization_request_endpoint: Option<String>,
+                        }
+                        if let Ok(body_bytes) =
+                            crate::auth::read_bounded_response_bytes(resp, MAX_OAUTH_METADATA_BYTES)
+                                .await
+                        {
+                            if let Ok(meta) =
+                                serde_json::from_slice::<AuthServerMetadata>(&body_bytes)
+                            {
+                                if let Some(ref iss) = meta.issuer {
+                                    if validate_endpoints(
+                                        iss,
+                                        &meta.authorization_endpoint,
+                                        &meta.token_endpoint,
+                                        meta.pushed_authorization_request_endpoint.as_deref(),
+                                        &pds_origin,
+                                        pds_base,
+                                    ) {
+                                        return Ok((
+                                            meta.authorization_endpoint,
+                                            meta.token_endpoint,
+                                            meta.pushed_authorization_request_endpoint,
+                                            meta.issuer,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
         // Try protected resource metadata
-        let res_resp = http_client.get(&well_known_resource).send().await;
-        if let Ok(resp) = res_resp {
-            if resp.status().is_success() {
-                #[derive(Deserialize)]
-                struct ProtectedResourceMetadata {
-                    authorization_servers: Option<Vec<String>>,
-                }
-                if let Ok(meta) = resp.json::<ProtectedResourceMetadata>().await {
-                    if let Some(servers) = meta.authorization_servers {
-                        if let Some(server) = servers.first() {
-                            let server_meta_url = format!("{}/.well-known/oauth-authorization-server", server.trim_end_matches('/'));
-                            if let Ok(s_resp) = http_client.get(&server_meta_url).send().await {
-                                #[derive(Deserialize)]
-                                struct AuthServerMetadata {
-                                    issuer: Option<String>,
-                                    authorization_endpoint: String,
-                                    token_endpoint: String,
-                                    pushed_authorization_request_endpoint: Option<String>,
-                                }
-                                if let Ok(meta) = s_resp.json::<AuthServerMetadata>().await {
-                                    return Ok((
-                                        meta.authorization_endpoint,
-                                        meta.token_endpoint,
-                                        meta.pushed_authorization_request_endpoint,
-                                        meta.issuer,
+        if let Ok(res_url) = url::Url::parse(&well_known_resource) {
+            if let Ok(client) = self.transport.build_pinned_client(&res_url).await {
+                if let Ok(resp) = client.get(res_url.as_str()).send().await {
+                    if resp.status().is_success() {
+                        #[derive(Deserialize)]
+                        struct ProtectedResourceMetadata {
+                            resource: Option<String>,
+                            authorization_servers: Option<Vec<String>>,
+                        }
+                        if let Ok(res_bytes) =
+                            crate::auth::read_bounded_response_bytes(resp, MAX_OAUTH_METADATA_BYTES)
+                                .await
+                        {
+                            if let Ok(meta) =
+                                serde_json::from_slice::<ProtectedResourceMetadata>(&res_bytes)
+                            {
+                                // Resource MUST be present, HTTPS, and match PDS origin & base
+                                let resource_str = meta.resource.as_deref().ok_or_else(|| {
+                                    AppError::Unauthorized(AuthReason::AudienceMismatch)
+                                })?;
+                                let r_url = url::Url::parse(resource_str).map_err(|_| {
+                                    AppError::Unauthorized(AuthReason::AudienceMismatch)
+                                })?;
+                                if r_url.scheme() != "https"
+                                    || r_url.origin().ascii_serialization() != pds_origin
+                                    || resource_str.trim_end_matches('/') != pds_base
+                                {
+                                    return Err(AppError::Unauthorized(
+                                        AuthReason::AudienceMismatch,
                                     ));
+                                }
+
+                                if let Some(servers) = meta.authorization_servers {
+                                    for server in servers {
+                                        let Ok(server_url) = url::Url::parse(&server) else {
+                                            continue;
+                                        };
+                                        if server_url.scheme() != "https" {
+                                            continue;
+                                        };
+                                        let server_origin =
+                                            server_url.origin().ascii_serialization();
+                                        let server_base = server.trim_end_matches('/');
+
+                                        let server_meta_url_str = format!(
+                                            "{server_base}/.well-known/oauth-authorization-server"
+                                        );
+                                        if let Ok(server_meta_url) =
+                                            url::Url::parse(&server_meta_url_str)
+                                        {
+                                            if let Ok(s_client) = self
+                                                .transport
+                                                .build_pinned_client(&server_meta_url)
+                                                .await
+                                            {
+                                                if let Ok(s_resp) = s_client
+                                                    .get(server_meta_url.as_str())
+                                                    .send()
+                                                    .await
+                                                {
+                                                    if s_resp.status().is_success() {
+                                                        #[derive(Deserialize)]
+                                                        struct AuthServerMetadata {
+                                                            issuer: Option<String>,
+                                                            authorization_endpoint: String,
+                                                            token_endpoint: String,
+                                                            pushed_authorization_request_endpoint:
+                                                                Option<String>,
+                                                        }
+                                                        if let Ok(s_bytes) = crate::auth::read_bounded_response_bytes(s_resp, MAX_OAUTH_METADATA_BYTES).await {
+                                                            if let Ok(meta) = serde_json::from_slice::<AuthServerMetadata>(&s_bytes) {
+                                                                if let Some(ref iss) = meta.issuer {
+                                                                    if validate_endpoints(
+                                                                        iss,
+                                                                        &meta.authorization_endpoint,
+                                                                        &meta.token_endpoint,
+                                                                        meta.pushed_authorization_request_endpoint.as_deref(),
+                                                                        &server_origin,
+                                                                        server_base,
+                                                                    ) {
+                                                                        return Ok((
+                                                                            meta.authorization_endpoint,
+                                                                            meta.token_endpoint,
+                                                                            meta.pushed_authorization_request_endpoint,
+                                                                            meta.issuer,
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1153,8 +1481,10 @@ async fn post_form_with_dpop(
         .get("DPoP-Nonce")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let body = first.text().await.unwrap_or_default();
-
+    let body_bytes = crate::auth::read_bounded_response_bytes(first, MAX_OAUTH_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body_bytes);
     let needs_nonce = body.contains("use_dpop_nonce");
     match (needs_nonce, nonce) {
         (true, Some(nonce)) => send(create_dpop_proof(key, "POST", url, None, Some(&nonce))?)
@@ -1252,9 +1582,7 @@ pub async fn get_with_dpop(
         .map_err(|e| AppError::Internal(format!("DPoP request failed: {e}")))?;
 
     let status = first.status();
-    if status != reqwest::StatusCode::UNAUTHORIZED
-        && status != reqwest::StatusCode::BAD_REQUEST
-    {
+    if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::BAD_REQUEST {
         return Ok(first);
     }
 
@@ -1273,16 +1601,25 @@ pub async fn get_with_dpop(
     // Only retry when the server actually asked for a nonce; otherwise this is a
     // real auth failure and must surface, not be silently retried.
     if !challenge.contains("use_dpop_nonce") {
-        let body = first.text().await.unwrap_or_default();
+        let body_bytes = crate::auth::read_bounded_response_bytes(first, MAX_OAUTH_RESPONSE_BYTES)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&body_bytes);
         if !body.contains("use_dpop_nonce") {
             return Err(AppError::Internal(format!("{status}: {body}")));
         }
     }
 
     match nonce {
-        Some(nonce) => send(create_dpop_proof(key, "GET", url, Some(token), Some(&nonce))?)
-            .await
-            .map_err(|e| AppError::Internal(format!("DPoP retry failed: {e}"))),
+        Some(nonce) => send(create_dpop_proof(
+            key,
+            "GET",
+            url,
+            Some(token),
+            Some(&nonce),
+        )?)
+        .await
+        .map_err(|e| AppError::Internal(format!("DPoP retry failed: {e}"))),
         None => Err(AppError::Internal(
             "Server demanded a DPoP nonce but sent no DPoP-Nonce header".into(),
         )),
@@ -1406,7 +1743,7 @@ pub async fn resolve_and_verify_client_attestation(
     token: &str,
     expected_client_id: &str,
     expected_audience: &str,
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
 ) -> Result<ClientAttestationClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1443,9 +1780,18 @@ pub async fn resolve_and_verify_client_attestation(
         return Err(AppError::Unauthorized(AuthReason::Expired));
     }
 
+    let client_id_url = url::Url::parse(&claims.iss)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid client_id URL: {e}")))?;
+    if client_id_url.scheme() != "https" {
+        return Err(AppError::InvalidRequest("client_id must use HTTPS".into()));
+    }
+
+    let transport = crate::space_client::DefaultSpaceHostTransport::new();
+    let meta_client = transport.build_pinned_client(&client_id_url).await?;
+
     // Fetch client metadata from client_id
-    let meta_resp = http_client
-        .get(&claims.iss)
+    let meta_resp = meta_client
+        .get(client_id_url.as_str())
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch client-metadata: {e}")))?;
@@ -1455,14 +1801,21 @@ pub async fn resolve_and_verify_client_attestation(
             meta_resp.status()
         )));
     }
-    let metadata: OAuthClientMetadata = meta_resp
-        .json()
-        .await
+    let meta_bytes =
+        crate::auth::read_bounded_response_bytes(meta_resp, MAX_OAUTH_METADATA_BYTES).await?;
+    let metadata: OAuthClientMetadata = serde_json::from_slice(&meta_bytes)
         .map_err(|e| AppError::Internal(format!("Failed to parse client-metadata: {e}")))?;
 
     // Fetch JWKS from metadata.jwks_uri
-    let jwks_resp = http_client
-        .get(&metadata.jwks_uri)
+    let jwks_url = url::Url::parse(&metadata.jwks_uri)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid jwks_uri: {e}")))?;
+    if jwks_url.scheme() != "https" {
+        return Err(AppError::InvalidRequest("jwks_uri must use HTTPS".into()));
+    }
+    let jwks_client = transport.build_pinned_client(&jwks_url).await?;
+
+    let jwks_resp = jwks_client
+        .get(jwks_url.as_str())
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch JWKS: {e}")))?;
@@ -1472,11 +1825,10 @@ pub async fn resolve_and_verify_client_attestation(
             jwks_resp.status()
         )));
     }
-    let jwks: JwksResponse = jwks_resp
-        .json()
-        .await
+    let jwks_bytes =
+        crate::auth::read_bounded_response_bytes(jwks_resp, crate::auth::MAX_JWKS_BYTES).await?;
+    let jwks: JwksResponse = serde_json::from_slice(&jwks_bytes)
         .map_err(|e| AppError::Internal(format!("Failed to parse JWKS: {e}")))?;
-
     // Verify signature using matching kid
     let kid = header.kid.as_deref();
     let jwk = jwks
@@ -1504,6 +1856,7 @@ pub async fn resolve_and_verify_client_attestation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::space_client::DefaultSpaceHostTransport;
     use chrono::Duration;
     use p256::ecdsa::signature::Verifier;
     use sqlx::PgPool;
@@ -1529,7 +1882,8 @@ mod tests {
         );
     }
 
-    const TEST_ENC_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_ENC_KEY_HEX: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn setup_test_encryption_key() -> [u8; 32] {
         std::env::set_var("SESSION_ENCRYPTION_KEY", TEST_ENC_KEY_HEX);
@@ -1579,10 +1933,14 @@ mod tests {
 
         // Attempting to decrypt alice's ciphertext under bob's DID must fail because AAD binds user_did
         let decrypt_for_bob = decrypt_secret(&key, "did:plc:bob", &encrypted_for_alice);
-        assert!(decrypt_for_bob.is_err(), "Transplanted row must fail AEAD AAD verification");
+        assert!(
+            decrypt_for_bob.is_err(),
+            "Transplanted row must fail AEAD AAD verification"
+        );
 
         // Decrypting under alice's DID must succeed
-        let decrypt_for_alice = decrypt_secret(&key, "did:plc:alice", &encrypted_for_alice).unwrap();
+        let decrypt_for_alice =
+            decrypt_secret(&key, "did:plc:alice", &encrypted_for_alice).unwrap();
         assert_eq!(decrypt_for_alice, secret);
     }
 
@@ -1644,17 +2002,37 @@ mod tests {
         assert!(loaded.expires_at.is_some());
 
         // Direct database verification: secrets MUST be encrypted at rest
-        let (raw_access_token, raw_refresh_token, raw_dpop_key): (Vec<u8>, Option<Vec<u8>>, Vec<u8>) =
-            sqlx::query_as("SELECT access_token, refresh_token, dpop_key FROM oauth_sessions WHERE user_did = $1")
-                .bind(&session.user_did)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (raw_access_token, raw_refresh_token, raw_dpop_key): (
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Vec<u8>,
+        ) = sqlx::query_as(
+            "SELECT access_token, refresh_token, dpop_key FROM oauth_sessions WHERE user_did = $1",
+        )
+        .bind(&session.user_did)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-        assert_ne!(raw_access_token, session.access_token.as_bytes(), "access_token must not be cleartext");
-        assert_ne!(raw_refresh_token.unwrap(), session.refresh_token.as_ref().unwrap().as_bytes(), "refresh_token must not be cleartext");
-        assert_ne!(raw_dpop_key, session.dpop_key.to_bytes().to_vec(), "dpop_key must not be cleartext");
-        assert_eq!(raw_access_token[0], 1, "access_token envelope version must be 1");
+        assert_ne!(
+            raw_access_token,
+            session.access_token.as_bytes(),
+            "access_token must not be cleartext"
+        );
+        assert_ne!(
+            raw_refresh_token.unwrap(),
+            session.refresh_token.as_ref().unwrap().as_bytes(),
+            "refresh_token must not be cleartext"
+        );
+        assert_ne!(
+            raw_dpop_key,
+            session.dpop_key.to_bytes().to_vec(),
+            "dpop_key must not be cleartext"
+        );
+        assert_eq!(
+            raw_access_token[0], 1,
+            "access_token envelope version must be 1"
+        );
         assert_eq!(raw_dpop_key[0], 1, "dpop_key envelope version must be 1");
 
         // Verify dpop_key signature verification
@@ -1781,11 +2159,12 @@ mod tests {
     ) {
         setup_test_encryption_key();
         let mock_server = MockServer::start().await;
-        let service = OAuthService::new(
+        let service = OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
             p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
             None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         );
         let http_client = reqwest::Client::new();
 
@@ -1816,13 +2195,21 @@ mod tests {
         let res1 = service
             .handle_callback("auth-code-1", &state_str, &http_client)
             .await;
-        assert!(res1.is_err(), "First callback attempt must fail on 500 error");
+        assert!(
+            res1.is_err(),
+            "First callback attempt must fail on 500 error"
+        );
 
         // Pending state must STILL exist and in_flight must be reset to false (retryable)
         {
             let lock = service.pending_states.read();
-            let state_entry = lock.get(&state_str).expect("Pending state must survive transient failure");
-            assert!(!state_entry.in_flight, "in_flight must be reset to false for retry");
+            let state_entry = lock
+                .get(&state_str)
+                .expect("Pending state must survive transient failure");
+            assert!(
+                !state_entry.in_flight,
+                "in_flight must be reset to false for retry"
+            );
         }
 
         // 2. Second attempt: token endpoint returns 200 OK
@@ -1840,7 +2227,11 @@ mod tests {
         let res2 = service
             .handle_callback("auth-code-1", &state_str, &http_client)
             .await;
-        assert!(res2.is_ok(), "Second callback attempt must succeed");
+        assert!(
+            res2.is_ok(),
+            "Second callback attempt must succeed, got err: {:?}",
+            res2.err()
+        );
 
         // Session must now be stored in Postgres
         let session = service
@@ -1910,7 +2301,10 @@ mod tests {
         }
 
         let evicted_count = service.cleanup_expired_pending_states();
-        assert_eq!(evicted_count, 1, "Exactly one expired state should be evicted");
+        assert_eq!(
+            evicted_count, 1,
+            "Exactly one expired state should be evicted"
+        );
 
         {
             let lock = service.pending_states.read();
@@ -1929,11 +2323,12 @@ mod tests {
     async fn concurrent_refreshes_for_one_user_result_in_exactly_one_http_refresh(pool: PgPool) {
         setup_test_encryption_key();
         let mock_server = MockServer::start().await;
-        let service = Arc::new(OAuthService::new(
+        let service = Arc::new(OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
             p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
             None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         ));
         let http_client = reqwest::Client::new();
 
@@ -1975,12 +2370,8 @@ mod tests {
         let c1 = http_client.clone();
         let c2 = http_client.clone();
 
-        let task1 = tokio::spawn(async move {
-            s1.get_valid_token(user_did, &c1).await
-        });
-        let task2 = tokio::spawn(async move {
-            s2.get_valid_token(user_did, &c2).await
-        });
+        let task1 = tokio::spawn(async move { s1.get_valid_token(user_did, &c1).await });
+        let task2 = tokio::spawn(async move { s2.get_valid_token(user_did, &c2).await });
 
         let (res1, res2) = tokio::join!(task1, task2);
         let (token1, key1) = res1.unwrap().expect("task 1 get_valid_token must succeed");
@@ -1988,7 +2379,11 @@ mod tests {
 
         assert_eq!(token1, "newly-refreshed-access-token");
         assert_eq!(token2, "newly-refreshed-access-token");
-        assert_eq!(key1.to_bytes(), key2.to_bytes(), "both callers should receive the newly stored key");
+        assert_eq!(
+            key1.to_bytes(),
+            key2.to_bytes(),
+            "both callers should receive the newly stored key"
+        );
 
         // Verify the mock server received EXACTLY 1 request, proving concurrent refreshes were serialized
         mock_server.verify().await;
@@ -1996,7 +2391,10 @@ mod tests {
         // Verify the database now holds the updated non-expired session
         let updated = service.get_session(user_did).await.unwrap().unwrap();
         assert_eq!(updated.access_token, "newly-refreshed-access-token");
-        assert_eq!(updated.refresh_token.as_deref(), Some("rotated-next-refresh-token"));
+        assert_eq!(
+            updated.refresh_token.as_deref(),
+            Some("rotated-next-refresh-token")
+        );
         assert!(updated.expires_at.unwrap() > Utc::now());
     }
 }

@@ -7,15 +7,13 @@ use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
 use catbird_atproto::generated::app_bsky::feed::{
     NotFoundPost, ThreadViewPost, ThreadViewPostParent, ThreadViewPostRepliesItem,
 };
-use catbird_atproto::generated::blue_catbird::circle::CircleSummary;
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
+use catbird_atproto::generated::blue_catbird::circle::CircleSummary;
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::string::{AtUri, Did, Tid};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use std::future::Future;
-use std::pin::Pin;
 
 const MAX_THREAD_NODES: usize = 500;
 
@@ -56,7 +54,7 @@ pub async fn get_post_thread(
             pref.muted
         FROM circles c
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $2
-        WHERE c.space_uri = $1 AND c.deleted_at IS NULL
+        WHERE c.space_uri = $1 AND c.deleted_at IS NULL AND c.app_access_granted = true
         "#,
     )
     .bind(space_uri)
@@ -73,8 +71,9 @@ pub async fn get_post_thread(
         .map_err(|e| AppError::Internal(format!("Invalid circle TID '{circle_id}': {e}")))?;
     let circle_space_ref = AtSpaceUri::new(SmolStr::new(space_uri))
         .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
-    let circle_owner_did = Did::new(SmolStr::new(&circle_owner))
-        .map_err(|e| AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}")))?;
+    let circle_owner_did = Did::new(SmolStr::new(&circle_owner)).map_err(|e| {
+        AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}"))
+    })?;
 
     let circle_summary = CircleSummary {
         circle_id: circle_tid,
@@ -118,23 +117,24 @@ pub async fn get_post_thread(
             r.indexed_at,
             r.parent_uri,
             r.root_uri,
-            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
             (
                 SELECT count(*)
                 FROM circle_records rep
-                WHERE (rep.parent_uri = r.uri OR rep.parent_uri = $1 OR rep.parent_uri = $2)
+                WHERE (
+                    rep.parent_uri = r.uri
+                    OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
+                    OR rep.parent_uri = $1
+                    OR rep.parent_uri = $2
+                    OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE($1, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
+                )
                   AND rep.space_uri = $3
                   AND rep.deleted_at IS NULL
                   AND (
                       rep.root_uri IS NULL
                       OR EXISTS (
                           SELECT 1 FROM circle_records root
-                          WHERE (root.uri = rep.root_uri OR root.uri = (
-                              CASE
-                                  WHEN rep.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.root_uri, '/space/', 2)
-                                  ELSE rep.root_uri
-                              END
-                          ))
+                          WHERE (root.uri = rep.root_uri OR REGEXP_REPLACE(root.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                             AND root.space_uri = $3
                             AND root.deleted_at IS NULL
                             AND root.collection = 'app.bsky.feed.post'
@@ -144,19 +144,14 @@ pub async fn get_post_thread(
                       rep.parent_uri IS NULL
                       OR EXISTS (
                           SELECT 1 FROM circle_records p
-                          WHERE (p.uri = rep.parent_uri OR p.uri = (
-                              CASE
-                                  WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
-                                  ELSE rep.parent_uri
-                              END
-                          ))
+                          WHERE (p.uri = rep.parent_uri OR REGEXP_REPLACE(p.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                             AND p.space_uri = $3
                             AND p.deleted_at IS NULL
                             AND p.collection = 'app.bsky.feed.post'
                       )
                   )
             ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
         JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
@@ -228,7 +223,9 @@ pub async fn get_post_thread(
         .fetch_optional(&state.db)
         .await?;
         if root_active.is_none() {
-            return Err(AppError::NotFound("Root post was deleted or does not exist".into()));
+            return Err(AppError::NotFound(
+                "Root post was deleted or does not exist".into(),
+            ));
         }
     }
     if let Some(ref p_uri) = root_data.6 {
@@ -240,7 +237,9 @@ pub async fn get_post_thread(
         .fetch_optional(&state.db)
         .await?;
         if parent_active.is_none() {
-            return Err(AppError::NotFound("Parent post was deleted or does not exist".into()));
+            return Err(AppError::NotFound(
+                "Parent post was deleted or does not exist".into(),
+            ));
         }
     }
 
@@ -301,23 +300,24 @@ pub async fn get_post_thread(
                 r.indexed_at,
                 r.parent_uri,
                 r.root_uri,
-                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
+                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
                 (
                     SELECT count(*)
                     FROM circle_records rep
-                    WHERE (rep.parent_uri = r.uri OR rep.parent_uri = $1 OR rep.parent_uri = $2)
+                    WHERE (
+                        rep.parent_uri = r.uri
+                        OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
+                        OR rep.parent_uri = $1
+                        OR rep.parent_uri = $2
+                        OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE($1, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
+                    )
                       AND rep.space_uri = $3
                       AND rep.deleted_at IS NULL
                       AND (
                           rep.root_uri IS NULL
                           OR EXISTS (
                               SELECT 1 FROM circle_records root
-                              WHERE (root.uri = rep.root_uri OR root.uri = (
-                                  CASE
-                                      WHEN rep.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.root_uri, '/space/', 2)
-                                      ELSE rep.root_uri
-                                  END
-                              ))
+                              WHERE (root.uri = rep.root_uri OR REGEXP_REPLACE(root.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                                 AND root.space_uri = $3
                                 AND root.deleted_at IS NULL
                                 AND root.collection = 'app.bsky.feed.post'
@@ -327,19 +327,14 @@ pub async fn get_post_thread(
                           rep.parent_uri IS NULL
                           OR EXISTS (
                               SELECT 1 FROM circle_records p
-                              WHERE (p.uri = rep.parent_uri OR p.uri = (
-                                  CASE
-                                      WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
-                                      ELSE rep.parent_uri
-                                  END
-                              ))
+                              WHERE (p.uri = rep.parent_uri OR REGEXP_REPLACE(p.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                                 AND p.space_uri = $3
                                 AND p.deleted_at IS NULL
                                 AND p.collection = 'app.bsky.feed.post'
                           )
                       )
                 ) AS reply_count,
-                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
+                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
             FROM circle_records r
             JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
             JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
@@ -371,7 +366,7 @@ pub async fn get_post_thread(
 
     // 4. Build replies recursively downwards
     let mut remaining_budget_ref = remaining_budget;
-    let raw_replies = fetch_replies_raw(
+    let raw_replies = fetch_thread_replies_set_based(
         &state.db,
         user_did,
         &db_root_uri,
@@ -541,134 +536,224 @@ pub async fn get_post_thread(
 }
 
 #[allow(clippy::type_complexity)]
-fn fetch_replies_raw<'a>(
-    pool: &'a PgPool,
-    user_did: &'a str,
-    parent_uri: &'a str,
-    space_uri: &'a str,
-    depth: usize,
-    budget: &'a mut usize,
-) -> Pin<Box<dyn Future<Output = Result<Vec<RawThreadNode>, AppError>> + Send + 'a>> {
-    Box::pin(async move {
-        if depth == 0 || *budget == 0 {
-            return Ok(Vec::new());
+async fn fetch_replies_batch(
+    pool: &PgPool,
+    parent_uris: &[String],
+    space_uri: &str,
+    user_did: &str,
+    budget: usize,
+) -> Result<
+    Vec<(
+        String,
+        String,
+        String,
+        String,
+        serde_json::Value,
+        DateTime<Utc>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    )>,
+    AppError,
+> {
+    if parent_uris.is_empty() || budget == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut all_match_uris = Vec::new();
+    for p in parent_uris {
+        all_match_uris.push(p.clone());
+        if p.contains("/space/") {
+            all_match_uris.push(normalize_uri_to_standard_aturi(p));
+        } else if let Some(rest) = p.strip_prefix("at://") {
+            all_match_uris.push(format!("{space_uri}/{rest}"));
+        }
+    }
+
+    let rows = sqlx::query_as(
+        r#"
+        SELECT
+            r.uri,
+            r.cid,
+            r.space_uri,
+            r.author_did,
+            r.record_json,
+            r.indexed_at,
+            r.parent_uri,
+            r.root_uri,
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri) AS like_count,
+            (
+                SELECT count(*)
+                FROM circle_records rep
+                WHERE (
+                    rep.parent_uri = r.uri
+                    OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
+                )
+                  AND rep.space_uri = r.space_uri
+                  AND rep.deleted_at IS NULL
+                  AND (
+                      rep.root_uri IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM circle_records root
+                          WHERE (root.uri = rep.root_uri OR REGEXP_REPLACE(root.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
+                            AND root.space_uri = $2
+                            AND root.deleted_at IS NULL
+                            AND root.collection = 'app.bsky.feed.post'
+                      )
+                  )
+                  AND (
+                      rep.parent_uri IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM circle_records p
+                          WHERE (p.uri = rep.parent_uri OR REGEXP_REPLACE(p.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
+                            AND p.space_uri = $2
+                            AND p.deleted_at IS NULL
+                            AND p.collection = 'app.bsky.feed.post'
+                      )
+                  )
+            ) AS reply_count,
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri AND l.author_did = $3) AS viewer_like_uri
+        FROM circle_records r
+        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
+        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $3
+        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+        WHERE r.parent_uri = ANY($1)
+          AND r.space_uri = $2
+          AND r.collection = 'app.bsky.feed.post'
+          AND r.deleted_at IS NULL
+        ORDER BY r.created_at ASC, r.uri ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(&all_match_uris)
+    .bind(space_uri)
+    .bind(user_did)
+    .bind(budget as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+async fn fetch_thread_replies_set_based(
+    pool: &PgPool,
+    user_did: &str,
+    root_parent_uri: &str,
+    space_uri: &str,
+    max_depth: usize,
+    budget: &mut usize,
+) -> Result<Vec<RawThreadNode>, AppError> {
+    if max_depth == 0 || *budget == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut current_level_parents = vec![root_parent_uri.to_string()];
+    let mut levels: Vec<Vec<(String, RawThreadNode)>> = Vec::new();
+
+    let mut current_depth = 0;
+    while current_depth < max_depth && *budget > 0 && !current_level_parents.is_empty() {
+        let rows =
+            fetch_replies_batch(pool, &current_level_parents, space_uri, user_did, *budget).await?;
+        if rows.is_empty() {
+            break;
         }
 
-        let alt_parent_uri = if parent_uri.contains("/space/") {
-            normalize_uri_to_standard_aturi(parent_uri)
-        } else if let Some(rest) = parent_uri.strip_prefix("at://") {
-            format!("{space_uri}/{rest}")
-        } else {
-            parent_uri.to_string()
-        };
+        let count = rows.len();
+        *budget = budget.saturating_sub(count);
 
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            serde_json::Value,
-            DateTime<Utc>,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-            Option<String>,
-        )> = sqlx::query_as(
-            r#"
-            SELECT
-                r.uri,
-                r.cid,
-                r.space_uri,
-                r.author_did,
-                r.record_json,
-                r.indexed_at,
-                r.parent_uri,
-                r.root_uri,
-                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = (CASE WHEN r.uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.uri, '/space/', 2) ELSE r.uri END)) AND l.space_uri = r.space_uri) AS like_count,
-                (
-                    SELECT count(*)
-                    FROM circle_records rep
-                    WHERE (rep.parent_uri = r.uri OR rep.parent_uri = (CASE WHEN r.uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.uri, '/space/', 2) ELSE r.uri END))
-                      AND rep.space_uri = r.space_uri
-                      AND rep.deleted_at IS NULL
-                      AND (
-                          rep.root_uri IS NULL
-                          OR EXISTS (
-                              SELECT 1 FROM circle_records root
-                              WHERE (root.uri = rep.root_uri OR root.uri = (
-                                  CASE
-                                      WHEN rep.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.root_uri, '/space/', 2)
-                                      ELSE rep.root_uri
-                                  END
-                              ))
-                                AND root.space_uri = $3
-                                AND root.deleted_at IS NULL
-                                AND root.collection = 'app.bsky.feed.post'
-                          )
-                      )
-                      AND (
-                          rep.parent_uri IS NULL
-                          OR EXISTS (
-                              SELECT 1 FROM circle_records p
-                              WHERE (p.uri = rep.parent_uri OR p.uri = (
-                                  CASE
-                                      WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
-                                      ELSE rep.parent_uri
-                                  END
-                              ))
-                                AND p.space_uri = $3
-                                AND p.deleted_at IS NULL
-                                AND p.collection = 'app.bsky.feed.post'
-                          )
-                      )
-                ) AS reply_count,
-                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR l.post_uri = (CASE WHEN r.uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(r.uri, '/space/', 2) ELSE r.uri END)) AND l.space_uri = r.space_uri AND l.author_did = $4) AS viewer_like_uri
-            FROM circle_records r
-            JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
-            JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
-            WHERE (r.parent_uri = $1 OR r.parent_uri = $2)
-              AND r.space_uri = $3
-              AND r.collection = 'app.bsky.feed.post'
-              AND r.deleted_at IS NULL
-            ORDER BY r.created_at ASC, r.uri ASC
-            LIMIT $5
-            "#,
-        )
-        .bind(parent_uri)
-        .bind(&alt_parent_uri)
-        .bind(space_uri)
-        .bind(user_did)
-        .bind(*budget as i64)
-        .fetch_all(pool)
-        .await?;
-
-        let direct_count = rows.len();
-        *budget = budget.saturating_sub(direct_count);
-
-        let mut reply_nodes = Vec::with_capacity(direct_count);
+        let mut next_level_parents = Vec::new();
+        let mut level_nodes = Vec::with_capacity(count);
 
         for row in rows {
-            let child_uri = row.0.clone();
-            let child_replies = if depth > 1 && *budget > 0 {
-                fetch_replies_raw(pool, user_did, &child_uri, space_uri, depth - 1, budget).await?
-            } else {
-                Vec::new()
-            };
-
-            reply_nodes.push(RawThreadNode {
-                uri: row.0,
-                cid: row.1,
-                author_did: row.3,
-                record_json: row.4,
-                indexed_at: row.5,
-                like_count: row.8,
-                reply_count: row.9,
-                viewer_like_uri: row.10,
-                replies: child_replies,
-            });
+            let parent_key = row.6.clone().unwrap_or_default();
+            let uri = row.0.clone();
+            next_level_parents.push(uri);
+            level_nodes.push((
+                parent_key,
+                RawThreadNode {
+                    uri: row.0,
+                    cid: row.1,
+                    author_did: row.3,
+                    record_json: row.4,
+                    indexed_at: row.5,
+                    like_count: row.8,
+                    reply_count: row.9,
+                    viewer_like_uri: row.10,
+                    replies: Vec::new(),
+                },
+            ));
         }
 
-        Ok(reply_nodes)
-    })
+        levels.push(level_nodes);
+        current_level_parents = next_level_parents;
+        current_depth += 1;
+    }
+
+    if levels.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Iteratively attach children to parents from deepest level up
+    for d in (1..levels.len()).rev() {
+        let child_level = std::mem::take(&mut levels[d]);
+        let mut children_by_parent: std::collections::HashMap<String, Vec<RawThreadNode>> =
+            std::collections::HashMap::new();
+        for (parent_uri, node) in child_level {
+            let normalized_parent = if parent_uri.contains("/space/") {
+                normalize_uri_to_standard_aturi(&parent_uri)
+            } else {
+                parent_uri.clone()
+            };
+            children_by_parent
+                .entry(parent_uri.clone())
+                .or_default()
+                .push(node.clone());
+            if normalized_parent != parent_uri {
+                children_by_parent
+                    .entry(normalized_parent)
+                    .or_default()
+                    .push(node);
+            }
+        }
+
+        for (_parent_key, parent_node) in &mut levels[d - 1] {
+            let p_uri = &parent_node.uri;
+            let norm_p_uri = normalize_uri_to_standard_aturi(p_uri);
+            let mut matched_children: Vec<RawThreadNode> = Vec::new();
+            let mut seen_uris = std::collections::HashSet::new();
+
+            let mut candidates = Vec::new();
+            if let Some(c) = children_by_parent.remove(p_uri) {
+                candidates.extend(c);
+            }
+            if let Some(c) = children_by_parent.remove(&norm_p_uri) {
+                candidates.extend(c);
+            }
+            if let Some(rest) = p_uri.strip_prefix("at://") {
+                let space_scoped = format!("{space_uri}/{rest}");
+                if let Some(c) = children_by_parent.remove(&space_scoped) {
+                    candidates.extend(c);
+                }
+            }
+
+            for child in candidates {
+                if seen_uris.insert(child.uri.clone()) {
+                    matched_children.push(child);
+                }
+            }
+
+            matched_children.sort_by(|a, b| {
+                a.indexed_at
+                    .cmp(&b.indexed_at)
+                    .then_with(|| a.uri.cmp(&b.uri))
+            });
+            parent_node.replies.extend(matched_children);
+        }
+    }
+
+    let top_level = levels.into_iter().next().unwrap_or_default();
+    let result = top_level.into_iter().map(|(_, node)| node).collect();
+    Ok(result)
 }

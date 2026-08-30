@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
-
+pub const MAX_PROFILE_CACHE_CAPACITY: usize = 10_000;
 #[derive(Clone)]
 pub struct CachedProfile {
     pub profile: ProfileViewBasic,
@@ -19,15 +19,25 @@ pub struct ProfileHydrator {
     cache: Arc<RwLock<HashMap<String, CachedProfile>>>,
     http_client: reqwest::Client,
     public_appview_url: String,
+    capacity: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ProfileHydrator {
     pub fn new(public_appview_url: String, http_client: reqwest::Client) -> Self {
+        Self::with_capacity(public_appview_url, http_client, MAX_PROFILE_CACHE_CAPACITY)
+    }
+
+    pub fn with_capacity(
+        public_appview_url: String,
+        http_client: reqwest::Client,
+        capacity: usize,
+    ) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             public_appview_url: public_appview_url.trim_end_matches('/').to_string(),
+            capacity,
             semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
@@ -58,7 +68,10 @@ impl ProfileHydrator {
             Ok(permit) => permit,
             Err(_) => return Self::unavailable_profile(did),
         };
-        let url = format!("{}/xrpc/app.bsky.actor.getProfile?actor={}", self.public_appview_url, did);
+        let url = format!(
+            "{}/xrpc/app.bsky.actor.getProfile?actor={}",
+            self.public_appview_url, did
+        );
         match self.http_client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<catbird_atproto::generated::app_bsky::actor::get_profile::GetProfileOutput>().await {
@@ -170,7 +183,17 @@ impl ProfileHydrator {
         {
             let mut cache = self.cache.write().await;
             let now = Instant::now();
+            cache.retain(|_, v| now.duration_since(v.cached_at) < CACHE_TTL);
             for (did, profile) in cache_entries {
+                if cache.len() >= self.capacity && !cache.contains_key(&did) {
+                    if let Some(oldest_key) = cache
+                        .iter()
+                        .min_by_key(|(_, v)| v.cached_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        cache.remove(&oldest_key);
+                    }
+                }
                 cache.insert(
                     did,
                     CachedProfile {
@@ -185,17 +208,33 @@ impl ProfileHydrator {
     }
 
     pub async fn set_cached_profile(&self, did: &str, profile: ProfileViewBasic) {
-        self.set_cached_profile_with_time(did, profile, Instant::now()).await;
+        self.set_cached_profile_with_time(did, profile, Instant::now())
+            .await;
     }
 
-    pub async fn set_cached_profile_with_time(&self, did: &str, profile: ProfileViewBasic, cached_at: Instant) {
+    pub async fn set_cached_profile_with_time(
+        &self,
+        did: &str,
+        profile: ProfileViewBasic,
+        cached_at: Instant,
+    ) {
         let mut cache = self.cache.write().await;
-        cache.insert(
-            did.to_string(),
-            CachedProfile {
-                profile,
-                cached_at,
-            },
-        );
+        let now = Instant::now();
+        cache.retain(|_, v| now.duration_since(v.cached_at) < CACHE_TTL);
+        if cache.len() >= self.capacity && !cache.contains_key(did) {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, v)| v.cached_at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(did.to_string(), CachedProfile { profile, cached_at });
+    }
+
+    pub async fn cached_count(&self) -> usize {
+        let cache = self.cache.read().await;
+        cache.len()
     }
 }

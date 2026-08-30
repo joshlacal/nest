@@ -1,9 +1,6 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use circle_appview::{
-    config::Config,
-    db,
-};
+use circle_appview::{config::Config, db};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {

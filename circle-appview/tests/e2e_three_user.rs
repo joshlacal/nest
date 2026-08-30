@@ -33,11 +33,11 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, FeedItem};
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
 use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
 use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
+use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, FeedItem};
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::string::{Did, Handle};
 
@@ -234,7 +234,12 @@ impl TestUser {
         output.feed
     }
 
-    pub async fn thread(&self, env: &ThreeUserEnv, circle: &CircleInfo, post_uri: &str) -> GetPostThreadOutput {
+    pub async fn thread(
+        &self,
+        env: &ThreeUserEnv,
+        circle: &CircleInfo,
+        post_uri: &str,
+    ) -> GetPostThreadOutput {
         let token = mint_jwt(
             &self.did,
             "blue.catbird.circle.getPostThread",
@@ -261,7 +266,12 @@ impl TestUser {
         serde_json::from_slice(&body).unwrap()
     }
 
-    pub async fn thread_status(&self, env: &ThreeUserEnv, circle: &CircleInfo, post_uri: &str) -> StatusCode {
+    pub async fn thread_status(
+        &self,
+        env: &ThreeUserEnv,
+        circle: &CircleInfo,
+        post_uri: &str,
+    ) -> StatusCode {
         let token = mint_jwt(
             &self.did,
             "blue.catbird.circle.getPostThread",
@@ -385,6 +395,7 @@ pub struct LikeInfo {
     pub subject_uri: String,
 }
 
+#[derive(Default)]
 pub struct MockPublicAppView {
     pub public_records: Vec<String>,
 }
@@ -493,8 +504,8 @@ impl ThreeUserEnv {
             push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
+            commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
         };
-
         let profile_hydrator = Arc::new(ProfileHydrator::new(
             config.public_appview_url.clone(),
             reqwest::Client::new(),
@@ -943,11 +954,22 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
     // Carol's feed has viewer.like populated on Alice's post
     let carol_target_post = &carol_feed[0];
     assert!(
-        carol_target_post.post.post.uri.as_str().ends_with("3l7alicepost1"),
+        carol_target_post
+            .post
+            .post
+            .uri
+            .as_str()
+            .ends_with("3l7alicepost1"),
         "Alice's post must be in Carol's feed"
     );
     assert!(
-        carol_target_post.post.post.viewer.as_ref().and_then(|v| v.like.as_ref()).is_some(),
+        carol_target_post
+            .post
+            .post
+            .viewer
+            .as_ref()
+            .and_then(|v| v.like.as_ref())
+            .is_some(),
         "Carol must have viewer.like set on Alice's post"
     );
     // Alice's post shows like_count = 1 and reply_count = 1
@@ -1000,14 +1022,23 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
     // Thread inspection: Alice, Bob, Carol can fetch the full thread
     let thread_output = env.alice.thread(&env, &circle, &post.std_uri).await;
     assert_eq!(thread_output.thread.post.uri.as_str(), post.std_uri);
-    assert_eq!(thread_output.thread.replies.as_ref().map(|r| r.len()), Some(1));
+    assert_eq!(
+        thread_output.thread.replies.as_ref().map(|r| r.len()),
+        Some(1)
+    );
     let (alice_media_status, alice_media_bytes) = env.alice.media(&env, &post).await;
     assert_eq!(alice_media_status, StatusCode::OK);
-    assert_eq!(alice_media_bytes, b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO");
+    assert_eq!(
+        alice_media_bytes,
+        b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO"
+    );
 
     let (bob_media_status, bob_media_bytes) = env.bob.media(&env, &post).await;
     assert_eq!(bob_media_status, StatusCode::OK);
-    assert_eq!(bob_media_bytes, b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO");
+    assert_eq!(
+        bob_media_bytes,
+        b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO"
+    );
 
     // -----------------------------------------------------------------------
     // Add Dave to Family -> Dave receives full history & media
@@ -1045,7 +1076,10 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
     );
     let (dave_media_status, dave_media_bytes) = env.dave.media(&env, &post).await;
     assert_eq!(dave_media_status, StatusCode::OK);
-    assert_eq!(dave_media_bytes, b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO");
+    assert_eq!(
+        dave_media_bytes,
+        b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO"
+    );
 
     // -----------------------------------------------------------------------
     // Remove Bob from Family -> Bob revoked; Alice, Carol, Dave remain
@@ -1133,11 +1167,17 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
         "Public search must not find Circle reply URI"
     );
     assert!(
-        env.public_appview.search_uri(&circle.space_uri).await.is_none(),
+        env.public_appview
+            .search_uri(&circle.space_uri)
+            .await
+            .is_none(),
         "Public search must not find Space URI"
     );
     assert!(
-        env.public_appview.get_post_thread(&post.uri).await.is_none(),
+        env.public_appview
+            .get_post_thread(&post.uri)
+            .await
+            .is_none(),
         "Public thread must not return Circle thread"
     );
     assert!(
@@ -1176,8 +1216,11 @@ async fn non_member_write_is_rejected_by_validation_policy(pool: PgPool) {
         }),
     };
 
-    let validation_policy = policy(&env.alice.did, active_members(&[&env.bob.did, &env.carol.did]))
-        .with_space_uri(&circle.space_uri);
+    let validation_policy = policy(
+        &env.alice.did,
+        active_members(&[&env.bob.did, &env.carol.did]),
+    )
+    .with_space_uri(&circle.space_uri);
 
     // Dave is NOT an active member, so validation policy must reject candidate
     let validation_result = validate(dave_post_candidate, &validation_policy);
@@ -1205,7 +1248,9 @@ async fn privacy_audit_canaries_are_isolated_and_unleaked(pool: PgPool) {
     let canary_blob_cid = post.blob_cid.as_ref().unwrap();
 
     // 3. Bob replies, Carol likes
-    let reply = env.reply(&env.bob, &circle, &post, "CANARY_REPLY_TEXT_445566").await;
+    let reply = env
+        .reply(&env.bob, &circle, &post, "CANARY_REPLY_TEXT_445566")
+        .await;
     let _like = env.like(&env.carol, &circle, &post).await;
 
     // 4. Add Dave, then remove Bob
@@ -1215,8 +1260,16 @@ async fn privacy_audit_canaries_are_isolated_and_unleaked(pool: PgPool) {
     // 5. Audit: Public surfaces MUST NOT contain any of the canaries
     assert!(env.public_appview.search_uri(&post.uri).await.is_none());
     assert!(env.public_appview.search_uri(&reply.uri).await.is_none());
-    assert!(env.public_appview.search_uri(&circle.space_uri).await.is_none());
-    assert!(env.public_appview.search_uri(canary_blob_cid).await.is_none());
+    assert!(env
+        .public_appview
+        .search_uri(&circle.space_uri)
+        .await
+        .is_none());
+    assert!(env
+        .public_appview
+        .search_uri(canary_blob_cid)
+        .await
+        .is_none());
 
     // 6. Audit: Database state for removed member Bob must have zero cache entries,
     // notifications, or preferences

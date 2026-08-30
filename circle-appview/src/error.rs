@@ -4,6 +4,10 @@ use axum::{
     Json,
 };
 use serde::Serialize;
+/// Key for storing request ID in request extensions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestId(pub String);
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +111,9 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -132,28 +139,49 @@ impl IntoResponse for AppError {
                 )
             }
             AppError::Forbidden(msg) => {
-                tracing::warn!("Forbidden access attempt: {}", msg);
+                tracing::warn!(error_code = "Forbidden", "Forbidden access attempt");
                 (StatusCode::FORBIDDEN, "Forbidden", msg.clone())
             }
             AppError::AccessRemoved(msg) => {
-                tracing::warn!("Access removed: {}", msg);
+                tracing::warn!(error_code = "AccessRemoved", "Access removed");
                 (StatusCode::FORBIDDEN, "AccessRemoved", msg.clone())
             }
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NotFound", msg.clone()),
+            AppError::NotFound(msg) => {
+                tracing::info!(error_code = "NotFound", "Resource not found");
+                (StatusCode::NOT_FOUND, "NotFound", msg.clone())
+            }
             AppError::InvalidRequest(msg) => {
+                tracing::info!(error_code = "InvalidRequest", "Invalid request");
                 (StatusCode::BAD_REQUEST, "InvalidRequest", msg.clone())
             }
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone()),
-            AppError::Database(err) => {
-                tracing::error!("Database query error: {:?}", err);
+            AppError::Conflict(msg) => {
+                tracing::info!(error_code = "Conflict", "Resource conflict");
+                (StatusCode::CONFLICT, "Conflict", msg.clone())
+            }
+            AppError::TooManyRequests(msg) => {
+                tracing::warn!(error_code = "TooManyRequests", "Too many requests");
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "TooManyRequests",
+                    msg.clone(),
+                )
+            }
+            AppError::Database(_err) => {
+                tracing::error!(
+                    error_code = "DatabaseError",
+                    "Database query error occurred"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "InternalServerError",
                     "A database error occurred".to_string(),
                 )
             }
-            AppError::Internal(err) => {
-                tracing::error!("Internal server error: {}", err);
+            AppError::Internal(_err) => {
+                tracing::error!(
+                    error_code = "InternalError",
+                    "Internal server error occurred"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "InternalServerError",
@@ -168,5 +196,40 @@ impl IntoResponse for AppError {
         });
 
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_error_response_redacts_database_and_internal_errors() {
+        let internal_err = AppError::Internal(
+            "Database connection string: postgres://user:SECRET_PASS@host/db".into(),
+        );
+        let response = internal_err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert!(!body_str.contains("SECRET_PASS"));
+        assert!(body_str.contains("An internal server error occurred"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_reasons_render_uniform_unauthorized() {
+        let err = AppError::Unauthorized(AuthReason::Expired);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert!(body_str.contains("AuthRequired"));
+        assert!(body_str.contains("Authentication required"));
     }
 }

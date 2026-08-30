@@ -24,6 +24,5 @@ pub async fn get_post_thread_handler(
         query.parent_height,
     )
     .await?;
-
     Ok(Json(output))
 }
