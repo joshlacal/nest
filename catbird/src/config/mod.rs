@@ -148,7 +148,7 @@ fn default_mls_service_did() -> String {
     "did:web:mlschat.catbird.blue".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PushConfig {
     /// Shared Postgres URL used by Nest and catbird-firehose
     #[serde(default)]
@@ -167,6 +167,18 @@ pub struct PushConfig {
     /// Max queue rows to lease per poll
     #[serde(default = "default_push_queue_batch_size")]
     pub queue_batch_size: u32,
+    /// Max active devices per account (default: 10)
+    #[serde(default = "default_max_active_devices_per_account")]
+    pub max_active_devices_per_account: i64,
+    /// Max inactive devices retained per account before pruning (default: 20)
+    #[serde(default = "default_max_inactive_devices_per_account")]
+    pub max_inactive_devices_per_account: i64,
+    /// Max active devices to fan out to per notification (default: 10)
+    #[serde(default = "default_max_fanout_per_notification")]
+    pub max_fanout_per_notification: i64,
+    /// APNs send timeout in seconds (default: 10)
+    #[serde(default = "default_push_send_timeout_seconds")]
+    pub send_timeout_seconds: u64,
     /// APNs delivery configuration
     #[serde(default)]
     pub apns: ApnsConfig,
@@ -178,6 +190,24 @@ pub struct PushConfig {
 impl PushConfig {
     pub fn is_enabled(&self) -> bool {
         self.database_url.is_some() && self.service_did.is_some()
+    }
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            database_url: None,
+            service_did: None,
+            verdict_ttl_seconds: default_push_verdict_ttl_seconds(),
+            queue_poll_interval_ms: default_push_queue_poll_interval_ms(),
+            queue_batch_size: default_push_queue_batch_size(),
+            max_active_devices_per_account: default_max_active_devices_per_account(),
+            max_inactive_devices_per_account: default_max_inactive_devices_per_account(),
+            max_fanout_per_notification: default_max_fanout_per_notification(),
+            send_timeout_seconds: default_push_send_timeout_seconds(),
+            apns: Default::default(),
+            chat_poll_enabled: false,
+        }
     }
 }
 
@@ -211,6 +241,22 @@ fn default_push_queue_poll_interval_ms() -> u64 {
 
 fn default_push_queue_batch_size() -> u32 {
     32
+}
+
+fn default_max_active_devices_per_account() -> i64 {
+    10
+}
+
+fn default_max_inactive_devices_per_account() -> i64 {
+    20
+}
+
+fn default_max_fanout_per_notification() -> i64 {
+    10
+}
+
+fn default_push_send_timeout_seconds() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -37,8 +37,8 @@ pub async fn poll_account(
         return Ok(());
     }
 
-    // Resolve session + DPoP data for this account
-    let (session_id, pds_url) = lookup_push_account(db_pool, &row.account_did).await?;
+    // Resolve session + DPoP data for this account and capture auth_generation before network
+    let (session_id, pds_url, auth_generation) = lookup_push_account(db_pool, &row.account_did).await?;
     let (session, dpop) =
         match resolve_background_session(state, &row.account_did, &session_id, &pds_url).await {
             Ok(pair) => pair,
@@ -293,6 +293,7 @@ pub async fn poll_account(
                         .take(300)
                         .collect(),
                     sent_at: event.message.sent_at.clone(),
+                    auth_generation,
                 };
                 if let Err(err) = enqueue_push(db_pool, &push_event, 15).await {
                     tracing::warn!(did = %row.account_did, error = %err, "Failed to enqueue chat push");
@@ -562,15 +563,19 @@ fn batch_read_maxima(logs: &[LogEntry]) -> HashMap<String, String> {
     maxima
 }
 
-/// Look up session_id and pds_url from push_accounts for a given DID.
-async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(String, String)> {
-    let row = sqlx::query_as::<_, (String, String)>(
-        "SELECT session_id, pds_url FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
+/// Look up session_id, pds_url, and auth_generation from push_accounts for a given DID.
+async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(String, String, i64)> {
+    let row = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT session_id, pds_url, auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
     )
     .bind(did)
     .fetch_optional(db_pool)
     .await?
     .ok_or_else(|| anyhow!("No active push account for DID {}", did))?;
+
+    if row.2 <= 0 {
+        return Err(anyhow!("Invalid non-positive auth_generation for DID {}", did));
+    }
 
     Ok(row)
 }
@@ -585,11 +590,17 @@ async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(Str
 /// only needs to survive long enough to build a generic notification. The
 /// fast (Redis pub/sub) path carries the real text for the one immediate
 /// delivery attempt and never writes it to disk; see `publish_to_redis`.
-pub(crate) async fn enqueue_push(
+pub async fn enqueue_push(
     db_pool: &Pool<Postgres>,
     event: &ChatPushEvent,
     delay_secs: i64,
 ) -> Result<()> {
+    if event.auth_generation <= 0 {
+        return Err(anyhow!(
+            "Cannot enqueue push event with invalid auth_generation {}",
+            event.auth_generation
+        ));
+    }
     let dedupe_key = event.dedupe_key();
     let mut persisted_event = event.clone();
     persisted_event.message_text.clear();
@@ -601,10 +612,11 @@ pub(crate) async fn enqueue_push(
         INSERT INTO push_event_queue (
             recipient_did, actor_did, notification_type,
             event_cid, event_path, event_record_json,
-            event_timestamp, dedupe_key, available_at
+            event_timestamp, dedupe_key, available_at,
+            auth_generation
         )
         VALUES ($1, $2, 'chat_message', $3, 'chat.bsky.convo.getLog', $4, $5, $6,
-                NOW() + make_interval(secs => $7))
+                NOW() + make_interval(secs => $7), $8)
         ON CONFLICT (dedupe_key) DO NOTHING
         "#,
     )
@@ -615,6 +627,7 @@ pub(crate) async fn enqueue_push(
     .bind(now_epoch)
     .bind(&dedupe_key)
     .bind(delay_secs)
+    .bind(event.auth_generation)
     .execute(db_pool)
     .await?;
 

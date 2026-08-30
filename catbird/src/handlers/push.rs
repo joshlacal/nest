@@ -32,6 +32,9 @@ pub async fn register_push(
     Extension(session): Extension<CatbirdSession>,
     Json(input): Json<RegisterPushInput>,
 ) -> AppResult<StatusCode> {
+    input
+        .validate()
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
     push.registry.validate_service_did(&input.service_did)?;
     push.registry
@@ -47,13 +50,15 @@ pub async fn unregister_push(
     Extension(session): Extension<CatbirdSession>,
     Json(input): Json<UnregisterPushInput>,
 ) -> AppResult<StatusCode> {
+    input
+        .validate()
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
     push.registry.validate_service_did(&input.service_did)?;
     push.registry
         .deactivate_registration(&session, &input)
         .await
         .map_err(internal_error)?;
-
     if let Some(push_db) = state.push_db.as_ref() {
         let scheduler =
             crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());

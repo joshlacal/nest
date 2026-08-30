@@ -38,14 +38,18 @@ impl PushSubscriptions {
         subject_did: &str,
         subscription: &ActivitySubscriptionPreference,
     ) -> Result<Option<ActivitySubscriptionPreference>> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, subscriber_did).await?;
+
         if !subscription.post && !subscription.reply {
             sqlx::query(
                 "DELETE FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = $2",
             )
             .bind(subscriber_did)
             .bind(subject_did)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             return Ok(None);
         }
 
@@ -71,12 +75,12 @@ impl PushSubscriptions {
         .bind(subject_did)
         .bind(subscription.post)
         .bind(subscription.reply)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(Some(subscription.clone()))
     }
-
     pub async fn list_profiles_json(
         &self,
         http_client: &reqwest::Client,
