@@ -6,6 +6,10 @@ use axum::{
 use serde::Serialize;
 use thiserror::Error;
 
+/// Key for storing request ID in request extensions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestId(pub String);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthReason {
     MissingHeader,
@@ -132,28 +136,35 @@ impl IntoResponse for AppError {
                 )
             }
             AppError::Forbidden(msg) => {
-                tracing::warn!("Forbidden access attempt: {}", msg);
+                tracing::warn!(error_code = "Forbidden", "Forbidden access attempt");
                 (StatusCode::FORBIDDEN, "Forbidden", msg.clone())
             }
             AppError::AccessRemoved(msg) => {
-                tracing::warn!("Access removed: {}", msg);
+                tracing::warn!(error_code = "AccessRemoved", "Access removed");
                 (StatusCode::FORBIDDEN, "AccessRemoved", msg.clone())
             }
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NotFound", msg.clone()),
+            AppError::NotFound(msg) => {
+                tracing::info!(error_code = "NotFound", "Resource not found");
+                (StatusCode::NOT_FOUND, "NotFound", msg.clone())
+            }
             AppError::InvalidRequest(msg) => {
+                tracing::info!(error_code = "InvalidRequest", "Invalid request");
                 (StatusCode::BAD_REQUEST, "InvalidRequest", msg.clone())
             }
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone()),
-            AppError::Database(err) => {
-                tracing::error!("Database query error: {:?}", err);
+            AppError::Conflict(msg) => {
+                tracing::info!(error_code = "Conflict", "Resource conflict");
+                (StatusCode::CONFLICT, "Conflict", msg.clone())
+            }
+            AppError::Database(_err) => {
+                tracing::error!(error_code = "DatabaseError", "Database query error occurred");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "InternalServerError",
                     "A database error occurred".to_string(),
                 )
             }
-            AppError::Internal(err) => {
-                tracing::error!("Internal server error: {}", err);
+            AppError::Internal(_err) => {
+                tracing::error!(error_code = "InternalError", "Internal server error occurred");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "InternalServerError",
@@ -168,5 +179,62 @@ impl IntoResponse for AppError {
         });
 
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_error_response_redacts_database_and_internal_errors() {
+        let internal_err = AppError::Internal(
+            "Database connection string: postgres://user:SECRET_PASS@host/db".into(),
+        );
+        let response = internal_err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert!(!body_str.contains("SECRET_PASS"));
+        assert!(!body_str.contains("postgres://"));
+        assert!(body_str.contains("InternalServerError"));
+        assert!(body_str.contains("An internal server error occurred"));
+
+        let forbidden_err = AppError::Forbidden("AppNotAuthorized".into());
+        let f_response = forbidden_err.into_response();
+        assert_eq!(f_response.status(), StatusCode::FORBIDDEN);
+        let f_bytes = axum::body::to_bytes(f_response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let f_body_str = String::from_utf8_lossy(&f_bytes);
+        assert!(f_body_str.contains("Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn test_all_error_variants_redact_sentinels() {
+        let variants = [
+            AppError::Unauthorized(AuthReason::MissingHeader),
+            AppError::Forbidden("AppNotAuthorized".into()),
+            AppError::AccessRemoved("SpaceDeleted".into()),
+            AppError::NotFound("SpaceNotFound".into()),
+            AppError::InvalidRequest("InvalidRequest".into()),
+            AppError::Conflict("Conflict".into()),
+            AppError::Internal("FATAL_SENTINEL_QUERY_ERROR_0xDEADBEEF".into()),
+        ];
+
+        for err in variants {
+            let response = err.into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("read body");
+            let body_str = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body_str.contains("FATAL_SENTINEL"),
+                "Leaked sentinel in response body: {body_str}"
+            );
+        }
     }
 }

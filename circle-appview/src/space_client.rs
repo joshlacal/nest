@@ -354,10 +354,23 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 &access_token,
             )
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to get delegation token: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    operation = "get_delegation_token",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    "Failed to send get_delegation_token request"
+                );
+                AppError::Internal(format!("Failed to get delegation token: {e}"))
+            })?;
 
             if !response.status().is_success() {
                 let status = response.status();
+                tracing::warn!(
+                    operation = "get_delegation_token",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC get_delegation_token returned error"
+                );
                 let body = response
                     .text()
                     .await
@@ -416,10 +429,23 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .json(&req_body)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "get_space_credential",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to connect to Space host for get_space_credential"
+                    );
+                    AppError::Internal(format!("Failed to connect to Space host: {e}"))
+                })?;
 
             if !response.status().is_success() {
                 let status = response.status();
+                tracing::warn!(
+                    operation = "get_space_credential",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC get_space_credential returned error"
+                );
                 let body = response
                     .text()
                     .await
@@ -475,10 +501,23 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .json(&req_body)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to call registerNotify: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "register_notify",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to call registerNotify"
+                    );
+                    AppError::Internal(format!("Failed to call registerNotify: {e}"))
+                })?;
 
             if !response.status().is_success() {
                 let status = response.status();
+                tracing::warn!(
+                    operation = "register_notify",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC registerNotify returned error"
+                );
                 return Err(AppError::Internal(format!(
                     "registerNotify returned status {status}"
                 )));
@@ -548,12 +587,25 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .header("DPoP", dpop_proof)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "list_repos",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to connect to Space host for listRepos"
+                    );
+                    AppError::Internal(format!("Failed to connect to Space host: {e}"))
+                })?;
 
             if !response.status().is_success() {
+                let status = response.status();
+                tracing::warn!(
+                    operation = "list_repos",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC listRepos returned error"
+                );
                 return Err(AppError::Internal(format!(
-                    "Space host listRepos returned {}",
-                    response.status()
+                    "Space host listRepos returned {status}"
                 )));
             }
             let output = response
@@ -617,12 +669,25 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .header("DPoP", dpop_proof)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "list_repo_ops",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to connect to Space host for listRepoOps"
+                    );
+                    AppError::Internal(format!("Failed to connect to Space host: {e}"))
+                })?;
 
             if !response.status().is_success() {
+                let status = response.status();
+                tracing::warn!(
+                    operation = "list_repo_ops",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC listRepoOps returned error"
+                );
                 return Err(AppError::Internal(format!(
-                    "Space host listRepoOps returned {}",
-                    response.status()
+                    "Space host listRepoOps returned {status}"
                 )));
             }
             let output = response
@@ -671,12 +736,25 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .header("DPoP", dpop_proof)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "get_repo",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to connect to Space host for getRepo"
+                    );
+                    AppError::Internal(format!("Failed to connect to Space host: {e}"))
+                })?;
 
             if !response.status().is_success() {
+                let status = response.status();
+                tracing::warn!(
+                    operation = "get_repo",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC getRepo returned error"
+                );
                 return Err(AppError::Internal(format!(
-                    "Space host getRepo returned {}",
-                    response.status()
+                    "Space host getRepo returned {status}"
                 )));
             }
 
@@ -742,12 +820,25 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .header("DPoP", dpop_proof)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "get_latest_commit",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to connect to Space host for getLatestCommit"
+                    );
+                    AppError::Internal(format!("Failed to connect to Space host: {e}"))
+                })?;
 
             if !response.status().is_success() {
+                let status = response.status();
+                tracing::warn!(
+                    operation = "get_latest_commit",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC getLatestCommit returned error"
+                );
                 return Err(AppError::Internal(format!(
-                    "Space host getLatestCommit returned {}",
-                    response.status()
+                    "Space host getLatestCommit returned {status}"
                 )));
             }
             let output: catbird_atproto::generated::com_atproto::space::get_latest_commit::GetLatestCommitOutput = response.json().await.map_err(|e| AppError::Internal(e.to_string()))?;
@@ -791,12 +882,25 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .header("DPoP", dpop_proof)
                 .send()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        operation = "get_blob",
+                        upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                        "Failed to connect to Space host for getBlob"
+                    );
+                    AppError::Internal(format!("Failed to connect to Space host: {e}"))
+                })?;
 
             if !response.status().is_success() {
+                let status = response.status();
+                tracing::warn!(
+                    operation = "get_blob",
+                    upstream_host = %target_url.host_str().unwrap_or("unknown"),
+                    upstream_status = %status.as_u16(),
+                    "Upstream XRPC getBlob returned error"
+                );
                 return Err(AppError::Internal(format!(
-                    "Space host getBlob returned {}",
-                    response.status()
+                    "Space host getBlob returned {status}"
                 )));
             }
 
@@ -1841,20 +1945,17 @@ pub fn validate_space_credential(
 #[derive(Deserialize)]
 struct XrpcErrorPayload {
     error: Option<String>,
-    message: Option<String>,
 }
 
 pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
     if status.is_server_error() {
-        return AppError::Internal(format!("Upstream server error ({status}): {body}"));
+        return AppError::Internal(format!("Upstream server error ({status})"));
     }
 
     let payload: XrpcErrorPayload = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(_) => {
-            return AppError::Internal(format!(
-                "Failed to parse XRPC error payload ({status}): {body}"
-            ));
+            return AppError::Internal(format!("Failed to parse XRPC error payload ({status})"));
         }
     };
 
@@ -1862,32 +1963,24 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
         Some(code) => code,
         None => {
             return AppError::Internal(format!(
-                "XRPC error response missing error field ({status}): {body}"
+                "XRPC error response missing error field ({status})"
             ));
         }
     };
 
-    let message = payload.message.as_deref().unwrap_or(body);
-
     match error_code {
-        "AppNotAuthorized" => AppError::Forbidden(format!("AppNotAuthorized: {message}")),
-        "UserNotAuthorized" => AppError::Forbidden(format!("UserNotAuthorized: {message}")),
-        "NotAuthorized" => AppError::Forbidden(format!("NotAuthorized: {message}")),
-        "InvalidDelegationToken" => {
-            AppError::Forbidden(format!("InvalidDelegationToken: {message}"))
-        }
-        "InvalidClientAttestation" => {
-            AppError::Forbidden(format!("InvalidClientAttestation: {message}"))
-        }
-        "SpaceNotFound" => AppError::NotFound(format!("SpaceNotFound: {message}")),
-        "SpaceDeleted" => AppError::AccessRemoved(format!("SpaceDeleted: {message}")),
-        other => match status {
-            reqwest::StatusCode::NOT_FOUND => AppError::NotFound(format!("{other}: {message}")),
-            reqwest::StatusCode::FORBIDDEN => AppError::Forbidden(format!("{other}: {message}")),
-            reqwest::StatusCode::BAD_REQUEST => {
-                AppError::InvalidRequest(format!("{other}: {message}"))
-            }
-            _ => AppError::Internal(format!("{other} ({status}): {message}")),
+        "AppNotAuthorized" => AppError::Forbidden("AppNotAuthorized".into()),
+        "UserNotAuthorized" => AppError::Forbidden("UserNotAuthorized".into()),
+        "NotAuthorized" => AppError::Forbidden("NotAuthorized".into()),
+        "InvalidDelegationToken" => AppError::Forbidden("InvalidDelegationToken".into()),
+        "InvalidClientAttestation" => AppError::Forbidden("InvalidClientAttestation".into()),
+        "SpaceNotFound" => AppError::NotFound("SpaceNotFound".into()),
+        "SpaceDeleted" => AppError::AccessRemoved("SpaceDeleted".into()),
+        _ => match status {
+            reqwest::StatusCode::NOT_FOUND => AppError::NotFound("NotFound".into()),
+            reqwest::StatusCode::FORBIDDEN => AppError::Forbidden("Forbidden".into()),
+            reqwest::StatusCode::BAD_REQUEST => AppError::InvalidRequest("InvalidRequest".into()),
+            _ => AppError::Internal(format!("Upstream error ({status})")),
         },
     }
 }
@@ -2094,6 +2187,72 @@ mod tests {
             other => panic!("Expected AppError::AccessRemoved, got: {:?}", other),
         }
     }
+    #[test]
+    fn test_parse_xrpc_error_sentinel_never_leaks() {
+        let cases = [
+            // 500 server error with secret in body
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database failed: connection string postgres://admin:SENTINEL_SECRET_500@host/db",
+            ),
+            // 502 bad gateway with secret
+            (StatusCode::BAD_GATEWAY, "Gateway crash: SENTINEL_SECRET_502"),
+            // Malformed JSON with secret
+            (
+                StatusCode::BAD_REQUEST,
+                "{\"error\": \"SENTINEL_MALFORMED_SECRET",
+            ),
+            // Missing error field with secret in message
+            (
+                StatusCode::BAD_REQUEST,
+                "{\"message\": \"SENTINEL_MISSING_ERROR_FIELD\"}",
+            ),
+            // Allowlisted error code with secret in message
+            (
+                StatusCode::FORBIDDEN,
+                "{\"error\": \"AppNotAuthorized\", \"message\": \"token: SENTINEL_ALLOWLISTED_MSG\"}",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "{\"error\": \"SpaceNotFound\", \"message\": \"path: SENTINEL_SPACE_NOT_FOUND\"}",
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                "{\"error\": \"SpaceDeleted\", \"message\": \"reason: SENTINEL_SPACE_DELETED\"}",
+            ),
+            // Unknown error code with secret in error and message
+            (
+                StatusCode::FORBIDDEN,
+                "{\"error\": \"SENTINEL_ERR_CODE\", \"message\": \"SENTINEL_ERR_MSG\"}",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "{\"error\": \"SENTINEL_404_CODE\", \"message\": \"SENTINEL_404_MSG\"}",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "{\"error\": \"SENTINEL_400_CODE\", \"message\": \"SENTINEL_400_MSG\"}",
+            ),
+            (
+                StatusCode::IM_A_TEAPOT,
+                "{\"error\": \"SENTINEL_418_CODE\", \"message\": \"SENTINEL_418_MSG\"}",
+            ),
+        ];
+
+        for (status, body) in cases {
+            let err = parse_xrpc_error(status, body);
+            let err_str = err.to_string();
+            let err_debug = format!("{err:?}");
+            assert!(
+                !err_str.contains("SENTINEL"),
+                "Status {status} leaked sentinel in display: {err_str}"
+            );
+            assert!(
+                !err_debug.contains("SENTINEL"),
+                "Status {status} leaked sentinel in debug: {err_debug}"
+            );
+        }
+    }
 
     struct FailingDnsResolver;
     impl SpaceHostDnsResolver for FailingDnsResolver {
@@ -2133,5 +2292,59 @@ mod tests {
             AppError::Unauthorized(AuthReason::SsrfBlocked) => {}
             other => panic!("Expected AppError::Unauthorized(SsrfBlocked), got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_mock_space_credential_is_valid_compact_jwt_and_validates() {
+        let authority_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let verifying_key = authority_key.verifying_key();
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(encoded_point.x().unwrap().as_slice());
+        let y = URL_SAFE_NO_PAD.encode(encoded_point.y().unwrap().as_slice());
+
+        let authority_did = "did:plc:authority123";
+        let space_uri = "at://did:plc:space123/app.bsky.feed.generator/main";
+        let jkt = "mock_jkt_abc123";
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+
+        let cred = mint_mock_space_credential(
+            &authority_key,
+            authority_did,
+            space_uri,
+            jkt,
+            expires_at,
+        );
+
+        let parts: Vec<&str> = cred.split('.').collect();
+        assert_eq!(parts.len(), 3, "Mock space credential must be a 3-segment compact JWT");
+
+        let doc = DidDocument {
+            id: authority_did.into(),
+            verification_method: vec![crate::auth::VerificationMethod {
+                id: format!("{authority_did}#atproto_space"),
+                r#type: "JsonWebKey2020".into(),
+                controller: authority_did.into(),
+                public_key_jwk: Some(crate::auth::PublicKeyJwk {
+                    kty: "EC".into(),
+                    crv: "P-256".into(),
+                    x,
+                    y: Some(y),
+                    kid: None,
+                }),
+                public_key_multibase: None,
+            }],
+            service: vec![],
+        };
+
+        let validated_exp = validate_space_credential(
+            &cred,
+            authority_did,
+            space_uri,
+            jkt,
+            &doc,
+        )
+        .expect("Mock credential should validate successfully");
+
+        assert_eq!(validated_exp.timestamp(), expires_at.timestamp());
     }
 }

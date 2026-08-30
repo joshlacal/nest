@@ -173,6 +173,9 @@ pub struct PushConfig {
     /// Enable the chat poll background service
     #[serde(default)]
     pub chat_poll_enabled: bool,
+    /// When true (Phase 2), writers bind the SHA-256 fingerprint into session_id instead of raw plaintext bearer strings
+    #[serde(default)]
+    pub phase2_writers: bool,
 }
 
 impl PushConfig {
@@ -242,6 +245,26 @@ pub struct RedisConfig {
     /// Session TTL in seconds
     #[serde(default = "default_session_ttl")]
     pub session_ttl_seconds: u64,
+}
+
+/// Redact userinfo and query parameters from a Redis connection URL for safe logging.
+pub fn redact_redis_url(raw: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(raw) {
+        let scheme = parsed.scheme();
+        let host = match parsed.host_str() {
+            Some(h) => h,
+            None => return "<invalid-redis-url>".to_string(),
+        };
+        let port_part = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = parsed.path().trim_start_matches('/');
+        let db_part = match path.parse::<u32>() {
+            Ok(db) => format!("/{db}"),
+            Err(_) => String::new(),
+        };
+        format!("{scheme}://{host}{port_part}{db_part}")
+    } else {
+        "<invalid-redis-url>".to_string()
+    }
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawOAuthConfig")]
@@ -632,6 +655,9 @@ pub struct AppState {
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
     /// AES-256-GCM encryption key for Redis session records
     pub session_encryption_key: Option<[u8; 32]>,
+    /// Session index readiness signal for background workers
+    pub session_index_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub session_index_readiness: Arc<tokio::sync::Notify>,
 }
 
 fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Error> {
@@ -727,7 +753,10 @@ impl AppState {
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             session_encryption_key,
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         };
+
         // Initialize KeyStore first (needed by OAuth client)
         match crate::services::KeyStore::from_config(&state) {
             Ok(store) => {
@@ -748,7 +777,7 @@ impl AppState {
                 Ok((store, client)) => {
                     state.auth_store = Some(Arc::new(store));
                     state.jacquard_client = Some(Arc::new(client));
-                    tracing::info!("Jacquard OAuthClient initialized successfully");
+                    tracing::info!("Jacquard OAuthClient and RedisAuthStore initialized");
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -802,6 +831,89 @@ impl AppState {
         self.push = Some(Arc::new(services));
         tracing::info!("Push services initialized successfully");
         Ok(())
+    }
+
+    pub fn is_session_index_ready(&self) -> bool {
+        self.session_index_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn wait_for_session_index_readiness(&self) {
+        if self.is_session_index_ready() {
+            return;
+        }
+        while !self.is_session_index_ready() {
+            let notified = self.session_index_readiness.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_session_index_ready() {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    /// Reconcile pre-existing sessions at startup before background workers consume.
+    /// Always releases session index readiness on completion or failure so workers are never parked forever.
+    pub async fn reconcile_session_indexes(&self) -> Result<crate::services::ReconciliationOutcome, anyhow::Error> {
+        let Some(auth_store) = self.auth_store.as_ref() else {
+            self.session_index_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.session_index_readiness.notify_waiters();
+            return Ok(crate::services::ReconciliationOutcome {
+                reconciled: 0,
+                skipped: 0,
+                failed: 0,
+                total_scanned: 0,
+                is_complete: true,
+            });
+        };
+
+        let mut attempts = 0usize;
+        let max_attempts = 3usize;
+        let mut last_error = None;
+
+        while attempts < max_attempts {
+            attempts += 1;
+            match auth_store.reconcile_legacy_sessions().await {
+                Ok(outcome) => {
+                    self.session_index_ready
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.session_index_readiness.notify_waiters();
+                    tracing::info!(
+                        reconciled = outcome.reconciled,
+                        attempts = attempts,
+                        is_complete = outcome.is_complete,
+                        "Session index reconciliation complete; background workers unblocked"
+                    );
+                    return Ok(outcome);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        attempt = attempts,
+                        error = %err,
+                        "Session index reconciliation attempt failed"
+                    );
+                    last_error = Some(err);
+                    if attempts < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * (1 << (attempts - 1)))).await;
+                    }
+                }
+            }
+        }
+
+        // Reconciliation failed after retries: always release readiness so background workers are never parked forever.
+        // The background resolver has fail-closed and self-healing mechanisms for individual session lookups.
+        self.session_index_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.session_index_readiness.notify_waiters();
+
+        let final_err = last_error.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string());
+        tracing::error!(
+            error = %final_err,
+            "Session index reconciliation failed after max retries; background workers unblocked (resolver fails safe)"
+        );
+        Err(anyhow::anyhow!("Session index reconciliation failed: {final_err}"))
     }
 
     /// Build the Jacquard RedisAuthStore and OAuthClient from current state.
@@ -1484,6 +1596,38 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_redis_url() {
+        assert_eq!(
+            redact_redis_url("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://default:secretpass@127.0.0.1:6379/2?foo=bar#frag"),
+            "redis://127.0.0.1:6379/2"
+        );
+        assert_eq!(
+            redact_redis_url("rediss://user:token@prod.redis.cache.amazonaws.com:6380/0"),
+            "rediss://prod.redis.cache.amazonaws.com:6380/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://:onlypass@localhost:6379"),
+            "redis://localhost:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://default:secretpass@127.0.0.1:6379/0/SENTINEL_TOKEN?token=SENTINEL_QUERY#SENTINEL_FRAG"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_redis_url("redis://:pass@localhost:6379/notanumber/SENTINEL"),
+            "redis://localhost:6379"
+        );
+        assert_eq!(
+            redact_redis_url("not a url"),
+            "<invalid-redis-url>"
+        );
+    }
+
+    #[test]
     fn test_redis_key_prefix_rejects_legacy_and_unversioned() {
         // Legacy prefix
         let legacy_config = base_test_config_builder()
@@ -1619,5 +1763,73 @@ mod tests {
 
         let custom = validate_catmos_scopes("atproto transition:generic identity:handle").unwrap();
         assert_eq!(custom.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_session_indexes_releases_readiness_on_failure() {
+        let session_index_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session_index_readiness = Arc::new(tokio::sync::Notify::new());
+
+        assert!(!session_index_ready.load(std::sync::atomic::Ordering::Acquire));
+
+        // Spawn a background waiter using the safe pinned-enable pattern
+        let waiter_ready = session_index_ready.clone();
+        let waiter_notify = session_index_readiness.clone();
+        let waiter = tokio::spawn(async move {
+            while !waiter_ready.load(std::sync::atomic::Ordering::Acquire) {
+                let notified = waiter_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if waiter_ready.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+            true
+        });
+
+        // Simulate reconciliation failure and ensure readiness is unconditionally set
+        session_index_ready.store(true, std::sync::atomic::Ordering::Release);
+        session_index_readiness.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), waiter).await;
+        assert!(result.is_ok(), "Waiter must not be parked when reconciliation completes or fails");
+        assert!(result.unwrap().unwrap(), "Waiter must observe readiness as true");
+        assert!(session_index_ready.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_session_index_readiness_no_lost_wakeup() {
+        let session_index_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session_index_readiness = Arc::new(tokio::sync::Notify::new());
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let ready = session_index_ready.clone();
+            let notify = session_index_readiness.clone();
+            handles.push(tokio::spawn(async move {
+                while !ready.load(std::sync::atomic::Ordering::Acquire) {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if ready.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    notified.await;
+                }
+                true
+            }));
+        }
+
+        tokio::task::yield_now().await;
+
+        session_index_ready.store(true, std::sync::atomic::Ordering::Release);
+        session_index_readiness.notify_waiters();
+
+        for handle in handles {
+            let res = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+            assert!(res.is_ok(), "Waiter must not be parked due to lost wakeup");
+            assert!(res.unwrap().unwrap(), "Waiter must observe readiness");
+        }
     }
 }

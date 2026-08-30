@@ -9,7 +9,7 @@ use crate::access::{
 };
 use crate::auth::{select_verification_method, DidResolver};
 use crate::commit::{
-    compute_dagcbor_cid, extract_and_validate_car, parse_permissioned_car, verify_commit,
+    compute_dagcbor_cid, extract_and_validate_car, parse_permissioned_car, verify_commit_atproto,
     CommitContext, LtHash, LTHASH_SIZE,
 };
 use crate::config::AppState;
@@ -419,7 +419,7 @@ impl SyncEngine {
                 rev: commit.rev.clone(),
             };
             let hash_matches = commit.hash.as_ref() == lthash.digest().as_slice();
-            let verified = hash_matches && verify_commit(commit, &context, &author_signing_key).is_ok();
+            let verified = hash_matches && verify_commit_atproto(commit, &context, &author_signing_key).is_ok();
 
             if verified {
                 let hash_ok = match expected_authority_hash {
@@ -1179,8 +1179,8 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
         summary.spaces_checked += 1;
         let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
             Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
+            Err(_) => {
+                tracing::warn!(error_code = "SpaceCredentialFailed", space_ref = %crate::access::space_fingerprint(&space_uri), "Failed to ensure space credential for sweep");
                 summary.repos_failed += 1;
                 continue;
             }

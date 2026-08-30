@@ -33,7 +33,7 @@ pub use oauth_upgrade::{
     UPGRADE_RECEIPT_TTL_SECONDS,
 };
 pub use push::PushServices;
-pub use redis_auth_store::RedisAuthStore;
+pub use redis_auth_store::{ReconciliationOutcome, RedisAuthStore};
 pub use service_auth::{
     ServiceAuthProvider, CIRCLE_APPVIEW_SERVICE_REF, CIRCLE_ENDPOINTS, MLS_APPVIEW_SERVICE_REF,
 };

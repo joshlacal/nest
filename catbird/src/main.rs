@@ -63,8 +63,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
-    tracing::info!("Connected to Redis at {}", app_config.redis.url);
+    tracing::info!("Connected to Redis at {}", crate::config::redact_redis_url(&app_config.redis.url));
 
+    // Reconcile session indexes for pre-existing sessions in the background.
+    // Health endpoints and listener bind immediately; /ready reflects reconciliation state
+    // and background workers wait on session_index_readiness.
+    // If reconciliation is truncated or encounters errors, re-arms periodically on a timer.
+    let recon_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            match recon_state.reconcile_session_indexes().await {
+                Ok(outcome) => {
+                    if outcome.is_complete && outcome.failed == 0 {
+                        tracing::info!(
+                            reconciled = outcome.reconciled,
+                            "Session index reconciliation fully completed"
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        reconciled = outcome.reconciled,
+                        failed = outcome.failed,
+                        "Session index reconciliation incomplete or had failures; will retry on timer"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed during background session index reconciliation; will retry on timer");
+                }
+            }
+            interval.tick().await;
+        }
+    });
     // Register Prometheus metrics
     metrics::register_metrics();
     tracing::info!("Prometheus metrics registered");

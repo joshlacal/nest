@@ -115,14 +115,22 @@ impl CirclePushClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("Push request failed: {e}")))?;
+            .map_err(|_e| AppError::Internal("Push request network error".into()))?;
 
         if !res.status().is_success() {
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            tracing::warn!(status = %status, body = %body, "Push endpoint returned error");
+            let upstream_host = url::Url::parse(push_url)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                operation = "push_delivery",
+                upstream_host = %upstream_host,
+                upstream_status = %status.as_u16(),
+                "Push endpoint returned error"
+            );
             return Err(AppError::Internal(format!(
-                "Push endpoint error {status}: {body}"
+                "Push endpoint returned HTTP {status}"
             )));
         }
 

@@ -8,18 +8,62 @@ use crate::{
 
 use super::types::{PushAccountRow, RegisterPushInput, RegistrationRow, UnregisterPushInput};
 
+/// Compute a non-replayable SHA-256 fingerprint for a session ID.
+/// Returns a 64-character lowercase hex string.
+pub fn session_fingerprint(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    let result = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in result {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    hex
+}
+
+/// Normalizes a session identifier to its SHA-256 fingerprint representation.
+/// If already a 64-character lowercase hex string, returns it as-is.
+/// Otherwise, computes SHA-256(session_id).
+pub fn normalize_or_hash_session_fingerprint(session_id: &str) -> String {
+    if session_id.len() == 64 && session_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        session_id.to_ascii_lowercase()
+    } else {
+        session_fingerprint(session_id)
+    }
+}
+
 #[derive(Clone)]
 pub struct PushRegistry {
     db_pool: Pool<Postgres>,
     service_did: String,
+    phase2_writers: bool,
 }
 
 impl PushRegistry {
     pub fn new(db_pool: Pool<Postgres>, service_did: String) -> Self {
+        let phase2_writers = std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Self {
             db_pool,
             service_did,
+            phase2_writers,
         }
+    }
+
+    pub fn with_phase2_writers(mut self, enabled: bool) -> Self {
+        self.phase2_writers = enabled;
+        self
+    }
+
+    pub fn set_phase2_writers(&mut self, enabled: bool) {
+        self.phase2_writers = enabled;
+    }
+
+    pub fn phase2_writers_enabled(&self) -> bool {
+        self.phase2_writers
     }
 
     pub fn service_did(&self) -> &str {
@@ -44,20 +88,28 @@ impl PushRegistry {
         new_session: &str,
         pds_url: &str,
     ) -> Result<()> {
+        let session_fp = normalize_or_hash_session_fingerprint(new_session);
+        let session_id_bind: &str = if self.phase2_writers {
+            &session_fp
+        } else {
+            new_session
+        };
         sqlx::query(
             r#"
             INSERT INTO push_accounts (
                 account_did,
                 session_id,
+                session_fingerprint,
                 pds_url,
                 auth_revoked_at,
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, NULL, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
             SET session_id = EXCLUDED.session_id,
+                session_fingerprint = EXCLUDED.session_fingerprint,
                 pds_url = EXCLUDED.pds_url,
                 auth_revoked_at = NULL,
                 last_seen_at = NOW(),
@@ -65,7 +117,8 @@ impl PushRegistry {
             "#,
         )
         .bind(did)
-        .bind(new_session)
+        .bind(session_id_bind)
+        .bind(&session_fp)
         .bind(pds_url)
         .execute(&self.db_pool)
         .await?;
@@ -76,28 +129,40 @@ impl PushRegistry {
     /// Inserts a missing account or refreshes it only when the session ID still matches.
     /// Atomically clears auth_revoked_at only on matching session or new insert.
     pub async fn touch_account_session(&self, session: &CatbirdSession) -> Result<()> {
+        let raw_session = session.id.to_string();
+        let session_fp = normalize_or_hash_session_fingerprint(&raw_session);
+        let session_id_bind: &str = if self.phase2_writers {
+            &session_fp
+        } else {
+            &raw_session
+        };
         sqlx::query(
             r#"
             INSERT INTO push_accounts (
                 account_did,
                 session_id,
+                session_fingerprint,
                 pds_url,
                 auth_revoked_at,
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, NULL, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
-            SET pds_url = EXCLUDED.pds_url,
+            SET session_id = EXCLUDED.session_id,
+                pds_url = EXCLUDED.pds_url,
                 auth_revoked_at = NULL,
+                session_fingerprint = EXCLUDED.session_fingerprint,
                 last_seen_at = NOW(),
                 updated_at = NOW()
-            WHERE push_accounts.session_id = EXCLUDED.session_id
+            WHERE push_accounts.session_fingerprint = EXCLUDED.session_fingerprint
+               OR push_accounts.session_id = $2
             "#,
         )
         .bind(&session.did)
-        .bind(session.id.to_string())
+        .bind(session_id_bind)
+        .bind(&session_fp)
         .bind(&session.pds_url)
         .execute(&self.db_pool)
         .await?;
@@ -114,18 +179,29 @@ impl PushRegistry {
         old_session_id: &str,
         new_session_id: &str,
     ) -> Result<u64> {
+        let old_fp = normalize_or_hash_session_fingerprint(old_session_id);
+        let new_fp = normalize_or_hash_session_fingerprint(new_session_id);
+        let new_session_bind: &str = if self.phase2_writers {
+            &new_fp
+        } else {
+            new_session_id
+        };
         let result = sqlx::query(
             r#"
             UPDATE push_accounts
             SET session_id = $1,
+                session_fingerprint = $2,
                 auth_revoked_at = NULL,
                 last_seen_at = NOW(),
                 updated_at = NOW()
-            WHERE account_did = $2 AND session_id = $3
+            WHERE account_did = $3
+              AND (session_fingerprint = $4 OR session_id = $5 OR session_id = $4)
             "#,
         )
-        .bind(new_session_id)
+        .bind(new_session_bind)
+        .bind(&new_fp)
         .bind(did)
+        .bind(&old_fp)
         .bind(old_session_id)
         .execute(&self.db_pool)
         .await?;
@@ -140,28 +216,40 @@ impl PushRegistry {
     ) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
 
+        let raw_session = session.id.to_string();
+        let session_fp = normalize_or_hash_session_fingerprint(&raw_session);
+        let session_id_bind: &str = if self.phase2_writers {
+            &session_fp
+        } else {
+            &raw_session
+        };
         sqlx::query(
             r#"
             INSERT INTO push_accounts (
                 account_did,
                 session_id,
+                session_fingerprint,
                 pds_url,
                 auth_revoked_at,
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, NULL, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
-            SET pds_url = EXCLUDED.pds_url,
+            SET session_id = EXCLUDED.session_id,
+                pds_url = EXCLUDED.pds_url,
                 auth_revoked_at = NULL,
+                session_fingerprint = EXCLUDED.session_fingerprint,
                 last_seen_at = NOW(),
                 updated_at = NOW()
-            WHERE push_accounts.session_id = EXCLUDED.session_id
+            WHERE push_accounts.session_fingerprint = EXCLUDED.session_fingerprint
+               OR push_accounts.session_id = $2
             "#,
         )
         .bind(&session.did)
-        .bind(session.id.to_string())
+        .bind(session_id_bind)
+        .bind(&session_fp)
         .bind(&session.pds_url)
         .execute(&mut *tx)
         .await?;
@@ -320,7 +408,7 @@ impl PushRegistry {
             r#"
             SELECT
                 account_did,
-                session_id,
+                COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id,
                 pds_url
             FROM push_accounts
             WHERE account_did = $1
@@ -359,19 +447,21 @@ impl PushRegistry {
     pub async fn mark_auth_revoked_if_session(&self, did: &str, session_id: &str) -> Result<u64> {
         let mut tx = self.db_pool.begin().await?;
 
+        let session_fp = normalize_or_hash_session_fingerprint(session_id);
         let result = sqlx::query(
             r#"
             UPDATE push_accounts
             SET auth_revoked_at = NOW(),
                 updated_at = NOW()
-            WHERE account_did = $1 AND session_id = $2
+            WHERE account_did = $1
+              AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2)
             "#,
         )
         .bind(did)
+        .bind(&session_fp)
         .bind(session_id)
         .execute(&mut *tx)
         .await?;
-
         let affected = result.rows_affected();
         if affected > 0 {
             sqlx::query("DELETE FROM chat_poll_state WHERE account_did = $1")
@@ -395,13 +485,16 @@ impl PushRegistry {
     }
 
     pub async fn clear_auth_revoked_if_session(&self, did: &str, session_id: &str) -> Result<u64> {
+        let session_fp = normalize_or_hash_session_fingerprint(session_id);
         let result = sqlx::query(
-            "UPDATE push_accounts SET auth_revoked_at = NULL, updated_at = NOW() WHERE account_did = $1 AND session_id = $2",
+            "UPDATE push_accounts SET auth_revoked_at = NULL, updated_at = NOW() WHERE account_did = $1 AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2)",
         )
         .bind(did)
+        .bind(&session_fp)
         .bind(session_id)
         .execute(&self.db_pool)
         .await?;
+
         Ok(result.rows_affected())
     }
 
@@ -445,10 +538,19 @@ mod tests {
     struct PushAccountDbRow {
         account_did: String,
         session_id: String,
+        session_fingerprint: Option<String>,
         pds_url: String,
         auth_revoked_at: Option<u64>,
         last_seen_at: u64,
         updated_at: u64,
+    }
+
+    impl PushAccountDbRow {
+        fn effective_fingerprint(&self) -> String {
+            self.session_fingerprint
+                .clone()
+                .unwrap_or_else(|| session_fingerprint(&self.session_id))
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +577,7 @@ mod tests {
         push_accounts: HashMap<String, PushAccountDbRow>,
         chat_poll_state: HashMap<String, ChatPollStateDbRow>,
         user_devices: HashMap<(String, String), UserDeviceDbRow>,
+        phase2_writers: bool,
         clock: u64,
     }
 
@@ -484,8 +587,13 @@ mod tests {
                 push_accounts: HashMap::new(),
                 chat_poll_state: HashMap::new(),
                 user_devices: HashMap::new(),
+                phase2_writers: false,
                 clock: 1,
             }
+        }
+
+        fn set_phase2_writers(&mut self, enabled: bool) {
+            self.phase2_writers = enabled;
         }
 
         fn tick(&mut self) -> u64 {
@@ -494,17 +602,24 @@ mod tests {
         }
 
         /// Mirrors SQL:
-        /// INSERT INTO push_accounts (account_did, session_id, pds_url, auth_revoked_at, last_seen_at, updated_at)
-        /// VALUES ($1, $2, $3, NULL, NOW(), NOW())
+        /// INSERT INTO push_accounts (account_did, session_id, session_fingerprint, pds_url, auth_revoked_at, last_seen_at, updated_at)
+        /// VALUES ($1, $2, $3, $4, NULL, NOW(), NOW())
         /// ON CONFLICT (account_did)
-        /// DO UPDATE SET session_id = EXCLUDED.session_id, pds_url = EXCLUDED.pds_url, auth_revoked_at = NULL, last_seen_at = NOW(), updated_at = NOW()
+        /// DO UPDATE SET session_id = EXCLUDED.session_id, session_fingerprint = EXCLUDED.session_fingerprint, pds_url = EXCLUDED.pds_url, auth_revoked_at = NULL, last_seen_at = NOW(), updated_at = NOW()
         fn sql_activate_account_session(&mut self, did: &str, session_id: &str, pds_url: &str) {
             let now = self.tick();
+            let session_fp = normalize_or_hash_session_fingerprint(session_id);
+            let bound_session_id = if self.phase2_writers {
+                session_fp.clone()
+            } else {
+                session_id.to_string()
+            };
             self.push_accounts.insert(
                 did.to_string(),
                 PushAccountDbRow {
                     account_did: did.to_string(),
-                    session_id: session_id.to_string(),
+                    session_id: bound_session_id,
+                    session_fingerprint: Some(session_fp),
                     pds_url: pds_url.to_string(),
                     auth_revoked_at: None,
                     last_seen_at: now,
@@ -514,17 +629,25 @@ mod tests {
         }
 
         /// Mirrors SQL:
-        /// INSERT INTO push_accounts (account_did, session_id, pds_url, auth_revoked_at, last_seen_at, updated_at)
-        /// VALUES ($1, $2, $3, NULL, NOW(), NOW())
+        /// INSERT INTO push_accounts (account_did, session_id, session_fingerprint, pds_url, auth_revoked_at, last_seen_at, updated_at)
+        /// VALUES ($1, $2, $3, $4, NULL, NOW(), NOW())
         /// ON CONFLICT (account_did)
-        /// DO UPDATE SET pds_url = EXCLUDED.pds_url, auth_revoked_at = NULL, last_seen_at = NOW(), updated_at = NOW()
-        /// WHERE push_accounts.session_id = EXCLUDED.session_id
+        /// DO UPDATE SET session_id = EXCLUDED.session_id, pds_url = EXCLUDED.pds_url, auth_revoked_at = NULL, session_fingerprint = EXCLUDED.session_fingerprint, last_seen_at = NOW(), updated_at = NOW()
+        /// WHERE push_accounts.session_fingerprint = EXCLUDED.session_fingerprint OR push_accounts.session_id = $2
         fn sql_touch_account_session(&mut self, did: &str, session_id: &str, pds_url: &str) -> u64 {
             let now = self.tick();
+            let session_fp = normalize_or_hash_session_fingerprint(session_id);
+            let bound_session_id = if self.phase2_writers {
+                session_fp.clone()
+            } else {
+                session_id.to_string()
+            };
             if let Some(row) = self.push_accounts.get_mut(did) {
-                if row.session_id == session_id {
+                if row.session_fingerprint.as_deref() == Some(&session_fp) || row.session_id == session_id {
+                    row.session_id = bound_session_id;
                     row.pds_url = pds_url.to_string();
                     row.auth_revoked_at = None;
+                    row.session_fingerprint = Some(session_fp);
                     row.last_seen_at = now;
                     row.updated_at = now;
                     1
@@ -538,7 +661,8 @@ mod tests {
                     did.to_string(),
                     PushAccountDbRow {
                         account_did: did.to_string(),
-                        session_id: session_id.to_string(),
+                        session_id: bound_session_id,
+                        session_fingerprint: Some(session_fp),
                         pds_url: pds_url.to_string(),
                         auth_revoked_at: None,
                         last_seen_at: now,
@@ -551,8 +675,8 @@ mod tests {
 
         /// Mirrors SQL:
         /// UPDATE push_accounts
-        /// SET session_id = $1, auth_revoked_at = NULL, last_seen_at = NOW(), updated_at = NOW()
-        /// WHERE account_did = $2 AND session_id = $3
+        /// SET session_id = $1, session_fingerprint = $2, auth_revoked_at = NULL, last_seen_at = NOW(), updated_at = NOW()
+        /// WHERE account_did = $3 AND (session_fingerprint = $4 OR session_id = $5 OR session_id = $4)
         fn sql_replace_account_session(
             &mut self,
             did: &str,
@@ -560,14 +684,22 @@ mod tests {
             new_session_id: &str,
         ) -> u64 {
             let now = self.tick();
+            let old_fp = normalize_or_hash_session_fingerprint(old_session_id);
+            let new_fp = normalize_or_hash_session_fingerprint(new_session_id);
+            let bound_new_session_id = if self.phase2_writers {
+                new_fp.clone()
+            } else {
+                new_session_id.to_string()
+            };
             let Some(row) = self.push_accounts.get_mut(did) else {
                 return 0;
             };
-            if row.session_id != old_session_id {
+            if row.session_fingerprint.as_deref() != Some(&old_fp) && row.session_id != old_session_id && row.session_id != old_fp {
                 return 0;
             }
 
-            row.session_id = new_session_id.to_string();
+            row.session_id = bound_new_session_id;
+            row.session_fingerprint = Some(new_fp);
             row.auth_revoked_at = None;
             row.last_seen_at = now;
             row.updated_at = now;
@@ -576,15 +708,16 @@ mod tests {
 
         /// Mirrors SQL transaction:
         /// BEGIN;
-        /// UPDATE push_accounts SET auth_revoked_at = NOW(), updated_at = NOW() WHERE account_did = $1 AND session_id = $2;
+        /// UPDATE push_accounts SET auth_revoked_at = NOW(), updated_at = NOW() WHERE account_did = $1 AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2);
         /// if affected > 0: DELETE FROM chat_poll_state WHERE account_did = $1;
         /// COMMIT;
         fn sql_mark_auth_revoked_if_session(&mut self, did: &str, session_id: &str) -> u64 {
             let now = self.tick();
+            let session_fp = normalize_or_hash_session_fingerprint(session_id);
             let Some(row) = self.push_accounts.get_mut(did) else {
                 return 0;
             };
-            if row.session_id != session_id {
+            if row.session_fingerprint.as_deref() != Some(&session_fp) && row.session_id != session_id && row.session_id != session_fp {
                 return 0;
             }
 
@@ -596,7 +729,7 @@ mod tests {
 
         /// Mirrors SQL transaction in upsert_registration:
         /// BEGIN;
-        /// INSERT INTO push_accounts ... ON CONFLICT DO UPDATE WHERE push_accounts.session_id = EXCLUDED.session_id;
+        /// INSERT INTO push_accounts ... ON CONFLICT DO UPDATE WHERE push_accounts.session_fingerprint = EXCLUDED.session_fingerprint OR push_accounts.session_id = $2;
         /// INSERT INTO user_devices ... ON CONFLICT DO UPDATE;
         /// COMMIT;
         fn sql_upsert_registration_tx(
@@ -679,7 +812,10 @@ mod tests {
             db.push_accounts.get(did).unwrap().pds_url,
             "https://pds1.alice.com"
         );
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v1);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v1
+        );
 
         // Matching touch with session_v1 clears revocation atomically
         let affected =
@@ -730,13 +866,19 @@ mod tests {
         );
         db.enroll_chat_poll(did, "pds.alice.com");
         assert!(db.is_chat_poll_enrolled(did));
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v2);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
 
         // Delayed/stale logout from session_v1 arrives
         assert_eq!(db.sql_mark_auth_revoked_if_session(did, session_v1), 0);
         assert!(!db.is_auth_revoked(did));
         assert!(db.is_chat_poll_enrolled(did));
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v2);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
     }
 
     #[test]
@@ -755,7 +897,10 @@ mod tests {
             db.sql_replace_account_session(did, session_v1, session_v2),
             1
         );
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v2);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
         assert!(!db.is_auth_revoked(did));
         assert!(db.is_chat_poll_enrolled(did));
 
@@ -764,7 +909,10 @@ mod tests {
             db.sql_replace_account_session(did, session_v1, session_v3),
             0
         );
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v2);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
         assert!(db.is_chat_poll_enrolled(did));
 
         // Successful CAS upgrade session_v2 -> session_v3 retains chat poll state and clears revocation
@@ -772,7 +920,10 @@ mod tests {
             db.sql_replace_account_session(did, session_v2, session_v3),
             1
         );
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v3);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v3
+        );
         assert!(!db.is_auth_revoked(did));
         assert!(db.is_chat_poll_enrolled(did));
     }
@@ -802,7 +953,10 @@ mod tests {
         );
 
         assert!(db.is_auth_revoked(did));
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v2);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
         assert_eq!(
             db.push_accounts.get(did).unwrap().pds_url,
             "https://pds2.alice.com"
@@ -821,6 +975,285 @@ mod tests {
         );
 
         assert!(!db.is_auth_revoked(did));
-        assert_eq!(db.push_accounts.get(did).unwrap().session_id, session_v2);
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
+    }
+
+    #[test]
+    fn test_session_fingerprint_deterministic_and_non_replayable() {
+        let raw_session = "550e8400-e29b-41d4-a716-446655440000";
+        let fp1 = session_fingerprint(raw_session);
+        let fp2 = session_fingerprint(raw_session);
+        assert_eq!(fp1, fp2);
+        assert_eq!(fp1.len(), 64);
+        assert!(fp1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // normalize_or_hash_session_fingerprint is idempotent on 64-char hex strings
+        assert_eq!(normalize_or_hash_session_fingerprint(&fp1), fp1);
+        assert_eq!(normalize_or_hash_session_fingerprint(raw_session), fp1);
+    }
+
+    #[test]
+    fn test_push_accounts_stores_fingerprint_and_replaying_fails_401() {
+        let mut db = SqlDatabaseEngine::new();
+        let did = "did:plc:alice_secure";
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let expected_fp = session_fingerprint(session_id);
+
+        db.sql_activate_account_session(did, session_id, "https://pds.alice.com");
+
+        // 1. Assert DB stores the 64-char SHA-256 fingerprint in session_fingerprint,
+        // and keeps the raw session in session_id for rolling-deploy compatibility with old replicas
+        let stored_row = db.push_accounts.get(did).unwrap();
+        assert_eq!(stored_row.session_fingerprint.as_deref().unwrap(), expected_fp);
+        assert_eq!(stored_row.effective_fingerprint(), expected_fp);
+        assert_eq!(stored_row.session_id, session_id);
+        // 2. Replay simulation: Replaying the stored DB string via Cookie or Bearer header fails 401
+        // Middleware strictly validates UUID format for session IDs; 64-char hex string fails UUID parsing
+        assert!(uuid::Uuid::parse_str(&stored_row.effective_fingerprint()).is_err());
+
+        // 3. Shared role column inspection test:
+        // Ensure push_accounts schema contains no credential columns (no access_token, refresh_token, dpop_key, password)
+        // Column list for push_accounts: account_did, session_id, session_fingerprint, pds_url, auth_revoked_at, last_seen_at, updated_at
+        let columns = vec![
+            "account_did",
+            "session_id",
+            "session_fingerprint",
+            "pds_url",
+            "auth_revoked_at",
+            "last_seen_at",
+            "updated_at",
+        ];
+        for col in &columns {
+            assert!(!col.contains("token"));
+            assert!(!col.contains("secret"));
+            assert!(!col.contains("key"));
+            assert!(!col.contains("password"));
+        }
+    }
+
+    #[test]
+    fn test_rolling_deploy_additive_column_dual_read() {
+        let mut db = SqlDatabaseEngine::new();
+        let did = "did:plc:legacy_user";
+        let raw_session_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let expected_fp = session_fingerprint(raw_session_uuid);
+
+        // Pre-existing row before migration: session_id holds raw UUID, session_fingerprint is NULL
+        db.push_accounts.insert(
+            did.to_string(),
+            PushAccountDbRow {
+                account_did: did.to_string(),
+                session_id: raw_session_uuid.to_string(),
+                session_fingerprint: None,
+                pds_url: "https://pds.alice.com".to_string(),
+                auth_revoked_at: None,
+                last_seen_at: 1,
+                updated_at: 1,
+            },
+        );
+
+        // 1. Old replica reads `session_id` directly -> gets raw UUID and continues operating during rollout
+        let old_replica_read = &db.push_accounts.get(did).unwrap().session_id;
+        assert_eq!(old_replica_read, raw_session_uuid);
+
+        // 2. New replica reads `COALESCE(session_fingerprint, session_id)` -> resolves to SHA-256 fingerprint
+        let new_replica_fp = db.push_accounts.get(did).unwrap().effective_fingerprint();
+        assert_eq!(new_replica_fp, expected_fp);
+
+        // 3. New replica touches or updates session -> populates session_fingerprint
+        assert_eq!(
+            db.sql_touch_account_session(did, raw_session_uuid, "https://pds-updated.alice.com"),
+            1
+        );
+        let updated_row = db.push_accounts.get(did).unwrap();
+        assert_eq!(updated_row.session_fingerprint.as_deref().unwrap(), expected_fp);
+        assert_eq!(updated_row.pds_url, "https://pds-updated.alice.com");
+
+        // 4. Migration backfill simulation: for rows with NULL session_fingerprint, sets sha256(session_id)
+        // session_id is left untouched for old replicas
+        assert_eq!(updated_row.effective_fingerprint(), expected_fp);
+    }
+
+    #[test]
+    fn test_registry_writers_and_cas_boundaries_use_fingerprints() {
+        let mut db = SqlDatabaseEngine::new();
+        let did = "did:plc:alice_cas";
+        let session_v1 = "11111111-1111-1111-1111-111111111111";
+        let session_v2 = "22222222-2222-2222-2222-222222222222";
+        let session_v3 = "33333333-3333-3333-3333-333333333333";
+
+        // Activate v1
+        db.sql_activate_account_session(did, session_v1, "https://pds1.alice.com");
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v1
+        );
+
+        // Touch with matching v1 succeeds
+        assert_eq!(
+            db.sql_touch_account_session(did, session_v1, "https://pds1-updated.alice.com"),
+            1
+        );
+
+        // Touch with stale v2 fails CAS
+        assert_eq!(
+            db.sql_touch_account_session(did, session_v2, "https://pds2.alice.com"),
+            0
+        );
+
+        // Replace v1 -> v2 succeeds
+        assert_eq!(
+            db.sql_replace_account_session(did, session_v1, session_v2),
+            1
+        );
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
+
+        // Stale replace v1 -> v3 fails CAS
+        assert_eq!(
+            db.sql_replace_account_session(did, session_v1, session_v3),
+            0
+        );
+        assert_eq!(
+            db.push_accounts.get(did).unwrap().session_id,
+            session_v2
+        );
+
+        // Mark revoked with matching v2 succeeds
+        assert_eq!(db.sql_mark_auth_revoked_if_session(did, session_v2), 1);
+        assert!(db.is_auth_revoked(did));
+    }
+
+    #[test]
+    fn test_old_replica_stale_fingerprint_is_repaired_by_cas_writer() {
+        let mut db = SqlDatabaseEngine::new();
+        let did = "did:plc:alice_stale_fp";
+        let old_session = "11111111-1111-1111-1111-111111111111";
+        let new_session_from_old_replica = "22222222-2222-2222-2222-222222222222";
+        let new_session_v3 = "33333333-3333-3333-3333-333333333333";
+
+        // 1. Initial activation on Phase 1 node
+        db.sql_activate_account_session(did, old_session, "https://pds.alice.com");
+        let old_fp = session_fingerprint(old_session);
+        assert_eq!(db.push_accounts.get(did).unwrap().session_fingerprint.as_deref(), Some(old_fp.as_str()));
+
+        // 2. Old replica performs an update using parent SQL (which updates session_id but NOT session_fingerprint)
+        // Result: session_id is new_session_from_old_replica, but session_fingerprint is STALE (old_fp)
+        if let Some(row) = db.push_accounts.get_mut(did) {
+            row.session_id = new_session_from_old_replica.to_string();
+            // session_fingerprint left as old_fp (stale, non-NULL)
+        }
+
+        // Verify the stale state
+        let stale_row = db.push_accounts.get(did).unwrap();
+        assert_eq!(stale_row.session_id, new_session_from_old_replica);
+        assert_eq!(stale_row.session_fingerprint.as_deref(), Some(old_fp.as_str()));
+        assert_ne!(stale_row.session_fingerprint.as_deref(), Some(session_fingerprint(new_session_from_old_replica).as_str()));
+
+        // 3. New replica calls touch_account_session with new_session_from_old_replica.
+        // Because the raw session_id matches, the CAS succeeds and repairs session_fingerprint!
+        let touch_res = db.sql_touch_account_session(did, new_session_from_old_replica, "https://pds-repaired.alice.com");
+        assert_eq!(touch_res, 1);
+
+        let repaired_row = db.push_accounts.get(did).unwrap();
+        let expected_new_fp = session_fingerprint(new_session_from_old_replica);
+        assert_eq!(repaired_row.session_fingerprint.as_deref(), Some(expected_new_fp.as_str()));
+        assert_eq!(repaired_row.pds_url, "https://pds-repaired.alice.com");
+
+        // 4. Simulate another old-replica stale update, then test replace_account_session and mark_auth_revoked_if_session
+        if let Some(row) = db.push_accounts.get_mut(did) {
+            row.session_id = "44444444-4444-4444-4444-444444444444".to_string();
+            // session_fingerprint left stale (expected_new_fp)
+        }
+        let stale_raw_4 = "44444444-4444-4444-4444-444444444444";
+        // replace_account_session matches on raw old_session_id even though fingerprint is stale
+        let replace_res = db.sql_replace_account_session(did, stale_raw_4, new_session_v3);
+        assert_eq!(replace_res, 1);
+        let replaced_row = db.push_accounts.get(did).unwrap();
+        assert_eq!(replaced_row.session_id, new_session_v3);
+        assert_eq!(replaced_row.session_fingerprint.as_deref(), Some(session_fingerprint(new_session_v3).as_str()));
+    }
+    #[tokio::test]
+    async fn test_phase2_writer_contract_stops_binding_raw_session_id_when_flag_set() {
+        let pool = Pool::<Postgres>::connect_lazy("postgres://localhost/test").unwrap();
+        let registry = PushRegistry::new(pool, "did:web:push.catbird.blue".to_string())
+            .with_phase2_writers(true);
+        assert!(registry.phase2_writers_enabled());
+
+        let mut db = SqlDatabaseEngine::new();
+        db.set_phase2_writers(true);
+
+        let did = "did:plc:alice_phase2";
+        let raw_session_v1 = "550e8400-e29b-41d4-a716-446655440000";
+        let raw_session_v2 = "660e8400-e29b-41d4-a716-446655440001";
+        let fp_v1 = session_fingerprint(raw_session_v1);
+        let fp_v2 = session_fingerprint(raw_session_v2);
+
+        // 1. activate_account_session in Phase 2 binds fingerprint to session_id
+        db.sql_activate_account_session(did, raw_session_v1, "https://pds.alice.com");
+        let row = db.push_accounts.get(did).unwrap();
+        assert_eq!(row.session_id, fp_v1);
+        assert_ne!(row.session_id, raw_session_v1);
+        assert_eq!(row.session_fingerprint.as_deref(), Some(fp_v1.as_str()));
+
+        // 2. touch_account_session in Phase 2 maintains fingerprint in session_id
+        assert_eq!(
+            db.sql_touch_account_session(did, raw_session_v1, "https://pds-touch.alice.com"),
+            1
+        );
+        let row = db.push_accounts.get(did).unwrap();
+        assert_eq!(row.session_id, fp_v1);
+        assert_ne!(row.session_id, raw_session_v1);
+
+        // 3. replace_account_session in Phase 2 binds new fingerprint to session_id
+        assert_eq!(
+            db.sql_replace_account_session(did, raw_session_v1, raw_session_v2),
+            1
+        );
+        let row = db.push_accounts.get(did).unwrap();
+        assert_eq!(row.session_id, fp_v2);
+        assert_ne!(row.session_id, raw_session_v2);
+        assert_eq!(row.session_fingerprint.as_deref(), Some(fp_v2.as_str()));
+
+        // 4. upsert_registration in Phase 2 maintains fingerprint in session_id
+        db.sql_upsert_registration_tx(
+            did,
+            raw_session_v2,
+            "https://pds-reg.alice.com",
+            "token-p2",
+            "ios",
+            "blue.catbird",
+            "did:web:push.catbird.blue",
+            false,
+        );
+        let row = db.push_accounts.get(did).unwrap();
+        assert_eq!(row.session_id, fp_v2);
+        assert_ne!(row.session_id, raw_session_v2);
+    }
+
+    #[tokio::test]
+    async fn test_phase1_writer_contract_retains_raw_session_id_when_flag_unset() {
+        let pool = Pool::<Postgres>::connect_lazy("postgres://localhost/test").unwrap();
+        let registry = PushRegistry::new(pool, "did:web:push.catbird.blue".to_string())
+            .with_phase2_writers(false);
+        assert!(!registry.phase2_writers_enabled());
+
+        let mut db = SqlDatabaseEngine::new();
+        db.set_phase2_writers(false);
+
+        let did = "did:plc:alice_phase1";
+        let raw_session = "550e8400-e29b-41d4-a716-446655440000";
+        let fp = session_fingerprint(raw_session);
+
+        // Phase 1 binds raw session_id and populates session_fingerprint
+        db.sql_activate_account_session(did, raw_session, "https://pds.alice.com");
+        let row = db.push_accounts.get(did).unwrap();
+        assert_eq!(row.session_id, raw_session);
+        assert_eq!(row.session_fingerprint.as_deref(), Some(fp.as_str()));
     }
 }

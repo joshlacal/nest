@@ -297,7 +297,7 @@ impl ActorModerationResolver {
     ) -> Result<ActorModeration> {
         let account = sqlx::query(
             r#"
-            SELECT session_id, pds_url, auth_revoked_at
+            SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url, auth_revoked_at
             FROM push_accounts
             WHERE account_did = $1
             "#,

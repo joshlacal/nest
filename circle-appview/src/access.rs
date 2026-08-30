@@ -379,8 +379,8 @@ pub async fn verify_member_access(
                 Ok(MemberAccessOutcome::DeniedNotMember)
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "Member cache refresh failed, denying access as indeterminate");
+        Err(_e) => {
+            tracing::warn!(space_ref = %space_fingerprint(space_uri), "Member cache refresh failed, denying access as indeterminate");
             Ok(MemberAccessOutcome::IndeterminateDenied)
         }
     }
@@ -445,10 +445,18 @@ pub async fn refresh_member_cache(
         .member_dids(space_uri)
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "Failed to fetch member DIDs from PDS");
-            AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}"))
+            tracing::warn!(space_ref = %space_fingerprint(space_uri), "Failed to fetch member DIDs from PDS");
+            match e {
+                AppError::Database(err) => AppError::Database(err),
+                AppError::Unauthorized(r) => AppError::Unauthorized(r),
+                AppError::Forbidden(_) => AppError::Forbidden("Unable to fetch member list from PDS".into()),
+                AppError::NotFound(_) => AppError::NotFound("Space not found on PDS".into()),
+                AppError::AccessRemoved(_) => AppError::AccessRemoved("Space deleted".into()),
+                AppError::InvalidRequest(_) => AppError::InvalidRequest("Invalid member request".into()),
+                AppError::Conflict(_) => AppError::Conflict("Member conflict".into()),
+                AppError::Internal(_) => AppError::Internal("Failed to fetch member DIDs from PDS".into()),
+            }
         })?;
-
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
 
     sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1")
@@ -506,6 +514,14 @@ pub async fn get_cached_member_count(
     Ok(row.map(|(count,)| count as i64))
 }
 
+
+/// Computes an opaque, truncated SHA-256 fingerprint for a Space URI for safe operational logging.
+pub fn space_fingerprint(space_uri: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(space_uri.as_bytes());
+    let hex_part: String = hash[..6].iter().map(|b| format!("{:02x}", b)).collect();
+    format!("space_{hex_part}")
+}
 /// Activates a Circle by verifying Space on PDS and returning defs#circleSummary.
 pub async fn activate_circle(
     state: &AppState,
@@ -520,8 +536,17 @@ pub async fn activate_circle(
         .get_space(space_uri)
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "get_space failed on PDS");
-            AppError::NotFound(format!("Space not found or upstream unavailable: {e}"))
+            tracing::warn!(space_ref = %space_fingerprint(space_uri), "get_space failed on PDS");
+            match e {
+                AppError::Database(err) => AppError::Database(err),
+                AppError::Unauthorized(r) => AppError::Unauthorized(r),
+                AppError::Forbidden(_) => AppError::Forbidden("Space not accessible or upstream forbidden".into()),
+                AppError::NotFound(_) => AppError::NotFound("Space not found or upstream unavailable".into()),
+                AppError::AccessRemoved(_) => AppError::AccessRemoved("Space deleted".into()),
+                AppError::InvalidRequest(_) => AppError::InvalidRequest("Invalid space request".into()),
+                AppError::Conflict(_) => AppError::Conflict("Space conflict".into()),
+                AppError::Internal(_) => AppError::Internal("Space upstream unavailable".into()),
+            }
         })?;
 
     // Verify appAccess names this AppView's client_id
@@ -541,8 +566,17 @@ pub async fn activate_circle(
         .member_dids(space_uri)
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "Failed to fetch member DIDs from PDS");
-            AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}"))
+            tracing::warn!(space_ref = %space_fingerprint(space_uri), "Failed to fetch member DIDs from PDS");
+            match e {
+                AppError::Database(err) => AppError::Database(err),
+                AppError::Unauthorized(r) => AppError::Unauthorized(r),
+                AppError::Forbidden(_) => AppError::Forbidden("Unable to fetch member list from PDS".into()),
+                AppError::NotFound(_) => AppError::NotFound("Space not found on PDS".into()),
+                AppError::AccessRemoved(_) => AppError::AccessRemoved("Space deleted".into()),
+                AppError::InvalidRequest(_) => AppError::InvalidRequest("Invalid member request".into()),
+                AppError::Conflict(_) => AppError::Conflict("Member conflict".into()),
+                AppError::Internal(_) => AppError::Internal("Failed to fetch member DIDs from PDS".into()),
+            }
         })?;
     if !members.iter().any(|m| m == user_did) && user_did != authority_did {
         return Err(AppError::Forbidden(
@@ -552,8 +586,17 @@ pub async fn activate_circle(
 
     // 3. Acquire a Space credential under the calling user's OAuth session first.
     let cred = ensure_space_credential(state, space_uri, Some(user_did)).await.map_err(|e| {
-        tracing::warn!(error = %e, space_uri = %space_uri, "Failed to acquire space credential during activation");
-        e
+        tracing::warn!(space_ref = %space_fingerprint(space_uri), "Failed to acquire space credential during activation");
+        match e {
+            AppError::Database(err) => AppError::Database(err),
+            AppError::Unauthorized(r) => AppError::Unauthorized(r),
+            AppError::Forbidden(_) => AppError::Forbidden("Failed to acquire space credential".into()),
+            AppError::NotFound(_) => AppError::NotFound("Failed to acquire space credential: not found".into()),
+            AppError::AccessRemoved(_) => AppError::AccessRemoved("Failed to acquire space credential: access removed".into()),
+            AppError::InvalidRequest(_) => AppError::InvalidRequest("Failed to acquire space credential: invalid request".into()),
+            AppError::Conflict(_) => AppError::Conflict("Failed to acquire space credential: conflict".into()),
+            AppError::Internal(_) => AppError::Internal("Failed to acquire space credential: upstream error".into()),
+        }
     })?;
 
     // 4. Fetch and parse the authority's repo IN MEMORY to discover and validate
@@ -586,15 +629,24 @@ pub async fn activate_circle(
         )
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, space_uri = %space_uri, "Failed to fetch authority repo during activation");
-            AppError::Internal(format!("Could not read the Space: repo fetch failed ({e})"))
+            tracing::warn!(space_ref = %space_fingerprint(space_uri), "Failed to fetch authority repo during activation");
+            match e {
+                AppError::Database(err) => AppError::Database(err),
+                AppError::Unauthorized(r) => AppError::Unauthorized(r),
+                AppError::Forbidden(_) => AppError::Forbidden("Could not read the Space: repo access forbidden".into()),
+                AppError::NotFound(_) => AppError::NotFound("Could not read the Space: repo not found".into()),
+                AppError::AccessRemoved(_) => AppError::AccessRemoved("Could not read the Space: repo deleted".into()),
+                AppError::InvalidRequest(_) => AppError::InvalidRequest("Could not read the Space: invalid repo request".into()),
+                AppError::Conflict(_) => AppError::Conflict("Could not read the Space: repo conflict".into()),
+                AppError::Internal(_) => AppError::Internal("Could not read the Space: repo fetch failed".into()),
+            }
         })?;
 
     let car = crate::commit::parse_permissioned_car(&car_bytes)
         .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, space_uri = %space_uri, "CAR decoding failed during activation");
-            AppError::Internal(format!("Could not read the Space: CAR decoding failed ({e})"))
+        .map_err(|_e| {
+            tracing::warn!(space_ref = %space_fingerprint(space_uri), "CAR decoding failed during activation");
+            AppError::Internal("Could not read the Space: CAR decoding failed".into())
         })?;
 
     let (_commit, records, _lthash) = crate::commit::extract_and_validate_car(
@@ -603,9 +655,9 @@ pub async fn activate_circle(
         &authority_did,
         &author_signing_key,
     )
-    .map_err(|e| {
-        tracing::warn!(error = %e, space_uri = %space_uri, "CAR validation failed during activation");
-        AppError::Internal(format!("Could not read the Space: CAR validation failed ({e})"))
+    .map_err(|_e| {
+        tracing::warn!(space_ref = %space_fingerprint(space_uri), "CAR validation failed during activation");
+        AppError::Internal("Could not read the Space: CAR validation failed".into())
     })?;
 
     let meta_records: Vec<_> = records
@@ -665,8 +717,8 @@ pub async fn activate_circle(
 
     // 6. Now that the circle row exists, sync the repo so children (circle_records, etc.) have their FK parent.
     let sync_engine = crate::sync::SyncEngine::new(state);
-    if let Err(e) = sync_engine.sync_repo(space_uri, &authority_did).await {
-        tracing::warn!(error = %e, space_uri = %space_uri, "Space repo sync failed during activation");
+    if let Err(_e) = sync_engine.sync_repo(space_uri, &authority_did).await {
+        tracing::warn!(space_ref = %space_fingerprint(space_uri), "Space repo sync failed during activation");
     }
     // 7. Now that the circle row exists, persist the member cache.
     let members = refresh_member_cache(state, space_uri).await?;
@@ -1915,5 +1967,18 @@ mod tests {
         .unwrap();
 
         assert!(circle_row.is_none(), "NO circles row must exist in DB");
+    }
+
+    #[test]
+    fn test_space_fingerprint() {
+        let uri1 = "at://did:plc:alice123/com.atproto.space/space456";
+        let fp1 = space_fingerprint(uri1);
+        assert!(fp1.starts_with("space_"));
+        assert!(!fp1.contains("alice123"));
+        assert!(!fp1.contains("space456"));
+
+        let uri2 = "at://did:plc:bob456/com.atproto.space/space789";
+        let fp2 = space_fingerprint(uri2);
+        assert_ne!(fp1, fp2);
     }
 }

@@ -139,6 +139,58 @@ fn record_data<T: Serialize>(record: &T) -> Result<Data<String>, String> {
         .map_err(|e| format!("Failed to convert serialized record to Data: {e}"))
 }
 
+/// Validates an endpoint URL for external E2E testing:
+/// - Enforces HTTPS for all non-loopback destinations.
+/// - Allows plaintext HTTP only when the destination resolves strictly to loopback IP addresses (127.0.0.0/8 or ::1).
+/// - Rejects unsupported schemes and unresolvable/external HTTP hosts.
+pub fn validate_endpoint_url(name: &str, u: &str) -> Result<Url, String> {
+    let parsed = Url::parse(u).map_err(|e| format!("Invalid URL for {name} '{u}': {e}"))?;
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" => {
+            let host_str = parsed
+                .host_str()
+                .ok_or_else(|| format!("{name} '{u}' has no host"))?;
+            let port = parsed.port_or_known_default().unwrap_or(80);
+
+            // Check if host_str is a literal IP or hostname that resolves to loopback
+            if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
+                if ip.is_loopback() {
+                    return Ok(parsed);
+                } else {
+                    return Err(format!(
+                        "{name} '{u}' uses plaintext HTTP to non-loopback IP '{ip}'. Plaintext HTTP is strictly prohibited for non-loopback destinations when credentials are present; use HTTPS or loopback 127.0.0.1/::1."
+                    ));
+                }
+            }
+
+            // Resolve hostname via ToSocketAddrs
+            use std::net::ToSocketAddrs;
+            let socket_addrs = format!("{host_str}:{port}")
+                .to_socket_addrs()
+                .map_err(|e| format!("Failed to resolve host for {name} '{u}': {e}"))?;
+
+            let mut resolved_any = false;
+            for addr in socket_addrs {
+                resolved_any = true;
+                if !addr.ip().is_loopback() {
+                    return Err(format!(
+                        "{name} '{u}' resolved to non-loopback IP '{}'. Plaintext HTTP is strictly prohibited for non-loopback destinations when credentials are present; use HTTPS or loopback 127.0.0.1/::1.",
+                        addr.ip()
+                    ));
+                }
+            }
+
+            if !resolved_any {
+                return Err(format!("{name} '{u}' did not resolve to any IP addresses"));
+            }
+
+            Ok(parsed)
+        }
+        other => Err(format!("{name} must use https or loopback http scheme, got '{other}'")),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UserSession {
     pub name: &'static str,
@@ -232,7 +284,7 @@ impl ScenarioConfig {
         let dave_pds = env::var("DAVE_PDS_URL")
             .map_err(|_| "DAVE_PDS_URL is required (Space-capable PDS endpoint)".to_string())?;
 
-        // Validate URLs
+        // Validate URLs with strict HTTPS / loopback policy
         for (name, u) in [
             ("NEST_URL", &nest_url),
             ("CIRCLE_APPVIEW_URL", &circle_appview_url),
@@ -242,10 +294,7 @@ impl ScenarioConfig {
             ("CAROL_PDS_URL", &carol_pds),
             ("DAVE_PDS_URL", &dave_pds),
         ] {
-            let parsed = Url::parse(u).map_err(|e| format!("Invalid URL for {name} '{u}': {e}"))?;
-            if parsed.scheme() != "http" && parsed.scheme() != "https" {
-                return Err(format!("{name} must use http or https scheme, got '{u}'"));
-            }
+            validate_endpoint_url(name, u)?;
         }
 
         // Ensure all four sessions are distinct
@@ -439,12 +488,53 @@ pub struct ScenarioRunner {
 }
 
 impl ScenarioRunner {
-    pub fn new(config: ScenarioConfig) -> Self {
-        let client = Client::builder()
+    pub fn new(config: ScenarioConfig) -> Result<Self, String> {
+        let mut builder = Client::builder()
             .timeout(Duration::from_secs(20))
-            .build()
-            .unwrap_or_default();
-        Self { config, client }
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+
+        let endpoints = [
+            ("NEST_URL", &config.nest_url),
+            ("CIRCLE_APPVIEW_URL", &config.circle_appview_url),
+            ("PUBLIC_APPVIEW_URL", &config.public_appview_url),
+            ("ALICE_PDS_URL", &config.alice.pds_url),
+            ("BOB_PDS_URL", &config.bob.pds_url),
+            ("CAROL_PDS_URL", &config.carol.pds_url),
+            ("DAVE_PDS_URL", &config.dave.pds_url),
+        ];
+
+        for (name, url_str) in endpoints {
+            let parsed = Url::parse(url_str).map_err(|e| format!("Invalid {name} '{url_str}': {e}"))?;
+            let host = parsed.host_str().ok_or_else(|| format!("{name} '{url_str}' missing host"))?;
+            let port = parsed.port_or_known_default().unwrap_or(80);
+
+            if parsed.scheme() == "http" {
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    if !ip.is_loopback() {
+                        return Err(format!("{name} '{url_str}' has non-loopback IP {ip}"));
+                    }
+                } else {
+                    use std::net::ToSocketAddrs;
+                    let socket_addrs: Vec<std::net::SocketAddr> = format!("{host}:{port}")
+                        .to_socket_addrs()
+                        .map_err(|e| format!("Failed to resolve loopback host for {name} '{url_str}': {e}"))?
+                        .collect();
+                    if socket_addrs.is_empty() {
+                        return Err(format!("{name} '{url_str}' resolved to no addresses"));
+                    }
+                    for addr in &socket_addrs {
+                        if !addr.ip().is_loopback() {
+                            return Err(format!("{name} '{url_str}' resolved to non-loopback IP {}", addr.ip()));
+                        }
+                    }
+                    builder = builder.resolve(host, socket_addrs[0]);
+                }
+            }
+        }
+
+        let client = builder.build().map_err(|e| format!("Failed to build secure E2E client: {e}"))?;
+        Ok(Self { config, client })
     }
 
     fn write_private_file(&self, path: &Path, content: &[u8]) -> Result<(), String> {
@@ -886,28 +976,32 @@ impl ScenarioRunner {
             .map_err(|e| format!("Failed to parse GetLatestCommitOutput: {e}"))?;
         let commit = commit_output.commit;
 
-        if commit.ver != 1 {
-            return Err(format!(
-                "Expected SignedCommit ver == 1, got {}",
-                commit.ver
-            ));
+        if commit.ver == 1 {
+            if let Some(ikm) = &commit.ikm {
+                if ikm.len() != 32 {
+                    return Err(format!(
+                        "Expected SignedCommit ikm length 32, got {}",
+                        ikm.len()
+                    ));
+                }
+            } else {
+                return Err("Expected SignedCommit ikm to be present for ver == 1".to_string());
+            }
+            if let Some(mac) = &commit.mac {
+                if mac.len() != 32 {
+                    return Err(format!(
+                        "Expected SignedCommit mac length 32, got {}",
+                        mac.len()
+                    ));
+                }
+            } else {
+                return Err("Expected SignedCommit mac to be present for ver == 1".to_string());
+            }
         }
         if commit.hash.len() != 32 {
             return Err(format!(
                 "Expected SignedCommit hash length 32, got {}",
                 commit.hash.len()
-            ));
-        }
-        if commit.ikm.len() != 32 {
-            return Err(format!(
-                "Expected SignedCommit ikm length 32, got {}",
-                commit.ikm.len()
-            ));
-        }
-        if commit.mac.len() != 32 {
-            return Err(format!(
-                "Expected SignedCommit mac length 32, got {}",
-                commit.mac.len()
             ));
         }
         if commit.sig.is_empty() {
@@ -2942,7 +3036,13 @@ async fn main() {
         }
     };
 
-    let runner = ScenarioRunner::new(config);
+    let runner = match ScenarioRunner::new(config) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[e2e_scenario] Failed to initialize runner: {err}");
+            std::process::exit(2);
+        }
+    };
     if let Err(probe_err) = runner.check_readiness().await {
         eprintln!("[e2e_scenario] Missing prerequisite service: {probe_err}");
         std::process::exit(2);
@@ -2955,4 +3055,117 @@ async fn main() {
 
     eprintln!("[e2e_scenario] STEP_15_SCENARIO_COMPLETE");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_endpoint_url_https_allowed() {
+        assert!(validate_endpoint_url("NEST_URL", "https://nest.catbird.blue").is_ok());
+        assert!(validate_endpoint_url("PUBLIC_APPVIEW_URL", "https://public.api.bsky.app").is_ok());
+        assert!(validate_endpoint_url("PDS_URL", "https://pds.example.com:443/xrpc").is_ok());
+    }
+
+    #[test]
+    fn test_validate_endpoint_url_loopback_http_allowed() {
+        assert!(validate_endpoint_url("NEST_URL", "http://127.0.0.1:3000").is_ok());
+        assert!(validate_endpoint_url("NEST_URL", "http://127.0.0.2:8080").is_ok());
+        assert!(validate_endpoint_url("CIRCLE_APPVIEW_URL", "http://[::1]:3002").is_ok());
+        assert!(validate_endpoint_url("NEST_URL", "http://localhost:3000").is_ok());
+    }
+
+    #[test]
+    fn test_validate_endpoint_url_non_loopback_http_rejected() {
+        let err1 = validate_endpoint_url("NEST_URL", "http://192.168.1.1:3000").unwrap_err();
+        assert!(err1.contains("non-loopback"));
+
+        let err2 = validate_endpoint_url("NEST_URL", "http://10.0.0.1:3000").unwrap_err();
+        assert!(err2.contains("non-loopback"));
+
+        let err3 = validate_endpoint_url("NEST_URL", "http://169.254.169.254:3000").unwrap_err();
+        assert!(err3.contains("non-loopback"));
+
+        let err4 = validate_endpoint_url("NEST_URL", "http://8.8.8.8:3000").unwrap_err();
+        assert!(err4.contains("non-loopback"));
+
+        let err5 = validate_endpoint_url("NEST_URL", "http://[2001:db8::1]:3000").unwrap_err();
+        assert!(err5.contains("non-loopback"));
+    }
+
+    #[tokio::test]
+    async fn test_e2e_client_no_redirect_protects_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://attacker.example.com/steal\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let target_url = format!("http://127.0.0.1:{port}");
+        let config = ScenarioConfig {
+            run_id: "test_run".to_string(),
+            nest_url: target_url.clone(),
+            circle_appview_url: target_url.clone(),
+            circle_appview_service_did: "did:web:circles.catbird.blue#atproto_circles".to_string(),
+            circle_appview_client_id: "https://circles.catbird.blue/client-metadata.json".to_string(),
+            public_appview_url: "https://public.api.bsky.app".to_string(),
+            database_url: "postgres://user:pass@localhost:5432/db".to_string(),
+            alice: UserSession {
+                name: "alice",
+                did: "did:plc:alice".to_string(),
+                session_id: "sess_alice".to_string(),
+                pds_url: target_url.clone(),
+            },
+            bob: UserSession {
+                name: "bob",
+                did: "did:plc:bob".to_string(),
+                session_id: "sess_bob".to_string(),
+                pds_url: target_url.clone(),
+            },
+            carol: UserSession {
+                name: "carol",
+                did: "did:plc:carol".to_string(),
+                session_id: "sess_carol".to_string(),
+                pds_url: target_url.clone(),
+            },
+            dave: UserSession {
+                name: "dave",
+                did: "did:plc:dave".to_string(),
+                session_id: "sess_dave".to_string(),
+                pds_url: target_url.clone(),
+            },
+            artifacts_dir: std::path::PathBuf::from("/tmp"),
+        };
+
+        let runner = ScenarioRunner::new(config).expect("ScenarioRunner::new must succeed");
+
+        let res = runner
+            .client
+            .get(format!("http://127.0.0.1:{port}/redirect-target"))
+            .header("Authorization", "Bearer SECRET_TOKEN")
+            .header("Cookie", "session=SECRET_COOKIE")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            res.headers().get("Location").unwrap().to_str().unwrap(),
+            "https://attacker.example.com/steal"
+        );
+    }
+    #[test]
+    fn test_validate_endpoint_url_invalid_schemes_rejected() {
+        assert!(validate_endpoint_url("NEST_URL", "ftp://127.0.0.1").is_err());
+        assert!(validate_endpoint_url("NEST_URL", "file:///etc/passwd").is_err());
+        assert!(validate_endpoint_url("NEST_URL", "not-a-url").is_err());
+    }
 }

@@ -79,7 +79,9 @@ const LUA_COMMIT_SCRIPT: &str = r#"
 -- 6: old_session_key (hashed)
 -- 7: old_session_index_key (hashed)
 -- 8: pending_upgrade_key (hashed)
-
+-- 9: new_fp_index_key (hashed)
+-- 10: old_fp_index_key (hashed)
+-- 11: did_index_key
 -- ARGV:
 -- 1: candidate_fingerprint (HMAC fingerprint of candidate_session_id)
 -- 2: old_fingerprint (HMAC fingerprint of old_session_id)
@@ -128,12 +130,16 @@ end
 
 redis.call('SETEX', KEYS[4], tonumber(ARGV[6]), ARGV[4])
 redis.call('SETEX', KEYS[5], tonumber(ARGV[7]), ARGV[3])
+redis.call('SETEX', KEYS[9], tonumber(ARGV[6]), ARGV[1])
+if KEYS[11] and KEYS[11] ~= '' then
+    redis.call('SETEX', KEYS[11], tonumber(ARGV[6]), ARGV[1])
+end
 redis.call('DEL', KEYS[6])
 redis.call('DEL', KEYS[7])
+redis.call('DEL', KEYS[10])
 redis.call('SETEX', KEYS[3], tonumber(ARGV[8]), ARGV[1])
 redis.call('SETEX', KEYS[2], tonumber(ARGV[9]), ARGV[5])
 redis.call('DEL', KEYS[1])
-
 if ARGV[10] and ARGV[10] ~= '' then
     local current_pending = redis.call('GET', KEYS[8])
     if current_pending == ARGV[10] then
@@ -510,6 +516,15 @@ impl OAuthUpgradeService {
             self.fingerprint(session_id)
         )
     }
+    pub fn session_fp_index_key(&self, session_id: &str) -> String {
+        let sha256_fp = crate::services::push::registry::session_fingerprint(session_id);
+        format!("{}session_fp_index:{}", self.key_prefix, sha256_fp)
+    }
+    pub fn did_index_key(&self, did: &str) -> String {
+        format!("{}did_index:{}", self.key_prefix, did)
+    }
+
+
 
     fn enc_key(&self) -> &[u8; 32] {
         &self.encryption_key
@@ -929,6 +944,9 @@ impl OAuthUpgradeService {
         let old_index_k = self.session_index_key(&candidate.old_session_id);
         let pending_k = self.pending_upgrade_key(&candidate.old_session_id);
         let receipt_k = self.receipt_key(candidate_session_id);
+        let new_fp_index_k = self.session_fp_index_key(candidate_session_id);
+        let old_fp_index_k = self.session_fp_index_key(&candidate.old_session_id);
+        let did_index_k = self.did_index_key(&candidate.did);
 
         let cand_fp = self.fingerprint(candidate_session_id);
         let old_fp = self.fingerprint(&candidate.old_session_id);
@@ -948,6 +966,9 @@ impl OAuthUpgradeService {
             .key(&old_session_k)
             .key(&old_index_k)
             .key(&pending_k)
+            .key(&new_fp_index_k)
+            .key(&old_fp_index_k)
+            .key(&did_index_k)
             .arg(&cand_fp)
             .arg(&old_fp)
             .arg(&candidate.did)

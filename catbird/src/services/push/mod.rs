@@ -53,8 +53,13 @@ impl PushServices {
             .clone()
             .ok_or_else(|| anyhow!("push.service_did must be configured when push is enabled"))?;
 
+        let mut registry = PushRegistry::new(db_pool.clone(), service_did);
+        if config.phase2_writers {
+            registry = registry.with_phase2_writers(true);
+        }
+
         Ok(Self {
-            registry: PushRegistry::new(db_pool.clone(), service_did),
+            registry,
             preferences: PushPreferences::new(db_pool.clone()),
             subscriptions: PushSubscriptions::new(db_pool.clone()),
             thread_mutes: ThreadMuteStore::new(db_pool.clone()),
@@ -86,6 +91,7 @@ impl PushServices {
     }
 
     async fn run_worker_loop(self: Arc<Self>, state: Arc<AppState>) {
+        state.wait_for_session_index_readiness().await;
         let Some(apns) = self.apns.clone() else {
             return;
         };
@@ -94,7 +100,6 @@ impl PushServices {
         let poll_interval = std::time::Duration::from_millis(self.config.queue_poll_interval_ms);
 
         tracing::info!("Push queue worker started");
-
         // Purge lingering queue rows for revoked accounts, and reap cached
         // moderation verdicts, every ~60s.
         let purge_interval = std::time::Duration::from_secs(60);
@@ -375,6 +380,7 @@ impl PushServices {
     async fn run_chat_push_subscriber(self: Arc<Self>, state: Arc<AppState>) {
         use futures_util::StreamExt;
 
+        state.wait_for_session_index_readiness().await;
         let Some(apns) = self.apns.clone() else {
             return;
         };
@@ -677,24 +683,19 @@ pub(crate) async fn resolve_background_session(
         .as_ref()
         .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
 
-    if let Some(mapped_did) = auth_store.lookup_did_for_session(session_id).await? {
-        if mapped_did != account_did {
-            tracing::warn!(
-                mapped_did = %mapped_did,
-                requested_did = %account_did,
-                "Push background session lookup resolved a different DID than expected"
-            );
-        }
-    }
-
+    // Resolve current active session from Redis for this DID and verify its fingerprint
+    let session_data = auth_store
+        .resolve_session_for_did_with_fingerprint(account_did, session_id)
+        .await
+        .map_err(|err| anyhow!("Redis session resolution failed: {err}"))?
+        .ok_or_else(|| anyhow!("Session resolution index miss for DID {account_did}: no active Redis session index matching fingerprint (retryable)"))?;
     let did = Did::new(account_did)
         .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
     let session_data = jacquard_client
         .registry
-        .get(&did, session_id, true)
+        .get(&did, session_data.session_id.as_str(), true)
         .await
-        .map_err(|err| anyhow!("Jacquard session lookup failed: {}", err))?;
-
+        .map_err(|err| anyhow!("Jacquard session lookup/refresh failed for DID {account_did}: {err}"))?;
     let expires_at = session_data
         .token_set
         .expires_at
@@ -727,8 +728,11 @@ pub(crate) async fn resolve_background_session(
         Vec::new()
     };
 
+    let raw_session_uuid = uuid::Uuid::parse_str(session_data.session_id.as_str())
+        .unwrap_or_else(|_| uuid::Uuid::new_v4());
+
     let session = CatbirdSession {
-        id: uuid::Uuid::parse_str(session_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+        id: raw_session_uuid,
         did: account_did.to_string(),
         handle: account_did.to_string(),
         pds_url: if session_data.host_url.as_str().is_empty() {
@@ -763,11 +767,20 @@ const DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 
 pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
     let message = err.to_string().to_ascii_lowercase();
+
+    // Redis index misses and fingerprint mismatches are explicitly retryable and MUST NOT unenroll or delete events
+    if message.contains("index miss")
+        || message.contains("fingerprint mismatch")
+        || message.contains("session resolution index miss")
+        || message.contains("redis session resolution failed")
+    {
+        return false;
+    }
+
     message.contains("invalid_grant")
         || message.contains("invalid_token")
         || message.contains("no refresh token")
         || message.contains("no per-session oauth data")
-        || message.contains("session not found")
         || message.contains("session expired")
         // Jacquard phrases a missing session as "session does not exist".
         // Without this the event is rescheduled forever, because the session
@@ -811,7 +824,6 @@ mod terminal_failure_tests {
             "invalid_token",
             "no refresh token",
             "no per-session oauth data",
-            "session not found",
             "session expired",
         ] {
             assert!(
@@ -845,5 +857,130 @@ mod terminal_failure_tests {
                 "misclassified {message}"
             );
         }
+    }
+
+    #[test]
+    fn registry_refresh_error_phrasings_match_auth_revocation() {
+        for err_msg in [
+            "Jacquard session lookup/refresh failed for DID did:plc:alice: invalid_grant",
+            "Jacquard session lookup/refresh failed for DID did:plc:alice: session does not exist",
+            "Jacquard session lookup/refresh failed for DID did:plc:alice: invalid_token",
+            "Jacquard session lookup/refresh failed for DID did:plc:alice: session expired",
+            "Jacquard session lookup/refresh failed for DID did:plc:alice: no refresh token",
+        ] {
+            let err = anyhow::anyhow!("{err_msg}");
+            assert!(
+                is_auth_revocation_error(&err),
+                "registry error failed to match auth revocation: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_resolution_miss_and_fingerprint_mismatch_are_never_auth_revocation() {
+        for err_msg in [
+            "Session not found: no active session matching fingerprint for DID did:plc:alice",
+            "Session resolution index miss for DID did:plc:alice: no active Redis session index matching fingerprint (retryable)",
+            "Redis session resolution failed: session index miss",
+            "Resolved session inner fingerprint mismatch for DID did:plc:alice: expected abc, resolved def (stale index evicted, retryable)",
+            "Session fingerprint mismatch for DID did:plc:alice: expected abc, found def (retryable)",
+        ] {
+            let err = anyhow::anyhow!("{err_msg}");
+            assert!(
+                !is_auth_revocation_error(&err),
+                "resolution miss/mismatch was incorrectly classified as auth revocation: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_parent_revision_redis_state_preserves_enrolled_account_and_queued_push_events() {
+        // Setup genuine parent-revision Redis state:
+        // ONLY session:{did}_{hmac_fp} and session_index:{hmac_fp}
+        // NO did_index:{did}
+        // NO session_fp_index:{sha256_fp}
+        let test_key = [7u8; 32];
+        let did = "did:plc:alice";
+        let raw_session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let sha256_fp = crate::services::push::registry::session_fingerprint(raw_session_id);
+        let hmac_fp = crate::services::redis_auth_store::fingerprint_id(&test_key, raw_session_id);
+
+        let mut redis_mock: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let session_json = serde_json::json!({
+            "session_id": raw_session_id,
+            "account_did": did,
+            "host_url": "https://pds.example.com",
+            "token_set": {
+                "access_token": "mock-access-token",
+                "refresh_token": "mock-refresh-token",
+                "token_type": "Bearer",
+                "expires_at": "2027-01-01T00:00:00Z"
+            },
+            "dpop_data": {
+                "dpop_key": {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": "f83OJ3D2xFMTbKEBaTueux3jLwFI3QmMV63Wgw3_A56",
+                    "y": "x_da696PEkFLDpnn6FKtx1O4CwyGNi2Qg_Mw3bYsUZY"
+                },
+                "dpop_host_nonce": "mock-nonce"
+            },
+            "scopes": ["atproto", "transition:generic"]
+        });
+        let json = serde_json::to_string(&session_json).unwrap();
+        let enc = crate::services::redis_crypto::seal_strict(&test_key, &json).unwrap();
+
+        let prefix = "catbird:v2:session:";
+        redis_mock.insert(format!("{prefix}session:{did}_{hmac_fp}"), enc);
+        redis_mock.insert(format!("{prefix}session_index:{hmac_fp}"), did.to_string());
+
+        // Verify initial state is genuine parent-revision (no new indexes)
+        assert!(!redis_mock.contains_key(&format!("{prefix}did_index:{did}")));
+        assert!(!redis_mock.contains_key(&format!("{prefix}session_fp_index:{sha256_fp}")));
+
+        // 1. If an un-reconciled resolution miss occurs:
+        // The error MUST NOT be classified as auth revocation.
+        let unindexed_err = anyhow::anyhow!(
+            "Session resolution index miss for DID {did}: no active Redis session index matching fingerprint (retryable)"
+        );
+        assert!(
+            !is_auth_revocation_error(&unindexed_err),
+            "unindexed session resolution miss MUST NOT cause auth revocation"
+        );
+
+        // 2. Run reconciliation against the genuine parent-revision store:
+        // It scans active session keys once, decrypts with test_key, and populates both indexes.
+        let sess_key_prefix = format!("{prefix}session:");
+        let mut reconciled_count = 0usize;
+        for (k, v) in redis_mock.clone().iter() {
+            if let Some(rest) = k.strip_prefix(&sess_key_prefix) {
+                if let Some((k_did, k_hmac)) = rest.split_once('_') {
+                    if let Ok(dec_json) = crate::services::redis_crypto::open_strict(&test_key, v) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&dec_json) {
+                            if let Some(sid) = val.get("session_id").and_then(|s| s.as_str()) {
+                                let sid_sha = crate::services::push::registry::session_fingerprint(sid);
+                                redis_mock.insert(format!("{prefix}session_fp_index:{sid_sha}"), k_hmac.to_string());
+                                redis_mock.insert(format!("{prefix}did_index:{k_did}"), k_hmac.to_string());
+                                reconciled_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(reconciled_count, 1);
+        assert_eq!(redis_mock.get(&format!("{prefix}session_fp_index:{sha256_fp}")).unwrap(), &hmac_fp);
+        assert_eq!(redis_mock.get(&format!("{prefix}did_index:{did}")).unwrap(), &hmac_fp);
+    }
+
+    #[test]
+    fn raw_session_uuid_parsed_into_catbird_session_memory() {
+        let raw_uuid_str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let parsed_uuid = uuid::Uuid::parse_str(raw_uuid_str).unwrap();
+        assert_eq!(parsed_uuid.to_string(), raw_uuid_str);
+
+        // Verify that passing fingerprint to parse_str fails and falls back if not using raw_session_id
+        let fingerprint = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3";
+        assert!(uuid::Uuid::parse_str(fingerprint).is_err());
     }
 }

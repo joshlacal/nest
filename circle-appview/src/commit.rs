@@ -12,12 +12,10 @@ pub use jacquard_repo::permissioned::{
     parse_cursor, sign_commit, sign_commit_with_ikm, verify_dpop, ApplyWritesResult,
     CnfJkt, CommitContext, CredentialClaims, DpopProof, LtHash,
     OplogAction, OplogEntry, OplogPage, PermissionedCar, PermissionedError, RecordValue,
-    SpaceTypeDeclaration, ValidatedRepoSnapshot, WriteOperation, WriteResult,
+    SignedCommit, SpaceTypeDeclaration, ValidatedRepoSnapshot, WriteOperation, WriteResult,
     WriteState, CLIENT_ATTESTATION_TYP, CLOCK_SKEW_SEC, DELEGATION_TOKEN_TYP,
     SPACE_CREDENTIAL_TYP,
 };
-pub use catbird_atproto::generated::com_atproto::space::SignedCommit;
-
 use crate::auth::ParsedVerifyingKey;
 
 pub const LTHASH_SIZE: usize = 2048;
@@ -159,23 +157,13 @@ pub async fn parse_permissioned_car(bytes: &[u8]) -> Result<PermissionedCar, Per
 ///
 /// Supports Ed25519 (upstream direct validation) as well as P-256 and Secp256k1 account keys.
 pub fn verify_commit(
-    commit: &catbird_atproto::generated::com_atproto::space::SignedCommit,
+    commit: &SignedCommit,
     context: &CommitContext,
     key: &ParsedVerifyingKey,
 ) -> Result<(), PermissionedError> {
     match key {
         ParsedVerifyingKey::Ed25519(vk) => {
-            let upstream_commit = jacquard_repo::permissioned::SignedCommit {
-                hash: commit.hash.clone(),
-                ikm: commit.ikm.clone(),
-                mac: commit.mac.clone(),
-                rev: jacquard_common::types::tid::Tid::new(commit.rev.as_str())
-                    .map_err(|e| PermissionedError::InvalidCommit(e.to_string()))?,
-                sig: commit.sig.clone(),
-                ver: commit.ver,
-                extra_data: None,
-            };
-            jacquard_repo::permissioned::verify_commit(&upstream_commit, context, vk)
+            jacquard_repo::permissioned::verify_commit(commit, context, vk)
         }
         ParsedVerifyingKey::P256(vk) => {
             verify_commit_ecdsa_p256(commit, context, vk)
@@ -184,6 +172,90 @@ pub fn verify_commit(
             verify_commit_ecdsa_k256(commit, context, vk)
         }
     }
+}
+
+pub fn to_jacquard_commit(
+    commit: &catbird_atproto::generated::com_atproto::space::SignedCommit,
+) -> Result<SignedCommit, PermissionedError> {
+    let ikm = commit
+        .ikm
+        .as_ref()
+        .ok_or_else(|| PermissionedError::InvalidCommit("missing ikm in commit".into()))?;
+    let mac = commit
+        .mac
+        .as_ref()
+        .ok_or_else(|| PermissionedError::InvalidCommit("missing mac in commit".into()))?;
+    Ok(SignedCommit {
+        hash: commit.hash.clone(),
+        ikm: ikm.clone(),
+        mac: mac.clone(),
+        rev: commit.rev.clone(),
+        sig: commit.sig.clone(),
+        ver: commit.ver,
+        extra_data: None,
+    })
+}
+
+pub fn to_atproto_commit(
+    commit: &SignedCommit,
+) -> catbird_atproto::generated::com_atproto::space::SignedCommit {
+    catbird_atproto::generated::com_atproto::space::SignedCommit {
+        action: None,
+        cid: None,
+        did: None,
+        hash: commit.hash.clone(),
+        ikm: Some(commit.ikm.clone()),
+        mac: Some(commit.mac.clone()),
+        path: None,
+        prev_cid: None,
+        prev_hash: None,
+        prev_rev: None,
+        rev: commit.rev.clone(),
+        sig: commit.sig.clone(),
+        space: None,
+        val: None,
+        ver: commit.ver,
+        extra_data: None,
+    }
+}
+
+pub fn to_atproto_commit_v2(
+    hash: bytes::Bytes,
+    rev: &str,
+    sig: bytes::Bytes,
+    did: Option<&str>,
+    space: Option<&str>,
+    prev_rev: Option<&str>,
+    prev_hash: Option<bytes::Bytes>,
+) -> catbird_atproto::generated::com_atproto::space::SignedCommit {
+    catbird_atproto::generated::com_atproto::space::SignedCommit {
+        action: None,
+        cid: None,
+        did: did.and_then(|d| d.parse().ok()),
+        hash,
+        ikm: None,
+        mac: None,
+        path: None,
+        prev_cid: None,
+        prev_hash,
+        prev_rev: prev_rev.and_then(|r| jacquard_common::types::string::Tid::new(r).ok()),
+        rev: jacquard_common::types::string::Tid::new(rev)
+            .unwrap_or_else(|_| jacquard_common::types::string::Tid::from(rev.to_string())),
+        sig,
+        space: space.and_then(|s| s.parse().ok()),
+        val: None,
+        ver: 2,
+        extra_data: None,
+    }
+}
+
+pub fn verify_commit_atproto(
+    commit: &catbird_atproto::generated::com_atproto::space::SignedCommit,
+    context: &CommitContext,
+    key: &ParsedVerifyingKey,
+) -> Result<(), PermissionedError> {
+    let jacquard_commit = to_jacquard_commit(commit)?;
+    verify_commit(&jacquard_commit, context, key)
 }
 
 fn verify_commit_ecdsa_p256(
@@ -322,20 +394,11 @@ pub fn extract_and_validate_car(
         return Err(PermissionedError::InvalidCar("CAR has fewer than 2 blocks".into()));
     }
 
-    let upstream_commit = commit_from_cbor(&car.blocks[0].1)?;
-    let commit = SignedCommit {
-        hash: upstream_commit.hash.clone(),
-        ikm: upstream_commit.ikm.clone(),
-        mac: upstream_commit.mac.clone(),
-        rev: upstream_commit.rev.to_string().into(),
-        sig: upstream_commit.sig.clone(),
-        ver: upstream_commit.ver,
-        extra_data: None,
-    };
+    let commit = commit_from_cbor(&car.blocks[0].1)?;
     let context = CommitContext {
         space: space_uri_parsed,
         author: author_did_parsed,
-        rev: upstream_commit.rev,
+        rev: commit.rev.clone(),
     };
 
     verify_commit(&commit, &context, key)?;
@@ -344,11 +407,10 @@ pub fn extract_and_validate_car(
         serde_ipld_dagcbor::from_slice(&car.blocks[1].1)
             .map_err(|e| PermissionedError::InvalidCar(format!("Index decode error: {e}")))?;
 
-    let mut index = Vec::new();
-    for (path, link) in decoded_index {
-        let cid = link.to_ipld().map_err(|e| PermissionedError::InvalidCar(e.to_string()))?;
-        index.push((path, cid));
-    }
+    let mut index: Vec<(String, String)> = decoded_index
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     index.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
 
     let mut lthash = LtHash::default();
@@ -366,7 +428,7 @@ pub fn extract_and_validate_car(
 
     let mut records = Vec::with_capacity(index.len());
     for ((path, expected_cid), (actual_cid, bytes)) in index.iter().zip(record_blocks) {
-        if actual_cid != expected_cid {
+        if actual_cid.to_string() != *expected_cid {
             return Err(PermissionedError::InvalidCar("Record block CID mismatch".into()));
         }
         let (collection, rkey) = path
@@ -766,4 +828,68 @@ pub fn decode_repo_car(bytes: &[u8]) -> Result<DecodedRepoCar, PermissionedError
         data_root_cid,
         records,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_signed_commit_v1_conversion_roundtrip() {
+        let space = "at://did:plc:alice-sync-test/space/blue.catbird.circle/test-circle";
+        let author = "did:plc:alice-sync-test";
+        let rev = "3l7aaaaaaaaaa";
+        let lthash_state = [42u8; LTHASH_SIZE];
+        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+
+        let minted = mint_signed_commit(space, author, rev, &lthash_state, &signing_key);
+        let atproto_commit = to_atproto_commit(&minted);
+
+        assert_eq!(atproto_commit.ver, 1);
+        assert_eq!(atproto_commit.hash, minted.hash);
+        assert_eq!(atproto_commit.sig, minted.sig);
+        assert_eq!(atproto_commit.rev.as_str(), rev);
+        assert!(atproto_commit.ikm.is_some());
+        assert!(atproto_commit.mac.is_some());
+
+        let recovered = to_jacquard_commit(&atproto_commit).expect("roundtrip conversion must succeed");
+        assert_eq!(recovered.hash, minted.hash);
+        assert_eq!(recovered.ikm, minted.ikm);
+        assert_eq!(recovered.mac, minted.mac);
+        assert_eq!(recovered.rev.as_str(), minted.rev.as_str());
+        assert_eq!(recovered.sig, minted.sig);
+        assert_eq!(recovered.ver, 1);
+    }
+
+    #[test]
+    fn test_signed_commit_v2_conversion_helper() {
+        let hash = bytes::Bytes::copy_from_slice(&[1u8; 32]);
+        let sig = bytes::Bytes::copy_from_slice(&[2u8; 64]);
+        let rev = "3l7bbbbbbbbbb";
+        let did = "did:plc:alice-sync-test";
+        let space = "at://did:plc:alice-sync-test/space/blue.catbird.circle/test-circle";
+        let prev_rev = "3l7aaaaaaaaaa";
+        let prev_hash = Some(bytes::Bytes::copy_from_slice(&[0u8; 32]));
+
+        let v2 = to_atproto_commit_v2(
+            hash.clone(),
+            rev,
+            sig.clone(),
+            Some(did),
+            Some(space),
+            Some(prev_rev),
+            prev_hash.clone(),
+        );
+
+        assert_eq!(v2.ver, 2);
+        assert_eq!(v2.hash, hash);
+        assert_eq!(v2.sig, sig);
+        assert_eq!(v2.rev.as_str(), rev);
+        assert_eq!(v2.did.as_ref().map(|d| d.as_str()), Some(did));
+        assert_eq!(v2.space.as_ref().map(|s| s.as_str()), Some(space));
+        assert_eq!(v2.prev_rev.as_ref().map(|r| r.as_str()), Some(prev_rev));
+        assert_eq!(v2.prev_hash, prev_hash);
+        assert!(v2.ikm.is_none());
+        assert!(v2.mac.is_none());
+    }
 }

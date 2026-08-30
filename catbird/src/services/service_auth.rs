@@ -365,9 +365,10 @@ mod tests {
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
             session_encryption_key: None,
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         })
     }
-
     fn test_session(did: &str, pds_url: &str) -> CatbirdSession {
         CatbirdSession {
             id: Uuid::new_v4(),

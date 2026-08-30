@@ -137,7 +137,7 @@ async fn sync_mutes_for_account(
 /// Look up session_id and pds_url from push_accounts for a given DID.
 async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(String, String)> {
     let row = sqlx::query_as::<_, (String, String)>(
-        "SELECT session_id, pds_url FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
+        "SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
     )
     .bind(did)
     .fetch_optional(db_pool)

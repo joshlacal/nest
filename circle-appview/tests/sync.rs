@@ -23,8 +23,8 @@ use circle_appview::auth::{
 };
 use circle_appview::commit::{
     compute_commit_context, compute_commit_mac, compute_dagcbor_cid, decode_repo_car,
-    derive_commit_mac_key, mint_repo_car, mint_signed_commit, verify_commit,
-    LtHash as RepoLtHash, RepoRecord, CommitContext,
+    derive_commit_mac_key, mint_repo_car, mint_signed_commit, to_atproto_commit, verify_commit,
+    CommitContext, LtHash as RepoLtHash, RepoRecord,
 };
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
@@ -588,7 +588,7 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
 
     let list_ops_output =
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -682,7 +682,7 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(bad_commit),
+            commit: Some(to_atproto_commit(&bad_commit)),
             cursor: None,
             ops: vec![inc_op_entry],
             extra_data: None,
@@ -787,7 +787,7 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![invalid_op],
             extra_data: None,
@@ -898,7 +898,7 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -996,7 +996,7 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -1425,7 +1425,7 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
     setup.mock_transport.set_list_repo_ops_response(
         &key_page2,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_page2],
             extra_data: None,
@@ -1684,7 +1684,7 @@ async fn federated_repo_sync_routes_to_member_pds_endpoint(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(bob_commit),
+            commit: Some(to_atproto_commit(&bob_commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -1784,7 +1784,7 @@ async fn ordered_operations_preserve_delete_then_recreate_on_same_path(pool: PgP
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_create_1, op_delete, op_create_2],
             extra_data: None,
@@ -1859,7 +1859,7 @@ async fn strong_reference_validation_rejects_without_fail_open_and_ignores_non_p
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -2034,7 +2034,7 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -2111,7 +2111,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -2204,7 +2204,7 @@ async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgP
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit1),
+            commit: Some(to_atproto_commit(&commit1)),
             cursor: None,
             ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
                 cid: Some(Cid::from(p1_cid.clone())),
@@ -2281,7 +2281,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_a1),
+            commit: Some(to_atproto_commit(&commit_a1)),
             cursor: None,
             ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
                 cid: Some(Cid::from(p1_cid.clone())),
@@ -2313,7 +2313,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_b1),
+            commit: Some(to_atproto_commit(&commit_b1)),
             cursor: None,
             ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
                 cid: Some(Cid::from(l1_cid.clone())),
@@ -2352,7 +2352,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_b2),
+            commit: Some(to_atproto_commit(&commit_b2)),
             cursor: None,
             ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
                 cid: Some(Cid::from(l1_invalid_cid.clone())),
@@ -2384,7 +2384,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_a2),
+            commit: Some(to_atproto_commit(&commit_a2)),
             cursor: None,
             ops: vec![catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
                 cid: None,
@@ -3026,7 +3026,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit.clone()),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -3270,7 +3270,7 @@ async fn staged_rejection_removes_uri_from_policy_preventing_stale_deps(pool: Pg
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit2),
+            commit: Some(to_atproto_commit(&commit2)),
             cursor: None,
             ops: vec![op1, op2],
             extra_data: None,
@@ -4127,7 +4127,7 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit: Some(to_atproto_commit(&commit)),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,

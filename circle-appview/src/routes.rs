@@ -103,9 +103,43 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(public_routes)
         .merge(authenticated_routes)
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
 
+pub async fn request_id_middleware(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 64
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    req.extensions_mut().insert(crate::error::RequestId(id.clone()));
+
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %id,
+        method = %req.method(),
+        uri = %req.uri().path(),
+    );
+    use tracing::Instrument;
+    let mut response = next.run(req).instrument(span).await;
+
+    if let Ok(header_value) = id.parse() {
+        response.headers_mut().insert("x-request-id", header_value);
+    }
+    response
+}
 async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }

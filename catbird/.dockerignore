@@ -1,6 +1,7 @@
-.DS_Store
 target/
+.git/
 .env
+.env*
 .env.*
 .env.local
 *.env
@@ -9,6 +10,16 @@ config/local.*
 *.pem
 *.p8
 *.key
+*.der
+*.pfx
+*.p12
+*.json
+!Cargo.lock
+!package.json
 sessions.json
 *export*.json
 artifacts/
+*.sqlite*
+*.db
+.tmp*
+.DS_Store

@@ -233,36 +233,24 @@ pub fn redact_oauth_error_body(body: &str) -> String {
     #[derive(Deserialize)]
     struct OAuthErrorPayload {
         error: Option<String>,
+        #[allow(dead_code)]
         error_description: Option<String>,
     }
 
     if let Ok(payload) = serde_json::from_str::<OAuthErrorPayload>(body) {
-        let err_code = payload.error.unwrap_or_else(|| "unknown_error".to_string());
-        let safe_err: String = err_code
-            .chars()
-            .take(64)
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .collect();
-        if let Some(desc) = payload.error_description {
-            let redacted_words: Vec<String> = desc
-                .split_whitespace()
-                .map(|word| {
-                    if word.len() > 24
-                        && word
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '+')
-                    {
-                        "[REDACTED]".to_string()
-                    } else {
-                        word.to_string()
-                    }
-                })
-                .collect();
-            let bounded_desc: String = redacted_words.join(" ").chars().take(128).collect();
-            format!("error: {safe_err}, description: {bounded_desc}")
-        } else {
-            format!("error: {safe_err}")
-        }
+        let err_code = match payload.error.as_deref() {
+            Some("invalid_request") => "invalid_request",
+            Some("invalid_client") => "invalid_client",
+            Some("invalid_grant") => "invalid_grant",
+            Some("unauthorized_client") => "unauthorized_client",
+            Some("unsupported_grant_type") => "unsupported_grant_type",
+            Some("invalid_scope") => "invalid_scope",
+            Some("access_denied") => "access_denied",
+            Some("server_error") => "server_error",
+            Some("temporarily_unavailable") => "temporarily_unavailable",
+            _ => "oauth_error",
+        };
+        format!("error: {err_code}")
     } else {
         "non-json error response".to_string()
     }
@@ -639,7 +627,17 @@ impl OAuthService {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             let redacted_desc = redact_oauth_error_body(&body);
-            tracing::warn!(%status, %redacted_desc, "Token exchange failed upstream");
+            let upstream_host = url::Url::parse(&pending.token_endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                operation = "token_exchange",
+                upstream_host = %upstream_host,
+                upstream_status = %status.as_u16(),
+                redacted_error = %redacted_desc,
+                "Token exchange failed upstream"
+            );
             return Err(AppError::Internal(format!(
                 "Token exchange returned {status}: {redacted_desc}"
             )));
@@ -754,7 +752,17 @@ impl OAuthService {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             let redacted_desc = redact_oauth_error_body(&body);
-            tracing::warn!(%status, %redacted_desc, "Token refresh failed upstream");
+            let upstream_host = url::Url::parse(&session.token_endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                operation = "token_refresh",
+                upstream_host = %upstream_host,
+                upstream_status = %status.as_u16(),
+                redacted_error = %redacted_desc,
+                "Token refresh failed upstream"
+            );
             return Err(AppError::Internal(format!(
                 "Token refresh returned {status}: {redacted_desc}"
             )));
@@ -1591,8 +1599,13 @@ mod tests {
         let raw_json_error = r#"{"error": "invalid_grant", "error_description": "The refresh token secret_refresh_token_value_abc1234567890xyz is invalid"}"#;
         let redacted = redact_oauth_error_body(raw_json_error);
         assert!(!redacted.contains("secret_refresh_token_value_abc1234567890xyz"));
-        assert!(redacted.contains("invalid_grant"));
-        assert!(redacted.contains("[REDACTED]"));
+        assert_eq!(redacted, "error: invalid_grant");
+
+        let unknown_json_error = r#"{"error": "SENTINEL_SECRET", "error_description": "SENTINEL_DESC"}"#;
+        let redacted_unknown = redact_oauth_error_body(unknown_json_error);
+        assert!(!redacted_unknown.contains("SENTINEL_SECRET"));
+        assert!(!redacted_unknown.contains("SENTINEL_DESC"));
+        assert_eq!(redacted_unknown, "error: oauth_error");
 
         let non_json_error = "<html><body>502 Bad Gateway with secret code=12345</body></html>";
         let redacted_non_json = redact_oauth_error_body(non_json_error);

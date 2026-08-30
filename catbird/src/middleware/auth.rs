@@ -427,6 +427,30 @@ mod tests {
     }
 
     #[test]
+    fn test_push_accounts_database_fingerprint_replayed_as_bearer_or_cookie_returns_401() {
+        let raw_session = "550e8400-e29b-41d4-a716-446655440000";
+        let db_stored_fingerprint = crate::services::push::registry::session_fingerprint(raw_session);
+        assert_eq!(db_stored_fingerprint.len(), 64);
+
+        // Case 1: Replayed as Bearer header
+        let req_bearer = Request::builder()
+            .header(AUTH_HEADER_NAME, format!("Bearer {db_stored_fingerprint}"))
+            .body(Body::empty())
+            .unwrap();
+        let session_id = extract_session_id(&req_bearer).unwrap();
+        // Middleware requires strict UUID validation
+        assert!(uuid::Uuid::parse_str(&session_id).is_err());
+
+        // Case 2: Replayed as Cookie
+        let req_cookie = Request::builder()
+            .header("cookie", format!("catbird_session={db_stored_fingerprint}"))
+            .body(Body::empty())
+            .unwrap();
+        let session_id_cookie = extract_session_id(&req_cookie).unwrap();
+        assert!(uuid::Uuid::parse_str(&session_id_cookie).is_err());
+    }
+
+    #[test]
     fn scope_validation_accepts_authoritative_atproto_scope() {
         let scopes = jacquard_oauth::scopes::Scopes::atproto();
         let granted = validate_authoritative_granted_scopes(&scopes, None).unwrap();

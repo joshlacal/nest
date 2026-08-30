@@ -24,7 +24,7 @@ jacquard-oauth = { git = "https://tangled.org/nonbinary.computer/jacquard", rev 
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }
 jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["dns", "cache"] }
 jose-jwk = { version = "0.1", features = ["p256"] }
-catbird-atproto = { path = "../../catbird-atproto" }
+catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-bluecatbird", "namespace-site-standard"] }
 
 # Encryption
 aes-gcm = "0.10"
