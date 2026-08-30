@@ -185,6 +185,18 @@ pub fn validate_record(
     candidate: &RecordCandidate,
     policy: &ValidationPolicy,
 ) -> Result<ValidatedRecord, InvalidRecord> {
+    // Canonical RecordKey validation (Finding 28)
+    if candidate
+        .rkey
+        .parse::<catbird_atproto::jacquard_common::types::string::Rkey>()
+        .is_err()
+    {
+        return Err(InvalidRecord::MalformedRecord(format!(
+            "Invalid RecordKey format '{}'",
+            candidate.rkey
+        )));
+    }
+
     // 1. Reject any floats or malformed JSON via IPLD converter
     crate::commit::json_to_ipld(&candidate.value)
         .map_err(|e| InvalidRecord::MalformedRecord(format!("Invalid IPLD/JSON format: {e}")))?;
@@ -207,44 +219,70 @@ pub fn validate_record(
     match candidate.collection.as_str() {
         "app.bsky.feed.post" => {
             // Deserialize into generated Post type (strictly validates schema, tags, and field types)
-            let post: Post = serde_json::from_value(norm_value)
-                .map_err(|e| InvalidRecord::MalformedRecord(format!("Invalid app.bsky.feed.post schema: {e}")))?;
+            let post: Post = serde_json::from_value(norm_value).map_err(|e| {
+                InvalidRecord::MalformedRecord(format!("Invalid app.bsky.feed.post schema: {e}"))
+            })?;
 
             // Run generated Lexicon constraint validation
-            post.validate()
-                .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for post: {e}")))?;
+            post.validate().map_err(|e| {
+                InvalidRecord::MalformedRecord(format!("Lexicon validation failed for post: {e}"))
+            })?;
             if let Some(labels) = &post.labels {
-                labels.validate()
-                    .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for labels: {e}")))?;
+                labels.validate().map_err(|e| {
+                    InvalidRecord::MalformedRecord(format!(
+                        "Lexicon validation failed for labels: {e}"
+                    ))
+                })?;
                 for label in &labels.values {
-                    label.validate()
-                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for label: {e}")))?;
+                    label.validate().map_err(|e| {
+                        InvalidRecord::MalformedRecord(format!(
+                            "Lexicon validation failed for label: {e}"
+                        ))
+                    })?;
                     if label.val.is_empty() || label.val.len() > 128 {
-                        return Err(InvalidRecord::MalformedRecord("SelfLabel val must be 1..128 characters".into()));
+                        return Err(InvalidRecord::MalformedRecord(
+                            "SelfLabel val must be 1..128 characters".into(),
+                        ));
                     }
                 }
             }
 
             if let Some(entities) = &post.entities {
                 for entity in entities {
-                    entity.validate()
-                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for entity: {e}")))?;
-                    entity.index.validate()
-                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for entity index: {e}")))?;
+                    entity.validate().map_err(|e| {
+                        InvalidRecord::MalformedRecord(format!(
+                            "Lexicon validation failed for entity: {e}"
+                        ))
+                    })?;
+                    entity.index.validate().map_err(|e| {
+                        InvalidRecord::MalformedRecord(format!(
+                            "Lexicon validation failed for entity index: {e}"
+                        ))
+                    })?;
                     if entity.index.start < 0 || entity.index.end < entity.index.start {
-                        return Err(InvalidRecord::MalformedRecord("Invalid entity text slice index range".into()));
+                        return Err(InvalidRecord::MalformedRecord(
+                            "Invalid entity text slice index range".into(),
+                        ));
                     }
                 }
             }
 
             if let Some(facets) = &post.facets {
                 for facet in facets {
-                    facet.validate()
-                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for facet: {e}")))?;
-                    facet.index.validate()
-                        .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for facet index: {e}")))?;
+                    facet.validate().map_err(|e| {
+                        InvalidRecord::MalformedRecord(format!(
+                            "Lexicon validation failed for facet: {e}"
+                        ))
+                    })?;
+                    facet.index.validate().map_err(|e| {
+                        InvalidRecord::MalformedRecord(format!(
+                            "Lexicon validation failed for facet index: {e}"
+                        ))
+                    })?;
                     if facet.index.byte_start < 0 || facet.index.byte_end < facet.index.byte_start {
-                        return Err(InvalidRecord::MalformedRecord("Invalid facet byte slice index range".into()));
+                        return Err(InvalidRecord::MalformedRecord(
+                            "Invalid facet byte slice index range".into(),
+                        ));
                     }
                     for feature in &facet.features {
                         match feature {
@@ -288,14 +326,23 @@ pub fn validate_record(
             if let Some(embed) = &post.embed {
                 match embed {
                     PostEmbed::Images(images) => {
-                        images.validate()
-                            .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for embed images: {e}")))?;
+                        images.validate().map_err(|e| {
+                            InvalidRecord::MalformedRecord(format!(
+                                "Lexicon validation failed for embed images: {e}"
+                            ))
+                        })?;
                         for img in &images.images {
-                            img.validate()
-                                .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for embed image: {e}")))?;
+                            img.validate().map_err(|e| {
+                                InvalidRecord::MalformedRecord(format!(
+                                    "Lexicon validation failed for embed image: {e}"
+                                ))
+                            })?;
                             if let Some(ar) = &img.aspect_ratio {
-                                ar.validate()
-                                    .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for aspect ratio: {e}")))?;
+                                ar.validate().map_err(|e| {
+                                    InvalidRecord::MalformedRecord(format!(
+                                        "Lexicon validation failed for aspect ratio: {e}"
+                                    ))
+                                })?;
                             }
                         }
                     }
@@ -310,8 +357,20 @@ pub fn validate_record(
                     return Err(InvalidRecord::NotMember);
                 }
 
-                let raw_parent_uri = candidate.value.get("reply").and_then(|r| r.get("parent")).and_then(|p| p.get("uri")).and_then(|u| u.as_str()).unwrap_or(reply.parent.uri.as_ref());
-                let raw_root_uri = candidate.value.get("reply").and_then(|r| r.get("root")).and_then(|p| p.get("uri")).and_then(|u| u.as_str()).unwrap_or(reply.root.uri.as_ref());
+                let raw_parent_uri = candidate
+                    .value
+                    .get("reply")
+                    .and_then(|r| r.get("parent"))
+                    .and_then(|p| p.get("uri"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or(reply.parent.uri.as_ref());
+                let raw_root_uri = candidate
+                    .value
+                    .get("reply")
+                    .and_then(|r| r.get("root"))
+                    .and_then(|p| p.get("uri"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or(reply.root.uri.as_ref());
 
                 let parent_uri = reply.parent.uri.as_ref();
                 let parent_cid = reply.parent.cid.as_ref();
@@ -319,8 +378,14 @@ pub fn validate_record(
                 let root_cid = reply.root.cid.as_ref();
 
                 // Parent and root must be known same-space post URIs with matching CIDs
-                let known_parent_cid = policy.known_posts.get(raw_parent_uri).or_else(|| policy.known_posts.get(parent_uri));
-                let known_root_cid = policy.known_posts.get(raw_root_uri).or_else(|| policy.known_posts.get(root_uri));
+                let known_parent_cid = policy
+                    .known_posts
+                    .get(raw_parent_uri)
+                    .or_else(|| policy.known_posts.get(parent_uri));
+                let known_root_cid = policy
+                    .known_posts
+                    .get(raw_root_uri)
+                    .or_else(|| policy.known_posts.get(root_uri));
                 match (known_parent_cid, known_root_cid) {
                     (Some(expected_parent_cid), Some(expected_root_cid)) => {
                         if expected_parent_cid != parent_cid || expected_root_cid != root_cid {
@@ -368,23 +433,34 @@ pub fn validate_record(
         }
         "app.bsky.feed.like" => {
             // Deserialize into generated Like type
-            let like: Like = serde_json::from_value(norm_value)
-                .map_err(|e| InvalidRecord::MalformedRecord(format!("Invalid app.bsky.feed.like schema: {e}")))?;
+            let like: Like = serde_json::from_value(norm_value).map_err(|e| {
+                InvalidRecord::MalformedRecord(format!("Invalid app.bsky.feed.like schema: {e}"))
+            })?;
 
             // Run generated Lexicon constraint validation
-            like.validate()
-                .map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for like: {e}")))?;
+            like.validate().map_err(|e| {
+                InvalidRecord::MalformedRecord(format!("Lexicon validation failed for like: {e}"))
+            })?;
 
             if !policy.has_membership(&candidate.author_did) {
                 return Err(InvalidRecord::NotMember);
             }
             let created_at = like.created_at.as_ref().with_timezone(&Utc);
 
-            let raw_subject_uri = candidate.value.get("subject").and_then(|s| s.get("uri")).and_then(|u| u.as_str()).unwrap_or(like.subject.uri.as_ref());
+            let raw_subject_uri = candidate
+                .value
+                .get("subject")
+                .and_then(|s| s.get("uri"))
+                .and_then(|u| u.as_str())
+                .unwrap_or(like.subject.uri.as_ref());
             let subject_uri = like.subject.uri.as_ref();
             let subject_cid = like.subject.cid.as_ref();
 
-            match policy.known_posts.get(raw_subject_uri).or_else(|| policy.known_posts.get(subject_uri)) {
+            match policy
+                .known_posts
+                .get(raw_subject_uri)
+                .or_else(|| policy.known_posts.get(subject_uri))
+            {
                 Some(expected_cid) => {
                     if expected_cid != subject_cid {
                         return Err(InvalidRecord::CrossSpaceReference);
@@ -425,21 +501,39 @@ pub fn compute_uri_hash(uri: &str) -> Vec<u8> {
 
 pub async fn persist_rejection(
     pool: &sqlx::PgPool,
+    space_uri: &str,
+    author_did: &str,
+    rev: &str,
     uri: &str,
     reason: &InvalidRecord,
 ) -> Result<(), sqlx::Error> {
     let uri_hash = compute_uri_hash(uri);
     sqlx::query(
         r#"
-        INSERT INTO circle_rejections (uri_hash, reason_code, observed_at)
-        VALUES ($1, $2, now())
-        ON CONFLICT (uri_hash) DO NOTHING
+        INSERT INTO circle_rejections (space_uri, author_did, rev, uri_hash, reason_code, observed_at)
+        VALUES ($1, $2, $3, $4, $5, now())
+        ON CONFLICT (space_uri, author_did, rev, uri_hash) DO UPDATE SET
+            reason_code = EXCLUDED.reason_code,
+            observed_at = now()
         "#,
     )
+    .bind(space_uri)
+    .bind(author_did)
+    .bind(rev)
     .bind(&uri_hash)
     .bind(reason.reason_code())
     .execute(pool)
     .await?;
 
     Ok(())
+}
+
+pub async fn prune_rejections(pool: &sqlx::PgPool, max_age_days: i32) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "DELETE FROM circle_rejections WHERE observed_at < now() - make_interval(days => $1)",
+    )
+    .bind(max_age_days)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }

@@ -70,7 +70,9 @@ pub async fn report_record(
         ReportRecordReason::Abuse => "abuse",
         ReportRecordReason::Other => "other",
         ReportRecordReason::UnknownValue(val) => {
-            return Err(AppError::InvalidRequest(format!("Unknown report reason: {val}")));
+            return Err(AppError::InvalidRequest(format!(
+                "Unknown report reason: {val}"
+            )));
         }
     };
 

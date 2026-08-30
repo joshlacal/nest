@@ -6,9 +6,6 @@
 use catbird_atproto::generated::blue_catbird::circle::activate_circle::{
     ActivateCircle, ActivateCircleOutput,
 };
-use catbird_atproto::generated::blue_catbird::circle::{
-    CircleSummary, NotificationReason,
-};
 use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
 use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
@@ -25,6 +22,7 @@ use catbird_atproto::generated::blue_catbird::circle::report_record::{
 use catbird_atproto::generated::blue_catbird::circle::update_preferences::{
     UpdatePreferences, UpdatePreferencesOutput,
 };
+use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, NotificationReason};
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Did, Tid};
@@ -32,24 +30,36 @@ use serde_json::json;
 
 #[test]
 fn test_activate_circle_contract_serialization() {
-    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
+    let space_uri = AtSpaceUri::new(SmolStr::new(
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+    ))
+    .unwrap();
     let input = ActivateCircle {
         space: space_uri,
         extra_data: None,
     };
 
     let serialized = serde_json::to_value(&input).unwrap();
-    assert_eq!(serialized["space"], "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
+    assert_eq!(
+        serialized["space"],
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+    );
 
     let deserialized: ActivateCircle = serde_json::from_value(serialized).unwrap();
-    assert_eq!(deserialized.space.as_str(), "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
+    assert_eq!(
+        deserialized.space.as_str(),
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+    );
 }
 
 #[test]
 fn test_activate_circle_output_contract() {
     let circle_summary = CircleSummary {
         circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
-        uri: AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap(),
+        uri: AtSpaceUri::new(SmolStr::new(
+            "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+        ))
+        .unwrap(),
         name: SmolStr::new("Test Circle"),
         owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
         member_count: Some(5),
@@ -77,7 +87,10 @@ fn test_activate_circle_output_contract() {
 fn test_circle_summary_contract() {
     let summary = CircleSummary {
         circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
-        uri: AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap(),
+        uri: AtSpaceUri::new(SmolStr::new(
+            "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+        ))
+        .unwrap(),
         name: SmolStr::new("Alice's Inner Circle"),
         owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
         member_count: Some(42),
@@ -87,7 +100,10 @@ fn test_circle_summary_contract() {
 
     let serialized = serde_json::to_value(&summary).unwrap();
     assert_eq!(serialized["circleId"], "3l7aaaaaaaaaa");
-    assert_eq!(serialized["uri"], "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
+    assert_eq!(
+        serialized["uri"],
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+    );
     assert_eq!(serialized["name"], "Alice's Inner Circle");
     assert_eq!(serialized["owner"], "did:plc:alice");
     assert_eq!(serialized["memberCount"], 42);
@@ -149,20 +165,29 @@ fn test_get_capabilities_output_contract() {
 
     let serialized = serde_json::to_value(&output).unwrap();
     assert_eq!(serialized["enabled"], true);
-    assert_eq!(serialized["protocolRevision"], "89deb9faca20e56fa2a262fe9746ed52bc1095ba");
+    assert_eq!(
+        serialized["protocolRevision"],
+        "89deb9faca20e56fa2a262fe9746ed52bc1095ba"
+    );
     assert_eq!(serialized["supportsImages"], true);
 }
 
 #[test]
 fn test_get_feed_query_and_output_contract() {
-    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
+    let space_uri = AtSpaceUri::new(SmolStr::new(
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+    ))
+    .unwrap();
     let query = GetFeed {
         cursor: Some(SmolStr::new("cursor123")),
         limit: Some(25),
         space: Some(space_uri),
     };
     let serialized = serde_json::to_value(&query).unwrap();
-    assert_eq!(serialized["space"], "at://did:plc:alice/space/blue.catbird.circle/3l7skey");
+    assert_eq!(
+        serialized["space"],
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+    );
     assert_eq!(serialized["limit"], 25);
     assert_eq!(serialized["cursor"], "cursor123");
 
@@ -218,8 +243,14 @@ fn test_list_notifications_query_and_output_contract() {
 
 #[test]
 fn test_get_media_and_post_thread_contract() {
-    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
-    let aturi = AtUri::new(SmolStr::new("at://did:plc:alice/app.bsky.feed.post/3l7rkey")).unwrap();
+    let space_uri = AtSpaceUri::new(SmolStr::new(
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+    ))
+    .unwrap();
+    let aturi = AtUri::new(SmolStr::new(
+        "at://did:plc:alice/app.bsky.feed.post/3l7rkey",
+    ))
+    .unwrap();
     let did = Did::new(SmolStr::new("did:plc:alice")).unwrap();
     let media = GetMedia {
         cid: Cid::new(b"bafkreibblob").unwrap(),
@@ -243,8 +274,14 @@ fn test_get_media_and_post_thread_contract() {
 
 #[test]
 fn test_moderation_and_preferences_contract() {
-    let space_uri = AtSpaceUri::new(SmolStr::new("at://did:plc:alice/space/blue.catbird.circle/3l7skey")).unwrap();
-    let aturi = AtUri::new(SmolStr::new("at://did:plc:alice/app.bsky.feed.post/3l7rkey")).unwrap();
+    let space_uri = AtSpaceUri::new(SmolStr::new(
+        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+    ))
+    .unwrap();
+    let aturi = AtUri::new(SmolStr::new(
+        "at://did:plc:alice/app.bsky.feed.post/3l7rkey",
+    ))
+    .unwrap();
 
     let report = ReportRecord {
         details: Some(SmolStr::new("Inappropriate content")),

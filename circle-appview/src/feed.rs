@@ -8,10 +8,8 @@ use catbird_atproto::generated::app_bsky::embed::images::{View as ImagesView, Vi
 use catbird_atproto::generated::app_bsky::feed::{
     FeedViewPost, PostView, PostViewEmbed, ViewerState,
 };
-use catbird_atproto::generated::blue_catbird::circle::{
-    CircleSummary, FeedItem,
-};
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
+use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, FeedItem};
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Tid, UriValue};
@@ -78,7 +76,11 @@ pub fn build_post_view(
                 .ok_or_else(|| AppError::InvalidRequest("Invalid images embed".into()))?;
             let mut view_images = Vec::new();
             for img in images_val {
-                let alt = img.get("alt").and_then(|a| a.as_str()).unwrap_or("").to_string();
+                let alt = img
+                    .get("alt")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let blob_cid = img
                     .get("image")
                     .and_then(|i| i.get("ref"))
@@ -92,7 +94,11 @@ pub fn build_post_view(
 
                 let blob_cid = match blob_cid {
                     Some(cid) if !cid.is_empty() => cid,
-                    _ => return Err(AppError::InvalidRequest("Missing blob CID in image embed".into())),
+                    _ => {
+                        return Err(AppError::InvalidRequest(
+                            "Missing blob CID in image embed".into(),
+                        ))
+                    }
                 };
 
                 let mut media_url_parsed = media_base_url
@@ -316,9 +322,9 @@ pub async fn get_feed(
              ) AS reply_count,
             (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
         FROM circle_records r
-        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
+        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
         JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1
-        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
         WHERE r.collection = 'app.bsky.feed.post'
           AND r.deleted_at IS NULL
@@ -396,8 +402,9 @@ pub async fn get_feed(
             .map_err(|e| AppError::Internal(format!("Invalid circle TID '{circle_id}': {e}")))?;
         let circle_space_ref = AtSpaceUri::new(SmolStr::new(space_uri))
             .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
-        let circle_owner_did = Did::new(SmolStr::new(circle_owner))
-            .map_err(|e| AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}")))?;
+        let circle_owner_did = Did::new(SmolStr::new(circle_owner)).map_err(|e| {
+            AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}"))
+        })?;
 
         let circle_summary = CircleSummary {
             circle_id: circle_tid,

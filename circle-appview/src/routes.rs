@@ -4,25 +4,25 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use catbird_atproto::generated::blue_catbird::circle::{
     activate_circle::{ActivateCircle, ActivateCircleOutput},
-    CircleSummary,
     get_capabilities::GetCapabilitiesOutput,
     list_circles::{ListCircles, ListCirclesOutput},
+    CircleSummary,
 };
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::string::{Did, Tid};
 use chrono::{DateTime, Utc};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::CIRCLE_PROTOCOL_REVISION;
 use crate::access;
 use crate::auth::{self, AuthenticatedUser};
 use crate::config::AppState;
 use crate::error::AppError;
+use crate::CIRCLE_PROTOCOL_REVISION;
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -103,7 +103,43 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(public_routes)
         .merge(authenticated_routes)
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+pub async fn request_id_middleware(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 64
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    req.extensions_mut()
+        .insert(crate::error::RequestId(id.clone()));
+
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %id,
+        method = %req.method(),
+        uri = %req.uri().path(),
+    );
+    use tracing::Instrument;
+    let mut response = next.run(req).instrument(span).await;
+
+    if let Ok(header_value) = id.parse() {
+        response.headers_mut().insert("x-request-id", header_value);
+    }
+    response
 }
 
 async fn health_check() -> Json<HealthResponse> {
@@ -192,11 +228,13 @@ async fn list_circles_handler(
         LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $1
-        WHERE c.deleted_at IS NULL
+        WHERE c.deleted_at IS NULL AND c.app_access_granted = true
           AND (
               c.authority_did = $1
               OR (
                   m.member_did IS NOT NULL
+                  AND meta.app_access_granted = true
+                  AND meta.access_epoch = c.access_epoch
                   AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
               )
           )
@@ -236,7 +274,9 @@ async fn list_circles_handler(
     };
 
     let mut circles = Vec::with_capacity(result_rows.len());
-    for (space_uri, circle_id, authority_did, display_name, _created_at, muted, member_count) in result_rows {
+    for (space_uri, circle_id, authority_did, display_name, _created_at, muted, member_count) in
+        result_rows
+    {
         let circle_tid = Tid::new(SmolStr::new(circle_id))
             .map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
         let uri = AtSpaceUri::new(SmolStr::new(space_uri))

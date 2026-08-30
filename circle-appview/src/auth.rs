@@ -132,7 +132,10 @@ pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, Au
         if x.len() != 32 {
             return Err(AuthReason::InvalidCoordinates);
         }
-        let bytes: &[u8; 32] = x.as_slice().try_into().map_err(|_| AuthReason::InvalidCoordinates)?;
+        let bytes: &[u8; 32] = x
+            .as_slice()
+            .try_into()
+            .map_err(|_| AuthReason::InvalidCoordinates)?;
         let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes)
             .map_err(|_| AuthReason::InvalidCoordinates)?;
         return Ok(ParsedVerifyingKey::Ed25519(vk));
@@ -194,7 +197,9 @@ pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifying
             if key_bytes.len() != 32 {
                 return Err(AuthReason::InvalidCoordinates);
             }
-            let bytes: &[u8; 32] = key_bytes.try_into().map_err(|_| AuthReason::InvalidCoordinates)?;
+            let bytes: &[u8; 32] = key_bytes
+                .try_into()
+                .map_err(|_| AuthReason::InvalidCoordinates)?;
             let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes)
                 .map_err(|_| AuthReason::InvalidCoordinates)?;
             return Ok(ParsedVerifyingKey::Ed25519(vk));
@@ -278,6 +283,13 @@ impl DefaultDidWebTransport {
             allow_loopback_for_test: allow_loopback,
         }
     }
+
+    pub fn with_loopback(allow_loopback: bool) -> Self {
+        Self {
+            test_root_cert: None,
+            allow_loopback_for_test: allow_loopback,
+        }
+    }
 }
 
 /// Builds the pinned reqwest client used for did:web document fetches.
@@ -349,27 +361,157 @@ impl DidWebTransport for DefaultDidWebTransport {
                 return Err(AuthReason::DidResolutionFailed);
             }
 
-            resp.json::<DidDocument>()
+            let body_bytes = read_bounded_response_bytes(resp, MAX_DID_DOC_BYTES)
                 .await
+                .map_err(|_| AuthReason::DidDocumentInvalid)?;
+
+            serde_json::from_slice::<DidDocument>(&body_bytes)
                 .map_err(|_| AuthReason::DidDocumentInvalid)
         })
     }
 }
+pub const DID_AUTH_REVOCATION_SLO_SECS: i64 = 60;
+pub const FRESH_RESOLUTION_COOLDOWN_SECS: i64 = 5;
+pub const MAX_DID_DOC_BYTES: usize = 512 * 1024; // 512 KiB
+pub const MAX_JWKS_BYTES: usize = 512 * 1024; // 512 KiB
+pub const MAX_CONCURRENT_PUBLIC_FLOWS: usize = 32;
+pub const MAX_AGGREGATE_PUBLIC_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// Budget class distinguishing unauthenticated public flows from authenticated Space transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteBudget {
+    /// Unauthenticated public flows (OAuth metadata discovery, PAR, token exchange/refresh,
+    /// DID resolution, JWKS) subject to the 16 MiB aggregate public memory budget (`MAX_AGGREGATE_PUBLIC_BYTES`).
+    PublicFlow,
+    /// Authenticated Space-host transfers (CAR files, blobs, space RPC responses) bounded by
+    /// their own per-response limits (e.g. 50 MiB CAR, 20 MiB blob) without consuming the public budget.
+    AuthenticatedSpace,
+}
+
+static PUBLIC_FLOW_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PUBLIC_FLOWS)));
+static PUBLIC_BYTE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn public_flow_semaphore() -> Arc<tokio::sync::Semaphore> {
+    PUBLIC_FLOW_SEMAPHORE.clone()
+}
+
+pub fn current_aggregate_public_bytes() -> usize {
+    PUBLIC_BYTE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drop guard for aggregate public byte budget to prevent reservation leaks on errors, early returns, or cancellation.
+pub struct AggregateByteGuard(pub usize);
+
+impl Drop for AggregateByteGuard {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            PUBLIC_BYTE_BUDGET.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Read an HTTP response body with an explicit maximum byte limit to prevent decompression/memory exhaustion.
+/// For unauthenticated public flows (`ByteBudget::PublicFlow`), enforces Content-Length validation,
+/// streaming chunk size checks, and aggregate public flow byte budget (`MAX_AGGREGATE_PUBLIC_BYTES`).
+/// For authenticated Space transfers (`ByteBudget::AuthenticatedSpace`), enforces per-response limits
+/// without consuming or being rejected by the public aggregate budget.
+pub async fn read_bounded_response_bytes_with_budget(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    budget: ByteBudget,
+) -> Result<Vec<u8>, AppError> {
+    if let Some(len) = response.content_length() {
+        if len > max_bytes as u64 {
+            return Err(AppError::InvalidRequest(format!(
+                "Response Content-Length {len} exceeds limit of {max_bytes} bytes"
+            )));
+        }
+    }
+    let mut body = Vec::new();
+    let mut guard = AggregateByteGuard(0);
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed reading response chunk: {e}")))?
+    {
+        let chunk_len = chunk.len();
+        if body.len() + chunk_len > max_bytes {
+            return Err(AppError::InvalidRequest(format!(
+                "Response body exceeded maximum allowed size of {max_bytes} bytes"
+            )));
+        }
+
+        if budget == ByteBudget::PublicFlow {
+            let prev =
+                PUBLIC_BYTE_BUDGET.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed);
+            guard.0 += chunk_len;
+            if prev + chunk_len > MAX_AGGREGATE_PUBLIC_BYTES {
+                return Err(AppError::InvalidRequest(format!(
+                    "Aggregate public flow byte budget of {MAX_AGGREGATE_PUBLIC_BYTES} bytes exceeded"
+                )));
+            }
+        }
+
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+/// Read unauthenticated public flow response with aggregate public byte budget enforcement.
+pub async fn read_bounded_public_response_bytes(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
+    read_bounded_response_bytes_with_budget(response, max_bytes, ByteBudget::PublicFlow).await
+}
+
+/// Read authenticated Space transfer response (e.g. CAR files, blobs) with per-response size limits.
+pub async fn read_bounded_authenticated_response_bytes(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
+    read_bounded_response_bytes_with_budget(response, max_bytes, ByteBudget::AuthenticatedSpace)
+        .await
+}
+
+/// Default public flow response reader (for backward compatibility).
+pub async fn read_bounded_response_bytes(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
+    read_bounded_public_response_bytes(response, max_bytes).await
+}
+
+pub const MAX_DID_CACHE_CAPACITY: usize = 10_000;
 pub struct DidResolver {
     plc_directory_url: String,
     http_client: reqwest::Client,
     pub web_transport: Arc<dyn DidWebTransport>,
+    capacity: usize,
     cache: RwLock<HashMap<String, (DidDocument, DateTime<Utc>)>>,
+    last_fresh_resolution: RwLock<HashMap<String, std::time::Instant>>,
 }
 
 impl DidResolver {
     pub fn new(plc_directory_url: String, http_client: reqwest::Client) -> Self {
+        Self::with_capacity(plc_directory_url, http_client, MAX_DID_CACHE_CAPACITY)
+    }
+
+    pub fn with_capacity(
+        plc_directory_url: String,
+        http_client: reqwest::Client,
+        capacity: usize,
+    ) -> Self {
         Self {
             plc_directory_url,
             http_client,
             web_transport: Arc::new(DefaultDidWebTransport::new()),
+            capacity,
             cache: RwLock::new(HashMap::new()),
+            last_fresh_resolution: RwLock::new(HashMap::new()),
         }
     }
 
@@ -382,23 +524,100 @@ impl DidResolver {
             plc_directory_url,
             http_client,
             web_transport,
+            capacity: MAX_DID_CACHE_CAPACITY,
             cache: RwLock::new(HashMap::new()),
+            last_fresh_resolution: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Invalidate any cached DID document for a DID.
+    pub fn invalidate_cached(&self, did: &str) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(did);
+        }
+    }
+
+    /// Return total cached entries count.
+    pub fn cached_count(&self) -> usize {
+        if let Ok(cache) = self.cache.read() {
+            cache.len()
+        } else {
+            0
         }
     }
 
     /// Insert or override a DID document directly in cache (useful for testing)
     pub fn insert_cached(&self, did: String, doc: DidDocument) {
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(did, (doc, Utc::now() + chrono::Duration::hours(24)));
-        }
+        self.insert_cached_with_ttl(
+            did,
+            doc,
+            chrono::Duration::seconds(DID_AUTH_REVOCATION_SLO_SECS),
+        );
     }
 
+    /// Insert with explicit TTL and enforce capacity + expired eviction
+    pub fn insert_cached_with_ttl(&self, did: String, doc: DidDocument, ttl: chrono::Duration) {
+        if let Ok(mut cache) = self.cache.write() {
+            let now = Utc::now();
+            cache.retain(|_, (_, exp)| *exp > now);
+            if cache.len() >= self.capacity && !cache.contains_key(&did) {
+                // Evict oldest/earliest expiring entry
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, exp))| *exp)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(did, (doc, now + ttl));
+        }
+    }
     pub async fn resolve(&self, did: &str) -> Result<DidDocument, AuthReason> {
-        // Check in-memory cache
-        if let Ok(cache) = self.cache.read() {
-            if let Some((doc, exp)) = cache.get(did) {
-                if *exp > Utc::now() {
-                    return Ok(doc.clone());
+        self.resolve_internal(did, false).await
+    }
+
+    /// Force fresh resolution from network/upstream and update cache (enforces revocation SLO).
+    /// Protected by a per-issuer cooldown and admission permit to prevent unauthenticated
+    /// bad-signature JWT floods from forcing unbounded uncached upstream fetches.
+    pub async fn resolve_fresh(&self, did: &str) -> Result<DidDocument, AuthReason> {
+        // Check per-issuer cooldown: if fresh resolution was performed very recently,
+        // serve cached document to mitigate flood of unauthenticated invalid-signature requests.
+        if let Ok(mut last_map) = self.last_fresh_resolution.write() {
+            if let Some(last_time) = last_map.get(did) {
+                if last_time.elapsed()
+                    < std::time::Duration::from_secs(FRESH_RESOLUTION_COOLDOWN_SECS as u64)
+                {
+                    if let Ok(cache) = self.cache.read() {
+                        if let Some((doc, _)) = cache.get(did) {
+                            return Ok(doc.clone());
+                        }
+                    }
+                }
+            }
+            last_map.insert(did.to_string(), std::time::Instant::now());
+        }
+
+        // Acquire admission permit to bound concurrent upstream resolution calls
+        let _permit = public_flow_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthReason::DidResolutionFailed)?;
+        self.resolve_internal(did, true).await
+    }
+
+    async fn resolve_internal(
+        &self,
+        did: &str,
+        force_fresh: bool,
+    ) -> Result<DidDocument, AuthReason> {
+        // Check in-memory cache if not forced fresh
+        if !force_fresh {
+            if let Ok(cache) = self.cache.read() {
+                if let Some((doc, exp)) = cache.get(did) {
+                    if *exp > Utc::now() {
+                        return Ok(doc.clone());
+                    }
                 }
             }
         }
@@ -411,13 +630,12 @@ impl DidResolver {
             return Err(AuthReason::UnsupportedDidMethod);
         };
 
-        // Cache resolved document
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(
-                did.to_string(),
-                (doc.clone(), Utc::now() + chrono::Duration::hours(1)),
-            );
-        }
+        // Cache resolved document with configured <= 60s revocation SLO TTL
+        self.insert_cached_with_ttl(
+            did.to_string(),
+            doc.clone(),
+            chrono::Duration::seconds(DID_AUTH_REVOCATION_SLO_SECS),
+        );
 
         Ok(doc)
     }
@@ -435,8 +653,11 @@ impl DidResolver {
             return Err(AuthReason::DidResolutionFailed);
         }
 
-        resp.json::<DidDocument>()
+        let body_bytes = read_bounded_response_bytes(resp, MAX_DID_DOC_BYTES)
             .await
+            .map_err(|_| AuthReason::DidDocumentInvalid)?;
+
+        serde_json::from_slice::<DidDocument>(&body_bytes)
             .map_err(|_| AuthReason::DidDocumentInvalid)
     }
 
@@ -514,7 +735,11 @@ impl DidResolver {
         let service = doc
             .service
             .iter()
-            .find(|s| s.id == "#atproto_pds" || s.id == pds_full_id || s.r#type == "AtprotoPersonalDataServer")
+            .find(|s| {
+                s.id == "#atproto_pds"
+                    || s.id == pds_full_id
+                    || s.r#type == "AtprotoPersonalDataServer"
+            })
             .ok_or(AuthReason::NoVerificationMethod)?;
         Ok(service.service_endpoint.clone())
     }
@@ -566,10 +791,11 @@ pub async fn fetch_https_jwks(
     if !resp.status().is_success() {
         return Err(AuthReason::DidResolutionFailed);
     }
-    let jwks: JwksDocument = resp
-        .json()
+    let body_bytes = read_bounded_response_bytes(resp, MAX_JWKS_BYTES)
         .await
         .map_err(|_| AuthReason::DidDocumentInvalid)?;
+    let jwks: JwksDocument =
+        serde_json::from_slice(&body_bytes).map_err(|_| AuthReason::DidDocumentInvalid)?;
     let mut parsed_keys = Vec::new();
     for jwk in &jwks.keys {
         if let Ok(k) = parse_public_key_jwk(jwk) {
@@ -664,7 +890,6 @@ pub fn select_authority_verification_method<'a>(
     Ok(selected)
 }
 
-
 pub async fn verify_service_jwt(
     state: &AppState,
     token: &str,
@@ -754,17 +979,22 @@ pub async fn verify_service_jwt(
         .await
         .map_err(AppError::Unauthorized)?;
 
-    let vm = select_verification_method(&did_doc, &claims.iss, header.kid.as_deref())
-        .map_err(AppError::Unauthorized)?;
-
-    let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
-
-    // Verify algorithm matches key curve
-    match (&key, header.alg.as_str()) {
-        (ParsedVerifyingKey::P256(_), "ES256") => {}
-        (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
-        _ => return Err(AppError::Unauthorized(AuthReason::AlgKeyMismatch)),
-    }
+    let verify_with_doc = |doc: &DidDocument,
+                           kid: Option<&str>,
+                           alg: &str,
+                           signing_input: &[u8],
+                           sig_bytes: &[u8]|
+     -> Result<(), AuthReason> {
+        let vm = select_verification_method(doc, &claims.iss, kid)?;
+        let key = parse_verification_key(vm)?;
+        match (&key, alg) {
+            (ParsedVerifyingKey::P256(_), "ES256") => {}
+            (ParsedVerifyingKey::Secp256k1(_), "ES256K") => {}
+            _ => return Err(AuthReason::AlgKeyMismatch),
+        }
+        key.verify(signing_input, sig_bytes)?;
+        Ok(())
+    };
 
     // 8. Verify cryptographic signature
     let sig_bytes = URL_SAFE_NO_PAD
@@ -772,9 +1002,28 @@ pub async fn verify_service_jwt(
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidSignatureFormat))?;
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    key.verify(signing_input.as_bytes(), &sig_bytes)
+    if let Err(_first_err) = verify_with_doc(
+        &did_doc,
+        header.kid.as_deref(),
+        header.alg.as_str(),
+        signing_input.as_bytes(),
+        &sig_bytes,
+    ) {
+        // If verification fails with cached key or algorithm mismatched, try resolving fresh from upstream (enforcing <= 60s revocation SLO)
+        let fresh_doc = state
+            .did_resolver
+            .resolve_fresh(&claims.iss)
+            .await
+            .map_err(AppError::Unauthorized)?;
+        verify_with_doc(
+            &fresh_doc,
+            header.kid.as_deref(),
+            header.alg.as_str(),
+            signing_input.as_bytes(),
+            &sig_bytes,
+        )
         .map_err(AppError::Unauthorized)?;
-
+    }
     // 9. Enforce single-use JTI replay protection
     let expires_at = DateTime::from_timestamp(claims.exp, 0)
         .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
@@ -1060,4 +1309,14 @@ pub fn is_localhost_hostname(host: &str) -> bool {
         || trimmed.ends_with(".invalid")
         || trimmed.ends_with(".test")
         || trimmed.ends_with(".example")
+}
+
+pub fn is_loopback_or_localhost(host: &str) -> bool {
+    if is_localhost_hostname(host) {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
 }
