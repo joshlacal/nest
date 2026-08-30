@@ -2811,6 +2811,19 @@ async fn jti_concurrent_exactly_once_insertion_and_backlog_drain(pool: PgPool) {
         !overflow,
         "Nonce exceeding MAX_ACTIVE_JTIS_PER_ISSUER must be rejected"
     );
+
+    // Other legitimate issuer must NOT be starved by the rate-limited issuer
+    let other_issuer = "did:plc:other-legitimate-issuer";
+    let other_res = db::consume_jti_nonce(
+        &pool,
+        "jti-other-issuer-1",
+        other_issuer,
+        CIRCLE_AUDIENCE,
+        exp,
+    )
+    .await
+    .unwrap();
+    assert!(other_res, "Legitimate issuer must not be starved");
 }
 
 #[tokio::test]
@@ -3071,4 +3084,32 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
         .await
         .unwrap();
     assert_eq!(space_config.name.as_deref(), Some("Test Space"));
+}
+
+#[tokio::test]
+async fn did_resolver_last_fresh_resolution_capacity_bounding() {
+    let did_resolver =
+        DidResolver::with_capacity("https://plc.directory".into(), reqwest::Client::new(), 5);
+
+    // Populate fresh resolutions
+    for i in 0..10 {
+        let did = format!("did:plc:flood-{i}");
+        // Cache doc so resolve_fresh doesn't need network
+        did_resolver.insert_cached(
+            did.clone(),
+            DidDocument {
+                id: did.clone(),
+                verification_method: vec![],
+                service: vec![],
+            },
+        );
+        let _ = did_resolver.resolve_fresh(&did).await;
+    }
+
+    // Capacity is 5, so fresh_resolution_count must be bounded by 5
+    assert!(
+        did_resolver.fresh_resolution_count() <= 5,
+        "last_fresh_resolution must be bounded by capacity, got {}",
+        did_resolver.fresh_resolution_count()
+    );
 }

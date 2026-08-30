@@ -1662,8 +1662,7 @@ pub async fn sweep_once_with_shutdown(
     )
     .fetch_optional(&state.db)
     .await
-    .unwrap_or(None);
-
+    .map_err(AppError::Database)?;
     let last_space_uri = last_checkpoint.map(|(s,)| s).unwrap_or_default();
 
     // Query active spaces in ordered sequence starting after checkpoint
@@ -1704,18 +1703,6 @@ pub async fn sweep_once_with_shutdown(
             tracing::info!("Sweep byte budget reached; checkpointing progress for fair resume");
             break;
         }
-
-        // Persist checkpoint for fair resume
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO circle_sweep_checkpoint (checkpoint_key, last_space_uri, updated_at)
-            VALUES ('revision_sweep', $1, now())
-            ON CONFLICT (checkpoint_key) DO UPDATE SET last_space_uri = EXCLUDED.last_space_uri, updated_at = now()
-            "#,
-        )
-        .bind(&space_uri)
-        .execute(&state.db)
-        .await;
 
         summary.spaces_checked += 1;
         let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
@@ -1854,6 +1841,19 @@ pub async fn sweep_once_with_shutdown(
                 break;
             }
         }
+
+        // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
+        sqlx::query(
+            r#"
+            INSERT INTO circle_sweep_checkpoint (checkpoint_key, last_space_uri, updated_at)
+            VALUES ('revision_sweep', $1, now())
+            ON CONFLICT (checkpoint_key) DO UPDATE SET last_space_uri = EXCLUDED.last_space_uri, updated_at = now()
+            "#,
+        )
+        .bind(&space_uri)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::Database)?;
     }
 
     Ok(summary)

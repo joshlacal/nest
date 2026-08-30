@@ -14,13 +14,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 pub const MAX_JTI_LEN: usize = 512;
 pub const MAX_ACTIVE_JTIS_PER_ISSUER: i64 = 1000;
-pub const MAX_ACTIVE_JTIS_GLOBAL: i64 = 200_000;
 pub const MAX_JTI_CLEANUP_BATCH_SIZE: i64 = 5000;
 pub const DEFAULT_CLEANUP_BATCHES_PER_RUN: usize = 50;
 
 /// Atomically consume a single-use JTI nonce under an issuer advisory lock and transaction.
 /// Returns Ok(true) if the nonce was new and recorded, or Ok(false) if it was already used (replay),
-/// invalid, or exceeded per-issuer or global active admission limits.
+/// invalid, or exceeded per-issuer active admission limits.
 pub async fn consume_jti_nonce(
     pool: &PgPool,
     jti: &str,
@@ -40,28 +39,24 @@ pub async fn consume_jti_nonce(
         .execute(&mut *tx)
         .await?;
 
-    // Check active unexpired JTIs count for this issuer to bound per-issuer retention/admission
+    // Bounded check of active unexpired JTIs count for this issuer to enforce per-issuer admission fairness
     let active_issuer_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM auth_jti_nonce WHERE issuer_did = $1 AND expires_at > now()",
+        r#"
+        SELECT COUNT(*) FROM (
+            SELECT 1 FROM auth_jti_nonce
+            WHERE issuer_did = $1 AND expires_at > now()
+            LIMIT $2
+        ) sub
+        "#,
     )
     .bind(issuer_did)
+    .bind(MAX_ACTIVE_JTIS_PER_ISSUER)
     .fetch_one(&mut *tx)
     .await?;
 
     if active_issuer_count.0 >= MAX_ACTIVE_JTIS_PER_ISSUER {
         return Ok(false);
     }
-
-    // Check global active unexpired JTIs count to enforce bounded global retention
-    let active_global_count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM auth_jti_nonce WHERE expires_at > now()")
-            .fetch_one(&mut *tx)
-            .await?;
-
-    if active_global_count.0 >= MAX_ACTIVE_JTIS_GLOBAL {
-        return Ok(false);
-    }
-
     let result = sqlx::query(
         r#"
         INSERT INTO auth_jti_nonce (jti, issuer_did, audience, expires_at, consumed_at)

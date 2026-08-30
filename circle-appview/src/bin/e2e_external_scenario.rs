@@ -491,6 +491,7 @@ impl ScenarioRunner {
     pub fn new(config: ScenarioConfig) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
         Self { config, client }
@@ -3096,4 +3097,39 @@ async fn main() {
 
     eprintln!("[e2e_scenario] STEP_15_SCENARIO_COMPLETE");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_scenario_client_does_not_follow_redirects() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/redirect-target"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "https://unvetted.example.com/stolen"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let res = client
+            .get(format!("{}/redirect-target", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::FOUND);
+    }
 }
