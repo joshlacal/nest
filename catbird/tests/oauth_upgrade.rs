@@ -45,7 +45,7 @@ use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 use catbird::config::{AppConfig, AppState, JacquardOAuthClient};
 use catbird::models::{ALLOWLISTED_UPGRADE_SCOPES, FIXED_UPGRADE_CALLBACK_URL};
 use catbird::routes::atproto::create_router;
-use catbird::services::{OAuthUpgradeService, RedisAuthStore, DEFAULT_UPGRADE_CALLBACK_URL};
+use catbird::services::{HardenedHttpClient, OAuthUpgradeService, RedisAuthStore, DEFAULT_UPGRADE_CALLBACK_URL};
 
 /// Test encryption key for deterministic AES-256-GCM fixture storage
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42u8; 32];
@@ -249,7 +249,7 @@ enum RedisGuard {
     Container(ContainerAsync<Redis>),
 }
 
-fn build_mock_resolver(mock: &MockServer) -> JacquardResolver<reqwest::Client> {
+fn build_mock_resolver(mock: &MockServer) -> JacquardResolver<HardenedHttpClient> {
     let plc_base = jacquard_common::deps::fluent_uri::Uri::parse(format!("{}/", mock.uri()).as_str())
         .expect("valid mock plc url")
         .to_owned();
@@ -257,7 +257,7 @@ fn build_mock_resolver(mock: &MockServer) -> JacquardResolver<reqwest::Client> {
         plc_source: PlcSource::PlcDirectory { base: plc_base },
         ..ResolverOptions::default()
     };
-    JacquardResolver::new(reqwest::Client::new(), opts)
+    JacquardResolver::new(HardenedHttpClient::new(reqwest::Client::new()), opts)
 }
 
 /// Formats received mock requests for diagnostic assertion output.
@@ -409,7 +409,7 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
 
 /// Set up an isolated Redis-backed AppState and TestServer with optional custom resolver.
 async fn setup_test_server_with_resolver(
-    custom_resolver: Option<JacquardResolver<reqwest::Client>>,
+    custom_resolver: Option<JacquardResolver<HardenedHttpClient>>,
 ) -> (Arc<AppState>, TestServer, OAuthUpgradeService, RedisGuard) {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let (redis_url, redis_guard) = if let Some((url, local)) = start_local_redis().await {
@@ -499,7 +499,7 @@ async fn setup_test_server_with_resolver(
     .with_jwks_uri(jwks_uri);
     let client_data = ClientData::new(keyset, metadata);
     let resolver = custom_resolver.unwrap_or_else(|| {
-        JacquardResolver::new(reqwest::Client::new(), ResolverOptions::default())
+        JacquardResolver::new(HardenedHttpClient::new(reqwest::Client::new()), ResolverOptions::default())
     });
     let jacquard_client = JacquardOAuthClient::new_from_resolver(store, resolver, client_data);
     state_obj.jacquard_client = Some(Arc::new(jacquard_client));

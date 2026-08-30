@@ -434,9 +434,9 @@ mod tests {
         // FIX 1 + FIX 2 (Amended): Store sealed session_id at composite key
         let exchange_key =
             compute_exchange_redis_key(&exchange_code, &browser_nonce, &canonical_origin);
+        let ex_aad = catbird::services::redis_crypto::build_aad("oauth_exchange", &exchange_key, None, None);
         let sealed_val =
-            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
-
+            catbird::services::redis_crypto::seal_with_aad(&enc_key, session_id.as_bytes(), &ex_aad).unwrap();
         // Invariant: assert no Redis key or value contains raw code, raw nonce, or plaintext session_id
         assert!(
             !exchange_key.contains(&exchange_code),
@@ -535,8 +535,9 @@ mod tests {
         // --- TEST REQUIREMENT 2: wrong Origin -> 401 AND code still redeemable afterwards ---
         let code2 = generate_exchange_code();
         let key2 = compute_exchange_redis_key(&code2, &browser_nonce, &canonical_origin);
+        let ex_aad2 = catbird::services::redis_crypto::build_aad("oauth_exchange", &key2, None, None);
         let sealed_val2 =
-            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
+            catbird::services::redis_crypto::seal_with_aad(&enc_key, session_id.as_bytes(), &ex_aad2).unwrap();
         let _: () = redis::cmd("SET")
             .arg(&key2)
             .arg(&sealed_val2)
@@ -578,8 +579,9 @@ mod tests {
         // (4) Missing Origin test -> 401
         let code3 = generate_exchange_code();
         let key3 = compute_exchange_redis_key(&code3, &browser_nonce, &canonical_origin);
+        let ex_aad3 = catbird::services::redis_crypto::build_aad("oauth_exchange", &key3, None, None);
         let sealed_val3 =
-            catbird::services::redis_crypto::seal(&enc_key, session_id.as_bytes()).unwrap();
+            catbird::services::redis_crypto::seal_with_aad(&enc_key, session_id.as_bytes(), &ex_aad3).unwrap();
         let _: () = redis::cmd("SET")
             .arg(&key3)
             .arg(&sealed_val3)
@@ -880,7 +882,7 @@ mod tests {
         let mut config = AppConfig::load().unwrap();
         config.circle.base_url = appview.uri();
         config.circle.service_did = appview_target.into();
-        let http_client = reqwest::Client::builder().build().unwrap();
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
         let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
         let redis = redis::aio::ConnectionManager::new(redis_client)
             .await
@@ -895,10 +897,13 @@ mod tests {
             jacquard_client: None,
             catmos_jacquard_client: None,
             catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
             session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
         });
 
         let session = CatbirdSession {

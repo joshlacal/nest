@@ -229,6 +229,9 @@ pub struct ServerConfig {
     /// Allowed CORS origins (empty = permissive in dev)
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Trusted reverse proxy CIDRs (empty = none trusted; forwarding headers ignored)
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -603,7 +606,7 @@ impl AppConfig {
 
 /// Concrete Jacquard OAuth client type used throughout nest.
 pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
-    jacquard_identity::JacquardResolver<reqwest::Client>,
+    jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient>,
     crate::services::RedisAuthStore,
 >;
 
@@ -615,23 +618,25 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub push_db: Option<Pool<Postgres>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
-    /// Jacquard OAuth client (primary — Catbird iOS)
     pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Jacquard OAuth client for catmos-web
     pub catmos_jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Scopes configured for catmos-web OAuth client
     pub catmos_oauth_scopes: Vec<jacquard_oauth::scopes::Scope>,
+    /// Trusted reverse proxy CIDRs (empty = none trusted; forwarding headers ignored)
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Redis-backed auth store for Jacquard sessions
     pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
     /// Push subsystem managers (only present when push is configured)
     pub push: Option<Arc<crate::services::push::PushServices>>,
-    /// Process-wide per-origin DPoP nonce cache, shared by the XRPC proxy
-    /// path and the chat poller so a nonce learned via one saves the other
-    /// a guaranteed `use_dpop_nonce` round trip. See
-    /// `services::DpopNonceCache` for the cache/eviction/rotation contract.
+    /// Process-wide per-origin DPoP nonce cache
     pub dpop_nonce_cache: Arc<crate::services::DpopNonceCache>,
     /// AES-256-GCM encryption key for Redis session records
     pub session_encryption_key: Option<[u8; 32]>,
+    /// Concurrency semaphore for active outbound proxy streams
+    pub active_stream_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Rate limit state for session, IP, and byte rate limiting
+    pub rate_limit: Arc<crate::middleware::RateLimitState>,
 }
 
 fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Error> {
@@ -648,6 +653,13 @@ fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Err
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         validate_configured_oauth_scopes(&config.oauth.scopes)?;
+        let mut parsed_trusted_proxies = Vec::new();
+        for cidr_str in &config.server.trusted_proxies {
+            let net: ipnet::IpNet = cidr_str.parse().map_err(|e| {
+                anyhow::anyhow!("Invalid trusted_proxies CIDR '{cidr_str}': {e}")
+            })?;
+            parsed_trusted_proxies.push(net);
+        }
         let push_db = match config.push.database_url.as_deref() {
             Some(database_url) => {
                 let pool = PgPoolOptions::new()
@@ -660,13 +672,8 @@ impl AppState {
             None => None,
         };
 
-        let http_client = reqwest::Client::builder()
-            .user_agent("Catbird/0.1.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(10)
-            .build()?;
+        let http_client = crate::services::build_hardened_http_client()
+            .map_err(|e| anyhow::anyhow!("Failed to build hardened HTTP client: {e}"))?;
 
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
         let redis = redis::aio::ConnectionManager::new(redis_client).await?;
@@ -714,6 +721,11 @@ impl AppState {
             anyhow::bail!("CATMOS_OAUTH_SCOPES must contain mandatory 'atproto' scope");
         }
 
+        let rate_limit = Arc::new(crate::middleware::RateLimitState::with_trusted_proxies(
+            parsed_trusted_proxies.clone(),
+        ));
+        rate_limit.clone().start_cleanup_task();
+
         let mut state = Self {
             config: Arc::new(config),
             http_client,
@@ -723,10 +735,13 @@ impl AppState {
             jacquard_client: None,
             catmos_jacquard_client: None,
             catmos_oauth_scopes,
+            trusted_proxies: parsed_trusted_proxies,
             auth_store: None,
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             session_encryption_key,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit,
         };
         // Initialize KeyStore first (needed by OAuth client)
         match crate::services::KeyStore::from_config(&state) {
@@ -741,8 +756,6 @@ impl AppState {
                 );
             }
         }
-
-        // Initialize Jacquard auth store + OAuth client
         if let Some(ref key_store) = state.key_store {
             match Self::init_jacquard(&state, key_store).await {
                 Ok((store, client)) => {
@@ -918,19 +931,12 @@ impl AppState {
     /// Nest handles low-volume OAuth login flows where correctness matters more
     /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
     /// stale identity data to persist indefinitely when users retried login.
-    fn build_resolver() -> jacquard_identity::JacquardResolver<reqwest::Client> {
-        // `reqwest::Client::new()` has NO timeout: a hung identity lookup
-        // waits forever. This resolver is reached from background workers that
-        // process work sequentially, so one unbounded request stalls the whole
-        // pipeline behind it.
-        let resolver_client = reqwest::Client::builder()
-            .user_agent("Catbird/0.1.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+    fn build_resolver() -> jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient> {
+        let resolver_client = crate::services::build_hardened_http_client()
+            .expect("Failed to build hardened HTTP client for identity resolver");
+        let hardened_client = crate::services::HardenedHttpClient::new(resolver_client);
         let resolver = jacquard_identity::JacquardResolver::new(
-            resolver_client,
+            hardened_client,
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         resolver.with_system_dns()

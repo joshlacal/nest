@@ -501,9 +501,10 @@ pub async fn upgrade_commit(
     };
 
     if !is_candidate_active {
+        let candidate_fp = crate::handlers::atproto::redact_session_id(&receipt.candidate_session_id);
         tracing::warn!(
             did = %receipt.did,
-            candidate_id = %receipt.candidate_session_id,
+            candidate_fp = %candidate_fp,
             "Logout won race during upgrade commit; performing candidate compensation"
         );
 
@@ -523,7 +524,7 @@ pub async fn upgrade_commit(
             if let Err(e) = revoked {
                 tracing::warn!(
                     did = %receipt.did,
-                    candidate_id = %receipt.candidate_session_id,
+                    candidate_fp = %candidate_fp,
                     error = %e,
                     "Best-effort candidate Jacquard revocation failed during compensation"
                 );
@@ -543,7 +544,7 @@ pub async fn upgrade_commit(
             {
                 tracing::warn!(
                     did = %receipt.did,
-                    candidate_id = %receipt.candidate_session_id,
+                    candidate_fp = %candidate_fp,
                     error = %e,
                     "Best-effort candidate push revocation failed during compensation"
                 );
@@ -938,6 +939,7 @@ mod tests {
         // Loopback is deliberately permitted in debug builds so WireMock-backed
         // tests can target 127.0.0.1; release builds block it via
         // `is_private_ipv4`. Same guard as `ssrf::tests::test_blocks_private_ipv4`.
+        #[allow(unused_mut)]
         let mut invalid_pds_urls = vec![
             "https://10.0.0.1",
             "https://192.168.1.1",

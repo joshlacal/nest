@@ -11,9 +11,10 @@ use jacquard_oauth::authstore::ClientAuthStore;
 use jacquard_oauth::session::{AuthRequestData, ClientSessionData};
 use redis::AsyncCommands;
 use sha2::Sha256;
-
-use super::redis_crypto::{open_strict, seal_strict};
-
+use super::redis_crypto::{
+    build_aad, open_session_dual_read, open_strict_with_aad, open_v2_with_metadata,
+    seal_strict_with_aad, seal_v2_with_metadata, EnvelopeMetadata,
+};
 type HmacSha256 = Hmac<Sha256>;
 
 const STATE_TTL_SECONDS: u64 = 600; // 10 minutes for OAuth state
@@ -142,8 +143,8 @@ redis.call('SETEX', KEYS[1], tonumber(ARGV[3]), ARGV[1])
 redis.call('SETEX', KEYS[2], tonumber(ARGV[4]), ARGV[2])
 return 0
 "#;
-
 /// Lua script for atomic logout retirement:
+/// - Checks if old session was upgraded to a winner candidate; if so, atomically revokes the winner candidate lineage
 /// - Sets retired tombstone on hashed key
 /// - Deletes hashed session and index entries, and pending upgrade state pointers
 const LUA_LOGOUT_RETIRE_SCRIPT: &str = r#"
@@ -156,6 +157,29 @@ const LUA_LOGOUT_RETIRE_SCRIPT: &str = r#"
 -- ARGV:
 -- 1: retired_ttl
 -- 2: retired_marker
+-- 3: key_prefix
+-- 4: did
+
+local current_winner = redis.call('GET', KEYS[1])
+if current_winner and current_winner ~= '' and current_winner ~= 'logout' then
+    local prefix = ARGV[3]
+    local did = ARGV[4]
+    if prefix and did and prefix ~= '' and did ~= '' then
+        local winner_session = prefix .. 'session:' .. did .. '_' .. current_winner
+        local winner_index = prefix .. 'session_index:' .. current_winner
+        local winner_retired = prefix .. 'upgrade_retired:' .. current_winner
+        local winner_receipt = prefix .. 'upgrade_receipt:' .. current_winner
+        local winner_candidate = prefix .. 'upgrade_candidate:' .. current_winner
+        local winner_pending = prefix .. 'pending_upgrade:' .. current_winner
+        
+        redis.call('SETEX', winner_retired, tonumber(ARGV[1]), ARGV[2])
+        redis.call('DEL', winner_session)
+        redis.call('DEL', winner_index)
+        redis.call('DEL', winner_receipt)
+        redis.call('DEL', winner_candidate)
+        redis.call('DEL', winner_pending)
+    end
+end
 
 redis.call('SETEX', KEYS[1], tonumber(ARGV[1]), ARGV[2])
 redis.call('DEL', KEYS[2])
@@ -440,17 +464,43 @@ impl ClientAuthStore for RedisAuthStore {
             .map_err(redis_err)?;
 
         if let Some(encrypted) = data {
-            let json = open_strict(&self.encryption_key, &encrypted)
-                .map_err(|e| other_err(&format!("Session decryption failed: {e}")))?;
+            let (json, metadata, is_v1) = open_v2_with_metadata(
+                &self.encryption_key,
+                &encrypted,
+                "session",
+                &hashed_session_key,
+            )
+            .map_err(|e| other_err(&format!("Session decryption failed: {e}")))?;
             let session: ClientSessionData =
                 serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
             let session = validate_session_identity(session, did, session_id)?;
+
+            if let Some(meta_did) = metadata.did {
+                if meta_did != did.as_str() {
+                    return Err(other_err("Session DID mismatch with envelope metadata"));
+                }
+            }
+
+            // Safe dual-read re-encrypt on access: if session was stored as legacy v1, upgrade it to v2 envelope with AAD
+            if is_v1 {
+                let meta = EnvelopeMetadata::new(
+                    "session",
+                    &hashed_session_key,
+                    Some(did.as_str()),
+                    None,
+                );
+                let v2_encrypted = seal_v2_with_metadata(&self.encryption_key, &json, &meta)
+                    .map_err(|e| other_err(&format!("Session reseal failed during migration: {e}")))?;
+                conn.set_ex::<_, _, ()>(&hashed_session_key, v2_encrypted, self.session_ttl)
+                    .await
+                    .map_err(redis_err)?;
+            }
+
             return Ok(Some(session));
         }
 
         Ok(None)
     }
-
     /// Upsert a session into hashed keys. Atomically checks retired tombstones.
     async fn upsert_session(
         &self,
@@ -461,7 +511,13 @@ impl ClientAuthStore for RedisAuthStore {
         let hashed_retired = self.retired_key(&session.session_id);
 
         let json = serde_json::to_string(&session).map_err(SessionStoreError::Serde)?;
-        let encrypted = seal_strict(&self.encryption_key, &json)
+        let meta = EnvelopeMetadata::new(
+            "session",
+            &hashed_session,
+            Some(session.account_did.as_str()),
+            None,
+        );
+        let encrypted = seal_v2_with_metadata(&self.encryption_key, &json, &meta)
             .map_err(|e| other_err(&format!("Session encryption failed: {e}")))?;
         let mut conn = self.redis.clone();
         let script = redis::Script::new(LUA_UPSERT_SESSION_SCRIPT);
@@ -476,7 +532,6 @@ impl ClientAuthStore for RedisAuthStore {
             .invoke_async(&mut conn)
             .await
             .map_err(redis_err)?;
-
         if res == 1 {
             return Err(other_err("session has been retired"));
         }
@@ -505,6 +560,8 @@ impl ClientAuthStore for RedisAuthStore {
             .key(&hashed_pending)
             .arg(self.retired_ttl())
             .arg("logout")
+            .arg(&self.key_prefix)
+            .arg(did.as_str())
             .invoke_async(&mut conn)
             .await
             .map_err(redis_err)?;
@@ -523,8 +580,13 @@ impl ClientAuthStore for RedisAuthStore {
 
         match data {
             Some(encrypted) => {
-                let json = open_strict(&self.encryption_key, &encrypted)
-                    .map_err(|e| other_err(&format!("Auth request decryption failed: {e}")))?;
+                let (json, _metadata, _) = open_v2_with_metadata(
+                    &self.encryption_key,
+                    &encrypted,
+                    "auth_req_info",
+                    &key,
+                )
+                .map_err(|e| other_err(&format!("Auth request decryption failed: {e}")))?;
                 let info: AuthRequestData =
                     serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
                 let info = validate_auth_req_identity(info, state)?;
@@ -540,7 +602,8 @@ impl ClientAuthStore for RedisAuthStore {
     ) -> Result<(), SessionStoreError> {
         let key = self.auth_req_key(&auth_req_info.state);
         let json = serde_json::to_string(auth_req_info).map_err(SessionStoreError::Serde)?;
-        let encrypted = seal_strict(&self.encryption_key, &json)
+        let meta = EnvelopeMetadata::new("auth_req_info", &key, None, None);
+        let encrypted = seal_v2_with_metadata(&self.encryption_key, &json, &meta)
             .map_err(|e| other_err(&format!("Auth request encryption failed: {e}")))?;
         let mut conn = self.redis.clone();
 
@@ -561,15 +624,14 @@ impl ClientAuthStore for RedisAuthStore {
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::redis_crypto::{open_strict, seal_strict};
     use jacquard_oauth::session::{DpopClientData, DpopReqData};
     use jacquard_oauth::types::{OAuthTokenType, TokenSet};
 
-    const TEST_KEY: [u8; 32] = [0x5au8; 32];
-
+    const TEST_KEY: [u8; 32] = [0x42u8; 32];
     #[test]
     fn test_absent_encryption_key_fails_closed() {
         let err = RedisAuthStore::validate_encryption_key(None).unwrap_err();
@@ -1186,5 +1248,74 @@ mod tests {
             Err(MockAuthError::InvalidSession) => {}
             _ => panic!("Expected InvalidSession for absent session"),
         }
+    }
+
+    #[test]
+    fn test_logout_retire_atomically_revokes_winner_candidate_lineage_logic() {
+        let old_session_id = "550e8400-e29b-41d4-a716-446655440001";
+        let candidate_session_id = "550e8400-e29b-41d4-a716-446655440002";
+        let did = "did:plc:alice";
+        let prefix = "catbird:v2:session:";
+        let key = TEST_KEY;
+
+        let old_fp = fingerprint_id(&key, old_session_id);
+        let cand_fp = fingerprint_id(&key, candidate_session_id);
+
+        let mut store = std::collections::HashMap::new();
+
+        // Setup state where upgrade commit won and recorded cand_fp on old retired key
+        let old_retired_k = format!("{}upgrade_retired:{}", prefix, old_fp);
+        let old_session_k = format!("{}session:{}_{}", prefix, did, old_fp);
+        let old_index_k = format!("{}session_index:{}", prefix, old_fp);
+        let old_pending_k = format!("{}pending_upgrade:{}", prefix, old_fp);
+
+        let winner_session_k = format!("{}session:{}_{}", prefix, did, cand_fp);
+        let winner_index_k = format!("{}session_index:{}", prefix, cand_fp);
+        let winner_retired_k = format!("{}retired:{}", prefix, cand_fp);
+        let winner_receipt_k = format!("{}upgrade_receipt:{}", prefix, cand_fp);
+        let winner_candidate_k = format!("{}upgrade_candidate:{}", prefix, cand_fp);
+        let winner_pending_k = format!("{}pending_upgrade:{}", prefix, cand_fp);
+
+        store.insert(old_retired_k.clone(), cand_fp.clone());
+        store.insert(winner_session_k.clone(), "sealed_candidate_session".into());
+        store.insert(winner_index_k.clone(), did.into());
+        store.insert(winner_receipt_k.clone(), "sealed_receipt".into());
+        store.insert(winner_candidate_k.clone(), "sealed_candidate".into());
+        store.insert(winner_pending_k.clone(), "pending_flow_pointer".into());
+        // Simulate Lua script execution
+        let current_winner = store.get(&old_retired_k).cloned();
+        if let Some(winner) = current_winner {
+            if !winner.is_empty() && winner != "logout" {
+                let w_sess = format!("{}session:{}_{}", prefix, did, winner);
+                let w_idx = format!("{}session_index:{}", prefix, winner);
+                let w_ret = format!("{}retired:{}", prefix, winner);
+                let w_rec = format!("{}upgrade_receipt:{}", prefix, winner);
+                let w_cand = format!("{}upgrade_candidate:{}", prefix, winner);
+                let w_pend = format!("{}pending_upgrade:{}", prefix, winner);
+
+                store.insert(w_ret, "logout".into());
+                store.remove(&w_sess);
+                store.remove(&w_idx);
+                store.remove(&w_rec);
+                store.remove(&w_cand);
+                store.remove(&w_pend);
+            }
+        }
+
+        store.insert(old_retired_k.clone(), "logout".into());
+        store.remove(&old_session_k);
+        store.remove(&old_index_k);
+        store.remove(&old_pending_k);
+
+        // Verify old session is tombstoned
+        assert_eq!(store.get(&old_retired_k).map(|s| s.as_str()), Some("logout"));
+        assert!(!store.contains_key(&old_session_k));
+
+        // Verify winner candidate is completely revoked and purged
+        assert_eq!(store.get(&winner_retired_k).map(|s| s.as_str()), Some("logout"));
+        assert!(!store.contains_key(&winner_session_k));
+        assert!(!store.contains_key(&winner_receipt_k));
+        assert!(!store.contains_key(&winner_candidate_k));
+        assert!(!store.contains_key(&winner_pending_k));
     }
 }

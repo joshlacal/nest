@@ -11,6 +11,7 @@ use axum::{
     http::{Request, Response},
     middleware::Next,
 };
+use tracing::Instrument;
 
 /// Key for storing request ID in request extensions
 #[derive(Debug, Clone)]
@@ -26,7 +27,8 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
 
     req.extensions_mut().insert(RequestId(id.clone()));
 
-    let mut response = next.run(req).await;
+    let span = tracing::info_span!("request", request_id = %id);
+    let mut response = next.run(req).instrument(span).await;
 
     if let Ok(header_value) = id.parse() {
         response.headers_mut().insert("x-request-id", header_value);

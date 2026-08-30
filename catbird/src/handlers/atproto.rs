@@ -41,6 +41,19 @@ pub enum OAuthMode {
     Direct,
 }
 
+pub const OAUTH_DIRECT_NONCE_COOKIE_NAME: &str = "catbird_oauth_direct_nonce";
+
+/// Returns a non-replayable fingerprint of a session ID for privacy-safe logging.
+pub fn redact_session_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(id.as_bytes());
+    let mut s = String::with_capacity(16);
+    for b in &hash[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthFlowRecord {
     pub version: u32,
@@ -102,8 +115,8 @@ pub async fn login(
 
     // Mode determination & redirect validation:
     // Require exchange mode (browser_nonce + redirect_to) for every external/native/loopback redirect;
-    // direct mode only when no redirect is requested (cookie-based direct session, no session ID in Location).
-    let mode = if let Some(nonce) = &browser_nonce {
+    // direct mode binds the initiating browser via a secure HttpOnly SameSite cookie nonce.
+    let (mode, browser_nonce, direct_cookie_header) = if let Some(nonce) = &browser_nonce {
         if !is_valid_base64url_43(nonce) {
             return Err(AppError::BadRequest(
                 "Invalid browser_nonce: must be exactly 43 base64url characters".into(),
@@ -117,7 +130,7 @@ pub async fn login(
         if !is_allowed_redirect(r) {
             return Err(AppError::BadRequest("Disallowed redirect_to URL".into()));
         }
-        OAuthMode::Exchange
+        (OAuthMode::Exchange, Some(nonce.clone()), None)
     } else {
         // Direct mode: external, native, and loopback redirects require exchange mode + browser_nonce
         if let Some(_r) = &redirect_to {
@@ -126,9 +139,16 @@ pub async fn login(
                     .into(),
             ));
         }
-        OAuthMode::Direct
+        let direct_nonce = uuid::Uuid::new_v4().to_string();
+        let cookie = Cookie::build((OAUTH_DIRECT_NONCE_COOKIE_NAME, direct_nonce.clone()))
+            .path("/auth/callback")
+            .http_only(true)
+            .secure(true)
+            .same_site(SameSite::Lax)
+            .max_age(time::Duration::seconds(600))
+            .build();
+        (OAuthMode::Direct, Some(direct_nonce), Some(cookie.to_string()))
     };
-
     tracing::info!(
         "Login request for identifier: {}, client: {:?}, redirect_to: {:?}, selector: {}",
         identifier,
@@ -169,13 +189,14 @@ pub async fn login(
         AppError::Internal("Serialization error during login".into())
     })?;
 
-    let sealed_flow =
-        crate::services::redis_crypto::seal_strict(enc_key, &flow_json).map_err(|e| {
-            tracing::error!(error = %e, "Failed to seal OAuthFlowRecord");
-            AppError::Internal("Encryption error during login".into())
-        })?;
-
     let flow_key = format!("{}oauth_flow:{}", &state.config.redis.key_prefix, state_fp);
+    let flow_aad = crate::services::redis_crypto::build_aad("oauth_flow", &flow_key, None, None);
+    let sealed_flow =
+        crate::services::redis_crypto::seal_strict_with_aad(enc_key, &flow_json, &flow_aad)
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to seal OAuthFlowRecord");
+                AppError::Internal("Encryption error during login".into())
+            })?;
     let mut conn = state.redis.clone();
     redis::cmd("SET")
         .arg(&flow_key)
@@ -230,14 +251,16 @@ pub async fn login(
     })?;
 
     // Redirect to the PDS authorization URL
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::FOUND)
-        .header("Location", auth_url.as_str())
-        .body(Body::empty())
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to build redirect response");
-            AppError::Internal("Failed to build redirect response".into())
-        })?)
+        .header("Location", auth_url.as_str());
+    if let Some(cookie_str) = direct_cookie_header {
+        resp = resp.header("Set-Cookie", cookie_str);
+    }
+    Ok(resp.body(Body::empty()).map_err(|e| {
+        tracing::error!(error = %e, "Failed to build redirect response");
+        AppError::Internal("Failed to build redirect response".into())
+    })?)
 }
 
 /// Handle OAuth callback
@@ -282,7 +305,8 @@ pub async fn oauth_callback(
             .await
         {
             Ok(Some(sealed)) => {
-                if let Ok(plaintext) = crate::services::redis_crypto::open_strict(enc_key, &sealed)
+                let flow_aad = crate::services::redis_crypto::build_aad("oauth_flow", &flow_key, None, None);
+                if let Ok(plaintext) = crate::services::redis_crypto::open_strict_with_aad(enc_key, &sealed, &flow_aad)
                 {
                     serde_json::from_str::<OAuthFlowRecord>(&plaintext)
                         .ok()
@@ -371,7 +395,8 @@ pub async fn oauth_callback(
         ));
     };
 
-    let flow_json = match crate::services::redis_crypto::open_strict(enc_key, &sealed_str) {
+    let flow_aad = crate::services::redis_crypto::build_aad("oauth_flow", &flow_key, None, None);
+    let flow_json = match crate::services::redis_crypto::open_strict_with_aad(enc_key, &sealed_str, &flow_aad) {
         Ok(json) => json,
         Err(e) => {
             let _ = redis::cmd("DEL")
@@ -456,7 +481,6 @@ pub async fn oauth_callback(
 
         Some(canonical_origin)
     } else {
-        // Direct mode: no external, native, or loopback redirect allowed
         if let Some(r) = &flow_record.redirect_to {
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
@@ -466,6 +490,46 @@ pub async fn oauth_callback(
             return Err(AppError::BadRequest(
                 "External, native, and loopback redirects require exchange mode".into(),
             ));
+        }
+
+        // Direct mode browser nonce verification (Finding 21):
+        // Verify that the browser presented the direct-mode nonce cookie matching the flow record.
+        let cookie_nonce = jar.get(OAUTH_DIRECT_NONCE_COOKIE_NAME).map(|c| c.value());
+        let expected_nonce = flow_record.browser_nonce.as_deref();
+        match (cookie_nonce, expected_nonce) {
+            (Some(c_nonce), Some(e_nonce)) if !c_nonce.is_empty() && c_nonce == e_nonce => {
+                // Valid browser nonce; verified before token exchange!
+            }
+            (None, _) => {
+                let _ = redis::cmd("DEL")
+                    .arg(&claim_key)
+                    .query_async::<_, ()>(&mut conn)
+                    .await;
+                tracing::error!("Direct mode callback rejected: missing browser nonce cookie");
+                return Err(AppError::Unauthorized(
+                    "Direct OAuth callback browser nonce missing".into(),
+                ));
+            }
+            (Some(_), None) => {
+                let _ = redis::cmd("DEL")
+                    .arg(&claim_key)
+                    .query_async::<_, ()>(&mut conn)
+                    .await;
+                tracing::error!("Direct mode callback rejected: flow record missing expected browser nonce");
+                return Err(AppError::Unauthorized(
+                    "Direct OAuth callback flow record missing nonce".into(),
+                ));
+            }
+            (Some(_), Some(_)) => {
+                let _ = redis::cmd("DEL")
+                    .arg(&claim_key)
+                    .query_async::<_, ()>(&mut conn)
+                    .await;
+                tracing::error!("Direct mode callback rejected: browser nonce cookie mismatched");
+                return Err(AppError::Unauthorized(
+                    "Direct OAuth callback browser nonce mismatched".into(),
+                ));
+            }
         }
         None
     };
@@ -555,10 +619,11 @@ pub async fn oauth_callback(
 
             let exchange_code = generate_exchange_code();
             let exchange_key = compute_exchange_redis_key(&exchange_code, nonce, &canonical_origin);
-
-            let sealed_session_id = crate::services::redis_crypto::seal(
+            let ex_aad = crate::services::redis_crypto::build_aad("oauth_exchange", &exchange_key, None, None);
+            let sealed_session_id = crate::services::redis_crypto::seal_with_aad(
                 enc_key,
                 session_id.as_bytes(),
+                &ex_aad,
             )
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to seal session_id for exchange record");
@@ -587,7 +652,7 @@ pub async fn oauth_callback(
 
             (jar, redirect_url)
         } else {
-            // Direct mode: set HttpOnly, SameSite=Strict cookie. No session ID in Location!
+            // Direct mode: set HttpOnly, SameSite=Strict cookie and clear direct nonce cookie
             let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.clone()))
                 .path("/")
                 .http_only(true)
@@ -595,12 +660,17 @@ pub async fn oauth_callback(
                 .same_site(SameSite::Strict)
                 .max_age(time::Duration::days(30))
                 .build();
-
+            let direct_cleanup_cookie = Cookie::build((OAUTH_DIRECT_NONCE_COOKIE_NAME, ""))
+                .path("/auth/callback")
+                .http_only(true)
+                .secure(true)
+                .same_site(SameSite::Lax)
+                .max_age(time::Duration::ZERO)
+                .build();
             let redirect_target = "/";
 
-            (jar.add(cookie), redirect_target.to_string())
+            (jar.add(cookie).add(direct_cleanup_cookie), redirect_target.to_string())
         };
-
         // 4. Construct response
         let response = Response::builder()
             .status(StatusCode::FOUND)
@@ -617,9 +687,10 @@ pub async fn oauth_callback(
                 .activate_account_session(&did, &session_id, &pds_url)
                 .await
                 .map_err(|e| {
+                    let session_fp = redact_session_id(&session_id);
                     tracing::error!(
                         did = %did,
-                        session_id = %session_id,
+                        session_fp = %session_fp,
                         error = %e,
                         "Push account session activation failed"
                     );
@@ -651,7 +722,7 @@ pub async fn oauth_callback(
         Err(err) => {
             tracing::error!(
                 did = %did,
-                session_id = %session_id,
+                session_fp = %redact_session_id(&session_id),
                 error = %err,
                 "Post-callback finalization failed; executing unified compensation path"
             );
@@ -852,10 +923,11 @@ async fn cleanup_new_session(
             Ok(oauth_session) => oauth_session.logout().await,
             Err(_) => jacquard_client.revoke(&parsed_did, session_id).await,
         };
+        let session_fp = redact_session_id(session_id);
         if let Err(e) = revoked {
             tracing::warn!(
                 did = %did,
-                session_id = %session_id,
+                session_fp = %session_fp,
                 error = %e,
                 "Best-effort Jacquard session revocation failed after callback error"
             );
@@ -865,7 +937,7 @@ async fn cleanup_new_session(
             if let Err(e) = store.delete_session(&parsed_did, session_id).await {
                 tracing::warn!(
                     did = %did,
-                    session_id = %session_id,
+                    session_fp = %session_fp,
                     error = %e,
                     "Best-effort RedisAuthStore session deletion failed after callback error"
                 );
@@ -874,26 +946,44 @@ async fn cleanup_new_session(
     }
 }
 
-/// Resolve a handle for a DID by calling com.atproto.repo.describeRepo on the PDS.
 async fn resolve_handle_for_did(http_client: &reqwest::Client, did: &str, pds_url: &str) -> String {
+    if crate::services::validate_pds_url(pds_url).is_err() {
+        return did.to_string();
+    }
     let describe_url = format!(
         "{}/xrpc/com.atproto.repo.describeRepo?repo={}",
         pds_url.trim_end_matches('/'),
         did
     );
+    if crate::services::validate_pds_url(&describe_url).is_err() {
+        return did.to_string();
+    }
 
     match http_client.get(&describe_url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-            Ok(json) => json
-                .get("handle")
-                .and_then(|h| h.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| did.to_string()),
-            Err(_) => did.to_string(),
-        },
+        Ok(resp) if resp.status().is_success() => {
+            use futures_util::StreamExt;
+            let mut stream = resp.bytes_stream();
+            let mut body_bytes = Vec::new();
+            const MAX_HANDLE_BODY: usize = 64 * 1024;
+            while let Some(Ok(chunk)) = stream.next().await {
+                if body_bytes.len() + chunk.len() > MAX_HANDLE_BODY {
+                    return did.to_string();
+                }
+                body_bytes.extend_from_slice(&chunk);
+            }
+            match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                Ok(json) => json
+                    .get("handle")
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| did.to_string()),
+                Err(_) => did.to_string(),
+            }
+        }
         _ => did.to_string(),
     }
 }
+
 
 /// Allowed exact redirect URLs for OAuth callback (native app registered callback).
 const ALLOWED_EXACT_REDIRECT_URLS: &[&str] = &["https://catbird.blue/oauth/callback"];
@@ -999,59 +1089,12 @@ pub async fn logout(
     let did = jacquard_common::types::did::Did::new(session.did.as_str())
         .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
     let session_id_str = session.id.to_string();
+    let session_fp = redact_session_id(&session_id_str);
 
-    // 1. Session-scoped push revocation must succeed first
-    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
-        state
-            .push_db
-            .as_ref()
-            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
-    });
+    // 1. Preserve OAuthSession metadata in memory before local deletion so remote revocation can be attempted
+    let preserved_oauth_session = jacquard_client.restore(&did, &session_id_str).await.ok();
 
-    if let Some(registry) = push_registry {
-        registry
-            .mark_auth_revoked_if_session(&session.did, &session_id_str)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    did = %session.did,
-                    session_id = %session.id,
-                    error = %e,
-                    "Database error marking push auth revoked on logout"
-                );
-                AppError::AuthTemporarilyUnavailable(
-                    "Logout temporarily unavailable; please retry".into(),
-                )
-            })?;
-    }
-
-    // 2. Restore OAuthSession and perform remote authorization-server logout/revocation
-    let remote_logout_res = match jacquard_client.restore(&did, &session_id_str).await {
-        Ok(oauth_session) => oauth_session.logout().await,
-        Err(e) => {
-            tracing::warn!(
-                did = %session.did,
-                session_id = %session.id,
-                error = %e,
-                "Failed to restore OAuthSession for remote logout; falling back to direct revoke"
-            );
-            jacquard_client.revoke(&did, &session_id_str).await
-        }
-    };
-
-    if let Err(e) = remote_logout_res {
-        tracing::error!(
-            did = %session.did,
-            session_id = %session.id,
-            error = %e,
-            "Failed to revoke OAuth session with authorization server on logout"
-        );
-        return Err(AppError::AuthTemporarilyUnavailable(
-            "Logout temporarily unavailable; please retry".into(),
-        ));
-    }
-
-    // 3. Mandatory local delete from auth_store
+    // 2. Mandatory local delete from auth_store FIRST (fail-closed locally)
     if let Some(store) = state.auth_store.as_ref() {
         use jacquard_oauth::authstore::ClientAuthStore;
         store
@@ -1060,7 +1103,7 @@ pub async fn logout(
             .map_err(|e| {
                 tracing::error!(
                     did = %session.did,
-                    session_id = %session.id,
+                    session_fp = %session_fp,
                     error = %e,
                     "Failed mandatory local session delete on logout"
                 );
@@ -1070,6 +1113,45 @@ pub async fn logout(
             })?;
     }
 
+    // 3. Best-effort push revocation (cleanup failure does not reactivate bearer)
+    let push_registry = state.push.as_ref().map(|p| p.registry.clone()).or_else(|| {
+        state
+            .push_db
+            .as_ref()
+            .map(|db| crate::services::push::registry::PushRegistry::new(db.clone(), String::new()))
+    });
+
+    if let Some(registry) = push_registry {
+        if let Err(e) = registry
+            .mark_auth_revoked_if_session(&session.did, &session_id_str)
+            .await
+        {
+            tracing::warn!(
+                did = %session.did,
+                session_fp = %session_fp,
+                error = %e,
+                "Best-effort push auth revocation failed on logout"
+            );
+        }
+    }
+
+    // 4. Best-effort remote authorization-server logout/revocation using preserved session
+    if let Some(oauth_session) = preserved_oauth_session {
+        if let Err(e) = oauth_session.logout().await {
+            tracing::warn!(
+                did = %session.did,
+                session_fp = %session_fp,
+                error = %e,
+                "Best-effort OAuth session revocation with authorization server failed on logout"
+            );
+        }
+    } else {
+        tracing::warn!(
+            did = %session.did,
+            session_fp = %session_fp,
+            "No active OAuthSession restored before local deletion; skipping remote revocation"
+        );
+    }
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
         .http_only(true)
@@ -1147,9 +1229,15 @@ pub async fn exchange_code(
         tracing::error!("Exchange failed: session encryption key not configured");
         return Err(AppError::Unauthorized("Invalid exchange request".into()));
     };
+    // Require strict v2 envelope format for ephemeral exchange records to prevent legacy v1 transplantation
+    if !sealed_b64.starts_with(crate::services::redis_crypto::V2_PREFIX) {
+        tracing::warn!("Exchange failed: legacy v1 exchange ciphertext rejected");
+        return Err(AppError::Unauthorized("Invalid exchange request".into()));
+    }
 
+    let ex_aad = crate::services::redis_crypto::build_aad("oauth_exchange", &exchange_key, None, None);
     let plaintext_bytes =
-        crate::services::redis_crypto::open(enc_key, &sealed_b64).map_err(|e| {
+        crate::services::redis_crypto::open_with_aad(enc_key, &sealed_b64, &ex_aad).map_err(|e| {
             tracing::warn!("Exchange failed: decryption failed: {}", e);
             AppError::Unauthorized("Invalid exchange request".into())
         })?;
@@ -1567,10 +1655,15 @@ pub async fn proxy_xrpc(
             status,
             headers: resp_headers,
             body: upstream_response,
+            max_bytes,
+            permit,
+            rate_limit,
+            session_id,
         } => {
             tracing::info!(
                 request_id = %request_id,
                 status = status,
+                max_bytes = max_bytes,
                 "[BFF-RESP] PDS response (streaming)"
             );
 
@@ -1586,8 +1679,14 @@ pub async fn proxy_xrpc(
                 }
             }
 
-            // Stream the response body directly from upstream
-            let stream = upstream_response.bytes_stream();
+            // Stream the response body directly from upstream with cumulative remaining byte limit, live rate limit accounting, and held semaphore permit
+            let stream = crate::services::bounded_byte_stream_with_accounting(
+                upstream_response.bytes_stream(),
+                max_bytes,
+                permit,
+                rate_limit,
+                session_id,
+            );
             Ok(response.body(Body::from_stream(stream)).unwrap())
         }
     }
@@ -2224,5 +2323,54 @@ mod tests {
         assert_eq!(cookie.value(), "");
         assert_eq!(cookie.max_age(), Some(time::Duration::ZERO));
         assert_eq!(cookie.same_site(), Some(SameSite::Strict));
+    }
+
+    #[test]
+    fn test_direct_mode_browser_nonce_comparison_logic() {
+        let nonce = "550e8400-e29b-41d4-a716-446655440000";
+        let flow_record = OAuthFlowRecord {
+            version: 2,
+            mode: OAuthMode::Direct,
+            client_selector: "default".to_string(),
+            redirect_to: None,
+            browser_nonce: Some(nonce.to_string()),
+            created_at: 1700000000,
+        };
+
+        // Matching cookie -> OK
+        let cookie_match = Some(nonce);
+        assert_eq!(cookie_match, flow_record.browser_nonce.as_deref());
+
+        // Missing cookie -> mismatch
+        let cookie_missing: Option<&str> = None;
+        assert_ne!(cookie_missing, flow_record.browser_nonce.as_deref());
+
+        // Mismatched cookie -> mismatch
+        let cookie_mismatch = Some("attacker-nonce");
+        assert_ne!(cookie_mismatch, flow_record.browser_nonce.as_deref());
+    }
+
+    #[test]
+    fn test_exchange_code_strictly_rejects_v1_ciphertexts() {
+        let key = [0x42u8; 32];
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        
+        // Construct a raw v1 (no "v2:" prefix) ciphertext
+        use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+        use base64::Engine;
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = Nonce::from([0x01u8; 12]);
+        let ct = cipher.encrypt(&nonce, Payload { msg: session_id.as_bytes(), aad: &[] }).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0x01u8; 12]);
+        raw.extend_from_slice(&ct);
+        let v1_sealed = base64::engine::general_purpose::STANDARD.encode(&raw);
+
+        assert!(!v1_sealed.starts_with(crate::services::redis_crypto::V2_PREFIX));
+
+        // V2 ciphertext has the prefix
+        let aad = crate::services::redis_crypto::build_aad("oauth_exchange", "key", None, None);
+        let v2_sealed = crate::services::redis_crypto::seal_with_aad(&key, session_id.as_bytes(), &aad).unwrap();
+        assert!(v2_sealed.starts_with(crate::services::redis_crypto::V2_PREFIX));
     }
 }

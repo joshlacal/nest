@@ -346,7 +346,7 @@ mod tests {
 
     async fn test_state() -> Arc<AppState> {
         let config = AppConfig::load().unwrap();
-        let http_client = reqwest::Client::builder().build().unwrap();
+        let http_client = crate::services::build_hardened_http_client().unwrap();
         let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
         let redis = redis::aio::ConnectionManager::new(redis_client)
             .await
@@ -361,10 +361,13 @@ mod tests {
             jacquard_client: None,
             catmos_jacquard_client: None,
             catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
             auth_store: None,
             push: None,
-            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
         })
     }
 
