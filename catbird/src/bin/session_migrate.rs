@@ -957,7 +957,7 @@ async fn run_rekey(
     batch_size: usize,
     dry_run: bool,
 ) -> Result<(), anyhow::Error> {
-    use catbird::services::redis_auth_store::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
+    use catbird::services::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
     use catbird::services::redis_crypto::{
         open_session_dual_read, seal_v2_with_metadata, EnvelopeMetadata,
     };
