@@ -1013,6 +1013,19 @@ async fn run_rekey(
         };
         let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
         if parts.len() != 2 || !looks_like_raw_uuid(parts[0]) {
+            if dry_run {
+                let blob: Option<String> = redis::cmd("GET").arg(k).query_async(&mut conn).await?;
+                if let Some(blob) = blob {
+                    match open_session_dual_read(&key_bytes, &blob, &[]) {
+                        Err(e) => eprintln!("hashed-probe DECRYPT fails for {k}: {e}"),
+                        Ok((plain, _)) => {
+                            if let Err(e) = serde_json::from_slice::<jacquard_oauth::session::ClientSessionData>(&plain) {
+                                eprintln!("hashed-probe typed-parse FAILS for {k}: {e}");
+                            }
+                        }
+                    }
+                }
+            }
             skipped += 1; // already hashed or unrecognized
             continue;
         }
