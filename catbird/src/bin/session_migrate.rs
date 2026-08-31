@@ -1080,6 +1080,9 @@ async fn run_rekey(
             .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
 
         if dry_run {
+            if let Err(e) = serde_json::from_slice::<jacquard_oauth::session::ClientSessionData>(&plain) {
+                eprintln!("typed-parse FAILS for {k}: {e}");
+            }
             println!("would rekey {k} -> {new_session_key} (ttl {ttl})");
         } else {
             let index_ttl = (ttl as u64).max(SESSION_INDEX_TTL_SECONDS);
