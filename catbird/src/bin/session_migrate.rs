@@ -105,6 +105,25 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rekey legacy raw-id session keys into the hashed v2 scheme (HMAC key names,
+    /// v2 envelopes, session/did/fp indexes), deleting the raw-form keys afterward.
+    Rekey {
+        /// Redis connection URL
+        #[arg(long)]
+        redis_url: String,
+        /// Key prefix (default: "catbird:v2:session:")
+        #[arg(long, default_value = "catbird:v2:session:")]
+        prefix: String,
+        /// Session encryption key (32-byte hex or base64 string)
+        #[arg(long, env = "SESSION_ENCRYPTION_KEY")]
+        encryption_key: Option<String>,
+        /// Keys per SCAN iteration
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+        /// Print what would be rekeyed without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 // ── Export file format ───────────────────────────────────────────────
@@ -695,6 +714,22 @@ async fn main() {
             )
             .await
         }
+        Command::Rekey {
+            redis_url,
+            prefix,
+            encryption_key,
+            batch_size,
+            dry_run,
+        } => {
+            run_rekey(
+                &redis_url,
+                &prefix,
+                encryption_key.as_deref(),
+                batch_size,
+                dry_run,
+            )
+            .await
+        }
     };
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
@@ -909,4 +944,154 @@ mod tests {
         assert!(parse_encryption_key("not-a-valid-key").is_err());
         assert!(parse_encryption_key("012345").is_err());
     }
+}
+
+/// Migrate legacy raw-id session keys (`{prefix}session:{did}_{uuid}`) into the
+/// hashed v2 scheme the server actually reads: HMAC-fingerprint key names, v2
+/// AAD envelopes, and the session/did/sha256-fp indexes. Raw-form keys and
+/// their raw indexes are deleted after a successful rewrite.
+async fn run_rekey(
+    redis_url: &str,
+    prefix: &str,
+    encryption_key: Option<&str>,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<(), anyhow::Error> {
+    use catbird::services::redis_auth_store::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
+    use catbird::services::redis_crypto::{
+        open_session_dual_read, seal_v2_with_metadata, EnvelopeMetadata,
+    };
+
+    fn looks_like_raw_uuid(s: &str) -> bool {
+        s.len() == 36
+            && s.as_bytes()[8] == b'-'
+            && s.as_bytes()[13] == b'-'
+            && s.as_bytes()[18] == b'-'
+            && s.as_bytes()[23] == b'-'
+            && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    }
+
+    let raw_key = encryption_key
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SESSION_ENCRYPTION_KEY").ok())
+        .or_else(|| std::env::var("CATBIRD_SESSION_ENCRYPTION_KEY").ok())
+        .ok_or_else(|| anyhow::anyhow!("Encryption key required for rekey"))?;
+    let key_bytes = parse_encryption_key(&raw_key)?;
+
+    let mut conn = connect(redis_url).await?;
+    println!("Scanning session keys with prefix '{prefix}' for rekey...");
+    let pattern = format!("{prefix}session:*");
+    let mut cursor: u64 = 0;
+    let mut session_keys = Vec::new();
+    loop {
+        let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(batch_size)
+            .query_async(&mut conn)
+            .await?;
+        session_keys.extend(batch);
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+    session_keys.sort();
+    session_keys.dedup();
+
+    let mut rekeyed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for k in &session_keys {
+        let suffix = k.strip_prefix(prefix).unwrap_or(k);
+        let rest = match suffix.strip_prefix("session:") {
+            Some(r) => r,
+            None => continue,
+        };
+        let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
+        if parts.len() != 2 || !looks_like_raw_uuid(parts[0]) {
+            skipped += 1; // already hashed or unrecognized
+            continue;
+        }
+        let raw_sid = parts[0];
+        let did = parts[1];
+
+        let (blob, ttl): (Option<String>, i64) = {
+            let mut pipe = redis::pipe();
+            pipe.get(k).ttl(k);
+            let res: (Option<String>, i64) = pipe.query_async(&mut conn).await?;
+            res
+        };
+        let Some(blob) = blob else {
+            skipped += 1;
+            continue;
+        };
+        if ttl <= 0 {
+            skipped += 1;
+            continue;
+        }
+
+        let (plain, _is_v1) = match open_session_dual_read(&key_bytes, &blob, &[]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rekey: cannot decrypt '{k}': {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        let json: serde_json::Value = match serde_json::from_slice(&plain) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rekey: cannot parse session JSON for '{k}': {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        let sid_in_blob = json.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
+        let did_in_blob = json.get("account_did").and_then(|s| s.as_str()).unwrap_or("");
+        if sid_in_blob != raw_sid || did_in_blob != did {
+            eprintln!(
+                "rekey: identity mismatch for '{k}' (payload sid/did do not match key parts); skipping"
+            );
+            failed += 1;
+            continue;
+        }
+
+        let hmac_fp = fingerprint_id(&key_bytes, raw_sid);
+        let sha256_fp = catbird::services::push::registry::session_fingerprint(raw_sid);
+        let new_session_key = format!("{prefix}session:{did}_{hmac_fp}");
+        let session_index_key = format!("{prefix}session_index:{hmac_fp}");
+        let did_index_key = format!("{prefix}did_index:{did}");
+        let fp_index_key = format!("{prefix}session_fp_index:{sha256_fp}");
+        let old_raw_index = format!("{prefix}session_index:{raw_sid}");
+
+        let json_str = String::from_utf8_lossy(&plain).to_string();
+        let meta = EnvelopeMetadata::new("session", &new_session_key, Some(did), None);
+        let v2 = seal_v2_with_metadata(&key_bytes, &json_str, &meta)
+            .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
+
+        if dry_run {
+            println!("would rekey {k} -> {new_session_key} (ttl {ttl})");
+        } else {
+            let index_ttl = (ttl as u64).max(SESSION_INDEX_TTL_SECONDS);
+            let mut pipe = redis::pipe();
+            pipe.set_ex(&new_session_key, &v2, ttl as u64);
+            pipe.set_ex(&session_index_key, did, index_ttl);
+            pipe.set_ex(&did_index_key, &hmac_fp, index_ttl);
+            pipe.set_ex(&fp_index_key, &hmac_fp, index_ttl);
+            pipe.del(k);
+            pipe.del(&old_raw_index);
+            let _: () = pipe.query_async(&mut conn).await?;
+        }
+        rekeyed += 1;
+    }
+
+    println!("Rekey complete: {rekeyed} rekeyed, {skipped} skipped, {failed} failed");
+    if failed > 0 {
+        anyhow::bail!("{failed} sessions failed to rekey");
+    }
+    Ok(())
 }
