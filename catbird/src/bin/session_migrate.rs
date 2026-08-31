@@ -971,6 +971,21 @@ async fn run_rekey(
             && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
     }
 
+    /// Upgrade legacy session JSON shapes to the current jacquard schema:
+    /// `scopes` was serialized as an array of strings; it is now a single
+    /// space-delimited string.
+    fn upgrade_session_json(mut v: serde_json::Value) -> serde_json::Value {
+        if let Some(arr) = v.get("scopes").and_then(|s| s.as_array()) {
+            let joined = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            v["scopes"] = serde_json::Value::String(joined);
+        }
+        v
+    }
+
     let raw_key = encryption_key
         .map(|s| s.to_string())
         .or_else(|| std::env::var("SESSION_ENCRYPTION_KEY").ok())
@@ -1013,20 +1028,64 @@ async fn run_rekey(
         };
         let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
         if parts.len() != 2 || !looks_like_raw_uuid(parts[0]) {
-            if dry_run {
-                let blob: Option<String> = redis::cmd("GET").arg(k).query_async(&mut conn).await?;
-                if let Some(blob) = blob {
-                    match catbird::services::redis_crypto::open_v2_with_metadata(&key_bytes, &blob, "session", k) {
-                        Err(e) => eprintln!("hashed-probe DECRYPT fails for {k}: {e}"),
-                        Ok((plain, _meta, _is_v1)) => {
-                            if let Err(e) = serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&plain) {
-                                eprintln!("hashed-probe typed-parse FAILS for {k}: {e}");
+            // Hashed-form key: verify the payload parses under the current
+            // schema; upgrade legacy JSON shapes in place when it does not.
+            let (blob, ttl): (Option<String>, i64) = {
+                let mut pipe = redis::pipe();
+                pipe.get(k).ttl(k);
+                let res: (Option<String>, i64) = pipe.query_async(&mut conn).await?;
+                res
+            };
+            if let (Some(blob), ttl @ 1..) = (blob, ttl) {
+                match catbird::services::redis_crypto::open_v2_with_metadata(&key_bytes, &blob, "session", k) {
+                    Err(e) => {
+                        eprintln!("rekey: hashed key '{k}' does not decrypt: {e}");
+                        failed += 1;
+                    }
+                    Ok((plain, _meta, _is_v1)) => {
+                        if serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&plain).is_ok() {
+                            skipped += 1;
+                        } else {
+                            let v: serde_json::Value = match serde_json::from_str(&plain) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("rekey: hashed key '{k}' payload is not JSON: {e}");
+                                    failed += 1;
+                                    continue;
+                                }
+                            };
+                            let upgraded = upgrade_session_json(v);
+                            let upgraded_str = serde_json::to_string(&upgraded)?;
+                            match serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&upgraded_str) {
+                                Ok(_) => {
+                                    if dry_run {
+                                        println!("would upgrade payload of {k} (ttl {ttl})");
+                                    } else {
+                                        let hashed_did = rest.rsplitn(2, '_').nth(1);
+                                        let meta = EnvelopeMetadata::new("session", k, hashed_did, None);
+                                        let v2 = seal_v2_with_metadata(&key_bytes, &upgraded_str, &meta)
+                                            .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
+                                        let _: () = redis::cmd("SET")
+                                            .arg(k)
+                                            .arg(&v2)
+                                            .arg("EX")
+                                            .arg(ttl as u64)
+                                            .query_async(&mut conn)
+                                            .await?;
+                                    }
+                                    rekeyed += 1;
+                                }
+                                Err(e) => {
+                                    eprintln!("rekey: hashed key '{k}' still fails typed parse after upgrade: {e}");
+                                    failed += 1;
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                skipped += 1;
             }
-            skipped += 1; // already hashed or unrecognized
             continue;
         }
         let raw_sid = parts[0];
@@ -1087,7 +1146,13 @@ async fn run_rekey(
         let fp_index_key = format!("{prefix}session_fp_index:{sha256_fp}");
         let old_raw_index = format!("{prefix}session_index:{raw_sid}");
 
-        let json_str = String::from_utf8_lossy(&plain).to_string();
+        let upgraded = upgrade_session_json(json.clone());
+        let json_str = serde_json::to_string(&upgraded)?;
+        if let Err(e) = serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&json_str) {
+            eprintln!("rekey: '{k}' fails typed parse even after upgrade: {e}");
+            failed += 1;
+            continue;
+        }
         let meta = EnvelopeMetadata::new("session", &new_session_key, Some(did), None);
         let v2 = seal_v2_with_metadata(&key_bytes, &json_str, &meta)
             .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
