@@ -1016,10 +1016,10 @@ async fn run_rekey(
             if dry_run {
                 let blob: Option<String> = redis::cmd("GET").arg(k).query_async(&mut conn).await?;
                 if let Some(blob) = blob {
-                    match open_session_dual_read(&key_bytes, &blob, &[]) {
+                    match catbird::services::redis_crypto::open_v2_with_metadata(&key_bytes, &blob, "session", k) {
                         Err(e) => eprintln!("hashed-probe DECRYPT fails for {k}: {e}"),
-                        Ok((plain, _)) => {
-                            if let Err(e) = serde_json::from_slice::<jacquard_oauth::session::ClientSessionData>(&plain) {
+                        Ok((plain, _meta, _is_v1)) => {
+                            if let Err(e) = serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&plain) {
                                 eprintln!("hashed-probe typed-parse FAILS for {k}: {e}");
                             }
                         }
