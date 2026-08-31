@@ -1034,12 +1034,18 @@ async fn run_rekey(
             continue;
         }
 
-        let (plain, _is_v1) = match open_session_dual_read(&key_bytes, &blob, &[]) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("rekey: cannot decrypt '{k}': {e}");
-                failed += 1;
-                continue;
+        let plain = if blob.starts_with('{') {
+            // Pre-encryption era: session stored as plaintext JSON. Rekeying
+            // seals it into the v2 envelope, removing plaintext at rest.
+            blob.clone().into_bytes()
+        } else {
+            match open_session_dual_read(&key_bytes, &blob, &[]) {
+                Ok((v, _is_v1)) => v,
+                Err(e) => {
+                    eprintln!("rekey: cannot decrypt '{k}': {e}");
+                    failed += 1;
+                    continue;
+                }
             }
         };
         let json: serde_json::Value = match serde_json::from_slice(&plain) {
