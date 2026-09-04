@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(proof_claims.iat, now);
 
         // 3. Verify the complete procedure registry, including push registration.
-        assert_eq!(CHAT_ENDPOINTS.len(), 33);
+        assert_eq!(CHAT_ENDPOINTS.len(), 32);
         assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.updatePushToken"));
     }
 
