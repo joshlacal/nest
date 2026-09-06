@@ -1598,21 +1598,11 @@ pub async fn proxy_xrpc(
         let duration = start.elapsed().as_secs_f64();
         metrics::record_proxy_request(&lexicon, status, duration);
 
-        let mut response = Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
-        for (name, value) in response_headers.iter() {
-            let name_str = name.as_str();
-            if matches!(
-                name_str,
-                "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
-            ) {
-                if let Ok(v) = reqwest::header::HeaderValue::to_str(value) {
-                    response = response.header(name_str, v);
-                }
-            }
-        }
-
-        return Ok(response.body(Body::from(response_body)).unwrap());
+        return Ok(super::mls_proxy_response::build_response(
+            status,
+            &response_headers,
+            response_body,
+        ));
     }
 
     let path = format!("/xrpc/{}", lexicon);
