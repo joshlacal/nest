@@ -91,6 +91,20 @@ pub fn validate_oauth_server_endpoints(
     Ok(())
 }
 
+/// Normalize only a service URL's empty root path for OAuth discovery.
+/// Stored session URLs and the resolver's exact issuer checks remain unchanged.
+fn oauth_discovery_identifier(identifier: &str) -> Result<&str> {
+    if identifier.starts_with("http://") || identifier.starts_with("https://") {
+        validate_pds_url(identifier).map_err(|e| anyhow!("Invalid PDS identifier URL: {e}"))?;
+        let uri = jacquard_common::deps::fluent_uri::Uri::parse(identifier)
+            .map_err(|e| anyhow!("Invalid PDS identifier URI: {e}"))?;
+        if uri.path().as_str() == "/" && uri.query().is_none() && uri.fragment().is_none() {
+            return Ok(identifier.trim_end_matches('/'));
+        }
+    }
+    Ok(identifier)
+}
+
 /// Push an authorization request that asks for exactly `scopes`, returning the
 /// authorization URL to redirect the user to.
 ///
@@ -111,10 +125,7 @@ pub async fn start_auth_with_scopes(
         ));
     }
 
-    // If identifier is an explicit URL, validate it against SSRF first
-    if identifier.starts_with("http://") || identifier.starts_with("https://") {
-        validate_pds_url(identifier).map_err(|e| anyhow!("Invalid PDS identifier URL: {e}"))?;
-    }
+    let identifier = oauth_discovery_identifier(identifier)?;
 
     let client_data = &client.registry.client_data;
 
@@ -189,6 +200,74 @@ pub async fn start_auth_with_scopes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_accepts_session_root_slash_but_rejects_wrong_issuer() {
+        use jacquard_identity::{resolver::ResolverOptions, JacquardResolver};
+        use serde_json::json;
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let origin = server.uri();
+        Mock::given(path("/.well-known/oauth-protected-resource"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resource": origin,
+                "authorization_servers": [origin],
+                "scopes_supported": ["atproto"],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": origin,
+                "authorization_endpoint": format!("{origin}/oauth/authorize"),
+                "token_endpoint": format!("{origin}/oauth/token"),
+                "response_types_supported": ["code"],
+                "scopes_supported": ["atproto"],
+            })))
+            .mount(&server)
+            .await;
+
+        let resolver = JacquardResolver::new(reqwest::Client::new(), ResolverOptions::default());
+        let session_url = format!("{origin}/");
+        let metadata = resolver
+            .resolve_from_service(oauth_discovery_identifier(&session_url).unwrap())
+            .await
+            .expect("a session root slash must not prevent OAuth discovery");
+        assert_eq!(metadata.issuer.as_str(), origin);
+
+        server.reset().await;
+        Mock::given(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": "https://other.example.com",
+                "authorization_endpoint": "https://other.example.com/oauth/authorize",
+                "token_endpoint": "https://other.example.com/oauth/token",
+                "response_types_supported": ["code"],
+                "scopes_supported": ["atproto"],
+            })))
+            .mount(&server)
+            .await;
+        assert!(resolver
+            .resolve_from_service(oauth_discovery_identifier(&session_url).unwrap())
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn discovery_preserves_non_root_identifiers() {
+        for identifier in [
+            "did:plc:upgradetestuser",
+            "alice.bsky.social",
+            "https://pds.example.com",
+            "https://pds.example.com/tenant/",
+            "https://pds.example.com/?value=/",
+            "https://pds.example.com/#fragment/",
+        ] {
+            assert_eq!(oauth_discovery_identifier(identifier).unwrap(), identifier);
+        }
+        assert!(oauth_discovery_identifier("https://10.0.0.1/").is_err());
+        assert!(oauth_discovery_identifier("http://pds.example.com/").is_err());
+    }
 
     #[test]
     fn test_validate_oauth_server_endpoints_success() {
