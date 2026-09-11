@@ -3019,7 +3019,7 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
     endpoints.insert(
         "/xrpc/com.atproto.simplespace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fpublic%2F1".to_string(),
         (200, serde_json::json!({
-            "members": [{"did": "did:plc:member-1"}, {"did": "did:plc:member-2"}]
+            "members": [{"did": "did:plc:member-1", "read": true, "write": true}, {"did": "did:plc:member-2", "read": true, "write": false}]
         }).to_string()),
     );
     endpoints.insert(
