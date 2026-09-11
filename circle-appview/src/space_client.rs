@@ -127,12 +127,46 @@ impl SpaceAppAccess {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SpacePolicy {
+    Public,
+    MemberList,
+    ManagingApp,
+    Unknown(Option<String>),
+}
+
+impl SpacePolicy {
+    pub fn parse(val: &serde_json::Value) -> Self {
+        match val.get("$type").and_then(serde_json::Value::as_str) {
+            Some("com.atproto.simplespace.defs#publicPolicy") => Self::Public,
+            Some("com.atproto.simplespace.defs#memberListPolicy") => Self::MemberList,
+            Some("com.atproto.simplespace.defs#managingAppPolicy") => Self::ManagingApp,
+            other => Self::Unknown(other.map(str::to_owned)),
+        }
+    }
+
+    pub fn is_supported(&self) -> bool {
+        // Circles authorize from the member cache; public and managing-app
+        // policies cannot be represented by that cache.
+        matches!(self, SpacePolicy::MemberList)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceMember {
+    pub did: String,
+    pub read: bool,
+    pub write: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpaceConfig {
     pub authority: String,
     pub space_type: String,
     pub skey: String,
     pub app_access: SpaceAppAccess,
+    pub read_policy: SpacePolicy,
+    pub write_policy: SpacePolicy,
     pub user_policy: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -241,7 +275,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn list_members<'a>(
         &'a self,
         _space_uri: &'a str,
-    ) -> Option<Pin<Box<dyn Future<Output = Result<Vec<String>, AppError>> + Send + 'a>>> {
+    ) -> Option<Pin<Box<dyn Future<Output = Result<Vec<SpaceMember>, AppError>> + Send + 'a>>> {
         None
     }
 
@@ -1044,7 +1078,7 @@ pub struct MockSpaceHostTransport {
     blob_responses: Mutex<HashMap<String, (Option<String>, Vec<u8>)>>,
     blob_calls: Mutex<Vec<String>>,
     register_notify_responses: Mutex<HashMap<String, DateTime<Utc>>>,
-    space_members: Mutex<HashMap<String, Result<Vec<String>, String>>>,
+    space_members: Mutex<HashMap<String, Result<Vec<SpaceMember>, String>>>,
     space_configs: Mutex<HashMap<String, Result<SpaceConfig, String>>>,
 }
 
@@ -1147,6 +1181,19 @@ impl MockSpaceHostTransport {
     }
 
     pub fn set_space_members(&self, space: &str, members: Vec<String>) {
+        let mut lock = self.space_members.lock().unwrap();
+        let detailed: Vec<SpaceMember> = members
+            .into_iter()
+            .map(|did| SpaceMember {
+                did,
+                read: true,
+                write: true,
+            })
+            .collect();
+        lock.insert(space.to_string(), Ok(detailed));
+    }
+
+    pub fn set_space_members_detailed(&self, space: &str, members: Vec<SpaceMember>) {
         let mut lock = self.space_members.lock().unwrap();
         lock.insert(space.to_string(), Ok(members));
     }
@@ -1420,7 +1467,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn list_members<'a>(
         &'a self,
         space_uri: &'a str,
-    ) -> Option<Pin<Box<dyn Future<Output = Result<Vec<String>, AppError>> + Send + 'a>>> {
+    ) -> Option<Pin<Box<dyn Future<Output = Result<Vec<SpaceMember>, AppError>> + Send + 'a>>> {
         let lock = self.space_members.lock().unwrap();
         if let Some(res) = lock.get(space_uri).cloned() {
             Some(Box::pin(async move { res.map_err(AppError::Forbidden) }))
@@ -1435,7 +1482,22 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     ) -> Option<Pin<Box<dyn Future<Output = Result<SpaceConfig, AppError>> + Send + 'a>>> {
         let lock = self.space_configs.lock().unwrap();
         if let Some(res) = lock.get(space_uri).cloned() {
-            Some(Box::pin(async move { res.map_err(AppError::Forbidden) }))
+            Some(Box::pin(async move {
+                match res {
+                    Ok(cfg) => Ok(cfg),
+                    Err(e) => {
+                        if e.starts_with('{') {
+                            Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e))
+                        } else if e == "NotFound" || e == "SpaceNotFound" {
+                            Err(AppError::NotFound(e))
+                        } else if e.starts_with("Internal") || e.starts_with("Upstream") {
+                            Err(AppError::Internal(e))
+                        } else {
+                            Err(AppError::Forbidden(e))
+                        }
+                    }
+                }
+            }))
         } else {
             None
         }
@@ -1493,10 +1555,10 @@ impl SpaceClient {
             .await
     }
 
-    /// Fetch member DIDs via `com.atproto.simplespace.listMembers` from the owner's PDS using AppView's OAuth session.
+    /// Fetch member DIDs and their read/write flags via `com.atproto.simplespace.listMembers` from the owner's PDS using AppView's OAuth session.
     /// Enforces bounds on pages, total members, bytes, cursor length, duration, concurrency, and repeated cursor detection.
     /// Stages all results and only returns when completely fetched without truncation (fails closed).
-    pub async fn member_dids(&self, space: &str) -> Result<Vec<String>, AppError> {
+    pub async fn list_members(&self, space: &str) -> Result<Vec<SpaceMember>, AppError> {
         if let Some(fut) = self.transport.list_members(space) {
             return fut.await;
         }
@@ -1591,6 +1653,8 @@ impl SpaceClient {
             #[derive(Deserialize)]
             struct MemberItem {
                 did: String,
+                read: bool,
+                write: bool,
             }
             #[derive(Deserialize)]
             struct ListMembersResponse {
@@ -1613,7 +1677,11 @@ impl SpaceClient {
                 AppError::Internal(format!("Failed to parse listMembers output: {e}"))
             })?;
             for m in data.members {
-                staged_members.push(m.did);
+                staged_members.push(SpaceMember {
+                    did: m.did,
+                    read: m.read,
+                    write: m.write,
+                });
             }
 
             if staged_members.len() > MAX_LIST_MEMBERS_TOTAL {
@@ -1635,6 +1703,17 @@ impl SpaceClient {
         }
 
         Ok(staged_members)
+    }
+
+    /// Fetch member DIDs authorized for read via `com.atproto.simplespace.listMembers`.
+    /// Filters out members with `read = false` to prevent unauthorized read access.
+    pub async fn member_dids(&self, space: &str) -> Result<Vec<String>, AppError> {
+        let members = self.list_members(space).await?;
+        Ok(members
+            .into_iter()
+            .filter(|m| m.read)
+            .map(|m| m.did)
+            .collect())
     }
 
     /// Fetch space config via `com.atproto.simplespace.getSpace` from the owner's PDS using AppView's OAuth session.
@@ -1679,9 +1758,7 @@ impl SpaceClient {
             .await
             .unwrap_or_default();
             let body = String::from_utf8_lossy(&body_bytes);
-            return Err(AppError::Internal(format!(
-                "getSpace returned {status}: {body}"
-            )));
+            return Err(parse_xrpc_error(status, &body));
         }
 
         #[derive(Deserialize)]
@@ -1694,6 +1771,10 @@ impl SpaceClient {
             skey: Option<String>,
             #[serde(default, rename = "appAccess")]
             app_access: Option<serde_json::Value>,
+            #[serde(default, rename = "readPolicy")]
+            read_policy: Option<serde_json::Value>,
+            #[serde(default, rename = "writePolicy")]
+            write_policy: Option<serde_json::Value>,
             #[serde(default, rename = "userPolicy")]
             user_policy: Option<serde_json::Value>,
             #[serde(default)]
@@ -1716,6 +1797,18 @@ impl SpaceClient {
             .map(SpaceAppAccess::parse)
             .unwrap_or(SpaceAppAccess::Unknown(None));
 
+        let read_policy = raw
+            .read_policy
+            .as_ref()
+            .map(SpacePolicy::parse)
+            .unwrap_or(SpacePolicy::Unknown(None));
+
+        let write_policy = raw
+            .write_policy
+            .as_ref()
+            .map(SpacePolicy::parse)
+            .unwrap_or(SpacePolicy::Unknown(None));
+
         let (auth, st, sk) = parse_space_uri_parts(space)?;
 
         Ok(SpaceConfig {
@@ -1723,6 +1816,8 @@ impl SpaceClient {
             space_type: raw.space_type.unwrap_or(st),
             skey: raw.skey.unwrap_or(sk),
             app_access,
+            read_policy,
+            write_policy,
             user_policy: raw.user_policy.map(|v| v.to_string()),
             name: raw.name,
             description: raw.description,
@@ -2185,9 +2280,11 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
         "InvalidClientAttestation" => AppError::Forbidden("InvalidClientAttestation".into()),
         "SpaceNotFound" => AppError::NotFound("SpaceNotFound".into()),
         "SpaceDeleted" => AppError::AccessRemoved("SpaceDeleted".into()),
+        "AuthRequired" => AppError::Unauthorized(AuthReason::MissingHeader),
         _ => match status {
             reqwest::StatusCode::NOT_FOUND => AppError::NotFound("NotFound".into()),
             reqwest::StatusCode::FORBIDDEN => AppError::Forbidden("Forbidden".into()),
+            reqwest::StatusCode::UNAUTHORIZED => AppError::Unauthorized(AuthReason::MissingHeader),
             reqwest::StatusCode::BAD_REQUEST => AppError::InvalidRequest("InvalidRequest".into()),
             _ => AppError::Internal(format!("Upstream error ({status})")),
         },

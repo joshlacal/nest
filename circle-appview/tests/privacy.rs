@@ -236,6 +236,8 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
                 oauth_service.client_id.clone(),
                 CIRCLE_AUDIENCE.to_string(),
             ]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Space 1".to_string()),
             description: Some("Test Space 1".to_string()),
@@ -2720,6 +2722,8 @@ async fn app_access_open_policy_grants_access_and_preserves_projected_data(pool:
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-open".to_string(),
             app_access: SpaceAppAccess::Open,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Open Policy Space".to_string()),
             description: None,
@@ -2804,6 +2808,8 @@ async fn app_access_explicit_allow_list_omitting_client_revokes_and_purges_data(
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-omit".to_string(),
             app_access: SpaceAppAccess::AllowList(vec!["did:example:other-appview".to_string()]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("AllowList Omit Space".to_string()),
             description: None,
@@ -2887,6 +2893,8 @@ async fn app_access_unrecognized_variant_denies_without_purging_data(pool: PgPoo
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-unknown".to_string(),
             app_access: SpaceAppAccess::Unknown(Some("com.future.policy#customPolicy".to_string())),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Unknown Policy Space".to_string()),
             description: None,
@@ -2976,6 +2984,8 @@ async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPoo
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-absent".to_string(),
             app_access: parsed_access,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Absent Allowed Space".to_string()),
             description: None,
@@ -3066,6 +3076,8 @@ async fn app_access_explicit_empty_allowed_array_revokes_and_purges_data(pool: P
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-empty".to_string(),
             app_access: parsed_access,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Empty Allowed Space".to_string()),
             description: None,
@@ -3156,6 +3168,8 @@ async fn app_access_object_entry_allowed_array_denies_without_purging_data(pool:
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-objectentry".to_string(),
             app_access: parsed_access,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Object Entry Space".to_string()),
             description: None,
@@ -3536,6 +3550,8 @@ async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-1".to_string(),
             app_access: SpaceAppAccess::AllowList(vec![]), // Explicitly revokes
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Revoked Space".into()),
             description: None,
@@ -3645,4 +3661,148 @@ async fn delete_space_purges_member_cache_and_expired_tombstones_are_cleaned(poo
         .await
         .unwrap();
     assert_eq!(remaining.0, 0, "Tombstone row must be completely removed");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn write_only_member_does_not_gain_circles_read_authorization_from_cache(pool: PgPool) {
+    use circle_appview::access::{
+        check_member_access, refresh_member_cache, verify_member_access, MemberAccessOutcome,
+    };
+    use circle_appview::space_client::{SpaceConfig, SpaceMember, SpacePolicy};
+
+    let setup = setup_privacy_test(pool.clone()).await;
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3l7writeonly', $2, 'Write Only Member Space', now(), true)",
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Configure space config with MemberList policy
+    setup.mock_transport.set_space_config(
+        SPACE_1,
+        SpaceConfig {
+            authority: ALICE_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-writeonly".to_string(),
+            app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: SpacePolicy::MemberList,
+            write_policy: SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Write Only Member Space".to_string()),
+            description: None,
+        },
+    );
+
+    // 2. Bob is write-only: read = false, write = true
+    setup.mock_transport.set_space_members_detailed(
+        SPACE_1,
+        vec![
+            SpaceMember {
+                did: ALICE_DID.to_string(),
+                read: true,
+                write: true,
+            },
+            SpaceMember {
+                did: BOB_DID.to_string(),
+                read: false,
+                write: true,
+            },
+        ],
+    );
+
+    // 3. refresh_member_cache returns only reading members
+    let reading_members = refresh_member_cache(&setup.state, SPACE_1).await.unwrap();
+    assert!(
+        !reading_members.contains(&BOB_DID.to_string()),
+        "refresh_member_cache must NOT return write-only member Bob in reading members list"
+    );
+    assert!(
+        reading_members.contains(&ALICE_DID.to_string()),
+        "refresh_member_cache must include Alice who has read=true"
+    );
+
+    // 4. Verify circle_member_cache database row stores can_read=false, can_write=true for Bob
+    let bob_flags: (bool, bool) = sqlx::query_as(
+        "SELECT can_read, can_write FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bob_flags,
+        (false, true),
+        "Bob must have can_read=false and can_write=true in cache table"
+    );
+
+    // 5. verify_member_access must DENY Bob read access
+    let access_outcome = verify_member_access(&setup.state, SPACE_1, BOB_DID)
+        .await
+        .unwrap();
+    assert_eq!(
+        access_outcome,
+        MemberAccessOutcome::DeniedNotMember,
+        "verify_member_access must deny read access to write-only member Bob"
+    );
+
+    // 6. check_member_access must fail with AccessRemoved for Bob
+    let check_res = check_member_access(&setup.state, SPACE_1, BOB_DID).await;
+    assert!(
+        check_res.is_err(),
+        "check_member_access must reject write-only member Bob"
+    );
+
+    // 7. Verify circle_member_cache_meta member_count only counts reading members (Alice, count = 1)
+    let (member_count,): (i32,) =
+        sqlx::query_as("SELECT member_count FROM circle_member_cache_meta WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        member_count, 1,
+        "member_count in meta must count only reading members"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_space_unrecognized_policy_fails_closed(pool: PgPool) {
+    use circle_appview::access::refresh_member_cache;
+    use circle_appview::space_client::{SpaceAppAccess, SpaceConfig, SpacePolicy};
+
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // Mock get_space returning unrecognized read_policy
+    setup.mock_transport.set_space_config(
+        SPACE_1,
+        SpaceConfig {
+            authority: ALICE_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-badpolicy".to_string(),
+            app_access: SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: SpacePolicy::Unknown(Some("custom.unknown.policy".to_string())),
+            write_policy: SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Bad Policy Space".to_string()),
+            description: None,
+        },
+    );
+
+    let res = refresh_member_cache(&setup.state, SPACE_1).await;
+    assert!(
+        res.is_err(),
+        "refresh_member_cache must fail closed on unrecognized read policy"
+    );
 }

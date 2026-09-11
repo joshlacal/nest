@@ -848,6 +848,330 @@ async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn owner_omitted_from_explicit_list_sees_own_actual_post_in_unified_and_direct_feed_while_outsider_and_removed_member_denied(
+    pool: PgPool,
+) {
+    let setup = setup_views_test(pool.clone()).await;
+
+    // 1. Create a circle where ALICE is the authority
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3l7viewsaaaaa', $2, 'Alice Circle', now(), true)",
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2. Grant Bob active membership in Space 1 ONLY (simulates production where Swan is explicit member and Josh is authority)
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    // Verify ALICE is NOT in circle_member_cache
+    let alice_in_cache: Option<(String,)> = sqlx::query_as(
+        "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        alice_in_cache.is_none(),
+        "Owner Alice must not be in circle_member_cache"
+    );
+
+    // 3. Insert Alice's actual post in Space 1
+    let post_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3l7ownerpost");
+    let post_json = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Alice's owner post",
+        "createdAt": "2026-08-24T12:00:00.000Z"
+    });
+    let cid = compute_record_cid(&post_json);
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at, indexed_at)
+        VALUES ($1, $2, $3, $4, 'app.bsky.feed.post', '3l7ownerpost', $5, now(), now())
+        "#,
+    )
+    .bind(&post_uri)
+    .bind(&cid)
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(&post_json)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 4. Owner Alice queries direct feed (?space=SPACE_1) -> 200 OK, sees her own actual post
+    let alice_token_direct = mint_jwt(ALICE_DID, "blue.catbird.circle.getFeed", &setup.alice_key);
+    let req_alice_direct = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}"))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {alice_token_direct}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_alice_direct = setup.app.clone().oneshot(req_alice_direct).await.unwrap();
+    assert_eq!(resp_alice_direct.status(), StatusCode::OK);
+    let body_alice_direct = to_bytes(resp_alice_direct.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_alice_direct: GetFeedOutput = serde_json::from_slice(&body_alice_direct).unwrap();
+    assert_eq!(
+        feed_alice_direct.feed.len(),
+        1,
+        "Owner must see own post in direct feed"
+    );
+    assert_eq!(
+        feed_alice_direct.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7ownerpost")
+    );
+    assert_eq!(feed_alice_direct.feed[0].circle.owner.as_str(), ALICE_DID);
+
+    // 5. Owner Alice queries unified feed (space = None) -> 200 OK, sees her own actual post
+    let alice_token_unified = mint_jwt(ALICE_DID, "blue.catbird.circle.getFeed", &setup.alice_key);
+    let req_alice_unified = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.getFeed")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {alice_token_unified}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_alice_unified = setup.app.clone().oneshot(req_alice_unified).await.unwrap();
+    assert_eq!(resp_alice_unified.status(), StatusCode::OK);
+    let body_alice_unified = to_bytes(resp_alice_unified.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_alice_unified: GetFeedOutput = serde_json::from_slice(&body_alice_unified).unwrap();
+    assert_eq!(
+        feed_alice_unified.feed.len(),
+        1,
+        "Owner must see own post in unified feed"
+    );
+    assert_eq!(
+        feed_alice_unified.feed[0].post.post.uri.as_str(),
+        format!("at://{ALICE_DID}/app.bsky.feed.post/3l7ownerpost")
+    );
+
+    // 6. Member Bob queries direct feed (?space=SPACE_1) -> 200 OK, sees Alice's post
+    let bob_token_direct = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
+    let req_bob_direct = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}"))
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token_direct}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp_bob_direct = setup.app.clone().oneshot(req_bob_direct).await.unwrap();
+    assert_eq!(resp_bob_direct.status(), StatusCode::OK);
+    let body_bob_direct = to_bytes(resp_bob_direct.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_bob_direct: GetFeedOutput = serde_json::from_slice(&body_bob_direct).unwrap();
+    assert_eq!(
+        feed_bob_direct.feed.len(),
+        1,
+        "Member must see post in direct feed"
+    );
+
+    // 7. Member Bob queries unified feed (space = None) -> 200 OK, sees Alice's post
+    let bob_token_unified = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
+    let req_bob_unified = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.getFeed")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token_unified}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp_bob_unified = setup.app.clone().oneshot(req_bob_unified).await.unwrap();
+    assert_eq!(resp_bob_unified.status(), StatusCode::OK);
+    let body_bob_unified = to_bytes(resp_bob_unified.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_bob_unified: GetFeedOutput = serde_json::from_slice(&body_bob_unified).unwrap();
+    assert_eq!(
+        feed_bob_unified.feed.len(),
+        1,
+        "Member must see post in unified feed"
+    );
+
+    // 8. Outsider Charlie queries direct feed (?space=SPACE_1) -> 403 FORBIDDEN (fails closed)
+    let charlie_token_direct = mint_jwt(
+        CHARLIE_DID,
+        "blue.catbird.circle.getFeed",
+        &setup.charlie_key,
+    );
+    let req_charlie_direct = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}"))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {charlie_token_direct}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_charlie_direct = setup.app.clone().oneshot(req_charlie_direct).await.unwrap();
+    assert_eq!(resp_charlie_direct.status(), StatusCode::FORBIDDEN);
+
+    // 9. Outsider Charlie queries unified feed (space = None) -> 200 OK with empty feed (fails closed)
+    let charlie_token_unified = mint_jwt(
+        CHARLIE_DID,
+        "blue.catbird.circle.getFeed",
+        &setup.charlie_key,
+    );
+    let req_charlie_unified = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.getFeed")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {charlie_token_unified}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_charlie_unified = setup
+        .app
+        .clone()
+        .oneshot(req_charlie_unified)
+        .await
+        .unwrap();
+    assert_eq!(resp_charlie_unified.status(), StatusCode::OK);
+    let body_charlie_unified = to_bytes(resp_charlie_unified.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_charlie_unified: GetFeedOutput =
+        serde_json::from_slice(&body_charlie_unified).unwrap();
+    assert_eq!(
+        feed_charlie_unified.feed.len(),
+        0,
+        "Outsider must see 0 posts in unified feed"
+    );
+
+    // 10. Remove Bob from Space 1 using purge::remove_member
+    circle_appview::purge::remove_member(&pool, SPACE_1, BOB_DID)
+        .await
+        .unwrap();
+
+    // 11. Removed member Bob queries direct feed (?space=SPACE_1) -> 403 FORBIDDEN
+    let bob_removed_direct = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
+    let req_bob_rem_direct = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}"))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {bob_removed_direct}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_bob_rem_direct = setup.app.clone().oneshot(req_bob_rem_direct).await.unwrap();
+    assert_eq!(resp_bob_rem_direct.status(), StatusCode::FORBIDDEN);
+
+    // 12. Removed member Bob queries unified feed (space = None) -> 200 OK with empty feed
+    let bob_removed_unified = mint_jwt(BOB_DID, "blue.catbird.circle.getFeed", &setup.bob_key);
+    let req_bob_rem_unified = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.getFeed")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {bob_removed_unified}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_bob_rem_unified = setup
+        .app
+        .clone()
+        .oneshot(req_bob_rem_unified)
+        .await
+        .unwrap();
+    assert_eq!(resp_bob_rem_unified.status(), StatusCode::OK);
+    let body_bob_rem_unified = to_bytes(resp_bob_rem_unified.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_bob_rem_unified: GetFeedOutput =
+        serde_json::from_slice(&body_bob_rem_unified).unwrap();
+    assert_eq!(
+        feed_bob_rem_unified.feed.len(),
+        0,
+        "Removed member must see 0 posts in unified feed"
+    );
+
+    // 13. Owner Alice STILL sees own post in direct feed after member removal
+    let alice_token_after = mint_jwt(ALICE_DID, "blue.catbird.circle.getFeed", &setup.alice_key);
+    let req_alice_after = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/blue.catbird.circle.getFeed?space={SPACE_1}"))
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token_after}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp_alice_after = setup.app.clone().oneshot(req_alice_after).await.unwrap();
+    assert_eq!(resp_alice_after.status(), StatusCode::OK);
+    let body_alice_after = to_bytes(resp_alice_after.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_alice_after: GetFeedOutput = serde_json::from_slice(&body_alice_after).unwrap();
+    assert_eq!(
+        feed_alice_after.feed.len(),
+        1,
+        "Owner still sees post after member removed"
+    );
+
+    // 14. Owner Alice STILL sees own post in unified feed after member removal
+    let alice_token_uni_after =
+        mint_jwt(ALICE_DID, "blue.catbird.circle.getFeed", &setup.alice_key);
+    let req_alice_uni_after = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.getFeed")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {alice_token_uni_after}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp_alice_uni_after = setup
+        .app
+        .clone()
+        .oneshot(req_alice_uni_after)
+        .await
+        .unwrap();
+    assert_eq!(resp_alice_uni_after.status(), StatusCode::OK);
+    let body_alice_uni_after = to_bytes(resp_alice_uni_after.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let feed_alice_uni_after: GetFeedOutput =
+        serde_json::from_slice(&body_alice_uni_after).unwrap();
+    assert_eq!(
+        feed_alice_uni_after.feed.len(),
+        1,
+        "Owner still sees post in unified feed after member removed"
+    );
+
+    // 15. Verify Alice was NEVER added to circle_member_cache and member count is 0 after Bob's removal
+    let cached_members: Vec<(String,)> =
+        sqlx::query_as("SELECT member_did FROM circle_member_cache WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        cached_members.is_empty(),
+        "No manufactured members in cache"
+    );
+
+    let meta_count: (i32,) =
+        sqlx::query_as("SELECT member_count FROM circle_member_cache_meta WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        meta_count.0, 0,
+        "Member count must reflect explicit members only (0 after removal)"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space_interactions(
     pool: PgPool,
 ) {

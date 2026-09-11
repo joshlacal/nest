@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
@@ -6,7 +7,7 @@ use circle_appview::{
     auth::{DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod},
     config::{AppState, Config},
     db,
-    error::AuthReason,
+    error::{AppError, AuthReason},
     routes::create_router,
     space_client::{
         DefaultSpaceHostTransport, MockSpaceHostTransport, SpaceClient, SpaceHostDnsResolver,
@@ -102,6 +103,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
             app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
                 oauth_service.client_id.clone(),
             ]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Test Circle".to_string()),
             description: Some("Test Circle Desc".to_string()),
@@ -563,6 +566,61 @@ async fn unreadable_member_list_denies_without_signalling_removal(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn authority_omitted_from_member_cache_is_authorized_in_shared_gate_while_outsider_fails_closed(
+    pool: PgPool,
+) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3k2space1tidx', $2, 'Test Circle', now(), true)",
+    )
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Authority is NOT in member cache
+    let outcome = access::verify_member_access(&setup.state, &space, AUTHORITY_DID)
+        .await
+        .expect("verify_member_access must succeed for space authority");
+    assert_eq!(outcome, access::MemberAccessOutcome::Authorized);
+
+    access::check_member_access(&setup.state, &space, AUTHORITY_DID)
+        .await
+        .expect("check_member_access must succeed for space authority");
+
+    // Outsider (Bob) fails closed
+    let bob_err = access::check_member_access(&setup.state, &space, BOB_DID)
+        .await
+        .expect_err("check_member_access must deny outsider");
+    assert!(
+        matches!(
+            bob_err,
+            circle_appview::error::AppError::Forbidden(_)
+                | circle_appview::error::AppError::AccessRemoved(_)
+        ),
+        "Expected Forbidden or AccessRemoved for outsider, got {bob_err:?}"
+    );
+
+    // When circle app_access is revoked or deleted, authority is also denied (invariants preserved)
+    sqlx::query("UPDATE circles SET app_access_granted = false WHERE space_uri = $1")
+        .bind(&space)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let revoked_err = access::check_member_access(&setup.state, &space, AUTHORITY_DID)
+        .await
+        .expect_err("check_member_access must deny when appAccess revoked");
+    assert!(
+        matches!(revoked_err, circle_appview::error::AppError::NotFound(_)),
+        "Expected NotFound for revoked space, got {revoked_err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
 
@@ -577,6 +635,8 @@ async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
         app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
             service_did.clone()
         ]),
+        read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+        write_policy: circle_appview::space_client::SpacePolicy::MemberList,
         user_policy: None,
         name: Some("Test".to_string()),
         description: None,
@@ -595,6 +655,8 @@ async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
         app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
             expected_client_id.clone(),
         ]),
+        read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+        write_policy: circle_appview::space_client::SpacePolicy::MemberList,
         user_policy: None,
         name: Some("Test".to_string()),
         description: None,
@@ -1240,7 +1302,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
         .and(path("/xrpc/com.atproto.simplespace.listMembers"))
         .and(query_param("space", space))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "members": [{"did": "did:plc:user1"}],
+            "members": [{"did": "did:plc:user1", "read": true, "write": true}],
             "cursor": "repeated_cursor_token"
         })))
         .mount(&mock_server)
@@ -1293,4 +1355,86 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
         "Repeated pagination cursor must fail closed: got {:?}",
         res
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_activate_circle_missing_grant_returns_auth_required_not_404_and_preserves_not_found_and_upstream(
+    pool: PgPool,
+) {
+    let setup = setup_test(pool.clone()).await;
+    register_did_doc(
+        &setup.state.did_resolver,
+        AUTHORITY_DID,
+        &setup.authority_signing_key,
+        Some(vec![DidService {
+            id: "#atproto_pds".into(),
+            r#type: "AtprotoPersonalDataServer".into(),
+            service_endpoint: SPACE_HOST_ENDPOINT.into(),
+        }]),
+    );
+
+    // 1. Missing AppView OAuth grant: AUTHORITY_DID has no session in oauth_sessions.
+    // An unconfigured space triggers get_space which tries to fetch a token for AUTHORITY_DID.
+    let ungranted_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/ungranted");
+    let missing_grant_res =
+        access::activate_circle(&setup.state, ALICE_DID, &ungranted_space).await;
+
+    match missing_grant_res {
+        Err(AppError::Unauthorized(reason)) => {
+            assert_eq!(reason, AuthReason::MissingOAuthSession);
+            let resp = AppError::Unauthorized(reason).into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+        other => panic!("Expected missing OAuth session to require authorization, got {other:?}"),
+    }
+
+    // Verify no database writes occurred before access authorization
+    let circle_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circles")
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        circle_count.0, 0,
+        "No circle row must be written on authorization failure"
+    );
+
+    let member_cache_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circle_member_cache")
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        member_cache_count.0, 0,
+        "No member cache row must be written on authorization failure"
+    );
+
+    // 2. True NotFound: when PDS returns SpaceNotFound, it must return NotFound (404), not 401 or 500
+    let not_found_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/nonexistent");
+    setup
+        .mock_transport
+        .set_space_config_error(&not_found_space, "SpaceNotFound".into());
+
+    let not_found_res = access::activate_circle(&setup.state, ALICE_DID, &not_found_space).await;
+    match not_found_res {
+        Err(AppError::NotFound(_)) => {
+            let resp = not_found_res.unwrap_err().into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+        other => panic!("Expected NotFound for true missing space, got {other:?}"),
+    }
+
+    // 3. Upstream failure: when PDS returns server error / unavailable, it must retain Internal (500), not 404
+    let upstream_err_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/upstream-err");
+    setup.mock_transport.set_space_config_error(
+        &upstream_err_space,
+        "Upstream server error (503 Service Unavailable)".into(),
+    );
+
+    let upstream_res = access::activate_circle(&setup.state, ALICE_DID, &upstream_err_space).await;
+    match upstream_res {
+        Err(AppError::Internal(_)) => {
+            let resp = upstream_res.unwrap_err().into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        other => panic!("Expected Internal for upstream failure, got {other:?}"),
+    }
 }

@@ -154,7 +154,7 @@ pub async fn get_post_thread(
             (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
-        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
+        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4 AND m.can_read = true
         WHERE (r.uri = $1 OR r.uri = $2)
           AND r.space_uri = $3
           AND r.collection = 'app.bsky.feed.post'
@@ -337,7 +337,7 @@ pub async fn get_post_thread(
                 (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
             FROM circle_records r
             JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
-            JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
+            JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4 AND m.can_read = true
             WHERE (r.uri = $1 OR r.uri = $2)
               AND r.space_uri = $3
               AND r.collection = 'app.bsky.feed.post'
@@ -617,7 +617,7 @@ async fn fetch_replies_batch(
             (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri AND l.author_did = $3) AS viewer_like_uri
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $3
+        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $3 AND m.can_read = true
         JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
         WHERE r.parent_uri = ANY($1)
           AND r.space_uri = $2
