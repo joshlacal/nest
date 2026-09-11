@@ -82,6 +82,11 @@ pub struct ApnsDelivery {
 
 impl ApnsDelivery {
     pub fn new(config: &ApnsConfig) -> Result<Option<Self>> {
+        if !config.enabled {
+            tracing::warn!("APNs delivery is disabled by configuration; all Nest push delivery will stay disabled");
+            return Ok(None);
+        }
+
         let (Some(key_path), Some(key_id), Some(team_id), Some(topic)) = (
             config.key_path.as_deref(),
             config.key_id.as_deref(),
@@ -231,6 +236,38 @@ impl ApnsSender for ApnsDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_apns_skips_configured_credentials() {
+        let config: ApnsConfig = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "key_path": "/dev/null/nest-apns-disabled-test.p8",
+            "key_id": "test-key",
+            "team_id": "test-team",
+            "topic": "blue.catbird"
+        }))
+        .unwrap();
+
+        match ApnsDelivery::new(&config) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("disabled APNs must not create a delivery client"),
+            Err(err) => panic!("disabled APNs must not read configured credentials: {err}"),
+        }
+    }
+
+    #[test]
+    fn enabled_apns_still_validates_configured_credentials() {
+        let config: ApnsConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "key_path": "/dev/null/nest-apns-enabled-test.p8",
+            "key_id": "test-key",
+            "team_id": "test-team",
+            "topic": "blue.catbird"
+        }))
+        .unwrap();
+
+        assert!(ApnsDelivery::new(&config).is_err());
+    }
 
     #[test]
     fn first_try_env_prefers_known_registration_env() {

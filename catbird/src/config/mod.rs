@@ -228,8 +228,12 @@ impl Default for PushConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ApnsConfig {
+    /// Set CATBIRD__PUSH__APNS__ENABLED=false and restart Nest to disable all
+    /// push delivery while keeping the gateway and device registration available.
+    #[serde(default = "default_apns_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub key_path: Option<String>,
     #[serde(default)]
@@ -246,6 +250,23 @@ pub struct ApnsConfig {
     /// only affects which endpoint is tried first for brand-new tokens.
     #[serde(default)]
     pub production: bool,
+}
+
+impl Default for ApnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_apns_enabled(),
+            key_path: None,
+            key_id: None,
+            team_id: None,
+            topic: None,
+            production: false,
+        }
+    }
+}
+
+fn default_apns_enabled() -> bool {
+    true
 }
 
 fn default_push_verdict_ttl_seconds() -> u64 {
@@ -1203,6 +1224,41 @@ mod tests {
             !push_config.chat_poll_enabled,
             "chat_poll_enabled MUST be false by default until release gate opens"
         );
+    }
+
+    #[test]
+    fn apns_delivery_remains_enabled_when_switch_is_omitted() {
+        assert!(ApnsConfig::default().enabled);
+        assert!(PushConfig::default().apns.enabled);
+
+        for value in [serde_json::json!({}), serde_json::json!({ "apns": {} })] {
+            let config: PushConfig = serde_json::from_value(value).unwrap();
+            assert!(config.apns.enabled);
+        }
+    }
+
+    #[test]
+    fn apns_delivery_can_be_disabled_by_environment_override() {
+        let config = config::Config::builder()
+            .add_source(
+                config::Environment::with_prefix("CATBIRD")
+                    .separator("__")
+                    .try_parsing(true)
+                    .source(Some(
+                        [(
+                            "CATBIRD__PUSH__APNS__ENABLED".to_owned(),
+                            "false".to_owned(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )),
+            )
+            .build()
+            .unwrap()
+            .get::<PushConfig>("push")
+            .unwrap();
+
+        assert!(!config.apns.enabled);
     }
 
     #[test]
