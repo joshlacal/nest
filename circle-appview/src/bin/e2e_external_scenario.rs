@@ -64,10 +64,10 @@ use catbird_atproto::generated::com_atproto::repo::create_record::{
 use catbird_atproto::generated::com_atproto::repo::strong_ref::StrongRef;
 use catbird_atproto::generated::com_atproto::repo::upload_blob::UploadBlobOutput;
 use catbird_atproto::generated::com_atproto::server::describe_server::DescribeServerOutput;
-use catbird_atproto::generated::com_atproto::simplespace::add_member::AddMember;
 use catbird_atproto::generated::com_atproto::simplespace::create_space::{
-    CreateSpace, CreateSpaceAppAccess, CreateSpacePolicy,
+    CreateSpace, CreateSpaceAppAccess, CreateSpaceReadPolicy, CreateSpaceWritePolicy,
 };
+use catbird_atproto::generated::com_atproto::simplespace::put_member::PutMember;
 use catbird_atproto::generated::com_atproto::simplespace::remove_member::RemoveMember;
 use catbird_atproto::generated::com_atproto::space::apply_writes::{
     ApplyWrites, ApplyWritesOutput, ApplyWritesOutputResultsItem, ApplyWritesWritesItem, Create,
@@ -1555,7 +1555,12 @@ impl ScenarioRunner {
                 catbird_atproto::jacquard_common::types::string::RecordKey::any_static(skey)
                     .unwrap(),
             ),
-            policy: CreateSpacePolicy::MemberListPolicy(Box::new(
+            read_policy: CreateSpaceReadPolicy::MemberListPolicy(Box::new(
+                catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
+                    extra_data: None,
+                },
+            )),
+            write_policy: CreateSpaceWritePolicy::MemberListPolicy(Box::new(
                 catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
                     extra_data: None,
                 },
@@ -1601,30 +1606,32 @@ impl ScenarioRunner {
         )
         .await?;
 
-        // Alice adds Bob and Carol via simplespace.addMember
-        let add_member_url = format!(
-            "{}/xrpc/com.atproto.simplespace.addMember",
+        // Alice adds Bob and Carol via simplespace.putMember
+        let put_member_url = format!(
+            "{}/xrpc/com.atproto.simplespace.putMember",
             self.config.nest_url.trim_end_matches('/')
         );
         for user in [&self.config.bob, &self.config.carol] {
-            let add_input = AddMember {
+            let put_input = PutMember {
                 did: Did::new(user.did.clone()).unwrap(),
                 space: space_ref.clone(),
+                read: true,
+                write: true,
                 extra_data: None,
             };
-            let add_resp = self
+            let put_resp = self
                 .config
                 .alice
-                .apply_auth(self.client.post(&add_member_url))
-                .json(&add_input)
+                .apply_auth(self.client.post(&put_member_url))
+                .json(&put_input)
                 .send()
                 .await
-                .map_err(|e| format!("addMember failed for {}: {e}", user.name))?;
-            if !add_resp.status().is_success() {
+                .map_err(|e| format!("putMember failed for {}: {e}", user.name))?;
+            if !put_resp.status().is_success() {
                 return Err(format!(
-                    "addMember for {} returned HTTP {}",
+                    "putMember for {} returned HTTP {}",
                     user.name,
-                    add_resp.status()
+                    put_resp.status()
                 ));
             }
         }
@@ -2406,24 +2413,26 @@ impl ScenarioRunner {
         // Step 11: Alice Adds Dave to Circle via Nest updateMember
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_12_ADD_MEMBER_START");
-        let add_dave_input = AddMember {
+        let put_dave_input = PutMember {
             did: Did::new(self.config.dave.did.clone()).unwrap(),
             space: space_ref.clone(),
+            read: true,
+            write: true,
             extra_data: None,
         };
-        let add_dave_resp = self
+        let put_dave_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&add_member_url))
-            .json(&add_dave_input)
+            .apply_auth(self.client.post(&put_member_url))
+            .json(&put_dave_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call addMember to add Dave: {e}"))?;
+            .map_err(|e| format!("Failed to call putMember to add Dave: {e}"))?;
 
-        if !add_dave_resp.status().is_success() {
+        if !put_dave_resp.status().is_success() {
             return Err(format!(
-                "add Dave returned status {}",
-                add_dave_resp.status()
+                "put Dave returned status {}",
+                put_dave_resp.status()
             ));
         }
 

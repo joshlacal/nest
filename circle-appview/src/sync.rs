@@ -259,7 +259,7 @@ impl SyncEngine {
             r#"
             SELECT member_did
             FROM circle_member_cache
-            WHERE space_uri = $1
+            WHERE space_uri = $1 AND can_write = true
             "#,
         )
         .bind(space_uri)
@@ -735,7 +735,7 @@ impl SyncEngine {
 
                         if let Some((recipient,)) = post_author {
                             let author_is_member: Option<(String,)> = sqlx::query_as(
-                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true",
                             )
                             .bind(space_uri)
                             .bind(&valid.author_did)
@@ -743,7 +743,7 @@ impl SyncEngine {
                             .await?;
 
                             let recipient_is_member: Option<(String,)> = sqlx::query_as(
-                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_read = true",
                             )
                             .bind(space_uri)
                             .bind(&recipient)
@@ -828,7 +828,7 @@ impl SyncEngine {
 
                         if let Some((recipient,)) = parent_author {
                             let author_is_member: Option<(String,)> = sqlx::query_as(
-                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true",
                             )
                             .bind(space_uri)
                             .bind(&valid.author_did)
@@ -836,7 +836,7 @@ impl SyncEngine {
                             .await?;
 
                             let recipient_is_member: Option<(String,)> = sqlx::query_as(
-                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+                                "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_read = true",
                             )
                             .bind(space_uri)
                             .bind(&recipient)
@@ -1037,7 +1037,7 @@ impl SyncEngine {
         .map_err(AppError::Database)?;
 
         let is_still_member: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 FOR KEY SHARE)",
+            "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true FOR KEY SHARE)",
         )
         .bind(space_uri)
         .bind(author_did)
@@ -1059,7 +1059,7 @@ impl SyncEngine {
                     r#"
                     SELECT m.member_did FROM circle_member_cache m
                     JOIN circles c ON c.space_uri = m.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-                    WHERE m.space_uri = $1 AND m.member_did = $2
+                    WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_read = true
                     "#,
                 )
                 .bind(space_uri)
@@ -1544,7 +1544,7 @@ impl SyncEngine {
         .map_err(AppError::Database)?;
 
         let is_still_member: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 FOR KEY SHARE)",
+            "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true FOR KEY SHARE)",
         )
         .bind(space_uri)
         .bind(author_did)
@@ -1613,7 +1613,7 @@ impl SyncEngine {
                     r#"
                     SELECT m.member_did FROM circle_member_cache m
                     JOIN circles c ON c.space_uri = m.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-                    WHERE m.space_uri = $1 AND m.member_did = $2
+                    WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_read = true
                     "#,
                 )
                 .bind(space_uri)
@@ -1952,7 +1952,7 @@ pub async fn notify_write_handler(
 
     // Finding 17 & 36: Verify caller and repo author are active members before work
     let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2)",
+        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true)",
     )
     .bind(input.space.as_str())
     .bind(input.repo.as_str())

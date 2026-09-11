@@ -225,7 +225,7 @@ async fn list_circles_handler(
             COALESCE(pref.muted, false) AS muted,
             meta.member_count
         FROM circles c
-        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1
+        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.can_read = true
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $1
         WHERE c.deleted_at IS NULL AND c.app_access_granted = true

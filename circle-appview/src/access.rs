@@ -419,23 +419,29 @@ pub async fn verify_member_access(
     user_did: &str,
 ) -> Result<MemberAccessOutcome, AppError> {
     // 1. Check if the circle exists, is not deleted, and appAccess is granted
-    let space_row: Option<(Option<DateTime<Utc>>, bool, i64)> = sqlx::query_as(
-        "SELECT deleted_at, app_access_granted, access_epoch FROM circles WHERE space_uri = $1",
+    let space_row: Option<(Option<DateTime<Utc>>, bool, i64, String)> = sqlx::query_as(
+        "SELECT deleted_at, app_access_granted, access_epoch, authority_did FROM circles WHERE space_uri = $1",
     )
     .bind(space_uri)
     .fetch_optional(&state.db)
     .await
     .map_err(AppError::Database)?;
 
-    let (circle_deleted, circle_app_access, circle_epoch) = match space_row {
+    let (circle_deleted, circle_app_access, circle_epoch, authority_did) = match space_row {
         None => return Err(AppError::NotFound("Circle not found".into())),
-        Some((deleted_at, app_access, epoch)) => (deleted_at.is_some(), app_access, epoch),
+        Some((deleted_at, app_access, epoch, authority)) => {
+            (deleted_at.is_some(), app_access, epoch, authority)
+        }
     };
 
     if circle_deleted || !circle_app_access {
         return Err(AppError::NotFound(
             "Circle deleted or appAccess revoked".into(),
         ));
+    }
+
+    if user_did == authority_did {
+        return Ok(MemberAccessOutcome::Authorized);
     }
     // 2. Check cache freshness and matching access epoch metadata (TTL: 300 seconds)
     let cache_meta: Option<(DateTime<Utc>, i32, i64, bool)> = sqlx::query_as(
@@ -458,14 +464,13 @@ pub async fn verify_member_access(
 
     if is_fresh {
         let is_cached: Option<(String,)> = sqlx::query_as(
-            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_read = true",
         )
         .bind(space_uri)
         .bind(user_did)
         .fetch_optional(&state.db)
         .await
         .map_err(AppError::Database)?;
-
         if is_cached.is_some() {
             return Ok(MemberAccessOutcome::Authorized);
         }
@@ -518,7 +523,7 @@ pub async fn revalidate_stale_member_spaces(
         r#"
         SELECT DISTINCT c.space_uri
         FROM circles c
-        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1
+        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.can_read = true
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         WHERE c.deleted_at IS NULL
           AND (c.authority_did = $1 OR m.member_did IS NOT NULL)
@@ -592,6 +597,18 @@ pub async fn refresh_member_cache(
         ));
     }
 
+    // Fail closed if read_policy or write_policy is unrecognized or unsupported
+    if !space_config.read_policy.is_supported() || !space_config.write_policy.is_supported() {
+        tracing::warn!(
+            space_uri = %space_uri,
+            read_policy = ?space_config.read_policy,
+            write_policy = ?space_config.write_policy,
+            "Space readPolicy or writePolicy is unrecognized or unsupported, failing closed"
+        );
+        return Err(AppError::Forbidden(
+            "Space policy is unrecognized or unsupported".into(),
+        ));
+    }
     // Check if the circle is deleted or appAccess is not granted in the circles table
     let circle_row: Option<(bool, Option<DateTime<Utc>>, i64)> = sqlx::query_as(
         "SELECT app_access_granted, deleted_at, access_epoch FROM circles WHERE space_uri = $1",
@@ -612,31 +629,37 @@ pub async fn refresh_member_cache(
         ));
     }
 
-    let member_dids = state
+    let members = state
         .space_client
-        .member_dids(space_uri)
+        .list_members(space_uri)
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "Failed to fetch member DIDs from PDS");
-            AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}"))
+            tracing::warn!(error = %e, space_uri = %space_uri, "Failed to fetch member list from PDS during refresh");
+            match e {
+                AppError::Unauthorized(_) => e,
+                _ => AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}")),
+            }
         })?;
 
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
 
     // Fetch existing cached members to detect membership mutations
-    let existing_members: Vec<(String,)> =
-        sqlx::query_as("SELECT member_did FROM circle_member_cache WHERE space_uri = $1")
-            .bind(space_uri)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+    let existing_members: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT member_did, can_read, can_write FROM circle_member_cache WHERE space_uri = $1",
+    )
+    .bind(space_uri)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
 
-    let existing_set: std::collections::HashSet<String> =
-        existing_members.into_iter().map(|(d,)| d).collect();
-    let new_set: std::collections::HashSet<String> = member_dids.iter().cloned().collect();
+    let existing_set: std::collections::HashSet<(String, bool, bool)> =
+        existing_members.into_iter().collect();
+    let new_set: std::collections::HashSet<(String, bool, bool)> = members
+        .iter()
+        .map(|m| (m.did.clone(), m.read, m.write))
+        .collect();
 
     let membership_changed = existing_set != new_set;
-
     let target_epoch = if membership_changed {
         let (new_epoch,): (i64,) = sqlx::query_as(
             r#"
@@ -661,21 +684,28 @@ pub async fn refresh_member_cache(
         .await
         .map_err(AppError::Database)?;
 
-    for member_did in &member_dids {
+    for m in &members {
         sqlx::query(
             r#"
-            INSERT INTO circle_member_cache (space_uri, member_did, cached_at)
-            VALUES ($1, $2, now())
-            ON CONFLICT (space_uri, member_did) DO UPDATE SET cached_at = now()
+            INSERT INTO circle_member_cache (space_uri, member_did, can_read, can_write, cached_at)
+            VALUES ($1, $2, $3, $4, now())
+            ON CONFLICT (space_uri, member_did) DO UPDATE SET can_read = EXCLUDED.can_read, can_write = EXCLUDED.can_write, cached_at = now()
             "#,
         )
         .bind(space_uri)
-        .bind(member_did)
+        .bind(&m.did)
+        .bind(m.read)
+        .bind(m.write)
         .execute(&mut *tx)
         .await
         .map_err(AppError::Database)?;
     }
 
+    let reading_members: Vec<String> = members
+        .iter()
+        .filter(|m| m.read)
+        .map(|m| m.did.clone())
+        .collect();
     sqlx::query(
         r#"
         INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count, access_epoch, app_access_granted, generation)
@@ -685,7 +715,7 @@ pub async fn refresh_member_cache(
         "#,
     )
     .bind(space_uri)
-    .bind(member_dids.len() as i32)
+    .bind(reading_members.len() as i32)
     .bind(target_epoch)
     .execute(&mut *tx)
     .await
@@ -693,7 +723,7 @@ pub async fn refresh_member_cache(
 
     tx.commit().await.map_err(AppError::Database)?;
 
-    Ok(member_dids)
+    Ok(reading_members)
 }
 
 pub async fn get_cached_member_count(
@@ -728,7 +758,7 @@ pub async fn activate_circle(
     // 1. Independent verification via get_space on the owner's PDS
     let space_config = state.space_client.get_space(space_uri).await.map_err(|e| {
         tracing::warn!(error = %e, "get_space failed on PDS");
-        AppError::NotFound(format!("Space not found or upstream unavailable: {e}"))
+        e
     })?;
 
     // Verify appAccess names this AppView's client_id
@@ -739,6 +769,18 @@ pub async fn activate_circle(
         ));
     }
 
+    // Verify policies are supported (fail closed on malformed/unrecognized policy)
+    if !space_config.read_policy.is_supported() || !space_config.write_policy.is_supported() {
+        tracing::warn!(
+            space_uri = %space_uri,
+            read_policy = ?space_config.read_policy,
+            write_policy = ?space_config.write_policy,
+            "Space readPolicy or writePolicy is unrecognized or unsupported during activation, failing closed"
+        );
+        return Err(AppError::Forbidden(
+            "Space policy is unrecognized or unsupported".into(),
+        ));
+    }
     // 2. Authorize the caller against the PDS member list WITHOUT writing yet.
     // `circle_member_cache` has a foreign key onto `circles`, so the cache can
     // only be persisted after the circle row exists (step 4). Authorization
@@ -749,7 +791,10 @@ pub async fn activate_circle(
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "Failed to fetch member DIDs from PDS");
-            AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}"))
+            match e {
+                AppError::Unauthorized(_) => e,
+                _ => AppError::Forbidden(format!("Unable to fetch member list from PDS: {e}")),
+            }
         })?;
     if !members.iter().any(|m| m == user_did) && user_did != authority_did {
         return Err(AppError::Forbidden(
@@ -966,11 +1011,12 @@ pub async fn ensure_space_credential_from_parts(
     }
 
     if acting_user_did.is_none() {
-        let member_rows: Vec<(String,)> =
-            sqlx::query_as("SELECT member_did FROM circle_member_cache WHERE space_uri = $1")
-                .bind(space_uri)
-                .fetch_all(db)
-                .await?;
+        let member_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND can_read = true",
+        )
+        .bind(space_uri)
+        .fetch_all(db)
+        .await?;
 
         if !member_rows.is_empty() {
             let sessions = oauth_service.list_sessions().await?;
@@ -987,11 +1033,8 @@ pub async fn ensure_space_credential_from_parts(
         acting_user_did = Some(authority_did.clone());
     }
 
-    let user_did = acting_user_did.ok_or_else(|| {
-        AppError::Forbidden(
-            "Circle authorization required: no active OAuth session for user, members, or space authority".into(),
-        )
-    })?;
+    let user_did = acting_user_did
+        .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::MissingOAuthSession))?;
 
     // 3. Obtain valid token and DPoP signing key for the chosen user
     let (access_token, dpop_key) = oauth_service
@@ -1409,19 +1452,10 @@ mod tests {
         .await
         .expect_err("Must fail when no session is held for user/member/authority");
 
-        match err {
-            AppError::Forbidden(msg) => {
-                assert!(
-                    msg.contains("Circle authorization required")
-                        || msg.contains("no active OAuth session"),
-                    "Error must indicate authorization is needed, got: {msg}"
-                );
-            }
-            other => panic!(
-                "Expected AppError::Forbidden for missing session, got: {:?}",
-                other
-            ),
-        }
+        assert!(matches!(
+            err,
+            AppError::Unauthorized(AuthReason::MissingOAuthSession)
+        ));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1769,6 +1803,12 @@ mod tests {
                                 "$type": "com.atproto.space.defs#allowList",
                                 "allowed": ["https://circles.catbird.blue/oauth/client-metadata.json"]
                             },
+                            "readPolicy": {
+                                "$type": "com.atproto.simplespace.defs#memberListPolicy"
+                            },
+                            "writePolicy": {
+                                "$type": "com.atproto.simplespace.defs#memberListPolicy"
+                            },
                             "name": "Test Circle Space"
                         }).to_string();
                         let response = format!(
@@ -1780,8 +1820,8 @@ mod tests {
                     } else if req_str.starts_with("GET /xrpc/com.atproto.simplespace.listMembers") {
                         let body = serde_json::json!({
                             "members": [
-                                { "did": TEST_USER_DID },
-                                { "did": TEST_AUTHORITY_DID }
+                                { "did": TEST_USER_DID, "read": true, "write": true },
+                                { "did": TEST_AUTHORITY_DID, "read": true, "write": true }
                             ]
                         })
                         .to_string();

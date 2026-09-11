@@ -153,7 +153,6 @@ pub fn build_post_view(
             repost: None,
             bookmarked: None,
             embedding_disabled: None,
-            known_likers: None,
             pinned: None,
             reply_disabled: None,
             thread_muted: None,
@@ -323,12 +322,21 @@ pub async fn get_feed(
             (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
         FROM circle_records r
         JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1
-        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+        LEFT JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1 AND m.can_read = true
+        LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
         WHERE r.collection = 'app.bsky.feed.post'
           AND r.deleted_at IS NULL
           AND r.parent_uri IS NULL
+          AND (
+              c.authority_did = $1
+              OR (
+                  m.member_did IS NOT NULL
+                  AND meta.app_access_granted = true
+                  AND meta.access_epoch = c.access_epoch
+                  AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+              )
+          )
           AND ($2::TEXT IS NULL OR r.space_uri = $2)
           AND ($2::TEXT IS NOT NULL OR COALESCE(pref.muted, false) = false)
           AND (

@@ -87,7 +87,7 @@ pub async fn list_notifications(
             COALESCE(pref.muted, false) AS circle_muted
         FROM circle_notifications n
         JOIN circles c ON c.space_uri = n.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-        JOIN circle_member_cache m ON m.space_uri = n.space_uri AND m.member_did = $1
+        JOIN circle_member_cache m ON m.space_uri = n.space_uri AND m.member_did = $1 AND m.can_read = true
         JOIN circle_member_cache_meta meta ON meta.space_uri = n.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
         LEFT JOIN circle_preferences pref ON pref.space_uri = n.space_uri AND pref.member_did = $1
         WHERE n.recipient_did = $1
