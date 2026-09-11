@@ -80,7 +80,7 @@ pub struct ClientAttestationClaims {
     pub jti: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PendingOAuthState {
     pub state: String,
     pub code_verifier: String,
@@ -90,6 +90,23 @@ pub struct PendingOAuthState {
     pub auth_server_iss: Option<String>,
     pub created_at: DateTime<Utc>,
     pub in_flight: bool,
+    pub dpop_key: p256::ecdsa::SigningKey,
+}
+
+impl std::fmt::Debug for PendingOAuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingOAuthState")
+            .field("state", &self.state)
+            .field("code_verifier", &"[REDACTED]")
+            .field("user_did", &self.user_did)
+            .field("pds_endpoint", &self.pds_endpoint)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("auth_server_iss", &self.auth_server_iss)
+            .field("created_at", &self.created_at)
+            .field("in_flight", &self.in_flight)
+            .field("dpop_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -536,7 +553,7 @@ impl OAuthService {
         let mut state_bytes = [0u8; 24];
         rand::thread_rng().fill_bytes(&mut state_bytes);
         let state = URL_SAFE_NO_PAD.encode(state_bytes);
-
+        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
 
         // Try PAR first if supported
@@ -568,40 +585,45 @@ impl OAuthService {
                 ("client_assertion", client_assertion.as_str()),
             ];
 
-            let res = par_client.post(par_url_str).form(&params).send().await;
-            match res {
-                Ok(resp) if resp.status().is_success() => {
-                    #[derive(Deserialize)]
-                    struct ParResponse {
-                        request_uri: String,
-                    }
-                    let body_bytes =
-                        crate::auth::read_bounded_response_bytes(resp, MAX_OAUTH_RESPONSE_BYTES)
-                            .await?;
-                    let par: ParResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-                        AppError::Internal(format!("PAR response decode error: {e}"))
-                    })?;
-                    format!(
-                        "{}?client_id={}&request_uri={}",
-                        auth_endpoint,
-                        url_encode(&self.client_id),
-                        url_encode(&par.request_uri)
-                    )
-                }
-                _ => {
-                    // Fallback to standard authorization endpoint with query parameters
-                    format!(
-                        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-                        auth_endpoint,
-                        url_encode(&self.client_id),
-                        url_encode(&redirect_uri),
-                        url_encode(CIRCLE_SCOPE),
-                        url_encode(&state),
-                        url_encode(&code_challenge)
-                    )
-                }
+            let resp = post_form_with_dpop(&par_client, &dpop_key, par_url_str, &params)
+                .await
+                .map_err(|e| AppError::Internal(format!("PAR request failed: {e}")))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body_bytes =
+                    crate::auth::read_bounded_response_bytes(resp, MAX_OAUTH_RESPONSE_BYTES)
+                        .await
+                        .unwrap_or_default();
+                let body = String::from_utf8_lossy(&body_bytes);
+                let redacted_desc = redact_oauth_error_body(&body);
+                tracing::warn!(
+                    operation = "pushed_authorization_request",
+                    upstream_status = %status.as_u16(),
+                    redacted_error = %redacted_desc,
+                    "PAR failed upstream"
+                );
+                return Err(AppError::Internal(format!(
+                    "PAR returned {status}: {redacted_desc}"
+                )));
             }
+
+            #[derive(Deserialize)]
+            struct ParResponse {
+                request_uri: String,
+            }
+            let body_bytes =
+                crate::auth::read_bounded_response_bytes(resp, MAX_OAUTH_RESPONSE_BYTES).await?;
+            let par: ParResponse = serde_json::from_slice(&body_bytes)
+                .map_err(|e| AppError::Internal(format!("PAR response decode error: {e}")))?;
+            format!(
+                "{}?client_id={}&request_uri={}",
+                auth_endpoint,
+                url_encode(&self.client_id),
+                url_encode(&par.request_uri)
+            )
         } else {
+            // Standard authorization endpoint with query parameters only where metadata genuinely lacks PAR
             format!(
                 "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
                 auth_endpoint,
@@ -629,13 +651,13 @@ impl OAuthService {
                     auth_server_iss: auth_issuer,
                     created_at: now,
                     in_flight: false,
+                    dpop_key,
                 },
             );
         }
 
         Ok(authorization_url)
     }
-
     /// Handle callback from OAuth authorization server.
     pub async fn handle_callback(
         &self,
@@ -715,7 +737,7 @@ impl OAuthService {
                 AppError::TooManyRequests("Public flow concurrency limit reached".into())
             })?;
 
-        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let dpop_key = pending.dpop_key.clone();
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
         // RFC 7523 as profiled by atproto: `aud` is the authorization server's
         // ISSUER, not its token endpoint. Sending the endpoint is rejected with
@@ -839,9 +861,10 @@ impl OAuthService {
         user_did: &str,
         _http_client: &reqwest::Client,
     ) -> Result<(String, p256::ecdsa::SigningKey), AppError> {
-        let session = self.get_session(user_did).await?.ok_or_else(|| {
-            AppError::Unauthorized(crate::error::AuthReason::NoVerificationMethod)
-        })?;
+        let session = self
+            .get_session(user_did)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::MissingOAuthSession))?;
 
         let expired = session
             .expires_at
@@ -860,9 +883,10 @@ impl OAuthService {
         let _guard = self.user_locks.acquire(user_did).await;
 
         // Re-read session under lock to check if another concurrent task already completed refresh.
-        let session = self.get_session(user_did).await?.ok_or_else(|| {
-            AppError::Unauthorized(crate::error::AuthReason::NoVerificationMethod)
-        })?;
+        let session = self
+            .get_session(user_did)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::MissingOAuthSession))?;
 
         let expired = session
             .expires_at
@@ -1231,7 +1255,10 @@ impl OAuthService {
     ) -> Result<(String, String, Option<String>, Option<String>), AppError> {
         let pds_url = url::Url::parse(pds_endpoint)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid PDS endpoint URL: {e}")))?;
-        if pds_url.scheme() != "https" {
+        let allow_loopback = self.transport.allows_loopback_for_test();
+        let is_pds_loopback = (pds_url.scheme() == "http" || pds_url.scheme() == "https")
+            && is_loopback_or_localhost(pds_url.host_str().unwrap_or(""));
+        if (!allow_loopback || !is_pds_loopback) && pds_url.scheme() != "https" {
             return Err(AppError::InvalidRequest(
                 "PDS endpoint must use HTTPS".into(),
             ));
@@ -1260,9 +1287,15 @@ impl OAuthService {
                 return false;
             };
 
-            if iss_url.scheme() != "https"
-                || auth_url.scheme() != "https"
-                || tok_url.scheme() != "https"
+            let is_ep_loopback = |u: &url::Url| {
+                allow_loopback
+                    && (u.scheme() == "http" || u.scheme() == "https")
+                    && is_loopback_or_localhost(u.host_str().unwrap_or(""))
+            };
+
+            if (!allow_loopback || !is_ep_loopback(&iss_url)) && iss_url.scheme() != "https"
+                || (!allow_loopback || !is_ep_loopback(&auth_url)) && auth_url.scheme() != "https"
+                || (!allow_loopback || !is_ep_loopback(&tok_url)) && tok_url.scheme() != "https"
             {
                 return false;
             }
@@ -1280,7 +1313,7 @@ impl OAuthService {
                 let Ok(par_url) = url::Url::parse(par) else {
                     return false;
                 };
-                if par_url.scheme() != "https"
+                if (!allow_loopback || !is_ep_loopback(&par_url)) && par_url.scheme() != "https"
                     || par_url.origin().ascii_serialization() != expected_origin
                 {
                     return false;
@@ -1356,7 +1389,11 @@ impl OAuthService {
                                 let r_url = url::Url::parse(resource_str).map_err(|_| {
                                     AppError::Unauthorized(AuthReason::AudienceMismatch)
                                 })?;
-                                if r_url.scheme() != "https"
+                                let is_res_loopback = (r_url.scheme() == "http"
+                                    || r_url.scheme() == "https")
+                                    && is_loopback_or_localhost(r_url.host_str().unwrap_or(""));
+                                if (!allow_loopback || !is_res_loopback)
+                                    && r_url.scheme() != "https"
                                     || r_url.origin().ascii_serialization() != pds_origin
                                     || resource_str.trim_end_matches('/') != pds_base
                                 {
@@ -1370,7 +1407,14 @@ impl OAuthService {
                                         let Ok(server_url) = url::Url::parse(&server) else {
                                             continue;
                                         };
-                                        if server_url.scheme() != "https" {
+                                        let is_srv_loopback = (server_url.scheme() == "http"
+                                            || server_url.scheme() == "https")
+                                            && is_loopback_or_localhost(
+                                                server_url.host_str().unwrap_or(""),
+                                            );
+                                        if (!allow_loopback || !is_srv_loopback)
+                                            && server_url.scheme() != "https"
+                                        {
                                             continue;
                                         };
                                         let server_origin =
@@ -1641,15 +1685,33 @@ pub struct OAuthStartQuery {
     pub did: String,
 }
 
+fn safe_oauth_error(err: &AppError) -> &'static str {
+    match err {
+        AppError::InvalidRequest(_) => "invalid_request",
+        AppError::Unauthorized(_) => "access_denied",
+        AppError::Forbidden(_) => "access_denied",
+        AppError::TooManyRequests(_) => "temporarily_unavailable",
+        _ => "server_error",
+    }
+}
+
 pub async fn oauth_start_handler(
     State(state): State<AppState>,
     Query(query): Query<OAuthStartQuery>,
 ) -> Result<Redirect, AppError> {
-    let auth_url = state
+    match state
         .oauth_service
         .start_flow(&query.did, &state.did_resolver, &state.http_client)
-        .await?;
-    Ok(Redirect::temporary(&auth_url))
+        .await
+    {
+        Ok(auth_url) => Ok(Redirect::temporary(&auth_url)),
+        Err(e) => {
+            let safe_error = safe_oauth_error(&e);
+            tracing::warn!(did = %query.did, error = safe_error, "OAuth start flow failed");
+            let err_redirect = format!("{}?error={}", CALLBACK_DEEP_LINK, safe_error);
+            Ok(Redirect::temporary(&err_redirect))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1662,11 +1724,19 @@ pub async fn oauth_callback_handler(
     State(state): State<AppState>,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Result<Redirect, AppError> {
-    let redirect_url = state
+    match state
         .oauth_service
         .handle_callback(&query.code, &query.state, &state.http_client)
-        .await?;
-    Ok(Redirect::temporary(&redirect_url))
+        .await
+    {
+        Ok(redirect_url) => Ok(Redirect::temporary(&redirect_url)),
+        Err(e) => {
+            let safe_error = safe_oauth_error(&e);
+            tracing::warn!(error = safe_error, "OAuth callback failed");
+            let err_redirect = format!("{}?error={}", CALLBACK_DEEP_LINK, safe_error);
+            Ok(Redirect::temporary(&err_redirect))
+        }
+    }
 }
 
 /// Verifies an `atproto-client-attestation+jwt` directly against a provided JWKS document.
@@ -2178,6 +2248,7 @@ mod tests {
             auth_server_iss: Some(mock_server.uri()),
             created_at: Utc::now(),
             in_flight: false,
+            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
         };
         service
             .pending_states
@@ -2281,6 +2352,7 @@ mod tests {
             auth_server_iss: Some("https://pds.expired.example".to_string()),
             created_at: Utc::now() - Duration::seconds(PENDING_STATE_TTL_SECS + 30),
             in_flight: false,
+            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
         };
 
         let fresh_pending = PendingOAuthState {
@@ -2292,6 +2364,7 @@ mod tests {
             auth_server_iss: Some("https://pds.fresh.example".to_string()),
             created_at: Utc::now(),
             in_flight: false,
+            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
         };
 
         {
@@ -2396,5 +2469,448 @@ mod tests {
             Some("rotated-next-refresh-token")
         );
         assert!(updated.expires_at.unwrap() > Utc::now());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn par_flow_handles_nonce_challenge_and_reuses_same_dpop_key_in_token_exchange(
+        pool: PgPool,
+    ) {
+        setup_test_encryption_key();
+        let mock_server = MockServer::start().await;
+        let service = OAuthService::with_transport(
+            pool.clone(),
+            "http://127.0.0.1:3002".to_string(),
+            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
+        );
+        let http_client = reqwest::Client::new();
+        let user_did = "did:plc:alice-par-challenge-test";
+
+        // 1. Mock OAuth authorization server metadata advertising PAR endpoint
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": mock_server.uri(),
+                "authorization_endpoint": format!("{}/oauth/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oauth/token", mock_server.uri()),
+                "pushed_authorization_request_endpoint": format!("{}/oauth/par", mock_server.uri()),
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 2. PAR endpoint: 1st request without nonce returns 400 use_dpop_nonce
+        Mock::given(method("POST"))
+            .and(path("/oauth/par"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("DPoP-Nonce", "par-nonce-retry-456")
+                    .set_body_json(serde_json::json!({
+                        "error": "use_dpop_nonce",
+                        "error_description": "DPoP nonce required"
+                    })),
+            )
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // 3. PAR endpoint: 2nd request with nonce returns 201 Created
+        Mock::given(method("POST"))
+            .and(path("/oauth/par"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "request_uri": "urn:ietf:params:oauth:request_uri:par-success-xyz",
+                "expires_in": 300
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 4. Token endpoint returns 200 OK
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "valid-par-access-token",
+                "refresh_token": "valid-par-refresh-token",
+                "expires_in": 3600,
+                "sub": user_did
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Seed DidResolver with mock server PDS endpoint
+        let did_resolver = DidResolver::new("https://plc.directory".into(), http_client.clone());
+        let doc = crate::auth::DidDocument {
+            id: user_did.into(),
+            verification_method: vec![],
+            service: vec![crate::auth::DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: mock_server.uri(),
+            }],
+        };
+        did_resolver.insert_cached(user_did.into(), doc);
+
+        // Run start_flow
+        let auth_url = service
+            .start_flow(user_did, &did_resolver, &http_client)
+            .await
+            .expect("start_flow with PAR challenge must succeed");
+
+        // Verify authorization URL has PAR request_uri
+        assert!(
+            auth_url.contains("request_uri="),
+            "auth_url must contain request_uri, got: {auth_url}"
+        );
+        assert!(
+            auth_url.contains("urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3Apar-success-xyz"),
+            "auth_url must contain encoded request_uri, got: {auth_url}"
+        );
+
+        // Verify pending state was saved with the generated DPoP key
+        let pending = {
+            let lock = service.pending_states.read();
+            assert_eq!(lock.len(), 1, "Exactly one pending state should be stored");
+            lock.values().next().unwrap().clone()
+        };
+        let expected_key_bytes = pending.dpop_key.to_bytes();
+
+        // Run handle_callback
+        let cb_res = service
+            .handle_callback("code-test-123", &pending.state, &http_client)
+            .await;
+        assert!(
+            cb_res.is_ok(),
+            "handle_callback must succeed using stored key: {:?}",
+            cb_res.err()
+        );
+
+        // Verify stored session in database has the EXACT SAME dpop_key as generated in start_flow
+        let stored_session = service
+            .get_session(user_did)
+            .await
+            .unwrap()
+            .expect("Session must be stored in DB");
+        assert_eq!(
+            stored_session.dpop_key.to_bytes(),
+            expected_key_bytes,
+            "Stored session must preserve the exact same DPoP key generated before PAR"
+        );
+
+        // Inspect captured wiremock requests to verify DPoP keys across PAR retry and token exchange
+        let requests = mock_server.received_requests().await.unwrap();
+        let par_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/oauth/par")
+            .collect();
+        assert_eq!(
+            par_requests.len(),
+            2,
+            "Expected 2 requests to /oauth/par (initial + retry)"
+        );
+
+        let token_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/oauth/token")
+            .collect();
+        assert_eq!(
+            token_requests.len(),
+            1,
+            "Expected 1 request to /oauth/token"
+        );
+
+        // Helper to extract jwk public key from DPoP header
+        let extract_jwk = |req: &wiremock::Request| -> serde_json::Value {
+            let dpop_str = req
+                .headers
+                .get("dpop")
+                .expect("request must include DPoP header")
+                .to_str()
+                .unwrap();
+            let header_b64 = dpop_str.split('.').next().unwrap();
+            let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).unwrap();
+            let header_json: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+            header_json.get("jwk").unwrap().clone()
+        };
+
+        let par1_jwk = extract_jwk(par_requests[0]);
+        let par2_jwk = extract_jwk(par_requests[1]);
+        let token_jwk = extract_jwk(token_requests[0]);
+
+        assert_eq!(
+            par1_jwk, par2_jwk,
+            "PAR initial and retry must use the same DPoP key"
+        );
+        assert_eq!(
+            par2_jwk, token_jwk,
+            "PAR and token exchange must use the exact same per-flow DPoP key"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn failing_par_returns_error_and_does_not_downgrade_to_direct_authorization(
+        pool: PgPool,
+    ) {
+        setup_test_encryption_key();
+        let mock_server = MockServer::start().await;
+        let service = OAuthService::with_transport(
+            pool.clone(),
+            "http://127.0.0.1:3002".to_string(),
+            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
+        );
+        let http_client = reqwest::Client::new();
+        let user_did = "did:plc:bob-par-failure-test";
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": mock_server.uri(),
+                "authorization_endpoint": format!("{}/oauth/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oauth/token", mock_server.uri()),
+                "pushed_authorization_request_endpoint": format!("{}/oauth/par", mock_server.uri()),
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // PAR returns genuine 400 Bad Request (not use_dpop_nonce)
+        Mock::given(method("POST"))
+            .and(path("/oauth/par"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_request",
+                "error_description": "Pushed authorization rejected by upstream"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let did_resolver = DidResolver::new("https://plc.directory".into(), http_client.clone());
+        let doc = crate::auth::DidDocument {
+            id: user_did.into(),
+            verification_method: vec![],
+            service: vec![crate::auth::DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: mock_server.uri(),
+            }],
+        };
+        did_resolver.insert_cached(user_did.into(), doc);
+
+        let res = service
+            .start_flow(user_did, &did_resolver, &http_client)
+            .await;
+
+        // MUST fail and NOT downgrade to direct authorization
+        assert!(
+            res.is_err(),
+            "start_flow must fail when PAR fails instead of downgrading to direct authorization"
+        );
+        let err = res.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("PAR") || err_str.contains("400"),
+            "Error must indicate PAR failure, got: {err_str}"
+        );
+
+        // Verify no pending state was inserted
+        assert!(
+            service.pending_states.read().is_empty(),
+            "No pending state should be inserted on PAR failure"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn oauth_start_handler_redirects_to_native_callback_with_safe_error_on_failure(
+        pool: PgPool,
+    ) {
+        use axum::response::IntoResponse;
+
+        setup_test_encryption_key();
+        let mock_server = MockServer::start().await;
+        let service = Arc::new(OAuthService::with_transport(
+            pool.clone(),
+            "http://127.0.0.1:3002".to_string(),
+            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
+        ));
+        let http_client = reqwest::Client::new();
+        let user_did = "did:plc:charlie-start-fail";
+
+        // Metadata with PAR endpoint
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": mock_server.uri(),
+                "authorization_endpoint": format!("{}/oauth/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oauth/token", mock_server.uri()),
+                "pushed_authorization_request_endpoint": format!("{}/oauth/par", mock_server.uri()),
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // PAR fails with 500 error
+        Mock::given(method("POST"))
+            .and(path("/oauth/par"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&mock_server)
+            .await;
+
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            http_client.clone(),
+        ));
+        let doc = crate::auth::DidDocument {
+            id: user_did.into(),
+            verification_method: vec![],
+            service: vec![crate::auth::DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: mock_server.uri(),
+            }],
+        };
+        did_resolver.insert_cached(user_did.into(), doc);
+
+        let config = Arc::new(crate::config::Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://unused".into(),
+            service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
+            plc_directory_url: "https://plc.directory".into(),
+            public_appview_url: "https://public.api.bsky.app".into(),
+            circle_media_base_url: url::Url::parse("https://media.circles.catbird.blue").unwrap(),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: "did:web:circles.catbird.blue#push".into(),
+            push_signing_key_path: None,
+            push_signing_key_hex: None,
+            commit_verification_policy: crate::commit::CommitVerificationPolicy::StrictV2,
+        });
+
+        let app_state = AppState {
+            config,
+            db: pool.clone(),
+            http_client: http_client.clone(),
+            did_resolver,
+            credential_store: Arc::new(crate::access::CredentialStore::new()),
+            space_client: Arc::new(crate::space_client::SpaceClient::new()),
+            space_locks: Arc::new(crate::access::SpaceLockManager::new()),
+            profile_hydrator: Arc::new(crate::hydration::ProfileHydrator::new(
+                "https://public.api.bsky.app".into(),
+                http_client.clone(),
+            )),
+            oauth_service: service,
+            push_client: None,
+        };
+
+        let result = oauth_start_handler(
+            axum::extract::State(app_state),
+            axum::extract::Query(OAuthStartQuery {
+                did: user_did.to_string(),
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "oauth_start_handler must return Ok(Redirect) on failure, got err: {:?}",
+            result.err()
+        );
+        let redirect = result.unwrap();
+        let resp = redirect.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::TEMPORARY_REDIRECT);
+
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Redirect must have Location header")
+            .to_str()
+            .unwrap();
+
+        assert!(
+            location.starts_with(CALLBACK_DEEP_LINK),
+            "Redirect must point to native callback deep link {CALLBACK_DEEP_LINK}, got: {location}"
+        );
+        assert!(
+            location.contains("error="),
+            "Redirect must contain error param, got: {location}"
+        );
+        assert!(
+            !location.contains("500") && !location.contains("Internal"),
+            "Redirect must contain safe error and never raw error details, got: {location}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn metadata_genuinely_lacking_par_uses_standard_direct_authorization(pool: PgPool) {
+        setup_test_encryption_key();
+        let mock_server = MockServer::start().await;
+        let service = OAuthService::with_transport(
+            pool.clone(),
+            "http://127.0.0.1:3002".to_string(),
+            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
+        );
+        let http_client = reqwest::Client::new();
+        let user_did = "did:plc:dave-no-par-test";
+
+        // Metadata genuinely has NO pushed_authorization_request_endpoint
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": mock_server.uri(),
+                "authorization_endpoint": format!("{}/oauth/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oauth/token", mock_server.uri()),
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let did_resolver = DidResolver::new("https://plc.directory".into(), http_client.clone());
+        let doc = crate::auth::DidDocument {
+            id: user_did.into(),
+            verification_method: vec![],
+            service: vec![crate::auth::DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: mock_server.uri(),
+            }],
+        };
+        did_resolver.insert_cached(user_did.into(), doc);
+
+        let auth_url = service
+            .start_flow(user_did, &did_resolver, &http_client)
+            .await
+            .expect("start_flow without PAR in metadata must succeed using standard path");
+
+        // Verify authorization URL points to /oauth/authorize with query parameters
+        assert!(
+            auth_url.starts_with(&format!("{}/oauth/authorize?", mock_server.uri())),
+            "auth_url must use direct authorization endpoint, got: {auth_url}"
+        );
+        assert!(
+            auth_url.contains("response_type=code"),
+            "auth_url must contain response_type=code"
+        );
+        assert!(
+            auth_url.contains("code_challenge="),
+            "auth_url must contain code_challenge="
+        );
+        assert!(
+            !auth_url.contains("request_uri="),
+            "auth_url must not contain request_uri"
+        );
+
+        // Verify mock server received NO requests to /oauth/par
+        let requests = mock_server.received_requests().await.unwrap();
+        let par_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/oauth/par")
+            .collect();
+        assert_eq!(
+            par_requests.len(),
+            0,
+            "No PAR requests should be sent when not advertised"
+        );
     }
 }
