@@ -2385,6 +2385,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -2426,6 +2427,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -2455,6 +2457,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -2554,6 +2557,7 @@ async fn oauth_provider_origin_mismatch_and_proof_header_absence(pool: PgPool) {
         auth_server_iss: Some(pds_fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
