@@ -17,7 +17,7 @@ tower_governor = "0.4"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP Client
-reqwest = { version = "0.13", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
+reqwest = { version = "0.13", features = ["rustls", "json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
 flate2 = "1.0"
 brotli = "8.0"
 # Jacquard (AT Protocol)
@@ -88,6 +88,9 @@ tokio-test = "0.4"
 wiremock = "0.6"
 testcontainers = "0.18"
 testcontainers-modules = { version = "0.6", features = ["redis"] }
+# Exercise a2's exact Hyper-Rustls connector in the opt-in live incident probe.
+hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "http2", "webpki-roots", "ring"] }
+rustls = "0.22"
 
 [lints.rust]
 dead_code = "allow"
