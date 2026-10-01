@@ -150,7 +150,6 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
 
     let state = AppState::new(config, pool.clone());

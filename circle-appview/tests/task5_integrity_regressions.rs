@@ -12,9 +12,8 @@ use circle_appview::{
         DidDocument, DidResolver, DidService, ParsedVerifyingKey, PublicKeyJwk, VerificationMethod,
     },
     commit::{
-        compute_dagcbor_cid, extract_and_validate_car_with_policy, json_to_ipld, mint_repo_car,
-        mint_signed_commit, mint_signed_commit_v2_p256, parse_permissioned_car, verify_commit_v2,
-        CommitContextV2, CommitVerificationPolicy, LtHash as RepoLtHash, RepoRecord,
+        compute_dagcbor_cid, extract_and_validate_car, json_to_ipld, mint_repo_car,
+        mint_signed_commit, parse_permissioned_car, LtHash as RepoLtHash, RepoRecord,
     },
     config::{AppState, Config},
     db,
@@ -156,7 +155,6 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: CommitVerificationPolicy::default(),
     };
     let owner_signing_key = SigningKey::random(&mut OsRng);
     let bob_signing_key = SigningKey::random(&mut OsRng);
@@ -722,61 +720,6 @@ async fn test_prune_rejections_retention_bounds(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_commit_verification_policy_production_dispatch(pool: PgPool) {
-    let setup = setup_test(pool).await;
-
-    // Default policy is StrictV2: sending a v1 commit must be rejected
-    let sync_engine_strict = SyncEngine::new(&setup.state)
-        .with_commit_verification_policy(CommitVerificationPolicy::StrictV2);
-
-    let mut lthash = LtHash::default();
-    lthash.add(
-        "app.bsky.feed.post",
-        "3l7post11111",
-        "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454",
-    );
-    let v1_commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567a234",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
-    let car_v1 = mint_repo_car(&v1_commit, &[]).unwrap();
-    setup
-        .mock_transport
-        .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_v1);
-    setup.mock_transport.set_list_repo_ops_response(
-        &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            cursor: None,
-            ops: vec![],
-            commit: Some(v1_commit),
-            extra_data: None,
-        },
-    );
-
-    let res = sync_engine_strict.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        res.is_err(),
-        "v1 commit must be rejected under StrictV2 policy in production sync"
-    );
-
-    // DualReadWithCutoff policy: cutoff at "3l7234567a230", commit is "3l7234567a234" -> must be rejected
-    let sync_engine_dual = SyncEngine::new(&setup.state).with_commit_verification_policy(
-        CommitVerificationPolicy::DualReadWithCutoff {
-            cutoff_rev: "3l7234567a230".to_string(),
-        },
-    );
-
-    let res_dual = sync_engine_dual.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        res_dual.is_err(),
-        "v1 commit exceeding cutoff must be rejected under DualRead policy"
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
 async fn test_car_extra_unreferenced_blocks_rejected(pool: PgPool) {
     let setup = setup_test(pool).await;
 
@@ -823,12 +766,11 @@ async fn test_car_extra_unreferenced_blocks_rejected(pool: PgPool) {
     car_bytes.extend_from_slice(&extra_section);
 
     let parsed_car = parse_permissioned_car(&car_bytes).await.unwrap();
-    let res = extract_and_validate_car_with_policy(
+    let res = extract_and_validate_car(
         &parsed_car,
         SPACE_URI,
         OWNER_DID,
         &ParsedVerifyingKey::P256(*setup.owner_signing_key.verifying_key()),
-        &CommitVerificationPolicy::ExplicitMigrationPermitV1,
     );
     assert!(
         res.is_err(),
@@ -898,305 +840,7 @@ async fn test_sweep_checkpoint_fair_resume_and_shutdown(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_v2_commit_context_anchored_to_trusted_local_state(pool: PgPool) {
-    let setup = setup_test(pool).await;
-    let sync_engine = SyncEngine::new(&setup.state)
-        .with_commit_verification_policy(CommitVerificationPolicy::StrictV2);
-
-    // Store head at rev "3l7234567a234"
-    let init_val = json!({"$type": "app.bsky.feed.post", "text": "one", "createdAt": "2026-08-30T12:00:00.000Z"});
-    let init_cid = compute_dagcbor_cid(&init_val).unwrap();
-    let mut lthash = LtHash::default();
-    lthash.add("app.bsky.feed.post", "rkey1", &init_cid);
-    let init_hash = lthash.digest();
-
-    sqlx::query(
-        "INSERT INTO circle_repo_sync_state (space_uri, author_did, last_rev, last_hash, last_synced_at) VALUES ($1, $2, '3jzfcijpj2m24', $3, now())"
-    )
-    .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .bind(lthash.as_bytes().as_slice())
-    .execute(&setup.pool)
-    .await
-    .unwrap();
-
-    // Adversary produces v2 commit for rev "3jzfcijpj2m25", but with skipped/mismatched prev_rev "3jzfcijpj2m22" (stored is 3jzfcijpj2m24)
-    let val2 = json!({"$type": "app.bsky.feed.post", "text": "two", "createdAt": "2026-08-30T12:01:00.000Z"});
-    let cid2 = compute_dagcbor_cid(&val2).unwrap();
-    let mut lthash2 = lthash.clone();
-    lthash2.add("app.bsky.feed.post", "rkey2", &cid2);
-
-    let forged_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m22".to_string(), // Mismatched predecessor (stored is 3jzfcijpj2m24)
-        hash: lthash2.digest(),
-        prev_hash: init_hash,
-        path: "app.bsky.feed.post/rkey2".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid2.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val2).unwrap()),
-    };
-
-    let forged_commit = mint_signed_commit_v2_p256(&forged_ctx, &setup.owner_signing_key).unwrap();
-
-    setup.mock_transport.set_list_repo_ops_response(
-        &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            cursor: None,
-            ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(cid2.into()),
-                    collection: "app.bsky.feed.post".to_string().into(),
-                    prev: None,
-                    rev: "3jzfcijpj2m25".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new("rkey2")
-                        .unwrap()
-                        .into(),
-                    value: Some(json_to_ipld(&val2).unwrap()),
-                    extra_data: None,
-                },
-            ],
-            commit: Some(forged_commit),
-            extra_data: None,
-        },
-    );
-
-    // Set fallback recovery to invalid
-    setup
-        .mock_transport
-        .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), vec![0xFF; 16]);
-
-    // Sync must fail because trusted local state anchors prev_rev = "3jzfcijpj2m24"
-    let sync_res = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        sync_res.is_err(),
-        "v2 commit with mismatched predecessor must fail against trusted local state"
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn test_full_recovery_rejects_forged_prev_rev_or_prev_hash(pool: PgPool) {
-    let setup = setup_test(pool).await;
-    let sync_engine = SyncEngine::new(&setup.state)
-        .with_commit_verification_policy(CommitVerificationPolicy::StrictV2);
-
-    // 1. Initial stored state: rev = "3jzfcijpj2m24"
-    let init_val = json!({"$type": "app.bsky.feed.post", "text": "one", "createdAt": "2026-08-30T12:00:00.000Z"});
-    let init_cid = compute_dagcbor_cid(&init_val).unwrap();
-    let mut lthash = LtHash::default();
-    lthash.add("app.bsky.feed.post", "rkey1", &init_cid);
-    let init_hash = lthash.digest();
-
-    sqlx::query(
-        "INSERT INTO circle_repo_sync_state (space_uri, author_did, last_rev, last_hash, last_synced_at) VALUES ($1, $2, '3jzfcijpj2m24', $3, now())"
-    )
-    .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .bind(lthash.as_bytes().as_slice())
-    .execute(&setup.pool)
-    .await
-    .unwrap();
-
-    let val2 = json!({"$type": "app.bsky.feed.post", "text": "two", "createdAt": "2026-08-30T12:01:00.000Z"});
-    let cid2 = compute_dagcbor_cid(&val2).unwrap();
-    let mut lthash2 = lthash.clone();
-    lthash2.add("app.bsky.feed.post", "rkey2", &cid2);
-    let rec1 = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "rkey1".to_string(),
-        cid: init_cid.clone(),
-        value: init_val.clone(),
-    };
-    let rec2 = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "rkey2".to_string(),
-        cid: cid2.clone(),
-        value: val2.clone(),
-    };
-
-    // Case A: CAR commit has non-monotonic prev_rev (prev_rev >= rev)
-    let non_mono_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m26".to_string(), // non-descending (greater than rev)!
-        hash: lthash2.digest(),
-        prev_hash: init_hash,
-        path: "app.bsky.feed.post/rkey2".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid2.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val2).unwrap()),
-    };
-    let non_mono_commit =
-        mint_signed_commit_v2_p256(&non_mono_ctx, &setup.owner_signing_key).unwrap();
-    let car_non_mono_bytes =
-        mint_repo_car(&non_mono_commit, &[rec1.clone(), rec2.clone()]).unwrap();
-    let parsed_non_mono_car = parse_permissioned_car(&car_non_mono_bytes).await.unwrap();
-
-    let res_non_mono = extract_and_validate_car_with_policy(
-        &parsed_non_mono_car,
-        SPACE_URI,
-        OWNER_DID,
-        &ParsedVerifyingKey::P256(*setup.owner_signing_key.verifying_key()),
-        &CommitVerificationPolicy::StrictV2,
-    );
-    assert!(
-        res_non_mono.is_err(),
-        "Full recovery CAR with non-monotonic prev_rev must be rejected"
-    );
-
-    // Case B: CAR commit forged with mismatched commit hash vs CAR index
-    let forged_hash_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m24".to_string(),
-        hash: [0xEE; 32], // Mismatched hash vs index!
-        prev_hash: init_hash,
-        path: "app.bsky.feed.post/rkey2".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid2.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val2).unwrap()),
-    };
-    let forged_hash_commit =
-        mint_signed_commit_v2_p256(&forged_hash_ctx, &setup.owner_signing_key).unwrap();
-    let car_hash_bytes = mint_repo_car(&forged_hash_commit, &[rec1.clone(), rec2.clone()]).unwrap();
-    let parsed_hash_car = parse_permissioned_car(&car_hash_bytes).await.unwrap();
-
-    let res_hash = extract_and_validate_car_with_policy(
-        &parsed_hash_car,
-        SPACE_URI,
-        OWNER_DID,
-        &ParsedVerifyingKey::P256(*setup.owner_signing_key.verifying_key()),
-        &CommitVerificationPolicy::StrictV2,
-    );
-    assert!(
-        res_hash.is_err(),
-        "Full recovery CAR with mismatched hash vs index must be rejected"
-    );
-
-    // Case C: Forged prev_hash when claiming immediate descent from stored head (prev_rev == "3jzfcijpj2m24" but prev_hash != init_hash)
-    // The CAR itself is self-consistent (valid signature, index matches commit hash),
-    // but in full recovery, the conditional anchor detects the fork against stored last_rev and rejects it.
-    let forged_prev_hash_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m24".to_string(), // Claims stored head as predecessor
-        hash: lthash2.digest(),
-        prev_hash: [0xAA; 32], // Forged prev_hash! Does not match stored init_hash!
-        path: "app.bsky.feed.post/rkey2".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid2.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val2).unwrap()),
-    };
-    let forged_prev_hash_commit =
-        mint_signed_commit_v2_p256(&forged_prev_hash_ctx, &setup.owner_signing_key).unwrap();
-    let car_forged_prev_bytes =
-        mint_repo_car(&forged_prev_hash_commit, &[rec1.clone(), rec2.clone()]).unwrap();
-    setup
-        .mock_transport
-        .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_forged_prev_bytes);
-
-    let res_forged_prev = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        res_forged_prev.is_err(),
-        "Full recovery must reject CAR with forged prev_hash when prev_rev matches stored last_rev"
-    );
-
-    // Case D: Valid full recovery CAR with matching prev_rev and matching prev_hash succeeds
-    let valid_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m24".to_string(),
-        hash: lthash2.digest(),
-        prev_hash: init_hash, // Correctly matches stored init_hash
-        path: "app.bsky.feed.post/rkey2".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid2.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val2).unwrap()),
-    };
-    let valid_commit = mint_signed_commit_v2_p256(&valid_ctx, &setup.owner_signing_key).unwrap();
-    let car_valid_bytes = mint_repo_car(&valid_commit, &[rec1.clone(), rec2.clone()]).unwrap();
-    setup
-        .mock_transport
-        .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_valid_bytes);
-
-    let res_valid = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        res_valid.is_ok(),
-        "Valid full recovery CAR under StrictV2 must succeed: {:?}",
-        res_valid.err()
-    );
-    let valid_out = res_valid.unwrap();
-    assert_eq!(valid_out.latest_rev, "3jzfcijpj2m25");
-
-    // Case E: Multi-commit-gap recovery succeeds without anchoring to stored head
-    // Stored head is now at rev "3jzfcijpj2m25".
-    // Remote Space advanced across multiple commits to rev "3jzfcijpj2m2a" (prev_rev = "3jzfcijpj2m27").
-    let val3 = json!({"$type": "app.bsky.feed.post", "text": "three", "createdAt": "2026-08-30T12:02:00.000Z"});
-    let cid3 = compute_dagcbor_cid(&val3).unwrap();
-    let mut lthash3 = lthash2.clone();
-    lthash3.add("app.bsky.feed.post", "rkey3", &cid3);
-
-    let rec3 = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "rkey3".to_string(),
-        cid: cid3.clone(),
-        value: val3.clone(),
-    };
-
-    let gap_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m2a".to_string(),
-        prev_rev: "3jzfcijpj2m27".to_string(), // Longer gap: prev_rev != stored last_rev ("3jzfcijpj2m25")
-        hash: lthash3.digest(),
-        prev_hash: [0x55; 32], // Hash of state at rev 27 (different from stored hash at rev 25)
-        path: "app.bsky.feed.post/rkey3".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid3.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val3).unwrap()),
-    };
-    let gap_commit = mint_signed_commit_v2_p256(&gap_ctx, &setup.owner_signing_key).unwrap();
-    let car_gap_bytes = mint_repo_car(&gap_commit, &[rec1, rec2, rec3]).unwrap();
-    setup
-        .mock_transport
-        .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_gap_bytes);
-
-    let res_gap = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        res_gap.is_ok(),
-        "Multi-commit-gap recovery under StrictV2 must succeed: {:?}",
-        res_gap.err()
-    );
-    let gap_out = res_gap.unwrap();
-    assert_eq!(gap_out.latest_rev, "3jzfcijpj2m2a");
-
-    // Verify stored head in database advanced to "3jzfcijpj2m2a"
-    let head_row: (String, Vec<u8>) = sqlx::query_as(
-        "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
-    )
-    .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .fetch_one(&setup.pool)
-    .await
-    .unwrap();
-    assert_eq!(head_row.0, "3jzfcijpj2m2a");
-    assert_eq!(head_row.1, lthash3.as_bytes().as_slice());
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn test_activate_circle_uses_configured_commit_verification_policy(pool: PgPool) {
+async fn test_car_validation_accepts_only_upstream_v1_commits(pool: PgPool) {
     let setup = setup_test(pool).await;
 
     // Create a metadata record and mint a v1 commit
@@ -1233,93 +877,34 @@ async fn test_activate_circle_uses_configured_commit_verification_policy(pool: P
         .mock_transport
         .set_get_repo_response(SPACE_URI, car_bytes.clone());
 
-    // Setup active space credential
     let parsed_car = parse_permissioned_car(&car_bytes).await.unwrap();
     let owner_key = ParsedVerifyingKey::P256(*setup.owner_signing_key.verifying_key());
 
-    // 1. Under StrictV2 policy, CAR validation must reject the v1 commit
-    let strict_res = extract_and_validate_car_with_policy(
-        &parsed_car,
-        SPACE_URI,
-        OWNER_DID,
-        &owner_key,
-        &CommitVerificationPolicy::StrictV2,
-    );
+    // 1. An upstream v1 commit is accepted (CIRCLES-01).
+    let v1_res = extract_and_validate_car(&parsed_car, SPACE_URI, OWNER_DID, &owner_key);
     assert!(
-        strict_res.is_err(),
-        "CAR validation must fail under StrictV2 policy when CAR has v1 commit"
+        v1_res.is_ok(),
+        "CAR validation must accept an upstream v1 commit: {:?}",
+        v1_res.err()
     );
 
-    // 2. Under ExplicitMigrationPermitV1 policy, CAR validation must accept the v1 commit
-    let permit_res = extract_and_validate_car_with_policy(
-        &parsed_car,
-        SPACE_URI,
-        OWNER_DID,
-        &owner_key,
-        &CommitVerificationPolicy::ExplicitMigrationPermitV1,
-    );
-    assert!(
-        permit_res.is_ok(),
-        "CAR validation must succeed under ExplicitMigrationPermitV1 policy"
-    );
-
-    // 2b. The default policy, and the default-policy wrapper, accept upstream v1
-    // (CIRCLES-01): StrictV2 as the default rejected every real space-host commit.
-    assert_eq!(
-        CommitVerificationPolicy::default(),
-        CommitVerificationPolicy::UpstreamV1
-    );
-    let default_res = extract_and_validate_car_with_policy(
-        &parsed_car,
-        SPACE_URI,
-        OWNER_DID,
-        &owner_key,
-        &CommitVerificationPolicy::default(),
-    );
-    assert!(
-        default_res.is_ok(),
-        "CAR validation must accept a v1 commit under the default policy: {:?}",
-        default_res.err()
-    );
-    assert!(
-        circle_appview::commit::extract_and_validate_car(
-            &parsed_car,
-            SPACE_URI,
-            OWNER_DID,
-            &owner_key
-        )
-        .is_ok(),
-        "extract_and_validate_car (default policy) must accept a v1 commit"
-    );
-
-    // 3. Under StrictV2 policy, CAR validation succeeds when CAR has v2 commit
-    let v2_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m2b".to_string(),
-        prev_rev: "3jzfcijpj2m2a".to_string(),
-        hash: lthash.digest(),
-        prev_hash: [0u8; 32],
-        path: "blue.catbird.circle.metadata/self".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid_meta.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&rec_meta_val).unwrap()),
-    };
-    let v2_commit = mint_signed_commit_v2_p256(&v2_ctx, &setup.owner_signing_key).unwrap();
+    // 2. Any other commit version is rejected; v2 was a retired Catbird-only fork.
+    let mut v2_commit = v1_commit.clone();
+    v2_commit.ver = 2;
     let v2_car_bytes = mint_repo_car(&v2_commit, &[rec_meta]).unwrap();
     let parsed_v2_car = parse_permissioned_car(&v2_car_bytes).await.unwrap();
-
-    let v2_res = extract_and_validate_car_with_policy(
-        &parsed_v2_car,
-        SPACE_URI,
-        OWNER_DID,
-        &owner_key,
-        &CommitVerificationPolicy::StrictV2,
-    );
+    let v2_err = extract_and_validate_car(&parsed_v2_car, SPACE_URI, OWNER_DID, &owner_key)
+        .expect_err("a non-v1 commit must be rejected");
     assert!(
-        v2_res.is_ok(),
-        "CAR validation must succeed under StrictV2 policy when CAR has v2 commit"
+        v2_err.to_string().contains("unsupported commit version"),
+        "unexpected error: {v2_err}"
+    );
+
+    // 3. A v1 commit for a different author fails signature/context verification.
+    let other_key = ParsedVerifyingKey::P256(*SigningKey::random(&mut OsRng).verifying_key());
+    assert!(
+        extract_and_validate_car(&parsed_car, SPACE_URI, OWNER_DID, &other_key).is_err(),
+        "a v1 commit must not verify under another key"
     );
 }
 
@@ -1366,210 +951,6 @@ async fn test_sweep_budget_and_shutdown_in_per_page_repo_loop(pool: PgPool) {
     assert_eq!(
         summary.repos_synced, 0,
         "Shutdown signal must prevent repo loop processing"
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn test_multi_op_batch_strict_v2_verification_and_head_advance(pool: PgPool) {
-    let setup = setup_test(pool).await;
-    let sync_engine = SyncEngine::new(&setup.state)
-        .with_commit_verification_policy(CommitVerificationPolicy::StrictV2);
-
-    // Initial stored state in DB: rev = "3jzfcijpj2m20" with record rkey0
-    let val0 = json!({"$type": "app.bsky.feed.post", "text": "zero", "createdAt": "2026-08-30T12:00:00.000Z"});
-    let cid0 = compute_dagcbor_cid(&val0).unwrap();
-    let mut lthash = LtHash::default();
-    lthash.add("app.bsky.feed.post", "rkey0", &cid0);
-
-    sqlx::query(
-        "INSERT INTO circle_repo_sync_state (space_uri, author_did, last_rev, last_hash, last_synced_at) VALUES ($1, $2, '3jzfcijpj2m22', $3, now())"
-    )
-    .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .bind(lthash.as_bytes().as_slice())
-    .execute(&setup.pool)
-    .await
-    .unwrap();
-
-    // Op 1: rev "3jzfcijpj2m23", creates post rkey1
-    let val1 = json!({"$type": "app.bsky.feed.post", "text": "one", "createdAt": "2026-08-30T12:01:00.000Z"});
-    let cid1 = compute_dagcbor_cid(&val1).unwrap();
-    lthash.add("app.bsky.feed.post", "rkey1", &cid1);
-
-    // Op 2: rev "3jzfcijpj2m24", creates post rkey2
-    let val2 = json!({"$type": "app.bsky.feed.post", "text": "two", "createdAt": "2026-08-30T12:02:00.000Z"});
-    let cid2 = compute_dagcbor_cid(&val2).unwrap();
-    lthash.add("app.bsky.feed.post", "rkey2", &cid2);
-    let hash2 = lthash.digest();
-
-    // Op 3: rev "3jzfcijpj2m25", creates post rkey3
-    let val3 = json!({"$type": "app.bsky.feed.post", "text": "three", "createdAt": "2026-08-30T12:03:00.000Z"});
-    let cid3 = compute_dagcbor_cid(&val3).unwrap();
-    lthash.add("app.bsky.feed.post", "rkey3", &cid3);
-    let hash3 = lthash.digest();
-
-    // Terminal commit for the 3-op batch:
-    // A v2 commit describes the final transition (Op 3):
-    // rev = "3jzfcijpj2m25", prev_rev = "3jzfcijpj2m24" (second-to-last applied op's rev),
-    // hash = hash3 (post-batch digest), prev_hash = hash2 (LtHash digest before Op 3 is folded in)
-    let commit_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m24".to_string(),
-        hash: hash3,
-        prev_hash: hash2,
-        path: "app.bsky.feed.post/rkey3".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid3.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val3).unwrap()),
-    };
-    let signed_commit = mint_signed_commit_v2_p256(&commit_ctx, &setup.owner_signing_key).unwrap();
-    setup.mock_transport.set_list_repo_ops_response(
-        &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            cursor: None,
-            ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(cid1.into()),
-                    collection: "app.bsky.feed.post".to_string().into(),
-                    prev: None,
-                    rev: "3jzfcijpj2m23".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new("rkey1")
-                        .unwrap()
-                        .into(),
-                    value: Some(json_to_ipld(&val1).unwrap()),
-                    extra_data: None,
-                },
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(cid2.into()),
-                    collection: "app.bsky.feed.post".to_string().into(),
-                    prev: None,
-                    rev: "3jzfcijpj2m24".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new("rkey2")
-                        .unwrap()
-                        .into(),
-                    value: Some(json_to_ipld(&val2).unwrap()),
-                    extra_data: None,
-                },
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(cid3.into()),
-                    collection: "app.bsky.feed.post".to_string().into(),
-                    prev: None,
-                    rev: "3jzfcijpj2m25".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new("rkey3")
-                        .unwrap()
-                        .into(),
-                    value: Some(json_to_ipld(&val3).unwrap()),
-                    extra_data: None,
-                },
-            ],
-            commit: Some(signed_commit),
-            extra_data: None,
-        },
-    );
-
-    // Fallback get_repo set to fail to ensure incremental sync succeeds on its own
-    setup
-        .mock_transport
-        .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), vec![0xFF; 16]);
-
-    let sync_res = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await;
-    assert!(
-        sync_res.is_ok(),
-        "3-op batch under StrictV2 must verify and succeed: {:?}",
-        sync_res.err()
-    );
-    let res = sync_res.unwrap();
-    assert!(res.commit_verified);
-    assert_eq!(res.latest_rev, "3jzfcijpj2m25");
-    assert_eq!(res.ops_applied, 3);
-
-    // Verify stored sync state advanced in database
-    let stored_sync: (String, Vec<u8>) = sqlx::query_as(
-        "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2"
-    )
-    .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .fetch_one(&setup.pool)
-    .await
-    .unwrap();
-
-    assert_eq!(stored_sync.0, "3jzfcijpj2m25");
-    assert_eq!(stored_sync.1.as_slice(), lthash.as_bytes().as_slice());
-
-    // Verify all 3 records staged and present
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL"
-    )
-    .bind(SPACE_URI)
-    .bind(OWNER_DID)
-    .fetch_one(&setup.pool)
-    .await
-    .unwrap();
-    assert_eq!(count.0, 3);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn test_non_descending_predecessor_rejected_under_strict_v2(pool: PgPool) {
-    let setup = setup_test(pool).await;
-
-    let val = json!({"$type": "app.bsky.feed.post", "text": "hello", "createdAt": "2026-08-30T12:00:00.000Z"});
-    let cid = compute_dagcbor_cid(&val).unwrap();
-    let mut lthash = LtHash::default();
-    lthash.add("app.bsky.feed.post", "rkey1", &cid);
-
-    // Case A: rev == prev_rev (equal revision, non-descending)
-    let equal_rev_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m25".to_string(),
-        prev_rev: "3jzfcijpj2m25".to_string(), // equal to rev!
-        hash: lthash.digest(),
-        prev_hash: [0u8; 32],
-        path: "app.bsky.feed.post/rkey1".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid.clone()),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val).unwrap()),
-    };
-    let equal_commit =
-        mint_signed_commit_v2_p256(&equal_rev_ctx, &setup.owner_signing_key).unwrap();
-    let ver_res = verify_commit_v2(
-        &equal_commit,
-        &equal_rev_ctx,
-        &ParsedVerifyingKey::P256(*setup.owner_signing_key.verifying_key()),
-    );
-    assert!(
-        ver_res.is_err(),
-        "Equal rev and prev_rev must be rejected as non-monotonic"
-    );
-
-    // Case B: rev < prev_rev (prev_rev in future, non-descending)
-    let inverted_rev_ctx = CommitContextV2 {
-        space: SPACE_URI.to_string(),
-        author: OWNER_DID.to_string(),
-        rev: "3jzfcijpj2m24".to_string(),
-        prev_rev: "3jzfcijpj2m25".to_string(), // greater than rev!
-        hash: lthash.digest(),
-        prev_hash: [0u8; 32],
-        path: "app.bsky.feed.post/rkey1".to_string(),
-        action: "create".to_string(),
-        cid: Some(cid),
-        prev_cid: None,
-        val: bytes::Bytes::from(serde_ipld_dagcbor::to_vec(&val).unwrap()),
-    };
-    let inverted_commit =
-        mint_signed_commit_v2_p256(&inverted_rev_ctx, &setup.owner_signing_key).unwrap();
-    let ver_res2 = verify_commit_v2(
-        &inverted_commit,
-        &inverted_rev_ctx,
-        &ParsedVerifyingKey::P256(*setup.owner_signing_key.verifying_key()),
-    );
-    assert!(
-        ver_res2.is_err(),
-        "prev_rev greater than rev must be rejected as non-monotonic"
     );
 }
 

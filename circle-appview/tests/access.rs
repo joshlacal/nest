@@ -62,7 +62,6 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
 
     let alice_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);

@@ -2784,7 +2784,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#push".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: crate::commit::CommitVerificationPolicy::StrictV2,
         });
 
         let app_state = AppState {

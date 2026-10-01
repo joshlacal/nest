@@ -9,9 +9,8 @@ use crate::access::{
 };
 use crate::auth::{select_verification_method, DidResolver};
 use crate::commit::{
-    compute_dagcbor_cid, extract_and_validate_car_with_policy, parse_permissioned_car,
-    verify_commit_with_policy, CommitContext, CommitContextV2, CommitVerificationPolicy, LtHash,
-    LTHASH_SIZE,
+    compute_dagcbor_cid, extract_and_validate_car, parse_permissioned_car, verify_commit,
+    CommitContext, LtHash, LTHASH_SIZE,
 };
 use crate::config::AppState;
 use crate::error::AppError;
@@ -66,7 +65,6 @@ pub struct SyncEngine {
     oauth_service: Option<Arc<crate::oauth::OAuthService>>,
     http_client: reqwest::Client,
     push_client: Option<Arc<crate::push::CirclePushClient>>,
-    commit_verification_policy: CommitVerificationPolicy,
     total_bytes_processed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -96,7 +94,6 @@ impl SyncEngine {
             oauth_service: Some(state.oauth_service.clone()),
             http_client: state.http_client.clone(),
             push_client: state.push_client.clone(),
-            commit_verification_policy: state.config.commit_verification_policy.clone(),
             total_bytes_processed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -117,7 +114,6 @@ impl SyncEngine {
             oauth_service: None,
             http_client: reqwest::Client::new(),
             push_client: None,
-            commit_verification_policy: CommitVerificationPolicy::default(),
             total_bytes_processed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -128,10 +124,6 @@ impl SyncEngine {
     }
     pub fn with_push_client(mut self, push_client: Arc<crate::push::CirclePushClient>) -> Self {
         self.push_client = Some(push_client);
-        self
-    }
-    pub fn with_commit_verification_policy(mut self, policy: CommitVerificationPolicy) -> Self {
-        self.commit_verification_policy = policy;
         self
     }
     pub fn total_bytes_processed(&self) -> usize {
@@ -312,36 +304,10 @@ impl SyncEngine {
         let mut cursor: Option<String> = None;
         let mut terminal_commit = None;
         let mut fetch_failed = false;
-        let mut last_applied_op: Option<(
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            bytes::Bytes,
-        )> = None;
         let mut page_count = 0;
         let mut total_bytes = 0;
         let start_time = std::time::Instant::now();
 
-        let mut snapshotted_prev_rev = existing_sync
-            .as_ref()
-            .map(|(r, _)| r.clone())
-            .unwrap_or_default();
-        let mut snapshotted_prev_hash = {
-            let mut prev_h = [0u8; 32];
-            if let Some((_, h)) = &existing_sync {
-                if h.len() == 32 {
-                    prev_h.copy_from_slice(h);
-                } else if h.len() == LTHASH_SIZE {
-                    let digest = Sha256::digest(h);
-                    prev_h.copy_from_slice(&digest);
-                }
-            } else {
-                prev_h = lthash.digest();
-            }
-            prev_h
-        };
-        let mut last_applied_rev: Option<String> = None;
         loop {
             if page_count >= MAX_PAGES_PER_REPO_SYNC
                 || ops_applied >= MAX_OPS_PER_REPO_SYNC
@@ -386,12 +352,6 @@ impl SyncEngine {
                 let rkey_str = op.rkey.0.as_str();
                 let uri = format!("{space_uri}/{author_did}/{collection_str}/{rkey_str}");
 
-                // Snapshot LtHash and rev before folding in this operation (Finding 6 / Item 4)
-                snapshotted_prev_hash = lthash.digest();
-                if let Some(r) = &last_applied_rev {
-                    snapshotted_prev_rev = r.clone();
-                }
-
                 if let Some(cid) = &op.cid {
                     let cid_str = cid.as_str();
                     let data_val = match &op.value {
@@ -430,18 +390,6 @@ impl SyncEngine {
                     }
                     lthash.add(&format!("{collection_str}/{rkey_str}/{cid_str}"));
 
-                    last_applied_op = Some((
-                        format!("{collection_str}/{rkey_str}"),
-                        if op.prev.is_some() {
-                            "update".to_string()
-                        } else {
-                            "create".to_string()
-                        },
-                        Some(cid_str.to_string()),
-                        op.prev.as_ref().map(|p| p.to_string()),
-                        bytes::Bytes::from(val_bytes),
-                    ));
-
                     let candidate_val =
                         serde_json::to_value(data_val).unwrap_or(serde_json::Value::Null);
 
@@ -478,17 +426,9 @@ impl SyncEngine {
                     if let Some(prev) = &op.prev {
                         lthash.remove(&format!("{collection_str}/{rkey_str}/{}", prev.as_str()));
                     }
-                    last_applied_op = Some((
-                        format!("{collection_str}/{rkey_str}"),
-                        "delete".to_string(),
-                        None,
-                        op.prev.as_ref().map(|p| p.to_string()),
-                        bytes::Bytes::new(),
-                    ));
                     current_policy.remove_post(&uri);
                     staged_mutations.push(StagedMutation::DeleteRecord { uri });
                 }
-                last_applied_rev = Some(op.rev.to_string());
             }
 
             if fetch_failed {
@@ -590,49 +530,12 @@ impl SyncEngine {
                         }
                     };
 
-                let context_v1 = CommitContext {
+                let context = CommitContext {
                     space: space_uri_parsed,
                     author: author_did_parsed,
                     rev: commit.rev.clone(),
                 };
-
-                let current_hash_digest: [u8; 32] = lthash.digest();
-
-                // Construct CommitContextV2 using trusted local state (Finding 18 / Item 4)
-                let (path, action, cid, prev_cid, val) =
-                    if let Some((p, act, c, prev_c, v)) = last_applied_op {
-                        (p, act, c, prev_c, v)
-                    } else {
-                        (
-                            "".to_string(),
-                            "".to_string(),
-                            None,
-                            None,
-                            bytes::Bytes::new(),
-                        )
-                    };
-
-                let context_v2 = CommitContextV2 {
-                    space: space_uri.to_string(),
-                    author: author_did.to_string(),
-                    rev: commit.rev.to_string(),
-                    prev_rev: snapshotted_prev_rev,
-                    hash: current_hash_digest,
-                    prev_hash: snapshotted_prev_hash,
-                    path,
-                    action,
-                    cid,
-                    prev_cid,
-                    val,
-                };
-
-                let policy_ver_res = verify_commit_with_policy(
-                    commit,
-                    Some(&context_v1),
-                    Some(&context_v2),
-                    &author_signing_key,
-                    &self.commit_verification_policy,
-                );
+                let policy_ver_res = verify_commit(commit, &context, &author_signing_key);
 
                 if policy_ver_res.is_ok() {
                     let hash_ok = match expected_authority_hash {
@@ -1127,14 +1030,9 @@ impl SyncEngine {
             .await
             .map_err(|e| AppError::Internal(format!("CAR decoding failed: {e}")))?;
 
-        let (commit, records, lthash) = extract_and_validate_car_with_policy(
-            &car,
-            space_uri,
-            author_did,
-            author_signing_key,
-            &self.commit_verification_policy,
-        )
-        .map_err(|e| AppError::InvalidRequest(format!("CAR validation failed: {e}")))?;
+        let (commit, records, lthash) =
+            extract_and_validate_car(&car, space_uri, author_did, author_signing_key)
+                .map_err(|e| AppError::InvalidRequest(format!("CAR validation failed: {e}")))?;
         let latest_rev = commit.rev.to_string();
         if let Some((prev_rev, prev_hash)) = &existing_sync {
             let prev_hash_matches = prev_hash == lthash.state().as_slice()
@@ -1145,33 +1043,6 @@ impl SyncEngine {
                 return Err(AppError::InvalidRequest(
                     "Non-monotonic revision in full recovery: revision cannot rollback or equal existing with different hash".into(),
                 ));
-            }
-
-            // Conditional anchor: when commit.prev_rev == stored last_rev, require commit.prev_hash == sha256(stored last_hash)
-            if let Some(commit_prev_rev) = &commit.prev_rev {
-                if commit_prev_rev.as_str() == prev_rev.as_str() {
-                    let stored_digest: [u8; 32] = if prev_hash.len() == LTHASH_SIZE {
-                        Sha256::digest(prev_hash).into()
-                    } else if prev_hash.len() == 32 {
-                        let mut d = [0u8; 32];
-                        d.copy_from_slice(prev_hash);
-                        d
-                    } else {
-                        [0u8; 32]
-                    };
-
-                    let commit_prev_hash_matches = commit
-                        .prev_hash
-                        .as_ref()
-                        .map(|h| h.as_ref() == stored_digest.as_slice())
-                        .unwrap_or(false);
-
-                    if !commit_prev_hash_matches {
-                        return Err(AppError::InvalidRequest(
-                            "Fork detected in full recovery: commit claims descent from stored revision but prev_hash does not match stored state digest".into(),
-                        ));
-                    }
-                }
             }
         }
         // Verify against expected authority hash and rev if provided

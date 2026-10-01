@@ -24,7 +24,7 @@ use circle_appview::auth::{
 use circle_appview::commit::{
     compute_commit_context, compute_commit_mac, compute_dagcbor_cid, decode_repo_car,
     derive_commit_mac_key, mint_repo_car, mint_signed_commit, verify_commit, CommitContext,
-    CommitVerificationPolicy, LtHash as RepoLtHash, RepoRecord,
+    LtHash as RepoLtHash, RepoRecord,
 };
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
@@ -353,7 +353,7 @@ fn commit_verification_succeeds_and_fails_on_tampering() {
     // 2. Tampered MAC -> fails
     let mut tampered_mac_commit = signed_commit.clone();
     tampered_mac_commit.mac =
-        Some(catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]));
+        catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]);
     assert!(verify_commit(&tampered_mac_commit, &context, &parsed_vk).is_err());
 
     // 3. Tampered Signature -> fails
@@ -452,7 +452,6 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         push_key_id: "did:web:appview.catbird.blue#atproto_circles".into(),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: CommitVerificationPolicy::default(),
     };
     let did_resolver = Arc::new(DidResolver::new(
         config.plc_directory_url.clone(),
@@ -2693,22 +2692,18 @@ fn strict_car_rejects_noncanonical_signed_commit_dagcbor() {
         b'a',
         b'c',
         0x58,
-        commit.mac.as_ref().map_or(0, |m| m.len()) as u8,
+        commit.mac.len() as u8,
     ]);
-    if let Some(mac) = &commit.mac {
-        noncanonical_commit_cbor.extend_from_slice(mac.as_ref());
-    }
+    noncanonical_commit_cbor.extend_from_slice(commit.mac.as_ref());
     noncanonical_commit_cbor.extend_from_slice(&[
         0x63,
         b'i',
         b'k',
         b'm',
         0x58,
-        commit.ikm.as_ref().map_or(0, |i| i.len()) as u8,
+        commit.ikm.len() as u8,
     ]);
-    if let Some(ikm) = &commit.ikm {
-        noncanonical_commit_cbor.extend_from_slice(ikm.as_ref());
-    }
+    noncanonical_commit_cbor.extend_from_slice(commit.ikm.as_ref());
 
     let (nc_cid_bytes, nc_cid_str) =
         circle_appview::commit::create_cid_bytes_from_data(&noncanonical_commit_cbor);
@@ -2778,28 +2773,10 @@ fn strict_car_rejects_signed_commit_with_extra_data_float() {
     // Encode SignedCommit with keys in canonical DAG-CBOR order (3-byte keys, then 4-byte key 'hash', then 11-byte key 'extra_float' containing CBOR float 0xfa 0x42 0x2a 0x00 0x00)
     let mut float_commit_cbor = Vec::new();
     float_commit_cbor.push(0xa7); // 7 entries
-    float_commit_cbor.extend_from_slice(&[
-        0x63,
-        b'i',
-        b'k',
-        b'm',
-        0x58,
-        commit.ikm.as_ref().map_or(0, |i| i.len()) as u8,
-    ]);
-    if let Some(ikm) = &commit.ikm {
-        float_commit_cbor.extend_from_slice(ikm.as_ref());
-    }
-    float_commit_cbor.extend_from_slice(&[
-        0x63,
-        b'm',
-        b'a',
-        b'c',
-        0x58,
-        commit.mac.as_ref().map_or(0, |m| m.len()) as u8,
-    ]);
-    if let Some(mac) = &commit.mac {
-        float_commit_cbor.extend_from_slice(mac.as_ref());
-    }
+    float_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
+    float_commit_cbor.extend_from_slice(commit.ikm.as_ref());
+    float_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
+    float_commit_cbor.extend_from_slice(commit.mac.as_ref());
     float_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
     float_commit_cbor.extend_from_slice(commit.rev.as_bytes());
     float_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);
@@ -2886,28 +2863,10 @@ fn strict_car_rejects_signed_commit_with_unknown_extra_data() {
     // Canonical SignedCommit CBOR with canonical extra string field: extra_field: "value"
     let mut extra_commit_cbor = Vec::new();
     extra_commit_cbor.push(0xa7); // 7 entries
-    extra_commit_cbor.extend_from_slice(&[
-        0x63,
-        b'i',
-        b'k',
-        b'm',
-        0x58,
-        commit.ikm.as_ref().map_or(0, |i| i.len()) as u8,
-    ]);
-    if let Some(ikm) = &commit.ikm {
-        extra_commit_cbor.extend_from_slice(ikm.as_ref());
-    }
-    extra_commit_cbor.extend_from_slice(&[
-        0x63,
-        b'm',
-        b'a',
-        b'c',
-        0x58,
-        commit.mac.as_ref().map_or(0, |m| m.len()) as u8,
-    ]);
-    if let Some(mac) = &commit.mac {
-        extra_commit_cbor.extend_from_slice(mac.as_ref());
-    }
+    extra_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
+    extra_commit_cbor.extend_from_slice(commit.ikm.as_ref());
+    extra_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
+    extra_commit_cbor.extend_from_slice(commit.mac.as_ref());
     extra_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
     extra_commit_cbor.extend_from_slice(commit.rev.as_bytes());
     extra_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);

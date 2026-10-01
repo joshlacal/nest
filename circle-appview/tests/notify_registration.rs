@@ -16,7 +16,6 @@ use circle_appview::access::{ActiveSpaceCredential, CredentialStore, SpaceLockMa
 use circle_appview::auth::{
     DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod,
 };
-use circle_appview::commit::CommitVerificationPolicy;
 use circle_appview::config::{AppState, Config};
 use circle_appview::notify;
 use circle_appview::space_client::{
@@ -52,7 +51,6 @@ fn config(service_did: &str) -> Config {
         push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: CommitVerificationPolicy::default(),
     }
 }
 

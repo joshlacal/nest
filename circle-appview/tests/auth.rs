@@ -60,7 +60,6 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
     let state = AppState::new(config, pool.clone());
 
@@ -1046,7 +1045,6 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
     let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
     let app = create_router(app_state);
@@ -1105,7 +1103,6 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
         },
         setup.pool.clone(),
         resolver_private,
@@ -1156,7 +1153,6 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
         },
         setup.pool.clone(),
         resolver_mixed,
@@ -1898,7 +1894,6 @@ async fn key_rotation_with_curve_change_and_controllable_upstream(pool: PgPool) 
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
     let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
     let app = create_router(app_state);

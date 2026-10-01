@@ -882,13 +882,8 @@ pub async fn activate_circle(
             AppError::Internal(format!("Could not read the Space: CAR decoding failed ({e})"))
         })?;
 
-    let (_commit, records, _lthash) = crate::commit::extract_and_validate_car_with_policy(
-        &car,
-        space_uri,
-        &authority_did,
-        &author_signing_key,
-        &state.config.commit_verification_policy,
-    )
+    let (_commit, records, _lthash) =
+        crate::commit::extract_and_validate_car(&car, space_uri, &authority_did, &author_signing_key)
     .map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "CAR validation failed during activation");
         AppError::Internal(format!("Could not read the Space: CAR validation failed ({e})"))
@@ -1693,7 +1688,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let http_client = reqwest::Client::new();
@@ -2057,7 +2051,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
@@ -2285,7 +2278,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(

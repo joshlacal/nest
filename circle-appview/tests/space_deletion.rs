@@ -20,7 +20,6 @@ use circle_appview::access::{self, CredentialStore, SpaceLockManager};
 use circle_appview::auth::{
     DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod,
 };
-use circle_appview::commit::CommitVerificationPolicy;
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
 use circle_appview::oauth::UserOAuthSession;
@@ -83,7 +82,6 @@ async fn setup(pool: PgPool) -> Setup {
         push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: CommitVerificationPolicy::default(),
     };
     let did_resolver = Arc::new(DidResolver::new(
         config.plc_directory_url.clone(),

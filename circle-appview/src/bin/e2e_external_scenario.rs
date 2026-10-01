@@ -950,16 +950,16 @@ impl ScenarioRunner {
                 commit.hash.len()
             ));
         }
-        if commit.ikm.as_ref().map_or(0, |b| b.len()) != 32 {
+        if commit.ikm.len() != 32 {
             return Err(format!(
-                "Expected SignedCommit ikm length 32, got {:?}",
-                commit.ikm.as_ref().map(|b| b.len())
+                "Expected SignedCommit ikm length 32, got {}",
+                commit.ikm.len()
             ));
         }
-        if commit.mac.as_ref().map_or(0, |b| b.len()) != 32 {
+        if commit.mac.len() != 32 {
             return Err(format!(
-                "Expected SignedCommit mac length 32, got {:?}",
-                commit.mac.as_ref().map(|b| b.len())
+                "Expected SignedCommit mac length 32, got {}",
+                commit.mac.len()
             ));
         }
         if commit.sig.is_empty() {

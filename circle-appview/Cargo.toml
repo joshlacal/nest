@@ -48,3 +48,11 @@ rcgen = "0.13"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 wiremock = "0.6"
+
+# TODO(spaces-upstream-defs-20261001): this code needs catbird-atproto fd5dad96
+# (upstream v1 SignedCommit), which is not pushed yet. Cargo must still fetch
+# the git `rev` above before patching, so it stays at the last pushed rev while
+# this patch builds fd5dad96 from the sibling jj workspace. Once the bookmark is
+# pushed: set `rev` above to the pushed commit and delete this [patch] section.
+[patch."https://github.com/joshlacal/catbird-atproto.git"]
+catbird-atproto = { path = "../../catbird-atproto" }

@@ -1,6 +1,5 @@
 use crate::access::CredentialStore;
 use crate::auth::DidResolver;
-use crate::commit::CommitVerificationPolicy;
 use crate::oauth::OAuthService;
 use crate::space_client::SpaceClient;
 use sqlx::PgPool;
@@ -22,7 +21,6 @@ pub struct Config {
     pub push_key_id: String,
     pub push_signing_key_path: Option<String>,
     pub push_signing_key_hex: Option<String>,
-    pub commit_verification_policy: CommitVerificationPolicy,
 }
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
@@ -110,12 +108,17 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-        let commit_verification_policy_raw = env::var("COMMIT_VERIFICATION_POLICY")
+        // Upstream v1 is the only commit format. A leftover policy variable from
+        // the retired v2 fork is ignored (not fatal) so an old drop-in cannot
+        // crash-loop the service.
+        if let Ok(policy) = env::var("COMMIT_VERIFICATION_POLICY")
             .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
-            .ok();
-        let commit_verification_policy =
-            CommitVerificationPolicy::from_env_value(commit_verification_policy_raw.as_deref())
-                .map_err(|e| anyhow::anyhow!("COMMIT_VERIFICATION_POLICY: {e}"))?;
+        {
+            tracing::warn!(
+                %policy,
+                "COMMIT_VERIFICATION_POLICY is obsolete and ignored; upstream v1 commits are always verified"
+            );
+        }
 
         Ok(Self {
             host,
@@ -132,7 +135,6 @@ impl Config {
             push_key_id,
             push_signing_key_path,
             push_signing_key_hex,
-            commit_verification_policy,
         })
     }
 }
