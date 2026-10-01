@@ -1996,8 +1996,7 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy:
-                crate::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
+            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
@@ -2212,8 +2211,7 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy:
-                crate::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
+            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(

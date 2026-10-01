@@ -256,8 +256,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_cas_rejects_rollback_and_equal_rev_different_hash(pool: PgPool) {
     let setup = setup_test(pool).await;
-    let sync_engine = SyncEngine::new(&setup.state)
-        .with_commit_verification_policy(CommitVerificationPolicy::ExplicitMigrationPermitV1);
+    // The default policy must accept the upstream v1 commits this test syncs.
+    let sync_engine = SyncEngine::new(&setup.state);
 
     // Initial state: rev "3l7234567a234"
     let post_val = json!({
@@ -532,8 +532,8 @@ async fn test_notify_write_requires_active_membership_before_work(pool: PgPool) 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_missing_operation_value_fails_atomically_without_advancing_sync_state(pool: PgPool) {
     let setup = setup_test(pool).await;
-    let sync_engine = SyncEngine::new(&setup.state)
-        .with_commit_verification_policy(CommitVerificationPolicy::ExplicitMigrationPermitV1);
+    // The default policy must accept the upstream v1 commits this test syncs.
+    let sync_engine = SyncEngine::new(&setup.state);
 
     // Initial commit with record 1
     let val1 = json!({"$type": "app.bsky.feed.post", "text": "one", "createdAt": "2026-08-30T12:00:00.000Z"});
@@ -1261,6 +1261,35 @@ async fn test_activate_circle_uses_configured_commit_verification_policy(pool: P
     assert!(
         permit_res.is_ok(),
         "CAR validation must succeed under ExplicitMigrationPermitV1 policy"
+    );
+
+    // 2b. The default policy, and the default-policy wrapper, accept upstream v1
+    // (CIRCLES-01): StrictV2 as the default rejected every real space-host commit.
+    assert_eq!(
+        CommitVerificationPolicy::default(),
+        CommitVerificationPolicy::UpstreamV1
+    );
+    let default_res = extract_and_validate_car_with_policy(
+        &parsed_car,
+        SPACE_URI,
+        OWNER_DID,
+        &owner_key,
+        &CommitVerificationPolicy::default(),
+    );
+    assert!(
+        default_res.is_ok(),
+        "CAR validation must accept a v1 commit under the default policy: {:?}",
+        default_res.err()
+    );
+    assert!(
+        circle_appview::commit::extract_and_validate_car(
+            &parsed_car,
+            SPACE_URI,
+            OWNER_DID,
+            &owner_key
+        )
+        .is_ok(),
+        "extract_and_validate_car (default policy) must accept a v1 commit"
     );
 
     // 3. Under StrictV2 policy, CAR validation succeeds when CAR has v2 commit

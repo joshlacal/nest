@@ -1,7 +1,15 @@
 //! Permissioned repository commit and CAR verification primitives.
 //!
-//! Implements v1 (legacy) and v2 (authenticated transition) commit and CAR verification
-//! across Ed25519, P-256, and Secp256k1 curves.
+//! Implements upstream v1 commit and CAR verification (the default), plus the
+//! Catbird-only v2 "authenticated transition" format, across Ed25519, P-256, and
+//! Secp256k1 curves.
+//!
+//! TODO(CIRCLES-01, catbird-atproto regen lane opened 2026-10-01): the v2 format
+//! is a private fork that no space host emits. Once catbird-atproto is regenerated
+//! from the upstream `com.atproto.space.defs` (ikm/mac required, no prev* fields),
+//! delete `StrictV2`, `DualReadWithCutoff`, `CommitContextV2`/`verify_commit_v2`,
+//! the prev_rev/prev_hash anchor in sync.rs, tests/commit_v2.rs and the task5 v2
+//! tests. Until then the v2 code stays compiling but no default path uses it.
 
 use bytes::Bytes;
 use cid::Cid as IpldCid;
@@ -27,13 +35,44 @@ pub const MAX_CAR_BLOCKS: usize = 10_000;
 /// Verification policy controlling commit version acceptance.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CommitVerificationPolicy {
-    /// Strictly accept only authenticated v2 commits (default).
+    /// Accept upstream `ver: 1` commits, the only format any space host emits
+    /// (default). A Catbird-only v2 commit is still verified if one arrives.
     #[default]
+    UpstreamV1,
+    /// Accept only the Catbird-only v2 format. Rejects every upstream commit, so it
+    /// is opt-in only (`COMMIT_VERIFICATION_POLICY=strict_v2`).
     StrictV2,
-    /// Dual-read mode accepting v1 commits only up to the specified cutoff revision.
+    /// Accept v1 commits only up to the specified cutoff revision. Rejects every
+    /// later upstream commit, so it is opt-in only.
     DualReadWithCutoff { cutoff_rev: String },
-    /// Explicit migration mode accepting legacy v1 commits.
+    /// Same behaviour as `UpstreamV1`; retained for existing callers.
     ExplicitMigrationPermitV1,
+}
+
+impl CommitVerificationPolicy {
+    /// Parse `COMMIT_VERIFICATION_POLICY`. Unset means `UpstreamV1`. An
+    /// unrecognised value is an error: silently falling back to `StrictV2` made
+    /// every upstream commit fail to sync.
+    pub fn from_env_value(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("v1") | Some("upstream_v1") => Ok(Self::UpstreamV1),
+            Some("migration_permit_v1") | Some("explicit_migration_permit_v1") => {
+                Ok(Self::ExplicitMigrationPermitV1)
+            }
+            Some("strict_v2") => Ok(Self::StrictV2),
+            Some(s) if s.starts_with("dual_read:") => {
+                let cutoff_rev = s.trim_start_matches("dual_read:").to_string();
+                if cutoff_rev.is_empty() {
+                    return Err("dual_read: requires a cutoff revision".into());
+                }
+                Ok(Self::DualReadWithCutoff { cutoff_rev })
+            }
+            Some(other) => Err(format!(
+                "unrecognised commit verification policy {other:?}; expected v1, \
+                 upstream_v1, strict_v2 or dual_read:<rev>"
+            )),
+        }
+    }
 }
 
 /// Commit transition context for v2 authenticated commits.
@@ -616,7 +655,8 @@ pub fn verify_commit_with_policy(
                 })?;
                 verify_commit_v1(commit, ctx, key)
             }
-            CommitVerificationPolicy::ExplicitMigrationPermitV1 => {
+            CommitVerificationPolicy::UpstreamV1
+            | CommitVerificationPolicy::ExplicitMigrationPermitV1 => {
                 let ctx = context_v1.ok_or_else(|| {
                     PermissionedError::InvalidCommit(
                         "v1 commit verification requires CommitContext".into(),
@@ -631,7 +671,7 @@ pub fn verify_commit_with_policy(
     }
 }
 
-/// Verify a signed commit with default policy (StrictV2 / dual read).
+/// Verify a v1 signed commit (the upstream format).
 pub fn verify_commit(
     commit: &SignedCommit,
     context: &CommitContext,
@@ -1364,4 +1404,41 @@ pub fn decode_repo_car(bytes: &[u8]) -> Result<DecodedRepoCar, PermissionedError
         data_root_cid,
         records,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommitVerificationPolicy as P;
+
+    #[test]
+    fn unset_policy_defaults_to_upstream_v1() {
+        assert_eq!(P::default(), P::UpstreamV1);
+        assert_eq!(P::from_env_value(None), Ok(P::UpstreamV1));
+        assert_eq!(P::from_env_value(Some("")), Ok(P::UpstreamV1));
+        assert_eq!(P::from_env_value(Some("v1")), Ok(P::UpstreamV1));
+        assert_eq!(P::from_env_value(Some("upstream_v1")), Ok(P::UpstreamV1));
+    }
+
+    #[test]
+    fn legacy_and_v2_policies_are_explicit_opt_ins() {
+        assert_eq!(
+            P::from_env_value(Some("explicit_migration_permit_v1")),
+            Ok(P::ExplicitMigrationPermitV1)
+        );
+        assert_eq!(P::from_env_value(Some("strict_v2")), Ok(P::StrictV2));
+        assert_eq!(
+            P::from_env_value(Some("dual_read:3kabc")),
+            Ok(P::DualReadWithCutoff {
+                cutoff_rev: "3kabc".into()
+            })
+        );
+    }
+
+    /// An unknown value used to fall back to StrictV2, which rejects every
+    /// upstream commit. It must now fail startup instead.
+    #[test]
+    fn unrecognised_policy_is_an_error_not_strict_v2() {
+        assert!(P::from_env_value(Some("strictv2")).is_err());
+        assert!(P::from_env_value(Some("dual_read:")).is_err());
+    }
 }

@@ -452,7 +452,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         push_key_id: "did:web:appview.catbird.blue#atproto_circles".into(),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: CommitVerificationPolicy::ExplicitMigrationPermitV1,
+        commit_verification_policy: CommitVerificationPolicy::default(),
     };
     let did_resolver = Arc::new(DidResolver::new(
         config.plc_directory_url.clone(),

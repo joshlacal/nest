@@ -110,19 +110,12 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-        let commit_verification_policy = match env::var("COMMIT_VERIFICATION_POLICY")
+        let commit_verification_policy_raw = env::var("COMMIT_VERIFICATION_POLICY")
             .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
-            .as_deref()
-        {
-            Ok("explicit_migration_permit_v1") | Ok("migration_permit_v1") | Ok("v1") => {
-                CommitVerificationPolicy::ExplicitMigrationPermitV1
-            }
-            Ok(s) if s.starts_with("dual_read:") => {
-                let cutoff = s.trim_start_matches("dual_read:").to_string();
-                CommitVerificationPolicy::DualReadWithCutoff { cutoff_rev: cutoff }
-            }
-            _ => CommitVerificationPolicy::StrictV2,
-        };
+            .ok();
+        let commit_verification_policy =
+            CommitVerificationPolicy::from_env_value(commit_verification_policy_raw.as_deref())
+                .map_err(|e| anyhow::anyhow!("COMMIT_VERIFICATION_POLICY: {e}"))?;
 
         Ok(Self {
             host,
