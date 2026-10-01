@@ -873,6 +873,16 @@ pub fn select_verification_method<'a>(
     Err(AuthReason::NoVerificationMethod)
 }
 
+/// Future `iat` tolerated on inbound service-auth JWTs (CIRCLES-23).
+pub const SERVICE_JWT_IAT_SKEW_SECS: i64 = 30;
+
+/// Select a space authority's credential-signing key.
+///
+/// With a `kid`, the key it names is used, as upstream `resolveSpaceKey` does:
+/// `#atproto`, `#atproto_space`, their bare forms, or `{did}#...`; anything else
+/// is `InvalidKid`. An authority that publishes `#atproto_space` may still sign
+/// with `#atproto` (the reference PDS does). Without a `kid`, `#atproto_space`
+/// is preferred over `#atproto`.
 pub fn select_authority_verification_method<'a>(
     doc: &'a DidDocument,
     authority_did: &str,
@@ -886,40 +896,31 @@ pub fn select_authority_verification_method<'a>(
         return Err(AuthReason::NoVerificationMethod);
     }
 
-    let expected_full_space = format!("{authority_did}#atproto_space");
-    let expected_full_atproto = format!("{authority_did}#atproto");
-
-    // Exact dedicated key #atproto_space first, fallback to #atproto
-    let dedicated = doc.verification_method.iter().find(|vm| {
-        (vm.id == "#atproto_space" || vm.id == expected_full_space)
-            && vm.controller == authority_did
-    });
-
-    let selected = if let Some(vm) = dedicated {
-        vm
-    } else {
+    let find = |name: &str| {
+        let full = format!("{authority_did}#{name}");
+        let relative = format!("#{name}");
         doc.verification_method
             .iter()
-            .find(|vm| {
-                (vm.id == "#atproto" || vm.id == expected_full_atproto)
-                    && vm.controller == authority_did
-            })
-            .ok_or(AuthReason::NoVerificationMethod)?
+            .find(|vm| (vm.id == relative || vm.id == full) && vm.controller == authority_did)
     };
 
-    if let Some(target_kid) = kid {
-        let matches = target_kid == selected.id
-            || (target_kid == "#atproto_space" && selected.id == expected_full_space)
-            || (target_kid == "#atproto" && selected.id == expected_full_atproto)
-            || (target_kid == expected_full_space && selected.id == "#atproto_space")
-            || (target_kid == expected_full_atproto && selected.id == "#atproto");
-
-        if !matches {
+    if let Some(kid) = kid {
+        let fragment = match kid.strip_prefix(authority_did) {
+            Some(rest) if rest.starts_with('#') => rest,
+            Some(_) => return Err(AuthReason::InvalidKid),
+            None if kid.starts_with("did:") => return Err(AuthReason::InvalidKid),
+            None => kid,
+        };
+        let name = fragment.strip_prefix('#').unwrap_or(fragment);
+        if name != "atproto" && name != "atproto_space" {
             return Err(AuthReason::InvalidKid);
         }
+        return find(name).ok_or(AuthReason::NoVerificationMethod);
     }
 
-    Ok(selected)
+    find("atproto_space")
+        .or_else(|| find("atproto"))
+        .ok_or(AuthReason::NoVerificationMethod)
 }
 
 pub async fn verify_service_jwt(
@@ -964,8 +965,11 @@ pub async fn verify_service_jwt(
 
     let now = Utc::now().timestamp();
 
-    // iat <= now (strictly now or past; no future clock skew allowed)
-    if iat > now {
+    // Tolerate a slightly fast issuer clock: forwarded notifyWrite and
+    // notifySpaceDeleted JWTs from a space host a few seconds ahead were
+    // rejected outright. Upstream service auth does not check iat at all; the
+    // 60 s lifetime and exp checks below still bound the token.
+    if iat > now + SERVICE_JWT_IAT_SKEW_SECS {
         return Err(AppError::Unauthorized(AuthReason::FutureIat));
     }
 

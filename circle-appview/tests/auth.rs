@@ -570,18 +570,33 @@ async fn enforces_exact_iat_exp_and_lifetime_bounds(pool: PgPool) {
         StatusCode::UNAUTHORIZED
     );
 
-    // 2. Future iat: exactly +1s in the future -> rejected (strictly iat <= now)
-    let token_future_1s = create_custom_service_token(
+    // 2. Future iat: a slightly fast issuer clock is tolerated up to
+    // SERVICE_JWT_IAT_SKEW_SECS (30 s, CIRCLES-23); beyond that it is rejected.
+    // Margins stay clear of the bound so a second tick cannot flip the result.
+    let token_future_20s = create_custom_service_token(
         &setup.p256_signing_key,
         TokenOptions {
-            iat: Some(now + 1),
+            iat: Some(now + 20),
             exp: Some(now + 60),
-            jti: Some("jti-future-1s"),
+            jti: Some("jti-future-20s"),
             ..Default::default()
         },
     );
     assert_eq!(
-        request_feed(&setup.app, &token_future_1s).await.status(),
+        request_feed(&setup.app, &token_future_20s).await.status(),
+        StatusCode::OK
+    );
+    let token_future_45s = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(now + 45),
+            exp: Some(now + 60),
+            jti: Some("jti-future-45s"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_future_45s).await.status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -3182,5 +3197,67 @@ async fn did_resolver_last_fresh_resolution_capacity_bounding() {
         did_resolver.fresh_resolution_count() <= 5,
         "last_fresh_resolution must be bounded by capacity, got {}",
         did_resolver.fresh_resolution_count()
+    );
+}
+
+/// CIRCLES-28: the space-credential key is the one the JWT `kid` names. An
+/// authority that publishes both #atproto and #atproto_space may sign with
+/// either; the reference PDS signs with #atproto.
+#[test]
+fn authority_key_selection_follows_the_credential_kid() {
+    use circle_appview::auth::select_authority_verification_method;
+    const DID: &str = "did:plc:authority-kid";
+    let vm = |id: &str| VerificationMethod {
+        id: id.into(),
+        r#type: "Multikey".into(),
+        controller: DID.into(),
+        public_key_jwk: None,
+        public_key_multibase: Some(format!("z{id}")),
+    };
+    let both = DidDocument {
+        id: DID.into(),
+        verification_method: vec![vm(&format!("{DID}#atproto_space")), vm("#atproto")],
+        service: vec![],
+    };
+    let only_atproto = DidDocument {
+        id: DID.into(),
+        verification_method: vec![vm("#atproto")],
+        service: vec![],
+    };
+
+    for (kid, expected) in [
+        ("#atproto", "#atproto".to_string()),
+        ("atproto", "#atproto".to_string()),
+        (&*format!("{DID}#atproto"), "#atproto".to_string()),
+        ("#atproto_space", format!("{DID}#atproto_space")),
+        ("atproto_space", format!("{DID}#atproto_space")),
+    ] {
+        let selected = select_authority_verification_method(&both, DID, Some(kid))
+            .unwrap_or_else(|e| panic!("kid {kid} must select a key, got {e:?}"));
+        assert_eq!(selected.id, expected, "kid {kid}");
+    }
+
+    // No kid: the dedicated space key is preferred.
+    assert_eq!(
+        select_authority_verification_method(&both, DID, None)
+            .unwrap()
+            .id,
+        format!("{DID}#atproto_space")
+    );
+
+    // A kid naming any other key, or another DID's key, is refused.
+    for kid in ["#atproto_label", "did:plc:someone-else#atproto", "#"] {
+        assert_eq!(
+            select_authority_verification_method(&both, DID, Some(kid)).unwrap_err(),
+            circle_appview::error::AuthReason::InvalidKid,
+            "kid {kid}"
+        );
+    }
+
+    // A kid naming a key the document does not publish has nothing to verify with.
+    assert_eq!(
+        select_authority_verification_method(&only_atproto, DID, Some("#atproto_space"))
+            .unwrap_err(),
+        circle_appview::error::AuthReason::NoVerificationMethod
     );
 }
