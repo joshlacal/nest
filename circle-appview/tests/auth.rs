@@ -1520,6 +1520,37 @@ async fn did_document_endpoint_serves_single_atproto_circles_service_entry(pool:
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let doc: DidDocument = serde_json::from_slice(&body).expect("Must parse valid DidDocument");
 
+        // @atproto/identity rejects a DID document whose optional fields are
+        // `null` (publicKeyMultibase is `z.string().optional()`), so no value
+        // anywhere in the published document may be null.
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        fn assert_no_nulls(value: &serde_json::Value, at: &str) {
+            match value {
+                serde_json::Value::Null => panic!("DID document has null at {at}"),
+                serde_json::Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        assert_no_nulls(item, &format!("{at}[{i}]"));
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        assert_no_nulls(v, &format!("{at}.{k}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_nulls(&raw, "$");
+        let vm = &raw["verificationMethod"][0];
+        assert!(
+            vm.get("publicKeyMultibase").is_none(),
+            "absent publicKeyMultibase must be omitted, got {vm}"
+        );
+        assert!(
+            vm.get("publicKeyJwk").is_some_and(|jwk| jwk.is_object()),
+            "the JWK verification method must still be published, got {vm}"
+        );
+
         assert_eq!(doc.id, "did:web:circles.catbird.blue");
 
         // Must expose EXACTLY ONE service entry: #atproto_circles

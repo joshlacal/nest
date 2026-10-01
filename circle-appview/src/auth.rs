@@ -69,9 +69,20 @@ pub struct VerificationMethod {
     pub id: String,
     pub r#type: String,
     pub controller: String,
-    #[serde(default, rename = "publicKeyJwk")]
+    // Absent keys must be omitted, never `null`: @atproto/identity declares
+    // publicKeyMultibase as an optional string and rejects the whole DID
+    // document on `null`, which made the AppView unresolvable for registerNotify.
+    #[serde(
+        default,
+        rename = "publicKeyJwk",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_key_jwk: Option<PublicKeyJwk>,
-    #[serde(default, rename = "publicKeyMultibase")]
+    #[serde(
+        default,
+        rename = "publicKeyMultibase",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_key_multibase: Option<String>,
 }
 
@@ -80,9 +91,9 @@ pub struct PublicKeyJwk {
     pub kty: String,
     pub crv: String,
     pub x: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub y: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
 }
 
