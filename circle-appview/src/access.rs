@@ -1127,6 +1127,19 @@ pub async fn ensure_space_credential_from_parts(
             purge_deleted_space(db, credential_store, space_uri).await;
             return Err(e);
         }
+        Err(e @ AppError::UnsupportedPds(_)) => {
+            let profile = space_client
+                .describe_space_host(&space_host_endpoint)
+                .await
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unavailable".into());
+            tracing::warn!(
+                space_host = %space_host_endpoint,
+                host_profile = %profile,
+                "Refusing space host: credential is not DPoP-bound (cnf.jkt)"
+            );
+            return Err(e);
+        }
         Err(e) => return Err(e),
     };
 

@@ -116,6 +116,10 @@ pub enum AppError {
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
 
+    /// The Circle's space host cannot serve Circles (declared `UnsupportedPDS`).
+    #[error("Unsupported PDS: {0}")]
+    UnsupportedPds(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -167,6 +171,10 @@ impl IntoResponse for AppError {
                     "TooManyRequests",
                     msg.clone(),
                 )
+            }
+            AppError::UnsupportedPds(msg) => {
+                tracing::warn!(error_code = "UnsupportedPDS", "Unsupported space host");
+                (StatusCode::BAD_REQUEST, "UnsupportedPDS", msg.clone())
             }
             AppError::Database(_err) => {
                 tracing::error!(

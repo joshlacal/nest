@@ -1973,6 +1973,31 @@ impl SpaceClient {
         Ok((credential_jwt, ephemeral_key, expires_at))
     }
 
+    /// Best-effort `com.atproto.server.describeServer` on a space host, reduced to
+    /// the fields that identify its implementation profile, for operator logs.
+    pub async fn describe_space_host(&self, service_endpoint: &str) -> Option<serde_json::Value> {
+        let url = construct_xrpc_url(service_endpoint, "com.atproto.server.describeServer").ok()?;
+        let client = self.transport.build_pinned_client(&url).await.ok()?;
+        let response = client.get(url.as_str()).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = crate::auth::read_bounded_authenticated_response_bytes(
+            response,
+            MAX_SPACE_RESPONSE_BYTES,
+        )
+        .await
+        .ok()?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let mut profile = serde_json::Map::new();
+        for key in ["did", "swanProfile", "version"] {
+            if let Some(value) = body.get(key) {
+                profile.insert(key.to_string(), value.clone());
+            }
+        }
+        Some(serde_json::Value::Object(profile))
+    }
+
     pub async fn register_notify(
         &self,
         service_endpoint: &str,
@@ -2419,6 +2444,9 @@ pub fn construct_xrpc_url(service_endpoint: &str, method: &str) -> Result<url::U
     Ok(xrpc_url)
 }
 
+pub const UNBOUND_CREDENTIAL_MESSAGE: &str =
+    "Space host issues credentials without DPoP binding (cnf.jkt); Circles require a DPoP-bound space host";
+
 pub fn validate_space_credential(
     credential_jwt: &str,
     expected_iss: &str,
@@ -2437,16 +2465,26 @@ pub fn validate_space_credential(
     let header: JwtHeader = serde_json::from_slice(&header_bytes)
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
 
-    match &header.typ {
-        Some(t) if t == "atproto-space-credential+jwt" || t == "JWT" => {}
-        _ => return Err(AppError::Unauthorized(AuthReason::InvalidTyp)),
-    }
-
     let claims_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsEncoding))?;
     let claims: serde_json::Value = serde_json::from_slice(&claims_bytes)
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
+
+    // Host compatibility gate, checked before anything else so the declared
+    // error surfaces whatever else differs: space credentials must be DPoP-bound
+    // (cnf.jkt). Swan profiles 2026-08-15 and 2026-09-10 issue unbound bearer
+    // credentials; the reference alpha and Swan >= 2026-09-19 bind them.
+    let cnf_jkt = claims
+        .get("cnf")
+        .and_then(|cnf| cnf.get("jkt"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::UnsupportedPds(UNBOUND_CREDENTIAL_MESSAGE.into()))?;
+
+    match &header.typ {
+        Some(t) if t == "atproto-space-credential+jwt" || t == "JWT" => {}
+        _ => return Err(AppError::Unauthorized(AuthReason::InvalidTyp)),
+    }
 
     let iss = claims
         .get("iss")
@@ -2479,12 +2517,6 @@ pub fn validate_space_credential(
     if sub != expected_sub {
         return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
     }
-
-    let cnf_jkt = claims
-        .get("cnf")
-        .and_then(|cnf| cnf.get("jkt"))
-        .and_then(|v| v.as_str())
-        .ok_or(AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
 
     if cnf_jkt != expected_jkt {
         return Err(AppError::Unauthorized(AuthReason::IdMismatch));

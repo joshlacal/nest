@@ -3121,6 +3121,42 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
     assert_eq!(space_config.name.as_deref(), Some("Test Space"));
 }
 
+/// The host compatibility gate logs the refused space host's profile; the
+/// profile comes from describeServer over the pinned transport.
+#[tokio::test]
+async fn describe_space_host_reports_the_host_profile() {
+    use circle_appview::space_client::SpaceClient;
+
+    let mut endpoints = std::collections::HashMap::new();
+    endpoints.insert(
+        "/xrpc/com.atproto.server.describeServer".to_string(),
+        (
+            200,
+            serde_json::json!({
+                "did": "did:web:pds.example.com",
+                "swanProfile": "permissioned-data-0016-2026-09-10",
+                "availableUserDomains": [],
+                "inviteCodeRequired": true
+            })
+            .to_string(),
+        ),
+    );
+    let fixture = TlsOAuthFixture::spawn("pds.example.com", endpoints).await;
+    let space_client = SpaceClient::with_transport(fixture.transport());
+
+    let profile = space_client
+        .describe_space_host(&fixture.base_url)
+        .await
+        .expect("describeServer is reachable");
+    assert_eq!(
+        profile,
+        serde_json::json!({
+            "did": "did:web:pds.example.com",
+            "swanProfile": "permissioned-data-0016-2026-09-10"
+        })
+    );
+}
+
 #[tokio::test]
 async fn did_resolver_last_fresh_resolution_capacity_bounding() {
     let did_resolver =
