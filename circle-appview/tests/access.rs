@@ -614,9 +614,13 @@ async fn authority_omitted_from_member_cache_is_authorized_in_shared_gate_while_
     let revoked_err = access::check_member_access(&setup.state, &space, AUTHORITY_DID)
         .await
         .expect_err("check_member_access must deny when appAccess revoked");
+    // AccessRemoved (not NotFound) so the device purges its cached Circle (CIRCLES-04).
     assert!(
-        matches!(revoked_err, circle_appview::error::AppError::NotFound(_)),
-        "Expected NotFound for revoked space, got {revoked_err:?}"
+        matches!(
+            revoked_err,
+            circle_appview::error::AppError::AccessRemoved(_)
+        ),
+        "Expected AccessRemoved for revoked space, got {revoked_err:?}"
     );
 }
 

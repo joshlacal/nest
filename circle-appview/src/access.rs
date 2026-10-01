@@ -229,6 +229,35 @@ pub struct DelegationTokenClaims {
     pub jti: String,
 }
 
+/// XRPC error a space host returns from getSpaceCredential once the space is
+/// deleted. `parse_xrpc_error` maps it to `AppError::AccessRemoved(SPACE_DELETED)`.
+pub const SPACE_DELETED: &str = "SpaceDeleted";
+
+/// True only for a space host's declared `SpaceDeleted`. Every other credential
+/// failure (authorization, transport, 5xx) must leave Circle data in place.
+pub fn is_space_deleted(err: &AppError) -> bool {
+    matches!(err, AppError::AccessRemoved(code) if code == SPACE_DELETED)
+}
+
+/// A syncer that missed notifySpaceDeleted learns of the deletion at its next
+/// credential exchange and must delete every copy (permissioned-data proposal,
+/// "Space deletion"). Purges projections, the member cache, the credential and
+/// the notify registration, and tombstones the Circle so reads return
+/// `AccessRemoved` until the tombstone expires.
+pub async fn purge_deleted_space(db: &PgPool, credential_store: &CredentialStore, space_uri: &str) {
+    match crate::purge::delete_space(db, credential_store, space_uri).await {
+        Ok(()) => tracing::info!(
+            space = %space_fingerprint(space_uri),
+            "Space host reported SpaceDeleted; purged Circle data"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            space = %space_fingerprint(space_uri),
+            "Space host reported SpaceDeleted but the purge failed; it is retried at the next credential exchange"
+        ),
+    }
+}
+
 pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
     let stripped = space_uri.strip_prefix("at://").ok_or_else(|| {
         AppError::InvalidRequest("Invalid Space URI: must start with at://".into())
@@ -434,8 +463,11 @@ pub async fn verify_member_access(
         }
     };
 
+    // A tombstoned Circle (space deleted or appAccess revoked) answers with the
+    // declared AccessRemoved, which tells devices to purge their caches. NotFound
+    // or Forbidden surface on the client as a network error and nothing is purged.
     if circle_deleted || !circle_app_access {
-        return Err(AppError::NotFound(
+        return Err(AppError::AccessRemoved(
             "Circle deleted or appAccess revoked".into(),
         ));
     }
@@ -1071,7 +1103,7 @@ pub async fn ensure_space_credential_from_parts(
     // 7. Step 2: Sign client attestation and exchange for Space credential
     let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
 
-    let (credential_jwt, ephemeral_dpop_key, expires_at) = space_client
+    let exchanged = space_client
         .exchange_credential(
             &space_host_endpoint,
             space_uri,
@@ -1080,7 +1112,15 @@ pub async fn ensure_space_credential_from_parts(
             &authority_did,
             &authority_doc,
         )
-        .await?;
+        .await;
+    let (credential_jwt, ephemeral_dpop_key, expires_at) = match exchanged {
+        Ok(exchanged) => exchanged,
+        Err(e) if is_space_deleted(&e) => {
+            purge_deleted_space(db, credential_store, space_uri).await;
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     let cred = ActiveSpaceCredential {
         token: credential_jwt,

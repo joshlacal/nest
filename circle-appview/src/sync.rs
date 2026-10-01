@@ -53,6 +53,8 @@ pub struct SweepSummary {
     pub repos_checked: usize,
     pub repos_synced: usize,
     pub repos_failed: usize,
+    /// Spaces whose credential exchange returned SpaceDeleted and were purged.
+    pub spaces_purged: usize,
 }
 
 pub struct SyncEngine {
@@ -1707,6 +1709,11 @@ pub async fn sweep_once_with_shutdown(
         summary.spaces_checked += 1;
         let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
             Ok(c) => c,
+            // ensure_space_credential has already purged and tombstoned the Circle.
+            Err(e) if crate::access::is_space_deleted(&e) => {
+                summary.spaces_purged += 1;
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
                 summary.repos_failed += 1;
@@ -1891,6 +1898,7 @@ pub fn spawn_revision_sweep_task(
                                  repos_checked = summary.repos_checked,
                                 repos_synced = summary.repos_synced,
                                 repos_failed = summary.repos_failed,
+                                spaces_purged = summary.spaces_purged,
                                 "Completed scheduled revision sweep"
                             );
                         }
