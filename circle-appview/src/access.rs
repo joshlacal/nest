@@ -595,6 +595,8 @@ pub async fn refresh_member_cache(
         .is_explicit_revocation(expected_client_id)
     {
         tracing::warn!(space_uri = %space_uri, "Space appAccess explicitly omits client_id, revoking");
+        // Unregister while the space credential is still cached; revocation drops it.
+        crate::notify::unregister(state, space_uri).await;
         let mut revoke_res =
             crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await;
         if revoke_res.is_err() {
@@ -952,6 +954,12 @@ pub async fn activate_circle(
     // 6. Now that the circle row exists, persist the member cache before syncing repo records
     // so notification triggers correctly detect active members.
     let members = refresh_member_cache(state, space_uri).await?;
+
+    // 6b. Register for notifyWrite / notifySpaceDeleted at the space host. Best
+    // effort: the revision sweep retries a failed registration.
+    if let Err(e) = crate::notify::ensure_registration(state, space_uri, &cred).await {
+        tracing::warn!(error = %e, space = %space_fingerprint(space_uri), "registerNotify failed during activation");
+    }
 
     // 7. Sync the repo so children (circle_records, etc.) have their FK parent and notifications are generated.
     let sync_engine = crate::sync::SyncEngine::new(state);
@@ -2106,6 +2114,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(member_rows.len(), 2);
+
+        // Activation registered for notifications at the authority's space host
+        // with the configured service id (CIRCLES-06).
+        let registration: Option<(String, String)> = sqlx::query_as(
+            "SELECT service, space_host_endpoint FROM circle_notify_registrations WHERE space_uri = $1",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let (service, endpoint) = registration.expect("activation must register for notifications");
+        assert_eq!(service, state.config.notify_service_identifier());
+        assert_eq!(endpoint, TEST_SPACE_HOST);
     }
 
     #[sqlx::test(migrations = "./migrations")]

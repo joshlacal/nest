@@ -229,6 +229,21 @@ pub trait SpaceHostTransport: Send + Sync {
         })
     }
 
+    fn unregister_notify<'a>(
+        &'a self,
+        _target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        _service_identifier: &'a str,
+        _space_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(AppError::NotFound(
+                "unregister_notify not implemented on transport".into(),
+            ))
+        })
+    }
+
     fn list_repos<'a>(
         &'a self,
         _target_url: &'a url::Url,
@@ -698,9 +713,15 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 
             if !response.status().is_success() {
                 let status = response.status();
-                return Err(AppError::Internal(format!(
-                    "registerNotify returned status {status}"
-                )));
+                let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
+                    response,
+                    MAX_SPACE_CREDENTIAL_BYTES,
+                )
+                .await
+                .unwrap_or_default();
+                let body = String::from_utf8_lossy(&body_bytes);
+                tracing::warn!(%status, "registerNotify rejected by space host");
+                return Err(parse_xrpc_error(status, &body));
             }
 
             #[derive(Deserialize)]
@@ -722,6 +743,54 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 .with_timezone(&Utc);
 
             Ok(expires_at)
+        })
+    }
+
+    fn unregister_notify<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        space_credential: &'a str,
+        dpop_proof: &'a str,
+        service_identifier: &'a str,
+        space_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>> {
+        let target_url = target_url.clone();
+        let space_credential = space_credential.to_string();
+        let dpop_proof = dpop_proof.to_string();
+        let service_identifier = service_identifier.to_string();
+        let space_uri = space_uri.to_string();
+
+        Box::pin(async move {
+            let client = self.build_pinned_client(&target_url).await?;
+            let response = client
+                .post(target_url.as_str())
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("DPoP {space_credential}"),
+                )
+                .header("DPoP", dpop_proof)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&serde_json::json!({
+                    "service": service_identifier,
+                    "space": space_uri,
+                }))
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to call unregisterNotify: {e}")))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
+                    response,
+                    MAX_SPACE_CREDENTIAL_BYTES,
+                )
+                .await
+                .unwrap_or_default();
+                return Err(parse_xrpc_error(
+                    status,
+                    &String::from_utf8_lossy(&body_bytes),
+                ));
+            }
+            Ok(())
         })
     }
 
@@ -1017,6 +1086,13 @@ pub struct RecordedSpaceHostCall {
     pub client_attestation: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedNotifyCall {
+    pub endpoint_url: String,
+    pub space_uri: String,
+    pub service: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordedDelegationTokenCall {
     pub endpoint_url: String,
@@ -1049,6 +1125,8 @@ pub struct MockSpaceHostTransport {
     blob_responses: Mutex<HashMap<String, (Option<String>, Vec<u8>)>>,
     blob_calls: Mutex<Vec<String>>,
     register_notify_responses: Mutex<HashMap<String, DateTime<Utc>>>,
+    register_notify_calls: Mutex<Vec<RecordedNotifyCall>>,
+    unregister_notify_calls: Mutex<Vec<RecordedNotifyCall>>,
     space_members: Mutex<HashMap<String, Result<Vec<SpaceMember>, String>>>,
     space_configs: Mutex<HashMap<String, Result<SpaceConfig, String>>>,
 }
@@ -1074,6 +1152,8 @@ impl MockSpaceHostTransport {
             blob_responses: Mutex::new(HashMap::new()),
             blob_calls: Mutex::new(Vec::new()),
             register_notify_responses: Mutex::new(HashMap::new()),
+            register_notify_calls: Mutex::new(Vec::new()),
+            unregister_notify_calls: Mutex::new(Vec::new()),
             space_members: Mutex::new(HashMap::new()),
             space_configs: Mutex::new(HashMap::new()),
         }
@@ -1139,6 +1219,14 @@ impl MockSpaceHostTransport {
     pub fn set_register_notify_response(&self, space: &str, expires_at: DateTime<Utc>) {
         let mut lock = self.register_notify_responses.lock().unwrap();
         lock.insert(space.to_string(), expires_at);
+    }
+
+    pub fn recorded_register_notify_calls(&self) -> Vec<RecordedNotifyCall> {
+        self.register_notify_calls.lock().unwrap().clone()
+    }
+
+    pub fn recorded_unregister_notify_calls(&self) -> Vec<RecordedNotifyCall> {
+        self.unregister_notify_calls.lock().unwrap().clone()
     }
 
     pub fn recorded_calls(&self) -> Vec<RecordedSpaceHostCall> {
@@ -1267,18 +1355,45 @@ impl SpaceHostTransport for MockSpaceHostTransport {
 
     fn register_notify<'a>(
         &'a self,
-        _target_url: &'a url::Url,
+        target_url: &'a url::Url,
         _space_credential: &'a str,
         _dpop_proof: &'a str,
-        _service_identifier: &'a str,
+        service_identifier: &'a str,
         space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<DateTime<Utc>, AppError>> + Send + 'a>> {
+        self.register_notify_calls
+            .lock()
+            .unwrap()
+            .push(RecordedNotifyCall {
+                endpoint_url: target_url.to_string(),
+                space_uri: space_uri.to_string(),
+                service: service_identifier.to_string(),
+            });
         let lock = self.register_notify_responses.lock().unwrap();
         let expires_at = lock
             .get(space_uri)
             .cloned()
             .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(24));
         Box::pin(async move { Ok(expires_at) })
+    }
+
+    fn unregister_notify<'a>(
+        &'a self,
+        target_url: &'a url::Url,
+        _space_credential: &'a str,
+        _dpop_proof: &'a str,
+        service_identifier: &'a str,
+        space_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>> {
+        self.unregister_notify_calls
+            .lock()
+            .unwrap()
+            .push(RecordedNotifyCall {
+                endpoint_url: target_url.to_string(),
+                space_uri: space_uri.to_string(),
+                service: service_identifier.to_string(),
+            });
+        Box::pin(async move { Ok(()) })
     }
 
     fn list_repos<'a>(
@@ -1871,6 +1986,28 @@ impl SpaceClient {
             create_dpop_proof_with_ath(dpop_key, "POST", xrpc_url.as_str(), Some(space_credential));
         self.transport
             .register_notify(
+                &xrpc_url,
+                space_credential,
+                &dpop_proof,
+                service_identifier,
+                space_uri,
+            )
+            .await
+    }
+
+    pub async fn unregister_notify(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+        space_credential: &str,
+        dpop_key: &p256::ecdsa::SigningKey,
+        service_identifier: &str,
+    ) -> Result<(), AppError> {
+        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.unregisterNotify")?;
+        let dpop_proof =
+            create_dpop_proof_with_ath(dpop_key, "POST", xrpc_url.as_str(), Some(space_credential));
+        self.transport
+            .unregister_notify(
                 &xrpc_url,
                 space_credential,
                 &dpop_proof,

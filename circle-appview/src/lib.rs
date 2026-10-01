@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod hydration;
 pub mod media;
 pub mod notifications;
+pub mod notify;
 pub mod oauth;
 pub mod preferences;
 pub mod purge;

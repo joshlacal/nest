@@ -1720,6 +1720,13 @@ pub async fn sweep_once_with_shutdown(
                 continue;
             }
         };
+        if let Err(e) = crate::notify::ensure_registration(state, &space_uri, &cred).await {
+            tracing::warn!(
+                error = %e,
+                space = %crate::access::space_fingerprint(&space_uri),
+                "registerNotify failed during sweep; retried next sweep"
+            );
+        }
         let authority_did = match extract_authority_did(&space_uri) {
             Ok(a) => a,
             Err(_) => continue,
@@ -1913,6 +1920,23 @@ pub fn spawn_revision_sweep_task(
     (handle, shutdown_tx)
 }
 
+/// Upper bound on notifyWrite-triggered syncs running at once.
+pub const MAX_CONCURRENT_NOTIFY_SYNCS: usize = 32;
+
+static NOTIFY_SYNC_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NOTIFY_SYNCS)));
+
+/// Wait until no notifyWrite-triggered sync is running in this process.
+pub async fn wait_for_notify_syncs_idle() {
+    while NOTIFY_SYNC_PERMITS.available_permits() < MAX_CONCURRENT_NOTIFY_SYNCS {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Receives com.atproto.space.notifyWrite. Upstream fan-out is best-effort and
+/// does not wait on the receiver, so this validates the caller and the Circle,
+/// queues the sync in the background and acknowledges at once. When the queue is
+/// full the notification is dropped and the revision sweep repairs it.
 pub async fn notify_write_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1974,15 +1998,44 @@ pub async fn notify_write_handler(
         ));
     }
 
-    let sync_engine = SyncEngine::new(&state);
-    sync_engine
-        .sync_repo_with_expected_commit(
-            input.space.as_str(),
-            input.repo.as_str(),
-            Some(input.hash.as_ref()),
-            Some(input.rev.as_str()),
-        )
-        .await?;
+    let circle_active: Option<bool> = sqlx::query_scalar(
+        "SELECT app_access_granted FROM circles WHERE space_uri = $1 AND deleted_at IS NULL",
+    )
+    .bind(input.space.as_str())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+    if circle_active != Some(true) {
+        return Err(AppError::Forbidden(
+            "Space is deleted or appAccess revoked".into(),
+        ));
+    }
+
+    match NOTIFY_SYNC_PERMITS.clone().try_acquire_owned() {
+        Ok(permit) => {
+            let space = input.space.as_str().to_string();
+            let repo = input.repo.as_str().to_string();
+            let rev = input.rev.as_str().to_string();
+            let hash = input.hash.to_vec();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let res = SyncEngine::new(&state)
+                    .sync_repo_with_expected_commit(&space, &repo, Some(&hash), Some(&rev))
+                    .await;
+                if let Err(e) = res {
+                    tracing::warn!(
+                        error = %e,
+                        space = %crate::access::space_fingerprint(&space),
+                        "notifyWrite sync failed; the revision sweep will retry"
+                    );
+                }
+            });
+        }
+        Err(_) => tracing::warn!(
+            space = %crate::access::space_fingerprint(input.space.as_str()),
+            "notifyWrite sync queue full; the revision sweep will catch up"
+        ),
+    }
 
     use axum::response::IntoResponse;
     Ok(axum::http::StatusCode::OK.into_response())

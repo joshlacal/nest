@@ -137,6 +137,19 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Service identifier passed to `com.atproto.space.registerNotify`: this
+    /// AppView's DID plus the `#atproto_circles` service entry that space hosts
+    /// resolve to deliver notifyWrite and notifySpaceDeleted.
+    pub fn notify_service_identifier(&self) -> String {
+        if self.service_did.contains('#') {
+            self.service_did.clone()
+        } else {
+            format!("{}#atproto_circles", self.service_did)
+        }
+    }
+}
+
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
     if !s.len().is_multiple_of(2) {
         return Err(());

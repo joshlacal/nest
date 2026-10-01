@@ -945,7 +945,10 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Record was immediately indexed with permissioned URI!
+    // notifyWrite acknowledges first and syncs in the background (CIRCLES-06).
+    circle_appview::sync::wait_for_notify_syncs_idle().await;
+
+    // Record was indexed with permissioned URI without waiting for the sweep.
     let record: (String, String) = sqlx::query_as(
         "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did = $2",
     )
@@ -2208,9 +2211,33 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
         bytes::Bytes::from(serde_json::to_vec(&notify_input_mismatched).unwrap()),
     )
     .await;
+    // notifyWrite acknowledges once validated and syncs in the background
+    // (CIRCLES-06), so the mismatch is caught by the sync, not the response.
     assert!(
-        res_mismatch.is_err(),
-        "Mismatched notify hash must be rejected"
+        res_mismatch.is_ok(),
+        "A validated notifyWrite is acknowledged before syncing"
+    );
+    circle_appview::sync::wait_for_notify_syncs_idle().await;
+    let indexed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM circle_records WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(indexed, 0, "Mismatched notify hash must not be synced");
+    let synced: Option<String> = sqlx::query_scalar(
+        "SELECT last_rev FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        synced.is_none(),
+        "Mismatched notify hash must not advance sync state"
     );
 
     // 2. Correct notify hash -> Accepted
@@ -2244,6 +2271,16 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     )
     .await;
     assert!(res_correct.is_ok(), "Matching notify hash must succeed");
+    circle_appview::sync::wait_for_notify_syncs_idle().await;
+    let indexed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM circle_records WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(indexed, 1, "Matching notify hash must be synced");
 }
 
 #[sqlx::test(migrations = "./migrations")]
