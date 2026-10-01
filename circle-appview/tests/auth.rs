@@ -3017,16 +3017,16 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
 
     let mut endpoints = std::collections::HashMap::new();
     endpoints.insert(
-        "/xrpc/com.atproto.simplespace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fpublic%2F1".to_string(),
+        "/xrpc/com.atproto.simplespace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
             "members": [{"did": "did:plc:member-1", "read": true, "write": true}, {"did": "did:plc:member-2", "read": true, "write": false}]
         }).to_string()),
     );
     endpoints.insert(
-        "/xrpc/com.atproto.simplespace.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fpublic%2F1".to_string(),
+        "/xrpc/com.atproto.simplespace.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
             "authority": "did:plc:space-auth",
-            "spaceType": "public",
+            "spaceType": "com.example.space",
             "name": "Test Space"
         }).to_string()),
     );
@@ -3077,14 +3077,14 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
 
     // 1. member_dids uses transport.build_pinned_client and succeeds over TLS with injected resolver/cert
     let members = space_client
-        .member_dids("at://did:plc:space-auth/space/public/1")
+        .member_dids("at://did:plc:space-auth/space/com.example.space/1")
         .await
         .unwrap();
     assert_eq!(members, vec!["did:plc:member-1", "did:plc:member-2"]);
 
     // 2. get_space uses transport.build_pinned_client and succeeds over TLS with injected resolver/cert
     let space_config = space_client
-        .get_space("at://did:plc:space-auth/space/public/1")
+        .get_space("at://did:plc:space-auth/space/com.example.space/1")
         .await
         .unwrap();
     assert_eq!(space_config.name.as_deref(), Some("Test Space"));

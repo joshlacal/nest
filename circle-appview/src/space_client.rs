@@ -334,7 +334,7 @@ pub trait SpaceHostTransport: Send + Sync {
         _space_credential: &'a str,
         _dpop_proof: &'a str,
         _space_uri: &'a str,
-        _did: &'a str,
+        _repo: &'a str,
         _cid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>>
     {
@@ -752,14 +752,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
 
-            let mut req_url = target_url.clone();
-            {
-                let mut query = req_url.query_pairs_mut();
-                query.append_pair("space", &space_uri);
-                if let Some(c) = &cursor {
-                    query.append_pair("cursor", c);
-                }
-            }
+            let req_url = xrpc_query::list_repos(&target_url, &space_uri, cursor.as_deref())?;
 
             let response = client
                 .get(req_url.as_str())
@@ -820,18 +813,13 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
 
-            let mut req_url = target_url.clone();
-            {
-                let mut query = req_url.query_pairs_mut();
-                query.append_pair("space", &space_uri);
-                query.append_pair("repo", &repo_did);
-                if let Some(s) = &since {
-                    query.append_pair("since", s);
-                }
-                if let Some(c) = &cursor {
-                    query.append_pair("cursor", c);
-                }
-            }
+            let req_url = xrpc_query::list_repo_ops(
+                &target_url,
+                &space_uri,
+                &repo_did,
+                since.as_deref(),
+                cursor.as_deref(),
+            )?;
 
             let response = client
                 .get(req_url.as_str())
@@ -880,15 +868,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
 
-            let mut req_url = target_url.clone();
-            {
-                let mut query = req_url.query_pairs_mut();
-                query.append_pair("space", &space_uri);
-                query.append_pair("repo", &repo_did);
-                if let Some(s) = &since {
-                    query.append_pair("since", s);
-                }
-            }
+            // getRepo has no `since` parameter upstream; the full repo is returned.
+            let _ = since;
+            let req_url = xrpc_query::get_repo(&target_url, &space_uri, &repo_did)?;
 
             let response = client
                 .get(req_url.as_str())
@@ -943,12 +925,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
 
-            let mut req_url = target_url.clone();
-            {
-                let mut query = req_url.query_pairs_mut();
-                query.append_pair("space", &space_uri);
-                query.append_pair("repo", &repo_did);
-            }
+            let req_url = xrpc_query::get_latest_commit(&target_url, &space_uri, &repo_did)?;
 
             let response = client
                 .get(req_url.as_str())
@@ -983,7 +960,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         space_credential: &'a str,
         dpop_proof: &'a str,
         space_uri: &'a str,
-        did: &'a str,
+        repo: &'a str,
         cid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>>
     {
@@ -991,19 +968,13 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         let space_credential = space_credential.to_string();
         let dpop_proof = dpop_proof.to_string();
         let space_uri = space_uri.to_string();
-        let did = did.to_string();
+        let repo = repo.to_string();
         let cid = cid.to_string();
 
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
 
-            let mut req_url = target_url.clone();
-            {
-                let mut query = req_url.query_pairs_mut();
-                query.append_pair("space", &space_uri);
-                query.append_pair("did", &did);
-                query.append_pair("cid", &cid);
-            }
+            let req_url = xrpc_query::get_blob(&target_url, &space_uri, &repo, &cid)?;
 
             let response = client
                 .get(req_url.as_str())
@@ -1622,15 +1593,11 @@ impl SpaceClient {
                 }
             }
 
-            let mut req_url =
-                construct_xrpc_url(&pds_endpoint, "com.atproto.simplespace.listMembers")?;
-            {
-                let mut q = req_url.query_pairs_mut();
-                q.append_pair("space", space);
-                if let Some(c) = &cursor {
-                    q.append_pair("cursor", c);
-                }
-            }
+            let req_url = xrpc_query::list_members(
+                &construct_xrpc_url(&pds_endpoint, "com.atproto.simplespace.listMembers")?,
+                space,
+                cursor.as_deref(),
+            )?;
 
             let client = self.transport.build_pinned_client(&req_url).await?;
             let resp = crate::oauth::get_with_dpop(&client, &dpop_key, req_url.as_str(), &token)
@@ -1743,8 +1710,10 @@ impl SpaceClient {
             .get_valid_token(&authority, &deps.http_client)
             .await?;
 
-        let mut req_url = construct_xrpc_url(&pds_endpoint, "com.atproto.simplespace.getSpace")?;
-        req_url.query_pairs_mut().append_pair("space", space);
+        let req_url = xrpc_query::get_space(
+            &construct_xrpc_url(&pds_endpoint, "com.atproto.simplespace.getSpace")?,
+            space,
+        )?;
         let client = self.transport.build_pinned_client(&req_url).await?;
         let resp = crate::oauth::get_with_dpop(&client, &dpop_key, req_url.as_str(), &token)
             .await
@@ -2008,7 +1977,7 @@ impl SpaceClient {
         &self,
         service_endpoint: &str,
         space_uri: &str,
-        did: &str,
+        repo: &str,
         cid: &str,
         space_credential: &str,
         dpop_key: &p256::ecdsa::SigningKey,
@@ -2022,7 +1991,7 @@ impl SpaceClient {
                 space_credential,
                 &dpop_proof,
                 space_uri,
-                did,
+                repo,
                 cid,
             )
             .await
@@ -2112,6 +2081,173 @@ pub fn create_dpop_proof_with_ath(
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
 
     format!("{signing_input}.{sig_b64}")
+}
+
+/// Query URLs for the space-host and simplespace reads, built from the
+/// lexicon-generated `catbird_atproto` params structs so the wire keys come from
+/// the lexicon rather than hand-typed strings. A hand-typed `did` in place of
+/// getBlob's `repo` once made every Circle image request fail upstream.
+pub mod xrpc_query {
+    use super::AppError;
+    use catbird_atproto::generated::com_atproto::{simplespace, space};
+    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+    use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
+    use catbird_atproto::jacquard_common::types::string::{Cid, Did, Tid};
+
+    fn space_ref(space: &str) -> Result<AtSpaceUri<SmolStr>, AppError> {
+        AtSpaceUri::new(SmolStr::new(space))
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid space reference: {e}")))
+    }
+
+    fn did(value: &str) -> Result<Did<SmolStr>, AppError> {
+        Did::new(SmolStr::new(value))
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid repo DID: {e}")))
+    }
+
+    fn with_params<P: serde::Serialize>(
+        target_url: &url::Url,
+        params: &P,
+    ) -> Result<url::Url, AppError> {
+        let value = serde_json::to_value(params)
+            .map_err(|e| AppError::Internal(format!("Failed to encode XRPC params: {e}")))?;
+        let serde_json::Value::Object(map) = value else {
+            return Err(AppError::Internal(
+                "XRPC params must encode as an object".into(),
+            ));
+        };
+        let mut url = target_url.clone();
+        {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in map {
+                match value {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(s) => {
+                        query.append_pair(&key, &s);
+                    }
+                    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                        query.append_pair(&key, &value.to_string());
+                    }
+                    other => {
+                        return Err(AppError::Internal(format!(
+                            "Unsupported XRPC param value for {key}: {other}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(url)
+    }
+
+    pub fn get_blob(
+        target_url: &url::Url,
+        space_uri: &str,
+        repo: &str,
+        cid: &str,
+    ) -> Result<url::Url, AppError> {
+        with_params(
+            target_url,
+            &space::get_blob::GetBlob::<SmolStr> {
+                space: space_ref(space_uri)?,
+                repo: did(repo)?,
+                cid: Cid::Str(SmolStr::new(cid)),
+            },
+        )
+    }
+
+    pub fn list_repo_ops(
+        target_url: &url::Url,
+        space_uri: &str,
+        repo: &str,
+        since: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<url::Url, AppError> {
+        let since = since
+            .map(|s| {
+                Tid::new(s).map_err(|e| {
+                    AppError::Internal(format!("listRepoOps since is not a TID rev: {e}"))
+                })
+            })
+            .transpose()?;
+        with_params(
+            target_url,
+            &space::list_repo_ops::ListRepoOps::<SmolStr> {
+                cursor: cursor.map(SmolStr::new),
+                exclude_values: None,
+                limit: None,
+                repo: did(repo)?,
+                since,
+                space: space_ref(space_uri)?,
+            },
+        )
+    }
+
+    pub fn get_repo(
+        target_url: &url::Url,
+        space_uri: &str,
+        repo: &str,
+    ) -> Result<url::Url, AppError> {
+        with_params(
+            target_url,
+            &space::get_repo::GetRepo::<SmolStr> {
+                exclude_values: None,
+                repo: did(repo)?,
+                space: space_ref(space_uri)?,
+            },
+        )
+    }
+
+    pub fn get_latest_commit(
+        target_url: &url::Url,
+        space_uri: &str,
+        repo: &str,
+    ) -> Result<url::Url, AppError> {
+        with_params(
+            target_url,
+            &space::get_latest_commit::GetLatestCommit::<SmolStr> {
+                repo: did(repo)?,
+                space: space_ref(space_uri)?,
+            },
+        )
+    }
+
+    pub fn list_repos(
+        target_url: &url::Url,
+        space_uri: &str,
+        cursor: Option<&str>,
+    ) -> Result<url::Url, AppError> {
+        with_params(
+            target_url,
+            &space::list_repos::ListRepos::<SmolStr> {
+                cursor: cursor.map(SmolStr::new),
+                limit: None,
+                space: space_ref(space_uri)?,
+            },
+        )
+    }
+
+    pub fn get_space(target_url: &url::Url, space_uri: &str) -> Result<url::Url, AppError> {
+        with_params(
+            target_url,
+            &simplespace::get_space::GetSpace::<SmolStr> {
+                space: space_ref(space_uri)?,
+            },
+        )
+    }
+
+    pub fn list_members(
+        target_url: &url::Url,
+        space_uri: &str,
+        cursor: Option<&str>,
+    ) -> Result<url::Url, AppError> {
+        with_params(
+            target_url,
+            &simplespace::list_members::ListMembers::<SmolStr> {
+                cursor: cursor.map(SmolStr::new),
+                limit: None,
+                space: space_ref(space_uri)?,
+            },
+        )
+    }
 }
 
 pub fn construct_xrpc_url(service_endpoint: &str, method: &str) -> Result<url::Url, AppError> {
@@ -2587,5 +2723,117 @@ mod tests {
                 other
             ),
         }
+    }
+
+    const SPACE: &str = "at://did:plc:authority123/space/blue.catbird.circle/3kabcdefghi22";
+    const REPO: &str = "did:plc:author456";
+    const CID: &str = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+    const REV: &str = "3kabcdefghi22";
+
+    fn query_keys(url: &url::Url) -> std::collections::BTreeSet<String> {
+        url.query_pairs().map(|(k, _)| k.into_owned()).collect()
+    }
+
+    fn keys(expected: &[&str]) -> std::collections::BTreeSet<String> {
+        expected.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// Every space-host and simplespace read must carry exactly the lexicon's
+    /// parameter names. getBlob once sent `did` where the lexicon requires `repo`.
+    #[test]
+    fn xrpc_query_keys_match_the_lexicon_params() {
+        let base = url::Url::parse("https://host.example/xrpc/m").unwrap();
+
+        let blob = xrpc_query::get_blob(&base, SPACE, REPO, CID).unwrap();
+        assert_eq!(query_keys(&blob), keys(&["space", "repo", "cid"]));
+        assert!(blob.query_pairs().any(|(k, v)| k == "repo" && v == REPO));
+        assert!(!blob.query_pairs().any(|(k, _)| k == "did"));
+
+        let ops = xrpc_query::list_repo_ops(&base, SPACE, REPO, None, None).unwrap();
+        assert_eq!(query_keys(&ops), keys(&["space", "repo"]));
+        let ops = xrpc_query::list_repo_ops(&base, SPACE, REPO, Some(REV), Some("c1")).unwrap();
+        assert_eq!(
+            query_keys(&ops),
+            keys(&["space", "repo", "since", "cursor"])
+        );
+
+        let repo = xrpc_query::get_repo(&base, SPACE, REPO).unwrap();
+        assert_eq!(query_keys(&repo), keys(&["space", "repo"]));
+
+        let latest = xrpc_query::get_latest_commit(&base, SPACE, REPO).unwrap();
+        assert_eq!(query_keys(&latest), keys(&["space", "repo"]));
+
+        let repos = xrpc_query::list_repos(&base, SPACE, None).unwrap();
+        assert_eq!(query_keys(&repos), keys(&["space"]));
+        let repos = xrpc_query::list_repos(&base, SPACE, Some("c1")).unwrap();
+        assert_eq!(query_keys(&repos), keys(&["space", "cursor"]));
+
+        let space = xrpc_query::get_space(&base, SPACE).unwrap();
+        assert_eq!(query_keys(&space), keys(&["space"]));
+
+        let members = xrpc_query::list_members(&base, SPACE, None).unwrap();
+        assert_eq!(query_keys(&members), keys(&["space"]));
+        let members = xrpc_query::list_members(&base, SPACE, Some("c1")).unwrap();
+        assert_eq!(query_keys(&members), keys(&["space", "cursor"]));
+    }
+
+    #[test]
+    fn xrpc_query_rejects_malformed_repo_and_space() {
+        let base = url::Url::parse("https://host.example/xrpc/m").unwrap();
+        assert!(matches!(
+            xrpc_query::get_blob(&base, SPACE, "not-a-did", CID),
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            xrpc_query::get_blob(&base, "https://not-a-space", REPO, CID),
+            Err(AppError::InvalidRequest(_))
+        ));
+    }
+
+    /// The real transport must put `repo` on the wire for getBlob. A capturing
+    /// HTTP server records the exact query the Space host receives.
+    #[tokio::test]
+    async fn default_transport_get_blob_sends_repo_on_the_wire() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.space.getBlob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"png-bytes".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let transport = DefaultSpaceHostTransport::with_loopback(true);
+        let target =
+            url::Url::parse(&format!("{}/xrpc/com.atproto.space.getBlob", server.uri())).unwrap();
+        let (content_type, bytes) = transport
+            .get_blob(&target, "cred", "proof", SPACE, REPO, CID)
+            .await
+            .expect("getBlob succeeds against the capturing host");
+        assert_eq!(content_type.as_deref(), Some("image/png"));
+        assert_eq!(bytes, b"png-bytes");
+
+        let received = server.received_requests().await.expect("recording on");
+        assert_eq!(received.len(), 1);
+        let pairs: std::collections::BTreeMap<String, String> = received[0]
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            keys(&["space", "repo", "cid"])
+        );
+        assert_eq!(pairs["repo"], REPO);
+        assert_eq!(pairs["space"], SPACE);
+        assert_eq!(pairs["cid"], CID);
     }
 }
