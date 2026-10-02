@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use a2::{
-    Client, DefaultNotificationBuilder, Error as A2Error, ErrorReason, NotificationBuilder,
-    NotificationOptions, Priority,
+    Client, CollapseId, DefaultNotificationBuilder, Error as A2Error, ErrorReason,
+    NotificationBuilder, NotificationOptions, Priority,
 };
 use anyhow::{Context, Result};
 
@@ -209,7 +209,8 @@ impl ApnsDelivery {
                 apns_collapse_id: notification
                     .custom_data
                     .get("pushDeliveryId")
-                    .map(String::as_str),
+                    .map(|id| CollapseId::new(id))
+                    .transpose()?,
                 apns_expiration: None,
                 apns_push_type: None,
                 apns_id: notification

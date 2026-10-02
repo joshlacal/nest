@@ -461,6 +461,7 @@ async fn read_after_enqueue_suppresses_delivery_but_processed_watermark_does_not
 
     let mut second = fixture.event.clone();
     second.message_id = "fixture-message-2".to_string();
+    second.log_rev = Some("0000000000004".to_string());
     enqueue_push(&fixture.pool, &second, 0).await.unwrap();
     sqlx::query("UPDATE chat_notified_watermarks SET last_read_rev = '0000000000005' WHERE account_did = $1 AND convo_id = $2")
         .bind(RECIPIENT).bind(CONVO).execute(&fixture.pool).await.unwrap();
@@ -576,7 +577,7 @@ async fn accepted_response_with_receipt_write_failure_remains_uncertain_on_resta
     let token = format!("{:064x}", 1);
     sqlx::raw_sql(
         "CREATE FUNCTION reject_acceptance_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN IF NEW.state = 'accepted' THEN RAISE EXCEPTION 'fixture receipt persistence crash'; END IF; RETURN NEW; END $$; \
+         BEGIN IF NEW.state = 'accepted' THEN RAISE EXCEPTION 'fixture receipt persistence crash'; END IF; RETURN NEW; END; $$; \
          CREATE TRIGGER reject_acceptance_receipt BEFORE UPDATE ON push_device_deliveries \
          FOR EACH ROW EXECUTE FUNCTION reject_acceptance_receipt();"
     ).execute(&fixture.pool).await.unwrap();
@@ -603,7 +604,7 @@ async fn queue_ack_failure_after_persisted_acceptance_restarts_without_resending
     let token = format!("{:064x}", 1);
     sqlx::raw_sql(
         "CREATE FUNCTION reject_queue_ack() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN RAISE EXCEPTION 'fixture queue acknowledgement crash'; END $$; \
+         BEGIN RAISE EXCEPTION 'fixture queue acknowledgement crash'; END; $$; \
          CREATE TRIGGER reject_queue_ack BEFORE DELETE ON push_event_queue \
          FOR EACH ROW EXECUTE FUNCTION reject_queue_ack();",
     )
