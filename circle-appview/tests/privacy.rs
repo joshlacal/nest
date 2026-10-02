@@ -378,7 +378,7 @@ async fn unauthorized_user_cannot_fetch_media_or_notifications(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "mock-space-token".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -640,7 +640,7 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -851,7 +851,7 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -953,7 +953,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "active-cred-media-res".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1163,7 +1163,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-1".into(),
-                dpop_key: cred_key_1,
+                signing_key: cred_key_1,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1177,7 +1177,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
             SPACE_2.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-2".into(),
-                dpop_key: cred_key_2,
+                signing_key: cred_key_2,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1596,7 +1596,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1731,7 +1731,7 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1912,7 +1912,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -2021,7 +2021,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-live".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -2444,9 +2444,13 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
     let notify_dave = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(DAVE_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
             .unwrap(),
         extra_data: None,
@@ -2469,9 +2473,13 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
     let notify_alice = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(ALICE_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
             .unwrap(),
         extra_data: None,
@@ -3438,7 +3446,7 @@ async fn revocation_durability_commits_state_flip_and_credentials_before_purge(p
             SPACE_1.to_string(),
             circle_appview::access::ActiveSpaceCredential {
                 token: "dpop_token_123".into(),
-                dpop_key: p256_key,
+                signing_key: p256_key,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         )
@@ -3534,7 +3542,7 @@ async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_
             SPACE_1.to_string(),
             circle_appview::access::ActiveSpaceCredential {
                 token: "dpop_token_active".into(),
-                dpop_key: p256_key,
+                signing_key: p256_key,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         )

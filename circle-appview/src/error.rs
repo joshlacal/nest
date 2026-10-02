@@ -48,6 +48,12 @@ pub enum AuthReason {
     IdMismatch,
     SsrfBlocked,
     AlgKeyMismatch,
+    /// A repo or space host revoked the space credential (`CredentialRevoked`).
+    CredentialRevoked,
+    /// A host refused the request's HTTP message signature (`BadSpaceSignature`).
+    BadSpaceSignature,
+    /// A host refused the request's `Atproto-Space-Audience` (`BadSpaceAudience`).
+    BadSpaceAudience,
 }
 
 impl std::fmt::Display for AuthReason {
@@ -89,6 +95,9 @@ impl std::fmt::Display for AuthReason {
             Self::IdMismatch => "id_mismatch",
             Self::SsrfBlocked => "ssrf_blocked",
             Self::AlgKeyMismatch => "alg_key_mismatch",
+            Self::CredentialRevoked => "credential_revoked",
+            Self::BadSpaceSignature => "bad_space_signature",
+            Self::BadSpaceAudience => "bad_space_audience",
         };
         write!(f, "{s}")
     }

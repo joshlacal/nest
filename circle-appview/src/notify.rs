@@ -61,16 +61,29 @@ pub async fn ensure_registration_at(
         })?;
     let (space_host_endpoint, _) = resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
-    let expires_at = state
+    let expires_at = match state
         .space_client
         .register_notify(
             &space_host_endpoint,
             space_uri,
             &cred.token,
-            &cred.dpop_key,
+            &cred.signing_key,
             &service,
         )
-        .await?;
+        .await
+    {
+        Ok(expires_at) => expires_at,
+        Err(e) => {
+            crate::access::evict_rejected_credential(
+                &state.credential_store,
+                space_uri,
+                &cred.token,
+                &e,
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
     sqlx::query(
         r#"
@@ -125,16 +138,25 @@ pub async fn unregister(state: &AppState, space_uri: &str) {
             &endpoint,
             space_uri,
             &cred.token,
-            &cred.dpop_key,
+            &cred.signing_key,
             &service,
         );
         match tokio::time::timeout(std::time::Duration::from_secs(5), call).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                error = %e,
-                space = %space_fingerprint(space_uri),
-                "unregisterNotify failed"
-            ),
+            Ok(Err(e)) => {
+                crate::access::evict_rejected_credential(
+                    &state.credential_store,
+                    space_uri,
+                    &cred.token,
+                    &e,
+                )
+                .await;
+                tracing::warn!(
+                    error = %e,
+                    space = %space_fingerprint(space_uri),
+                    "unregisterNotify failed"
+                )
+            }
             Err(_) => tracing::warn!(
                 space = %space_fingerprint(space_uri),
                 "unregisterNotify timed out"

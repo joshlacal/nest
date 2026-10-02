@@ -142,7 +142,7 @@ async fn setup(pool: PgPool, service_did: &str) -> Setup {
 fn credential(expires_at: DateTime<Utc>) -> ActiveSpaceCredential {
     ActiveSpaceCredential {
         token: "space.credential.jwt".into(),
-        dpop_key: SigningKey::random(&mut OsRng),
+        signing_key: SigningKey::random(&mut OsRng),
         expires_at,
     }
 }
@@ -330,9 +330,13 @@ async fn notify_write_acknowledges_before_syncing(pool: PgPool) {
     let body = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[7u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(OWNER_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
             .unwrap(),
         extra_data: None,

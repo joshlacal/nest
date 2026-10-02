@@ -492,13 +492,13 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
     let space_locks = Arc::new(SpaceLockManager::new());
 
     // Pre-populate credential in store for space
-    let dpop_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::random(&mut OsRng);
     credential_store
         .insert(
             SPACE_URI.to_string(),
             ActiveSpaceCredential {
                 token: "test.space.credential.jwt".to_string(),
-                dpop_key,
+                signing_key,
                 expires_at: Utc::now() + chrono::Duration::hours(2),
             },
         )
@@ -910,7 +910,11 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
             &lthash.digest(),
         ),
         repo: Did::from(String::from(OWNER_DID)),
-        rev: Tid::from(String::from(rev)),
+        repo_rev: Tid::from(String::from(rev)),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
             .unwrap(),
         extra_data: None,
@@ -918,7 +922,7 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
 
     let token = mint_service_jwt(
         OWNER_DID,
-        &setup.state.config.service_did,
+        &setup.state.config.notify_service_identifier(),
         "com.atproto.space.notifyWrite",
         &setup.owner_signing_key,
     );
@@ -1013,7 +1017,10 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
             &lthash.digest(),
         ),
-        rev: Tid::from(String::from(rev)),
+        repo_rev: Tid::from(String::from(rev)),
+        space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+            "3l7spacerev2a",
+        )),
         extra_data: None,
     };
     setup.mock_transport.set_list_repos_response(
@@ -1518,6 +1525,58 @@ async fn two_root_car_full_recovery_and_tampered_car_rejection(pool: PgPool) {
     tampered_car[last_idx] ^= 0xff; // corrupt a record block
     assert!(decode_repo_car(&tampered_car).is_err());
 }
+/// The forwarded notifyWrite body is {space, repo, repoRev, hash, spaceRev,
+/// prevSpaceRev?}: prevSpaceRev is omitted on a space's first update, and the
+/// pre-Oct-1 `rev` field no longer parses.
+#[test]
+fn notify_write_body_parses_the_oct1_shape() {
+    use catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite;
+
+    let first = NotifyWrite {
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[9u8; 32]),
+        repo: Did::from(String::from(OWNER_DID)),
+        repo_rev: Tid::from(String::from("3l7rev234567a")),
+        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
+            .unwrap(),
+        space_rev: Some(Tid::from(String::from("3l7spacerev2a"))),
+        prev_space_rev: None,
+        extra_data: None,
+    };
+    let wire = serde_json::to_value(&first).unwrap();
+    let keys: std::collections::BTreeSet<_> = wire.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        keys,
+        ["hash", "repo", "repoRev", "space", "spaceRev"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+    let parse = |v: &serde_json::Value| {
+        serde_json::from_slice::<NotifyWrite>(&serde_json::to_vec(v).unwrap())
+    };
+    let parsed = parse(&wire).unwrap();
+    assert_eq!(parsed.repo_rev.as_str(), "3l7rev234567a");
+    assert_eq!(
+        parsed.space_rev.as_ref().map(|r| r.as_str()),
+        Some("3l7spacerev2a")
+    );
+    assert!(parsed.prev_space_rev.is_none());
+
+    let mut next = wire.clone();
+    next["prevSpaceRev"] = serde_json::json!("3l7spacerev2a");
+    next["spaceRev"] = serde_json::json!("3l7spacerev2b");
+    let parsed = parse(&next).unwrap();
+    assert_eq!(
+        parsed.prev_space_rev.as_ref().map(|r| r.as_str()),
+        Some("3l7spacerev2a")
+    );
+
+    let mut legacy = wire;
+    let rev = legacy.as_object_mut().unwrap().remove("repoRev").unwrap();
+    legacy["rev"] = rev;
+    assert!(parse(&legacy).is_err());
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
@@ -1528,7 +1587,11 @@ async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
     let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]),
         repo: Did::from(String::from(OWNER_DID)),
-        rev: Tid::from(String::from("3l7rev234567a")),
+        repo_rev: Tid::from(String::from("3l7rev234567a")),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
             .unwrap(),
         extra_data: None,
@@ -1558,7 +1621,7 @@ async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
 
     let attacker_token = mint_service_jwt(
         attacker_did,
-        &setup.state.config.service_did,
+        &setup.state.config.notify_service_identifier(),
         "com.atproto.space.notifyWrite",
         &attacker_key,
     );
@@ -2004,12 +2067,17 @@ async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
     use circle_appview::space_client::SpaceHostTransport;
 
     let transport = DefaultSpaceHostTransport::new(); // production transport (allow_loopback = false)
+    let auth = circle_appview::space_signature::credential_headers(
+        &SigningKey::random(&mut OsRng),
+        "cred",
+        OWNER_DID,
+    );
 
     // 1. list_repos to 127.0.0.1 -> blocked
     let loopback_url =
         url::Url::parse("https://127.0.0.1/xrpc/com.atproto.space.listRepos").unwrap();
     let res1 = transport
-        .list_repos(&loopback_url, "cred", "dpop", SPACE_URI, None)
+        .list_repos(&loopback_url, &auth, SPACE_URI, None)
         .await;
     assert!(matches!(
         res1,
@@ -2020,15 +2088,7 @@ async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
     let private_url =
         url::Url::parse("https://10.0.0.1/xrpc/com.atproto.space.listRepoOps").unwrap();
     let res2 = transport
-        .list_repo_ops(
-            &private_url,
-            "cred",
-            "dpop",
-            SPACE_URI,
-            OWNER_DID,
-            None,
-            None,
-        )
+        .list_repo_ops(&private_url, &auth, SPACE_URI, OWNER_DID, None, None)
         .await;
     assert!(matches!(
         res2,
@@ -2039,7 +2099,7 @@ async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
     let localhost_url =
         url::Url::parse("https://localhost/xrpc/com.atproto.space.getRepo").unwrap();
     let res3 = transport
-        .get_repo(&localhost_url, "cred", "dpop", SPACE_URI, OWNER_DID, None)
+        .get_repo(&localhost_url, &auth, SPACE_URI, OWNER_DID, None)
         .await;
     assert!(matches!(
         res3,
@@ -2050,7 +2110,7 @@ async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
     let http_url =
         url::Url::parse("http://space.example.com/xrpc/com.atproto.space.getLatestCommit").unwrap();
     let res4 = transport
-        .get_latest_commit(&http_url, "cred", "dpop", SPACE_URI, OWNER_DID)
+        .get_latest_commit(&http_url, &auth, SPACE_URI, OWNER_DID)
         .await;
     assert!(matches!(
         res4,
@@ -2101,38 +2161,72 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
         },
     );
 
-    // Page 1 of listRepos returns cursor="page2_cur" with no matching repo
+    // listRepos (Oct-1 alpha): entries ascend by spaceRev, a nonempty page's
+    // cursor is its last entry's spaceRev (an exclusive checkpoint), and the
+    // listing ends with an empty page that omits the cursor. OWNER_DID advances
+    // while the sweep paginates, so it reappears on page 2.
+    let space_rev_1 = "3l7spacerev2a";
+    let space_rev_2 = "3l7spacerev2b";
+    let entry =
+        |space_rev: &str| catbird_atproto::generated::com_atproto::space::list_repos::Repo {
+            did: Did::from(String::from(OWNER_DID)),
+            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                &lthash.digest(),
+            ),
+            repo_rev: Tid::from(String::from(rev)),
+            space_rev: Tid::from(String::from(space_rev)),
+            extra_data: None,
+        };
     setup.mock_transport.set_list_repos_response(
         SPACE_URI,
         catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
-            cursor: Some("page2_cur".into()),
-            repos: vec![],
+            cursor: Some(space_rev_1.into()),
+            repos: vec![entry(space_rev_1)],
             extra_data: None,
         },
     );
-
-    // Page 2 of listRepos returns OWNER_DID repo
-    let page2_key = format!("{SPACE_URI}:page2_cur");
-    let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-        did: Did::from(String::from(OWNER_DID)),
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            &lthash.digest(),
-        ),
-        rev: Tid::from(String::from(rev)),
-        extra_data: None,
-    };
     setup.mock_transport.set_list_repos_response(
-        &page2_key,
+        &format!("{SPACE_URI}:{space_rev_1}"),
         catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
-            cursor: None,
-            repos: vec![repo_item],
+            cursor: Some(space_rev_2.into()),
+            repos: vec![entry(space_rev_2)],
             extra_data: None,
         },
     );
+    // Past space_rev_2 the mock answers the empty, cursor-less final page.
 
     let summary = sweep_once(&setup.state).await.unwrap();
-    assert_eq!(summary.repos_checked, 1);
-    assert_eq!(summary.repos_synced, 1);
+    assert_eq!(
+        summary.repos_checked, 2,
+        "the repeated repo is listed twice"
+    );
+    assert_eq!(
+        summary.repos_synced, 1,
+        "the repeat matches stored state and is not re-synced"
+    );
+    assert_eq!(summary.repos_failed, 0);
+    assert_eq!(
+        setup.mock_transport.recorded_list_repos_cursors(),
+        vec![
+            None,
+            Some(space_rev_1.to_string()),
+            Some(space_rev_2.to_string())
+        ],
+        "each returned cursor is passed back unchanged until an empty page"
+    );
+
+    // listRepos is a space-host operation: signed for the authority's bare DID.
+    let list_uses: Vec<_> = setup
+        .mock_transport
+        .recorded_credential_uses()
+        .into_iter()
+        .filter(|u| u.method == "com.atproto.space.listRepos")
+        .collect();
+    assert_eq!(list_uses.len(), 3);
+    for u in &list_uses {
+        assert_eq!(u.auth.audience.as_deref(), Some(OWNER_DID));
+        assert!(u.auth.authorization.starts_with("Atproto-Space "));
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -2180,7 +2274,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
 
     let token = mint_service_jwt(
         OWNER_DID,
-        &setup.state.config.service_did,
+        &setup.state.config.notify_service_identifier(),
         "com.atproto.space.notifyWrite",
         &setup.owner_signing_key,
     );
@@ -2193,7 +2287,11 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
                 &wrong_hash,
             ),
             repo: Did::from(String::from(OWNER_DID)),
-            rev: Tid::from(String::from(rev)),
+            repo_rev: Tid::from(String::from(rev)),
+            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+                String::from("3l7spacerev2a"),
+            )),
+            prev_space_rev: None,
             space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
                 .unwrap(),
             extra_data: None,
@@ -2246,7 +2344,11 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
                 &lthash.digest(),
             ),
             repo: Did::from(String::from(OWNER_DID)),
-            rev: Tid::from(String::from(rev)),
+            repo_rev: Tid::from(String::from(rev)),
+            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+                String::from("3l7spacerev2a"),
+            )),
+            prev_space_rev: None,
             space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
                 .unwrap(),
             extra_data: None,
@@ -2254,7 +2356,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
 
     let token2 = mint_service_jwt(
         OWNER_DID,
-        &setup.state.config.service_did,
+        &setup.state.config.notify_service_identifier(),
         "com.atproto.space.notifyWrite",
         &setup.owner_signing_key,
     );
@@ -3287,7 +3389,7 @@ async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
 
     let token = mint_service_jwt(
         OWNER_DID,
-        &setup.state.config.service_did,
+        &setup.state.config.notify_service_identifier(),
         "com.atproto.space.notifyWrite",
         &setup.owner_signing_key,
     );
@@ -3304,7 +3406,11 @@ async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
                 &[0x11u8; 16],
             ),
             repo: Did::from(String::from(OWNER_DID)),
-            rev: Tid::from(String::from("3l7234567a234")),
+            repo_rev: Tid::from(String::from("3l7234567a234")),
+            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+                String::from("3l7spacerev2a"),
+            )),
+            prev_space_rev: None,
             space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
                 .unwrap(),
             extra_data: None,
@@ -4614,7 +4720,10 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
             &lthash.digest(),
         ),
-        rev: Tid::from(String::from(rev)),
+        repo_rev: Tid::from(String::from(rev)),
+        space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+            "3l7spacerev2a",
+        )),
         extra_data: None,
     };
     setup.mock_transport.set_list_repos_response(

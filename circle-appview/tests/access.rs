@@ -249,7 +249,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let cred1 = ActiveSpaceCredential {
         token: "jwt_token_1".into(),
-        dpop_key: signing_key.clone(),
+        signing_key: signing_key.clone(),
         expires_at: Utc::now() + chrono::Duration::hours(1),
     };
 
@@ -263,7 +263,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     // Monotonic overwrite with longer lifetime
     let cred2 = ActiveSpaceCredential {
         token: "jwt_token_2".into(),
-        dpop_key: signing_key.clone(),
+        signing_key: signing_key.clone(),
         expires_at: Utc::now() + chrono::Duration::hours(2),
     };
     store.insert(space.clone(), cred2).await;
@@ -272,7 +272,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     // Overwrite with shorter lifetime is ignored
     let cred_shorter = ActiveSpaceCredential {
         token: "jwt_token_shorter".into(),
-        dpop_key: signing_key,
+        signing_key,
         expires_at: Utc::now() + chrono::Duration::minutes(30),
     };
     store.insert(space.clone(), cred_shorter).await;
@@ -965,9 +965,12 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                 if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
                     let has_auth = req_str.contains("authorization: Bearer test-delegation-token")
                         || req_str.contains("Authorization: Bearer test-delegation-token");
-                    let has_dpop = req_str.contains("dpop: test-dpop-proof")
-                        || req_str.contains("DPoP: test-dpop-proof");
-                    if has_auth && has_dpop {
+                    // HTTP message signature over the delegation token, no DPoP.
+                    let has_signature = req_str.contains(
+                        r#"signature-input: atproto-space=("authorization");keyid="did:key:"#,
+                    ) && req_str.contains("signature: atproto-space=:");
+                    let has_dpop = req_str.to_ascii_lowercase().contains("\r\ndpop:");
+                    if has_auth && has_signature && !has_dpop {
                         let body = r#"{"credential":"test.space.credential.jwt"}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1035,11 +1038,13 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     ))
     .unwrap();
 
+    let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let exchange_auth =
+        circle_appview::space_signature::exchange_headers(&exchange_key, "test-delegation-token");
     let cred = transport_success
         .get_space_credential(
             &target_url,
-            "test-delegation-token",
-            "test-dpop-proof",
+            &exchange_auth,
             "at://did:plc:auth/space/1",
             "test-attestation",
         )
@@ -1056,8 +1061,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     let redirect_res = transport_success
         .get_space_credential(
             &redirect_url,
-            "test-delegation-token",
-            "test-dpop-proof",
+            &exchange_auth,
             "at://did:plc:auth/space/1",
             "test-attestation",
         )

@@ -17,6 +17,7 @@ pub mod push;
 pub mod reports;
 pub mod routes;
 pub mod space_client;
+pub mod space_signature;
 pub mod sync;
 pub mod thread;
 pub mod validator;

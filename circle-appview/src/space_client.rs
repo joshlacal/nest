@@ -3,11 +3,9 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use p256::ecdsa::signature::Signer;
 use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -21,6 +19,8 @@ use crate::auth::{
 };
 use crate::error::{AppError, AuthReason};
 use crate::oauth::OAuthService;
+pub use crate::space_signature::SpaceAuthHeaders;
+use crate::space_signature::{credential_headers, exchange_headers, p256_did_key};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SpaceAppAccess {
@@ -208,8 +208,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
-        delegation_token: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>>;
@@ -217,8 +216,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn register_notify<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _service_identifier: &'a str,
         _space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<DateTime<Utc>, AppError>> + Send + 'a>> {
@@ -232,8 +230,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn unregister_notify<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _service_identifier: &'a str,
         _space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>> {
@@ -247,8 +244,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn list_repos<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _space_uri: &'a str,
         _cursor: Option<&'a str>,
     ) -> Pin<
@@ -272,8 +268,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn list_repo_ops<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _space_uri: &'a str,
         _repo_did: &'a str,
         _since: Option<&'a str>,
@@ -304,8 +299,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn get_repo<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _space_uri: &'a str,
         _repo_did: &'a str,
         _since: Option<&'a str>,
@@ -320,8 +314,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn get_latest_commit<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _space_uri: &'a str,
         _repo_did: &'a str,
     ) -> Pin<
@@ -346,8 +339,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn get_blob<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        _auth: &'a SpaceAuthHeaders,
         _space_uri: &'a str,
         _repo: &'a str,
         _cid: &'a str,
@@ -614,14 +606,12 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
-        delegation_token: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
         let target_url = target_url.clone();
-        let delegation_token = delegation_token.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let space_uri = space_uri.to_string();
         let client_attestation = client_attestation.to_string();
 
@@ -633,13 +623,8 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 "clientAttestation": client_attestation,
             });
 
-            let response = client
-                .post(target_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {delegation_token}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.post(target_url.as_str()))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&req_body)
                 .send()
@@ -679,14 +664,12 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn register_notify<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         service_identifier: &'a str,
         space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<DateTime<Utc>, AppError>> + Send + 'a>> {
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let service_identifier = service_identifier.to_string();
         let space_uri = space_uri.to_string();
 
@@ -698,13 +681,8 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 "space": space_uri,
             });
 
-            let response = client
-                .post(target_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.post(target_url.as_str()))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&req_body)
                 .send()
@@ -749,26 +727,19 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn unregister_notify<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         service_identifier: &'a str,
         space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>> {
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let service_identifier = service_identifier.to_string();
         let space_uri = space_uri.to_string();
 
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
-            let response = client
-                .post(target_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.post(target_url.as_str()))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&serde_json::json!({
                     "service": service_identifier,
@@ -797,8 +768,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn list_repos<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         cursor: Option<&'a str>,
     ) -> Pin<
@@ -813,8 +783,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         >,
     > {
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let space_uri = space_uri.to_string();
         let cursor = cursor.map(|c| c.to_string());
 
@@ -823,22 +792,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 
             let req_url = xrpc_query::list_repos(&target_url, &space_uri, cursor.as_deref())?;
 
-            let response = client
-                .get(req_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.get(req_url.as_str()))
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
 
             if !response.status().is_success() {
-                let status = response.status();
-                return Err(AppError::Internal(format!(
-                    "Space host listRepos returned status {status}"
-                )));
+                return Err(credential_use_error(response, "listRepos").await);
             }
             let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
                 response,
@@ -854,8 +815,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn list_repo_ops<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo_did: &'a str,
         since: Option<&'a str>,
@@ -872,8 +832,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         >,
     >{
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let space_uri = space_uri.to_string();
         let repo_did = repo_did.to_string();
         let since = since.map(|s| s.to_string());
@@ -890,22 +849,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 cursor.as_deref(),
             )?;
 
-            let response = client
-                .get(req_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.get(req_url.as_str()))
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
 
             if !response.status().is_success() {
-                let status = response.status();
-                return Err(AppError::Internal(format!(
-                    "Space host listRepoOps returned status {status}"
-                )));
+                return Err(credential_use_error(response, "listRepoOps").await);
             }
             let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
                 response,
@@ -921,15 +872,13 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn get_repo<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo_did: &'a str,
         since: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AppError>> + Send + 'a>> {
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let space_uri = space_uri.to_string();
         let repo_did = repo_did.to_string();
         let since = since.map(|s| s.to_string());
@@ -941,22 +890,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             let _ = since;
             let req_url = xrpc_query::get_repo(&target_url, &space_uri, &repo_did)?;
 
-            let response = client
-                .get(req_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.get(req_url.as_str()))
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
 
             if !response.status().is_success() {
-                return Err(AppError::Internal(format!(
-                    "Space host getRepo returned status {}",
-                    response.status()
-                )));
+                return Err(credential_use_error(response, "getRepo").await);
             }
 
             let max_car_bytes = crate::commit::MAX_CAR_BYTES;
@@ -970,8 +911,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn get_latest_commit<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo_did: &'a str,
     ) -> Pin<
@@ -986,8 +926,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         >,
     > {
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let space_uri = space_uri.to_string();
         let repo_did = repo_did.to_string();
 
@@ -996,22 +935,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 
             let req_url = xrpc_query::get_latest_commit(&target_url, &space_uri, &repo_did)?;
 
-            let response = client
-                .get(req_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.get(req_url.as_str()))
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
 
             if !response.status().is_success() {
-                let status = response.status();
-                return Err(AppError::Internal(format!(
-                    "Space host getLatestCommit returned status {status}"
-                )));
+                return Err(credential_use_error(response, "getLatestCommit").await);
             }
             let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
                 response,
@@ -1026,16 +957,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn get_blob<'a>(
         &'a self,
         target_url: &'a url::Url,
-        space_credential: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo: &'a str,
         cid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>>
     {
         let target_url = target_url.clone();
-        let space_credential = space_credential.to_string();
-        let dpop_proof = dpop_proof.to_string();
+        let auth = auth.clone();
         let space_uri = space_uri.to_string();
         let repo = repo.to_string();
         let cid = cid.to_string();
@@ -1045,22 +974,14 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 
             let req_url = xrpc_query::get_blob(&target_url, &space_uri, &repo, &cid)?;
 
-            let response = client
-                .get(req_url.as_str())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("DPoP {space_credential}"),
-                )
-                .header("DPoP", dpop_proof)
+            let response = auth
+                .apply(client.get(req_url.as_str()))
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
 
             if !response.status().is_success() {
-                return Err(AppError::Internal(format!(
-                    "Space host getBlob returned status {}",
-                    response.status()
-                )));
+                return Err(credential_use_error(response, "getBlob").await);
             }
 
             let content_type = response
@@ -1080,10 +1001,19 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 #[derive(Debug, Clone)]
 pub struct RecordedSpaceHostCall {
     pub endpoint_url: String,
-    pub delegation_token: String,
-    pub dpop_proof: String,
+    /// The signed exchange headers (`Bearer` delegation token, `keyid`).
+    pub auth: SpaceAuthHeaders,
     pub space_uri: String,
     pub client_attestation: String,
+}
+
+/// One request the mock received with a space credential.
+#[derive(Debug, Clone)]
+pub struct RecordedCredentialUse {
+    /// The XRPC method, e.g. `com.atproto.space.getRepo`.
+    pub method: &'static str,
+    pub space_uri: String,
+    pub auth: SpaceAuthHeaders,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1129,6 +1059,9 @@ pub struct MockSpaceHostTransport {
     unregister_notify_calls: Mutex<Vec<RecordedNotifyCall>>,
     space_members: Mutex<HashMap<String, Result<Vec<SpaceMember>, String>>>,
     space_configs: Mutex<HashMap<String, Result<SpaceConfig, String>>>,
+    credential_uses: Mutex<Vec<RecordedCredentialUse>>,
+    list_repos_cursors: Mutex<Vec<Option<String>>>,
+    credential_rejection: Mutex<Option<AuthReason>>,
 }
 
 impl Default for MockSpaceHostTransport {
@@ -1156,6 +1089,46 @@ impl MockSpaceHostTransport {
             unregister_notify_calls: Mutex::new(Vec::new()),
             space_members: Mutex::new(HashMap::new()),
             space_configs: Mutex::new(HashMap::new()),
+            credential_uses: Mutex::new(Vec::new()),
+            list_repos_cursors: Mutex::new(Vec::new()),
+            credential_rejection: Mutex::new(None),
+        }
+    }
+
+    /// Every request made with a space credential, in order.
+    pub fn recorded_credential_uses(&self) -> Vec<RecordedCredentialUse> {
+        self.credential_uses.lock().unwrap().clone()
+    }
+
+    /// The `cursor` of each listRepos request, in order.
+    pub fn recorded_list_repos_cursors(&self) -> Vec<Option<String>> {
+        self.list_repos_cursors.lock().unwrap().clone()
+    }
+
+    /// Reject every later request made with a space credential, as a host does
+    /// for a revoked credential or a refused signature or audience.
+    pub fn reject_credential_uses(&self, reason: Option<AuthReason>) {
+        *self.credential_rejection.lock().unwrap() = reason;
+    }
+
+    /// Record a credential use; `Err` when uses are being rejected.
+    fn use_credential(
+        &self,
+        method: &'static str,
+        space_uri: &str,
+        auth: &SpaceAuthHeaders,
+    ) -> Result<(), AppError> {
+        self.credential_uses
+            .lock()
+            .unwrap()
+            .push(RecordedCredentialUse {
+                method,
+                space_uri: space_uri.to_string(),
+                auth: auth.clone(),
+            });
+        match *self.credential_rejection.lock().unwrap() {
+            Some(reason) => Err(AppError::Unauthorized(reason)),
+            None => Ok(()),
         }
     }
 
@@ -1303,8 +1276,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
-        delegation_token: &'a str,
-        dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         client_attestation: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
@@ -1312,8 +1284,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
             let mut calls = self.calls.lock().unwrap();
             calls.push(RecordedSpaceHostCall {
                 endpoint_url: target_url.to_string(),
-                delegation_token: delegation_token.to_string(),
-                dpop_proof: dpop_proof.to_string(),
+                auth: auth.clone(),
                 space_uri: space_uri.to_string(),
                 client_attestation: client_attestation.to_string(),
             });
@@ -1333,14 +1304,17 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 Some(Err(e)) => Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e)),
                 None => {
                     if let Some(key) = authority_key {
-                        let jkt = extract_jkt_from_dpop_proof(dpop_proof)
-                            .unwrap_or_else(|_| "mock_jkt".into());
+                        // Bind to the signature's keyid, as the authority does.
+                        let key_id = auth
+                            .key_id()
+                            .ok_or_else(|| AppError::Unauthorized(AuthReason::BadSpaceSignature))?;
                         let cred = mint_mock_space_credential(
                             &key,
                             &authority_did,
                             space_uri,
-                            &jkt,
-                            Utc::now() + chrono::Duration::hours(2),
+                            key_id,
+                            Utc::now()
+                                + chrono::Duration::seconds(DEFAULT_CREDENTIAL_LIFETIME_SECS),
                         );
                         Ok(cred)
                     } else {
@@ -1356,11 +1330,13 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn register_notify<'a>(
         &'a self,
         target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         service_identifier: &'a str,
         space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<DateTime<Utc>, AppError>> + Send + 'a>> {
+        if let Err(e) = self.use_credential("com.atproto.space.registerNotify", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
         self.register_notify_calls
             .lock()
             .unwrap()
@@ -1380,11 +1356,13 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn unregister_notify<'a>(
         &'a self,
         target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         service_identifier: &'a str,
         space_uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>> {
+        if let Err(e) = self.use_credential("com.atproto.space.unregisterNotify", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
         self.unregister_notify_calls
             .lock()
             .unwrap()
@@ -1399,8 +1377,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn list_repos<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         cursor: Option<&'a str>,
     ) -> Pin<
@@ -1414,12 +1391,25 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 + 'a,
         >,
     > {
+        if let Err(e) = self.use_credential("com.atproto.space.listRepos", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
+        self.list_repos_cursors
+            .lock()
+            .unwrap()
+            .push(cursor.map(str::to_string));
         let lock = self.list_repos_responses.lock().unwrap();
+        // A cursor is an exclusive spaceRev checkpoint: past the last configured
+        // page the listing is exhausted, which a host answers with an empty page
+        // that omits the cursor.
         let res = match cursor {
-            Some(c) => lock
-                .get(&format!("{space_uri}:{c}"))
-                .or_else(|| lock.get(space_uri))
-                .cloned(),
+            Some(c) => Some(lock.get(&format!("{space_uri}:{c}")).cloned().unwrap_or(
+                catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+                    cursor: None,
+                    repos: Vec::new(),
+                    extra_data: None,
+                },
+            )),
             None => lock.get(space_uri).cloned(),
         };
         let lookup_key = match cursor {
@@ -1436,8 +1426,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn list_repo_ops<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo_did: &'a str,
         _since: Option<&'a str>,
@@ -1453,6 +1442,9 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 + 'a,
         >,
     >{
+        if let Err(e) = self.use_credential("com.atproto.space.listRepoOps", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
         let base_key = format!("{space_uri}:{repo_did}");
         let lock = self.list_repo_ops_responses.lock().unwrap();
         let res = match cursor {
@@ -1477,12 +1469,14 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn get_repo<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo_did: &'a str,
         _since: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AppError>> + Send + 'a>> {
+        if let Err(e) = self.use_credential("com.atproto.space.getRepo", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
         let key = format!("{space_uri}:{repo_did}");
         let lock = self.get_repo_responses.lock().unwrap();
         let res = lock.get(&key).or_else(|| lock.get(space_uri)).cloned();
@@ -1494,8 +1488,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn get_latest_commit<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         repo_did: &'a str,
     ) -> Pin<
@@ -1509,6 +1502,9 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 + 'a,
         >,
     > {
+        if let Err(e) = self.use_credential("com.atproto.space.getLatestCommit", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
         let key = format!("{space_uri}:{repo_did}");
         let lock = self.latest_commits.lock().unwrap();
         let res = lock.get(&key).or_else(|| lock.get(space_uri)).cloned();
@@ -1522,13 +1518,15 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn get_blob<'a>(
         &'a self,
         _target_url: &'a url::Url,
-        _space_credential: &'a str,
-        _dpop_proof: &'a str,
+        auth: &'a SpaceAuthHeaders,
         space_uri: &'a str,
         did: &'a str,
         cid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(Option<String>, Vec<u8>), AppError>> + Send + 'a>>
     {
+        if let Err(e) = self.use_credential("com.atproto.space.getBlob", space_uri, auth) {
+            return Box::pin(async move { Err(e) });
+        }
         let key = format!("{space_uri}:{did}:{cid}");
         let alt_key = format!("{did}:{cid}");
         {
@@ -1945,28 +1943,22 @@ impl SpaceClient {
         let mut xrpc_url = parsed_endpoint;
         xrpc_url.set_path(&xrpc_path);
 
+        // A fresh key per credential; the authority binds the credential to it
+        // (cnf.kid) and every later use is signed with it.
         let ephemeral_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let verifying_key = ephemeral_key.verifying_key();
-        let expected_jkt = calculate_rfc7638_jkt(verifying_key);
-
-        let dpop_proof = create_dpop_proof(&ephemeral_key, "POST", xrpc_url.as_str());
+        let key_id = p256_did_key(ephemeral_key.verifying_key());
+        let auth = exchange_headers(&ephemeral_key, delegation_token);
 
         let credential_jwt = self
             .transport
-            .get_space_credential(
-                &xrpc_url,
-                delegation_token,
-                &dpop_proof,
-                space_uri,
-                client_attestation,
-            )
+            .get_space_credential(&xrpc_url, &auth, space_uri, client_attestation)
             .await?;
 
         let expires_at = validate_space_credential(
             &credential_jwt,
             authority_did,
             space_uri,
-            &expected_jkt,
+            &key_id,
             authority_doc,
         )?;
 
@@ -1998,67 +1990,71 @@ impl SpaceClient {
         Some(serde_json::Value::Object(profile))
     }
 
+    /// `com.atproto.space.registerNotify` on the authority's space host. A
+    /// space-host operation: the audience is the authority's bare DID.
     pub async fn register_notify(
         &self,
         service_endpoint: &str,
         space_uri: &str,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
         service_identifier: &str,
     ) -> Result<DateTime<Utc>, AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.registerNotify")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "POST", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(
+            signing_key,
+            space_credential,
+            &extract_authority_from_space_uri(space_uri)?,
+        );
         self.transport
-            .register_notify(
-                &xrpc_url,
-                space_credential,
-                &dpop_proof,
-                service_identifier,
-                space_uri,
-            )
+            .register_notify(&xrpc_url, &auth, service_identifier, space_uri)
             .await
     }
 
+    /// `com.atproto.space.unregisterNotify`; audience as for [`Self::register_notify`].
     pub async fn unregister_notify(
         &self,
         service_endpoint: &str,
         space_uri: &str,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
         service_identifier: &str,
     ) -> Result<(), AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.unregisterNotify")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "POST", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(
+            signing_key,
+            space_credential,
+            &extract_authority_from_space_uri(space_uri)?,
+        );
         self.transport
-            .unregister_notify(
-                &xrpc_url,
-                space_credential,
-                &dpop_proof,
-                service_identifier,
-                space_uri,
-            )
+            .unregister_notify(&xrpc_url, &auth, service_identifier, space_uri)
             .await
     }
 
+    /// `com.atproto.space.listRepos` on the space host; audience is the
+    /// authority's bare DID. `cursor` is an exclusive spaceRev checkpoint.
     pub async fn list_repos(
         &self,
         service_endpoint: &str,
         space_uri: &str,
         cursor: Option<&str>,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
     ) -> Result<catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput, AppError>
     {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.listRepos")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(
+            signing_key,
+            space_credential,
+            &extract_authority_from_space_uri(space_uri)?,
+        );
         self.transport
-            .list_repos(&xrpc_url, space_credential, &dpop_proof, space_uri, cursor)
+            .list_repos(&xrpc_url, &auth, space_uri, cursor)
             .await
     }
 
+    /// `com.atproto.space.listRepoOps` on the repo's host; audience is the repo
+    /// owner's DID.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_repo_ops(
         &self,
@@ -2068,27 +2064,20 @@ impl SpaceClient {
         since: Option<&str>,
         cursor: Option<&str>,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
     ) -> Result<
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
         AppError,
     > {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.listRepoOps")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(signing_key, space_credential, repo_did);
         self.transport
-            .list_repo_ops(
-                &xrpc_url,
-                space_credential,
-                &dpop_proof,
-                space_uri,
-                repo_did,
-                since,
-                cursor,
-            )
+            .list_repo_ops(&xrpc_url, &auth, space_uri, repo_did, since, cursor)
             .await
     }
 
+    /// `com.atproto.space.getRepo` on the repo's host; audience is the repo
+    /// owner's DID.
     pub async fn get_repo(
         &self,
         service_endpoint: &str,
@@ -2096,45 +2085,34 @@ impl SpaceClient {
         repo_did: &str,
         since: Option<&str>,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
     ) -> Result<Vec<u8>, AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getRepo")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(signing_key, space_credential, repo_did);
         self.transport
-            .get_repo(
-                &xrpc_url,
-                space_credential,
-                &dpop_proof,
-                space_uri,
-                repo_did,
-                since,
-            )
+            .get_repo(&xrpc_url, &auth, space_uri, repo_did, since)
             .await
     }
 
+    /// `com.atproto.space.getLatestCommit` on the repo's host; audience is the
+    /// repo owner's DID.
     pub async fn get_latest_commit(
         &self,
         service_endpoint: &str,
         space_uri: &str,
         repo_did: &str,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
     ) -> Result<catbird_atproto::generated::com_atproto::space::SignedCommit, AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getLatestCommit")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(signing_key, space_credential, repo_did);
         self.transport
-            .get_latest_commit(
-                &xrpc_url,
-                space_credential,
-                &dpop_proof,
-                space_uri,
-                repo_did,
-            )
+            .get_latest_commit(&xrpc_url, &auth, space_uri, repo_did)
             .await
     }
 
+    /// `com.atproto.space.getBlob` on the repo's host; audience is the repo
+    /// owner's DID.
     pub async fn get_blob(
         &self,
         service_endpoint: &str,
@@ -2142,20 +2120,12 @@ impl SpaceClient {
         repo: &str,
         cid: &str,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        signing_key: &p256::ecdsa::SigningKey,
     ) -> Result<(Option<String>, Vec<u8>), AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getBlob")?;
-        let dpop_proof =
-            create_dpop_proof_with_ath(dpop_key, "GET", xrpc_url.as_str(), Some(space_credential));
+        let auth = credential_headers(signing_key, space_credential, repo);
         self.transport
-            .get_blob(
-                &xrpc_url,
-                space_credential,
-                &dpop_proof,
-                space_uri,
-                repo,
-                cid,
-            )
+            .get_blob(&xrpc_url, &auth, space_uri, repo, cid)
             .await
     }
 }
@@ -2186,63 +2156,6 @@ fn parse_space_uri_parts(space: &str) -> Result<(String, String, String), AppErr
         segments[2].to_string(),
         segments[3].to_string(),
     ))
-}
-
-pub fn calculate_rfc7638_jkt(verifying_key: &p256::ecdsa::VerifyingKey) -> String {
-    let point = EncodedPoint::from(verifying_key);
-    let x = URL_SAFE_NO_PAD.encode(point.x().expect("x coord"));
-    let y = URL_SAFE_NO_PAD.encode(point.y().expect("y coord"));
-    let canonical_json = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
-    let hash = Sha256::digest(canonical_json.as_bytes());
-    URL_SAFE_NO_PAD.encode(hash)
-}
-
-pub fn create_dpop_proof(key: &p256::ecdsa::SigningKey, method: &str, target_url: &str) -> String {
-    create_dpop_proof_with_ath(key, method, target_url, None)
-}
-
-pub fn create_dpop_proof_with_ath(
-    key: &p256::ecdsa::SigningKey,
-    method: &str,
-    target_url: &str,
-    access_token: Option<&str>,
-) -> String {
-    let verifying_key = key.verifying_key();
-    let point = EncodedPoint::from(verifying_key);
-    let x = URL_SAFE_NO_PAD.encode(point.x().expect("x coord"));
-    let y = URL_SAFE_NO_PAD.encode(point.y().expect("y coord"));
-
-    let header = json!({
-        "typ": "dpop+jwt",
-        "alg": "ES256",
-        "jwk": {
-            "kty": "EC",
-            "crv": "P-256",
-            "x": x,
-            "y": y
-        }
-    });
-
-    let mut claims = json!({
-        "jti": Uuid::new_v4().to_string(),
-        "htm": method,
-        "htu": target_url,
-        "iat": Utc::now().timestamp()
-    });
-
-    if let Some(token) = access_token {
-        let ath = URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()));
-        claims["ath"] = serde_json::Value::String(ath);
-    }
-
-    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
-    let claims_b64 = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
-    let signing_input = format!("{header_b64}.{claims_b64}");
-
-    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
-    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-    format!("{signing_input}.{sig_b64}")
 }
 
 /// Query URLs for the space-host and simplespace reads, built from the
@@ -2445,13 +2358,20 @@ pub fn construct_xrpc_url(service_endpoint: &str, method: &str) -> Result<url::U
 }
 
 pub const UNBOUND_CREDENTIAL_MESSAGE: &str =
-    "Space host issues credentials without DPoP binding (cnf.jkt); Circles require a DPoP-bound space host";
+    "Space host issues credentials without an HTTP message signature key binding (cnf.kid); Circles require a space host on the atproto Spaces 2026-10-01 alpha";
 
+/// Lifetime the reference authority gives a space credential, and the mock's.
+pub const DEFAULT_CREDENTIAL_LIFETIME_SECS: i64 = 600;
+/// Longest space credential lifetime (exp - iat) that issuers and verifiers accept.
+pub const MAX_CREDENTIAL_LIFETIME_SECS: i64 = 3600;
+
+/// Validate a space credential this client just received for `expected_key_id`
+/// (the `did:key` of the key that signed the exchange). Returns its expiry.
 pub fn validate_space_credential(
     credential_jwt: &str,
     expected_iss: &str,
     expected_sub: &str,
-    expected_jkt: &str,
+    expected_key_id: &str,
     authority_doc: &DidDocument,
 ) -> Result<DateTime<Utc>, AppError> {
     let parts: Vec<&str> = credential_jwt.split('.').collect();
@@ -2472,12 +2392,13 @@ pub fn validate_space_credential(
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidClaimsJson))?;
 
     // Host compatibility gate, checked before anything else so the declared
-    // error surfaces whatever else differs: space credentials must be DPoP-bound
-    // (cnf.jkt). Swan profiles 2026-08-15 and 2026-09-10 issue unbound bearer
-    // credentials; the reference alpha and Swan >= 2026-09-19 bind them.
-    let cnf_jkt = claims
+    // error surfaces whatever else differs: space credentials must be bound to
+    // the exchange's HTTP signature key (cnf.kid, atproto 2026-10-01 alpha).
+    // Bearer credentials (Swan 2026-08-15 / 2026-09-10) and DPoP-bound ones
+    // (cnf.jkt: the reference before 2026-10-01, Swan 2026-09-19) are refused.
+    let cnf_kid = claims
         .get("cnf")
-        .and_then(|cnf| cnf.get("jkt"))
+        .and_then(|cnf| cnf.get("kid"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::UnsupportedPds(UNBOUND_CREDENTIAL_MESSAGE.into()))?;
 
@@ -2518,7 +2439,7 @@ pub fn validate_space_credential(
         return Err(AppError::Unauthorized(AuthReason::AudienceMismatch));
     }
 
-    if cnf_jkt != expected_jkt {
+    if cnf_kid != expected_key_id {
         return Err(AppError::Unauthorized(AuthReason::IdMismatch));
     }
 
@@ -2528,6 +2449,9 @@ pub fn validate_space_credential(
     }
     if exp <= now {
         return Err(AppError::Unauthorized(AuthReason::Expired));
+    }
+    if exp <= iat || exp - iat > MAX_CREDENTIAL_LIFETIME_SECS {
+        return Err(AppError::Unauthorized(AuthReason::LifetimeExceeded));
     }
 
     let vm =
@@ -2554,6 +2478,41 @@ struct XrpcErrorPayload {
     error: Option<String>,
     #[allow(dead_code)]
     message: Option<String>,
+}
+
+/// The [`AuthReason`] for an XRPC error code that rejects the space credential
+/// itself. Retrying with that credential cannot succeed: the caller evicts it and
+/// reacquires one only through a still-authorized session.
+pub fn credential_rejection_reason(code: &str) -> Option<AuthReason> {
+    match code {
+        "CredentialRevoked" => Some(AuthReason::CredentialRevoked),
+        "BadSpaceSignature" => Some(AuthReason::BadSpaceSignature),
+        "BadSpaceAudience" => Some(AuthReason::BadSpaceAudience),
+        _ => None,
+    }
+}
+
+/// The error for a failed request made with a space credential. A rejection of
+/// the credential itself maps to its [`AuthReason`]; any other failure stays the
+/// opaque status error these reads always returned.
+async fn credential_use_error(response: reqwest::Response, op: &str) -> AppError {
+    let status = response.status();
+    if !status.is_server_error() {
+        let body = crate::auth::read_bounded_authenticated_response_bytes(
+            response,
+            MAX_SPACE_CREDENTIAL_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(reason) = serde_json::from_slice::<XrpcErrorPayload>(&body)
+            .ok()
+            .and_then(|p| p.error)
+            .and_then(|code| credential_rejection_reason(&code))
+        {
+            return AppError::Unauthorized(reason);
+        }
+    }
+    AppError::Internal(format!("Space host {op} returned status {status}"))
 }
 
 pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
@@ -2586,6 +2545,9 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
         "SpaceNotFound" => AppError::NotFound("SpaceNotFound".into()),
         "SpaceDeleted" => AppError::AccessRemoved("SpaceDeleted".into()),
         "AuthRequired" => AppError::Unauthorized(AuthReason::MissingHeader),
+        "CredentialRevoked" => AppError::Unauthorized(AuthReason::CredentialRevoked),
+        "BadSpaceSignature" => AppError::Unauthorized(AuthReason::BadSpaceSignature),
+        "BadSpaceAudience" => AppError::Unauthorized(AuthReason::BadSpaceAudience),
         _ => match status {
             reqwest::StatusCode::NOT_FOUND => AppError::NotFound("NotFound".into()),
             reqwest::StatusCode::FORBIDDEN => AppError::Forbidden("Forbidden".into()),
@@ -2596,48 +2558,25 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
     }
 }
 
-pub fn extract_jkt_from_dpop_proof(dpop_proof: &str) -> Result<String, AppError> {
-    let parts: Vec<&str> = dpop_proof.split('.').collect();
-    if parts.is_empty() {
-        return Err(AppError::InvalidRequest("Invalid DPoP proof format".into()));
-    }
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(parts[0])
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderEncoding))?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
-    let jwk = header
-        .get("jwk")
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::MissingKid))?;
-    let x = jwk
-        .get("x")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::InvalidCoordinates))?;
-    let y = jwk
-        .get("y")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Unauthorized(AuthReason::InvalidCoordinates))?;
-    let canonical_json = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
-    let hash = Sha256::digest(canonical_json.as_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(hash))
-}
-
+/// A space credential as the authority mints it: bound to `key_id` (`cnf.kid`),
+/// issued now, no JWT `aud`.
 pub fn mint_mock_space_credential(
     authority_key: &p256::ecdsa::SigningKey,
     authority_did: &str,
     space_uri: &str,
-    jkt: &str,
+    key_id: &str,
     expires_at: DateTime<Utc>,
 ) -> String {
     let header = json!({
         "typ": "atproto-space-credential+jwt",
-        "alg": "ES256"
+        "alg": "ES256",
+        "kid": "#atproto"
     });
     let claims = json!({
         "iss": authority_did,
         "sub": space_uri,
         "cnf": {
-            "jkt": jkt
+            "kid": key_id
         },
         "exp": expires_at.timestamp(),
         "iat": Utc::now().timestamp(),
@@ -2980,8 +2919,10 @@ mod tests {
         let transport = DefaultSpaceHostTransport::with_loopback(true);
         let target =
             url::Url::parse(&format!("{}/xrpc/com.atproto.space.getBlob", server.uri())).unwrap();
+        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth = credential_headers(&key, "cred", REPO);
         let (content_type, bytes) = transport
-            .get_blob(&target, "cred", "proof", SPACE, REPO, CID)
+            .get_blob(&target, &auth, SPACE, REPO, CID)
             .await
             .expect("getBlob succeeds against the capturing host");
         assert_eq!(content_type.as_deref(), Some("image/png"));
@@ -3004,5 +2945,315 @@ mod tests {
         assert_eq!(pairs["repo"], REPO);
         assert_eq!(pairs["space"], SPACE);
         assert_eq!(pairs["cid"], CID);
+
+        // The credential travels as `Atproto-Space`, signed for the repo owner.
+        let headers = &received[0].headers;
+        let header = |name: &str| -> Vec<String> {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(header("authorization"), vec!["Atproto-Space cred"]);
+        assert_eq!(header("atproto-space-audience"), vec![REPO]);
+        assert_eq!(
+            header("signature-input"),
+            vec![r#"atproto-space=("authorization" "atproto-space-audience")"#]
+        );
+        assert_eq!(header("signature"), vec![auth.signature.clone()]);
+        assert!(header("dpop").is_empty(), "no Spaces DPoP proof");
+    }
+
+    /// getSpaceCredential carries the delegation token as a Bearer token,
+    /// signed over `authorization` only, naming the key in `keyid`.
+    #[tokio::test]
+    async fn default_transport_exchange_sends_signed_delegation_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.space.getSpaceCredential"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"credential": "c"})),
+            )
+            .mount(&server)
+            .await;
+
+        let transport = DefaultSpaceHostTransport::with_loopback(true);
+        let target = url::Url::parse(&format!(
+            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            server.uri()
+        ))
+        .unwrap();
+        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let auth = exchange_headers(&key, "delegation");
+        let credential = transport
+            .get_space_credential(&target, &auth, SPACE, "attestation")
+            .await
+            .unwrap();
+        assert_eq!(credential, "c");
+
+        let received = server.received_requests().await.expect("recording on");
+        let headers = &received[0].headers;
+        let key_id = p256_did_key(key.verifying_key());
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer delegation");
+        assert!(headers.get("atproto-space-audience").is_none());
+        assert!(headers.get("dpop").is_none());
+        assert_eq!(
+            headers.get("signature-input").unwrap().to_str().unwrap(),
+            format!(r#"atproto-space=("authorization");keyid="{key_id}""#)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["space"], SPACE);
+        assert_eq!(body["clientAttestation"], "attestation");
+    }
+
+    /// CredentialRevoked, BadSpaceSignature and BadSpaceAudience from a repo or
+    /// space host surface as credential rejections; other failures do not.
+    #[tokio::test]
+    async fn credential_use_rejections_are_distinguished() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cases = [
+            (
+                401,
+                "CredentialRevoked",
+                Some(AuthReason::CredentialRevoked),
+            ),
+            (
+                401,
+                "BadSpaceSignature",
+                Some(AuthReason::BadSpaceSignature),
+            ),
+            (401, "BadSpaceAudience", Some(AuthReason::BadSpaceAudience)),
+            (401, "BadJwt", None),
+            (400, "InvalidRequest", None),
+        ];
+        for (status, code, expected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/xrpc/com.atproto.space.getRepo"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"error": code, "message": "m"})),
+                )
+                .mount(&server)
+                .await;
+            let transport = DefaultSpaceHostTransport::with_loopback(true);
+            let target =
+                url::Url::parse(&format!("{}/xrpc/com.atproto.space.getRepo", server.uri()))
+                    .unwrap();
+            let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+            let err = transport
+                .get_repo(
+                    &target,
+                    &credential_headers(&key, "cred", REPO),
+                    SPACE,
+                    REPO,
+                    None,
+                )
+                .await
+                .expect_err("host rejected the request");
+            match expected {
+                Some(reason) => assert!(
+                    matches!(&err, AppError::Unauthorized(r) if *r == reason),
+                    "{code}: expected {reason:?}, got {err:?}"
+                ),
+                None => assert!(
+                    matches!(&err, AppError::Internal(_)),
+                    "{code}: expected the opaque status error, got {err:?}"
+                ),
+            }
+        }
+
+        assert!(matches!(
+            parse_xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"CredentialRevoked","message":"revoked"}"#
+            ),
+            AppError::Unauthorized(AuthReason::CredentialRevoked)
+        ));
+    }
+
+    fn authority_doc(key: &p256::ecdsa::SigningKey) -> DidDocument {
+        let point = key.verifying_key().to_encoded_point(false);
+        DidDocument {
+            id: AUTHORITY.into(),
+            verification_method: vec![crate::auth::VerificationMethod {
+                id: format!("{AUTHORITY}#atproto"),
+                r#type: "JsonWebKey2020".into(),
+                controller: AUTHORITY.into(),
+                public_key_jwk: Some(crate::auth::PublicKeyJwk {
+                    kty: "EC".into(),
+                    crv: "P-256".into(),
+                    x: URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                    y: Some(URL_SAFE_NO_PAD.encode(point.y().unwrap())),
+                    kid: None,
+                }),
+                public_key_multibase: None,
+            }],
+            service: vec![],
+        }
+    }
+
+    fn credential_with_claims(key: &p256::ecdsa::SigningKey, claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(
+            json!({"typ": "atproto-space-credential+jwt", "alg": "ES256", "kid": "#atproto"})
+                .to_string(),
+        );
+        let input = format!("{header}.{}", URL_SAFE_NO_PAD.encode(claims.to_string()));
+        let sig: p256::ecdsa::Signature = key.sign(input.as_bytes());
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    const AUTHORITY: &str = "did:plc:authority123";
+
+    /// Repo reads are signed for the repo owner's DID; space-host operations for
+    /// the authority's bare DID (never a hostname or `#atproto_space_host`).
+    #[tokio::test]
+    async fn audience_is_derived_from_the_operation() {
+        let mock = Arc::new(MockSpaceHostTransport::new());
+        let client = SpaceClient::with_transport(mock.clone());
+        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let ep = "https://host.example";
+        let service = "did:web:circles.example#atproto_circles";
+
+        let _ = client.list_repos(ep, SPACE, None, "cred", &key).await;
+        let _ = client
+            .register_notify(ep, SPACE, "cred", &key, service)
+            .await;
+        let _ = client
+            .unregister_notify(ep, SPACE, "cred", &key, service)
+            .await;
+        let _ = client.get_repo(ep, SPACE, REPO, None, "cred", &key).await;
+        let _ = client
+            .list_repo_ops(ep, SPACE, REPO, None, None, "cred", &key)
+            .await;
+        let _ = client
+            .get_latest_commit(ep, SPACE, REPO, "cred", &key)
+            .await;
+        let _ = client.get_blob(ep, SPACE, REPO, CID, "cred", &key).await;
+
+        let audiences: Vec<(&str, Option<String>)> = mock
+            .recorded_credential_uses()
+            .into_iter()
+            .map(|u| {
+                assert_eq!(u.auth.authorization, "Atproto-Space cred");
+                assert_eq!(
+                    u.auth.signature_input,
+                    r#"atproto-space=("authorization" "atproto-space-audience")"#
+                );
+                (u.method, u.auth.audience)
+            })
+            .collect();
+        let authority = Some(AUTHORITY.to_string());
+        let repo = Some(REPO.to_string());
+        assert_eq!(
+            audiences,
+            vec![
+                ("com.atproto.space.listRepos", authority.clone()),
+                ("com.atproto.space.registerNotify", authority.clone()),
+                ("com.atproto.space.unregisterNotify", authority),
+                ("com.atproto.space.getRepo", repo.clone()),
+                ("com.atproto.space.listRepoOps", repo.clone()),
+                ("com.atproto.space.getLatestCommit", repo.clone()),
+                ("com.atproto.space.getBlob", repo),
+            ]
+        );
+    }
+
+    /// The exchange signs with a fresh key per credential, and the credential
+    /// returned is bound to exactly that key.
+    #[tokio::test]
+    async fn exchange_binds_each_credential_to_a_fresh_key() {
+        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let doc = authority_doc(&authority_key);
+        let mock = Arc::new(MockSpaceHostTransport::new());
+        mock.set_authority_signing_key(AUTHORITY, authority_key);
+        let client = SpaceClient::with_transport(mock.clone());
+
+        let (_, key_1, exp_1) = client
+            .exchange_credential("https://host.example", SPACE, "d1", "a1", AUTHORITY, &doc)
+            .await
+            .expect("first exchange");
+        let (_, key_2, _) = client
+            .exchange_credential("https://host.example", SPACE, "d2", "a2", AUTHORITY, &doc)
+            .await
+            .expect("second exchange");
+        assert_ne!(key_1.verifying_key(), key_2.verifying_key());
+        let lifetime = exp_1.timestamp() - Utc::now().timestamp();
+        assert!(
+            (DEFAULT_CREDENTIAL_LIFETIME_SECS - 5..=DEFAULT_CREDENTIAL_LIFETIME_SECS)
+                .contains(&lifetime),
+            "expiry is the credential's own exp, got {lifetime}s"
+        );
+
+        let calls = mock.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].auth.authorization, "Bearer d1");
+        assert_eq!(
+            calls[0].auth.key_id(),
+            Some(p256_did_key(key_1.verifying_key()).as_str())
+        );
+    }
+
+    /// The binding gate: cnf.kid must name the exchange key. A cnf.jkt (DPoP)
+    /// credential from a host on an older alpha is the declared UnsupportedPDS.
+    #[test]
+    fn credential_must_be_bound_to_our_key_id() {
+        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let doc = authority_doc(&authority_key);
+        let ours = p256_did_key(p256::ecdsa::SigningKey::random(&mut OsRng).verifying_key());
+        let theirs = p256_did_key(p256::ecdsa::SigningKey::random(&mut OsRng).verifying_key());
+        let expires = Utc::now() + chrono::Duration::seconds(DEFAULT_CREDENTIAL_LIFETIME_SECS);
+
+        let bound = mint_mock_space_credential(&authority_key, AUTHORITY, SPACE, &ours, expires);
+        let exp = validate_space_credential(&bound, AUTHORITY, SPACE, &ours, &doc).unwrap();
+        assert_eq!(
+            exp.timestamp(),
+            expires.timestamp(),
+            "refresh follows the actual exp"
+        );
+
+        let other = mint_mock_space_credential(&authority_key, AUTHORITY, SPACE, &theirs, expires);
+        assert!(matches!(
+            validate_space_credential(&other, AUTHORITY, SPACE, &ours, &doc),
+            Err(AppError::Unauthorized(AuthReason::IdMismatch))
+        ));
+
+        let now = Utc::now().timestamp();
+        let jkt_bound = credential_with_claims(
+            &authority_key,
+            json!({"iss": AUTHORITY, "sub": SPACE, "iat": now, "exp": now + 600,
+                   "jti": "j1", "cnf": {"jkt": "thumbprint"}}),
+        );
+        assert!(matches!(
+            validate_space_credential(&jkt_bound, AUTHORITY, SPACE, &ours, &doc),
+            Err(AppError::UnsupportedPds(_))
+        ));
+    }
+
+    #[test]
+    fn credential_lifetime_is_bounded_at_3600_seconds() {
+        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let doc = authority_doc(&authority_key);
+        let ours = p256_did_key(p256::ecdsa::SigningKey::random(&mut OsRng).verifying_key());
+        let now = Utc::now().timestamp();
+        let claims = |iat: i64, exp: i64| {
+            json!({"iss": AUTHORITY, "sub": SPACE, "iat": iat, "exp": exp,
+                   "jti": "j1", "cnf": {"kid": ours}})
+        };
+
+        let at_limit = credential_with_claims(&authority_key, claims(now, now + 3600));
+        assert!(validate_space_credential(&at_limit, AUTHORITY, SPACE, &ours, &doc).is_ok());
+
+        let over = credential_with_claims(&authority_key, claims(now, now + 3601));
+        assert!(matches!(
+            validate_space_credential(&over, AUTHORITY, SPACE, &ours, &doc),
+            Err(AppError::Unauthorized(AuthReason::LifetimeExceeded))
+        ));
     }
 }

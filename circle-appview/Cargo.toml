@@ -10,7 +10,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
 jacquard-repo = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["crypto-ed25519", "crypto-k256", "crypto-p256"] }
-catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto.git", rev = "39bb698616fc", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto.git", rev = "8bab4018ba20ff0342edf2ec8922304e5dd2cdbc", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
 bytes = { version = "1", features = ["serde"] }
 cid = "0.11"
 multihash = "0.19.3"
@@ -49,10 +49,11 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 wiremock = "0.6"
 
-# TODO(spaces-upstream-defs-20261001): this code needs catbird-atproto fd5dad96
-# (upstream v1 SignedCommit), which is not pushed yet. Cargo must still fetch
-# the git `rev` above before patching, so it stays at the last pushed rev while
-# this patch builds fd5dad96 from the sibling jj workspace. Once the bookmark is
-# pushed: set `rev` above to the pushed commit and delete this [patch] section.
+# TODO(spaces-oct1-20261002): `rev` above is catbird-atproto 8bab4018, the
+# atproto Spaces 2026-10-01 alpha regeneration (on origin as bookmark
+# spaces-oct1-20261002; it contains fd5dad96, the upstream v1 SignedCommit).
+# Cargo fetches that rev before patching. This [patch] still builds from the
+# sibling jj workspace (Dockerfile copies it), which must be at 8bab4018; delete
+# it once the catbird-atproto bookmark is merged and deploys build from git.
 [patch."https://github.com/joshlacal/catbird-atproto.git"]
 catbird-atproto = { path = "../../catbird-atproto" }

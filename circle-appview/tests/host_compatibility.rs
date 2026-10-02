@@ -1,6 +1,8 @@
 //! Host compatibility gate: Circles refuse a space host whose credentials are
-//! not DPoP-bound (no `cnf.jkt`) with the declared `UnsupportedPDS`, instead of
-//! a generic auth failure that the client reads as "sign in again".
+//! not bound to the exchange's HTTP signature key (no `cnf.kid`, atproto Spaces
+//! 2026-10-01 alpha) with the declared `UnsupportedPDS`, instead of a generic
+//! auth failure that the client reads as "sign in again". That covers bearer
+//! hosts and DPoP-bound (`cnf.jkt`) hosts on an older alpha alike.
 
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ use circle_appview::space_client::{
     mint_mock_space_credential, validate_space_credential, MockSpaceHostTransport, SpaceAppAccess,
     SpaceClient, SpaceConfig, SpacePolicy,
 };
+use circle_appview::space_signature::p256_did_key;
 
 const OWNER_DID: &str = "did:plc:owner-host-gate";
 const SPACE_URI: &str = "at://did:plc:owner-host-gate/space/blue.catbird.circle/3l7hostgate11";
@@ -64,57 +67,81 @@ fn owner_doc(key: &SigningKey) -> DidDocument {
 /// A bearer space credential, as Swan profiles 2026-08-15 and 2026-09-10 mint:
 /// correctly signed by the authority, but with no `cnf` claim.
 fn bearer_credential(key: &SigningKey, typ: &str) -> String {
+    credential_with_cnf(key, typ, None)
+}
+
+/// A credential with the given `cnf` claim, e.g. `{"jkt": ...}` from a DPoP-bound
+/// host on an older alpha.
+fn credential_with_cnf(key: &SigningKey, typ: &str, cnf: Option<serde_json::Value>) -> String {
     let now = Utc::now().timestamp();
     let header = URL_SAFE_NO_PAD.encode(
         serde_json::json!({"typ": typ, "alg": "ES256", "kid": "#atproto"})
             .to_string()
             .as_bytes(),
     );
-    let claims = URL_SAFE_NO_PAD.encode(
-        serde_json::json!({
-            "iss": OWNER_DID,
-            "sub": SPACE_URI,
-            "iat": now,
-            "exp": now + 3600,
-            "jti": uuid::Uuid::new_v4().to_string(),
-        })
-        .to_string()
-        .as_bytes(),
-    );
+    let mut claims = serde_json::json!({
+        "iss": OWNER_DID,
+        "sub": SPACE_URI,
+        "iat": now,
+        "exp": now + 3600,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    if let Some(cnf) = cnf {
+        claims["cnf"] = cnf;
+    }
+    let claims = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
     let input = format!("{header}.{claims}");
     let sig: p256::ecdsa::Signature = key.sign(input.as_bytes());
     format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+}
+
+fn fresh_key_id() -> String {
+    p256_did_key(SigningKey::random(&mut OsRng).verifying_key())
 }
 
 #[test]
 fn unbound_credential_is_refused_as_unsupported_pds() {
     let key = SigningKey::random(&mut OsRng);
     let doc = owner_doc(&key);
+    let key_id = fresh_key_id();
     for typ in ["atproto-space-credential+jwt", "at+jwt"] {
         let err = validate_space_credential(
             &bearer_credential(&key, typ),
             OWNER_DID,
             SPACE_URI,
-            "expected-jkt",
+            &key_id,
             &doc,
         )
-        .expect_err("a credential without cnf.jkt must be refused");
+        .expect_err("a credential without cnf.kid must be refused");
         assert!(
             matches!(err, AppError::UnsupportedPds(_)),
             "typ {typ}: expected UnsupportedPds, got {err:?}"
         );
     }
+
+    // A DPoP-bound credential (cnf.jkt) is the pre-Oct-1 format: refused too,
+    // so it is reacquired from an upgraded host rather than used.
+    let jkt_bound = credential_with_cnf(
+        &key,
+        "atproto-space-credential+jwt",
+        Some(serde_json::json!({"jkt": "thumbprint"})),
+    );
+    assert!(matches!(
+        validate_space_credential(&jkt_bound, OWNER_DID, SPACE_URI, &key_id, &doc),
+        Err(AppError::UnsupportedPds(_))
+    ));
 }
 
 #[test]
 fn bound_credentials_still_pass_and_wrong_binding_is_an_auth_failure() {
     let key = SigningKey::random(&mut OsRng);
     let doc = owner_doc(&key);
-    let expires = Utc::now() + chrono::Duration::hours(1);
-    let bound = mint_mock_space_credential(&key, OWNER_DID, SPACE_URI, "jkt-1", expires);
-    assert!(validate_space_credential(&bound, OWNER_DID, SPACE_URI, "jkt-1", &doc).is_ok());
+    let expires = Utc::now() + chrono::Duration::seconds(600);
+    let ours = fresh_key_id();
+    let bound = mint_mock_space_credential(&key, OWNER_DID, SPACE_URI, &ours, expires);
+    assert!(validate_space_credential(&bound, OWNER_DID, SPACE_URI, &ours, &doc).is_ok());
     assert!(matches!(
-        validate_space_credential(&bound, OWNER_DID, SPACE_URI, "jkt-2", &doc),
+        validate_space_credential(&bound, OWNER_DID, SPACE_URI, &fresh_key_id(), &doc),
         Err(AppError::Unauthorized(AuthReason::IdMismatch))
     ));
 }

@@ -750,7 +750,7 @@ impl ScenarioRunner {
                 cursor: None,
                 did: Some(Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?),
                 limit: Some(1),
-                r#type: None,
+                space_type: None,
             };
             let ls_resp = user
                 .apply_auth(self.client.get(&list_spaces_url))
@@ -1565,7 +1565,7 @@ impl ScenarioRunner {
                     extra_data: None,
                 },
             )),
-            r#type: Nsid::new("blue.catbird.circle".into())
+            space_type: Nsid::new("blue.catbird.circle".into())
                 .map_err(|e| format!("Invalid NSID: {e}"))?,
             extra_data: None,
         };

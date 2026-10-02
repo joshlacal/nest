@@ -11,13 +11,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub use catbird_atproto::generated::com_atproto::space::SignedCommit;
+// The pinned jacquard-repo also carries the superseded Spaces DPoP binding
+// (`verify_dpop`, `DpopProof`, `CnfJkt`, `CredentialClaims`); it is not
+// re-exported. Space credentials are HTTP-signature bound, see
+// `crate::space_signature`.
 pub use jacquard_repo::permissioned::{
-    apply_writes, commit_from_cbor, commit_to_cbor, format_cursor, list_repo_ops, normalize_htu,
-    parse_cursor, sign_commit, sign_commit_with_ikm, verify_dpop, ApplyWritesResult, CnfJkt,
-    CommitContext, CredentialClaims, DpopProof, LtHash, OplogAction, OplogEntry, OplogPage,
-    PermissionedCar, PermissionedError, RecordValue, SpaceTypeDeclaration, ValidatedRepoSnapshot,
-    WriteOperation, WriteResult, WriteState, CLIENT_ATTESTATION_TYP, CLOCK_SKEW_SEC,
-    DELEGATION_TOKEN_TYP, SPACE_CREDENTIAL_TYP,
+    apply_writes, commit_from_cbor, commit_to_cbor, format_cursor, list_repo_ops, parse_cursor,
+    sign_commit, sign_commit_with_ikm, ApplyWritesResult, CommitContext, LtHash, OplogAction,
+    OplogEntry, OplogPage, PermissionedCar, PermissionedError, RecordValue, SpaceTypeDeclaration,
+    ValidatedRepoSnapshot, WriteOperation, WriteResult, WriteState, CLIENT_ATTESTATION_TYP,
+    CLOCK_SKEW_SEC, DELEGATION_TOKEN_TYP, SPACE_CREDENTIAL_TYP,
 };
 
 use crate::auth::ParsedVerifyingKey;

@@ -328,13 +328,25 @@ impl SyncEngine {
                     last_rev.as_deref(),
                     cursor.as_deref(),
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                 )
                 .await;
 
             let page = match page_res {
                 Ok(p) => p,
-                Err(_) => {
+                Err(e) => {
+                    // A rejected credential is not retried by falling back to
+                    // getRepo with it: evict it and fail this sync.
+                    if crate::access::evict_rejected_credential(
+                        &self.credential_store,
+                        space_uri,
+                        &cred.token,
+                        &e,
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                     fetch_failed = true;
                     break;
                 }
@@ -461,7 +473,7 @@ impl SyncEngine {
                     author_did,
                     &repo_service_endpoint,
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                     &author_signing_key,
                     &policy,
                     expected_authority_hash,
@@ -472,17 +484,32 @@ impl SyncEngine {
 
         let commit_to_verify = match terminal_commit {
             Some(c) => Some(c),
-            None => self
+            None => match self
                 .space_client
                 .get_latest_commit(
                     &repo_service_endpoint,
                     space_uri,
                     author_did,
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                 )
                 .await
-                .ok(),
+            {
+                Ok(commit) => Some(commit),
+                Err(e) => {
+                    if crate::access::evict_rejected_credential(
+                        &self.credential_store,
+                        space_uri,
+                        &cred.token,
+                        &e,
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                    None
+                }
+            },
         };
 
         let commit_verified = if let Some(commit) = &commit_to_verify {
@@ -501,7 +528,7 @@ impl SyncEngine {
                                     author_did,
                                     &repo_service_endpoint,
                                     &cred.token,
-                                    &cred.dpop_key,
+                                    &cred.signing_key,
                                     &author_signing_key,
                                     &policy,
                                     expected_authority_hash,
@@ -520,7 +547,7 @@ impl SyncEngine {
                                     author_did,
                                     &repo_service_endpoint,
                                     &cred.token,
-                                    &cred.dpop_key,
+                                    &cred.signing_key,
                                     &author_signing_key,
                                     &policy,
                                     expected_authority_hash,
@@ -561,7 +588,7 @@ impl SyncEngine {
                     author_did,
                     &repo_service_endpoint,
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                     &author_signing_key,
                     &policy,
                     expected_authority_hash,
@@ -999,7 +1026,7 @@ impl SyncEngine {
         author_did: &str,
         service_endpoint: &str,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        credential_key: &p256::ecdsa::SigningKey,
         author_signing_key: &crate::auth::ParsedVerifyingKey,
         policy: &ValidationPolicy,
         expected_authority_hash: Option<&[u8]>,
@@ -1013,7 +1040,7 @@ impl SyncEngine {
         .fetch_optional(&self.db)
         .await?;
 
-        let car_bytes = self
+        let car_bytes = match self
             .space_client
             .get_repo(
                 service_endpoint,
@@ -1021,9 +1048,22 @@ impl SyncEngine {
                 author_did,
                 None,
                 space_credential,
-                dpop_key,
+                credential_key,
             )
-            .await?;
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::access::evict_rejected_credential(
+                    &self.credential_store,
+                    space_uri,
+                    space_credential,
+                    &e,
+                )
+                .await;
+                return Err(e);
+            }
+        };
         self.record_bytes_processed(car_bytes.len());
 
         let car = parse_permissioned_car(&car_bytes)
@@ -1641,14 +1681,30 @@ pub async fn sweep_once_with_shutdown(
                     &space_uri,
                     cursor.as_deref(),
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                 )
                 .await;
 
             let repos_output = match list_repos_res {
                 Ok(out) => out,
-                Err(_) => break,
+                Err(e) => {
+                    crate::access::evict_rejected_credential(
+                        &state.credential_store,
+                        &space_uri,
+                        &cred.token,
+                        &e,
+                    )
+                    .await;
+                    break;
+                }
             };
+            // listRepos pages through writers in ascending spaceRev order and
+            // ends with an empty page, which omits the cursor. This sweep keeps
+            // no listing checkpoint: every pass starts from the beginning.
+            if repos_output.repos.is_empty() {
+                break;
+            }
+            let mut credential_rejected = false;
 
             for repo in &repos_output.repos {
                 // Cooperative shutdown check inside repo loop
@@ -1686,10 +1742,12 @@ pub async fn sweep_once_with_shutdown(
                 .await
                 .unwrap_or(None);
 
+                // A repo can reappear when it advances during pagination; the
+                // comparison against stored state makes repeats a no-op.
                 let needs_sync = match db_sync {
                     Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
                         let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                        last_rev != repo.rev.as_str() || &digest[..] != repo.hash.as_ref()
+                        last_rev != repo.repo_rev.as_str() || &digest[..] != repo.hash.as_ref()
                     }
                     _ => true,
                 };
@@ -1700,17 +1758,28 @@ pub async fn sweep_once_with_shutdown(
                             &space_uri,
                             repo_did,
                             Some(repo.hash.as_ref()),
-                            Some(repo.rev.as_str()),
+                            Some(repo.repo_rev.as_str()),
                         )
                         .await
                     {
                         Ok(_res) => {
                             summary.repos_synced += 1;
                         }
-                        Err(_) => summary.repos_failed += 1,
+                        Err(e) => {
+                            summary.repos_failed += 1;
+                            // The credential was evicted; stop using it for this space.
+                            if crate::access::is_credential_rejected(&e) {
+                                credential_rejected = true;
+                                break;
+                            }
+                        }
                     }
                     total_bytes_processed = sync_engine.total_bytes_processed();
                 }
+            }
+
+            if credential_rejected {
+                break;
             }
 
             if let Some(next_cursor) = repos_output.cursor {
@@ -1825,14 +1894,17 @@ pub async fn notify_write_handler(
         .ok_or(AppError::Unauthorized(
             crate::error::AuthReason::InvalidHeader,
         ))?;
+    // A forwarded notification is signed by the space authority and addressed
+    // to the service identifier this AppView registered with registerNotify.
     let user = crate::auth::verify_service_jwt(
         &state,
         token,
-        &state.config.service_did,
+        &state.config.notify_service_identifier(),
         Some("com.atproto.space.notifyWrite"),
     )
     .await?;
 
+    // { space, repo, repoRev, hash, spaceRev, prevSpaceRev? }
     let input: catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite =
         serde_json::from_slice(&body)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid notifyWrite body: {e}")))?;
@@ -1842,16 +1914,26 @@ pub async fn notify_write_handler(
             "Hash must be exactly 32 bytes".into(),
         ));
     }
-    if input.rev.as_str().is_empty() {
-        return Err(AppError::InvalidRequest("Rev cannot be empty".into()));
+    if input.repo_rev.as_str().is_empty() {
+        return Err(AppError::InvalidRequest("repoRev cannot be empty".into()));
     }
 
+    // Only the space host forwards to syncers; a repo host notifies the space
+    // host, never this AppView.
     let authority = extract_authority_did(input.space.as_str())?;
-    if user.did != authority && user.did != input.repo.as_str() {
+    if user.did != authority {
         return Err(AppError::Forbidden(
-            "Caller DID does not match space authority or repo author".into(),
+            "notifyWrite issuer is not the space authority".into(),
         ));
     }
+    // Space revisions are not checkpointed here: the revision sweep re-lists
+    // every space, so a prevSpaceRev gap is repaired on its next pass.
+    tracing::debug!(
+        space = %crate::access::space_fingerprint(input.space.as_str()),
+        space_rev = ?input.space_rev.as_ref().map(|r| r.as_str()),
+        prev_space_rev = ?input.prev_space_rev.as_ref().map(|r| r.as_str()),
+        "notifyWrite received"
+    );
 
     // Finding 17 & 36: Verify caller and repo author are active members before work
     let is_member: bool = sqlx::query_scalar(
@@ -1886,7 +1968,7 @@ pub async fn notify_write_handler(
         Ok(permit) => {
             let space = input.space.as_str().to_string();
             let repo = input.repo.as_str().to_string();
-            let rev = input.rev.as_str().to_string();
+            let rev = input.repo_rev.as_str().to_string();
             let hash = input.hash.to_vec();
             tokio::spawn(async move {
                 let _permit = permit;
@@ -1937,7 +2019,7 @@ pub async fn notify_space_deleted_handler(
     let user = crate::auth::verify_service_jwt(
         &state,
         token,
-        &state.config.service_did,
+        &state.config.notify_service_identifier(),
         Some("com.atproto.space.notifySpaceDeleted"),
     )
     .await?;

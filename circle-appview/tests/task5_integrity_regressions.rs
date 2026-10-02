@@ -236,7 +236,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
             SPACE_URI.to_string(),
             ActiveSpaceCredential {
                 token: "test-space-token".into(),
-                dpop_key: SigningKey::random(&mut OsRng),
+                signing_key: SigningKey::random(&mut OsRng),
                 expires_at: Utc::now() + chrono::Duration::hours(1),
             },
         )
@@ -486,11 +486,26 @@ async fn test_notify_write_requires_active_membership_before_work(pool: PgPool) 
     let eve_key = SigningKey::random(&mut OsRng);
     register_did_doc(&setup.state.did_resolver, EVE_DID, &eve_key, None);
 
-    let token = mint_service_jwt(
+    // A forwarded notification comes from the space authority; Eve signing her
+    // own is refused before any work.
+    let eve_token = mint_service_jwt(
         EVE_DID,
         &setup.state.config.service_did,
         "com.atproto.space.notifyWrite",
         &eve_key,
+    );
+    let mut eve_headers = axum::http::HeaderMap::new();
+    eve_headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {eve_token}").parse().unwrap(),
+    );
+
+    // The authority forwarding a notification for a non-member's repo.
+    let token = mint_service_jwt(
+        OWNER_DID,
+        &setup.state.config.service_did,
+        "com.atproto.space.notifyWrite",
+        &setup.owner_signing_key,
     );
 
     let mut headers = axum::http::HeaderMap::new();
@@ -503,15 +518,30 @@ async fn test_notify_write_requires_active_membership_before_work(pool: PgPool) 
         &catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
             hash: bytes::Bytes::copy_from_slice(&[0x42; 32]),
             repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(EVE_DID)),
-            rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+            repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7234567a234",
             )),
+            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+                String::from("3l7spacerev2a"),
+            )),
+            prev_space_rev: None,
             space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
                 .unwrap(),
             extra_data: None,
         },
     )
     .unwrap();
+
+    let res = circle_appview::sync::notify_write_handler(
+        axum::extract::State(setup.state.clone()),
+        eve_headers,
+        bytes::Bytes::from(body.clone()),
+    )
+    .await;
+    match res.unwrap_err() {
+        AppError::Forbidden(msg) => assert!(msg.contains("not the space authority"), "{msg}"),
+        other => panic!("Expected Forbidden, got {other:?}"),
+    }
 
     let res = circle_appview::sync::notify_write_handler(
         axum::extract::State(setup.state.clone()),
@@ -916,19 +946,28 @@ async fn test_sweep_budget_and_shutdown_in_per_page_repo_loop(pool: PgPool) {
     let repos = vec![
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
             did: "did:plc:repo-1".to_string().into(),
-            rev: "3jzfcijpj2m2a".to_string().into(),
+            repo_rev: "3jzfcijpj2m2a".to_string().into(),
+            space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+                "3l7spacerev2a",
+            )),
             hash: bytes::Bytes::from(vec![0x11; 32]),
             extra_data: None,
         },
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
             did: "did:plc:repo-2".to_string().into(),
-            rev: "3jzfcijpj2m2a".to_string().into(),
+            repo_rev: "3jzfcijpj2m2a".to_string().into(),
+            space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+                "3l7spacerev2a",
+            )),
             hash: bytes::Bytes::from(vec![0x22; 32]),
             extra_data: None,
         },
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
             did: "did:plc:repo-3".to_string().into(),
-            rev: "3jzfcijpj2m2a".to_string().into(),
+            repo_rev: "3jzfcijpj2m2a".to_string().into(),
+            space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+                "3l7spacerev2a",
+            )),
             hash: bytes::Bytes::from(vec![0x33; 32]),
             extra_data: None,
         },
@@ -964,7 +1003,10 @@ async fn test_sweep_budget_caps_failing_repos_at_max_repos_per_sweep(pool: PgPoo
         repos.push(
             catbird_atproto::generated::com_atproto::space::list_repos::Repo {
                 did: format!("did:plc:failing-repo-{i}").into(),
-                rev: "3jzfcijpj2m2a".to_string().into(),
+                repo_rev: "3jzfcijpj2m2a".to_string().into(),
+                space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(
+                    String::from("3l7spacerev2a"),
+                ),
                 hash: bytes::Bytes::from(vec![0xAA; 32]),
                 extra_data: None,
             },
@@ -998,13 +1040,19 @@ async fn test_sweep_budget_halts_on_rejected_car_byte_limit(pool: PgPool) {
     let repos = vec![
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
             did: OWNER_DID.to_string().into(),
-            rev: "3jzfcijpj2m2a".to_string().into(),
+            repo_rev: "3jzfcijpj2m2a".to_string().into(),
+            space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+                "3l7spacerev2a",
+            )),
             hash: bytes::Bytes::from(vec![0xBB; 32]),
             extra_data: None,
         },
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
             did: "did:plc:unreached-repo-2".to_string().into(),
-            rev: "3jzfcijpj2m2a".to_string().into(),
+            repo_rev: "3jzfcijpj2m2a".to_string().into(),
+            space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+                "3l7spacerev2a",
+            )),
             hash: bytes::Bytes::from(vec![0xCC; 32]),
             extra_data: None,
         },

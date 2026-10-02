@@ -630,7 +630,7 @@ impl ThreeUserEnv {
                 space_uri.clone(),
                 ActiveSpaceCredential {
                     token: "family-circle-space-token".into(),
-                    dpop_key: cred_key,
+                    signing_key: cred_key,
                     expires_at: Utc::now() + Duration::hours(2),
                 },
             )
