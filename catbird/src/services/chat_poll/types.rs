@@ -21,6 +21,8 @@ pub struct ChatPollRow {
 /// Deserialized response from chat.bsky.convo.getLog
 #[derive(Debug, Deserialize)]
 pub struct GetLogResponse {
+    /// getLog may omit the cursor when there are no log entries.
+    #[serde(default)]
     pub cursor: String,
     pub logs: Vec<LogEntry>,
 }

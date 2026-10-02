@@ -211,7 +211,11 @@ pub(crate) async fn poll_account_with_session(
 
                         let page_done =
                             page.logs.is_empty() || Some(&page.cursor) == cursor.as_ref();
-                        let new_cursor = page.cursor;
+                        let new_cursor = if page.cursor.is_empty() {
+                            cursor.clone().unwrap_or_default()
+                        } else {
+                            page.cursor
+                        };
                         if !persist_prime_page(
                             db_pool,
                             row,
@@ -317,7 +321,7 @@ pub(crate) async fn poll_account_with_session(
                         dpop_nonce = next_nonce;
                     }
 
-                    cursor = Some(new_cursor);
+                    cursor = (!new_cursor.is_empty()).then_some(new_cursor);
                     if page_done {
                         done = true;
                         break;
@@ -904,8 +908,8 @@ fn validate_log_page(page: &GetLogResponse) -> Result<()> {
             MAX_PRIME_LOGS_PER_PAGE
         );
     }
-    if page.cursor.is_empty() {
-        anyhow::bail!("Chat log page has an empty cursor");
+    if page.cursor.is_empty() && !page.logs.is_empty() {
+        anyhow::bail!("Nonempty chat log page has no cursor");
     }
     Ok(())
 }
@@ -952,7 +956,7 @@ async fn persist_prime_page(
             next_poll_at = NOW() + INTERVAL '5 seconds' WHERE account_did = $1"#,
     )
     .bind(&row.account_did)
-    .bind(cursor)
+    .bind((!cursor.is_empty()).then_some(cursor))
     .bind(done)
     .execute(&mut *tx)
     .await?;
@@ -1105,7 +1109,11 @@ async fn persist_log_page(
             last_successful_poll_at = NOW() WHERE account_did = $1"#,
     )
     .bind(&row.account_did)
-    .bind(&page.cursor)
+    .bind(if page.cursor.is_empty() {
+        row.chat_cursor.as_deref()
+    } else {
+        Some(page.cursor.as_str())
+    })
     .bind(new_tier)
     .bind(super::types::tier_interval_secs(new_tier))
     .execute(&mut *tx)

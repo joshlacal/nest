@@ -549,7 +549,8 @@ fn poller_supports_current_and_legacy_read_logs_with_system_messages() {
                 "message": {
                     "$type": "chat.bsky.convo.defs#systemMessageView",
                     "id": "system", "rev": "3lb", "sentAt": "2026-01-01T00:00:00Z",
-                    "data": {"$type": "chat.bsky.convo.defs#systemMessageDataLockConvo"}
+                    "data": {"$type": "chat.bsky.convo.defs#systemMessageDataLockConvo",
+                        "lockedBy": {"did": "did:plc:senderfixture"}}
                 }
             }]
         }))
@@ -605,5 +606,41 @@ async fn poller_stale_mute_snapshot_cannot_overwrite_newer_mutation() {
         .is_convo_muted(&row.account_did, "new-mute")
         .await
         .unwrap());
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn poller_empty_optional_cursor_primes_fresh_and_preserves_initialized_cursor() {
+    let db = TestDb::new().await;
+    let row = db.account().await;
+    let empty: GetLogResponse = serde_json::from_value(serde_json::json!({"logs": []})).unwrap();
+    validate_log_page(&empty).unwrap();
+    persist_log_page(&db.pool, &row, &empty, 1).await.unwrap();
+    assert_eq!(db.row().await.chat_cursor.as_deref(), Some("before"));
+    sqlx::query("UPDATE chat_poll_state SET primed_at = NULL, chat_cursor = NULL, last_successful_poll_at = NULL")
+        .execute(&db.pool).await.unwrap();
+    let fresh = db.row().await;
+    assert!(persist_prime_page(
+        &db.pool,
+        &fresh,
+        None,
+        &empty.cursor,
+        &HashMap::new(),
+        true,
+        1
+    )
+    .await
+    .unwrap());
+    assert!(db.row().await.chat_cursor.is_none());
+    assert!(db.row().await.primed_at.is_some());
+    assert!(!ChatPollScheduler::new(db.pool.clone())
+        .hold_if_catch_up_required(&row.account_did)
+        .await
+        .unwrap());
+    assert_eq!(db.counts().await, (0, 0, 0));
+    let invalid: GetLogResponse =
+        serde_json::from_value(serde_json::json!({"logs": [{"$type": "future.log"}]})).unwrap();
+    assert!(validate_log_page(&invalid).is_err());
     db.finish().await;
 }

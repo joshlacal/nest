@@ -147,6 +147,7 @@ impl ApnsSender for FakeApns {
 
 struct Fixture {
     pool: Pool<Postgres>,
+    database_url: String,
     redis_url: String,
     fake: Arc<FakeApns>,
     session: CatbirdSession,
@@ -212,6 +213,7 @@ impl Fixture {
         .unwrap();
         let fixture = Self {
             pool,
+            database_url: url.to_string(),
             redis_url,
             fake: Arc::new(FakeApns::default()),
             session,
@@ -242,33 +244,7 @@ impl Fixture {
     }
 
     async fn state(&self, services: Arc<PushServices>) -> Arc<AppState> {
-        let mut config = AppConfig::test_default();
-        config.redis.url = self.redis_url.clone();
-        let redis = redis::aio::ConnectionManager::new(
-            redis::Client::open(self.redis_url.as_str()).unwrap(),
-        )
-        .await
-        .unwrap();
-        Arc::new(AppState {
-            config: Arc::new(config),
-            http_client: reqwest::Client::new(),
-            raw_http_client: reqwest::Client::new(),
-            redis,
-            push_db: Some(self.pool.clone()),
-            key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
-            catmos_oauth_scopes: vec![],
-            trusted_proxies: vec![],
-            auth_store: None,
-            push: Some(services),
-            dpop_nonce_cache: Arc::new(catbird::services::DpopNonceCache::new()),
-            session_encryption_key: None,
-            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
-            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
-            session_index_ready: Arc::new(AtomicBool::new(true)),
-            session_index_readiness: Arc::new(Notify::new()),
-        })
+        make_state(self.pool.clone(), &self.redis_url, services).await
     }
 
     async fn register(&self, services: &PushServices, index: usize) {
@@ -322,6 +298,38 @@ impl Fixture {
         sqlx::query_scalar("SELECT pd.state FROM push_device_deliveries pd JOIN user_devices ud ON ud.id = pd.device_id WHERE pd.dedupe_key = $1 AND ud.device_token = $2")
             .bind(self.event.dedupe_key()).bind(token).fetch_one(&self.pool).await.unwrap()
     }
+}
+
+async fn make_state(
+    pool: Pool<Postgres>,
+    redis_url: &str,
+    services: Arc<PushServices>,
+) -> Arc<AppState> {
+    let mut config = AppConfig::test_default();
+    config.redis.url = redis_url.to_string();
+    let redis = redis::aio::ConnectionManager::new(redis::Client::open(redis_url).unwrap())
+        .await
+        .unwrap();
+    Arc::new(AppState {
+        config: Arc::new(config),
+        http_client: reqwest::Client::new(),
+        raw_http_client: reqwest::Client::new(),
+        redis,
+        push_db: Some(pool),
+        key_store: None,
+        jacquard_client: None,
+        catmos_jacquard_client: None,
+        catmos_oauth_scopes: vec![],
+        trusted_proxies: vec![],
+        auth_store: None,
+        push: Some(services),
+        dpop_nonce_cache: Arc::new(catbird::services::DpopNonceCache::new()),
+        session_encryption_key: None,
+        active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+        session_index_ready: Arc::new(AtomicBool::new(true)),
+        session_index_readiness: Arc::new(Notify::new()),
+    })
 }
 
 #[tokio::test]
@@ -731,5 +739,214 @@ async fn migration_holds_legacy_queue_without_changing_payload_or_history() {
     assert_eq!(reason, "legacy_chat_missing_log_rev");
     assert_eq!(fixture.process_with_new_worker().await, 0);
     assert!(fixture.fake.attempts.lock().await.is_empty());
+    assert_eq!(fixture.queue_count().await, 1);
+}
+
+/// Owns exactly one test child. Panic, assertion failure, or timeout all kill and
+/// synchronously reap it; std::process::Child by itself does neither on Drop.
+#[cfg(unix)]
+struct OwnedChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+#[cfg(unix)]
+impl OwnedChild {
+    fn spawn(fixture: &Fixture, mode: &str) -> Self {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subprocess_delivery_worker_entrypoint",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("LITE_PUSH_SUBPROCESS_MODE", mode)
+            .env("DATABASE_URL", &fixture.database_url)
+            .env("REDIS_URL", &fixture.redis_url)
+            .env("LITE_PUSH_DISPOSABLE", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        eprintln!("LITE-001 child pid={} mode={mode}", child.id());
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn kill_and_reap(&mut self) -> std::process::ExitStatus {
+        let _ = self.child.kill();
+        let status = self.child.wait().unwrap();
+        self.reaped = true;
+        eprintln!("LITE-001 reaped pid={} status={status}", self.child.id());
+        status
+    }
+
+    fn try_reap(&mut self) -> Option<std::process::ExitStatus> {
+        let status = self.child.try_wait().unwrap();
+        if status.is_some() {
+            self.reaped = true;
+        }
+        status
+    }
+
+    fn output(&mut self) -> String {
+        use std::io::Read;
+        assert!(self.reaped);
+        let mut text = String::new();
+        if let Some(stdout) = &mut self.child.stdout {
+            stdout.read_to_string(&mut text).unwrap();
+        }
+        if let Some(stderr) = &mut self.child.stderr {
+            stderr.read_to_string(&mut text).unwrap();
+        }
+        text
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
+struct DurableFakeApns {
+    pool: Pool<Postgres>,
+    stall_after_acceptance: bool,
+}
+
+#[async_trait::async_trait]
+impl ApnsSender for DurableFakeApns {
+    async fn send(
+        &self,
+        registration: &RegistrationRow,
+        _notification: &ApnsNotification,
+    ) -> anyhow::Result<&'static str> {
+        // This is a fake provider's receipt, committed separately from Nest's
+        // delivery marker. It survives both test-worker process lifetimes.
+        sqlx::query("INSERT INTO fixture_apns_acceptances(device_id) VALUES ($1)")
+            .bind(registration.id)
+            .execute(&self.pool)
+            .await?;
+        if self.stall_after_acceptance {
+            std::future::pending::<()>().await;
+        }
+        Ok("sandbox")
+    }
+}
+
+#[tokio::test]
+#[ignore = "subprocess helper only; a direct include-ignored invocation is a no-op"]
+async fn subprocess_delivery_worker_entrypoint() {
+    let Ok(mode) = std::env::var("LITE_PUSH_SUBPROCESS_MODE") else {
+        eprintln!("LITE-001 subprocess helper not invoked; no independent test receipt");
+        return;
+    };
+    assert!(matches!(mode.as_str(), "accept-then-stall" | "recover"));
+    let database_url = isolated_url("DATABASE_URL", "postgres", 5432);
+    let redis_url = isolated_url("REDIS_URL", "redis", 6379);
+    let parsed = url::Url::parse(&database_url).unwrap();
+    assert!(parsed.path().starts_with("/lite_push_failure_"));
+    let pool = Pool::<Postgres>::connect(&database_url).await.unwrap();
+    let fake = Arc::new(DurableFakeApns {
+        pool: pool.clone(),
+        stall_after_acceptance: mode == "accept-then-stall",
+    });
+    let mut config = PushConfig::default();
+    config.service_did = Some("did:web:push.fixture.test".to_string());
+    config.apns.enabled = false;
+    config.send_timeout_seconds = 60;
+    let services = Arc::new(
+        PushServices::new(pool.clone(), config)
+            .unwrap()
+            .with_apns_sender(fake),
+    );
+    let state = make_state(pool, &redis_url, services.clone()).await;
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn killed_worker_process_restarts_and_holds_without_second_provider_acceptance() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = Fixture::new(1).await;
+    let token = format!("{:064x}", 1);
+    sqlx::query("CREATE TABLE fixture_apns_acceptances(id BIGSERIAL PRIMARY KEY, device_id UUID NOT NULL, accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+        .execute(&fixture.pool).await.unwrap();
+    fixture.enqueue().await;
+    let mut first = OwnedChild::spawn(&fixture, "accept-then-stall");
+    let observed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture_apns_acceptances")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+            if count > 0 {
+                break count;
+            }
+            if first.try_reap().is_some() {
+                break 0;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    // Clean up before any assertion, including timeouts and premature exits.
+    let killed = first.kill_and_reap();
+    let first_output = first.output();
+    assert_eq!(
+        observed.unwrap_or(0),
+        1,
+        "first child failed: {first_output}"
+    );
+    assert_eq!(
+        killed.signal(),
+        Some(9),
+        "the first worker must terminate by SIGKILL"
+    );
+    assert_eq!(fixture.device_state(&token).await, "attempting");
+
+    // Advance only this disposable fixture's lease to model its expiration;
+    // the second OS process must use the durable intent, not parent memory.
+    fixture.make_due().await;
+    let mut second = OwnedChild::spawn(&fixture, "recover");
+    let finished = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = second.try_reap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let status = match finished {
+        Ok(status) => status,
+        Err(_) => second.kill_and_reap(),
+    };
+    let second_output = second.output();
+    assert!(status.success(), "restart child failed: {second_output}");
+    eprintln!(
+        "LITE-001 recovery child reaped pid={} status={status}",
+        second.child.id()
+    );
+    let acceptances: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture_apns_acceptances")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        acceptances, 1,
+        "restart must not obtain a second fake provider acceptance"
+    );
+    assert_eq!(fixture.device_state(&token).await, "held");
+    assert_eq!(fixture.receipt_state().await, "held");
     assert_eq!(fixture.queue_count().await, 1);
 }
