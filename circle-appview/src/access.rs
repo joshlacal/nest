@@ -30,22 +30,27 @@ pub struct ActiveSpaceCredential {
 /// issue by default, with room for clock skew.
 pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
 
+/// After an acquisition for a request fails, requests for that space do not run
+/// the exchange again for this long (see [`ensure_space_credential_for_request`]).
+pub const FAILED_ACQUISITION_RETRY_DELAY: chrono::Duration = chrono::Duration::seconds(60);
+
 #[derive(Default)]
 pub struct CredentialStore {
     values: RwLock<HashMap<String, ActiveSpaceCredential>>,
+    /// Space URI -> when request-path acquisition may be tried again.
+    failed_acquisitions: RwLock<HashMap<String, DateTime<Utc>>>,
 }
 
 impl CredentialStore {
     pub fn new() -> Self {
-        Self {
-            values: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub async fn insert(&self, space: String, cred: ActiveSpaceCredential) {
         if cred.expires_at <= Utc::now() {
             return;
         }
+        self.failed_acquisitions.write().await.remove(&space);
 
         let mut lock = self.values.write().await;
         let now = Utc::now();
@@ -96,6 +101,24 @@ impl CredentialStore {
             return true;
         }
         false
+    }
+
+    /// Remember that acquiring a credential for `space` failed, so request
+    /// handlers stop retrying it for [`FAILED_ACQUISITION_RETRY_DELAY`].
+    pub async fn note_failed_acquisition(&self, space: &str) {
+        let now = Utc::now();
+        let mut lock = self.failed_acquisitions.write().await;
+        lock.retain(|_, retry_at| *retry_at > now);
+        lock.insert(space.to_string(), now + FAILED_ACQUISITION_RETRY_DELAY);
+    }
+
+    /// True while a failed acquisition for `space` is recent.
+    pub async fn acquisition_failed_recently(&self, space: &str) -> bool {
+        self.failed_acquisitions
+            .read()
+            .await
+            .get(space)
+            .is_some_and(|retry_at| *retry_at > Utc::now())
     }
 
     pub async fn count(&self) -> usize {
@@ -1080,6 +1103,58 @@ pub async fn ensure_space_credential(
     .await
 }
 
+/// [`ensure_space_credential`] for a request handler. A failed acquisition is
+/// remembered for [`FAILED_ACQUISITION_RETRY_DELAY`]; until then requests for
+/// that space fail at once instead of each minting a delegation token and
+/// calling a space host that is refusing the exchange. The failure is noted
+/// under the per-space lock, so requests queued behind it see it too.
+pub async fn ensure_space_credential_for_request(
+    state: &AppState,
+    space_uri: &str,
+    preferred_user_did: Option<&str>,
+) -> Result<ActiveSpaceCredential, AppError> {
+    let recently_failed =
+        || AppError::NotFound("Space credential acquisition failed recently".into());
+    if let Some(cred) = state.credential_store.get(space_uri).await {
+        return Ok(cred);
+    }
+    if state
+        .credential_store
+        .acquisition_failed_recently(space_uri)
+        .await
+    {
+        return Err(recently_failed());
+    }
+
+    let _lock_guard = state.space_locks.acquire(space_uri).await;
+    // Another request may have acquired, or failed to acquire, while this one waited.
+    if state
+        .credential_store
+        .acquisition_failed_recently(space_uri)
+        .await
+    {
+        return Err(recently_failed());
+    }
+    let result = ensure_space_credential_from_parts(
+        &state.db,
+        &state.space_client,
+        &state.credential_store,
+        &state.did_resolver,
+        &state.oauth_service,
+        &state.http_client,
+        space_uri,
+        preferred_user_did,
+    )
+    .await;
+    if result.is_err() {
+        state
+            .credential_store
+            .note_failed_acquisition(space_uri)
+            .await;
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_space_credential_from_parts(
     db: &PgPool,
@@ -1871,6 +1946,158 @@ mod tests {
         // The chain must have run exactly once due to the per-space lock and double-checked caching
         assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
         assert_eq!(mock_transport.recorded_calls().len(), 1);
+    }
+
+    /// An AppState over `mock_transport` holding an OAuth session for
+    /// TEST_USER_DID, for request-path acquisition tests.
+    async fn request_path_state(
+        pool: PgPool,
+        mock_transport: Arc<MockSpaceHostTransport>,
+    ) -> AppState {
+        setup_test_key();
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &p256::ecdsa::SigningKey::random(&mut OsRng),
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &p256::ecdsa::SigningKey::random(&mut OsRng),
+            vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            p256::ecdsa::SigningKey::random(&mut OsRng),
+            None,
+        ));
+        oauth_service
+            .store_session(UserOAuthSession {
+                user_did: TEST_USER_DID.into(),
+                access_token: "test_access_token".into(),
+                refresh_token: None,
+                token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+                auth_server_iss: TEST_USER_PDS.into(),
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                scope: "atproto".into(),
+                dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            })
+            .await
+            .unwrap();
+        let config = Arc::new(crate::config::Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
+            plc_directory_url: "https://plc.directory".into(),
+            public_appview_url: "https://public.api.bsky.app".into(),
+            circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
+            push_signing_key_path: None,
+            push_signing_key_hex: None,
+        });
+        let http_client = reqwest::Client::new();
+        AppState {
+            profile_hydrator: Arc::new(crate::hydration::ProfileHydrator::new(
+                config.public_appview_url.clone(),
+                http_client.clone(),
+            )),
+            config,
+            db: pool,
+            http_client,
+            did_resolver,
+            credential_store: Arc::new(CredentialStore::new()),
+            space_client: Arc::new(SpaceClient::with_transport(mock_transport)),
+            space_locks: Arc::new(SpaceLockManager::new()),
+            oauth_service,
+            push_client: None,
+        }
+    }
+
+    /// A refused exchange is remembered: concurrent and later requests for the
+    /// space do not each mint a delegation token and call the space host, and a
+    /// credential acquired elsewhere (the sweep) is served again at once.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn request_path_acquisition_failure_is_not_rerun_per_request(pool: PgPool) {
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_credential_response(
+            TEST_SPACE_URI,
+            Err(serde_json::json!({
+                "error": "AppNotAuthorized",
+                "message": "Client AppView not permitted to read Space"
+            })
+            .to_string()),
+        );
+        let state = request_path_state(pool, mock_transport.clone()).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                ensure_space_credential_for_request(&state, TEST_SPACE_URI, Some(TEST_USER_DID))
+                    .await
+            }));
+        }
+        for handle in handles {
+            assert!(handle.await.unwrap().is_err());
+        }
+        // Positive control: the chain did run, exactly once.
+        assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
+        assert_eq!(mock_transport.recorded_calls().len(), 1);
+
+        assert!(
+            ensure_space_credential_for_request(&state, TEST_SPACE_URI, Some(TEST_USER_DID))
+                .await
+                .is_err()
+        );
+        assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
+        assert_eq!(mock_transport.recorded_calls().len(), 1);
+
+        // Another space is unaffected by this space's failure.
+        assert!(
+            !state
+                .credential_store
+                .acquisition_failed_recently("at://did:plc:other/space/blue.catbird.circle/x")
+                .await
+        );
+
+        state
+            .credential_store
+            .insert(
+                TEST_SPACE_URI.into(),
+                credential("from-sweep", chrono::Duration::seconds(600)),
+            )
+            .await;
+        let served =
+            ensure_space_credential_for_request(&state, TEST_SPACE_URI, Some(TEST_USER_DID))
+                .await
+                .expect("a stored credential is served");
+        assert_eq!(served.token, "from-sweep");
+        assert!(
+            !state
+                .credential_store
+                .acquisition_failed_recently(TEST_SPACE_URI)
+                .await,
+            "a stored credential clears the failure"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
