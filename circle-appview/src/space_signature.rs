@@ -47,15 +47,36 @@ pub struct SpaceAuthHeaders {
 }
 
 impl SpaceAuthHeaders {
-    /// Set these headers on `request`, replacing any earlier value.
+    /// Set these headers on `request`, replacing any value already set for them:
+    /// a host refuses a request that carries two `Authorization` or
+    /// `Atproto-Space-Audience` fields.
     pub fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut request = request.header(reqwest::header::AUTHORIZATION, &self.authorization);
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+        let mut fields = vec![(AUTHORIZATION, self.authorization.as_str())];
         if let Some(audience) = &self.audience {
-            request = request.header(AUDIENCE_HEADER, audience);
+            fields.push((HeaderName::from_static(AUDIENCE_HEADER), audience.as_str()));
         }
-        request
-            .header("signature-input", &self.signature_input)
-            .header("signature", &self.signature)
+        fields.push((
+            HeaderName::from_static("signature-input"),
+            self.signature_input.as_str(),
+        ));
+        fields.push((
+            HeaderName::from_static("signature"),
+            self.signature.as_str(),
+        ));
+
+        let mut headers = HeaderMap::with_capacity(fields.len());
+        for (name, value) in fields {
+            match HeaderValue::from_str(value) {
+                Ok(value) => {
+                    headers.insert(name, value);
+                }
+                // Let reqwest report the invalid value when the request is sent.
+                Err(_) => return request.header(name, value),
+            }
+        }
+        // `headers` replaces existing values; `header` would append another.
+        request.headers(headers)
     }
 
     /// The `keyid` parameter of the signature, when one was supplied.
@@ -76,17 +97,6 @@ pub fn p256_did_key(key: &VerifyingKey) -> String {
         "did:key:{}",
         multibase::encode(multibase::Base::Base58Btc, bytes)
     )
-}
-
-/// Parse a P-256 `did:key`. `None` for any other key type or malformed input.
-pub fn parse_p256_did_key(did_key: &str) -> Option<VerifyingKey> {
-    let multibase_key = did_key.strip_prefix("did:key:")?;
-    let (base, bytes) = multibase::decode(multibase_key).ok()?;
-    if base != multibase::Base::Base58Btc {
-        return None;
-    }
-    let point = bytes.strip_prefix(&P256_PUB_MULTICODEC[..])?;
-    VerifyingKey::from_sec1_bytes(point).ok()
 }
 
 /// Headers for `com.atproto.space.getSpaceCredential`: the delegation token,
@@ -163,6 +173,18 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier;
     use p256::elliptic_curve::rand_core::OsRng;
+
+    /// Parse a P-256 `did:key` (the verifier's side of [`p256_did_key`]).
+    /// `None` for any other key type or malformed input.
+    fn parse_p256_did_key(did_key: &str) -> Option<VerifyingKey> {
+        let multibase_key = did_key.strip_prefix("did:key:")?;
+        let (base, bytes) = multibase::decode(multibase_key).ok()?;
+        if base != multibase::Base::Base58Btc {
+            return None;
+        }
+        let point = bytes.strip_prefix(&P256_PUB_MULTICODEC[..])?;
+        VerifyingKey::from_sec1_bytes(point).ok()
+    }
 
     fn signature_bytes(headers: &SpaceAuthHeaders) -> Vec<u8> {
         let encoded = headers
@@ -288,6 +310,39 @@ mod tests {
         let (_, bytes) = multibase::decode(did_key.strip_prefix("did:key:").unwrap()).unwrap();
         assert_eq!(&bytes[..2], &[0x80, 0x24]);
         assert_eq!(bytes.len(), 2 + 33, "compressed SEC1 point");
+    }
+
+    /// `apply` replaces auth headers already on the request instead of adding
+    /// a second field.
+    #[test]
+    fn apply_replaces_existing_auth_headers() {
+        let key = SigningKey::random(&mut OsRng);
+        let headers = credential_headers(&key, "cred", "did:plc:aud");
+        let request = headers
+            .apply(
+                reqwest::Client::new()
+                    .get("https://host.example/xrpc/com.atproto.space.getRepo")
+                    .header(reqwest::header::AUTHORIZATION, "Bearer stale")
+                    .header(AUDIENCE_HEADER, "did:plc:stale")
+                    .header("signature", "atproto-space=:c3RhbGU=:"),
+            )
+            .build()
+            .unwrap();
+        let values = |name: &str| -> Vec<&str> {
+            request
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect()
+        };
+        assert_eq!(values("authorization"), vec!["Atproto-Space cred"]);
+        assert_eq!(values(AUDIENCE_HEADER), vec!["did:plc:aud"]);
+        assert_eq!(
+            values("signature-input"),
+            vec![headers.signature_input.as_str()]
+        );
+        assert_eq!(values("signature"), vec![headers.signature.as_str()]);
     }
 
     /// A published P-256 did:key vector (w3c-ccg did-method-key test vectors).

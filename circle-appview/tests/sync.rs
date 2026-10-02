@@ -3426,28 +3426,76 @@ async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
         "Non-32-byte hash must return InvalidRequest"
     );
 
-    // 2. Empty rev via HTTP router -> Client Error (400 or 422)
-    let bad_json_req = Request::builder()
+    // 2. Empty repoRev. Each request carries a fresh service JWT: a jti is
+    // single-use, so reusing `token` would be refused (401) before the body is
+    // read.
+    let fresh_headers = || {
+        let token = mint_service_jwt(
+            OWNER_DID,
+            &setup.state.config.notify_service_identifier(),
+            "com.atproto.space.notifyWrite",
+            &setup.owner_signing_key,
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    };
+    // An Oct-1 body (32-byte hash) from a repo that is not a Circle member, with
+    // repoRev replaced.
+    let body_with_repo_rev = |repo_rev: &str| {
+        let input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
+            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                &[0x22u8; 32],
+            ),
+            repo: Did::from(String::from(DAVE_DID)),
+            repo_rev: Tid::from(String::from("3l7234567a234")),
+            space_rev: Some(Tid::from(String::from("3l7spacerev2a"))),
+            prev_space_rev: None,
+            space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
+                .unwrap(),
+            extra_data: None,
+        };
+        let mut body = serde_json::to_value(&input).unwrap();
+        body["repoRev"] = json!(repo_rev);
+        body.to_string()
+    };
+
+    // Positive control: with a nonempty repoRev the body parses and the handler
+    // gets as far as the membership check.
+    let res = circle_appview::sync::notify_write_handler(
+        axum::extract::State(setup.state.clone()),
+        fresh_headers(),
+        bytes::Bytes::from(body_with_repo_rev("3l7234567a234")),
+    )
+    .await;
+    assert!(matches!(res, Err(AppError::Forbidden(_))), "{res:?}");
+
+    let res = circle_appview::sync::notify_write_handler(
+        axum::extract::State(setup.state.clone()),
+        fresh_headers(),
+        bytes::Bytes::from(body_with_repo_rev("")),
+    )
+    .await;
+    // repoRev is a TID, so the generated type refuses "" while the body is
+    // parsed; the handler's own empty check is a backstop.
+    assert!(
+        matches!(&res, Err(AppError::InvalidRequest(_))),
+        "Empty repoRev must return InvalidRequest: {res:?}"
+    );
+
+    // The same body over the router is a client error, not an auth failure.
+    let mut request = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.notifyWrite")
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
         .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(
-            json!({
-                "space": SPACE_URI,
-                "repo": OWNER_DID,
-                "rev": "",
-                "hash": base64::engine::general_purpose::STANDARD.encode([0x22u8; 32])
-            })
-            .to_string(),
-        ))
+        .body(axum::body::Body::from(body_with_repo_rev("")))
         .unwrap();
-
-    let res2 = app.oneshot(bad_json_req).await.unwrap();
-    assert!(
-        res2.status().is_client_error(),
-        "Empty rev must return client error"
-    );
+    request.headers_mut().extend(fresh_headers());
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "Empty repoRev");
 }
 
 #[sqlx::test(migrations = "./migrations")]
