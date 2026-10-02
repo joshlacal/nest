@@ -27,16 +27,31 @@ pub struct ActiveSpaceCredential {
 /// A cached credential is handed out only while it has at least this long left,
 /// so a request (or a sweep's run of requests, bounded at 30 s) never starts on
 /// a credential about to expire. Sized for the 600 s credentials authorities
-/// issue by default, with room for clock skew.
+/// issue by default, with room for clock skew. Shorter-lived credentials use a
+/// proportionally smaller margin (see [`renewal_margin`]).
 pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
+
+/// The renewal margin for a credential with `lifetime` left when it is stored:
+/// [`CREDENTIAL_RENEWAL_MARGIN`], or half the lifetime when that is shorter.
+/// Issuers may choose any lifetime up to 3600 s, so a credential of a minute or
+/// less is still served for the first half of its life instead of never.
+pub fn renewal_margin(lifetime: chrono::Duration) -> chrono::Duration {
+    std::cmp::min(CREDENTIAL_RENEWAL_MARGIN, lifetime / 2)
+}
 
 /// After an acquisition for a request fails, requests for that space do not run
 /// the exchange again for this long (see [`ensure_space_credential_for_request`]).
 pub const FAILED_ACQUISITION_RETRY_DELAY: chrono::Duration = chrono::Duration::seconds(60);
 
+struct StoredCredential {
+    cred: ActiveSpaceCredential,
+    /// When [`CredentialStore::get`] stops serving it.
+    renew_at: DateTime<Utc>,
+}
+
 #[derive(Default)]
 pub struct CredentialStore {
-    values: RwLock<HashMap<String, ActiveSpaceCredential>>,
+    values: RwLock<HashMap<String, StoredCredential>>,
     /// Space URI -> when request-path acquisition may be tried again.
     failed_acquisitions: RwLock<HashMap<String, DateTime<Utc>>>,
 }
@@ -47,42 +62,52 @@ impl CredentialStore {
     }
 
     pub async fn insert(&self, space: String, cred: ActiveSpaceCredential) {
-        if cred.expires_at <= Utc::now() {
+        self.insert_at(space, cred, Utc::now()).await
+    }
+
+    async fn insert_at(&self, space: String, cred: ActiveSpaceCredential, now: DateTime<Utc>) {
+        if cred.expires_at <= now {
             return;
         }
         self.failed_acquisitions.write().await.remove(&space);
 
+        // Credentials are stored as soon as they are issued, so the time left
+        // now is their lifetime.
+        let renew_at = cred.expires_at - renewal_margin(cred.expires_at - now);
         let mut lock = self.values.write().await;
-        let now = Utc::now();
-        lock.retain(|_, v| v.expires_at > now);
+        lock.retain(|_, v| v.cred.expires_at > now);
 
-        if let Some(existing) = lock.get(&space) {
-            if cred.expires_at >= existing.expires_at {
-                lock.insert(space, cred);
-            }
-        } else {
-            lock.insert(space, cred);
+        if lock
+            .get(&space)
+            .is_some_and(|existing| cred.expires_at < existing.cred.expires_at)
+        {
+            return;
         }
+        lock.insert(space, StoredCredential { cred, renew_at });
     }
 
-    /// The cached credential for `space`, unless it is within
-    /// [`CREDENTIAL_RENEWAL_MARGIN`] of its expiry (the caller then acquires a
+    /// The cached credential for `space`, unless it is within its renewal
+    /// margin ([`renewal_margin`]) of its expiry (the caller then acquires a
     /// fresh credential with a fresh key).
     pub async fn get(&self, space: &str) -> Option<ActiveSpaceCredential> {
-        let now = Utc::now();
+        self.get_at(space, Utc::now()).await
+    }
+
+    async fn get_at(&self, space: &str, now: DateTime<Utc>) -> Option<ActiveSpaceCredential> {
         {
             let lock = self.values.read().await;
-            let cred = lock.get(space)?;
-            if cred.expires_at - CREDENTIAL_RENEWAL_MARGIN > now {
-                return Some(cred.clone());
+            let stored = lock.get(space)?;
+            if stored.renew_at > now {
+                return Some(stored.cred.clone());
             }
         }
 
         let mut lock = self.values.write().await;
-        if let Some(cred) = lock.get(space) {
-            if cred.expires_at <= now {
-                lock.remove(space);
-            }
+        if lock
+            .get(space)
+            .is_some_and(|stored| stored.cred.expires_at <= now)
+        {
+            lock.remove(space);
         }
         None
     }
@@ -96,7 +121,10 @@ impl CredentialStore {
     /// replacement acquired concurrently is kept. Returns whether it was removed.
     pub async fn remove_if_token(&self, space: &str, token: &str) -> bool {
         let mut lock = self.values.write().await;
-        if lock.get(space).is_some_and(|cred| cred.token == token) {
+        if lock
+            .get(space)
+            .is_some_and(|stored| stored.cred.token == token)
+        {
             lock.remove(space);
             return true;
         }
@@ -124,7 +152,7 @@ impl CredentialStore {
     pub async fn count(&self) -> usize {
         let mut lock = self.values.write().await;
         let now = Utc::now();
-        lock.retain(|_, v| v.expires_at > now);
+        lock.retain(|_, v| v.cred.expires_at > now);
         lock.len()
     }
 }
@@ -1367,28 +1395,54 @@ mod tests {
     }
 
     /// A 600 s credential is served until it is within the renewal margin of
-    /// its own exp, then the caller acquires a fresh one.
+    /// its own exp, then the caller acquires a fresh one. A credential shorter
+    /// than twice the margin is served for the first half of its life.
     #[tokio::test]
     async fn credential_store_renews_within_the_margin_of_actual_expiry() {
+        assert_eq!(
+            renewal_margin(chrono::Duration::seconds(600)),
+            CREDENTIAL_RENEWAL_MARGIN
+        );
+        assert_eq!(
+            renewal_margin(chrono::Duration::seconds(30)),
+            chrono::Duration::seconds(15)
+        );
+
         let store = CredentialStore::new();
+        let issued = Utc::now();
+        let at = |secs: i64| issued + chrono::Duration::seconds(secs);
+        let issued_for = |token: &str, secs: i64| ActiveSpaceCredential {
+            token: token.into(),
+            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            expires_at: at(secs),
+        };
+
+        store
+            .insert_at("space-a".into(), issued_for("fresh", 600), issued)
+            .await;
+        assert_eq!(store.get_at("space-a", at(0)).await.unwrap().token, "fresh");
+        assert!(store.get_at("space-a", at(539)).await.is_some());
+        assert!(
+            store.get_at("space-a", at(541)).await.is_none(),
+            "within 60 s of exp"
+        );
+
+        // 55 s credential: the old fixed 60 s margin never served it.
+        store
+            .insert_at("space-b".into(), issued_for("short", 55), issued)
+            .await;
+        assert_eq!(store.get_at("space-b", at(0)).await.unwrap().token, "short");
+        assert!(store.get_at("space-b", at(27)).await.is_some());
+        assert!(store.get_at("space-b", at(28)).await.is_none());
+
+        // Through the public API with the real clock.
         store
             .insert(
-                "space-a".into(),
+                "space-c".into(),
                 credential("fresh", chrono::Duration::seconds(600)),
             )
             .await;
-        assert_eq!(store.get("space-a").await.unwrap().token, "fresh");
-
-        store
-            .insert(
-                "space-b".into(),
-                credential(
-                    "expiring",
-                    CREDENTIAL_RENEWAL_MARGIN - chrono::Duration::seconds(5),
-                ),
-            )
-            .await;
-        assert!(store.get("space-b").await.is_none());
+        assert_eq!(store.get("space-c").await.unwrap().token, "fresh");
     }
 
     #[tokio::test]
