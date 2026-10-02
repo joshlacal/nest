@@ -271,7 +271,8 @@ async fn poller_prime_transactions_are_alert_free_and_fenced() {
         "middle",
         &watermarks,
         false,
-        1
+        1,
+        &[]
     )
     .await
     .unwrap());
@@ -282,15 +283,23 @@ async fn poller_prime_transactions_are_alert_free_and_fenced() {
         "stale",
         &watermarks,
         true,
-        1
+        1,
+        &[]
     )
     .await
     .unwrap());
-    assert!(
-        persist_prime_page(&db.pool, &row, Some("middle"), "head", &watermarks, true, 1)
-            .await
-            .unwrap()
-    );
+    assert!(persist_prime_page(
+        &db.pool,
+        &row,
+        Some("middle"),
+        "head",
+        &watermarks,
+        true,
+        1,
+        &[]
+    )
+    .await
+    .unwrap());
     assert_eq!(db.counts().await, (0, 0, 1));
     let current = db.row().await;
     assert_eq!(current.chat_cursor.as_deref(), Some("head"));
@@ -516,17 +525,24 @@ async fn poller_old_prime_response_cannot_initialize_new_enrollment() {
         .await
         .unwrap();
     let watermarks = HashMap::from([("convo".into(), "3lb".into())]);
-    assert!(
-        persist_prime_page(&db.pool, &old_row, None, "old-head", &watermarks, true, 1)
-            .await
-            .is_err()
-    );
+    assert!(persist_prime_page(
+        &db.pool,
+        &old_row,
+        None,
+        "old-head",
+        &watermarks,
+        true,
+        1,
+        &[]
+    )
+    .await
+    .is_err());
     assert_eq!(db.counts().await, (0, 0, 0));
     assert!(db.row().await.chat_cursor.is_none());
     assert!(db.row().await.primed_at.is_none());
     assert!(persist_prime_page(
         &db.pool,
-        &db.row().await,
+        &db.row(, &[]).await,
         None,
         "new-head",
         &watermarks,
@@ -628,7 +644,8 @@ async fn poller_empty_optional_cursor_primes_fresh_and_preserves_initialized_cur
         &empty.cursor,
         &HashMap::new(),
         true,
-        1
+        1,
+        &[]
     )
     .await
     .unwrap());
@@ -642,5 +659,128 @@ async fn poller_empty_optional_cursor_primes_fresh_and_preserves_initialized_cur
     let invalid: GetLogResponse =
         serde_json::from_value(serde_json::json!({"logs": [{"$type": "future.log"}]})).unwrap();
     assert!(validate_log_page(&invalid).is_err());
+    db.finish().await;
+}
+
+fn mute_log(convo: &str, rev: &str, muted: bool) -> LogEntry {
+    serde_json::from_value(serde_json::json!({
+        "$type": if muted { "chat.bsky.convo.defs#logMuteConvo" } else { "chat.bsky.convo.defs#logUnmuteConvo" },
+        "convoId": convo, "rev": rev
+    })).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn poller_source_mute_intervals_apply_in_order_and_survive_pages() {
+    let db = TestDb::new().await;
+    let row = db.account().await;
+    let first = page(vec![
+        mute_log("convo", "3la", true),
+        LogEntry::CreateMessage(message("convo", "3lb", "muted")),
+        mute_log("convo", "3lc", false),
+        LogEntry::CreateMessage(message("convo", "3ld", "after-unmute")),
+        mute_log("other", "3la", true),
+    ]);
+    persist_log_page(&db.pool, &row, &first, 1).await.unwrap();
+    assert_eq!(db.counts().await, (1, 1, 2));
+    let second = GetLogResponse {
+        cursor: "next".into(),
+        logs: vec![LogEntry::CreateMessage(message(
+            "other",
+            "3lb",
+            "still-muted-next-page",
+        ))],
+    };
+    persist_log_page(&db.pool, &db.row().await, &second, 1)
+        .await
+        .unwrap();
+    assert_eq!(db.counts().await, (1, 1, 2));
+    let state: (String, bool) = sqlx::query_as(
+        "SELECT last_mute_rev, log_muted FROM chat_notified_watermarks WHERE convo_id='other'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, ("3la".into(), true));
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn poller_old_log_unmute_cannot_clear_newer_log_or_explicit_mute() {
+    let db = TestDb::new().await;
+    let row = db.account().await;
+    let first = page(vec![mute_log("convo", "3lc", true)]);
+    persist_log_page(&db.pool, &row, &first, 1).await.unwrap();
+    let old = page(vec![mute_log("convo", "3lb", false)]);
+    persist_log_page(&db.pool, &db.row().await, &old, 1)
+        .await
+        .unwrap();
+    let muted: bool =
+        sqlx::query_scalar("SELECT log_muted FROM chat_notified_watermarks WHERE convo_id='convo'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(muted);
+    let scheduler = ChatPollScheduler::new(db.pool.clone());
+    scheduler
+        .set_convo_muted(&row.account_did, "convo", true)
+        .await
+        .unwrap();
+    let newer = GetLogResponse {
+        cursor: "next".into(),
+        logs: vec![
+            mute_log("convo", "3ld", false),
+            LogEntry::CreateMessage(message("convo", "3le", "explicit-still-muted")),
+        ],
+    };
+    persist_log_page(&db.pool, &db.row().await, &newer, 1)
+        .await
+        .unwrap();
+    assert_eq!(db.counts().await, (0, 0, 1));
+    assert!(scheduler
+        .is_convo_muted(&row.account_did, "convo")
+        .await
+        .unwrap());
+    let muted: bool =
+        sqlx::query_scalar("SELECT log_muted FROM chat_notified_watermarks WHERE convo_id='convo'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(!muted);
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn poller_prime_seeds_source_mute_without_alerting() {
+    let db = TestDb::new().await;
+    let row = db.account().await;
+    sqlx::query("UPDATE chat_poll_state SET primed_at=NULL, last_successful_poll_at=NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mutes = batch_mute_changes(&[mute_log("convo", "3la", true)]);
+    assert!(persist_prime_page(
+        &db.pool,
+        &row,
+        Some("before"),
+        "head",
+        &HashMap::new(),
+        true,
+        1,
+        &mutes
+    )
+    .await
+    .unwrap());
+    let logs = page(vec![LogEntry::CreateMessage(message(
+        "convo",
+        "3lb",
+        "new-but-muted",
+    ))]);
+    persist_log_page(&db.pool, &db.row().await, &logs, 1)
+        .await
+        .unwrap();
+    assert_eq!(db.counts().await, (0, 0, 1));
     db.finish().await;
 }

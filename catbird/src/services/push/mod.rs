@@ -265,9 +265,15 @@ impl PushServices {
                           )
                     )
                 ) AS activity_sub_active,
-                (tm.user_did IS NOT NULL OR ($4 = 'chat_message' AND EXISTS (
-                    SELECT 1 FROM chat_muted_convos cm
-                    WHERE cm.account_did=param.did AND cm.convo_id=q.event_record_json->>'convoId'
+                (tm.user_did IS NOT NULL OR ($4 = 'chat_message' AND (
+                    EXISTS (
+                        SELECT 1 FROM chat_muted_convos cm
+                        WHERE cm.account_did=param.did AND cm.convo_id=q.event_record_json->>'convoId'
+                    ) OR EXISTS (
+                        SELECT 1 FROM chat_notified_watermarks wm
+                        WHERE wm.account_did=param.did AND wm.convo_id=q.event_record_json->>'convoId'
+                          AND wm.log_muted = TRUE
+                    )
                 ))) AS thread_is_muted,
                 ($4 = 'chat_message' AND EXISTS (
                     SELECT 1 FROM chat_notified_watermarks wm

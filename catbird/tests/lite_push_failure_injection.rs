@@ -690,6 +690,37 @@ async fn legacy_chat_without_source_revision_is_held_without_sending_or_discardi
 }
 
 #[tokio::test]
+async fn queued_chat_obeys_log_mute_and_cached_mute_survives_log_unmute() {
+    let fixture = Fixture::new(1).await;
+    fixture.enqueue().await;
+    sqlx::query("INSERT INTO chat_notified_watermarks (account_did, convo_id, last_rev, last_mute_rev, log_muted) VALUES ($1, $2, '0000000000005', '0000000000005', TRUE)")
+        .bind(RECIPIENT).bind(CONVO).execute(&fixture.pool).await.unwrap();
+    fixture.process_with_new_worker().await;
+    assert!(fixture.fake.attempts.lock().await.is_empty());
+    assert_eq!(fixture.queue_count().await, 0);
+    catbird::services::chat_poll::scheduler::ChatPollScheduler::new(fixture.pool.clone())
+        .set_convo_muted(RECIPIENT, CONVO, true)
+        .await
+        .unwrap();
+    // Poller tests qualify monotonic log ordering. At the delivery boundary,
+    // neither an older nor a newer unmute state may erase a cached client mute.
+    for revision in ["0000000000004", "0000000000007"] {
+        sqlx::query("UPDATE chat_notified_watermarks SET last_mute_rev = $1, log_muted = FALSE WHERE account_did = $2 AND convo_id = $3")
+            .bind(revision).bind(RECIPIENT).bind(CONVO).execute(&fixture.pool).await.unwrap();
+        let mut event = fixture.event.clone();
+        event.message_id = format!("message-after-unmute-{revision}");
+        event.log_rev = Some("0000000000008".to_string());
+        enqueue_push(&fixture.pool, &event, 0).await.unwrap();
+        fixture.process_with_new_worker().await;
+        assert!(fixture.fake.attempts.lock().await.is_empty());
+        assert_eq!(fixture.queue_count().await, 0);
+        let muted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2)")
+            .bind(RECIPIENT).bind(CONVO).fetch_one(&fixture.pool).await.unwrap();
+        assert!(muted);
+    }
+}
+
+#[tokio::test]
 async fn migration_holds_legacy_queue_without_changing_payload_or_history() {
     let fixture = Fixture::new_at_schema(1, false).await;
     catbird::services::chat_poll::scheduler::ChatPollScheduler::new(fixture.pool.clone())

@@ -7,7 +7,10 @@ ALTER TABLE chat_poll_state
     ADD COLUMN catch_up_reason TEXT;
 
 -- Distinguish read suppression from the combined processed/notified watermark.
-ALTER TABLE chat_notified_watermarks ADD COLUMN last_read_rev TEXT;
+ALTER TABLE chat_notified_watermarks
+    ADD COLUMN last_read_rev TEXT,
+    ADD COLUMN last_mute_rev TEXT,
+    ADD COLUMN log_muted BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX idx_chat_poll_unheld_due ON chat_poll_state (next_poll_at)
     WHERE catch_up_required_at IS NULL;

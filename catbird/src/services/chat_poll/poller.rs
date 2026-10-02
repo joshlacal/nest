@@ -202,13 +202,16 @@ pub(crate) async fn poll_account_with_session(
                                 LogEntry::CreateMessage(event) => {
                                     raise_watermark(&mut dirty, &event.convo_id, &event.rev);
                                 }
-                                LogEntry::ReadMessage(event) => {
+                                LogEntry::ReadMessage(event)
+                                | LogEntry::MuteConvo(event)
+                                | LogEntry::UnmuteConvo(event) => {
                                     raise_watermark(&mut dirty, &event.convo_id, &event.rev);
                                 }
                                 _ => {}
                             }
                         }
 
+                        let log_mutes = batch_mute_changes(&page.logs);
                         let page_done =
                             page.logs.is_empty() || Some(&page.cursor) == cursor.as_ref();
                         let new_cursor = if page.cursor.is_empty() {
@@ -224,6 +227,7 @@ pub(crate) async fn poll_account_with_session(
                             &dirty,
                             page_done,
                             auth_generation,
+                            &log_mutes,
                         )
                         .await?
                         {
@@ -925,6 +929,7 @@ async fn persist_prime_page(
     watermarks: &HashMap<String, String>,
     done: bool,
     auth_generation: i64,
+    log_mutes: &[(String, String, bool)],
 ) -> Result<bool> {
     let mut tx = db_pool.begin().await?;
     crate::services::push::lock::acquire_account_lock(&mut tx, &row.account_did).await?;
@@ -941,6 +946,9 @@ async fn persist_prime_page(
         return Ok(false);
     }
     verify_page_authorization(&mut tx, &row.account_did, auth_generation).await?;
+    for (convo, rev, muted) in log_mutes {
+        persist_log_mute(&mut tx, &row.account_did, convo, rev, *muted).await?;
+    }
     let (convos, revs): (Vec<_>, Vec<_>) = watermarks.iter().unzip();
     sqlx::query(
         r#"INSERT INTO chat_notified_watermarks (account_did, convo_id, last_rev, updated_at)
@@ -962,6 +970,50 @@ async fn persist_prime_page(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Latest source mute state remains separate from explicit/cached preferences.
+/// A source unmute may clear only this veto, never a newer explicit mute.
+async fn persist_log_mute(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    did: &str,
+    convo_id: &str,
+    rev: &str,
+    muted: bool,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO chat_notified_watermarks
+            (account_did, convo_id, last_rev, last_mute_rev, log_muted, updated_at)
+            VALUES ($1, $2, $3, $3, $4, NOW())
+            ON CONFLICT (account_did, convo_id) DO UPDATE
+            SET last_rev = GREATEST(chat_notified_watermarks.last_rev, EXCLUDED.last_rev),
+                last_mute_rev = EXCLUDED.last_mute_rev,
+                log_muted = EXCLUDED.log_muted, updated_at = NOW()
+            WHERE chat_notified_watermarks.last_mute_rev IS NULL
+               OR chat_notified_watermarks.last_mute_rev < EXCLUDED.last_mute_rev"#,
+    )
+    .bind(did)
+    .bind(convo_id)
+    .bind(rev)
+    .bind(muted)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn batch_mute_changes(logs: &[LogEntry]) -> Vec<(String, String, bool)> {
+    let mut changes: Vec<_> = logs
+        .iter()
+        .filter_map(|entry| match entry {
+            LogEntry::MuteConvo(event) => Some((event.convo_id.clone(), event.rev.clone(), true)),
+            LogEntry::UnmuteConvo(event) => {
+                Some((event.convo_id.clone(), event.rev.clone(), false))
+            }
+            _ => None,
+        })
+        .collect();
+    changes.sort_by(|a, b| a.1.cmp(&b.1));
+    changes
 }
 
 /// The caller holds the push account advisory lock. An old network response
@@ -1022,26 +1074,45 @@ async fn persist_log_page(
     let reads = batch_read_maxima(&page.logs);
     let mut dirty = reads.clone();
     let mut had_incoming_message = false;
-    let mut creates: Vec<_> = page
+    let mut events: Vec<_> = page
         .logs
         .iter()
         .filter_map(|entry| match entry {
-            LogEntry::CreateMessage(event) => Some(event),
+            LogEntry::CreateMessage(event) => Some((event.rev.as_str(), entry)),
+            LogEntry::MuteConvo(event) | LogEntry::UnmuteConvo(event) => {
+                Some((event.rev.as_str(), entry))
+            }
             _ => None,
         })
         .collect();
-    // getLog pages normally arrive in revision order. Sorting prevents a
-    // duplicate/reordered page from losing a lower, still-unprocessed create.
-    creates.sort_by(|a, b| a.rev.cmp(&b.rev));
+    // Process source mutations alongside creates so a mute interval suppresses
+    // its own messages without a later unmute replaying them.
+    events.sort_by(|a, b| a.0.cmp(b.0));
 
-    for event in creates {
+    for (_, entry) in events {
+        let event = match entry {
+            LogEntry::MuteConvo(event) | LogEntry::UnmuteConvo(event) => {
+                persist_log_mute(
+                    &mut tx,
+                    &row.account_did,
+                    &event.convo_id,
+                    &event.rev,
+                    matches!(entry, LogEntry::MuteConvo(_)),
+                )
+                .await?;
+                raise_watermark(&mut dirty, &event.convo_id, &event.rev);
+                continue;
+            }
+            LogEntry::CreateMessage(event) => event,
+            _ => unreachable!("only creates and mute mutations were selected"),
+        };
         let wm = effective_watermark(&watermarks, &dirty, &event.convo_id);
         if !should_notify(&event.rev, wm.as_deref()) {
             continue;
         }
         let own = event.message.sender.did == row.account_did;
         let muted: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2)",
+            "SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2) OR EXISTS(SELECT 1 FROM chat_notified_watermarks WHERE account_did = $1 AND convo_id = $2 AND log_muted)",
         )
         .bind(&row.account_did)
         .bind(&event.convo_id)
