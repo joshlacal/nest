@@ -542,12 +542,13 @@ async fn poller_old_prime_response_cannot_initialize_new_enrollment() {
     assert!(db.row().await.primed_at.is_none());
     assert!(persist_prime_page(
         &db.pool,
-        &db.row(, &[]).await,
+        &db.row().await,
         None,
         "new-head",
         &watermarks,
         true,
-        2
+        2,
+        &[]
     )
     .await
     .unwrap());
