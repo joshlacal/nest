@@ -249,6 +249,8 @@ pub struct AppState {
     pub credential_store: Arc<CredentialStore>,
     pub space_client: Arc<SpaceClient>,
     pub space_locks: Arc<crate::access::SpaceLockManager>,
+    /// Where the revision sweep resumes budget-cut listRepos listings.
+    pub listing_resume: Arc<crate::sync::ListingResumePoints>,
     pub profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
     pub oauth_service: Arc<OAuthService>,
     pub push_client: Option<Arc<crate::push::CirclePushClient>>,
@@ -341,6 +343,7 @@ impl AppState {
             credential_store,
             space_client,
             space_locks,
+            listing_resume: Arc::new(crate::sync::ListingResumePoints::new()),
             profile_hydrator,
             oauth_service,
             push_client,

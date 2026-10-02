@@ -5007,3 +5007,72 @@ async fn credential_rejected_by_register_notify_is_not_used_to_list(pool: PgPool
         "no listRepos with a credential registerNotify just had rejected"
     );
 }
+
+/// A 13-character TID-alphabet spaceRev that sorts with `i`.
+fn space_rev(i: usize) -> String {
+    const ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+    let digit = |shift: usize| ALPHABET[(i >> shift) & 31] as char;
+    format!("3l7spacerv{}{}{}", digit(10), digit(5), digit(0))
+}
+
+fn writer_entry(i: usize) -> catbird_atproto::generated::com_atproto::space::list_repos::Repo {
+    catbird_atproto::generated::com_atproto::space::list_repos::Repo {
+        did: Did::from(format!("did:plc:resume-writer-{i}")),
+        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x22; 32]),
+        repo_rev: Tid::from(String::from("3l7234567a234")),
+        space_rev: Tid::from(space_rev(i)),
+        extra_data: None,
+    }
+}
+
+/// listRepos ascends by spaceRev, so a listing the sweep budget cuts short must
+/// resume after its last processed entry rather than restart: restarting would
+/// always drop the most recently updated writers. A finished listing starts over.
+#[sqlx::test(migrations = "./migrations")]
+async fn sweep_resumes_a_budget_cut_listing_from_its_last_processed_space_rev(pool: PgPool) {
+    use catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput;
+    use circle_appview::sync::MAX_REPOS_PER_SWEEP;
+    let setup = setup_sync_test(pool.clone()).await;
+    register_notify_fresh(&setup, &pool).await;
+    let writers = MAX_REPOS_PER_SWEEP + 5;
+    assert!(space_rev(0) < space_rev(1) && space_rev(1) < space_rev(writers - 1));
+
+    setup.mock_transport.set_list_repos_response(
+        SPACE_URI,
+        ListReposOutput {
+            cursor: Some(space_rev(writers - 1).into()),
+            repos: (0..writers).map(writer_entry).collect(),
+            extra_data: None,
+        },
+    );
+    let cut_at = space_rev(MAX_REPOS_PER_SWEEP - 1);
+    setup.mock_transport.set_list_repos_response(
+        &format!("{SPACE_URI}:{cut_at}"),
+        ListReposOutput {
+            cursor: Some(space_rev(writers - 1).into()),
+            repos: (MAX_REPOS_PER_SWEEP..writers).map(writer_entry).collect(),
+            extra_data: None,
+        },
+    );
+    // Past the last writer the mock answers the empty, cursor-less final page.
+
+    let first = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(first.repos_checked, MAX_REPOS_PER_SWEEP, "budget cut");
+    assert_eq!(
+        setup.state.listing_resume.get(SPACE_URI),
+        Some(cut_at.clone())
+    );
+
+    let second = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(second.repos_checked, 5, "the newest writers are reached");
+    assert_eq!(setup.state.listing_resume.get(SPACE_URI), None);
+
+    let third = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(third.repos_checked, MAX_REPOS_PER_SWEEP);
+
+    assert_eq!(
+        setup.mock_transport.recorded_list_repos_cursors(),
+        vec![None, Some(cut_at), Some(space_rev(writers - 1)), None,],
+        "resume after the last processed spaceRev, then start over once finished"
+    );
+}

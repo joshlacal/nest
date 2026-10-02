@@ -118,6 +118,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         credential_store,
         space_client,
         space_locks,
+        listing_resume: Default::default(),
         profile_hydrator,
         oauth_service,
         push_client: None,

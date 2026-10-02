@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -44,6 +44,47 @@ pub struct SyncResult {
     pub records_rejected: usize,
     pub latest_rev: String,
     pub bytes_processed: usize,
+}
+
+/// Where the revision sweep resumes a space's listRepos listing that its budget
+/// cut short. Held in memory only: after a restart every space is listed from
+/// the beginning.
+///
+/// listRepos ascends by spaceRev, so restarting a cut listing from the
+/// beginning would always drop the most recently updated writers (and, in a
+/// space larger than the budget, never reach them). A cut listing resumes after
+/// the spaceRev of the last entry it finished with, which the exclusive cursor
+/// accepts. Once a listing reaches its empty final page the space's next
+/// listing starts from the beginning again, re-checking every writer,
+/// including any whose sync failed.
+#[derive(Default)]
+pub struct ListingResumePoints {
+    space_revs: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl ListingResumePoints {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The exclusive spaceRev cursor to resume `space_uri`'s listing from.
+    pub fn get(&self, space_uri: &str) -> Option<String> {
+        self.lock().get(space_uri).cloned()
+    }
+
+    fn set(&self, space_uri: &str, space_rev: String) {
+        self.lock().insert(space_uri.to_string(), space_rev);
+    }
+
+    fn clear(&self, space_uri: &str) {
+        self.lock().remove(space_uri);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.space_revs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1659,9 +1700,14 @@ pub async fn sweep_once_with_shutdown(
                 Ok(ep) => ep,
                 Err(_) => continue,
             };
-        let mut cursor: Option<String> = None;
+        // Resume a listing an earlier pass's budget cut short (ListingResumePoints).
+        let mut cursor: Option<String> = state.listing_resume.get(&space_uri);
         let mut seen_cursors = HashSet::new();
         let mut page_count = 0;
+        // The spaceRev of the last entry this pass finished with, and whether
+        // the next listing of this space starts from the beginning.
+        let mut last_processed: Option<String> = None;
+        let mut start_over = false;
 
         loop {
             // Check shutdown between pages
@@ -1705,9 +1751,9 @@ pub async fn sweep_once_with_shutdown(
                 }
             };
             // listRepos pages through writers in ascending spaceRev order and
-            // ends with an empty page, which omits the cursor. This sweep keeps
-            // no listing checkpoint: every pass starts from the beginning.
+            // ends with an empty page, which omits the cursor.
             if repos_output.repos.is_empty() {
+                start_over = true;
                 break;
             }
             let mut credential_rejected = false;
@@ -1773,7 +1819,8 @@ pub async fn sweep_once_with_shutdown(
                         }
                         Err(e) => {
                             summary.repos_failed += 1;
-                            // The credential was evicted; stop using it for this space.
+                            // The credential was evicted; stop using it for this
+                            // space. A resumed listing retries this repo.
                             if crate::access::is_credential_rejected(&e) {
                                 credential_rejected = true;
                                 break;
@@ -1782,6 +1829,7 @@ pub async fn sweep_once_with_shutdown(
                     }
                     total_bytes_processed = sync_engine.total_bytes_processed();
                 }
+                last_processed = Some(repo.space_rev.to_string());
             }
 
             if credential_rejected {
@@ -1790,16 +1838,26 @@ pub async fn sweep_once_with_shutdown(
 
             if let Some(next_cursor) = repos_output.cursor {
                 let next_cur_str = next_cursor.to_string();
-                if next_cur_str.len() > MAX_CURSOR_LEN
-                    || seen_cursors.len() >= MAX_PAGES_PER_SWEEP
-                    || !seen_cursors.insert(next_cur_str.clone())
-                {
+                if next_cur_str.len() > MAX_CURSOR_LEN || seen_cursors.contains(&next_cur_str) {
+                    // A malformed or repeating listing is not resumed.
+                    start_over = true;
                     break;
                 }
+                if seen_cursors.len() >= MAX_PAGES_PER_SWEEP {
+                    break;
+                }
+                seen_cursors.insert(next_cur_str.clone());
                 cursor = Some(next_cur_str);
             } else {
+                start_over = true;
                 break;
             }
+        }
+
+        if start_over {
+            state.listing_resume.clear(&space_uri);
+        } else if let Some(space_rev) = last_processed {
+            state.listing_resume.set(&space_uri, space_rev);
         }
 
         // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
@@ -1933,7 +1991,8 @@ pub async fn notify_write_handler(
         ));
     }
     // Space revisions are not checkpointed here: the revision sweep re-lists
-    // every space, so a prevSpaceRev gap is repaired on its next pass.
+    // every space (resuming a listing its budget cut short), so a prevSpaceRev
+    // gap is repaired by a later pass.
     tracing::debug!(
         space = %crate::access::space_fingerprint(input.space.as_str()),
         space_rev = ?input.space_rev.as_ref().map(|r| r.as_str()),

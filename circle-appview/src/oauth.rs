@@ -2794,6 +2794,7 @@ mod tests {
             credential_store: Arc::new(crate::access::CredentialStore::new()),
             space_client: Arc::new(crate::space_client::SpaceClient::new()),
             space_locks: Arc::new(crate::access::SpaceLockManager::new()),
+            listing_resume: Default::default(),
             profile_hydrator: Arc::new(crate::hydration::ProfileHydrator::new(
                 "https://public.api.bsky.app".into(),
                 http_client.clone(),
