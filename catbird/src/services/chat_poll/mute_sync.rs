@@ -119,6 +119,13 @@ pub(crate) async fn sync_mutes_for_session(
     did: &str,
     start_time: std::time::Instant,
 ) -> Result<()> {
+    let remaining = MAX_MUTE_SYNC_DURATION
+        .checked_sub(start_time.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| anyhow!("Mute sync duration exhausted before generation capture"))?;
+    let mute_generation = tokio::time::timeout(remaining, scheduler.mute_generation(did))
+        .await
+        .map_err(|_| anyhow!("Mute sync generation lookup timed out"))??;
     let client = crate::services::AtProtoClient::new(state.clone());
 
     // Go through `proxy_request` rather than hand-rolling the call on
@@ -325,9 +332,9 @@ pub(crate) async fn sync_mutes_for_session(
         };
 
         // Bulk-replace the muted set in the database ONLY on full clean completion within deadline
-        match tokio::time::timeout(
+        let applied = match tokio::time::timeout(
             commit_remaining,
-            scheduler.sync_muted_convos(did, &staged_muted_ids),
+            scheduler.sync_muted_convos(did, &staged_muted_ids, mute_generation),
         )
         .await
         {
@@ -341,6 +348,11 @@ pub(crate) async fn sync_mutes_for_session(
                 return Err(anyhow!("Mute sync DB commit timed out for {}", did));
             }
         };
+
+        if !applied {
+            tracing::debug!(did = %did, "Discarding stale mute snapshot after a newer mutation; next sync will retry");
+            return Ok(());
+        }
 
         tracing::debug!(
             did = %did,

@@ -171,7 +171,7 @@ async fn poller_read_mute_and_own_suppression_preserve_read_watermark() {
     own.message.sender.did = row.account_did.clone();
     let logs = page(vec![
         LogEntry::CreateMessage(message("read", "3la", "read")),
-        LogEntry::ReadMessage(message("read", "3lc", "read")),
+        LogEntry::ReadMessage(message("read", "3lc", "read").into()),
         LogEntry::CreateMessage(message("muted", "3la", "muted")),
         LogEntry::CreateMessage(own),
         LogEntry::CreateMessage(message("visible", "3la", "visible")),
@@ -264,18 +264,30 @@ async fn poller_prime_transactions_are_alert_free_and_fenced() {
         .await
         .unwrap();
     let watermarks = HashMap::from([("convo".into(), "3lb".into())]);
+    assert!(persist_prime_page(
+        &db.pool,
+        &row,
+        Some("before"),
+        "middle",
+        &watermarks,
+        false,
+        1
+    )
+    .await
+    .unwrap());
+    assert!(!persist_prime_page(
+        &db.pool,
+        &row,
+        Some("before"),
+        "stale",
+        &watermarks,
+        true,
+        1
+    )
+    .await
+    .unwrap());
     assert!(
-        persist_prime_page(&db.pool, &row, Some("before"), "middle", &watermarks, false)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !persist_prime_page(&db.pool, &row, Some("before"), "stale", &watermarks, true)
-            .await
-            .unwrap()
-    );
-    assert!(
-        persist_prime_page(&db.pool, &row, Some("middle"), "head", &watermarks, true)
+        persist_prime_page(&db.pool, &row, Some("middle"), "head", &watermarks, true, 1)
             .await
             .unwrap()
     );
@@ -444,6 +456,154 @@ async fn poller_live_getlog_priming_and_reopening_emit_no_push() {
             .await
             .is_err()
     );
+    // Hold the fake listConvos response while a newer explicit mute commits.
+    // The fetched empty snapshot must be discarded by the captured generation.
+    let request_seen = Arc::new(tokio::sync::Notify::new());
+    let notify_request = request_seen.clone();
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_request: &Request| {
+            notify_request.notify_one();
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(serde_json::json!({"convos": []}))
+        })
+        .mount(&pds)
+        .await;
+    let sync = super::super::mute_sync::sync_mutes_for_session(
+        &state,
+        &scheduler,
+        &session,
+        &dpop,
+        &row.account_did,
+        std::time::Instant::now(),
+    );
+    let newer_mute = async {
+        tokio::time::timeout(Duration::from_secs(3), request_seen.notified())
+            .await
+            .expect("fake listConvos request must start");
+        scheduler
+            .set_convo_muted(&row.account_did, "newer-local-mute", true)
+            .await
+            .unwrap();
+    };
+    let (sync_result, ()) = tokio::join!(sync, newer_mute);
+    sync_result.unwrap();
+    assert!(scheduler
+        .is_convo_muted(&row.account_did, "newer-local-mute")
+        .await
+        .unwrap());
     drop(state);
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn poller_old_prime_response_cannot_initialize_new_enrollment() {
+    let db = TestDb::new().await;
+    let row = db.account().await;
+    sqlx::query("UPDATE chat_poll_state SET primed_at = NULL, chat_cursor = NULL, last_successful_poll_at = NULL")
+        .execute(&db.pool).await.unwrap();
+    let old_row = db.row().await;
+    let scheduler = ChatPollScheduler::new(db.pool.clone());
+    scheduler.unenroll_account(&row.account_did).await.unwrap();
+    sqlx::query("UPDATE push_accounts SET auth_generation = 2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    scheduler
+        .enroll_account(&row.account_did, "new-pds.invalid")
+        .await
+        .unwrap();
+    let watermarks = HashMap::from([("convo".into(), "3lb".into())]);
+    assert!(
+        persist_prime_page(&db.pool, &old_row, None, "old-head", &watermarks, true, 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(db.counts().await, (0, 0, 0));
+    assert!(db.row().await.chat_cursor.is_none());
+    assert!(db.row().await.primed_at.is_none());
+    assert!(persist_prime_page(
+        &db.pool,
+        &db.row().await,
+        None,
+        "new-head",
+        &watermarks,
+        true,
+        2
+    )
+    .await
+    .unwrap());
+    assert_eq!(db.row().await.chat_cursor.as_deref(), Some("new-head"));
+    db.finish().await;
+}
+
+#[test]
+fn poller_supports_current_and_legacy_read_logs_with_system_messages() {
+    for log_type in ["logReadMessage", "logReadConvo"] {
+        let page: GetLogResponse = serde_json::from_value(serde_json::json!({
+            "cursor": "head", "logs": [{
+                "$type": format!("chat.bsky.convo.defs#{log_type}"),
+                "convoId": "convo", "rev": "3lc",
+                "message": {
+                    "$type": "chat.bsky.convo.defs#systemMessageView",
+                    "id": "system", "rev": "3lb", "sentAt": "2026-01-01T00:00:00Z",
+                    "data": {"$type": "chat.bsky.convo.defs#systemMessageDataLockConvo"}
+                }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            batch_read_maxima(&page.logs)
+                .get("convo")
+                .map(String::as_str),
+            Some("3lc")
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn poller_stale_mute_snapshot_cannot_overwrite_newer_mutation() {
+    let db = TestDb::new().await;
+    let row = db.account().await;
+    let scheduler = ChatPollScheduler::new(db.pool.clone());
+    let before_fetch = scheduler.mute_generation(&row.account_did).await.unwrap();
+    scheduler
+        .set_convo_muted(&row.account_did, "new-mute", true)
+        .await
+        .unwrap();
+    assert!(!scheduler
+        .sync_muted_convos(&row.account_did, &[], before_fetch)
+        .await
+        .unwrap());
+    assert!(scheduler
+        .is_convo_muted(&row.account_did, "new-mute")
+        .await
+        .unwrap());
+    let current = scheduler.mute_generation(&row.account_did).await.unwrap();
+    assert!(scheduler
+        .sync_muted_convos(&row.account_did, &["new-mute".into()], current)
+        .await
+        .unwrap());
+    // A newer complete snapshot also invalidates an older overlapping fetch.
+    assert!(!scheduler
+        .sync_muted_convos(&row.account_did, &[], current)
+        .await
+        .unwrap());
+    let before_unmute = scheduler.mute_generation(&row.account_did).await.unwrap();
+    scheduler
+        .set_convo_muted(&row.account_did, "new-mute", false)
+        .await
+        .unwrap();
+    assert!(!scheduler
+        .sync_muted_convos(&row.account_did, &["new-mute".into()], before_unmute)
+        .await
+        .unwrap());
+    assert!(!scheduler
+        .is_convo_muted(&row.account_did, "new-mute")
+        .await
+        .unwrap());
     db.finish().await;
 }

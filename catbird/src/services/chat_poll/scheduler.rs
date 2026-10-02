@@ -388,6 +388,7 @@ impl ChatPollScheduler {
                 .await?;
             }
 
+            bump_mute_generation(&mut tx, did).await?;
             tx.commit().await?;
         } else {
             // Allow delete/unmute of legacy invalid rows regardless of creation-time syntax
@@ -398,10 +399,22 @@ impl ChatPollScheduler {
                 .bind(convo_id)
                 .execute(&mut *tx)
                 .await?;
+            bump_mute_generation(&mut tx, did).await?;
             tx.commit().await?;
         }
 
         Ok(())
+    }
+
+    /// Version captured before the background listConvos fetch begins.
+    pub async fn mute_generation(&self, did: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM chat_mute_sync_generations WHERE account_did = $1",
+        )
+        .bind(did)
+        .fetch_optional(&self.db_pool)
+        .await?
+        .unwrap_or(0))
     }
 
     /// Bulk-replace the full set of muted conversations for a DID.
@@ -409,7 +422,13 @@ impl ChatPollScheduler {
     /// Runs inside a transaction: deletes all existing mute rows for the DID,
     /// then inserts the new set. Fails atomically without modifying DB if over quota
     /// or any conversation ID is invalid.
-    pub async fn sync_muted_convos(&self, did: &str, convo_ids: &[String]) -> Result<()> {
+    /// Returns false if a newer mutation invalidated the fetched snapshot.
+    pub async fn sync_muted_convos(
+        &self,
+        did: &str,
+        convo_ids: &[String],
+        expected_generation: i64,
+    ) -> Result<bool> {
         let mut deduped = std::collections::HashSet::new();
         for convo_id in convo_ids {
             if !is_valid_convo_id(convo_id) {
@@ -428,6 +447,16 @@ impl ChatPollScheduler {
 
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM chat_mute_sync_generations WHERE account_did = $1",
+        )
+        .bind(did)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(0);
+        if generation != expected_generation {
+            return Ok(false);
+        }
 
         // Serialize quota cardinality with shared account advisory transaction lock across all writers
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('chat_muted_convos:' || $1))")
@@ -453,9 +482,10 @@ impl ChatPollScheduler {
             .await?;
         }
 
+        bump_mute_generation(&mut tx, did).await?;
         tx.commit().await?;
 
-        Ok(())
+        Ok(true)
     }
 
     // MARK: - Notification Watermarks
@@ -529,6 +559,15 @@ impl ChatPollScheduler {
 
         Ok(())
     }
+}
+
+/// Called only under the push account advisory lock, in the writer transaction.
+async fn bump_mute_generation(tx: &mut sqlx::Transaction<'_, Postgres>, did: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO chat_mute_sync_generations(account_did, generation) VALUES ($1, 1) ON CONFLICT(account_did) DO UPDATE SET generation = chat_mute_sync_generations.generation + 1",
+    )
+    .bind(did).execute(&mut **tx).await?;
+    Ok(())
 }
 
 #[cfg(test)]

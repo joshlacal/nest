@@ -199,7 +199,10 @@ pub(crate) async fn poll_account_with_session(
                         let mut dirty: HashMap<String, String> = HashMap::new();
                         for entry in &page.logs {
                             match entry {
-                                LogEntry::CreateMessage(event) | LogEntry::ReadMessage(event) => {
+                                LogEntry::CreateMessage(event) => {
+                                    raise_watermark(&mut dirty, &event.convo_id, &event.rev);
+                                }
+                                LogEntry::ReadMessage(event) => {
                                     raise_watermark(&mut dirty, &event.convo_id, &event.rev);
                                 }
                                 _ => {}
@@ -216,6 +219,7 @@ pub(crate) async fn poll_account_with_session(
                             &new_cursor,
                             &dirty,
                             page_done,
+                            auth_generation,
                         )
                         .await?
                         {
@@ -916,6 +920,7 @@ async fn persist_prime_page(
     cursor: &str,
     watermarks: &HashMap<String, String>,
     done: bool,
+    auth_generation: i64,
 ) -> Result<bool> {
     let mut tx = db_pool.begin().await?;
     crate::services::push::lock::acquire_account_lock(&mut tx, &row.account_did).await?;
@@ -931,6 +936,7 @@ async fn persist_prime_page(
     if stored_cursor.as_deref() != expected_cursor || primed_at.is_some() {
         return Ok(false);
     }
+    verify_page_authorization(&mut tx, &row.account_did, auth_generation).await?;
     let (convos, revs): (Vec<_>, Vec<_>) = watermarks.iter().unzip();
     sqlx::query(
         r#"INSERT INTO chat_notified_watermarks (account_did, convo_id, last_rev, updated_at)
@@ -952,6 +958,25 @@ async fn persist_prime_page(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// The caller holds the push account advisory lock. An old network response
+/// must not advance a new session/enrollment after logout and re-registration.
+async fn verify_page_authorization(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    did: &str,
+    auth_generation: i64,
+) -> Result<()> {
+    let current_generation: Option<i64> = sqlx::query_scalar(
+        "SELECT auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
+    )
+    .bind(did)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if current_generation != Some(auth_generation) || auth_generation <= 0 {
+        anyhow::bail!("Chat poll authorization changed before page commit");
+    }
+    Ok(())
 }
 
 /// Atomically commit one fetched page. A row lock plus expected-cursor check
@@ -980,15 +1005,7 @@ async fn persist_log_page(
         return Ok(());
     }
 
-    let current_generation: Option<i64> = sqlx::query_scalar(
-        "SELECT auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
-    )
-    .bind(&row.account_did)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if current_generation != Some(auth_generation) || auth_generation <= 0 {
-        anyhow::bail!("Chat poll authorization changed before page commit");
-    }
+    verify_page_authorization(&mut tx, &row.account_did, auth_generation).await?;
 
     let watermarks: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
         "SELECT convo_id, last_rev FROM chat_notified_watermarks WHERE account_did = $1",
@@ -1141,9 +1158,15 @@ mod tests {
     #[test]
     fn batch_read_maxima_tracks_per_convo_max_rev() {
         let logs = vec![
-            LogEntry::ReadMessage(log_message_event("convo1", "3laaa", "did:plc:self", "r1")),
-            LogEntry::ReadMessage(log_message_event("convo1", "3lccc", "did:plc:self", "r2")),
-            LogEntry::ReadMessage(log_message_event("convo2", "3lbbb", "did:plc:self", "r3")),
+            LogEntry::ReadMessage(
+                log_message_event("convo1", "3laaa", "did:plc:self", "r1").into(),
+            ),
+            LogEntry::ReadMessage(
+                log_message_event("convo1", "3lccc", "did:plc:self", "r2").into(),
+            ),
+            LogEntry::ReadMessage(
+                log_message_event("convo2", "3lbbb", "did:plc:self", "r3").into(),
+            ),
             LogEntry::CreateMessage(log_message_event("convo1", "3lzzz", "did:plc:other", "m1")),
         ];
 
@@ -1163,7 +1186,9 @@ mod tests {
         // any create.
         let logs = vec![
             LogEntry::CreateMessage(log_message_event("convo1", "3laaa", "did:plc:other", "m1")),
-            LogEntry::ReadMessage(log_message_event("convo1", "3lbbb", "did:plc:self", "r1")),
+            LogEntry::ReadMessage(
+                log_message_event("convo1", "3lbbb", "did:plc:self", "r1").into(),
+            ),
         ];
 
         let persisted: HashMap<String, String> = HashMap::new();

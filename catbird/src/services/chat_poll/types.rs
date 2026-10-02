@@ -33,10 +33,34 @@ pub enum LogEntry {
     CreateMessage(LogMessageEvent),
     #[serde(rename = "chat.bsky.convo.defs#logDeleteMessage")]
     DeleteMessage(LogMessageEvent),
-    #[serde(rename = "chat.bsky.convo.defs#logReadMessage")]
-    ReadMessage(LogMessageEvent),
+    #[serde(
+        rename = "chat.bsky.convo.defs#logReadMessage",
+        alias = "chat.bsky.convo.defs#logReadConvo"
+    )]
+    ReadMessage(LogReadEvent),
     #[serde(other)]
     Unknown,
+}
+
+/// Both read log variants advance the account's read state. Their message
+/// union also permits system messages, which have no sender. Only these two
+/// fields are needed for suppression, so do not deserialize a user-message
+/// shape for a read event.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogReadEvent {
+    pub convo_id: String,
+    pub rev: String,
+}
+
+#[cfg(test)]
+impl From<LogMessageEvent> for LogReadEvent {
+    fn from(event: LogMessageEvent) -> Self {
+        Self {
+            convo_id: event.convo_id,
+            rev: event.rev,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,3 +1,4 @@
+DROP TABLE chat_mute_sync_generations;
 DROP INDEX IF EXISTS idx_chat_poll_unheld_due;
 ALTER TABLE chat_notified_watermarks DROP COLUMN last_read_rev;
 ALTER TABLE chat_poll_state
