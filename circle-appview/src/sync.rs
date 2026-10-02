@@ -1637,6 +1637,12 @@ pub async fn sweep_once_with_shutdown(
                 space = %crate::access::space_fingerprint(&space_uri),
                 "registerNotify failed during sweep; retried next sweep"
             );
+            // The host rejected the credential and it was evicted: do not list
+            // with it. The next sweep acquires a replacement.
+            if crate::access::is_credential_rejected(&e) {
+                summary.repos_failed += 1;
+                continue;
+            }
         }
         let authority_did = match extract_authority_did(&space_uri) {
             Ok(a) => a,

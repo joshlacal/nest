@@ -4875,3 +4875,135 @@ async fn shutdown_signal_responds_to_sigterm() {
     kill_handle.join().unwrap();
     assert!(res.is_ok(), "SIGTERM must trigger signal receiver");
 }
+
+// ---------------------------------------------------------------------------------------
+// Rejected space credentials (Oct-1 alpha: CredentialRevoked, BadSpaceSignature,
+// BadSpaceAudience): evict the credential and never retry it.
+// ---------------------------------------------------------------------------------------
+
+const CACHED_CREDENTIAL: &str = "test.space.credential.jwt";
+
+fn credential_use_methods(setup: &SyncTestSetup) -> Vec<&'static str> {
+    setup
+        .mock_transport
+        .recorded_credential_uses()
+        .into_iter()
+        .map(|u| {
+            assert_eq!(
+                u.auth.authorization,
+                format!("Atproto-Space {CACHED_CREDENTIAL}"),
+                "only the cached credential exists in these tests"
+            );
+            u.method
+        })
+        .collect()
+}
+
+/// A fresh registerNotify registration, so a sweep goes straight to listRepos.
+async fn register_notify_fresh(setup: &SyncTestSetup, pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO circle_notify_registrations (space_uri, service, space_host_endpoint, expires_at) VALUES ($1, $2, 'https://space.catbird.blue', now() + interval '24 hours')",
+    )
+    .bind(SPACE_URI)
+    .bind(setup.state.config.notify_service_identifier())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rejected_credential_stops_repo_sync_without_get_repo_fallback(pool: PgPool) {
+    use circle_appview::error::AuthReason;
+    let setup = setup_sync_test(pool.clone()).await;
+    setup
+        .mock_transport
+        .reject_credential_uses(Some(AuthReason::CredentialRevoked));
+
+    let err = SyncEngine::new(&setup.state)
+        .sync_repo_with_expected_commit(SPACE_URI, OWNER_DID, None, None)
+        .await
+        .expect_err("a revoked credential fails the sync");
+    assert!(
+        matches!(err, AppError::Unauthorized(AuthReason::CredentialRevoked)),
+        "{err:?}"
+    );
+    assert!(
+        setup.state.credential_store.get(SPACE_URI).await.is_none(),
+        "the rejected credential is evicted"
+    );
+    assert_eq!(
+        credential_use_methods(&setup),
+        vec!["com.atproto.space.listRepoOps"],
+        "no getRepo full-recovery fallback with the rejected credential"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rejected_credential_stops_the_sweep_and_is_never_retried(pool: PgPool) {
+    use circle_appview::error::AuthReason;
+    let setup = setup_sync_test(pool.clone()).await;
+    register_notify_fresh(&setup, &pool).await;
+    setup.mock_transport.set_list_repos_response(
+        SPACE_URI,
+        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+            cursor: Some("3l7spacerev2a".into()),
+            repos: vec![
+                catbird_atproto::generated::com_atproto::space::list_repos::Repo {
+                    did: Did::from(String::from(OWNER_DID)),
+                    hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                        &[0x11; 32],
+                    ),
+                    repo_rev: Tid::from(String::from("3l7234567a234")),
+                    space_rev: Tid::from(String::from("3l7spacerev2a")),
+                    extra_data: None,
+                },
+            ],
+            extra_data: None,
+        },
+    );
+    setup
+        .mock_transport
+        .reject_credential_uses(Some(AuthReason::BadSpaceSignature));
+
+    let summary = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(summary.spaces_checked, 1);
+    assert_eq!(summary.repos_checked, 0, "the listing was refused");
+    assert!(setup.state.credential_store.get(SPACE_URI).await.is_none());
+    assert_eq!(
+        credential_use_methods(&setup),
+        vec!["com.atproto.space.listRepos"],
+        "one refused listRepos, then nothing else with that credential"
+    );
+
+    // The host would accept requests again, but the evicted credential is gone
+    // and this AppView holds no OAuth session to acquire a replacement with.
+    setup.mock_transport.reject_credential_uses(None);
+    let summary = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(summary.spaces_checked, 1, "the space is still visited");
+    assert_eq!(summary.repos_failed, 1, "credential acquisition failed");
+    assert_eq!(
+        credential_use_methods(&setup),
+        vec!["com.atproto.space.listRepos"],
+        "the rejected credential is never retried"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn credential_rejected_by_register_notify_is_not_used_to_list(pool: PgPool) {
+    use circle_appview::error::AuthReason;
+    let setup = setup_sync_test(pool.clone()).await;
+    // No registration yet, so the sweep registers before listing.
+    setup
+        .mock_transport
+        .reject_credential_uses(Some(AuthReason::BadSpaceAudience));
+
+    let summary = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(summary.spaces_checked, 1);
+    assert_eq!(summary.repos_failed, 1);
+    assert!(setup.state.credential_store.get(SPACE_URI).await.is_none());
+    assert_eq!(
+        credential_use_methods(&setup),
+        vec!["com.atproto.space.registerNotify"],
+        "no listRepos with a credential registerNotify just had rejected"
+    );
+}
