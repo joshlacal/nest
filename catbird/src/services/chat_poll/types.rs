@@ -87,6 +87,9 @@ pub struct ChatPushEvent {
     pub message_text: String,
     pub sent_at: String,
     pub auth_generation: i64,
+    /// Source log revision for durable read suppression; legacy events omit it.
+    #[serde(default)]
+    pub log_rev: Option<String>,
 }
 
 impl ChatPushEvent {

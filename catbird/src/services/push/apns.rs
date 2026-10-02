@@ -140,8 +140,9 @@ impl ApnsDelivery {
     /// If APNs rejects the token with `BadDeviceToken` — which happens when a
     /// sandbox token is sent to the production endpoint or vice versa — the
     /// notification is retried once against the other environment. If that
-    /// also fails with `BadDeviceToken`, the original error is returned so
-    /// callers can deactivate the token as invalid.
+    /// also fails, its error is returned. A second `BadDeviceToken` permits
+    /// token deactivation, an explicit transient rejection permits bounded
+    /// retry, and a lost/failed response remains an ambiguous held delivery.
     ///
     /// Returns the APNs environment ("production" or "sandbox") that
     /// successfully delivered the notification, so callers can persist a
@@ -173,9 +174,9 @@ impl ApnsDelivery {
                     Err(second_err) => {
                         // BadDeviceToken on both endpoints means the token is
                         // genuinely invalid, not just aimed at the wrong
-                        // environment. Surface the original error so
-                        // `is_invalid_token` (which also checks for
-                        // BadDeviceToken) can deactivate it.
+                        // environment. Preserve the SECOND error: substituting
+                        // the first BadDeviceToken for a second transport error
+                        // would discard an ambiguous possible acceptance.
                         Err(anyhow::Error::new(second_err))
                     }
                 }
@@ -203,10 +204,18 @@ impl ApnsDelivery {
             NotificationOptions {
                 apns_topic: Some(&self.topic),
                 apns_priority: Some(Priority::High),
-                apns_collapse_id: None,
+                // Correlation/collapse metadata helps APNs coalesce pending
+                // copies; it is not an exactly-once delivery contract.
+                apns_collapse_id: notification
+                    .custom_data
+                    .get("pushDeliveryId")
+                    .map(String::as_str),
                 apns_expiration: None,
                 apns_push_type: None,
-                apns_id: None,
+                apns_id: notification
+                    .custom_data
+                    .get("pushDeliveryId")
+                    .map(String::as_str),
             },
         );
 

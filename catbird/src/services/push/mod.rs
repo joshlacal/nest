@@ -28,7 +28,7 @@ use self::{
     lock::acquire_account_and_device_lock,
     moderation_verdict::ActorModerationResolver,
     preferences::PushPreferences,
-    queue::PushQueue,
+    queue::{DeviceAttempt, PushQueue},
     registry::PushRegistry,
     subscriptions::PushSubscriptions,
     thread_mutes::ThreadMuteStore,
@@ -42,6 +42,7 @@ pub enum PreSendFenceOutcome {
     LeaseLost,
     PreferencesDisabled,
     ThreadMuted,
+    ChatRead,
     ModerationSuppressed,
 }
 
@@ -264,7 +265,15 @@ impl PushServices {
                           )
                     )
                 ) AS activity_sub_active,
-                (tm.user_did IS NOT NULL) AS thread_is_muted,
+                (tm.user_did IS NOT NULL OR ($4 = 'chat_message' AND EXISTS (
+                    SELECT 1 FROM chat_muted_convos cm
+                    WHERE cm.account_did=param.did AND cm.convo_id=q.event_record_json->>'convoId'
+                ))) AS thread_is_muted,
+                ($4 = 'chat_message' AND EXISTS (
+                    SELECT 1 FROM chat_notified_watermarks wm
+                    WHERE wm.account_did=param.did AND wm.convo_id=q.event_record_json->>'convoId'
+                      AND wm.last_read_rev COLLATE "C" >= (q.event_record_json->>'logRev') COLLATE "C"
+                )) AS chat_is_read,
                 amv.verdict AS cached_moderation_verdict
             FROM (SELECT $1::text AS did) param
             LEFT JOIN push_accounts pa ON pa.account_did = param.did
@@ -357,6 +366,10 @@ impl PushServices {
             return Ok(PreSendFenceOutcome::ThreadMuted);
         }
 
+        if row.try_get::<bool, _>("chat_is_read")? {
+            return Ok(PreSendFenceOutcome::ChatRead);
+        }
+
         // 7. Moderation verdict: fail closed / suppress on missing or suppressing verdict
         let cached_verdict: Option<serde_json::Value> = row.try_get("cached_moderation_verdict")?;
         match cached_verdict {
@@ -391,12 +404,6 @@ impl PushServices {
         let state_clone = state.clone();
         tokio::spawn(async move {
             self_clone.run_worker_loop(state_clone).await;
-        });
-
-        let self_clone = self.clone();
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            self_clone.run_chat_push_subscriber(state_clone).await;
         });
     }
 
@@ -457,17 +464,42 @@ impl PushServices {
                 continue;
             }
 
+            // A chat row without a log revision cannot prove it is unread.
+            // Keep malformed/new and pre-cutover payloads available for review.
+            if row.notification_type == "chat_message"
+                && row
+                    .event_record_json
+                    .get("logRev")
+                    .and_then(|value| value.as_str())
+                    .is_none_or(|rev| rev.trim().is_empty())
+            {
+                let (token, version) = heartbeat.stop().await;
+                self.queue
+                    .hold_fenced(row.id, token, version, "chat_missing_log_rev")
+                    .await?;
+                continue;
+            }
+
             // Staleness guard: drop events that sat in the queue past 24h
             let age = time::OffsetDateTime::now_utc() - row.created_at;
-            if age > time::Duration::hours(24) {
+            let event_age = Utc::now().timestamp().saturating_sub(row.event_timestamp);
+            if age > time::Duration::hours(24)
+                || (row.notification_type == "chat_message" && event_age > 24 * 60 * 60)
+            {
                 tracing::debug!(
                     recipient = %row.recipient_did,
                     notification_type = %row.notification_type,
                     age_secs = age.whole_seconds(),
-                    "Dropping stale queued push event"
+                    "Stale push event reached delivery guard (chat alerts are held)"
                 );
                 let (token, version) = heartbeat.stop().await;
-                let _ = self.queue.delete_fenced(row.id, token, version).await;
+                if row.notification_type == "chat_message" {
+                    self.queue
+                        .hold_fenced(row.id, token, version, "stale_chat_alert_requires_review")
+                        .await?;
+                } else {
+                    let _ = self.queue.delete_fenced(row.id, token, version).await;
+                }
                 continue;
             }
 
@@ -517,8 +549,9 @@ impl PushServices {
                     let mut transient_error = None;
                     let mut is_revoked = false;
                     let mut is_lease_lost = false;
+                    let mut has_held_delivery = false;
 
-                    for (registration, notification) in deliveries {
+                    for (registration, mut notification) in deliveries {
                         let mut tx = match self.queue.pool().begin().await {
                             Ok(t) => t,
                             Err(err) => {
@@ -592,6 +625,7 @@ impl PushServices {
                             }
                             PreSendFenceOutcome::PreferencesDisabled
                             | PreSendFenceOutcome::ThreadMuted
+                            | PreSendFenceOutcome::ChatRead
                             | PreSendFenceOutcome::ModerationSuppressed => {
                                 let _ = tx.commit().await;
                                 tracing::info!(
@@ -603,20 +637,69 @@ impl PushServices {
                             }
                         }
 
+                        // Durable intent commits independently while this transaction
+                        // keeps the account/device revocation lock through the send.
+                        let delivery_id = match self
+                            .queue
+                            .begin_device_attempt(&row, &registration, lease_token)
+                            .await
+                        {
+                            Ok(DeviceAttempt::Send(id)) => id,
+                            Ok(DeviceAttempt::AlreadyFinished) => {
+                                let _ = tx.commit().await;
+                                continue;
+                            }
+                            Ok(DeviceAttempt::Held) => {
+                                has_held_delivery = true;
+                                let _ = tx.commit().await;
+                                continue;
+                            }
+                            Ok(DeviceAttempt::LeaseLost) => {
+                                is_lease_lost = true;
+                                let _ = tx.commit().await;
+                                break;
+                            }
+                            Err(err) => {
+                                transient_error = Some(err);
+                                let _ = tx.rollback().await;
+                                break;
+                            }
+                        };
+                        notification
+                            .custom_data
+                            .insert("pushDeliveryId".to_string(), delivery_id.to_string());
                         let send_fut = apns.send(&registration, &notification);
                         let send_res = match tokio::time::timeout(send_timeout, send_fut).await {
                             Ok(res) => res,
                             Err(_elapsed) => {
+                                self.queue
+                                    .record_device_outcome(
+                                        delivery_id,
+                                        "held",
+                                        Some("ambiguous_apns_timeout"),
+                                    )
+                                    .await?;
                                 let _ = tx.commit().await;
-                                tracing::warn!(
-                                    did = %registration.did,
-                                    token = %registration.device_token,
-                                    "APNs send timed out; scheduling retry"
-                                );
-                                transient_error = Some(anyhow!("APNs send timed out"));
-                                break;
+                                tracing::warn!(id = row.id, %delivery_id, "APNs acceptance unknown after timeout; holding device delivery");
+                                has_held_delivery = true;
+                                continue;
                             }
                         };
+                        let (delivery_state, reason) = match &send_res {
+                            Ok(_) => ("accepted", None),
+                            Err(err) if is_invalid_token(err) => {
+                                ("invalid", Some("invalid_apns_token"))
+                            }
+                            Err(err) if is_definite_retryable_rejection(err) => {
+                                ("retry", Some("apns_rejected_retryable"))
+                            }
+                            Err(_) => ("held", Some("ambiguous_or_permanent_apns_error")),
+                        };
+                        // Failure to persist acceptance leaves the intent visible and
+                        // quarantined on restart, rather than sending a second copy.
+                        self.queue
+                            .record_device_outcome(delivery_id, delivery_state, reason)
+                            .await?;
                         let _ = tx.commit().await;
 
                         match send_res {
@@ -683,9 +766,12 @@ impl PushServices {
                                 is_revoked = true;
                                 break;
                             }
-                            Err(err) => {
+                            Err(err) if is_definite_retryable_rejection(&err) => {
                                 transient_error = Some(err);
-                                break;
+                            }
+                            Err(err) => {
+                                tracing::warn!(id = row.id, %delivery_id, error = %err, "APNs outcome held for inspection");
+                                has_held_delivery = true;
                             }
                         }
                     }
@@ -735,6 +821,15 @@ impl PushServices {
                                 tracing::error!(error = %update_err, "Failed to schedule push retry");
                             }
                         }
+                    } else if has_held_delivery {
+                        self.queue
+                            .hold_fenced(
+                                row.id,
+                                token,
+                                final_version,
+                                "device_delivery_requires_review",
+                            )
+                            .await?;
                     } else {
                         match self.queue.delete_fenced(row.id, token, final_version).await {
                             Ok(true) => {}
@@ -843,383 +938,13 @@ impl PushServices {
             }
         }
     }
+}
 
-    async fn run_chat_push_subscriber(self: Arc<Self>, state: Arc<AppState>) {
-        use futures_util::StreamExt;
-
-        state.wait_for_session_index_readiness().await;
-        let Some(apns) = self.apns.clone() else {
-            return;
-        };
-
-        tracing::info!("Chat push Redis subscriber starting");
-
-        loop {
-            let client = match redis::Client::open(state.config.redis.url.as_str()) {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::error!(error = %err, "Failed to create Redis client for chat push subscriber");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            let mut pubsub = match client.get_async_pubsub().await {
-                Ok(ps) => ps,
-                Err(err) => {
-                    tracing::error!(error = %err, "Failed to get Redis pubsub connection for chat push subscriber");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            if let Err(err) = pubsub.subscribe("chat_push").await {
-                tracing::error!(error = %err, "Failed to subscribe to chat_push channel");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
-            }
-
-            tracing::info!("Subscribed to chat_push Redis channel");
-
-            let mut stream = pubsub.on_message();
-
-            while let Some(msg) = stream.next().await {
-                let payload: String = match msg.get_payload() {
-                    Ok(p) => p,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Failed to get chat_push message payload");
-                        continue;
-                    }
-                };
-
-                let event: crate::services::chat_poll::types::ChatPushEvent =
-                    match serde_json::from_str(&payload) {
-                        Ok(e) => e,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "Failed to deserialize ChatPushEvent");
-                            continue;
-                        }
-                    };
-
-                // Claim the queue row before doing anything else: only an
-                // UNLEASED row (one the durable worker hasn't picked up) is
-                // deleted here, so at most one path ever delivers this event.
-                let dedupe_key = event.dedupe_key();
-                match self.queue.claim_by_dedupe_key(&dedupe_key).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Durable worker owns it (or it was already delivered).
-                        continue;
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Chat push claim failed; leaving to durable path");
-                        continue;
-                    }
-                }
-
-                // Mirror decision.rs's preferences + moderation checks: the
-                // claim already consumed the row, so on either "drop" or
-                // check-error we must not silently swallow the event —
-                // check-errors requeue (delay 0) so the durable path can
-                // decide fail-closed, matching the durable worker's own
-                // error handling.
-                let prefs = match self.preferences.get_or_create(&event.recipient_did).await {
-                    Ok(prefs) => prefs,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            did = %event.recipient_did,
-                            "Chat push fast-path preferences lookup failed; requeuing"
-                        );
-                        if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
-                            self.queue.pool(),
-                            &event,
-                            0,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %err, "Failed to requeue chat push after preferences lookup failure");
-                        }
-                        continue;
-                    }
-                };
-                if !prefs.is_push_enabled_for("chat_message") {
-                    tracing::debug!(
-                        did = %event.recipient_did,
-                        "Chat push fast-path dropped: preferences_disabled"
-                    );
-                    continue;
-                }
-
-                match self
-                    .moderation
-                    .resolve(&state, &event.recipient_did, &event.sender_did)
-                    .await
-                    .map(|moderation| moderation.verdict.suppresses("chat_message"))
-                {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        tracing::debug!(
-                            did = %event.recipient_did,
-                            actor = %event.sender_did,
-                            "Chat push fast-path dropped: actor_moderated"
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            did = %event.recipient_did,
-                            "Chat push fast-path moderation lookup failed; requeuing"
-                        );
-                        if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
-                            self.queue.pool(),
-                            &event,
-                            0,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %err, "Failed to requeue chat push after moderation lookup failure");
-                        }
-                        continue;
-                    }
-                }
-
-                // Look up active registrations for recipient
-                let registrations = match self
-                    .registry
-                    .list_active_registrations(&event.recipient_did)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Failed to look up registrations for chat push");
-                        continue;
-                    }
-                };
-
-                if registrations.is_empty() {
-                    // No device to deliver to — the claim already consumed
-                    // the event, matching the durable path's Drop disposition.
-                    continue;
-                }
-
-                // Build notification
-                let mut custom_data = std::collections::HashMap::new();
-                custom_data.insert("type".to_string(), "chat_message".to_string());
-                custom_data.insert("recipientDid".to_string(), event.recipient_did.clone());
-                custom_data.insert("convoId".to_string(), event.convo_id.clone());
-                custom_data.insert("messageId".to_string(), event.message_id.clone());
-                custom_data.insert("senderDid".to_string(), event.sender_did.clone());
-                let truncated_text: String = event.message_text.chars().take(200).collect();
-                custom_data.insert("messageText".to_string(), truncated_text);
-
-                let notification = apns::ApnsNotification {
-                    title: "New Message".to_string(),
-                    body: "You have a new message".to_string(),
-                    user_did: event.recipient_did.clone(),
-                    custom_data,
-                    mutable_content: true,
-                    thread_id: Some(format!("chat:{}", event.convo_id)),
-                };
-
-                // Fan out to all devices
-                let send_timeout =
-                    std::time::Duration::from_secs(self.config.send_timeout_seconds.max(1));
-                let mut delivered_count = 0usize;
-                let mut is_revoked = false;
-                let mut had_transient_error = false;
-                for registration in &registrations {
-                    let mut tx = match self.queue.pool().begin().await {
-                        Ok(t) => t,
-                        Err(err) => {
-                            tracing::error!(error = %err, "Failed to begin transaction for chat fast-path");
-                            had_transient_error = true;
-                            break;
-                        }
-                    };
-                    if let Err(err) = acquire_account_and_device_lock(
-                        &mut tx,
-                        &event.recipient_did,
-                        &registration.device_token,
-                    )
-                    .await
-                    {
-                        let _ = tx.rollback().await;
-                        tracing::error!(error = %err, "Failed to acquire advisory lock for chat fast-path");
-                        had_transient_error = true;
-                        break;
-                    }
-
-                    let fence_outcome = match self
-                        .verify_pre_send_fence_tx(
-                            &mut tx,
-                            &event.recipient_did,
-                            &event.sender_did,
-                            &registration.device_token,
-                            "chat_message",
-                            None,
-                            None,
-                            Some(event.auth_generation),
-                        )
-                        .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            let _ = tx.rollback().await;
-                            tracing::error!(error = %err, "Chat fast-path pre-send fence failed closed");
-                            had_transient_error = true;
-                            break;
-                        }
-                    };
-
-                    match fence_outcome {
-                        PreSendFenceOutcome::Authorized => {}
-                        PreSendFenceOutcome::Revoked => {
-                            let _ = tx.commit().await;
-                            tracing::info!(
-                                recipient = %event.recipient_did,
-                                "Auth revoked before chat fast-path APNs send; cancelling remaining deliveries"
-                            );
-                            is_revoked = true;
-                            break;
-                        }
-                        PreSendFenceOutcome::DeviceInactive => {
-                            let _ = tx.commit().await;
-                            tracing::info!(
-                                did = %registration.did,
-                                token = %registration.device_token,
-                                "Device is no longer active for recipient (chat fast-path); skipping"
-                            );
-                            continue;
-                        }
-                        PreSendFenceOutcome::PreferencesDisabled
-                        | PreSendFenceOutcome::ThreadMuted
-                        | PreSendFenceOutcome::ModerationSuppressed
-                        | PreSendFenceOutcome::LeaseLost => {
-                            let _ = tx.commit().await;
-                            tracing::info!(
-                                recipient = %event.recipient_did,
-                                outcome = ?fence_outcome,
-                                "Chat fast-path delivery suppressed by fence; skipping device"
-                            );
-                            continue;
-                        }
-                    }
-
-                    let send_fut = apns.send(registration, &notification);
-                    let send_res = match tokio::time::timeout(send_timeout, send_fut).await {
-                        Ok(res) => res,
-                        Err(_elapsed) => {
-                            let _ = tx.commit().await;
-                            tracing::warn!(
-                                did = %registration.did,
-                                token = %registration.device_token,
-                                "Chat fast-path APNs send timed out"
-                            );
-                            had_transient_error = true;
-                            break;
-                        }
-                    };
-                    let _ = tx.commit().await;
-                    match send_res {
-                        Ok(delivered_env) => {
-                            delivered_count += 1;
-                            if registration.apns_environment.as_deref() != Some(delivered_env) {
-                                tracing::info!(
-                                    did = %registration.did,
-                                    token = %registration.device_token,
-                                    env = delivered_env,
-                                    "Learned APNs environment (chat push fast-path)"
-                                );
-                                if let Err(err) = self
-                                    .registry
-                                    .set_apns_environment(
-                                        &registration.did,
-                                        &registration.device_token,
-                                        delivered_env,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(error = %err, "Failed to persist learned APNs environment (chat push fast-path)");
-                                }
-                            }
-                        }
-                        Err(err) if is_invalid_token(&err) => {
-                            tracing::info!(
-                                did = %registration.did,
-                                token = %registration.device_token,
-                                "Deactivating invalid APNs token (chat push fast-path)"
-                            );
-                            if let Err(update_err) = self
-                                .registry
-                                .deactivate_invalid_token(
-                                    &registration.did,
-                                    &registration.device_token,
-                                    "apns_unregistered",
-                                )
-                                .await
-                            {
-                                tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
-                            } else if let Some(push_db) = state.push_db.as_ref() {
-                                let scheduler =
-                                    crate::services::chat_poll::scheduler::ChatPollScheduler::new(
-                                        push_db.clone(),
-                                    );
-                                if let Err(err) = scheduler
-                                    .unenroll_account_if_no_active_devices(&registration.did)
-                                    .await
-                                {
-                                    tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
-                                }
-                            }
-                        }
-                        Err(err) if is_auth_revocation_error(&err) => {
-                            tracing::info!(
-                                recipient = %event.recipient_did,
-                                error = %err,
-                                "Auth revoked during chat fast-path send; cancelling"
-                            );
-                            is_revoked = true;
-                            break;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                did = %event.recipient_did,
-                                token = %registration.device_token,
-                                "Chat push fast-path delivery failed"
-                            );
-                            had_transient_error = true;
-                        }
-                    }
-                }
-
-                // If auth was revoked, drop terminally — NEVER requeue revoked events
-                if is_revoked {
-                    tracing::info!(
-                        recipient = %event.recipient_did,
-                        "Dropping chat push event terminally due to auth revocation"
-                    );
-                } else if delivered_count == 0 && had_transient_error {
-                    // Only hand back to durable queue if nothing was delivered due to transient failures
-                    if let Err(err) = crate::services::chat_poll::poller::enqueue_push(
-                        self.queue.pool(),
-                        &event,
-                        0,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %err, "Failed to requeue chat push after fast-path failure");
-                    }
-                }
-            }
-
-            // Stream ended — reconnect
-            tracing::warn!("Chat push Redis subscription stream ended; reconnecting...");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-    }
+/// Only an explicit APNs rejection is safe to retry automatically. Transport
+/// errors and timeouts cannot establish whether APNs accepted the request.
+fn is_definite_retryable_rejection(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<a2::Error>(), Some(a2::Error::ResponseError(response))
+        if response.code == 429 || (500..=599).contains(&response.code))
 }
 
 fn is_invalid_token(err: &anyhow::Error) -> bool {
@@ -1388,6 +1113,29 @@ pub(crate) fn push_unavailable_error() -> AppError {
 #[cfg(test)]
 mod terminal_failure_tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_apns_rejections_allow_automatic_retry() {
+        for code in [429, 500, 503] {
+            let err = anyhow::Error::new(a2::Error::ResponseError(a2::Response {
+                error: None,
+                apns_id: None,
+                code,
+            }));
+            assert!(is_definite_retryable_rejection(&err));
+        }
+        for code in [400, 403, 410] {
+            let err = anyhow::Error::new(a2::Error::ResponseError(a2::Response {
+                error: None,
+                apns_id: None,
+                code,
+            }));
+            assert!(!is_definite_retryable_rejection(&err));
+        }
+        assert!(!is_definite_retryable_rejection(&anyhow!(
+            "response lost after acceptance"
+        )));
+    }
 
     #[test]
     fn session_does_not_exist_is_auth_revocation() {

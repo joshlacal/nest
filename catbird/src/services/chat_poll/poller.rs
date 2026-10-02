@@ -17,6 +17,7 @@ use crate::services::push::{is_auth_revocation_error, resolve_background_session
 pub const MAX_PRIME_LOGS_PER_PAGE: usize = 1000;
 
 enum PrimeStepResult {
+    Superseded,
     LocalBudgetExhausted,
     PdsRateLimited {
         retry_after: u64,
@@ -66,6 +67,14 @@ pub async fn poll_account(
     rate_budget: &PdsRateBudget,
     row: &ChatPollRow,
 ) -> Result<()> {
+    if scheduler
+        .hold_if_catch_up_required(&row.account_did)
+        .await?
+    {
+        tracing::warn!(did = %row.account_did, "Chat cursor held for catch-up review; history retained");
+        return Ok(());
+    }
+
     // Resolve session + DPoP data for this account and capture auth_generation before network
     let (session_id, pds_url, auth_generation) =
         lookup_push_account(db_pool, &row.account_did).await?;
@@ -110,6 +119,13 @@ pub(crate) async fn poll_account_with_session(
     auth_generation: i64,
     prime_start: std::time::Instant,
 ) -> Result<()> {
+    if scheduler
+        .hold_if_catch_up_required(&row.account_did)
+        .await?
+    {
+        return Ok(());
+    }
+
     // Host DPoP nonce to try first. Seeded from dpop data or cached PDS origin nonce;
     // `fetch_log_page` updates it in place whenever a `use_dpop_nonce` 401
     // forces a retry with a fresh one, so later pages in this same poll (and
@@ -179,8 +195,9 @@ pub(crate) async fn poll_account_with_session(
 
                         let page: GetLogResponse = serde_json::from_slice(&body)?;
 
+                        validate_log_page(&page)?;
                         let mut dirty: HashMap<String, String> = HashMap::new();
-                        for entry in page.logs.iter().take(MAX_PRIME_LOGS_PER_PAGE) {
+                        for entry in &page.logs {
                             match entry {
                                 LogEntry::CreateMessage(event) | LogEntry::ReadMessage(event) => {
                                     raise_watermark(&mut dirty, &event.convo_id, &event.rev);
@@ -189,18 +206,20 @@ pub(crate) async fn poll_account_with_session(
                             }
                         }
 
-                        // Flush watermarks in ONE batched query BEFORE updating the cursor
-                        scheduler
-                            .bump_watermarks_batch(&row.account_did, &dirty)
-                            .await?;
-
                         let page_done =
                             page.logs.is_empty() || Some(&page.cursor) == cursor.as_ref();
                         let new_cursor = page.cursor;
-                        if !new_cursor.is_empty() {
-                            scheduler
-                                .update_prime_cursor(&row.account_did, &new_cursor)
-                                .await?;
+                        if !persist_prime_page(
+                            db_pool,
+                            row,
+                            cursor.as_deref(),
+                            &new_cursor,
+                            &dirty,
+                            page_done,
+                        )
+                        .await?
+                        {
+                            return Ok(PrimeStepResult::Superseded);
                         }
 
                         Ok(PrimeStepResult::Success {
@@ -227,6 +246,7 @@ pub(crate) async fn poll_account_with_session(
             };
 
             match step {
+                PrimeStepResult::Superseded => return Ok(()),
                 PrimeStepResult::LocalBudgetExhausted => {
                     tracing::debug!(
                         did = %row.account_did,
@@ -302,12 +322,6 @@ pub(crate) async fn poll_account_with_session(
             }
         }
         if done {
-            scheduler.mark_primed(&row.account_did).await?;
-            if let Some(c) = &cursor {
-                scheduler
-                    .update_after_poll(&row.account_did, c, false, row.poll_tier)
-                    .await?;
-            }
             tracing::info!(did = %row.account_did, "Chat poll primed (cursor fast-forwarded, watermarks seeded, no notifications)");
         }
         // If the page cap was exhausted without finishing, progress (cursor
@@ -398,80 +412,7 @@ pub(crate) async fn poll_account_with_session(
     // Parse the response
     let log_response: GetLogResponse = serde_json::from_slice(&body)?;
 
-    let watermarks = scheduler.get_watermarks(&row.account_did).await?;
-    let mut had_incoming_message = false;
-
-    // Pass 1: seed the in-memory watermark from every ReadMessage in this
-    // batch BEFORE evaluating any CreateMessage. Without this, a page
-    // ordered [Create(convo, rev=3), Read(convo, rev=5)] would evaluate the
-    // create first and push a notification for a message the same batch
-    // shows was already read.
-    let mut dirty: HashMap<String, String> = batch_read_maxima(&log_response.logs);
-
-    // Pass 2: evaluate + notify CreateMessage entries against the
-    // read-seeded watermark.
-    for entry in &log_response.logs {
-        if let LogEntry::CreateMessage(event) = entry {
-            let wm = effective_watermark(&watermarks, &dirty, &event.convo_id);
-            if !should_notify(&event.rev, wm.as_deref()) {
-                continue;
-            }
-            // Own messages and muted convos advance the watermark
-            // without notifying (unmuting must not replay history).
-            let own = event.message.sender.did == row.account_did;
-            let muted = !own
-                && scheduler
-                    .is_convo_muted(&row.account_did, &event.convo_id)
-                    .await?;
-
-            if !own {
-                had_incoming_message = true;
-            }
-
-            if !own && !muted {
-                let push_event = ChatPushEvent {
-                    recipient_did: row.account_did.clone(),
-                    sender_did: event.message.sender.did.clone(),
-                    convo_id: event.convo_id.clone(),
-                    message_id: event.message.id.clone(),
-                    message_text: event
-                        .message
-                        .text
-                        .clone()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(300)
-                        .collect(),
-                    sent_at: event.message.sent_at.clone(),
-                    auth_generation,
-                };
-                if let Err(err) = enqueue_push(db_pool, &push_event, 15).await {
-                    tracing::warn!(did = %row.account_did, error = %err, "Failed to enqueue chat push");
-                }
-                if let Err(err) = publish_to_redis(state, &push_event).await {
-                    tracing::debug!(did = %row.account_did, error = %err, "Redis publish failed (durable path covers it)");
-                }
-            }
-
-            raise_watermark(&mut dirty, &event.convo_id, &event.rev);
-        }
-    }
-
-    // Flush watermarks BEFORE the cursor: if we crash between the two, the
-    // next poll re-reads the same logs and the watermarks suppress them.
-    // (Cursor-first would re-notify on the inverse crash.)
-    scheduler
-        .bump_watermarks_batch(&row.account_did, &dirty)
-        .await?;
-
-    scheduler
-        .update_after_poll(
-            &row.account_did,
-            &log_response.cursor,
-            had_incoming_message,
-            row.poll_tier,
-        )
-        .await?;
+    persist_log_page(db_pool, row, &log_response, auth_generation).await?;
 
     Ok(())
 }
@@ -936,69 +877,223 @@ async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(Str
     Ok(row)
 }
 
-/// Insert a chat push event into the push_event_queue. `delay_secs` sets how
-/// long the row is invisible to the durable worker (`available_at`): new chat
-/// enqueues pass the durable grace window (15s) so the fast-path subscriber
-/// gets first crack at claiming and delivering; requeues after a fast-path
-/// delivery failure pass 0 so the durable worker can pick it up immediately.
-///
-/// `message_text` is deliberately dropped before persisting — the queue row
-/// only needs to survive long enough to build a generic notification. The
-/// fast (Redis pub/sub) path carries the real text for the one immediate
-/// delivery attempt and never writes it to disk; see `publish_to_redis`.
+/// Compatibility insertion for callers outside the poller. The poller calls
+/// the same queue helper inside its page transaction so an outbox insertion
+/// failure can never advance either the watermark or cursor.
 pub async fn enqueue_push(
     db_pool: &Pool<Postgres>,
     event: &ChatPushEvent,
     delay_secs: i64,
 ) -> Result<()> {
-    if event.auth_generation <= 0 {
-        return Err(anyhow!(
-            "Cannot enqueue push event with invalid auth_generation {}",
-            event.auth_generation
-        ));
-    }
-    let dedupe_key = event.dedupe_key();
-    let mut persisted_event = event.clone();
-    persisted_event.message_text.clear();
-    let event_json = serde_json::to_value(&persisted_event)?;
-    let now_epoch = chrono::Utc::now().timestamp();
-
-    sqlx::query(
-        r#"
-        INSERT INTO push_event_queue (
-            recipient_did, actor_did, notification_type,
-            event_cid, event_path, event_record_json,
-            event_timestamp, dedupe_key, available_at,
-            auth_generation
-        )
-        VALUES ($1, $2, 'chat_message', $3, 'chat.bsky.convo.getLog', $4, $5, $6,
-                NOW() + make_interval(secs => $7), $8)
-        ON CONFLICT (dedupe_key) DO NOTHING
-        "#,
-    )
-    .bind(&event.recipient_did)
-    .bind(&event.sender_did)
-    .bind(&event.message_id)
-    .bind(&event_json)
-    .bind(now_epoch)
-    .bind(&dedupe_key)
-    .bind(delay_secs)
-    .bind(event.auth_generation)
-    .execute(db_pool)
-    .await?;
-
+    let mut tx = db_pool.begin().await?;
+    crate::services::push::lock::acquire_account_lock(&mut tx, &event.recipient_did).await?;
+    crate::services::push::queue::enqueue_chat_tx(&mut tx, event, delay_secs).await?;
+    tx.commit().await?;
     Ok(())
 }
 
-/// Publish a chat push event to Redis pub/sub for real-time connected clients.
-async fn publish_to_redis(state: &Arc<AppState>, event: &ChatPushEvent) -> Result<()> {
-    let payload = serde_json::to_string(event)?;
-    let mut conn = state.redis.clone();
-    let _: () = redis::cmd("PUBLISH")
-        .arg("chat_push")
-        .arg(&payload)
-        .query_async(&mut conn)
+/// Reject an oversized page rather than advancing past unprocessed entries.
+fn validate_log_page(page: &GetLogResponse) -> Result<()> {
+    if page.logs.len() > MAX_PRIME_LOGS_PER_PAGE {
+        anyhow::bail!(
+            "Chat log page exceeds the {} entry limit",
+            MAX_PRIME_LOGS_PER_PAGE
+        );
+    }
+    if page.cursor.is_empty() {
+        anyhow::bail!("Chat log page has an empty cursor");
+    }
+    Ok(())
+}
+
+/// Priming also commits cursor and watermarks together. On overlap only the
+/// transaction extending the expected cursor may commit, and reaching the end
+/// marks successful priming in that same transaction.
+async fn persist_prime_page(
+    db_pool: &Pool<Postgres>,
+    row: &ChatPollRow,
+    expected_cursor: Option<&str>,
+    cursor: &str,
+    watermarks: &HashMap<String, String>,
+    done: bool,
+) -> Result<bool> {
+    let mut tx = db_pool.begin().await?;
+    crate::services::push::lock::acquire_account_lock(&mut tx, &row.account_did).await?;
+    let current: Option<(Option<String>, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "SELECT chat_cursor, primed_at FROM chat_poll_state WHERE account_did = $1 FOR UPDATE",
+    )
+    .bind(&row.account_did)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((stored_cursor, primed_at)) = current else {
+        return Ok(false);
+    };
+    if stored_cursor.as_deref() != expected_cursor || primed_at.is_some() {
+        return Ok(false);
+    }
+    let (convos, revs): (Vec<_>, Vec<_>) = watermarks.iter().unzip();
+    sqlx::query(
+        r#"INSERT INTO chat_notified_watermarks (account_did, convo_id, last_rev, updated_at)
+            SELECT $1, u.convo_id, u.rev, NOW() FROM UNNEST($2::text[], $3::text[]) AS u(convo_id, rev)
+            ON CONFLICT (account_did, convo_id) DO UPDATE
+            SET last_rev = GREATEST(chat_notified_watermarks.last_rev, EXCLUDED.last_rev), updated_at = NOW()"#,
+    )
+    .bind(&row.account_did).bind(convos).bind(revs).execute(&mut *tx).await?;
+    sqlx::query(
+        r#"UPDATE chat_poll_state SET chat_cursor = $2, last_poll_at = NOW(),
+            primed_at = CASE WHEN $3 THEN NOW() ELSE NULL END,
+            last_successful_poll_at = CASE WHEN $3 THEN NOW() ELSE last_successful_poll_at END,
+            next_poll_at = NOW() + INTERVAL '5 seconds' WHERE account_did = $1"#,
+    )
+    .bind(&row.account_did)
+    .bind(cursor)
+    .bind(done)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Atomically commit one fetched page. A row lock plus expected-cursor check
+/// fences an overlapping/expired claim; the fetched page must still extend
+/// the stored cursor. Queue identities, watermarks and cursor all commit or
+/// all roll back. Redis is no longer an independent delivery path.
+async fn persist_log_page(
+    db_pool: &Pool<Postgres>,
+    row: &ChatPollRow,
+    page: &GetLogResponse,
+    auth_generation: i64,
+) -> Result<()> {
+    validate_log_page(page)?;
+    let mut tx = db_pool.begin().await?;
+    crate::services::push::lock::acquire_account_lock(&mut tx, &row.account_did).await?;
+    let current: Option<(Option<String>, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "SELECT chat_cursor, catch_up_required_at FROM chat_poll_state WHERE account_did = $1 FOR UPDATE",
+    )
+    .bind(&row.account_did)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((cursor, hold)) = current else {
+        return Ok(());
+    };
+    if cursor != row.chat_cursor || hold.is_some() {
+        return Ok(());
+    }
+
+    let current_generation: Option<i64> = sqlx::query_scalar(
+        "SELECT auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
+    )
+    .bind(&row.account_did)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if current_generation != Some(auth_generation) || auth_generation <= 0 {
+        anyhow::bail!("Chat poll authorization changed before page commit");
+    }
+
+    let watermarks: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT convo_id, last_rev FROM chat_notified_watermarks WHERE account_did = $1",
+    )
+    .bind(&row.account_did)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
+    let reads = batch_read_maxima(&page.logs);
+    let mut dirty = reads.clone();
+    let mut had_incoming_message = false;
+    let mut creates: Vec<_> = page
+        .logs
+        .iter()
+        .filter_map(|entry| match entry {
+            LogEntry::CreateMessage(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    // getLog pages normally arrive in revision order. Sorting prevents a
+    // duplicate/reordered page from losing a lower, still-unprocessed create.
+    creates.sort_by(|a, b| a.rev.cmp(&b.rev));
+
+    for event in creates {
+        let wm = effective_watermark(&watermarks, &dirty, &event.convo_id);
+        if !should_notify(&event.rev, wm.as_deref()) {
+            continue;
+        }
+        let own = event.message.sender.did == row.account_did;
+        let muted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2)",
+        )
+        .bind(&row.account_did)
+        .bind(&event.convo_id)
+        .fetch_one(&mut *tx)
         .await?;
+        had_incoming_message |= !own;
+        if !own && !muted {
+            let sent_at = chrono::DateTime::parse_from_rfc3339(&event.message.sent_at)?;
+            // A fresh successful poll time alone cannot prove that every source
+            // message is recent. Preserve the entire page for catch-up review.
+            if sent_at < chrono::Utc::now() - chrono::Duration::hours(24) {
+                tx.rollback().await?;
+                sqlx::query(
+                    "UPDATE chat_poll_state SET catch_up_required_at = COALESCE(catch_up_required_at, NOW()), catch_up_reason = COALESCE(catch_up_reason, 'source_message_older_than_24h') WHERE account_did = $1 AND chat_cursor IS NOT DISTINCT FROM $2",
+                )
+                .bind(&row.account_did)
+                .bind(&row.chat_cursor)
+                .execute(db_pool)
+                .await?;
+                return Ok(());
+            }
+            let push_event = ChatPushEvent {
+                recipient_did: row.account_did.clone(),
+                sender_did: event.message.sender.did.clone(),
+                convo_id: event.convo_id.clone(),
+                message_id: event.message.id.clone(),
+                message_text: String::new(),
+                sent_at: event.message.sent_at.clone(),
+                auth_generation,
+                log_rev: Some(event.rev.clone()),
+            };
+            crate::services::push::queue::enqueue_chat_tx(&mut tx, &push_event, 0).await?;
+        }
+        raise_watermark(&mut dirty, &event.convo_id, &event.rev);
+    }
+
+    for (convo, rev) in dirty {
+        sqlx::query(
+            r#"
+            INSERT INTO chat_notified_watermarks (account_did, convo_id, last_rev, last_read_rev, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (account_did, convo_id) DO UPDATE
+            SET last_rev = GREATEST(chat_notified_watermarks.last_rev, EXCLUDED.last_rev),
+                last_read_rev = GREATEST(chat_notified_watermarks.last_read_rev, EXCLUDED.last_read_rev),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&row.account_did)
+        .bind(&convo)
+        .bind(&rev)
+        .bind(reads.get(&convo))
+        .execute(&mut *tx)
+        .await?;
+    }
+    let new_tier = if had_incoming_message {
+        super::types::TIER_HOT
+    } else if row.poll_tier == super::types::TIER_HOT {
+        super::types::TIER_WARM
+    } else {
+        row.poll_tier
+    };
+    sqlx::query(
+        r#"UPDATE chat_poll_state SET chat_cursor = $2, poll_tier = $3,
+            next_poll_at = NOW() + make_interval(secs => $4), last_poll_at = NOW(),
+            last_successful_poll_at = NOW() WHERE account_did = $1"#,
+    )
+    .bind(&row.account_did)
+    .bind(&page.cursor)
+    .bind(new_tier)
+    .bind(super::types::tier_interval_secs(new_tier))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2212,7 +2307,7 @@ mod tests {
         let session_id = format!("sess_{}", uuid::Uuid::new_v4());
         let rate_budget = PdsRateBudget::new(20.0);
 
-        poll_account_with_session(
+        let result = poll_account_with_session(
             &state,
             &pool,
             &scheduler,
@@ -2224,10 +2319,10 @@ mod tests {
             1,
             std::time::Instant::now(),
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(result.unwrap_err().to_string().contains("entry limit"));
 
-        // Verify EXACTLY 1000 watermarks were committed (not 1500) via bump_watermarks_batch
+        // Oversized pages retain the old cursor and every unprocessed event.
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM chat_notified_watermarks WHERE account_did = $1")
                 .bind(&test_did)
@@ -2235,11 +2330,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            count.0, 1000,
-            "Must bound watermark items to MAX_PRIME_LOGS_PER_PAGE (1000)"
+            count.0, 0,
+            "No watermark may advance past a rejected oversized page"
         );
 
         // Clean up
         let _ = scheduler.unenroll_account(&test_did).await;
     }
 }
+
+#[cfg(test)]
+#[path = "reliability_tests.rs"]
+mod reliability_tests;

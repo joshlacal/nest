@@ -82,6 +82,15 @@ impl TestDb {
             .execute(&self.pool)
             .await
             .expect("Failed to run push security hardening migration");
+        for sql in [
+            include_str!("../migrations/20261002000100_chat_poll_catchup_hold.up.sql"),
+            include_str!("../migrations/20261002000200_push_delivery_receipts.up.sql"),
+        ] {
+            sqlx::raw_sql(sql)
+                .execute(&self.pool)
+                .await
+                .expect("Failed to run LITE-001 push reliability migration");
+        }
     }
 }
 
@@ -1631,8 +1640,11 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
         convo_id: "convo_123".to_string(),
         message_id: "msg_456".to_string(),
         message_text: "Hello from old session".to_string(),
-        sent_at: "2026-08-30T12:00:00Z".to_string(),
+        // Keep this event fresh so the source-age hold cannot mask the
+        // authorization-generation fence this regression is exercising.
+        sent_at: Utc::now().to_rfc3339(),
         auth_generation: captured_gen,
+        log_rev: Some("0000000000003".to_string()),
     };
 
     // Fast-path fence check must reject as Revoked
