@@ -1129,8 +1129,19 @@ pub async fn logout(
     let session_id_str = session.id.to_string();
     let session_fp = redact_session_id(&session_id_str);
 
-    // 1. Preserve OAuthSession metadata in memory before local deletion so remote revocation can be attempted
-    let preserved_oauth_session = jacquard_client.restore(&did, &session_id_str).await.ok();
+    // 1. Read the stored grant before local deletion so remote revocation can be attempted.
+    // Read directly from the store: restoring through jacquard could trigger a token refresh.
+    let preserved_grant = match state.auth_store.as_ref() {
+        Some(store) => {
+            use jacquard_oauth::authstore::ClientAuthStore;
+            store
+                .get_session(&did, &session_id_str)
+                .await
+                .ok()
+                .flatten()
+        }
+        None => None,
+    };
 
     // 2. Mandatory local delete from auth_store FIRST (fail-closed locally)
     if let Some(store) = state.auth_store.as_ref() {
@@ -1168,48 +1179,55 @@ pub async fn logout(
         }
     }
 
-    // 4. Remote authorization-server logout/revocation: local-first ordering is preserved (local deletion already succeeded in step 2).
-    // Genuine oauth_session.logout() is the only remote revocation arm.
-    // If no preserved session was available or if remote logout fails, persist a durable retry marker in Redis.
-    let remote_revoked = match preserved_oauth_session {
-        Some(oauth_session) => oauth_session.logout().await.map_err(|e| {
-            tracing::warn!(
-                did = %session.did,
-                session_fp = %session_fp,
-                error = %e,
-                "Preserved OAuthSession remote logout/revocation failed"
-            );
-            e.to_string()
-        }),
-        None => {
-            tracing::warn!(
-                did = %session.did,
-                session_fp = %session_fp,
-                "Could not restore OAuthSession for remote revocation before local delete"
-            );
-            Err("missing preserved OAuth session".to_string())
-        }
-    };
-    if let Err(e) = remote_revoked {
+    // Drop any OAuthSession jacquard cached in memory for this grant.
+    if let Err(e) = jacquard_client.registry.del(&did, &session_id_str).await {
         tracing::warn!(
             did = %session.did,
             session_fp = %session_fp,
             error = %e,
-            "Remote OAuth grant revocation failed on logout; persisting durable retry marker"
+            "Failed to invalidate cached OAuth session on logout"
         );
-        let prefix = state
-            .auth_store
-            .as_ref()
-            .map(|s| s.key_prefix())
-            .unwrap_or("catbird:v2:session:");
-        let retry_key = format!("{}revoke_retry:{}_{}", prefix, session.did, session_fp);
-        let mut conn = state.redis.clone();
-        let _: Result<(), _> = redis::cmd("SETEX")
-            .arg(&retry_key)
-            .arg(86400 * 7) // 7 days retention
-            .arg(&session_id_str)
-            .query_async(&mut conn)
-            .await;
+    }
+
+    // 4. Remote authorization-server revocation, after local deletion. One attempt inline;
+    // on failure the grant is sealed into a bounded retry job (services::revocation).
+    match preserved_grant {
+        Some(mut grant) => {
+            match crate::services::revocation::revoke_upstream(jacquard_client, &mut grant).await {
+                crate::services::revocation::RevokeOutcome::Revoked => {
+                    tracing::info!(did = %session.did, session_fp = %session_fp, "Upstream grant revoked on logout");
+                }
+                crate::services::revocation::RevokeOutcome::NoRevocationEndpoint => {
+                    tracing::info!(did = %session.did, session_fp = %session_fp, "Authorization server has no revocation endpoint");
+                }
+                crate::services::revocation::RevokeOutcome::Failed(e) => {
+                    tracing::warn!(
+                        did = %session.did,
+                        session_fp = %session_fp,
+                        error = %e,
+                        "Upstream grant revocation failed on logout; scheduling sealed retry"
+                    );
+                    if let Some(store) = state.auth_store.as_ref() {
+                        if let Err(e) = crate::services::revocation::enqueue_retry(
+                            store,
+                            grant,
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await
+                        {
+                            tracing::error!(did = %session.did, session_fp = %session_fp, error = %e, "Failed to schedule revocation retry");
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                did = %session.did,
+                session_fp = %session_fp,
+                "No stored grant found on logout; nothing to revoke upstream"
+            );
+        }
     }
     let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
@@ -2487,7 +2505,7 @@ mod tests {
             ..state_proto
         });
 
-        let did = "did:plc:test_logout_user";
+        let did = "did:plc:testlogoutuser";
         let session_id = Uuid::new_v4();
         let session_id_str = session_id.to_string();
         let session_fp = redact_session_id(&session_id_str);
@@ -2506,46 +2524,150 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let jar = CookieJar::new();
+        let mut conn = redis.clone();
+        let hmac_fp = auth_store.fingerprint(&session_id_str);
+        let job_key = crate::services::revocation::revoke_job_key(&prefix, &hmac_fp);
+        let legacy_marker = format!("{}revoke_retry:{}_{}", prefix, did, session_fp);
 
-        // 1. Invoke the real logout handler.
-        // Because no OAuth session was pre-installed in the mock auth server, restore fails/returns None.
-        // This MUST treat remote revocation as failed and persist the durable retry marker to Redis.
-        let (_, Json(resp)) = logout(State(state.clone()), Extension(session.clone()), jar)
-            .await
-            .expect("logout handler must succeed");
-
+        // 1. No stored grant: logout succeeds and stores nothing. A raw session ID
+        // alone cannot revoke anything, so no marker of any kind is written.
+        let (_, Json(resp)) = logout(
+            State(state.clone()),
+            Extension(session.clone()),
+            CookieJar::new(),
+        )
+        .await
+        .expect("logout handler must succeed");
         assert!(resp.success);
         assert_eq!(resp.message, "Logged out");
+        for key in [&legacy_marker, &job_key] {
+            let exists: i64 = redis::cmd("EXISTS")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(exists, 0, "{key} must not exist without a stored grant");
+        }
 
-        // 2. Verify that the durable retry marker was written to Redis with the expected key, session_id, and 7-day TTL
-        let retry_key = format!("{}revoke_retry:{}_{}", prefix, did, session_fp);
-        let mut conn = redis.clone();
-        let stored_val: Option<String> = redis::cmd("GET")
-            .arg(&retry_key)
+        // 2. Stored grant whose authorization server is unreachable: the local session is
+        // deleted and the grant is sealed into a bounded retry job keyed by HMAC fingerprint.
+        let session_id = Uuid::new_v4();
+        let session_id_str = session_id.to_string();
+        let session = crate::models::CatbirdSession {
+            id: session_id,
+            ..session
+        };
+        let hmac_fp = auth_store.fingerprint(&session_id_str);
+        let job_key = crate::services::revocation::revoke_job_key(&prefix, &hmac_fp);
+        {
+            use jacquard_oauth::authstore::ClientAuthStore;
+            auth_store
+                .upsert_session(crate::services::revocation::tests::session(
+                    did,
+                    &session_id_str,
+                ))
+                .await
+                .expect("install grant");
+        }
+        let (_, Json(resp)) = logout(
+            State(state.clone()),
+            Extension(session.clone()),
+            CookieJar::new(),
+        )
+        .await
+        .expect("logout handler must succeed when revocation fails");
+        assert!(resp.success);
+        {
+            use jacquard_oauth::authstore::ClientAuthStore;
+            let did_typed = jacquard_common::types::did::Did::new(did).unwrap();
+            assert!(
+                auth_store
+                    .get_session(&did_typed, &session_id_str)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "local session must be deleted before revocation"
+            );
+        }
+        let sealed: Option<String> = redis::cmd("GET")
+            .arg(&job_key)
             .query_async(&mut conn)
             .await
-            .expect("GET retry_key");
-
-        assert_eq!(
-            stored_val,
-            Some(session_id_str.clone()),
-            "Durable retry marker MUST be written to Redis when remote revocation fails"
-        );
-
+            .unwrap();
+        let sealed = sealed.expect("failed revocation must leave a sealed retry job");
+        assert!(!sealed.contains(&session_id_str));
+        assert!(!sealed.contains("refresh-secret"));
+        assert!(!sealed.contains("access-secret"));
+        assert!(!job_key.contains(&session_id_str));
+        let job = crate::services::revocation::open_job(auth_store.enc_key(), &job_key, &sealed)
+            .expect("job opens with the store key");
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.session.account_did.as_str(), did);
         let ttl: i64 = redis::cmd("TTL")
-            .arg(&retry_key)
+            .arg(&job_key)
             .query_async(&mut conn)
             .await
-            .expect("TTL retry_key");
+            .unwrap();
         assert!(
-            ttl > 0 && ttl <= 86400 * 7,
-            "Retry marker TTL must be set up to 7 days, got {ttl}"
+            ttl > 0 && ttl <= crate::services::revocation::REVOKE_JOB_TTL_SECONDS as i64,
+            "retry job TTL must be bounded, got {ttl}"
         );
+
+        // 3. A due retry that fails again is rescheduled in place without extending the TTL.
+        let now = chrono::Utc::now().timestamp() + 3600;
+        let stats = crate::services::revocation::run_retry_pass(&state, now)
+            .await
+            .expect("retry pass");
+        assert_eq!(stats.rescheduled, 1, "{stats:?}");
+        let sealed: String = redis::cmd("GET")
+            .arg(&job_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut job =
+            crate::services::revocation::open_job(auth_store.enc_key(), &job_key, &sealed).unwrap();
+        assert_eq!(job.attempts, 2);
+        assert!(job.next_attempt_at > now);
+        let ttl_after: i64 = redis::cmd("TTL")
+            .arg(&job_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(ttl_after > 0 && ttl_after <= ttl);
+
+        // 4. The final failed attempt deletes the sealed credential copy.
+        job.attempts = crate::services::revocation::MAX_REVOKE_ATTEMPTS - 1;
+        job.next_attempt_at = 0;
+        let resealed =
+            crate::services::revocation::seal_job(auth_store.enc_key(), &job_key, &job).unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&job_key)
+            .arg(resealed)
+            .arg("KEEPTTL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let claim_key = format!("{prefix}revoke_claim:{hmac_fp}");
+        let _: () = redis::cmd("DEL")
+            .arg(&claim_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let stats = crate::services::revocation::run_retry_pass(&state, now)
+            .await
+            .expect("retry pass");
+        assert_eq!(stats.abandoned, 1, "{stats:?}");
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&job_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(exists, 0, "abandoned job must be deleted");
 
         // Cleanup
         let _: () = redis::cmd("DEL")
-            .arg(&retry_key)
+            .arg(&job_key)
+            .arg(&claim_key)
             .query_async(&mut conn)
             .await
             .unwrap();

@@ -123,6 +123,9 @@ async fn main() -> anyhow::Result<()> {
         push.spawn_worker(state.clone());
     }
 
+    // Retries upstream grant revocations that failed during logout (sealed, bounded jobs).
+    services::revocation::spawn_retry_worker(state.clone());
+
     let chat_gate_open = state.config.push.is_chat_poll_release_gate_open();
     metrics::set_chat_poll_enabled_metric(chat_gate_open);
 
