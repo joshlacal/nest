@@ -357,3 +357,20 @@ fn default_include() -> String {
 fn default_true() -> bool {
     true
 }
+
+/// What signing out one session did to the account's push access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushAccountSignOut {
+    /// The account's push session belongs to another signed-in session; untouched.
+    NotPushSession,
+    /// Push moved to another live session that has an active device.
+    HandedOver,
+    /// No other live session remained, so the account's push access was revoked.
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignOutPushOutcome {
+    pub devices_deactivated: u64,
+    pub account: PushAccountSignOut,
+}

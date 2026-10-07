@@ -6,7 +6,10 @@ use crate::{
     models::CatbirdSession,
 };
 
-use super::types::{PushAccountRow, RegisterPushInput, RegistrationRow, UnregisterPushInput};
+use super::types::{
+    PushAccountRow, PushAccountSignOut, RegisterPushInput, RegistrationRow, SignOutPushOutcome,
+    UnregisterPushInput,
+};
 
 pub const MAX_ACTIVE_DEVICES_PER_ACCOUNT: i64 = 10;
 pub const MAX_FANOUT_PER_NOTIFICATION: i64 = 10;
@@ -698,6 +701,125 @@ impl PushRegistry {
 
         tx.commit().await?;
         Ok(affected)
+    }
+
+    /// Row ID of a device registration, used to link it to the registering session.
+    pub async fn device_row_id(&self, did: &str, device_token: &str) -> Result<Option<uuid::Uuid>> {
+        Ok(
+            sqlx::query_scalar("SELECT id FROM user_devices WHERE did = $1 AND device_token = $2")
+                .bind(did)
+                .bind(device_token)
+                .fetch_optional(&self.db_pool)
+                .await?,
+        )
+    }
+
+    pub async fn active_device_ids(&self, did: &str) -> Result<Vec<uuid::Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM user_devices WHERE did = $1 AND is_active = TRUE ORDER BY updated_at DESC",
+        )
+        .bind(did)
+        .fetch_all(&self.db_pool)
+        .await?)
+    }
+
+    /// Ends one session's notification access in a single transaction: deactivates the
+    /// devices that session registered and, only if it is the account's push session,
+    /// hands the account over to `handover_fp` (a live session's fingerprint) or revokes
+    /// it. Preferences, mutes and subscriptions are deliberately left in place.
+    pub async fn sign_out_session(
+        &self,
+        did: &str,
+        raw_session_id: &str,
+        own_device_ids: &[uuid::Uuid],
+        handover_fp: Option<&str>,
+    ) -> Result<SignOutPushOutcome> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let session_fp = normalize_or_hash_session_fingerprint(raw_session_id);
+
+        let devices_deactivated = if own_device_ids.is_empty() {
+            0
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE user_devices
+                SET is_active = FALSE,
+                    last_invalidated_at = NOW(),
+                    last_error = 'session_signed_out',
+                    updated_at = NOW()
+                WHERE did = $1 AND id = ANY($2) AND is_active = TRUE
+                "#,
+            )
+            .bind(did)
+            .bind(own_device_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+
+        let is_push_session: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM push_accounts
+                WHERE account_did = $1
+                  AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2)
+            )
+            "#,
+        )
+        .bind(did)
+        .bind(&session_fp)
+        .bind(raw_session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let account = match (is_push_session, handover_fp) {
+            (false, _) => PushAccountSignOut::NotPushSession,
+            (true, Some(next_fp)) => {
+                // Only a fingerprint is ever written here, regardless of phase2_writers.
+                sqlx::query(
+                    r#"
+                    UPDATE push_accounts
+                    SET session_id = $2,
+                        session_fingerprint = $2,
+                        auth_revoked_at = NULL,
+                        auth_generation = push_accounts.auth_generation + 1,
+                        updated_at = NOW()
+                    WHERE account_did = $1
+                    "#,
+                )
+                .bind(did)
+                .bind(next_fp)
+                .execute(&mut *tx)
+                .await?;
+                PushAccountSignOut::HandedOver
+            }
+            (true, None) => {
+                sqlx::query(
+                    r#"
+                    UPDATE push_accounts
+                    SET auth_revoked_at = NOW(),
+                        auth_generation = push_accounts.auth_generation + 1,
+                        updated_at = NOW()
+                    WHERE account_did = $1
+                    "#,
+                )
+                .bind(did)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM chat_poll_state WHERE account_did = $1")
+                    .bind(did)
+                    .execute(&mut *tx)
+                    .await?;
+                PushAccountSignOut::Revoked
+            }
+        };
+
+        tx.commit().await?;
+        Ok(SignOutPushOutcome {
+            devices_deactivated,
+            account,
+        })
     }
 
     pub async fn clear_auth_revoked(&self, did: &str) -> Result<()> {

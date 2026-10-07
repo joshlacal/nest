@@ -41,8 +41,29 @@ pub async fn register_push(
         .upsert_registration(&session, &input)
         .await
         .map_err(internal_error)?;
+    link_device_to_session(&state, &session, &input.token).await;
     crate::handlers::chat_poll::enroll_session_for_chat_poll(&state, &session).await;
     Ok(StatusCode::OK)
+}
+
+/// Best effort: records which session registered this device so signing out that
+/// session stops only its own devices. A missing link only loses that precision.
+async fn link_device_to_session(state: &AppState, session: &CatbirdSession, token: &str) {
+    let (Some(store), Some(push)) = (state.auth_store.as_deref(), state.push.as_ref()) else {
+        return;
+    };
+    let result = match push.registry.device_row_id(&session.did, token).await {
+        Ok(Some(device_id)) => {
+            crate::services::push::session_devices::link(store, device_id, &session.id.to_string())
+                .await
+                .map_err(|e| e.to_string())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = result {
+        tracing::warn!(did = %session.did, error = %e, "Failed to link push device to session");
+    }
 }
 
 pub async fn unregister_push(

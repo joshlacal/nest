@@ -1162,20 +1162,30 @@ pub async fn logout(
             })?;
     }
 
-    // 3. Best-effort push revocation (cleanup failure does not reactivate bearer)
-    let push_registry = state.push_registry();
-
-    if let Some(registry) = push_registry {
-        if let Err(e) = registry
-            .mark_auth_revoked_if_session(&session.did, &session_id_str)
-            .await
+    // 3. Best-effort push sign-out for this session only (cleanup failure does not
+    // reactivate the bearer). Other signed-in devices keep their notifications.
+    if let Some(registry) = state.push_registry() {
+        match crate::services::push::session_devices::sign_out_session(
+            state.auth_store.as_deref(),
+            &registry,
+            &session.did,
+            &session_id_str,
+        )
+        .await
         {
-            tracing::warn!(
+            Ok(outcome) => tracing::info!(
+                did = %session.did,
+                session_fp = %session_fp,
+                devices_deactivated = outcome.devices_deactivated,
+                account = ?outcome.account,
+                "Push access ended for signed-out session"
+            ),
+            Err(e) => tracing::warn!(
                 did = %session.did,
                 session_fp = %session_fp,
                 error = %e,
-                "Best-effort push auth revocation failed on logout"
-            );
+                "Best-effort push sign-out failed on logout"
+            ),
         }
     }
 

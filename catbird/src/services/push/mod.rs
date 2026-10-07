@@ -5,6 +5,7 @@ pub mod moderation_verdict;
 pub mod preferences;
 pub mod queue;
 pub mod registry;
+pub mod session_devices;
 pub mod subscriptions;
 pub mod thread_mutes;
 pub mod types;
