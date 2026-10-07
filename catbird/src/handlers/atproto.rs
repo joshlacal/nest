@@ -1490,7 +1490,7 @@ pub async fn proxy_xrpc(
         request_id = %request_id,
         lexicon = %lexicon,
         method = %method,
-        query = ?query_string,
+        query_keys = ?query_string.as_deref().map(query_param_names),
         content_type = ?content_type,
         body_bytes = body_bytes.len(),
         body_shape = ?body_shape,
@@ -1746,6 +1746,22 @@ pub async fn proxy_xrpc(
 }
 
 /// Extract JSON shape information for logging (top-level keys and array lengths)
+/// Parameter names from a raw query string, without values. Values carry actor
+/// identifiers, cursors and search terms, so only the names are ever logged.
+fn query_param_names(query: &str) -> Vec<String> {
+    const MAX_PARAMS: usize = 20;
+    const MAX_NAME_LEN: usize = 64;
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .take(MAX_PARAMS)
+        .map(|pair| {
+            let name = pair.split('=').next().unwrap_or_default();
+            name.chars().take(MAX_NAME_LEN).collect()
+        })
+        .collect()
+}
+
 fn json_shape(data: &[u8]) -> Option<String> {
     let json: Value = serde_json::from_slice(data).ok()?;
     Some(describe_json_shape(&json, 0))
@@ -2570,5 +2586,32 @@ mod tests {
             crate::services::redis_crypto::seal_with_aad(&key, session_id.as_bytes(), &aad)
                 .unwrap();
         assert!(v2_sealed.starts_with(crate::services::redis_crypto::V2_PREFIX));
+    }
+}
+
+#[cfg(test)]
+mod query_logging_tests {
+    use super::query_param_names;
+
+    #[test]
+    fn logs_parameter_names_but_never_values() {
+        let names = query_param_names("actor=did%3Aplc%3Aabc&q=private+search&cursor=xyz&flag");
+        assert_eq!(names, vec!["actor", "q", "cursor", "flag"]);
+        let joined = names.join(",");
+        assert!(!joined.contains("did"));
+        assert!(!joined.contains("private"));
+        assert!(!joined.contains("xyz"));
+    }
+
+    #[test]
+    fn bounds_parameter_count_and_name_length() {
+        let many = (0..50)
+            .map(|i| format!("p{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert_eq!(query_param_names(&many).len(), 20);
+        let long = format!("{}=v", "n".repeat(500));
+        assert_eq!(query_param_names(&long)[0].len(), 64);
+        assert!(query_param_names("").is_empty());
     }
 }

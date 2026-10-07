@@ -270,12 +270,11 @@ pub(crate) async fn poll_account_with_session(
                         }
                     }
 
-                    let body_snippet: String =
-                        String::from_utf8_lossy(&body).chars().take(300).collect();
                     tracing::warn!(
                         did = %row.account_did,
                         status,
-                        body = %body_snippet,
+                        error_code = ?xrpc_error_code(&body),
+                        body_bytes = body.len(),
                         "Prime pass got non-200; will resume next cycle"
                     );
                     scheduler.reschedule(&row.account_did, 120).await?;
@@ -384,11 +383,11 @@ pub(crate) async fn poll_account_with_session(
     }
 
     if status != 200 {
-        let body_text = String::from_utf8_lossy(&body);
         tracing::warn!(
             did = %row.account_did,
             status = status,
-            body = %body_text.chars().take(200).collect::<String>(),
+            error_code = ?xrpc_error_code(&body),
+            body_bytes = body.len(),
             "Chat poll unexpected status"
         );
         scheduler.reschedule(&row.account_did, 60).await?;
@@ -2241,5 +2240,34 @@ mod tests {
 
         // Clean up
         let _ = scheduler.unenroll_account(&test_did).await;
+    }
+}
+
+/// The XRPC `error` code from an upstream error body, if any. Error bodies are not
+/// logged verbatim: a `getLog` response can contain message text.
+fn xrpc_error_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.as_str()?;
+    let valid = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    valid.then(|| code.to_string())
+}
+
+#[cfg(test)]
+mod xrpc_error_code_tests {
+    use super::xrpc_error_code;
+
+    #[test]
+    fn extracts_only_well_formed_error_codes() {
+        assert_eq!(
+            xrpc_error_code(br#"{"error":"InvalidToken","message":"secret detail"}"#),
+            Some("InvalidToken".to_string())
+        );
+        assert_eq!(xrpc_error_code(br#"{"logs":[{"text":"hello"}]}"#), None);
+        assert_eq!(xrpc_error_code(br#"{"error":"has spaces in it"}"#), None);
+        assert_eq!(xrpc_error_code(b"<html>bad gateway</html>"), None);
     }
 }
