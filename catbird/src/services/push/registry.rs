@@ -37,6 +37,21 @@ pub fn normalize_or_hash_session_fingerprint(session_id: &str) -> String {
     }
 }
 
+/// Fingerprint-only writers are the default: a raw bearer session ID must never be
+/// written to `push_accounts.session_id`. `PUSH_ACCOUNTS_PHASE2_WRITERS=0|false` restores
+/// the legacy raw writes and exists only as an emergency rollback switch.
+pub fn phase2_writers_from_env() -> bool {
+    parse_phase2_writers(
+        std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_phase2_writers(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some(v) if v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
 #[derive(Clone)]
 pub struct PushRegistry {
     db_pool: Pool<Postgres>,
@@ -49,9 +64,7 @@ pub struct PushRegistry {
 
 impl PushRegistry {
     pub fn new(db_pool: Pool<Postgres>, service_did: String) -> Self {
-        let phase2_writers = std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let phase2_writers = phase2_writers_from_env();
         Self {
             db_pool,
             service_did,
@@ -69,9 +82,7 @@ impl PushRegistry {
         max_inactive_devices_per_account: i64,
         max_fanout_per_notification: i64,
     ) -> Self {
-        let phase2_writers = std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let phase2_writers = phase2_writers_from_env();
         Self {
             db_pool,
             service_did,
@@ -444,30 +455,42 @@ impl PushRegistry {
         )
         .await?;
 
+        let raw_session = session.id.to_string();
+        let session_fp = normalize_or_hash_session_fingerprint(&raw_session);
+        let session_id_bind: &str = if self.phase2_writers {
+            &session_fp
+        } else {
+            &raw_session
+        };
         sqlx::query(
             r#"
             INSERT INTO push_accounts (
                 account_did,
                 session_id,
+                session_fingerprint,
                 pds_url,
                 auth_revoked_at,
                 auth_generation,
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, NULL, 1, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, 1, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
-            SET pds_url = EXCLUDED.pds_url,
+            SET session_id = EXCLUDED.session_id,
+                pds_url = EXCLUDED.pds_url,
                 auth_revoked_at = NULL,
                 last_seen_at = NOW(),
                 updated_at = NOW()
-            WHERE push_accounts.session_id = EXCLUDED.session_id
+            WHERE push_accounts.session_fingerprint = EXCLUDED.session_fingerprint
+               OR push_accounts.session_id = $5
             "#,
         )
         .bind(&session.did)
-        .bind(session.id.to_string())
+        .bind(session_id_bind)
+        .bind(&session_fp)
         .bind(&session.pds_url)
+        .bind(&raw_session)
         .execute(&mut *tx)
         .await?;
 
@@ -1688,5 +1711,16 @@ mod tests {
             ..valid.clone()
         };
         assert!(empty_app_id.validate().is_err());
+    }
+
+    #[test]
+    fn phase2_writers_default_on_and_only_explicit_false_disables() {
+        assert!(parse_phase2_writers(None));
+        assert!(parse_phase2_writers(Some("1")));
+        assert!(parse_phase2_writers(Some("true")));
+        assert!(parse_phase2_writers(Some("")));
+        assert!(!parse_phase2_writers(Some("0")));
+        assert!(!parse_phase2_writers(Some("false")));
+        assert!(!parse_phase2_writers(Some(" FALSE ")));
     }
 }

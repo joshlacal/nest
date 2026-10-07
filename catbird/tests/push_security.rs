@@ -1598,7 +1598,12 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
     .await
     .unwrap();
     assert_eq!(captured_gen, 1, "Initial account generation must be 1");
-    assert_eq!(captured_session_id, session_1.id.to_string());
+    // Phase-2 writers (the default) store only the non-replayable fingerprint, never the bearer.
+    assert_eq!(
+        captured_session_id,
+        catbird::services::push::registry::session_fingerprint(&session_1.id.to_string())
+    );
+    assert_ne!(captured_session_id, session_1.id.to_string());
 
     // Mid-poll: user logs out and re-authenticates with a new session while network call is in flight
     services

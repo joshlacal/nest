@@ -185,8 +185,9 @@ pub struct PushConfig {
     /// Enable the chat poll background service
     #[serde(default)]
     pub chat_poll_enabled: bool,
-    /// When true (Phase 2), writers bind the SHA-256 fingerprint into session_id instead of raw plaintext bearer strings
-    #[serde(default)]
+    /// When true (Phase 2), writers bind the SHA-256 fingerprint into session_id instead of raw plaintext bearer strings.
+    /// Defaults to true; set false only as an emergency rollback to legacy raw writes.
+    #[serde(default = "default_phase2_writers")]
     pub phase2_writers: bool,
 }
 
@@ -223,7 +224,7 @@ impl Default for PushConfig {
             send_timeout_seconds: default_push_send_timeout_seconds(),
             apns: Default::default(),
             chat_poll_enabled: false,
-            phase2_writers: false,
+            phase2_writers: default_phase2_writers(),
         }
     }
 }
@@ -291,6 +292,10 @@ fn default_max_inactive_devices_per_account() -> i64 {
 
 fn default_max_fanout_per_notification() -> i64 {
     10
+}
+
+fn default_phase2_writers() -> bool {
+    crate::services::push::registry::phase2_writers_from_env()
 }
 
 fn default_push_send_timeout_seconds() -> u64 {
