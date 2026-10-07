@@ -43,6 +43,49 @@ pub enum OAuthMode {
 
 pub const OAUTH_DIRECT_NONCE_COOKIE_NAME: &str = "catbird_oauth_direct_nonce";
 
+fn validate_direct_browser_nonce(
+    cookie_nonce: Option<&str>,
+    expected_nonce: Option<&str>,
+    allow_missing_cookie: bool,
+) -> Result<(), &'static str> {
+    match (cookie_nonce, expected_nonce) {
+        (Some(cookie), Some(expected)) if !cookie.is_empty() && cookie == expected => Ok(()),
+        // Temporary legacy TestFlight exception; never accept a mismatched or empty cookie.
+        (None, Some(expected)) if allow_missing_cookie && !expected.is_empty() => {
+            tracing::warn!("Direct OAuth callback accepted without browser nonce cookie: temporary compatibility enabled");
+            Ok(())
+        }
+        (None, _) => Err("Direct OAuth callback browser nonce missing"),
+        (Some(_), None) => Err("Direct OAuth callback flow record missing nonce"),
+        (Some(_), Some(_)) => Err("Direct OAuth callback browser nonce mismatched"),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn direct_browser_nonce_compatibility_preserves_binding_when_present() {
+    for enabled in [false, true] {
+        assert!(validate_direct_browser_nonce(Some("nonce"), Some("nonce"), enabled).is_ok());
+        assert!(validate_direct_browser_nonce(Some("wrong"), Some("nonce"), enabled).is_err());
+        assert!(validate_direct_browser_nonce(Some(""), Some("nonce"), enabled).is_err());
+        assert!(validate_direct_browser_nonce(Some(""), Some(""), enabled).is_err());
+        assert!(validate_direct_browser_nonce(Some("nonce"), None, enabled).is_err());
+        assert!(validate_direct_browser_nonce(None, None, enabled).is_err());
+        assert!(validate_direct_browser_nonce(None, Some(""), enabled).is_err());
+    }
+    assert!(validate_direct_browser_nonce(None, Some("nonce"), false).is_err());
+    assert!(validate_direct_browser_nonce(None, Some("nonce"), true).is_ok());
+}
+
+fn direct_callback_redirect(session_id: &str, is_catmos: bool, legacy_handoff: bool) -> String {
+    if legacy_handoff && !is_catmos {
+        // Fixed native callback only; never use a caller-supplied redirect for bearer handoff.
+        build_app_redirect("", session_id)
+    } else {
+        "/".to_string()
+    }
+}
+
 /// Returns a non-replayable fingerprint of a session ID for privacy-safe logging.
 pub fn redact_session_id(id: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -502,46 +545,20 @@ pub async fn oauth_callback(
             ));
         }
 
-        // Direct mode browser nonce verification (Finding 21):
-        // Verify that the browser presented the direct-mode nonce cookie matching the flow record.
-        let cookie_nonce = jar.get(OAUTH_DIRECT_NONCE_COOKIE_NAME).map(|c| c.value());
-        let expected_nonce = flow_record.browser_nonce.as_deref();
-        match (cookie_nonce, expected_nonce) {
-            (Some(c_nonce), Some(e_nonce)) if !c_nonce.is_empty() && c_nonce == e_nonce => {
-                // Valid browser nonce; verified before token exchange!
-            }
-            (None, _) => {
-                let _ = redis::cmd("DEL")
-                    .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await;
-                tracing::error!("Direct mode callback rejected: missing browser nonce cookie");
-                return Err(AppError::Unauthorized(
-                    "Direct OAuth callback browser nonce missing".into(),
-                ));
-            }
-            (Some(_), None) => {
-                let _ = redis::cmd("DEL")
-                    .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await;
-                tracing::error!(
-                    "Direct mode callback rejected: flow record missing expected browser nonce"
-                );
-                return Err(AppError::Unauthorized(
-                    "Direct OAuth callback flow record missing nonce".into(),
-                ));
-            }
-            (Some(_), Some(_)) => {
-                let _ = redis::cmd("DEL")
-                    .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await;
-                tracing::error!("Direct mode callback rejected: browser nonce cookie mismatched");
-                return Err(AppError::Unauthorized(
-                    "Direct OAuth callback browser nonce mismatched".into(),
-                ));
-            }
+        // Default-off compatibility for legacy TestFlight's missing browser cookie only.
+        let allow_missing_cookie =
+            std::env::var("NEST_ALLOW_MISSING_DIRECT_OAUTH_COOKIE").as_deref() == Ok("true");
+        if let Err(message) = validate_direct_browser_nonce(
+            jar.get(OAUTH_DIRECT_NONCE_COOKIE_NAME).map(|c| c.value()),
+            flow_record.browser_nonce.as_deref(),
+            allow_missing_cookie,
+        ) {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!(message, "Direct mode callback rejected");
+            return Err(AppError::Unauthorized(message.into()));
         }
         None
     };
@@ -679,12 +696,11 @@ pub async fn oauth_callback(
                 .same_site(SameSite::Lax)
                 .max_age(time::Duration::ZERO)
                 .build();
-            let redirect_target = "/";
+            let legacy_handoff =
+                std::env::var("NEST_LEGACY_DIRECT_OAUTH_HANDOFF").as_deref() == Ok("true");
+            let redirect_target = direct_callback_redirect(&session_id, is_catmos, legacy_handoff);
 
-            (
-                jar.add(cookie).add(direct_cleanup_cookie),
-                redirect_target.to_string(),
-            )
+            (jar.add(cookie).add(direct_cleanup_cookie), redirect_target)
         };
         // 4. Construct response
         let response = Response::builder()
@@ -2321,28 +2337,22 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_mode_callback_cookie_and_location_invariants() {
+    fn direct_callback_handoff_matches_legacy_app_without_affecting_other_clients() {
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
-
-        // Direct mode sets HttpOnly, SameSite=Strict cookie with session_id
-        let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id))
-            .path("/")
-            .http_only(true)
-            .secure(true)
-            .same_site(SameSite::Strict)
-            .max_age(time::Duration::days(30))
-            .build();
-
-        assert_eq!(cookie.name(), SESSION_COOKIE_NAME);
-        assert_eq!(cookie.value(), session_id);
-        assert_eq!(cookie.http_only(), Some(true));
-        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
-        assert_eq!(cookie.secure(), Some(true));
-
-        // Direct mode location is strictly "/" (never contains session_id)
-        let location = "/";
-        assert!(!location.contains(session_id));
-        assert_eq!(location, "/");
+        let target = direct_callback_redirect(session_id, false, true);
+        let url = url::Url::parse(&target).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("catbird.blue"));
+        assert_eq!(url.path(), "/oauth/callback");
+        assert_eq!(url.query(), None);
+        // The old SDK reads session_id from the fragment, not a query code or browser cookie.
+        assert_eq!(
+            url.fragment(),
+            Some(format!("session_id={session_id}").as_str())
+        );
+        assert_eq!(direct_callback_redirect(session_id, false, false), "/");
+        assert_eq!(direct_callback_redirect(session_id, true, true), "/");
+        assert_eq!(direct_callback_redirect(session_id, true, false), "/");
     }
 
     #[test]
