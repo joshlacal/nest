@@ -1,8 +1,60 @@
 use anyhow::Result;
 use serde_json::Value;
-use sqlx::{Pool, Postgres, Row};
+use sqlx::{PgConnection, Pool, Postgres, Row};
 
-use super::types::QueueRow;
+use super::types::{QueueRow, RegistrationRow};
+use crate::services::chat_poll::types::ChatPushEvent;
+
+/// Caller must keep this connection in the same transaction as cursor/watermark
+/// advancement. The identity and queue insert commit together or neither does.
+pub async fn enqueue_chat_tx(
+    conn: &mut PgConnection,
+    event: &ChatPushEvent,
+    delay_secs: i64,
+) -> Result<bool> {
+    anyhow::ensure!(event.auth_generation > 0, "invalid push auth generation");
+    let event_timestamp = chrono::DateTime::parse_from_rfc3339(&event.sent_at)?.timestamp();
+    let dedupe_key = event.dedupe_key();
+    let mut persisted = event.clone();
+    persisted.message_text.clear();
+    let inserted = sqlx::query(
+        "INSERT INTO push_event_receipts(dedupe_key, recipient_did, auth_generation) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+    )
+    .bind(&dedupe_key).bind(&event.recipient_did).bind(event.auth_generation)
+    .execute(&mut *conn).await?.rows_affected() > 0;
+    if !inserted {
+        return Ok(false);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO push_event_queue(recipient_did, actor_did, notification_type,
+            event_cid, event_path, event_record_json, event_timestamp, dedupe_key,
+            available_at, auth_generation)
+        VALUES ($1,$2,'chat_message',$3,'chat.bsky.convo.getLog',$4,$5,$6,
+            NOW() + make_interval(secs => $7),$8)
+        ON CONFLICT (dedupe_key) DO NOTHING
+    "#,
+    )
+    .bind(&event.recipient_did)
+    .bind(&event.sender_did)
+    .bind(&event.message_id)
+    .bind(serde_json::to_value(persisted)?)
+    .bind(event_timestamp)
+    .bind(&dedupe_key)
+    .bind(delay_secs.max(0) as f64)
+    .bind(event.auth_generation)
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeviceAttempt {
+    Send(uuid::Uuid),
+    AlreadyFinished,
+    Held,
+    LeaseLost,
+}
 
 #[derive(Clone)]
 pub struct PushQueue {
@@ -24,6 +76,7 @@ impl PushQueue {
                 WHERE peq.available_at <= NOW()
                   AND (peq.leased_until IS NULL OR peq.leased_until < NOW())
                   AND (pa.auth_revoked_at IS NULL)
+                  AND peq.delivery_hold_reason IS NULL
                 ORDER BY peq.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF peq SKIP LOCKED
@@ -86,7 +139,15 @@ impl PushQueue {
         lease_version: i64,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "DELETE FROM push_event_queue WHERE id = $1 AND lease_token = $2 AND lease_version = $3 AND leased_until >= NOW()",
+            r#"WITH completed AS (
+                DELETE FROM push_event_queue
+                WHERE id = $1 AND lease_token = $2 AND lease_version = $3 AND leased_until >= NOW()
+                RETURNING dedupe_key, recipient_did, auth_generation
+            )
+            INSERT INTO push_event_receipts(dedupe_key, recipient_did, auth_generation, state)
+            SELECT dedupe_key, recipient_did, auth_generation, 'completed' FROM completed
+            ON CONFLICT (dedupe_key) DO UPDATE SET
+                state = 'completed', updated_at = NOW()"#,
         )
         .bind(id)
         .bind(lease_token)
@@ -118,7 +179,7 @@ impl PushQueue {
             "#,
         )
         .bind(id)
-        .bind(backoff_seconds)
+        .bind(backoff_seconds as f64)
         .bind(error)
         .bind(lease_token)
         .bind(lease_version)
@@ -147,7 +208,7 @@ impl PushQueue {
         .bind(id)
         .bind(lease_token)
         .bind(lease_version)
-        .bind(extension_seconds)
+        .bind(extension_seconds as f64)
         .fetch_optional(&self.db_pool)
         .await?;
 
@@ -174,22 +235,102 @@ impl PushQueue {
         Ok(row.is_some())
     }
 
-    /// Atomically claim a queued event by dedupe key. Returns true only if an
-    /// UNLEASED row was deleted — the caller then owns delivery. Returns false
-    /// if the row is absent or the durable worker already leased it.
-    pub async fn claim_by_dedupe_key(&self, dedupe_key: &str) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM push_event_queue
-            WHERE dedupe_key = $1
-              AND (leased_until IS NULL OR leased_until < NOW())
-            "#,
+    /// Commit an intent before crossing the APNs boundary. An intent without a
+    /// recorded response on restart is ambiguous, and is held for inspection.
+    pub async fn begin_device_attempt(
+        &self,
+        row: &QueueRow,
+        device: &RegistrationRow,
+        lease_token: uuid::Uuid,
+    ) -> Result<DeviceAttempt> {
+        let mut tx = self.db_pool.begin().await?;
+        let event_key = sqlx::query_scalar::<_, String>(
+            "SELECT dedupe_key FROM push_event_queue WHERE id=$1 AND lease_token=$2 AND leased_until >= NOW() AND delivery_hold_reason IS NULL",
+        ).bind(row.id).bind(lease_token).fetch_optional(&mut *tx).await?;
+        let Some(event_key) = event_key else {
+            return Ok(DeviceAttempt::LeaseLost);
+        };
+        sqlx::query("INSERT INTO push_event_receipts(dedupe_key,recipient_did,auth_generation) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+            .bind(&event_key).bind(&row.recipient_did).bind(row.auth_generation)
+            .execute(&mut *tx).await?;
+        let event_state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM push_event_receipts WHERE dedupe_key=$1 FOR UPDATE",
         )
-        .bind(dedupe_key)
-        .execute(&self.db_pool)
+        .bind(&event_key)
+        .fetch_one(&mut *tx)
         .await?;
+        if event_state == "completed" {
+            return Ok(DeviceAttempt::AlreadyFinished);
+        }
+        if event_state == "held" {
+            return Ok(DeviceAttempt::Held);
+        }
+        let prior = sqlx::query("SELECT state, attempts, delivery_id FROM push_device_deliveries WHERE dedupe_key=$1 AND device_id=$2 FOR UPDATE")
+            .bind(&event_key).bind(device.id).fetch_optional(&mut *tx).await?;
+        let outcome = if let Some(prior) = prior {
+            let status: String = prior.try_get("state")?;
+            let attempts: i32 = prior.try_get("attempts")?;
+            if status == "accepted" || status == "invalid" {
+                DeviceAttempt::AlreadyFinished
+            } else if status == "retry" && attempts < 5 {
+                sqlx::query("UPDATE push_device_deliveries SET state='attempting', attempts=attempts+1, updated_at=NOW() WHERE dedupe_key=$1 AND device_id=$2")
+                    .bind(&event_key).bind(device.id).execute(&mut *tx).await?;
+                DeviceAttempt::Send(prior.try_get("delivery_id")?)
+            } else {
+                sqlx::query("UPDATE push_device_deliveries SET state='held', last_error=CASE WHEN state='attempting' THEN 'ambiguous_process_interruption' WHEN state='retry' THEN 'retry_limit' ELSE last_error END, updated_at=NOW() WHERE dedupe_key=$1 AND device_id=$2")
+                    .bind(&event_key).bind(device.id).execute(&mut *tx).await?;
+                DeviceAttempt::Held
+            }
+        } else {
+            let delivery_id = sqlx::query_scalar::<_, uuid::Uuid>("INSERT INTO push_device_deliveries(dedupe_key,device_id,state) VALUES($1,$2,'attempting') RETURNING delivery_id")
+                .bind(&event_key).bind(device.id).fetch_one(&mut *tx).await?;
+            DeviceAttempt::Send(delivery_id)
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
 
-        Ok(result.rows_affected() > 0)
+    /// APNs success means accepted by APNs, never proof of phone presentation.
+    pub async fn record_device_outcome(
+        &self,
+        delivery_id: uuid::Uuid,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            ["accepted", "invalid", "retry", "held"].contains(&outcome),
+            "invalid delivery outcome"
+        );
+        let changed = sqlx::query("UPDATE push_device_deliveries SET state=$2, last_error=$3, updated_at=NOW() WHERE delivery_id=$1 AND state IN ('attempting','held')")
+            .bind(delivery_id).bind(outcome).bind(reason)
+            .execute(&self.db_pool).await?.rows_affected();
+        anyhow::ensure!(
+            changed == 1,
+            "delivery outcome missing or already finalized"
+        );
+        Ok(())
+    }
+
+    /// Held rows are durable operator-visible work, never automatically retried.
+    pub async fn hold_fenced(
+        &self,
+        id: i64,
+        token: uuid::Uuid,
+        version: i64,
+        reason: &str,
+    ) -> Result<bool> {
+        let changed = sqlx::query(r#"
+            WITH held AS (
+                UPDATE push_event_queue SET delivery_hold_reason=$4, last_error=$4,
+                    leased_until=NULL, lease_token=NULL, lease_version=lease_version+1, updated_at=NOW()
+                WHERE id=$1 AND lease_token=$2 AND lease_version=$3 AND leased_until >= NOW()
+                RETURNING dedupe_key,recipient_did,auth_generation
+            )
+            INSERT INTO push_event_receipts(dedupe_key,recipient_did,auth_generation,state,hold_reason)
+            SELECT dedupe_key,recipient_did,auth_generation,'held',$4 FROM held
+            ON CONFLICT(dedupe_key) DO UPDATE SET state='held',hold_reason=$4,updated_at=NOW()
+        "#).bind(id).bind(token).bind(version).bind(reason).execute(&self.db_pool).await?;
+        Ok(changed.rows_affected() > 0)
     }
 
     pub async fn push_snapshot(&self, id: i64) -> Result<Option<Value>> {
@@ -270,6 +411,7 @@ mod tests {
         ///     LEFT JOIN push_accounts pa ON pa.account_did = peq.recipient_did
         ///     WHERE peq.available_at <= NOW() AND (peq.leased_until IS NULL OR peq.leased_until < NOW())
         ///       AND (pa.auth_revoked_at IS NULL)
+        ///       AND peq.delivery_hold_reason IS NULL
         ///     ORDER BY peq.created_at ASC LIMIT $1 FOR UPDATE OF peq SKIP LOCKED
         /// )
         /// UPDATE push_event_queue q

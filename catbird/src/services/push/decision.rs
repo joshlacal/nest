@@ -1,4 +1,5 @@
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -121,10 +122,8 @@ fn build_chat_notification(row: &QueueRow) -> ApnsNotification {
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
-    // messageText is stripped before the event is persisted (see
-    // `enqueue_push`), so this durable/fallback path never has a preview to
-    // show — only the fast Redis pub/sub path (mod.rs) carries the real text,
-    // and only for its single immediate delivery attempt.
+    // Message text is stripped before persistence. Keep the APNs alert generic;
+    // client communication presentation must not reintroduce a message preview.
     let mut custom_data = HashMap::new();
     custom_data.insert("type".to_string(), "chat_message".to_string());
     custom_data.insert("recipientDid".to_string(), row.recipient_did.clone());
@@ -138,7 +137,11 @@ fn build_chat_notification(row: &QueueRow) -> ApnsNotification {
         user_did: row.recipient_did.clone(),
         custom_data,
         mutable_content: true,
-        thread_id: Some(format!("chat:{}", convo_id)),
+        thread_id: Some(format!(
+            "chat:{:x}:{}",
+            Sha256::digest(row.recipient_did.as_bytes()),
+            convo_id
+        )),
     }
 }
 
@@ -282,5 +285,49 @@ mod tests {
 
         assert_eq!(notification.body, "Someone reposted your post");
         assert!(!notification.body.contains("did:plc"));
+    }
+
+    #[test]
+    fn chat_notification_is_generic_and_keeps_account_and_message_routing() {
+        let mut row = queue_row("chat_message");
+        row.event_record_json = json!({
+            "convoId": "conversation-1",
+            "messageId": "message-1",
+            "messageText": "private text must not reach APNs",
+            "text": "alternate private text must not reach APNs",
+            "recipientDid": "did:plc:untrusted-event-recipient",
+            "senderDid": "did:plc:untrusted-event-sender"
+        });
+        let notification =
+            build_notification(&row, &PushPreferencesDocument::default(), Some("Alice"));
+        assert_eq!(notification.title, "New Message");
+        assert_eq!(notification.body, "You have a new message");
+        assert_eq!(notification.user_did, row.recipient_did);
+        assert_eq!(
+            notification.custom_data,
+            HashMap::from([
+                ("type".to_string(), "chat_message".to_string()),
+                ("recipientDid".to_string(), row.recipient_did.clone()),
+                ("senderDid".to_string(), row.actor_did.clone()),
+                ("convoId".to_string(), "conversation-1".to_string()),
+                ("messageId".to_string(), "message-1".to_string()),
+            ])
+        );
+        assert!(notification.mutable_content);
+        assert_eq!(notification.thread_id.as_deref(), Some("chat:aade54abfc42f9f1c0919f253ea44189672ec4125865c3cb292e4b933df6ad1a:conversation-1"));
+    }
+
+    #[test]
+    fn chat_thread_is_stable_for_messages_and_scoped_to_account_and_conversation() {
+        let mut row = queue_row("chat_message");
+        row.event_record_json = json!({ "convoId": "conversation-1", "messageId": "message-1" });
+        let first = build_chat_notification(&row);
+        row.event_record_json["messageId"] = json!("message-2");
+        assert_eq!(first.thread_id, build_chat_notification(&row).thread_id);
+        row.recipient_did = "did:plc:other-account".to_string();
+        assert_ne!(first.thread_id, build_chat_notification(&row).thread_id);
+        row.recipient_did = first.user_did.clone();
+        row.event_record_json["convoId"] = json!("conversation-2");
+        assert_ne!(first.thread_id, build_chat_notification(&row).thread_id);
     }
 }

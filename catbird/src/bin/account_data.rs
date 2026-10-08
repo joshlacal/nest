@@ -92,7 +92,9 @@ const OWNED_TABLES: &[(&str, &str)] = &[
     ("chat_muted_convos", "account_did"),
     ("chat_notified_watermarks", "account_did"),
     ("chat_poll_state", "account_did"),
+    ("chat_mute_sync_generations", "account_did"),
     ("push_event_queue", "recipient_did"),
+    ("push_event_receipts", "recipient_did"),
     ("actor_moderation_verdict", "recipient_did"),
     ("push_accounts", "account_did"),
 ];
@@ -124,12 +126,29 @@ const LEGACY_DID_COLUMNS: &[&str] = &["user_did", "did"];
 
 // ── Retention rules ──────────────────────────────────────────────────
 
+// Receipt history is removed only by explicit account deletion. Age-based
+// retention must also preserve unresolved delivery/catch-up state for review.
+macro_rules! no_notification_hold {
+    ($did:expr) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM chat_poll_state held_poll WHERE held_poll.account_did = ", $did,
+            " AND held_poll.catch_up_required_at IS NOT NULL) AND ",
+            "NOT EXISTS (SELECT 1 FROM push_event_queue held_queue WHERE held_queue.recipient_did = ", $did,
+            " AND held_queue.delivery_hold_reason IS NOT NULL) AND ",
+            "NOT EXISTS (SELECT 1 FROM push_event_receipts held_receipt WHERE held_receipt.recipient_did = ", $did,
+            " AND (held_receipt.state = 'held' OR EXISTS (SELECT 1 FROM push_device_deliveries held_device ",
+            "WHERE held_device.dedupe_key = held_receipt.dedupe_key AND held_device.state IN ('attempting', 'held'))))"
+        )
+    };
+}
+
 /// Accounts eligible for R1: revoked more than 180 days ago with no active device.
 macro_rules! r1_doomed {
     () => {
-        "SELECT pa.account_did AS did FROM push_accounts pa \
+        concat!("SELECT pa.account_did AS did FROM push_accounts pa \
          WHERE pa.auth_revoked_at < now() - interval '180 days' \
-         AND NOT EXISTS (SELECT 1 FROM user_devices d WHERE d.did = pa.account_did AND d.is_active)"
+         AND NOT EXISTS (SELECT 1 FROM user_devices d WHERE d.did = pa.account_did AND d.is_active) AND ",
+         no_notification_hold!("pa.account_did"))
     };
 }
 
@@ -151,9 +170,9 @@ const R1_COUNT_SQL: &str = concat!(
 );
 
 /// R1 (revoked accounts), apply: push_accounts revoked > 180 days with no
-/// active user_devices are deleted along with that DID's rows in every
-/// Nest-owned table. push_preferences goes by FK cascade; its count is read
-/// from the pre-statement snapshot.
+/// active user_devices or unresolved notification holds are deleted with the
+/// legacy retention scope. Receipt and mute-generation history remain intact.
+/// push_preferences goes by FK cascade; its count is read from the pre-statement snapshot.
 const R1_APPLY_SQL: &str = concat!(
     "WITH doomed AS (",
     r1_doomed!(),
@@ -196,7 +215,8 @@ macro_rules! r3_orphan {
         concat!(
             "NOT EXISTS (SELECT 1 FROM push_accounts pa WHERE pa.account_did = ",
             $t,
-            ".account_did AND (pa.auth_revoked_at IS NULL OR pa.auth_revoked_at >= now() - interval '30 days'))"
+            ".account_did AND (pa.auth_revoked_at IS NULL OR pa.auth_revoked_at >= now() - interval '30 days')) AND ",
+            no_notification_hold!(concat!($t, ".account_did"))
         )
     };
 }
@@ -518,6 +538,18 @@ async fn redis_scope(
 
 async fn pg_counts_for_did(pool: &PgPool, did: &str) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
+    let deliveries: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM push_device_deliveries d JOIN push_event_receipts r USING (dedupe_key) WHERE r.recipient_did = $1",
+    )
+    .bind(did)
+    .fetch_one(pool)
+    .await
+    .context("count push_device_deliveries")?;
+    entries.push(count(
+        "postgres (owned by DID)",
+        "push_device_deliveries.recipient_via_receipt",
+        deliveries,
+    ));
     for (table, col) in OWNED_TABLES {
         let n: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM \"{table}\" WHERE \"{col}\" = $1"
@@ -587,6 +619,20 @@ async fn pg_delete_for_did(pool: &PgPool, did: &str) -> Result<Vec<Entry>> {
     let mut tx = pool.begin().await?;
     lock_account(&mut tx, did).await?;
     let mut entries = Vec::new();
+    // Delete receipt children first; a registration may already have been
+    // removed, so ownership is resolved through the durable event receipt.
+    let deliveries = sqlx::query(
+        "DELETE FROM push_device_deliveries d USING push_event_receipts r WHERE d.dedupe_key = r.dedupe_key AND r.recipient_did = $1",
+    )
+    .bind(did)
+    .execute(&mut *tx)
+    .await
+    .context("delete push_device_deliveries")?;
+    entries.push(count(
+        "postgres deleted",
+        "push_device_deliveries.recipient_via_receipt",
+        deliveries.rows_affected() as i64,
+    ));
     for (table, col) in OWNED_TABLES {
         let r = sqlx::query(&format!("DELETE FROM \"{table}\" WHERE \"{col}\" = $1"))
             .bind(did)
@@ -704,6 +750,8 @@ async fn run_delete(c: &mut Conn, did: &str, apply: bool) -> Result<String> {
             REDIS_INDEX_NOTE,
             "other accounts' rows naming this DID (subscriptions to it, queued events it \
              authored, verdicts about it) are kept.",
+            "explicit account deletion also erases delivery deduplication history and catch-up holds; \
+             a future sign-in and enrollment prime a fresh cursor. Retention and rollback must retain receipt history.",
         ],
     ))
 }

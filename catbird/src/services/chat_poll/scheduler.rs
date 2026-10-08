@@ -42,13 +42,13 @@ impl ChatPollScheduler {
                 SELECT account_did
                 FROM chat_poll_state
                 WHERE next_poll_at <= NOW()
+                  AND catch_up_required_at IS NULL
                 ORDER BY next_poll_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE chat_poll_state s
-            SET next_poll_at = NOW() + INTERVAL '60 seconds',
-                last_poll_at = NOW()
+            SET next_poll_at = NOW() + INTERVAL '60 seconds'
             FROM claimed
             WHERE s.account_did = claimed.account_did
             RETURNING
@@ -70,6 +70,31 @@ impl ChatPollScheduler {
         .await?;
 
         Ok(rows)
+    }
+
+    /// Hold stale or previously initialized but unattested cursors for explicit
+    /// operator review. No cursor, watermark, or upstream history is changed.
+    /// Registration/foreground activity deliberately does not clear this hold.
+    pub async fn hold_if_catch_up_required(&self, did: &str) -> Result<bool> {
+        let held: Option<bool> = sqlx::query_scalar(
+            r#"
+            UPDATE chat_poll_state
+            SET catch_up_required_at = COALESCE(catch_up_required_at, NOW()),
+                catch_up_reason = COALESCE(catch_up_reason,
+                    CASE WHEN last_successful_poll_at IS NULL
+                         THEN 'unattested_initialized_cursor'
+                         ELSE 'last_successful_poll_older_than_24h' END)
+            WHERE account_did = $1 AND primed_at IS NOT NULL
+              AND (catch_up_required_at IS NOT NULL
+                   OR last_successful_poll_at IS NULL
+                   OR last_successful_poll_at < NOW() - INTERVAL '24 hours')
+            RETURNING true
+            "#,
+        )
+        .bind(did)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(held.unwrap_or(false))
     }
 
     // MARK: - Post-Poll Updates
@@ -102,7 +127,8 @@ impl ChatPollScheduler {
             SET chat_cursor = $2,
                 poll_tier = $3,
                 next_poll_at = NOW() + make_interval(secs => $4),
-                last_poll_at = NOW()
+                last_poll_at = NOW(),
+                last_successful_poll_at = NOW()
             WHERE account_did = $1
             "#,
         )
@@ -122,7 +148,7 @@ impl ChatPollScheduler {
     /// through all backlog and seeded watermarks, so the normal poll loop is
     /// now safe to run (and safe to notify) for this account.
     pub async fn mark_primed(&self, did: &str) -> Result<()> {
-        sqlx::query("UPDATE chat_poll_state SET primed_at = NOW() WHERE account_did = $1")
+        sqlx::query("UPDATE chat_poll_state SET primed_at = NOW(), last_successful_poll_at = NOW() WHERE account_did = $1")
             .bind(did)
             .execute(&self.db_pool)
             .await?;
@@ -263,6 +289,30 @@ impl ChatPollScheduler {
         Ok(())
     }
 
+    /// A terminal error for an old background session must not unenroll a
+    /// newer sign-in that won while the network request was in flight.
+    pub async fn unenroll_account_if_auth_generation(
+        &self,
+        did: &str,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        if expected_generation <= 0 {
+            return Ok(false);
+        }
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let deleted = sqlx::query(
+            "DELETE FROM chat_poll_state WHERE account_did = $1 AND EXISTS \
+             (SELECT 1 FROM push_accounts WHERE account_did = $1 AND auth_generation = $2)",
+        )
+        .bind(did)
+        .bind(expected_generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected() != 0)
+    }
+
     /// Unenroll only if the account has no active devices — atomic, so a
     /// concurrent re-registration's enrollment can't be wiped between a
     /// check and a delete.
@@ -312,6 +362,7 @@ impl ChatPollScheduler {
             }
 
             let mut tx = self.db_pool.begin().await?;
+            crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
 
             // Serialize quota cardinality with shared account advisory transaction lock across all writers
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext('chat_muted_convos:' || $1))")
@@ -361,17 +412,33 @@ impl ChatPollScheduler {
                 .await?;
             }
 
+            bump_mute_generation(&mut tx, did).await?;
             tx.commit().await?;
         } else {
             // Allow delete/unmute of legacy invalid rows regardless of creation-time syntax
+            let mut tx = self.db_pool.begin().await?;
+            crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
             sqlx::query("DELETE FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2")
                 .bind(did)
                 .bind(convo_id)
-                .execute(&self.db_pool)
+                .execute(&mut *tx)
                 .await?;
+            bump_mute_generation(&mut tx, did).await?;
+            tx.commit().await?;
         }
 
         Ok(())
+    }
+
+    /// Version captured before the background listConvos fetch begins.
+    pub async fn mute_generation(&self, did: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM chat_mute_sync_generations WHERE account_did = $1",
+        )
+        .bind(did)
+        .fetch_optional(&self.db_pool)
+        .await?
+        .unwrap_or(0))
     }
 
     /// Bulk-replace the full set of muted conversations for a DID.
@@ -379,7 +446,13 @@ impl ChatPollScheduler {
     /// Runs inside a transaction: deletes all existing mute rows for the DID,
     /// then inserts the new set. Fails atomically without modifying DB if over quota
     /// or any conversation ID is invalid.
-    pub async fn sync_muted_convos(&self, did: &str, convo_ids: &[String]) -> Result<()> {
+    /// Returns false if a newer mutation invalidated the fetched snapshot.
+    pub async fn sync_muted_convos(
+        &self,
+        did: &str,
+        convo_ids: &[String],
+        expected_generation: i64,
+    ) -> Result<bool> {
         let mut deduped = std::collections::HashSet::new();
         for convo_id in convo_ids {
             if !is_valid_convo_id(convo_id) {
@@ -397,6 +470,17 @@ impl ChatPollScheduler {
         }
 
         let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM chat_mute_sync_generations WHERE account_did = $1",
+        )
+        .bind(did)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(0);
+        if generation != expected_generation {
+            return Ok(false);
+        }
 
         // Serialize quota cardinality with shared account advisory transaction lock across all writers
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('chat_muted_convos:' || $1))")
@@ -422,9 +506,10 @@ impl ChatPollScheduler {
             .await?;
         }
 
+        bump_mute_generation(&mut tx, did).await?;
         tx.commit().await?;
 
-        Ok(())
+        Ok(true)
     }
 
     // MARK: - Notification Watermarks
@@ -498,6 +583,15 @@ impl ChatPollScheduler {
 
         Ok(())
     }
+}
+
+/// Called only under the push account advisory lock, in the writer transaction.
+async fn bump_mute_generation(tx: &mut sqlx::Transaction<'_, Postgres>, did: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO chat_mute_sync_generations(account_did, generation) VALUES ($1, 1) ON CONFLICT(account_did) DO UPDATE SET generation = chat_mute_sync_generations.generation + 1",
+    )
+    .bind(did).execute(&mut **tx).await?;
+    Ok(())
 }
 
 #[cfg(test)]

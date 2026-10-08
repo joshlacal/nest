@@ -476,6 +476,138 @@ async fn delete_apply_removes_only_target_account() {
     env.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "requires local Postgres and Redis"]
+async fn notification_history_requires_explicit_account_deletion() {
+    let env = TestEnv::new().await;
+    let c = "did:plc:completednotification";
+    for (did, tag, event_state, device_state) in [
+        (A, "held-a", "held", "held"),
+        (B, "held-b", "completed", "attempting"),
+        (c, "completed-c", "completed", "accepted"),
+    ] {
+        seed_account(&env, did, "fixture-session", Some(200), None, tag).await;
+        env.exec(&format!(
+            "INSERT INTO push_event_receipts (dedupe_key, recipient_did, auth_generation, state) \
+             VALUES ('dedupe-{tag}', '{did}', 1, '{event_state}')"
+        ))
+        .await;
+        // Device receipts outlive registration rows; deletion must join the
+        // event owner rather than relying on a surviving user_devices row.
+        env.exec(&format!(
+            "INSERT INTO push_device_deliveries (dedupe_key, device_id, state) \
+             VALUES ('dedupe-{tag}', gen_random_uuid(), '{device_state}')"
+        ))
+        .await;
+        env.exec(&format!(
+            "INSERT INTO chat_mute_sync_generations (account_did, generation) VALUES ('{did}', 5)"
+        ))
+        .await;
+    }
+    env.exec(&format!(
+        "UPDATE chat_poll_state SET chat_cursor='retained-cursor', primed_at=now(), \
+         catch_up_required_at=now(), catch_up_reason='stale_fixture' WHERE account_did='{A}'"
+    ))
+    .await;
+    env.exec(&format!(
+        "UPDATE push_event_queue SET delivery_hold_reason='fixture_hold' WHERE recipient_did='{A}'"
+    ))
+    .await;
+
+    let before = env.snapshot().await;
+    let report = parse_counts(&env.run_ok(&["report", "--did", A]));
+    for name in [
+        "push_device_deliveries.recipient_via_receipt",
+        "push_event_receipts.recipient_did",
+        "chat_mute_sync_generations.account_did",
+    ] {
+        assert_eq!(get(&report, "postgres (owned", name), 1, "{name}");
+    }
+    env.run_ok(&["delete", "--did", A]);
+    env.run_ok(&["retention"]);
+    assert_eq!(
+        env.snapshot().await,
+        before,
+        "dry runs must preserve all history"
+    );
+
+    env.run_ok(&["retention", "--apply"]);
+    for did in [A, B] {
+        assert_eq!(
+            env.count(&format!(
+                "SELECT count(*) FROM push_accounts WHERE account_did='{did}'"
+            ))
+            .await,
+            1
+        );
+        assert_eq!(
+            env.count(&format!(
+                "SELECT count(*) FROM chat_poll_state WHERE account_did='{did}'"
+            ))
+            .await,
+            1
+        );
+    }
+    assert_eq!(env.count(&format!("SELECT count(*) FROM chat_poll_state WHERE account_did='{A}' AND chat_cursor='retained-cursor' AND catch_up_required_at IS NOT NULL")).await, 1);
+    assert_eq!(env.count(&format!("SELECT count(*) FROM push_event_queue WHERE recipient_did='{A}' AND delivery_hold_reason='fixture_hold'")).await, 1);
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM push_accounts WHERE account_did='{c}'"
+        ))
+        .await,
+        0
+    );
+    for table in [
+        "push_event_receipts",
+        "push_device_deliveries",
+        "chat_mute_sync_generations",
+    ] {
+        assert_eq!(
+            env.count(&format!("SELECT count(*) FROM {table}")).await,
+            3,
+            "retention pruned {table}"
+        );
+    }
+
+    let deleted = env.run_ok(&["delete", "--did", A, "--apply"]);
+    assert!(deleted.contains("erases delivery deduplication history"));
+    let counts = parse_counts(&deleted);
+    assert_eq!(
+        get(
+            &counts,
+            "postgres deleted",
+            "push_device_deliveries.recipient_via_receipt"
+        ),
+        1
+    );
+    for table in [
+        "push_event_receipts",
+        "push_device_deliveries",
+        "chat_mute_sync_generations",
+    ] {
+        assert_eq!(
+            env.count(&format!("SELECT count(*) FROM {table}")).await,
+            2,
+            "deletion scope for {table}"
+        );
+    }
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM push_event_receipts WHERE recipient_did='{A}'"
+        ))
+        .await,
+        0
+    );
+    assert_eq!(env.count("SELECT count(*) FROM push_device_deliveries WHERE dedupe_key='dedupe-held-b' AND state='attempting'").await, 1);
+
+    catbird::services::chat_poll::scheduler::ChatPollScheduler::new(env.pool.clone())
+        .enroll_account(A, "pds.example.com")
+        .await
+        .unwrap();
+    assert_eq!(env.count(&format!("SELECT count(*) FROM chat_poll_state WHERE account_did='{A}' AND chat_cursor IS NULL AND primed_at IS NULL AND catch_up_required_at IS NULL")).await, 1);
+    env.cleanup().await;
+}
+
 async fn b_rows(env: &TestEnv) -> Vec<i64> {
     let mut v = Vec::new();
     for (table, col) in [

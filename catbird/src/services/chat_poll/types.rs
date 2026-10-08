@@ -21,6 +21,8 @@ pub struct ChatPollRow {
 /// Deserialized response from chat.bsky.convo.getLog
 #[derive(Debug, Deserialize)]
 pub struct GetLogResponse {
+    /// getLog may omit the cursor when there are no log entries.
+    #[serde(default)]
     pub cursor: String,
     pub logs: Vec<LogEntry>,
 }
@@ -33,10 +35,37 @@ pub enum LogEntry {
     CreateMessage(LogMessageEvent),
     #[serde(rename = "chat.bsky.convo.defs#logDeleteMessage")]
     DeleteMessage(LogMessageEvent),
-    #[serde(rename = "chat.bsky.convo.defs#logReadMessage")]
-    ReadMessage(LogMessageEvent),
+    #[serde(
+        rename = "chat.bsky.convo.defs#logReadMessage",
+        alias = "chat.bsky.convo.defs#logReadConvo"
+    )]
+    ReadMessage(LogConvoEvent),
+    #[serde(rename = "chat.bsky.convo.defs#logMuteConvo")]
+    MuteConvo(LogConvoEvent),
+    #[serde(rename = "chat.bsky.convo.defs#logUnmuteConvo")]
+    UnmuteConvo(LogConvoEvent),
     #[serde(other)]
     Unknown,
+}
+
+/// Minimal shared shape for account read and mute log events. Read events
+/// may reference system messages without a sender; the unused message union
+/// does not need to be deserialized for revision-based suppression.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogConvoEvent {
+    pub convo_id: String,
+    pub rev: String,
+}
+
+#[cfg(test)]
+impl From<LogMessageEvent> for LogConvoEvent {
+    fn from(event: LogMessageEvent) -> Self {
+        Self {
+            convo_id: event.convo_id,
+            rev: event.rev,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,7 +105,7 @@ pub struct ConvoView {
     pub muted: bool,
 }
 
-/// Push event passed from poller to queue + Redis
+/// Push event passed from poller to the durable queue
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatPushEvent {
@@ -87,11 +116,13 @@ pub struct ChatPushEvent {
     pub message_text: String,
     pub sent_at: String,
     pub auth_generation: i64,
+    /// Source log revision for durable read suppression; legacy events omit it.
+    #[serde(default)]
+    pub log_rev: Option<String>,
 }
 
 impl ChatPushEvent {
-    /// Queue dedupe key — MUST stay identical between enqueue (poller) and
-    /// fast-path claim (push subscriber), or dedup silently breaks.
+    /// Stable identity shared by outbox insertion and durable delivery receipts.
     pub fn dedupe_key(&self) -> String {
         format!(
             "{}:chat_message:{}:{}",
