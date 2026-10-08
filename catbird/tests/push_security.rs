@@ -220,6 +220,13 @@ impl ObservingFakeApns {
     }
 }
 
+// A suppressed send or lost barrier partner must fail the fixture, not hang it.
+async fn wait_for_test_barrier(barrier: &Barrier) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait())
+        .await
+        .expect("push-security test barrier timed out");
+}
+
 #[async_trait::async_trait]
 impl ApnsSender for ObservingFakeApns {
     async fn send(
@@ -228,10 +235,10 @@ impl ApnsSender for ObservingFakeApns {
         notification: &ApnsNotification,
     ) -> anyhow::Result<&'static str> {
         if let Some(enter) = &self.enter_barrier {
-            enter.wait().await;
+            wait_for_test_barrier(enter).await;
         }
         if let Some(exit) = &self.exit_barrier {
-            exit.wait().await;
+            wait_for_test_barrier(exit).await;
         }
         if let Some(duration) = self.pause_duration {
             tokio::time::sleep(duration).await;
@@ -387,7 +394,7 @@ async fn test_true_concurrent_token_claims_race() {
                 app_id: "blue.catbird".to_string(),
                 age_restricted: Some(false),
             };
-            barrier.wait().await;
+            wait_for_test_barrier(&barrier).await;
             services
                 .registry
                 .upsert_registration(&session, &input)
@@ -509,7 +516,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-1', 'app.bsky.feed.like/1',
-                '{}'::jsonb, 1700000000, 'dedupe-1', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-1', NOW(), 1)
         "#,
     )
     .bind(recipient_did)
@@ -572,7 +579,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-race', 'app.bsky.feed.like/race',
-                '{}'::jsonb, 1700000000, 'dedupe-race', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-race', NOW(), 1)
         "#,
     )
     .bind(recipient_did_a2)
@@ -660,7 +667,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-2', 'app.bsky.feed.like/2',
-                '{}'::jsonb, 1700000001, 'dedupe-2', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-2', NOW(), 1)
         "#,
     )
     .bind(recipient_did_b)
@@ -673,7 +680,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
         tokio::spawn(async move { s1_clone.process_queue_batch(&st1_clone).await });
 
     // Wait for Worker 1 to start sending device 1
-    enter_b.wait().await;
+    wait_for_test_barrier(&enter_b).await;
     // While Worker 1 is paused on device 1, simulate lease expiration and Worker 2 stealing the lease
     sqlx::query("UPDATE push_event_queue SET leased_until = NOW() - INTERVAL '1 second' WHERE dedupe_key = 'dedupe-2'")
         .execute(&pool)
@@ -685,7 +692,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
     let row_w2 = claimed_w2[0].clone();
     assert_eq!(row_w2.event_cid, "bafy-cid-2");
 
-    exit_b.wait().await;
+    wait_for_test_barrier(&exit_b).await;
     let res_w1 = worker1_handle.await.unwrap();
     assert!(res_w1.is_ok());
 
@@ -758,7 +765,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-rev1', 'app.bsky.feed.like/rev1',
-                '{}'::jsonb, 1700000000, 'dedupe-rev1', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rev1', NOW(), 1)
         "#,
     )
     .bind(recipient_did)
@@ -783,7 +790,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
         async move { s.process_queue_batch(&st).await }
     });
 
-    enter_barrier.wait().await;
+    wait_for_test_barrier(&enter_barrier).await;
 
     let mutator_done = Arc::new(AtomicBool::new(false));
     let mutator_handle = tokio::spawn({
@@ -802,7 +809,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
         "mark_auth_revoked must be blocked by advisory lock while APNs send is in flight"
     );
 
-    exit_barrier.wait().await;
+    wait_for_test_barrier(&exit_barrier).await;
     worker_handle.await.unwrap().unwrap();
     mutator_handle.await.unwrap();
     assert!(mutator_done.load(Ordering::SeqCst));
@@ -817,7 +824,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-rev2', 'app.bsky.feed.like/rev2',
-                '{}'::jsonb, 1700000001, 'dedupe-rev2', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rev2', NOW(), 1)
         "#,
     )
     .bind(recipient_did)
@@ -919,7 +926,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'activity_post', 'bafy-cid-act1', 'app.bsky.feed.post/1',
-                '{}'::jsonb, 1700000000, 'dedupe-act1', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-act1', NOW(), 1)
         "#,
     )
     .bind(subscriber_did)
@@ -946,7 +953,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
         async move { s.process_queue_batch(&st).await }
     });
 
-    enter_barrier.wait().await;
+    wait_for_test_barrier(&enter_barrier).await;
 
     // Mutator unsubscribes mid-flight
     let mutator_done = Arc::new(AtomicBool::new(false));
@@ -974,7 +981,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
         "Unsubscribe must be blocked by advisory lock during APNs send"
     );
 
-    exit_barrier.wait().await;
+    wait_for_test_barrier(&exit_barrier).await;
     worker_handle.await.unwrap().unwrap();
     mutator_handle.await.unwrap();
     assert!(mutator_done.load(Ordering::SeqCst));
@@ -989,7 +996,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'activity_post', 'bafy-cid-act2', 'app.bsky.feed.post/2',
-                '{}'::jsonb, 1700000001, 'dedupe-act2', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-act2', NOW(), 1)
         "#,
     )
     .bind(subscriber_did)
@@ -1059,7 +1066,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
             thread_root_uri, event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'reply', 'bafy-cid-rep1', 'app.bsky.feed.post/rep1',
-                $3, '{}'::jsonb, 1700000000, 'dedupe-rep1', NOW(), 1)
+                $3, '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rep1', NOW(), 1)
         "#,
     )
     .bind(user_did)
@@ -1087,7 +1094,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
         async move { s.process_queue_batch(&st).await }
     });
 
-    enter_barrier.wait().await;
+    wait_for_test_barrier(&enter_barrier).await;
 
     // Mutator mutes thread mid-flight
     let mutator_done = Arc::new(AtomicBool::new(false));
@@ -1108,7 +1115,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
         "mute_thread must be blocked by advisory lock during APNs send"
     );
 
-    exit_barrier.wait().await;
+    wait_for_test_barrier(&exit_barrier).await;
     worker_handle.await.unwrap().unwrap();
     mutator_handle.await.unwrap();
     assert!(mutator_done.load(Ordering::SeqCst));
@@ -1123,7 +1130,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
             thread_root_uri, event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'reply', 'bafy-cid-rep2', 'app.bsky.feed.post/rep2',
-                $3, '{}'::jsonb, 1700000001, 'dedupe-rep2', NOW(), 1)
+                $3, '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rep2', NOW(), 1)
         "#,
     )
     .bind(user_did)
@@ -1191,7 +1198,7 @@ async fn test_enqueue_before_logout_claim_after_reauth() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-stale', 'app.bsky.feed.like/stale',
-                '{}'::jsonb, 1700000000, 'dedupe-stale', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-stale', NOW(), 1)
         "#,
     )
     .bind(recipient_did)
@@ -1273,7 +1280,7 @@ async fn test_concurrent_quota_final_slot_race_and_fanout() {
                 app_id: "blue.catbird".to_string(),
                 age_restricted: Some(false),
             };
-            barrier.wait().await;
+            wait_for_test_barrier(&barrier).await;
             services
                 .registry
                 .upsert_registration(&session, &input)
@@ -1749,7 +1756,7 @@ async fn test_firehose_candidate_generation_and_reauth_fence() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:firehose_actor', 'like', 'bafy-firehose-1', 'app.bsky.feed.like/1',
-                '{}'::jsonb, 1700000000, 'dedupe-firehose-1', NOW(), $2)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-firehose-1', NOW(), $2)
         "#,
     )
     .bind(recipient_did)
