@@ -391,3 +391,127 @@ async fn real_coordinator_preserves_second_device_then_erases_last_session_exper
     drop(push);
     f.finish().await;
 }
+
+/// Only explicit logout may erase. Session expiry, an upstream auth failure and
+/// an account switch on the same device keep the account's Catbird experience,
+/// and the next sign-in finds it intact.
+#[tokio::test]
+#[ignore = "root-owned disposable PostgreSQL and Redis fixtures"]
+async fn expiry_auth_failure_and_account_switch_never_erase_account_experience() {
+    use catbird::services::{
+        login_apply::{ensure_local_preferences_with, NewAccountChoices},
+        push::{registry::PushRegistry, types::RegisterPushInput, PushServices},
+    };
+    let f = Fixture::new().await;
+    let expired = session();
+    cleanup_auth::seed(&f.store, &expired).await;
+    let mut config = catbird::config::PushConfig::default();
+    config.service_did = Some("did:web:push.fixture.test".into());
+    config.apns.enabled = false;
+    let push = Arc::new(
+        PushServices::new(f.pool.clone(), config)
+            .unwrap()
+            .with_auth_store(f.store.clone()),
+    );
+    let register = |token: &str| RegisterPushInput {
+        service_did: "did:web:push.fixture.test".into(),
+        token: token.into(),
+        platform: "ios".into(),
+        app_id: "blue.catbird.fixture".into(),
+        age_restricted: None,
+    };
+    push.registry
+        .upsert_registration(&expired, &register("shared-device"))
+        .await
+        .unwrap();
+    let mut chosen = PushPreferencesDocument::default();
+    chosen.like.push = false;
+    push.preferences.put(DID, &chosen).await.unwrap();
+    PushSubscriptions::new(f.pool.clone())
+        .put(
+            DID,
+            "did:plc:keptsubject",
+            &ActivitySubscriptionPreference {
+                post: true,
+                reply: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Account switch: another account registers the same device token.
+    let mut other = session();
+    other.did = "did:plc:switchedtoaccount".into();
+    cleanup_auth::seed(&f.store, &other).await;
+    push.registry
+        .upsert_registration(&other, &register("shared-device"))
+        .await
+        .unwrap();
+    // Upstream refresh failure for the original session, then TTL expiry of
+    // its Redis session (no logout request is ever made).
+    let registry = PushRegistry::new(f.pool.clone(), "did:web:fixture.invalid".into())
+        .with_auth_store(f.store.clone());
+    registry
+        .mark_auth_revoked_if_session(DID, &expired.id.to_string())
+        .await
+        .unwrap();
+    f.store
+        .delete_session(&Did::new(DID).unwrap(), &expired.id.to_string())
+        .await
+        .unwrap();
+
+    let kept = |table: &'static str, column: &'static str| {
+        let pool = f.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table} WHERE {column}=$1"))
+                .bind(DID)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(kept("push_preferences", "account_did").await, 1);
+    assert_eq!(kept("activity_subscriptions", "subscriber_did").await, 1);
+    assert_eq!(kept("push_accounts", "account_did").await, 1);
+    assert_eq!(kept("user_devices", "did").await, 1);
+    assert!(!push.preferences.get(DID).await.unwrap().unwrap().like.push);
+
+    // Signing in again (the OAuth callback's activation) resumes with the
+    // retained Catbird choices and clears the earlier auth failure.
+    let fresh = session();
+    cleanup_auth::seed(&f.store, &fresh).await;
+    registry
+        .activate_account_session(DID, &fresh.id.to_string(), &fresh.pds_url)
+        .await
+        .unwrap();
+    push.registry
+        .upsert_registration(&fresh, &register("shared-device"))
+        .await
+        .unwrap();
+    for mode in [
+        NewAccountChoices::CatbirdDefaults,
+        NewAccountChoices::Required,
+    ] {
+        let response = ensure_local_preferences_with(&f.pool, &f.store, &fresh, mode)
+            .await
+            .unwrap();
+        assert_eq!(response.body["preferences"]["like"]["push"], false);
+        assert!(response.body.get("restoreStatus").is_none());
+    }
+    assert!(push
+        .preferences
+        .get_for_delivery(DID)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        PushSubscriptions::new(f.pool.clone())
+            .list(DID)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(push);
+    f.finish().await;
+}
