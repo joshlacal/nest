@@ -126,22 +126,57 @@ fn local_off_preferences() -> PushPreferencesDocument {
     }
 }
 
+/// How a missing Catbird preference row (new account, or after last-session
+/// cleanup) is initialized. Neither mode reads official Bluesky settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewAccountChoices {
+    /// Catbird's own defaults, exactly as the legacy `get_or_create` wrote them.
+    /// Clients that cannot ask for choices (Catbird 1.0 never reads
+    /// `getSetupStatus` and only saves user-edited diffs) would otherwise
+    /// receive no notifications at all.
+    CatbirdDefaults,
+    /// Everything off until the user saves explicit Catbird choices.
+    Required,
+}
+
+impl NewAccountChoices {
+    /// Opt in with `NEST_NOTIFICATION_CHOICES_REQUIRED=true` once a client that
+    /// prompts from `getSetupStatus` is the deployed baseline.
+    pub fn from_env() -> Self {
+        if std::env::var("NEST_NOTIFICATION_CHOICES_REQUIRED").as_deref() == Ok("true") {
+            Self::Required
+        } else {
+            Self::CatbirdDefaults
+        }
+    }
+}
+
 pub async fn ensure_preferences(
     state: &Arc<AppState>,
     session: &CatbirdSession,
 ) -> AppResult<PreferencesResponse> {
     let pool = state.push_db.as_ref().ok_or_else(unavailable)?;
     let store = state.auth_store.as_deref().ok_or_else(unavailable)?;
-    ensure_local_preferences(pool, store, session).await
+    ensure_local_preferences_with(pool, store, session, NewAccountChoices::from_env()).await
+}
+
+/// `ensure_local_preferences_with` in `Required` mode.
+pub async fn ensure_local_preferences(
+    pool: &Pool<Postgres>,
+    store: &RedisAuthStore,
+    session: &CatbirdSession,
+) -> AppResult<PreferencesResponse> {
+    ensure_local_preferences_with(pool, store, session, NewAccountChoices::Required).await
 }
 
 /// The lock and original live bearer prevent pre-logout requests from recreating
 /// deleted state. Existing Catbird rows are returned byte-for-byte unchanged.
 /// No snapshot, PDS URL, network client, or provider preference is accepted.
-pub async fn ensure_local_preferences(
+pub async fn ensure_local_preferences_with(
     pool: &Pool<Postgres>,
     store: &RedisAuthStore,
     session: &CatbirdSession,
+    choices: NewAccountChoices,
 ) -> AppResult<PreferencesResponse> {
     let mut tx = pool.begin().await?;
     super::push::lock::acquire_account_lock(&mut tx, &session.did)
@@ -163,11 +198,19 @@ pub async fn ensure_local_preferences(
     let generation: Option<i64> = sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1 AND auth_revoked_at IS NULL AND auth_generation>0")
         .bind(&session.did).fetch_optional(&mut *tx).await?;
     let generation = generation.ok_or_else(stale)?;
-    let mut payload = serde_json::to_value(local_off_preferences())?;
-    payload[RESTORE_METADATA_KEY] = json!({
-        "version": 1, "source": "catbird_local", "localConsent": "Required",
-        "authGeneration": generation, "automaticPushReady": false,
-    });
+    let payload = match choices {
+        NewAccountChoices::CatbirdDefaults => {
+            serde_json::to_value(PushPreferencesDocument::default())?
+        }
+        NewAccountChoices::Required => {
+            let mut payload = serde_json::to_value(local_off_preferences())?;
+            payload[RESTORE_METADATA_KEY] = json!({
+                "version": 1, "source": "catbird_local", "localConsent": "Required",
+                "authGeneration": generation, "automaticPushReady": false,
+            });
+            payload
+        }
+    };
     sqlx::query("INSERT INTO push_preferences(account_did,preferences_json,created_at,updated_at) VALUES($1,$2,NOW(),NOW())")
         .bind(&session.did).bind(&payload).execute(&mut *tx).await?;
     tx.commit().await?;

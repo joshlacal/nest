@@ -432,3 +432,91 @@ async fn existing_catbird_settings_and_local_subscription_mutes_are_unchanged() 
         .is_some());
     fixture.finish().await;
 }
+
+/// Catbird 1.0 cannot ask for choices, so the production default initializes a
+/// missing row with Catbird's own defaults, as the legacy `get_or_create` did.
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL and Redis"]
+async fn catbird_defaults_mode_initializes_legacy_defaults_without_consent_gate() {
+    use catbird::services::login_apply::{
+        ensure_local_preferences_with, setup_status_response, NewAccountChoices,
+    };
+    let fixture = Fixture::new().await; // Provider endpoint is deliberately unavailable.
+    let response = ensure_local_preferences_with(
+        &fixture.pool,
+        &fixture.store,
+        &fixture.session,
+        NewAccountChoices::CatbirdDefaults,
+    )
+    .await
+    .unwrap();
+    assert!(response.ready);
+    assert_eq!(
+        response.body["preferences"],
+        PushPreferencesDocument::default().to_lexicon_json()
+    );
+    assert_eq!(response.body["preferences"]["reply"]["push"], true);
+    assert_eq!(response.body["preferences"]["chat"]["push"], true);
+    assert!(response.body.get("restoreStatus").is_none());
+    let row = stored(&fixture).await;
+    assert!(row.get("_catbirdRestore").is_none(), "no consent marker");
+    assert_eq!(
+        setup_status_response(&response.body, true)["status"],
+        "legacy_configured"
+    );
+    let preferences = PushPreferences::new(fixture.pool.clone());
+    assert!(preferences
+        .get_for_delivery(&fixture.session.did)
+        .await
+        .unwrap()
+        .is_some());
+
+    // A 1.0 client saves only the changed category; the rest keep defaults.
+    let input: PutPreferencesInput =
+        serde_json::from_value(json!({"like":{"list":true,"push":false,"include":"all"}})).unwrap();
+    preferences
+        .patch_authenticated(
+            &fixture.store,
+            &fixture.session.did,
+            &fixture.session.id.to_string(),
+            Some(input),
+        )
+        .await
+        .unwrap();
+    let edited = stored(&fixture).await;
+    assert_eq!(edited["like"]["push"], false);
+    assert_eq!(edited["reply"]["push"], true);
+    assert!(edited.get("_catbirdRestore").is_none());
+
+    // Either mode returns an existing row unchanged.
+    for mode in [
+        NewAccountChoices::CatbirdDefaults,
+        NewAccountChoices::Required,
+    ] {
+        ensure_local_preferences_with(&fixture.pool, &fixture.store, &fixture.session, mode)
+            .await
+            .unwrap();
+        assert_eq!(stored(&fixture).await, edited);
+    }
+    assert_eq!(fixture.count("activity_subscriptions").await, 0);
+    fixture.finish().await;
+}
+
+/// The production default must not change unless the operator opts in.
+#[test]
+fn new_account_choices_default_to_catbird_defaults() {
+    use catbird::services::login_apply::NewAccountChoices;
+    std::env::remove_var("NEST_NOTIFICATION_CHOICES_REQUIRED");
+    assert_eq!(
+        NewAccountChoices::from_env(),
+        NewAccountChoices::CatbirdDefaults
+    );
+    std::env::set_var("NEST_NOTIFICATION_CHOICES_REQUIRED", "1");
+    assert_eq!(
+        NewAccountChoices::from_env(),
+        NewAccountChoices::CatbirdDefaults
+    );
+    std::env::set_var("NEST_NOTIFICATION_CHOICES_REQUIRED", "true");
+    assert_eq!(NewAccountChoices::from_env(), NewAccountChoices::Required);
+    std::env::remove_var("NEST_NOTIFICATION_CHOICES_REQUIRED");
+}
