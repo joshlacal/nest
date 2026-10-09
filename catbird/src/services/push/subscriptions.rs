@@ -123,9 +123,42 @@ impl PushSubscriptions {
         subject_did: &str,
         subscription: &ActivitySubscriptionPreference,
     ) -> Result<Option<ActivitySubscriptionPreference>> {
+        self.put_with_auth(subscriber_did, subject_did, subscription, None)
+            .await
+    }
+
+    pub async fn put_authenticated(
+        &self,
+        store: &crate::services::RedisAuthStore,
+        session_id: &str,
+        subscriber_did: &str,
+        subject_did: &str,
+        subscription: &ActivitySubscriptionPreference,
+    ) -> Result<Option<ActivitySubscriptionPreference>> {
+        self.put_with_auth(
+            subscriber_did,
+            subject_did,
+            subscription,
+            Some((store, session_id)),
+        )
+        .await
+    }
+
+    async fn put_with_auth(
+        &self,
+        subscriber_did: &str,
+        subject_did: &str,
+        subscription: &ActivitySubscriptionPreference,
+        auth: Option<(&crate::services::RedisAuthStore, &str)>,
+    ) -> Result<Option<ActivitySubscriptionPreference>> {
         // Allow delete/unmute of legacy invalid rows regardless of creation-time syntax
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, subscriber_did).await?;
+        if let Some((store, session_id)) = auth {
+            store
+                .validate_live_session_local(subscriber_did, session_id)
+                .await?;
+        }
 
         if !subscription.post && !subscription.reply {
             sqlx::query(

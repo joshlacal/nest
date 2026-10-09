@@ -48,8 +48,14 @@ pub async fn enroll_session_for_chat_poll(state: &Arc<AppState>, session: &Catbi
         tracing::warn!(did = %session.did, pds_url = %session.pds_url, "Cannot enroll chat poll: unparseable PDS URL");
         return;
     };
+    let Some(store) = state.auth_store.as_deref() else {
+        return;
+    };
     let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
-    if let Err(err) = scheduler.enroll_account(&session.did, &host).await {
+    if let Err(err) = scheduler
+        .enroll_account_authenticated(session, store, &host)
+        .await
+    {
         tracing::warn!(did = %session.did, error = %err, "Chat poll enrollment failed");
     }
 }
@@ -70,7 +76,14 @@ pub async fn push_heartbeat(
 
     let lease_secs: i64 = 90;
     let rows_affected = scheduler
-        .update_foreground_lease(&session.did, lease_secs)
+        .update_foreground_lease_authenticated(
+            &session,
+            state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| AppError::Config("Session store unavailable".into()))?,
+            lease_secs,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -78,7 +91,14 @@ pub async fn push_heartbeat(
         tracing::warn!(did = %session.did, "Heartbeat lease update touched no rows; enrollment must have failed earlier in this request. Retrying enrollment once.");
         enroll_session_for_chat_poll(&state, &session).await;
         let retry_rows = scheduler
-            .update_foreground_lease(&session.did, lease_secs)
+            .update_foreground_lease_authenticated(
+                &session,
+                state
+                    .auth_store
+                    .as_deref()
+                    .ok_or_else(|| AppError::Config("Session store unavailable".into()))?,
+                lease_secs,
+            )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         if retry_rows == 0 {
@@ -111,7 +131,15 @@ pub async fn update_mute_status(
     let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
 
     scheduler
-        .set_convo_muted(&session.did, &input.convo_id, input.muted)
+        .set_convo_muted_authenticated(
+            &session,
+            state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| AppError::Config("Session store unavailable".into()))?,
+            &input.convo_id,
+            input.muted,
+        )
         .await
         .map_err(|e| {
             let msg = e.to_string();

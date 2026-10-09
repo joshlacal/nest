@@ -27,6 +27,33 @@ impl ThreadMuteStore {
         Self { db_pool }
     }
 
+    pub async fn set_thread_mute_authenticated(
+        &self,
+        store: &crate::services::RedisAuthStore,
+        user_did: &str,
+        session_id: &str,
+        thread_root_uri: &str,
+        muted: bool,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, user_did).await?;
+        store
+            .validate_live_session_local(user_did, session_id)
+            .await?;
+        if muted {
+            sqlx::query("INSERT INTO thread_mutes (user_did, thread_root_uri) VALUES ($1, $2) ON CONFLICT (user_did, thread_root_uri) DO NOTHING")
+                .bind(user_did).bind(thread_root_uri).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("DELETE FROM thread_mutes WHERE user_did = $1 AND thread_root_uri = $2")
+                .bind(user_did)
+                .bind(thread_root_uri)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn mute_thread(&self, user_did: &str, thread_root_uri: &str) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, user_did).await?;

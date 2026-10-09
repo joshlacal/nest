@@ -21,6 +21,9 @@ use sqlx::{Pool, Postgres};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
+#[path = "support/cleanup_auth.rs"]
+mod cleanup_auth;
+
 const RECIPIENT: &str = "did:plc:litefailuretest";
 const SENDER: &str = "did:plc:litefailuresender";
 const CONVO: &str = "lite-failure-convo";
@@ -149,6 +152,7 @@ struct Fixture {
     pool: Pool<Postgres>,
     database_url: String,
     redis_url: String,
+    auth_store: Arc<catbird::services::RedisAuthStore>,
     fake: Arc<FakeApns>,
     session: CatbirdSession,
     event: ChatPushEvent,
@@ -180,6 +184,14 @@ impl Fixture {
             }) {
                 sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
             }
+            // This case withholds only the delivery-receipts migration; the
+            // current registration writer requires transactional ownership.
+            sqlx::raw_sql(include_str!(
+                "../migrations/20261008000100_device_auth_session.up.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         admin.close().await;
         // Keep the database within the disposable instance for evidence after a
@@ -200,6 +212,8 @@ impl Fixture {
             last_used_at: now,
             granted_scopes: vec!["atproto".to_string()],
         };
+        let auth_store = cleanup_auth::store().await;
+        cleanup_auth::seed(&auth_store, &session).await;
         let event = serde_json::from_value(json!({
             "recipientDid": RECIPIENT,
             "senderDid": SENDER,
@@ -211,10 +225,11 @@ impl Fixture {
             "logRev": "0000000000003"
         }))
         .unwrap();
-        let fixture = Self {
+        let mut fixture = Self {
             pool,
             database_url: url.to_string(),
             redis_url,
+            auth_store,
             fake: Arc::new(FakeApns::default()),
             session,
             event,
@@ -223,6 +238,17 @@ impl Fixture {
         for index in 1..=devices {
             fixture.register(&services, index).await;
         }
+        fixture.event.auth_generation =
+            sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did = $1")
+                .bind(RECIPIENT)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        services
+            .preferences
+            .put(RECIPIENT, &Default::default())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO actor_moderation_verdict (recipient_did, actor_did, verdict, display_label, fetched_at, generation) \
              SELECT account_did, $2, '{}'::jsonb, 'Fixture Sender', NOW(), moderation_generation \
@@ -239,12 +265,19 @@ impl Fixture {
         Arc::new(
             PushServices::new(self.pool.clone(), config)
                 .unwrap()
+                .with_auth_store(self.auth_store.clone())
                 .with_apns_sender(self.fake.clone()),
         )
     }
 
     async fn state(&self, services: Arc<PushServices>) -> Arc<AppState> {
-        make_state(self.pool.clone(), &self.redis_url, services).await
+        make_state(
+            self.pool.clone(),
+            &self.redis_url,
+            services,
+            self.auth_store.clone(),
+        )
+        .await
     }
 
     async fn register(&self, services: &PushServices, index: usize) {
@@ -304,9 +337,11 @@ async fn make_state(
     pool: Pool<Postgres>,
     redis_url: &str,
     services: Arc<PushServices>,
+    auth_store: Arc<catbird::services::RedisAuthStore>,
 ) -> Arc<AppState> {
     let mut config = AppConfig::test_default();
     config.redis.url = redis_url.to_string();
+    config.redis.key_prefix = auth_store.key_prefix().into();
     let redis = redis::aio::ConnectionManager::new(redis::Client::open(redis_url).unwrap())
         .await
         .unwrap();
@@ -321,10 +356,10 @@ async fn make_state(
         catmos_jacquard_client: None,
         catmos_oauth_scopes: vec![],
         trusted_proxies: vec![],
-        auth_store: None,
+        auth_store: Some(auth_store),
         push: Some(services),
         dpop_nonce_cache: Arc::new(catbird::services::DpopNonceCache::new()),
-        session_encryption_key: None,
+        session_encryption_key: Some(cleanup_auth::KEY),
         active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
         session_index_ready: Arc::new(AtomicBool::new(true)),
@@ -731,11 +766,11 @@ async fn migration_holds_legacy_queue_without_changing_payload_or_history() {
         "recipientDid": RECIPIENT, "senderDid": SENDER,
         "convoId": CONVO, "messageId": fixture.event.message_id,
         "messageText": "", "sentAt": fixture.event.sent_at,
-        "authGeneration": 1
+        "authGeneration": fixture.event.auth_generation
     });
-    sqlx::query("INSERT INTO push_event_queue (recipient_did, actor_did, notification_type, event_cid, event_path, event_record_json, event_timestamp, dedupe_key, auth_generation) VALUES ($1, $2, 'chat_message', 'fixture-message-1', 'chat.bsky.convo.getLog', $3, $4, $5, 1)")
+    sqlx::query("INSERT INTO push_event_queue (recipient_did, actor_did, notification_type, event_cid, event_path, event_record_json, event_timestamp, dedupe_key, auth_generation) VALUES ($1, $2, 'chat_message', 'fixture-message-1', 'chat.bsky.convo.getLog', $3, $4, $5, $6)")
         .bind(RECIPIENT).bind(SENDER).bind(&payload).bind(Utc::now().timestamp())
-        .bind(fixture.event.dedupe_key()).execute(&fixture.pool).await.unwrap();
+        .bind(fixture.event.dedupe_key()).bind(fixture.event.auth_generation).execute(&fixture.pool).await.unwrap();
     sqlx::query("UPDATE chat_poll_state SET chat_cursor = 'preserved-old-cursor', primed_at = NOW() - INTERVAL '48 hours' WHERE account_did = $1")
         .bind(RECIPIENT).execute(&fixture.pool).await.unwrap();
     let before: (i64, serde_json::Value) =
@@ -796,6 +831,7 @@ impl OwnedChild {
             .env("DATABASE_URL", &fixture.database_url)
             .env("REDIS_URL", &fixture.redis_url)
             .env("LITE_PUSH_DISPOSABLE", "1")
+            .env("LITE_PUSH_AUTH_PREFIX", fixture.auth_store.key_prefix())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -895,12 +931,17 @@ async fn subprocess_delivery_worker_entrypoint() {
     config.service_did = Some("did:web:push.fixture.test".to_string());
     config.apns.enabled = false;
     config.send_timeout_seconds = 60;
+    let auth_store = cleanup_auth::store_with_prefix(
+        &std::env::var("LITE_PUSH_AUTH_PREFIX").expect("owning fixture auth prefix"),
+    )
+    .await;
     let services = Arc::new(
         PushServices::new(pool.clone(), config)
             .unwrap()
+            .with_auth_store(auth_store.clone())
             .with_apns_sender(fake),
     );
-    let state = make_state(pool, &redis_url, services.clone()).await;
+    let state = make_state(pool, &redis_url, services.clone(), auth_store).await;
     assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
 }
 

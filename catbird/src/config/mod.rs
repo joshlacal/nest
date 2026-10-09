@@ -957,7 +957,9 @@ impl AppState {
             return Ok(());
         }
 
-        let services = crate::services::push::PushServices::new(pool, self.config.push.clone())?;
+        let store = self.auth_store.clone().ok_or_else(|| anyhow::anyhow!("Push requires the local session write guard"))?;
+        let services = crate::services::push::PushServices::new(pool, self.config.push.clone())?
+            .with_auth_store(store);
         self.push = Some(Arc::new(services));
         tracing::info!("Push services initialized successfully");
         Ok(())
@@ -968,11 +970,11 @@ impl AppState {
         if let Some(push) = &self.push {
             return Some(push.registry.clone());
         }
-        self.push_db.as_ref().map(|db| {
+        self.push_db.as_ref().zip(self.auth_store.as_ref()).map(|(db, store)| {
             crate::services::push::registry::PushRegistry::with_config(
                 db.clone(),
                 &self.config.push,
-            )
+            ).with_auth_store(store.clone())
         })
     }
 

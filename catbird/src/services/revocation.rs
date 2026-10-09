@@ -181,123 +181,16 @@ pub struct RetryPassStats {
 }
 
 /// One bounded pass over pending revocation jobs.
-pub async fn run_retry_pass(state: &AppState, now: i64) -> Result<RetryPassStats, String> {
-    let (Some(store), Some(client)) = (state.auth_store.as_ref(), state.jacquard_client.as_ref())
-    else {
-        return Ok(RetryPassStats::default());
-    };
-    let prefix = store.key_prefix().to_string();
-    let mut conn = store.redis_connection();
-    let pattern = format!("{prefix}revoke_job:*");
-    let mut keys = Vec::new();
-    let mut cursor: u64 = 0;
-    loop {
-        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(100)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| format!("scan revoke jobs: {e}"))?;
-        keys.extend(batch);
-        cursor = next;
-        if cursor == 0 || keys.len() >= MAX_JOBS_PER_PASS {
-            break;
-        }
-    }
-    keys.truncate(MAX_JOBS_PER_PASS);
-
-    let mut stats = RetryPassStats::default();
-    for key in keys {
-        stats.scanned += 1;
-        let claim: Option<String> = redis::cmd("SET")
-            .arg(revoke_claim_key(&prefix, &key))
-            .arg("1")
-            .arg("NX")
-            .arg("EX")
-            .arg(CLAIM_TTL_SECONDS)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| format!("claim revoke job: {e}"))?;
-        if claim.is_none() {
-            continue;
-        }
-        let sealed: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| format!("read revoke job: {e}"))?;
-        let Some(sealed) = sealed else { continue };
-        let mut job = match open_job(store.enc_key(), &key, &sealed) {
-            Ok(job) => job,
-            Err(e) => {
-                tracing::warn!(error = %e, "Dropping unreadable revocation retry job");
-                let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
-                stats.unreadable += 1;
-                continue;
-            }
-        };
-        if job.next_attempt_at > now {
-            continue;
-        }
-        let did = job.session.account_did.as_str().to_string();
-        let outcome = revoke_upstream(client, &mut job.session).await;
-        match decide_after_attempt(&outcome, job.attempts, now) {
-            RetryDecision::Delete => {
-                let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
-                match &outcome {
-                    RevokeOutcome::Failed(e) => {
-                        stats.abandoned += 1;
-                        tracing::warn!(%did, error = %e, attempts = MAX_REVOKE_ATTEMPTS, "Abandoning upstream grant revocation after final retry");
-                    }
-                    _ => {
-                        stats.revoked += 1;
-                        tracing::info!(%did, "Upstream grant revocation retry completed");
-                    }
-                }
-            }
-            RetryDecision::Reschedule {
-                attempts,
-                next_attempt_at,
-            } => {
-                job.attempts = attempts;
-                job.next_attempt_at = next_attempt_at;
-                let sealed = seal_job(store.enc_key(), &key, &job)?;
-                // XX + KEEPTTL: never resurrect a deleted job or extend the retention bound.
-                let _: Result<Option<String>, _> = redis::cmd("SET")
-                    .arg(&key)
-                    .arg(sealed)
-                    .arg("XX")
-                    .arg("KEEPTTL")
-                    .query_async(&mut conn)
-                    .await;
-                stats.rescheduled += 1;
-                if let RevokeOutcome::Failed(e) = &outcome {
-                    tracing::warn!(%did, error = %e, attempts, "Upstream grant revocation retry failed; rescheduled");
-                }
-            }
-        }
-    }
-    Ok(stats)
+pub async fn run_retry_pass(_state: &AppState, _now: i64) -> Result<RetryPassStats, String> {
+    // Legacy jobs have neither a complete cleanup receipt nor exclusive provider
+    // grant ownership. Never let an old job revoke a newly live/shared grant.
+    Err("Legacy revocation retries are paused pending lifecycle ownership; existing credentials keep their original TTL".into())
 }
 
-pub fn spawn_retry_worker(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(RETRY_PASS_INTERVAL_SECONDS));
-        loop {
-            interval.tick().await;
-            match run_retry_pass(&state, chrono::Utc::now().timestamp()).await {
-                Ok(stats) if stats.scanned > 0 => {
-                    tracing::info!(?stats, "Revocation retry pass finished")
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "Revocation retry pass failed"),
-            }
-        }
-    });
+pub fn spawn_retry_worker(_state: Arc<AppState>) {
+    tracing::warn!(
+        "Legacy revocation retries paused; authenticated cleanup receipts own new retries"
+    );
 }
 
 #[cfg(test)]

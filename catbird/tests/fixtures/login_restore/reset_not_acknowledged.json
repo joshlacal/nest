@@ -1,0 +1,199 @@
+{
+  "schemaVersion": 1,
+  "name": "reset_not_acknowledged",
+  "input": {
+    "accountDid": "did:plc:syntheticaccount",
+    "syncGeneration": 7,
+    "currentGeneration": 7,
+    "sessionActive": true,
+    "resetAcknowledged": false,
+    "snapshots": {
+      "actorPreferences": {
+        "status": "Complete",
+        "body": {
+          "preferences": [
+            {
+              "$type": "app.bsky.actor.defs#mutedWordsPref",
+              "items": [
+                {
+                  "value": "synthetic-word",
+                  "targets": [
+                    "content"
+                  ],
+                  "actorTarget": "exclude-following",
+                  "expiresAt": "2026-12-01T00:00:00Z"
+                }
+              ]
+            },
+            {
+              "$type": "app.bsky.actor.defs#futurePreference",
+              "syntheticField": "retain-unmodified"
+            }
+          ]
+        }
+      },
+      "notificationPreferences": {
+        "status": "Complete",
+        "body": {
+          "preferences": {
+            "chat": {
+              "include": "accepted",
+              "push": false
+            },
+            "follow": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "like": {
+              "include": "all",
+              "list": true,
+              "push": false
+            },
+            "likeViaRepost": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "mention": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "quote": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "reply": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "repost": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "repostViaRepost": {
+              "include": "all",
+              "list": true,
+              "push": true
+            },
+            "starterpackJoined": {
+              "list": true,
+              "push": true
+            },
+            "subscribedPost": {
+              "list": true,
+              "push": true
+            },
+            "unverified": {
+              "list": true,
+              "push": true
+            },
+            "verified": {
+              "list": false,
+              "push": true
+            }
+          }
+        }
+      },
+      "chatPreferences": {
+        "status": "Complete",
+        "body": {
+          "preferences": {
+            "chat": {
+              "include": "all",
+              "push": true
+            },
+            "chatRequest": {
+              "include": "all",
+              "push": false
+            }
+          }
+        }
+      },
+      "activitySubscriptions": {
+        "status": "Complete",
+        "pages": [
+          {
+            "subscriptions": [
+              {
+                "did": "did:plc:syntheticsubject",
+                "viewer": {
+                  "activitySubscription": {
+                    "post": true,
+                    "reply": false
+                  }
+                }
+              }
+            ],
+            "cursor": "activity-page-2"
+          },
+          {
+            "subscriptions": []
+          }
+        ]
+      },
+      "conversationMutes": {
+        "status": "Complete",
+        "pages": [
+          {
+            "convos": [
+              {
+                "id": "synthetic-convo-a",
+                "muted": true
+              },
+              {
+                "id": "synthetic-convo-b",
+                "muted": false
+              }
+            ]
+          }
+        ]
+      },
+      "threadMutes": {
+        "status": "Unsupported",
+        "reason": "no_public_enumeration"
+      }
+    },
+    "threadSuppressionMode": "ExplicitResetAccepted",
+    "priming": {
+      "status": "Complete",
+      "socialFenceEstablished": true,
+      "historicalNotificationsEnqueued": 0
+    },
+    "enforcement": {
+      "includeFollows": false,
+      "chatRequests": true
+    },
+    "pushPermissionGranted": true,
+    "restoredChoicesConfirmed": true
+  },
+  "expected": {
+    "snapshotComplete": true,
+    "pushReady": false,
+    "blockers": [
+      "reset_acknowledgment_required",
+      "thread_suppression_unavailable"
+    ],
+    "unsupported": [
+      "threadMutes"
+    ],
+    "unknown": [
+      "threadMutes"
+    ],
+    "historicalNotificationsEnqueued": 0,
+    "providerMutationCount": 0,
+    "preserveFalseValues": [
+      "notificationPreferences.like.push",
+      "notificationPreferences.verified.list",
+      "chatPreferences.chatRequest.push",
+      "activitySubscriptions.did:plc:syntheticsubject.reply",
+      "conversationMutes.synthetic-convo-b.muted"
+    ],
+    "ignoreLegacyAppViewChat": true,
+    "scopePolicy": "last_active_session"
+  }
+}

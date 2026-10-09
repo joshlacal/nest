@@ -16,8 +16,8 @@ impl TestDb {
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(
             url.port(),
-            Some(55471),
-            "dedicated LITE-001 PostgreSQL only"
+            Some(55473),
+            "dedicated task-7 PostgreSQL only"
         );
         assert_eq!(url.username(), "lite_push_test");
         let admin = Pool::<Postgres>::connect(&dsn).await.unwrap();
@@ -371,7 +371,7 @@ async fn poller_live_getlog_priming_and_reopening_emit_no_push() {
         .mount(&pds)
         .await;
     let redis_dsn = std::env::var("REDIS_URL").expect("explicit disposable REDIS_URL required");
-    assert_eq!(redis_dsn, "redis://127.0.0.1:56381");
+    assert_eq!(redis_dsn, "redis://127.0.0.1:56383");
     let client = redis::Client::open(redis_dsn).unwrap();
     let mut subscriber = client.get_async_pubsub().await.unwrap();
     subscriber.subscribe("chat_push").await.unwrap();

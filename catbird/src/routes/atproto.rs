@@ -94,15 +94,10 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Protected auth routes
         .route(
             "/logout",
-            post(atproto::logout)
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    auth_middleware,
-                ))
-                .layer(middleware::from_fn_with_state(
-                    rate_limit_state.clone(),
-                    ip_rate_limit,
-                )),
+            post(atproto::logout).layer(middleware::from_fn_with_state(
+                rate_limit_state.clone(),
+                ip_rate_limit,
+            )),
         )
         .route(
             "/session",
@@ -130,6 +125,10 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/app.bsky.notification.getPreferences",
             get(push::get_preferences),
+        )
+        .route(
+            "/blue.catbird.notification.getSetupStatus",
+            get(push::get_setup_status),
         )
         .route(
             "/app.bsky.notification.putPreferencesV2",

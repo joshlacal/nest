@@ -18,7 +18,13 @@ pub struct PushDecisionEngine;
 #[derive(Debug)]
 pub enum QueueDisposition {
     Drop(&'static str),
+    /// Readiness may recover; retry under the normal queue age/lease limits.
+    Retry(&'static str),
     Deliver(Vec<(RegistrationRow, ApnsNotification)>),
+    DeliverWithEvidence(
+        Vec<(RegistrationRow, ApnsNotification)>,
+        super::thread_evidence::ThreadEvidence,
+    ),
 }
 
 impl PushDecisionEngine {
@@ -42,12 +48,34 @@ impl PushDecisionEngine {
 
         // Preferences before any network call: no point asking the appview
         // about a notification the recipient has switched off.
-        let prefs = services
+        let Some(policy) = services
             .preferences
-            .get_or_create(&row.recipient_did)
-            .await?;
+            .get_delivery_policy(&row.recipient_did)
+            .await?
+        else {
+            return Ok(QueueDisposition::Retry("preferences_restore_required"));
+        };
+        let prefs = &policy.preferences;
         if !prefs.is_push_enabled_for(&row.notification_type) {
             return Ok(QueueDisposition::Drop("preferences_disabled"));
+        }
+        match policy.event_readiness(
+            &row.notification_type,
+            Some(row.event_timestamp),
+            row.thread_root_uri.as_deref(),
+        ) {
+            super::preferences::EventReadiness::Ready => {}
+            super::preferences::EventReadiness::BeforeConsent => {
+                return Ok(QueueDisposition::Drop(
+                    "source_event_before_catbird_consent",
+                ));
+            }
+            super::preferences::EventReadiness::Hold(reason) => {
+                return Ok(QueueDisposition::Retry(reason));
+            }
+            super::preferences::EventReadiness::NotFollowing => {
+                return Ok(QueueDisposition::Drop("actor_not_followed"));
+            }
         }
 
         // One authenticated `getProfile` answers the whole moderation question
@@ -64,7 +92,12 @@ impl PushDecisionEngine {
         // staleness guard bounds that deferral.
         let moderation = services
             .moderation
-            .resolve(state, &row.recipient_did, &row.actor_did)
+            .resolve_for_notification(
+                state,
+                &row.recipient_did,
+                &row.actor_did,
+                policy.requires_following(&row.notification_type),
+            )
             .await?;
 
         // A stale verdict means the appview was unreachable and we fell back to
@@ -84,6 +117,35 @@ impl PushDecisionEngine {
             return Ok(QueueDisposition::Drop("actor_moderated"));
         }
 
+        let thread_evidence = if policy.requires_thread_evidence(&row.notification_type) {
+            let evidence = super::thread_evidence::resolve(state, row).await?;
+            if evidence.is_muted()
+                || services
+                    .thread_mutes
+                    .is_thread_muted(&row.recipient_did, evidence.root_uri())
+                    .await?
+            {
+                return Ok(QueueDisposition::Drop("thread_muted"));
+            }
+            Some(evidence)
+        } else {
+            None
+        };
+        match policy.suppression_readiness(
+            &row.notification_type,
+            moderation.verdict.following,
+            thread_evidence.is_some(),
+        ) {
+            super::preferences::EventReadiness::Ready => {}
+            super::preferences::EventReadiness::NotFollowing => {
+                return Ok(QueueDisposition::Drop("actor_not_followed"))
+            }
+            super::preferences::EventReadiness::Hold(reason) => anyhow::bail!(reason),
+            super::preferences::EventReadiness::BeforeConsent => {
+                unreachable!("suppression check does not change source cutoff")
+            }
+        }
+
         if let Some(thread_root_uri) = row.thread_root_uri.as_deref() {
             if services
                 .thread_mutes
@@ -100,13 +162,16 @@ impl PushDecisionEngine {
             moderation.display_label.clone()
         };
 
-        let notification = build_notification(row, &prefs, actor_label.as_deref());
+        let notification = build_notification(row, prefs, actor_label.as_deref());
         let deliveries = registrations
             .into_iter()
             .map(|registration| (registration, notification.clone()))
             .collect();
 
-        Ok(QueueDisposition::Deliver(deliveries))
+        Ok(match thread_evidence {
+            Some(evidence) => QueueDisposition::DeliverWithEvidence(deliveries, evidence),
+            None => QueueDisposition::Deliver(deliveries),
+        })
     }
 }
 

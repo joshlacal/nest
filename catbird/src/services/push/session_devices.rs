@@ -1,17 +1,15 @@
-//! Which session registered which push device, so signing out one session stops only
-//! that session's devices.
+//! Reverse links between a session and its registered notification devices.
 //!
-//! `user_devices` has no session column, and adding one would make the previous
-//! release refuse to start (sqlx rejects unknown applied migrations), turning a
-//! binary rollback into a production DB write. The link therefore lives in Redis
-//! next to the sessions it describes, keyed by the non-replayable SHA-256 session
-//! fingerprint and bounded by the session index TTL:
+//! New registrations also record `user_devices.auth_session_fingerprint` in the
+//! SQL registration transaction. That SQL owner is authoritative for lifecycle
+//! cleanup; these Redis links support lookup and verified legacy ownership.
 //!
-//! - `{prefix}push_device_session:{device_id}` → fingerprint of the registering session
+//! - `{prefix}push_device_session:{device_id}` → registering session fingerprint
 //! - `{prefix}push_session_devices:{fingerprint}` → set of device row IDs
 //!
-//! The device key is authoritative: a device that a newer session re-registered
-//! still sits in the old session's set, but no longer belongs to it.
+//! A successful OAuth upgrade transfers proven old SQL ownership and repairs
+//! these links under the same account lock. Another device's current SQL owner
+//! is never inherited just because it supplies the account's push session.
 
 use std::collections::BTreeSet;
 
@@ -39,24 +37,42 @@ pub async fn link(
     let fp = normalize_or_hash_session_fingerprint(raw_session_id);
     let set_key = session_key(prefix, &fp);
     let mut conn = store.redis_connection();
-    redis::pipe()
-        .atomic()
-        .cmd("SET")
-        .arg(device_key(prefix, device_id))
-        .arg(&fp)
-        .arg("EX")
-        .arg(SESSION_INDEX_TTL_SECONDS)
-        .ignore()
-        .cmd("SADD")
-        .arg(&set_key)
-        .arg(device_id.to_string())
-        .ignore()
-        .cmd("EXPIRE")
-        .arg(&set_key)
-        .arg(SESSION_INDEX_TTL_SECONDS)
-        .ignore()
+    let did: Option<String> = redis::cmd("GET")
+        .arg(store.session_index_key(raw_session_id))
         .query_async(&mut conn)
-        .await
+        .await?;
+    let Some(did) = did else {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "session no longer live",
+        )));
+    };
+    let applied: i32 = redis::Script::new(
+        r#"
+        if redis.call('EXISTS',KEYS[3]) == 1 or redis.call('EXISTS',KEYS[4]) == 1
+          or redis.call('EXISTS',KEYS[5]) == 0 then return 0 end
+        redis.call('SET',KEYS[1],ARGV[1],'EX',ARGV[3])
+        redis.call('SADD',KEYS[2],ARGV[2]); redis.call('EXPIRE',KEYS[2],ARGV[3]); return 1
+    "#,
+    )
+    .key(device_key(prefix, device_id))
+    .key(&set_key)
+    .key(store.retired_key(raw_session_id))
+    .key(store.account_erasure_key(&did))
+    .key(store.session_key(&did, raw_session_id))
+    .arg(&fp)
+    .arg(device_id.to_string())
+    .arg(SESSION_INDEX_TTL_SECONDS)
+    .invoke_async(&mut conn)
+    .await?;
+    if applied == 1 {
+        Ok(())
+    } else {
+        Err(redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "session no longer live",
+        )))
+    }
 }
 
 async fn session_for_device(

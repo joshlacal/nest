@@ -2,10 +2,16 @@
 //!
 //! Business logic and external service integrations.
 
+pub mod account_cleanup_discovery;
+pub mod account_cleanup_inventory;
 mod atproto_client;
 pub mod chat_poll;
 mod crypto;
 mod dpop_nonce_cache;
+pub mod login_apply;
+pub mod login_restore;
+pub mod login_sync;
+pub mod logout_cleanup;
 mod mls_auth;
 pub mod oauth_authorize;
 pub mod oauth_upgrade;

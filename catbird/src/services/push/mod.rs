@@ -7,6 +7,7 @@ pub mod queue;
 pub mod registry;
 pub mod session_devices;
 pub mod subscriptions;
+pub mod thread_evidence;
 pub mod thread_mutes;
 pub mod types;
 use std::collections::HashSet;
@@ -42,6 +43,9 @@ pub enum PreSendFenceOutcome {
     DeviceInactive,
     LeaseLost,
     PreferencesDisabled,
+    RestorePending,
+    SourceEventBeforeConsent,
+    EventEvidencePending(&'static str),
     ThreadMuted,
     ChatRead,
     ModerationSuppressed,
@@ -187,6 +191,12 @@ impl PushServices {
         })
     }
 
+    /// Runtime construction must attach the authoritative local session store.
+    pub fn with_auth_store(mut self, store: Arc<crate::services::RedisAuthStore>) -> Self {
+        self.registry = self.registry.with_auth_store(store);
+        self
+    }
+
     pub fn with_apns_sender(mut self, sender: Arc<dyn ApnsSender>) -> Self {
         self.apns = Some(sender);
         self
@@ -230,6 +240,32 @@ impl PushServices {
         queue_fence: Option<(i64, uuid::Uuid, i64)>, // (id, lease_token, auth_generation)
         expected_auth_generation: Option<i64>,
     ) -> Result<PreSendFenceOutcome> {
+        self.verify_pre_send_fence_with_evidence_tx(
+            tx,
+            recipient_did,
+            actor_did,
+            device_token,
+            notification_type,
+            thread_root_uri,
+            queue_fence,
+            expected_auth_generation,
+            None,
+        )
+        .await
+    }
+
+    async fn verify_pre_send_fence_with_evidence_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        recipient_did: &str,
+        actor_did: &str,
+        device_token: &str,
+        notification_type: &str,
+        thread_root_uri: Option<&str>,
+        queue_fence: Option<(i64, uuid::Uuid, i64)>,
+        expected_auth_generation: Option<i64>,
+        thread_evidence: Option<&thread_evidence::ThreadEvidence>,
+    ) -> Result<PreSendFenceOutcome> {
         let queue_id = queue_fence.map(|(id, _, _)| id);
 
         let row = sqlx::query(
@@ -250,8 +286,11 @@ impl PushServices {
                 q.lease_version,
                 q.leased_until,
                 q.auth_generation AS queue_auth_generation,
+                q.event_timestamp AS source_event_timestamp,
                 pa.moderation_generation,
                 pp.preferences_json,
+                COALESCE(mg.generation,0) AS chat_mute_generation,
+                (cp.primed_at IS NOT NULL AND cp.catch_up_required_at IS NULL) AS chat_primed,
                 (
                     SELECT EXISTS (
                         SELECT 1 FROM activity_subscriptions sub
@@ -281,12 +320,15 @@ impl PushServices {
                     WHERE wm.account_did=param.did AND wm.convo_id=q.event_record_json->>'convoId'
                       AND wm.last_read_rev COLLATE "C" >= (q.event_record_json->>'logRev') COLLATE "C"
                 )) AS chat_is_read,
-                amv.verdict AS cached_moderation_verdict
+                amv.verdict AS cached_moderation_verdict,
+                amv.fetched_at AS cached_moderation_fetched_at
             FROM (SELECT $1::text AS did) param
             LEFT JOIN push_accounts pa ON pa.account_did = param.did
             LEFT JOIN user_devices ud ON ud.did = param.did AND ud.device_token = $2
             LEFT JOIN push_event_queue q ON q.id = $3
             LEFT JOIN push_preferences pp ON pp.account_did = param.did
+            LEFT JOIN chat_poll_state cp ON cp.account_did = param.did
+            LEFT JOIN chat_mute_sync_generations mg ON mg.account_did = param.did
             LEFT JOIN thread_mutes tm ON tm.user_did = param.did AND tm.thread_root_uri = $6
             LEFT JOIN actor_moderation_verdict amv ON amv.recipient_did = param.did AND amv.actor_did = $5
               AND amv.generation = pa.moderation_generation
@@ -348,15 +390,68 @@ impl PushServices {
             }
         }
 
-        // 4. Push preferences
+        // 4. The final fence re-reads server-owned restore readiness while
+        // holding the same account lock as restore/preference writers.
         let prefs_json: Option<serde_json::Value> = row.try_get("preferences_json")?;
-        if let Some(json_val) = prefs_json {
-            if let Ok(prefs) = serde_json::from_value::<types::PushPreferencesDocument>(json_val) {
-                if !prefs.is_push_enabled_for(notification_type) {
-                    return Ok(PreSendFenceOutcome::PreferencesDisabled);
-                }
+        let Some(mut policy) = prefs_json
+            .as_ref()
+            .and_then(|payload| preferences::delivery_policy(payload, current_gen))
+        else {
+            return Ok(PreSendFenceOutcome::RestorePending);
+        };
+        policy.chat_ready = row.try_get::<bool, _>("chat_primed")?
+            && preferences::chat_snapshot_matches(
+                prefs_json.as_ref().expect("policy has preferences"),
+                current_gen,
+                row.try_get("chat_mute_generation")?,
+            );
+        if !policy.preferences.is_push_enabled_for(notification_type) {
+            return Ok(PreSendFenceOutcome::PreferencesDisabled);
+        }
+        // Re-read the queued producer timestamp, not the decision's snapshot or
+        // enqueue time, under the consent writer's account lock.
+        match policy.event_readiness(
+            notification_type,
+            row.try_get("source_event_timestamp")?,
+            thread_root_uri,
+        ) {
+            preferences::EventReadiness::Ready => {}
+            preferences::EventReadiness::BeforeConsent => {
+                return Ok(PreSendFenceOutcome::SourceEventBeforeConsent);
+            }
+            preferences::EventReadiness::Hold(reason) => {
+                return Ok(PreSendFenceOutcome::EventEvidencePending(reason));
+            }
+            preferences::EventReadiness::NotFollowing => {
+                return Ok(PreSendFenceOutcome::PreferencesDisabled)
             }
         }
+
+        let thread_proven = if policy.requires_thread_evidence(notification_type) {
+            let Some(evidence) = thread_evidence else {
+                return Ok(PreSendFenceOutcome::EventEvidencePending(
+                    "upstream_thread_mute_evidence_required",
+                ));
+            };
+            let fresh: Option<types::QueueRow> = sqlx::query_as("SELECT id,recipient_did,actor_did,notification_type,event_cid,event_path,subject_uri,thread_root_uri,event_record_json,event_timestamp,created_at,attempts,lease_token,lease_version,auth_generation FROM push_event_queue WHERE id=$1")
+                .bind(queue_id).fetch_optional(&mut **tx).await?;
+            let moderation_generation: Option<i64> = row.try_get("moderation_generation")?;
+            if fresh.as_ref().is_none_or(|fresh| {
+                !evidence.matches(fresh, current_gen, moderation_generation.unwrap_or(0))
+            }) {
+                return Ok(PreSendFenceOutcome::EventEvidencePending(
+                    "upstream_thread_mute_evidence_expired",
+                ));
+            }
+            let locally_muted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM thread_mutes WHERE user_did=$1 AND thread_root_uri=$2)")
+                .bind(recipient_did).bind(evidence.root_uri()).fetch_one(&mut **tx).await?;
+            if evidence.is_muted() || locally_muted {
+                return Ok(PreSendFenceOutcome::ThreadMuted);
+            }
+            true
+        } else {
+            false
+        };
 
         // 5. Activity subscriptions: verify active subscription for activity notifications
         if notification_type.starts_with("activity_") || notification_type == "activitySubscription"
@@ -376,12 +471,24 @@ impl PushServices {
         if row.try_get::<bool, _>("chat_is_read")? {
             return Ok(PreSendFenceOutcome::ChatRead);
         }
+        if policy.suppression_readiness(notification_type, None, thread_proven)
+            == preferences::EventReadiness::Hold("chat_bootstrap_pending")
+        {
+            return Ok(PreSendFenceOutcome::EventEvidencePending(
+                "chat_bootstrap_pending",
+            ));
+        }
 
         // 7. Moderation verdict: fail closed / suppress on missing or suppressing verdict
         let cached_verdict: Option<serde_json::Value> = row.try_get("cached_moderation_verdict")?;
         match cached_verdict {
             None => {
                 // Missing moderation verdict in fence suppresses/defers delivery (e.g. after invalidation/mute)
+                if policy.requires_following(notification_type) {
+                    return Ok(PreSendFenceOutcome::EventEvidencePending(
+                        "following_relationship_evidence_required",
+                    ));
+                }
                 return Ok(PreSendFenceOutcome::ModerationSuppressed);
             }
             Some(verdict_val) => {
@@ -390,8 +497,39 @@ impl PushServices {
                         if verdict.suppresses(notification_type) {
                             return Ok(PreSendFenceOutcome::ModerationSuppressed);
                         }
+                        let fetched_at: Option<time::OffsetDateTime> =
+                            row.try_get("cached_moderation_fetched_at")?;
+                        let following = if fetched_at.is_some_and(|at| {
+                            let age = time::OffsetDateTime::now_utc() - at;
+                            age >= time::Duration::ZERO && age < time::Duration::seconds(30)
+                        }) {
+                            verdict.following
+                        } else {
+                            None
+                        };
+                        match policy.suppression_readiness(
+                            notification_type,
+                            following,
+                            thread_proven,
+                        ) {
+                            preferences::EventReadiness::Ready => {}
+                            preferences::EventReadiness::NotFollowing => {
+                                return Ok(PreSendFenceOutcome::PreferencesDisabled)
+                            }
+                            preferences::EventReadiness::Hold(reason) => {
+                                return Ok(PreSendFenceOutcome::EventEvidencePending(reason))
+                            }
+                            preferences::EventReadiness::BeforeConsent => {
+                                unreachable!("suppression check does not change cutoff")
+                            }
+                        }
                     }
                     Err(_) => {
+                        if policy.requires_following(notification_type) {
+                            return Ok(PreSendFenceOutcome::EventEvidencePending(
+                                "following_relationship_evidence_required",
+                            ));
+                        }
                         return Ok(PreSendFenceOutcome::ModerationSuppressed);
                     }
                 }
@@ -538,7 +676,29 @@ impl PushServices {
                     continue;
                 }
             };
+            // Keep the evidence outside the delivery vector so every device's
+            // final fence revalidates the same immutable fetched observation.
+            let mut thread_evidence = None;
+            let evaluated = evaluated.map(|disposition| match disposition {
+                QueueDisposition::DeliverWithEvidence(deliveries, evidence) => {
+                    thread_evidence = Some(evidence);
+                    QueueDisposition::Deliver(deliveries)
+                }
+                other => other,
+            });
             match evaluated {
+                Ok(QueueDisposition::DeliverWithEvidence(..)) => {
+                    unreachable!("evidence was extracted above")
+                }
+                Ok(QueueDisposition::Retry(reason)) => {
+                    // Missing consent/bootstrap/evidence can recover. Durable
+                    // holds are reserved for the existing ambiguous delivery
+                    // and chat-review paths, never decision-time readiness.
+                    let (token, version) = heartbeat.stop().await;
+                    self.queue
+                        .retry_later_fenced(row.id, token, version, row.attempts, reason)
+                        .await?;
+                }
                 Ok(QueueDisposition::Drop(reason)) => {
                     tracing::debug!(
                         recipient = %row.recipient_did,
@@ -556,6 +716,7 @@ impl PushServices {
                     let mut is_revoked = false;
                     let mut is_lease_lost = false;
                     let mut has_held_delivery = false;
+                    let mut readiness_hold = None;
 
                     for (registration, mut notification) in deliveries {
                         let mut tx = match self.queue.pool().begin().await {
@@ -577,7 +738,7 @@ impl PushServices {
                             break;
                         }
                         let fence_outcome = match self
-                            .verify_pre_send_fence_tx(
+                            .verify_pre_send_fence_with_evidence_tx(
                                 &mut tx,
                                 &registration.did,
                                 &row.actor_did,
@@ -586,6 +747,7 @@ impl PushServices {
                                 row.thread_root_uri.as_deref(),
                                 Some((row.id, lease_token, row.auth_generation)),
                                 Some(row.auth_generation),
+                                thread_evidence.as_ref(),
                             )
                             .await
                         {
@@ -629,7 +791,18 @@ impl PushServices {
                                 );
                                 continue;
                             }
+                            PreSendFenceOutcome::RestorePending => {
+                                let _ = tx.commit().await;
+                                readiness_hold = Some("preferences_restore_required");
+                                break;
+                            }
+                            PreSendFenceOutcome::EventEvidencePending(reason) => {
+                                let _ = tx.commit().await;
+                                readiness_hold = Some(reason);
+                                break;
+                            }
                             PreSendFenceOutcome::PreferencesDisabled
+                            | PreSendFenceOutcome::SourceEventBeforeConsent
                             | PreSendFenceOutcome::ThreadMuted
                             | PreSendFenceOutcome::ChatRead
                             | PreSendFenceOutcome::ModerationSuppressed => {
@@ -719,9 +892,11 @@ impl PushServices {
                                     );
                                     if let Err(err) = self
                                         .registry
-                                        .set_apns_environment(
+                                        .set_apns_environment_if_current(
                                             &registration.did,
+                                            registration.id,
                                             &registration.device_token,
+                                            row.auth_generation,
                                             delivered_env,
                                         )
                                         .await
@@ -744,22 +919,16 @@ impl PushServices {
                                 );
                                 if let Err(update_err) = self
                                     .registry
-                                    .deactivate_invalid_token(
+                                    .deactivate_invalid_token_if_current(
                                         &registration.did,
+                                        registration.id,
                                         &registration.device_token,
+                                        row.auth_generation,
                                         "apns_unregistered",
                                     )
                                     .await
                                 {
                                     tracing::error!(error = %update_err, "Failed to deactivate invalid APNs token");
-                                } else if let Some(push_db) = state.push_db.as_ref() {
-                                    let scheduler = crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());
-                                    if let Err(err) = scheduler
-                                        .unenroll_account_if_no_active_devices(&registration.did)
-                                        .await
-                                    {
-                                        tracing::warn!(did = %registration.did, error = %err, "Chat poll unenroll (APNs token death) failed");
-                                    }
                                 }
                             }
                             Err(err) if is_auth_revocation_error(&err) => {
@@ -798,6 +967,12 @@ impl PushServices {
                                 tracing::error!(error = %err, "Failed to delete revoked-account push event");
                             }
                         }
+                    } else if let Some(reason) = readiness_hold {
+                        // Provider/bootstrap evidence can become available on
+                        // retry. A durable hold would strand this event forever.
+                        self.queue
+                            .retry_later_fenced(row.id, token, final_version, row.attempts, reason)
+                            .await?;
                     } else if let Some(err) = transient_error {
                         tracing::warn!(
                             recipient = %row.recipient_did,

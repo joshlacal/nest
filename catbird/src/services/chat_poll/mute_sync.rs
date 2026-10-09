@@ -111,7 +111,16 @@ pub(crate) async fn sync_mutes_for_account(
         }
     };
 
-    let result = sync_mutes_for_session(state, scheduler, &session, &dpop, did, start_time).await;
+    let result = sync_mutes_for_session_fenced(
+        state,
+        scheduler,
+        &session,
+        &dpop,
+        did,
+        start_time,
+        Some(auth_generation),
+    )
+    .await;
     if result.as_ref().err().is_some_and(is_auth_revocation_error) {
         scheduler
             .unenroll_account_if_auth_generation(did, auth_generation)
@@ -120,6 +129,7 @@ pub(crate) async fn sync_mutes_for_account(
     result
 }
 
+#[cfg(test)]
 pub(crate) async fn sync_mutes_for_session(
     state: &Arc<AppState>,
     scheduler: &ChatPollScheduler,
@@ -127,6 +137,18 @@ pub(crate) async fn sync_mutes_for_session(
     dpop: &crate::middleware::JacquardDpopData,
     did: &str,
     start_time: std::time::Instant,
+) -> Result<()> {
+    sync_mutes_for_session_fenced(state, scheduler, session, dpop, did, start_time, None).await
+}
+
+async fn sync_mutes_for_session_fenced(
+    state: &Arc<AppState>,
+    scheduler: &ChatPollScheduler,
+    session: &crate::models::CatbirdSession,
+    dpop: &crate::middleware::JacquardDpopData,
+    did: &str,
+    start_time: std::time::Instant,
+    expected_auth_generation: Option<i64>,
 ) -> Result<()> {
     let remaining = MAX_MUTE_SYNC_DURATION
         .checked_sub(start_time.elapsed())
@@ -333,10 +355,28 @@ pub(crate) async fn sync_mutes_for_session(
         };
 
         // Bulk-replace the muted set in the database ONLY on full clean completion within deadline
-        let applied = match tokio::time::timeout(
-            commit_remaining,
-            scheduler.sync_muted_convos(did, &staged_muted_ids, mute_generation),
-        )
+        let applied = match tokio::time::timeout(commit_remaining, async {
+            match expected_auth_generation {
+                Some(auth_generation) => {
+                    scheduler
+                        .sync_muted_convos_fenced(
+                            did,
+                            &staged_muted_ids,
+                            mute_generation,
+                            auth_generation,
+                        )
+                        .await
+                }
+                #[cfg(test)]
+                None => {
+                    scheduler
+                        .sync_muted_convos(did, &staged_muted_ids, mute_generation)
+                        .await
+                }
+                #[cfg(not(test))]
+                None => Err(anyhow!("Missing authorization generation")),
+            }
+        })
         .await
         {
             Ok(res) => res?,

@@ -150,67 +150,204 @@ impl PushPreferencesDocument {
     }
 }
 
+// PUT patches are distinct from stored documents: each supplied category must
+// carry an explicit push choice. Omitted list/include fields preserve local state.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatPreferencePatch {
+    pub include: Option<String>,
+    pub push: bool,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterablePreferencePatch {
+    pub include: Option<String>,
+    pub list: Option<bool>,
+    pub push: bool,
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreferencePatch {
+    pub list: Option<bool>,
+    pub push: bool,
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct PutPreferencesInput {
-    pub chat: Option<ChatPreference>,
-    pub follow: Option<FilterablePreference>,
-    pub like: Option<FilterablePreference>,
+    pub chat: Option<ChatPreferencePatch>,
+    pub follow: Option<FilterablePreferencePatch>,
+    pub like: Option<FilterablePreferencePatch>,
     #[serde(rename = "likeViaRepost")]
-    pub like_via_repost: Option<FilterablePreference>,
-    pub mention: Option<FilterablePreference>,
-    pub quote: Option<FilterablePreference>,
-    pub reply: Option<FilterablePreference>,
-    pub repost: Option<FilterablePreference>,
+    pub like_via_repost: Option<FilterablePreferencePatch>,
+    pub mention: Option<FilterablePreferencePatch>,
+    pub quote: Option<FilterablePreferencePatch>,
+    pub reply: Option<FilterablePreferencePatch>,
+    pub repost: Option<FilterablePreferencePatch>,
     #[serde(rename = "repostViaRepost")]
-    pub repost_via_repost: Option<FilterablePreference>,
+    pub repost_via_repost: Option<FilterablePreferencePatch>,
     #[serde(rename = "starterpackJoined")]
-    pub starterpack_joined: Option<Preference>,
+    pub starterpack_joined: Option<PreferencePatch>,
     #[serde(rename = "subscribedPost")]
-    pub subscribed_post: Option<Preference>,
-    pub unverified: Option<Preference>,
-    pub verified: Option<Preference>,
+    pub subscribed_post: Option<PreferencePatch>,
+    pub unverified: Option<PreferencePatch>,
+    pub verified: Option<PreferencePatch>,
 }
-
 impl PutPreferencesInput {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(self.chat.is_some()
+            || self.follow.is_some()
+            || self.like.is_some()
+            || self.like_via_repost.is_some()
+            || self.mention.is_some()
+            || self.quote.is_some()
+            || self.reply.is_some()
+            || self.repost.is_some()
+            || self.repost_via_repost.is_some()
+            || self.starterpack_joined.is_some()
+            || self.subscribed_post.is_some()
+            || self.unverified.is_some()
+            || self.verified.is_some())
+        {
+            return Err(
+                "Supply at least one Catbird notification category with an explicit push choice",
+            );
+        }
+        let includes = [
+            self.chat
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.follow
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.like
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.like_via_repost
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.mention
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.quote
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.reply
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.repost
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+            self.repost_via_repost
+                .as_ref()
+                .and_then(|value| value.include.as_deref()),
+        ];
+        if includes
+            .into_iter()
+            .flatten()
+            .any(|value| !matches!(value, "all" | "follows"))
+        {
+            return Err("Notification include must be all or follows");
+        }
+        Ok(())
+    }
     pub fn apply_to(self, mut prefs: PushPreferencesDocument) -> PushPreferencesDocument {
         if let Some(value) = self.chat {
-            prefs.chat = value;
+            prefs.chat.push = value.push;
+            if let Some(include) = value.include {
+                prefs.chat.include = include;
+            }
         }
         if let Some(value) = self.follow {
-            prefs.follow = value;
+            prefs.follow.push = value.push;
+            if let Some(include) = value.include {
+                prefs.follow.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.follow.list = list;
+            }
         }
         if let Some(value) = self.like {
-            prefs.like = value;
+            prefs.like.push = value.push;
+            if let Some(include) = value.include {
+                prefs.like.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.like.list = list;
+            }
         }
         if let Some(value) = self.like_via_repost {
-            prefs.like_via_repost = value;
+            prefs.like_via_repost.push = value.push;
+            if let Some(include) = value.include {
+                prefs.like_via_repost.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.like_via_repost.list = list;
+            }
         }
         if let Some(value) = self.mention {
-            prefs.mention = value;
+            prefs.mention.push = value.push;
+            if let Some(include) = value.include {
+                prefs.mention.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.mention.list = list;
+            }
         }
         if let Some(value) = self.quote {
-            prefs.quote = value;
+            prefs.quote.push = value.push;
+            if let Some(include) = value.include {
+                prefs.quote.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.quote.list = list;
+            }
         }
         if let Some(value) = self.reply {
-            prefs.reply = value;
+            prefs.reply.push = value.push;
+            if let Some(include) = value.include {
+                prefs.reply.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.reply.list = list;
+            }
         }
         if let Some(value) = self.repost {
-            prefs.repost = value;
+            prefs.repost.push = value.push;
+            if let Some(include) = value.include {
+                prefs.repost.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.repost.list = list;
+            }
         }
         if let Some(value) = self.repost_via_repost {
-            prefs.repost_via_repost = value;
+            prefs.repost_via_repost.push = value.push;
+            if let Some(include) = value.include {
+                prefs.repost_via_repost.include = include;
+            }
+            if let Some(list) = value.list {
+                prefs.repost_via_repost.list = list;
+            }
         }
         if let Some(value) = self.starterpack_joined {
-            prefs.starterpack_joined = value;
+            prefs.starterpack_joined.push = value.push;
+            if let Some(list) = value.list {
+                prefs.starterpack_joined.list = list;
+            }
         }
         if let Some(value) = self.subscribed_post {
-            prefs.subscribed_post = value;
+            prefs.subscribed_post.push = value.push;
+            if let Some(list) = value.list {
+                prefs.subscribed_post.list = list;
+            }
         }
         if let Some(value) = self.unverified {
-            prefs.unverified = value;
+            prefs.unverified.push = value.push;
+            if let Some(list) = value.list {
+                prefs.unverified.list = list;
+            }
         }
         if let Some(value) = self.verified {
-            prefs.verified = value;
+            prefs.verified.push = value.push;
+            if let Some(list) = value.list {
+                prefs.verified.list = list;
+            }
         }
         prefs
     }
