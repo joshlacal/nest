@@ -220,6 +220,7 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
 /// - Connection pool limits
 pub fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
+        .tls_backend_rustls()
         .user_agent("Catbird/0.1.0")
         .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
         .no_proxy()
@@ -241,6 +242,7 @@ pub fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
 /// - Connection pool limits
 pub fn build_hardened_raw_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
+        .tls_backend_rustls()
         .user_agent("Catbird/0.1.0")
         .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
         .no_proxy()

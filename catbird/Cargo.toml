@@ -17,7 +17,7 @@ tower_governor = "0.4"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP Client
-reqwest = { version = "0.13", features = ["json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
+reqwest = { version = "0.13", features = ["rustls", "json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
 flate2 = "1.0"
 brotli = "8.0"
 # Jacquard (AT Protocol)
