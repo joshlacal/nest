@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
@@ -11,9 +12,7 @@ use catbird_atproto::generated::app_bsky::actor::get_profile::GetProfileOutput;
 use catbird_atproto::generated::app_bsky::actor::{
     ProfileAssociated, ProfileViewBasic, ProfileViewDetailed,
 };
-use catbird_atproto::generated::app_bsky::feed::{
-    PostViewEmbed, ThreadViewPostParent, ThreadViewPostRepliesItem,
-};
+use catbird_atproto::generated::app_bsky::feed::{ThreadViewPostParent, ThreadViewPostRepliesItem};
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
 use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
 use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
@@ -127,6 +126,7 @@ async fn grant_active_member(
 }
 
 async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
+    support::healthy_identity_fixture(&pool, &[ALICE_DID, BOB_DID, CHARLIE_DID]).await;
     db::run_migrations(&pool)
         .await
         .expect("Migrations must succeed");
@@ -141,6 +141,7 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -1302,9 +1303,7 @@ async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_and_absolute_media_url(
-    pool: PgPool,
-) {
+async fn feed_view_omits_rendered_images_while_blob_support_is_disabled(pool: PgPool) {
     let setup = setup_views_test(pool.clone()).await;
 
     sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7viewsaaaaa', $2, 'Space 1', now())")
@@ -1377,29 +1376,11 @@ async fn feed_view_post_embed_images_view_construction_preserves_aspect_ratio_an
     let feed: GetFeedOutput = serde_json::from_slice(&body).unwrap();
 
     let post = &feed.feed[0].post.post;
-    match &post.embed {
-        Some(PostViewEmbed::ImagesView(images_view)) => {
-            assert_eq!(images_view.images.len(), 1);
-            assert_eq!(images_view.images[0].alt.as_str(), "Test image alt");
-            assert!(images_view.images[0]
-                .fullsize
-                .as_str()
-                .starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
-            assert!(images_view.images[0].fullsize.as_str().contains(&blob_cid));
-            assert!(images_view.images[0]
-                .thumb
-                .as_str()
-                .starts_with("https://media.catbird.blue/xrpc/blue.catbird.circle.getMedia"));
-
-            let ar = images_view.images[0]
-                .aspect_ratio
-                .as_ref()
-                .expect("Aspect ratio must be preserved");
-            assert_eq!(ar.width, 1200);
-            assert_eq!(ar.height, 800);
-        }
-        other => panic!("Expected PostViewEmbed::ImagesView, got {:?}", other),
-    }
+    assert!(
+        post.embed.is_none(),
+        "Unqualified private images must not produce media URLs"
+    );
+    const { assert!(!circle_appview::SUPPORTS_IMAGES) };
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1652,6 +1633,11 @@ async fn thread_caps_traversal_at_node_budget_and_prevents_unbounded_expansion(p
             .bind(&r_uri).bind(&r_cid).bind(SPACE_1).bind(BOB_DID).bind(format!("3l7reply{i}")).bind(&r_json).bind(&root_uri).execute(&pool).await.unwrap();
     }
 
+    // Bulk fixture construction is outside the request being measured.
+    // Refresh its explicit healthy ledger and membership snapshot afterward.
+    support::healthy_identity_fixture(&pool, &[ALICE_DID, BOB_DID]).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
     let root_std_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/3l7budgetroot");
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
@@ -1664,8 +1650,9 @@ async fn thread_caps_traversal_at_node_budget_and_prevents_unbounded_expansion(p
         .unwrap();
 
     let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let thread: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
 
     let replies = thread.thread.replies.expect("Replies must exist");
@@ -2266,6 +2253,11 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
         "Seeded exactly 511 nodes (1 root + 50 L1 siblings + 460 L1_1 children)"
     );
 
+    // Bulk fixture construction is outside the request being measured.
+    // Refresh its explicit healthy ledger and membership snapshot afterward.
+    support::healthy_identity_fixture(&pool, &[ALICE_DID, BOB_DID]).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
     let root_std_uri = format!("at://{ALICE_DID}/app.bsky.feed.post/3l7advroot");
     let token = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
     let req = Request::builder()
@@ -2278,8 +2270,9 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
         .unwrap();
 
     let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
     let body = to_bytes(resp.into_body(), 10 * 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let thread_output: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
 
     fn count_nodes(replies: &[ThreadViewPostRepliesItem]) -> usize {

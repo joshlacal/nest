@@ -7,11 +7,8 @@ use crate::access::{
     extract_authority_did, resolve_pds_endpoint, resolve_space_host_endpoint, CredentialStore,
     SpaceLockManager,
 };
-use crate::auth::{select_verification_method, DidResolver};
-use crate::commit::{
-    compute_dagcbor_cid, extract_and_validate_car, parse_permissioned_car, verify_commit,
-    CommitContext, LtHash, LTHASH_SIZE,
-};
+use crate::auth::DidResolver;
+use crate::commit::{compute_dagcbor_cid, LtHash, LTHASH_SIZE};
 use crate::config::AppState;
 use crate::error::AppError;
 use crate::space_client::SpaceClient;
@@ -98,6 +95,7 @@ pub struct SweepSummary {
 }
 
 pub struct SyncEngine {
+    lifecycle_state: Option<AppState>,
     db: sqlx::PgPool,
     space_client: Arc<SpaceClient>,
     credential_store: Arc<CredentialStore>,
@@ -127,6 +125,7 @@ enum StagedMutation {
 impl SyncEngine {
     pub fn new(state: &AppState) -> Self {
         Self {
+            lifecycle_state: Some(state.clone()),
             db: state.db.clone(),
             space_client: state.space_client.clone(),
             credential_store: state.credential_store.clone(),
@@ -147,6 +146,7 @@ impl SyncEngine {
         space_locks: Arc<SpaceLockManager>,
     ) -> Self {
         Self {
+            lifecycle_state: None,
             db,
             space_client,
             credential_store,
@@ -233,6 +233,13 @@ impl SyncEngine {
         .map_err(AppError::Database)?;
 
         let authority_did = extract_authority_did(space_uri)?;
+        if let Some(state) = &self.lifecycle_state {
+            crate::access::ensure_active_account(state, author_did).await?;
+            crate::access::ensure_active_account(state, &authority_did).await?;
+        } else {
+            crate::identity_events::require_active_account(&self.db, author_did).await?;
+            crate::identity_events::require_active_account(&self.db, &authority_did).await?;
+        }
         let _initial_generation = match initial_membership {
             Some((gen,)) => Some(gen),
             None => {
@@ -284,10 +291,6 @@ impl SyncEngine {
                 )),
             })?;
         let (repo_service_endpoint, _) = resolve_pds_endpoint(&author_doc, author_did)?;
-        let author_vm = select_verification_method(&author_doc, author_did, None)
-            .map_err(AppError::Unauthorized)?;
-        let author_signing_key =
-            crate::auth::parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
 
         // Load active members and post-only known post URIs to build ValidationPolicy
         let active_member_rows: Vec<(String,)> = sqlx::query_as(
@@ -515,7 +518,6 @@ impl SyncEngine {
                     &repo_service_endpoint,
                     &cred.token,
                     &cred.signing_key,
-                    &author_signing_key,
                     &policy,
                     expected_authority_hash,
                     expected_authority_rev,
@@ -553,75 +555,19 @@ impl SyncEngine {
             },
         };
 
+        // The transport verifies each terminal commit MAC using that page's
+        // unique request secret before releasing the page to this accumulator.
         let commit_verified = if let Some(commit) = &commit_to_verify {
             latest_rev = commit.rev.to_string();
-            let hash_matches = commit.hash.as_ref() == lthash.digest().as_slice();
-            if !hash_matches {
-                false
-            } else {
-                let space_uri_parsed =
-                    match jacquard_common::types::aturi::AtSpaceUri::new_owned(space_uri) {
-                        Ok(u) => u,
-                        Err(_) => {
-                            return self
-                                .full_recovery(
-                                    space_uri,
-                                    author_did,
-                                    &repo_service_endpoint,
-                                    &cred.token,
-                                    &cred.signing_key,
-                                    &author_signing_key,
-                                    &policy,
-                                    expected_authority_hash,
-                                    expected_authority_rev,
-                                )
-                                .await;
-                        }
-                    };
-                let author_did_parsed =
-                    match jacquard_common::types::did::Did::new_owned(author_did) {
-                        Ok(d) => d,
-                        Err(_) => {
-                            return self
-                                .full_recovery(
-                                    space_uri,
-                                    author_did,
-                                    &repo_service_endpoint,
-                                    &cred.token,
-                                    &cred.signing_key,
-                                    &author_signing_key,
-                                    &policy,
-                                    expected_authority_hash,
-                                    expected_authority_rev,
-                                )
-                                .await;
-                        }
-                    };
-
-                let context = CommitContext {
-                    space: space_uri_parsed,
-                    author: author_did_parsed,
-                    rev: commit.rev.clone(),
-                };
-                let policy_ver_res = verify_commit(commit, &context, &author_signing_key);
-
-                if policy_ver_res.is_ok() {
-                    let hash_ok = match expected_authority_hash {
-                        Some(expected_hash) => commit.hash.as_ref() == expected_hash,
-                        None => true,
-                    };
-                    let rev_ok = match expected_authority_rev {
-                        Some(expected_rev) => commit.rev.as_str() == expected_rev,
-                        None => true,
-                    };
-                    hash_ok && rev_ok
-                } else {
-                    false
-                }
-            }
+            commit.data.as_ref() == lthash.digest().as_slice()
+                && commit.space.as_str() == space_uri
+                && commit.repo.as_str() == author_did
+                && expected_authority_hash.is_none_or(|data| commit.data.as_ref() == data)
+                && expected_authority_rev.is_none_or(|rev| commit.rev.as_str() == rev)
         } else {
             false
         };
+
         if !commit_verified {
             return self
                 .full_recovery(
@@ -630,7 +576,6 @@ impl SyncEngine {
                     &repo_service_endpoint,
                     &cred.token,
                     &cred.signing_key,
-                    &author_signing_key,
                     &policy,
                     expected_authority_hash,
                     expected_authority_rev,
@@ -1023,6 +968,17 @@ impl SyncEngine {
                 "Author membership was revoked during projection transaction".into(),
             ));
         }
+        let identities = vec![author_did.to_owned(), extract_authority_did(space_uri)?];
+        let account_states: Vec<(bool,)> =
+            sqlx::query_as("SELECT active FROM circle_account_status WHERE did=ANY($1) FOR SHARE")
+                .bind(identities)
+                .fetch_all(&mut *tx)
+                .await?;
+        if account_states.iter().any(|(active,)| !active) {
+            return Err(AppError::Forbidden(
+                "Account became unavailable during synchronization".into(),
+            ));
+        }
         tx.commit().await?;
 
         // Dispatch generic push notifications to distinct recipients after commit
@@ -1032,7 +988,10 @@ impl SyncEngine {
                     r#"
                     SELECT m.member_did FROM circle_member_cache m
                     JOIN circles c ON c.space_uri = m.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
+                    JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri AND meta.access_epoch = c.access_epoch AND meta.app_access_granted = true
                     WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_read = true
+                      AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
+                      AND NOT EXISTS (SELECT 1 FROM circle_account_status a WHERE a.did IN (m.member_did, c.authority_did) AND NOT a.active)
                     "#,
                 )
                 .bind(space_uri)
@@ -1068,7 +1027,6 @@ impl SyncEngine {
         service_endpoint: &str,
         space_credential: &str,
         credential_key: &p256::ecdsa::SigningKey,
-        author_signing_key: &crate::auth::ParsedVerifyingKey,
         policy: &ValidationPolicy,
         expected_authority_hash: Option<&[u8]>,
         expected_authority_rev: Option<&str>,
@@ -1081,7 +1039,7 @@ impl SyncEngine {
         .fetch_optional(&self.db)
         .await?;
 
-        let car_bytes = match self
+        let star_bytes = match self
             .space_client
             .get_repo(
                 service_endpoint,
@@ -1105,15 +1063,10 @@ impl SyncEngine {
                 return Err(e);
             }
         };
-        self.record_bytes_processed(car_bytes.len());
+        self.record_bytes_processed(star_bytes.len());
 
-        let car = parse_permissioned_car(&car_bytes)
-            .await
-            .map_err(|e| AppError::Internal(format!("CAR decoding failed: {e}")))?;
-
-        let (commit, records, lthash) =
-            extract_and_validate_car(&car, space_uri, author_did, author_signing_key)
-                .map_err(|e| AppError::InvalidRequest(format!("CAR validation failed: {e}")))?;
+        let snapshot = crate::space_star::parse_repo_star(&star_bytes, space_uri, author_did)?;
+        let (commit, records, lthash) = (snapshot.commit, snapshot.records, snapshot.lthash);
         let latest_rev = commit.rev.to_string();
         if let Some((prev_rev, prev_hash)) = &existing_sync {
             let prev_hash_matches = prev_hash == lthash.state().as_slice()
@@ -1128,16 +1081,16 @@ impl SyncEngine {
         }
         // Verify against expected authority hash and rev if provided
         if let Some(expected_hash) = expected_authority_hash {
-            if commit.hash.as_ref() != expected_hash {
+            if commit.data.as_ref() != expected_hash {
                 return Err(AppError::InvalidRequest(
-                    "CAR commit hash does not match expected authority hash".into(),
+                    "STAR commit hash does not match expected authority hash".into(),
                 ));
             }
         }
         if let Some(expected_rev) = expected_authority_rev {
             if commit.rev.as_str() != expected_rev {
                 return Err(AppError::InvalidRequest(
-                    "CAR commit revision does not match expected authority revision".into(),
+                    "STAR commit revision does not match expected authority revision".into(),
                 ));
             }
         }
@@ -1558,6 +1511,17 @@ impl SyncEngine {
                 ));
             }
         }
+        let identities = vec![author_did.to_owned(), extract_authority_did(space_uri)?];
+        let account_states: Vec<(bool,)> =
+            sqlx::query_as("SELECT active FROM circle_account_status WHERE did=ANY($1) FOR SHARE")
+                .bind(identities)
+                .fetch_all(&mut *tx)
+                .await?;
+        if account_states.iter().any(|(active,)| !active) {
+            return Err(AppError::Forbidden(
+                "Account became unavailable during synchronization".into(),
+            ));
+        }
         tx.commit().await?;
 
         // Dispatch generic push notifications to distinct recipients after commit
@@ -1567,7 +1531,10 @@ impl SyncEngine {
                     r#"
                     SELECT m.member_did FROM circle_member_cache m
                     JOIN circles c ON c.space_uri = m.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
+                    JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri AND meta.access_epoch = c.access_epoch AND meta.app_access_granted = true
                     WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_read = true
+                      AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
+                      AND NOT EXISTS (SELECT 1 FROM circle_account_status a WHERE a.did IN (m.member_did, c.authority_did) AND NOT a.active)
                     "#,
                 )
                 .bind(space_uri)
@@ -1592,7 +1559,7 @@ impl SyncEngine {
             records_accepted,
             records_rejected,
             latest_rev,
-            bytes_processed: car_bytes.len(),
+            bytes_processed: star_bytes.len(),
         })
     }
 }
@@ -1799,7 +1766,7 @@ pub async fn sweep_once_with_shutdown(
                 let needs_sync = match db_sync {
                     Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
                         let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                        last_rev != repo.repo_rev.as_str() || &digest[..] != repo.hash.as_ref()
+                        last_rev != repo.repo_rev.as_str() || &digest[..] != repo.data.as_ref()
                     }
                     _ => true,
                 };
@@ -1809,7 +1776,7 @@ pub async fn sweep_once_with_shutdown(
                         .sync_repo_with_expected_commit(
                             &space_uri,
                             repo_did,
-                            Some(repo.hash.as_ref()),
+                            Some(repo.data.as_ref()),
                             Some(repo.repo_rev.as_str()),
                         )
                         .await
@@ -1968,14 +1935,14 @@ pub async fn notify_write_handler(
     )
     .await?;
 
-    // { space, repo, repoRev, hash, spaceRev, prevSpaceRev? }
+    // { space, repo, repoRev, data, spaceRev, prevSpaceRev? }
     let input: catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite =
         serde_json::from_slice(&body)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid notifyWrite body: {e}")))?;
 
-    if input.hash.len() != 32 {
+    if input.data.len() != 32 {
         return Err(AppError::InvalidRequest(
-            "Hash must be exactly 32 bytes".into(),
+            "Data must be exactly 32 bytes".into(),
         ));
     }
     if input.repo_rev.as_str().is_empty() {
@@ -2034,7 +2001,7 @@ pub async fn notify_write_handler(
             let space = input.space.as_str().to_string();
             let repo = input.repo.as_str().to_string();
             let rev = input.repo_rev.as_str().to_string();
-            let hash = input.hash.to_vec();
+            let hash = input.data.to_vec();
             tokio::spawn(async move {
                 let _permit = permit;
                 let res = SyncEngine::new(&state)

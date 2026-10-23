@@ -1,16 +1,15 @@
-//! Permissioned repository commit and CAR verification primitives.
+//! LtHash/CID primitives and historical signed-commit/CAR regression helpers.
 //!
-//! Implements upstream `com.atproto.space` v1 commit and CAR verification across
-//! Ed25519, P-256, and Secp256k1 curves. v1 is the only commit format: the
-//! Catbird-only v2 "authenticated transition" fork was retired with the
-//! catbird-atproto regeneration to the upstream space defs (CIRCLES-01).
+//! Production Space synchronization uses `space_mac` and `space_star` for the
+//! October 22, 2026 wire protocol. These legacy signing/CAR routines are retained
+//! for historical-format regression coverage; they do not authenticate current reads.
 
 use bytes::Bytes;
 use cid::Cid as IpldCid;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-pub use catbird_atproto::generated::com_atproto::space::SignedCommit;
+pub use jacquard_repo::permissioned::SignedCommit;
 // The pinned jacquard-repo also carries the superseded Spaces DPoP binding
 // (`verify_dpop`, `DpopProof`, `CnfJkt`, `CredentialClaims`); it is not
 // re-exported. Space credentials are HTTP-signature bound, see

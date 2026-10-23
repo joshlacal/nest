@@ -416,3 +416,58 @@ pub async fn deactivate_author(pool: &PgPool, author: &str) -> Result<(), PurgeE
     tx.commit().await?;
     Ok(())
 }
+
+/// Confirmed account deletion removes private author payloads. This is never
+/// called for suspension/deactivation hints. The account ledger gates reads
+/// before this resumable, bounded cleanup begins.
+pub async fn purge_deleted_author(pool: &PgPool, author: &str) -> Result<(), PurgeError> {
+    const BATCH: i64 = 500;
+    loop {
+        let mut tx = pool.begin().await?;
+        let uris: Vec<String> = sqlx::query_scalar(
+            "SELECT uri FROM circle_records WHERE author_did=$1 ORDER BY uri LIMIT $2 FOR UPDATE",
+        )
+        .bind(author)
+        .bind(BATCH)
+        .fetch_all(&mut *tx)
+        .await?;
+        if uris.is_empty() {
+            break;
+        }
+        sqlx::query(
+            "DELETE FROM circle_notifications WHERE subject_uri=ANY($1) OR source_uri=ANY($1)",
+        )
+        .bind(&uris)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM circle_reports WHERE subject_uri=ANY($1)")
+            .bind(&uris)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM circle_records WHERE uri=ANY($1)")
+            .bind(&uris)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+    for (table, predicate) in [
+        ("circle_notifications", "actor_did=$1 OR recipient_did=$1"),
+        ("circle_reports", "reporter_did=$1"),
+        ("circle_preferences", "member_did=$1"),
+        ("circle_repo_sync_state", "author_did=$1"),
+        ("circle_member_cache", "member_did=$1"),
+        ("oauth_sessions", "user_did=$1"),
+    ] {
+        loop {
+            // Table/predicate strings are fixed literals above, not user input.
+            let deleted = sqlx::query(&format!(
+                "DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE {predicate} LIMIT $2)"
+            ))
+            .bind(author).bind(BATCH).execute(pool).await?.rows_affected();
+            if deleted < BATCH as u64 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}

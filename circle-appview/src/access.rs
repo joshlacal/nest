@@ -387,16 +387,8 @@ pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
 /// Resolve a Space authority's space-host endpoint, and the service identifier
 /// that addresses it as an audience.
 ///
-/// The returned identifier is always the fully-qualified
-/// `{authority_did}#atproto_space_host`. Per the permissioned-data proposal, that
-/// is the `aud` of both a delegation token and a client attestation, and it names
-/// the space-host *role* rather than whichever DID document entry the endpoint was
-/// resolved from. `#atproto_space_host` and `#atproto_space` are both optional: an
-/// authority that omits them falls back to `#atproto_pds` and `#atproto` for the
-/// endpoint and key, but the audience does not change with that fallback. Returning
-/// the matched `service.id` here instead sent the bare relative fragment
-/// `"#atproto_pds"` as an audience, which the live PDS rejected with
-/// `InvalidClientAttestation`.
+/// Authority hosting and delegation/attestation audiences use the declared PDS.
+/// The audience is always the fully qualified `{authority_did}#atproto_pds`.
 pub fn resolve_space_host_endpoint(
     doc: &DidDocument,
     authority_did: &str,
@@ -405,28 +397,8 @@ pub fn resolve_space_host_endpoint(
         return Err(AppError::Unauthorized(AuthReason::IdMismatch));
     }
 
-    let space_host_service = format!("{authority_did}#atproto_space_host");
-
-    for service in &doc.service {
-        if service.r#type == "AtprotoSpaceHost"
-            && (service.id == "#atproto_space_host" || service.id == space_host_service)
-        {
-            return Ok((service.service_endpoint.clone(), space_host_service));
-        }
-    }
-
-    let expected_atproto_pds = format!("{authority_did}#atproto_pds");
-    for service in &doc.service {
-        if service.r#type == "AtprotoPersonalDataServer"
-            && (service.id == "#atproto_pds" || service.id == expected_atproto_pds)
-        {
-            return Ok((service.service_endpoint.clone(), space_host_service));
-        }
-    }
-    Err(AppError::NotFound(
-        "Authority DID document does not declare an #atproto_space_host or #atproto_pds service"
-            .into(),
-    ))
+    resolve_pds_endpoint(doc, authority_did)
+        .map(|(endpoint, _)| (endpoint, format!("{authority_did}#atproto_pds")))
 }
 
 pub fn resolve_pds_endpoint(
@@ -487,6 +459,9 @@ pub fn parse_and_validate_delegation_token(
     let header: JwtHeader = serde_json::from_slice(&header_bytes)
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidHeaderJson))?;
 
+    if header.kid.as_deref() != Some("#atproto") {
+        return Err(AppError::Unauthorized(AuthReason::InvalidKid));
+    }
     if header.typ.as_deref() != Some("atproto-delegation-token+jwt") {
         return Err(AppError::Unauthorized(AuthReason::InvalidTyp));
     }
@@ -550,6 +525,29 @@ pub enum MemberAccessOutcome {
     IndeterminateDenied,
 }
 
+/// Accounts first seen after relay bootstrap must be confirmed at their current PDS.
+/// The optional relay is absent only in direct unit fixtures; HTTP routes require it.
+pub async fn ensure_active_account(state: &AppState, did: &str) -> Result<(), AppError> {
+    if let Some(relay) = &state.config.identity_relay_url {
+        if !crate::identity_events::is_healthy(&state.db, relay.as_str()).await? {
+            return Err(AppError::UnsupportedPds(
+                "Account lifecycle synchronization is not ready".into(),
+            ));
+        }
+        let known: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM circle_account_status WHERE did=$1)")
+                .bind(did)
+                .fetch_one(&state.db)
+                .await?;
+        if !known {
+            crate::identity_events::refresh_account(state, did, relay.as_str(), 0)
+                .await
+                .map_err(|_| AppError::Forbidden("Account status is not confirmed".into()))?;
+        }
+    }
+    crate::identity_events::require_active_account(&state.db, did).await
+}
+
 /// Verify service-auth subject is in the cached member list for the target Circle,
 /// revalidating against the owner's PDS on cache miss, stale cache, or cached denial.
 /// Returns explicit MemberAccessOutcome to distinguish authorized, removed, and indeterminate outcomes.
@@ -583,10 +581,10 @@ pub async fn verify_member_access(
         ));
     }
 
-    if user_did == authority_did {
-        return Ok(MemberAccessOutcome::Authorized);
-    }
-    // 2. Check cache freshness and matching access epoch metadata (TTL: 300 seconds)
+    ensure_active_account(state, user_did).await?;
+    ensure_active_account(state, &authority_did).await?;
+    let is_authority = user_did == authority_did;
+    // 2. Check cache freshness and matching access epoch metadata (TTL: 30 seconds)
     let cache_meta: Option<(DateTime<Utc>, i32, i64, bool)> = sqlx::query_as(
         "SELECT last_refreshed_at, member_count, access_epoch, app_access_granted FROM circle_member_cache_meta WHERE space_uri = $1",
     )
@@ -602,10 +600,13 @@ pub async fn verify_member_access(
             .is_some_and(|(refreshed_at, _, meta_epoch, meta_app_access)| {
                 *meta_app_access
                     && *meta_epoch == circle_epoch
-                    && now.signed_duration_since(*refreshed_at).num_seconds() < 300
+                    && now.signed_duration_since(*refreshed_at).num_seconds() < 30
             });
 
     if is_fresh {
+        if is_authority {
+            return Ok(MemberAccessOutcome::Authorized);
+        }
         let is_cached: Option<(String,)> = sqlx::query_as(
             "SELECT member_did FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_read = true",
         )
@@ -623,7 +624,7 @@ pub async fn verify_member_access(
     // Refresh member cache from owner's PDS
     match refresh_member_cache(state, space_uri).await {
         Ok(members) => {
-            if members.iter().any(|m| m == user_did) {
+            if is_authority || members.iter().any(|m| m == user_did) {
                 Ok(MemberAccessOutcome::Authorized)
             } else {
                 Ok(MemberAccessOutcome::DeniedNotMember)
@@ -655,7 +656,7 @@ pub async fn check_member_access(
     }
 }
 
-/// Revalidates any candidate spaces for a user where the member cache is stale (> 300s).
+/// Revalidates any candidate spaces for a user where the member cache is stale (> 30s).
 /// For each stale space, attempts to refresh the member cache from the owner's PDS.
 /// Unreadable spaces remain stale and thus excluded by the freshness gate (fail-closed).
 pub async fn revalidate_stale_member_spaces(
@@ -670,7 +671,7 @@ pub async fn revalidate_stale_member_spaces(
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         WHERE c.deleted_at IS NULL
           AND (c.authority_did = $1 OR m.member_did IS NOT NULL)
-          AND (meta.last_refreshed_at IS NULL OR meta.last_refreshed_at <= now() - INTERVAL '300 seconds')
+          AND (meta.last_refreshed_at IS NULL OR meta.last_refreshed_at <= now() - INTERVAL '30 seconds')
         "#,
     )
     .bind(user_did)
@@ -900,6 +901,21 @@ pub async fn activate_circle(
 ) -> Result<CircleSummary, AppError> {
     let authority_did = extract_authority_did(space_uri)?;
 
+    ensure_active_account(state, user_did).await?;
+    ensure_active_account(state, &authority_did).await?;
+    let retired: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circles WHERE space_uri=$1 AND deleted_at IS NOT NULL)",
+    )
+    .bind(space_uri)
+    .fetch_one(&state.db)
+    .await?;
+    if retired {
+        // Deliberate adoption cannot reuse a retired credential or projection.
+        crate::purge::delete_space(&state.db, &state.credential_store, space_uri)
+            .await
+            .map_err(|e| AppError::Internal(format!("Unable to reset retired Circle: {e}")))?;
+    }
+
     // 1. Independent verification via get_space on the owner's PDS
     let space_config = state.space_client.get_space(space_uri).await.map_err(|e| {
         tracing::warn!(error = %e, "get_space failed on PDS");
@@ -966,10 +982,6 @@ pub async fn activate_circle(
             )),
         })?;
     let (repo_service_endpoint, _) = resolve_pds_endpoint(&authority_doc, &authority_did)?;
-    let author_vm = select_verification_method(&authority_doc, &authority_did, None)
-        .map_err(AppError::Unauthorized)?;
-    let author_signing_key = parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
-
     let car_bytes = match state
         .space_client
         .get_repo(
@@ -992,19 +1004,8 @@ pub async fn activate_circle(
         }
     };
 
-    let car = crate::commit::parse_permissioned_car(&car_bytes)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, space_uri = %space_uri, "CAR decoding failed during activation");
-            AppError::Internal(format!("Could not read the Space: CAR decoding failed ({e})"))
-        })?;
-
-    let (_commit, records, _lthash) =
-        crate::commit::extract_and_validate_car(&car, space_uri, &authority_did, &author_signing_key)
-    .map_err(|e| {
-        tracing::warn!(error = %e, space_uri = %space_uri, "CAR validation failed during activation");
-        AppError::Internal(format!("Could not read the Space: CAR validation failed ({e})"))
-    })?;
+    let snapshot = crate::space_star::parse_repo_star(&car_bytes, space_uri, &authority_did)?;
+    let records = snapshot.records;
 
     let meta_records: Vec<_> = records
         .into_iter()
@@ -1344,14 +1345,10 @@ mod tests {
     const TEST_SPACE_HOST: &str = "https://space-host.example.com";
     const TEST_USER_PDS: &str = "https://pds.alice.example.com";
 
-    /// The `aud` of a client attestation and of a delegation token is the
-    /// space-host *role* identifier, always fully qualified, even when the
-    /// endpoint was resolved from the `#atproto_pds` fallback. Returning the
-    /// matched service's own relative id here sent `"#atproto_pds"` as an
-    /// audience and the live PDS answered `InvalidClientAttestation`.
+    /// October 22 authority hosting and audience use the account PDS.
     #[test]
-    fn space_host_audience_is_always_the_qualified_space_host_service() {
-        let declared = DidDocument {
+    fn authority_host_and_audience_require_the_qualified_pds_service() {
+        let legacy = DidDocument {
             id: TEST_AUTHORITY_DID.into(),
             verification_method: vec![],
             service: vec![DidService {
@@ -1360,30 +1357,25 @@ mod tests {
                 service_endpoint: TEST_SPACE_HOST.into(),
             }],
         };
-        let (endpoint, service) =
-            resolve_space_host_endpoint(&declared, TEST_AUTHORITY_DID).unwrap();
-        assert_eq!(endpoint, TEST_SPACE_HOST);
-        assert_eq!(service, format!("{TEST_AUTHORITY_DID}#atproto_space_host"));
-
-        // An authority that declares no space host falls back to its PDS for the
-        // endpoint, but the audience must not fall back with it.
-        let fallback = DidDocument {
-            id: TEST_AUTHORITY_DID.into(),
-            verification_method: vec![],
-            service: vec![DidService {
-                id: "#atproto_pds".into(),
-                r#type: "AtprotoPersonalDataServer".into(),
-                service_endpoint: TEST_USER_PDS.into(),
-            }],
-        };
-        let (endpoint, service) =
-            resolve_space_host_endpoint(&fallback, TEST_AUTHORITY_DID).unwrap();
-        assert_eq!(endpoint, TEST_USER_PDS);
-        assert_eq!(service, format!("{TEST_AUTHORITY_DID}#atproto_space_host"));
-        assert!(
-            !service.starts_with('#'),
-            "audience must be fully qualified"
-        );
+        assert!(resolve_space_host_endpoint(&legacy, TEST_AUTHORITY_DID).is_err());
+        for id in [
+            "#atproto_pds".to_string(),
+            format!("{TEST_AUTHORITY_DID}#atproto_pds"),
+        ] {
+            let doc = DidDocument {
+                id: TEST_AUTHORITY_DID.into(),
+                verification_method: vec![],
+                service: vec![DidService {
+                    id,
+                    r#type: "AtprotoPersonalDataServer".into(),
+                    service_endpoint: TEST_SPACE_HOST.into(),
+                }],
+            };
+            let (endpoint, service) =
+                resolve_space_host_endpoint(&doc, TEST_AUTHORITY_DID).unwrap();
+            assert_eq!(endpoint, TEST_SPACE_HOST);
+            assert_eq!(service, format!("{TEST_AUTHORITY_DID}#atproto_pds"));
+        }
     }
 
     fn credential(token: &str, expires_in: chrono::Duration) -> ActiveSpaceCredential {
@@ -1544,8 +1536,8 @@ mod tests {
             TEST_AUTHORITY_DID,
             &auth_key,
             vec![DidService {
-                id: "#atproto_space_host".into(),
-                r#type: "AtprotoSpaceHost".into(),
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
                 service_endpoint: TEST_SPACE_HOST.into(),
             }],
         );
@@ -1604,7 +1596,7 @@ mod tests {
 
         let cred_calls = mock_transport.recorded_calls();
         assert_eq!(cred_calls.len(), 1);
-        assert_eq!(cred_calls[0].space_uri, TEST_SPACE_URI);
+        assert_eq!(cred_calls[0].request.space, TEST_SPACE_URI);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1680,8 +1672,8 @@ mod tests {
             TEST_AUTHORITY_DID,
             &auth_key,
             vec![DidService {
-                id: "#atproto_space_host".into(),
-                r#type: "AtprotoSpaceHost".into(),
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
                 service_endpoint: TEST_SPACE_HOST.into(),
             }],
         );
@@ -1913,8 +1905,8 @@ mod tests {
             TEST_AUTHORITY_DID,
             &auth_key,
             vec![DidService {
-                id: "#atproto_space_host".into(),
-                r#type: "AtprotoSpaceHost".into(),
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
                 service_endpoint: TEST_SPACE_HOST.into(),
             }],
         );
@@ -1946,6 +1938,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             host: "127.0.0.1".into(),
             port: 3002,
+            identity_relay_url: None,
             database_url: "postgres://localhost/postgres".into(),
             service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
             plc_directory_url: "https://plc.directory".into(),
@@ -2029,8 +2022,8 @@ mod tests {
             TEST_AUTHORITY_DID,
             &p256::ecdsa::SigningKey::random(&mut OsRng),
             vec![DidService {
-                id: "#atproto_space_host".into(),
-                r#type: "AtprotoSpaceHost".into(),
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
                 service_endpoint: TEST_SPACE_HOST.into(),
             }],
         );
@@ -2056,6 +2049,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             host: "127.0.0.1".into(),
             port: 3002,
+            identity_relay_url: None,
             database_url: "postgres://localhost/postgres".into(),
             service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
             plc_directory_url: "https://plc.directory".into(),
@@ -2182,8 +2176,8 @@ mod tests {
             TEST_AUTHORITY_DID,
             &auth_key,
             vec![DidService {
-                id: "#atproto_space_host".into(),
-                r#type: "AtprotoSpaceHost".into(),
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
                 service_endpoint: TEST_SPACE_HOST.into(),
             }],
         );
@@ -2321,7 +2315,8 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn test_activate_circle_success_creates_circle_and_synced_records(pool: PgPool) {
         setup_test_key();
-        use crate::commit::{mint_repo_car, mint_signed_commit, LtHash, RepoRecord};
+        use crate::commit::{LtHash, RepoRecord};
+        use crate::test_support::{fixture_commit, fixture_star};
 
         let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
 
@@ -2447,15 +2442,14 @@ mod tests {
             rec_post.collection, rec_post.rkey, rec_post.cid
         ));
 
-        let commit = mint_signed_commit(
+        let commit = fixture_commit(
             TEST_SPACE_URI,
             TEST_AUTHORITY_DID,
             "3l7rev234567a",
             &lthash.state(),
-            &auth_key,
         );
 
-        let car_bytes = mint_repo_car(&commit, &[rec_meta, rec_post]).unwrap();
+        let car_bytes = fixture_star(&commit, &[rec_meta, rec_post]).unwrap();
         let key = format!("{TEST_SPACE_URI}:{TEST_AUTHORITY_DID}");
         mock_transport.set_get_repo_response(&key, car_bytes.clone());
         mock_transport.set_get_repo_response(TEST_SPACE_URI, car_bytes);
@@ -2463,6 +2457,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             host: "127.0.0.1".into(),
             port: 3002,
+            identity_relay_url: None,
             database_url: "postgres://localhost/postgres".into(),
             service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
             plc_directory_url: "https://plc.directory".into(),
@@ -2557,7 +2552,7 @@ mod tests {
         .unwrap();
         let (service, endpoint) = registration.expect("activation must register for notifications");
         assert_eq!(service, state.config.notify_service_identifier());
-        assert_eq!(endpoint, TEST_SPACE_HOST);
+        assert_eq!(endpoint, pds_endpoint);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2565,7 +2560,8 @@ mod tests {
         pool: PgPool,
     ) {
         setup_test_key();
-        use crate::commit::{mint_repo_car, mint_signed_commit, LtHash, RepoRecord};
+        use crate::commit::{LtHash, RepoRecord};
+        use crate::test_support::{fixture_commit, fixture_star};
 
         let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
 
@@ -2675,15 +2671,14 @@ mod tests {
             rec_post.collection, rec_post.rkey, rec_post.cid
         ));
 
-        let commit = mint_signed_commit(
+        let commit = fixture_commit(
             TEST_SPACE_URI,
             TEST_AUTHORITY_DID,
             "3l7rev234567a",
             &lthash.state(),
-            &auth_key,
         );
 
-        let car_bytes = mint_repo_car(&commit, &[rec_post]).unwrap();
+        let car_bytes = fixture_star(&commit, &[rec_post]).unwrap();
         let key = format!("{TEST_SPACE_URI}:{TEST_AUTHORITY_DID}");
         mock_transport.set_get_repo_response(&key, car_bytes.clone());
         mock_transport.set_get_repo_response(TEST_SPACE_URI, car_bytes);
@@ -2691,6 +2686,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             host: "127.0.0.1".into(),
             port: 3002,
+            identity_relay_url: None,
             database_url: "postgres://localhost/postgres".into(),
             service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
             plc_directory_url: "https://plc.directory".into(),

@@ -195,12 +195,25 @@ pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, Au
 
 pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifyingKey, AuthReason> {
     if let Some(multibase_str) = &vm.public_key_multibase {
-        if vm.r#type != "Multikey" {
-            return Err(AuthReason::InvalidKeyType);
-        }
-
         let (_base, decoded) =
             multibase::decode(multibase_str).map_err(|_| AuthReason::InvalidMultikey)?;
+
+        // PLC's established verification suites carry raw SEC1 bytes; Multikey
+        // carries a multicodec prefix. Both are emitted/accepted by atproto.
+        match vm.r#type.as_str() {
+            "EcdsaSecp256r1VerificationKey2019" => {
+                return p256::ecdsa::VerifyingKey::from_sec1_bytes(&decoded)
+                    .map(ParsedVerifyingKey::P256)
+                    .map_err(|_| AuthReason::InvalidCoordinates);
+            }
+            "EcdsaSecp256k1VerificationKey2019" => {
+                return k256::ecdsa::VerifyingKey::from_sec1_bytes(&decoded)
+                    .map(ParsedVerifyingKey::Secp256k1)
+                    .map_err(|_| AuthReason::InvalidCoordinates);
+            }
+            "Multikey" => {}
+            _ => return Err(AuthReason::InvalidKeyType),
+        }
 
         // Ed25519 multicodec prefix: 0xed -> varint [0xed, 0x01]
         if decoded.starts_with(&[0xed, 0x01]) {
@@ -638,6 +651,16 @@ impl DidResolver {
         self.resolve_internal(did, true).await
     }
 
+    /// Trusted lifecycle reconciliation bypasses the untrusted JWT refresh cooldown.
+    /// Still bounded by the shared resolver semaphore and pinned public transport.
+    pub async fn resolve_identity_event(&self, did: &str) -> Result<DidDocument, AuthReason> {
+        let _permit = public_flow_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthReason::DidResolutionFailed)?;
+        self.resolve_internal(did, true).await
+    }
+
     async fn resolve_internal(
         &self,
         did: &str,
@@ -878,11 +901,8 @@ pub const SERVICE_JWT_IAT_SKEW_SECS: i64 = 30;
 
 /// Select a space authority's credential-signing key.
 ///
-/// With a `kid`, the key it names is used, as upstream `resolveSpaceKey` does:
-/// `#atproto`, `#atproto_space`, their bare forms, or `{did}#...`; anything else
-/// is `InvalidKid`. An authority that publishes `#atproto_space` may still sign
-/// with `#atproto` (the reference PDS does). Without a `kid`, `#atproto_space`
-/// is preferred over `#atproto`.
+/// October 22 credentials require the JWT kid to be exactly `#atproto`.
+/// The DID document method may use its absolute or relative identifier.
 pub fn select_authority_verification_method<'a>(
     doc: &'a DidDocument,
     authority_did: &str,
@@ -896,31 +916,19 @@ pub fn select_authority_verification_method<'a>(
         return Err(AuthReason::NoVerificationMethod);
     }
 
-    let find = |name: &str| {
-        let full = format!("{authority_did}#{name}");
-        let relative = format!("#{name}");
-        doc.verification_method
-            .iter()
-            .find(|vm| (vm.id == relative || vm.id == full) && vm.controller == authority_did)
-    };
-
-    if let Some(kid) = kid {
-        let fragment = match kid.strip_prefix(authority_did) {
-            Some(rest) if rest.starts_with('#') => rest,
-            Some(_) => return Err(AuthReason::InvalidKid),
-            None if kid.starts_with("did:") => return Err(AuthReason::InvalidKid),
-            None => kid,
-        };
-        let name = fragment.strip_prefix('#').unwrap_or(fragment);
-        if name != "atproto" && name != "atproto_space" {
-            return Err(AuthReason::InvalidKid);
-        }
-        return find(name).ok_or(AuthReason::NoVerificationMethod);
+    if kid != Some("#atproto") {
+        return Err(AuthReason::InvalidKid);
     }
-
-    find("atproto_space")
-        .or_else(|| find("atproto"))
-        .ok_or(AuthReason::NoVerificationMethod)
+    let full = format!("{authority_did}#atproto");
+    let mut matches = doc
+        .verification_method
+        .iter()
+        .filter(|vm| vm.id == "#atproto" || vm.id == full);
+    let method = matches.next().ok_or(AuthReason::NoVerificationMethod)?;
+    if matches.next().is_some() || method.controller != authority_did {
+        return Err(AuthReason::InvalidKid);
+    }
+    Ok(method)
 }
 
 pub async fn verify_service_jwt(

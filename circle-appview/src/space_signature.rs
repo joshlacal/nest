@@ -1,19 +1,19 @@
-//! atproto Spaces HTTP message signatures (RFC 9421), October 1, 2026 alpha.
+//! atproto Spaces HTTP message signatures (RFC 9421), October 22, 2026 alpha.
 //!
 //! These replace the Spaces DPoP binding (atproto#5569). Ordinary AT Protocol
 //! OAuth DPoP in [`crate::oauth`] is a separate mechanism and is unchanged.
 //!
 //! A credential client holds one fresh P-256 key per space credential:
 //!
-//! - The exchange (`com.atproto.space.getSpaceCredential`) signs only
-//!   `authorization` and names the key as a `did:key` in `keyid`. The authority
-//!   binds the issued credential to that key as `cnf.kid`.
+//! - The body-only exchange sends `credentialKid`; the authority binds the
+//!   issued credential to that key as `cnf.kid`. No HTTP signature is sent.
+//!   See [`crate::space_client::SpaceCredentialRequest`].
 //! - Every use of the credential signs `authorization` and
 //!   `atproto-space-audience`, in that order, with the same key. The audience is
 //!   the repo owner's DID for repo reads and the space authority's bare DID for
 //!   space-host operations.
 //!
-//! Mirrors `packages/space/src/http-signature.ts` at atproto 679724ad.
+//! Mirrors `packages/space/src/http-signature.ts` at atproto ac0c9f15392f6f0298d71dc52aa88c05036150be.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -21,22 +21,22 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 
 /// The signature label in `Signature-Input` and `Signature`.
-pub const SIGNATURE_LABEL: &str = "atproto-space";
+pub const SIGNATURE_LABEL: &str = "atproto-space-credential";
 /// Header naming the DID a space credential is being presented to.
 pub const AUDIENCE_HEADER: &str = "atproto-space-audience";
 /// Authorization scheme for a space credential.
-pub const CREDENTIAL_AUTH_SCHEME: &str = "Atproto-Space";
+pub const CREDENTIAL_AUTH_SCHEME: &str = "Atproto-Space-Credential";
 
 /// Multicodec `p256-pub` (0x1200) as an unsigned varint.
 const P256_PUB_MULTICODEC: [u8; 2] = [0x80, 0x24];
 
-const EXCHANGE_COMPONENTS: &str = r#"("authorization")"#;
-const CREDENTIAL_COMPONENTS: &str = r#"("authorization" "atproto-space-audience")"#;
+const CREDENTIAL_COMPONENTS: &str =
+    r#"("authorization" "atproto-space-audience");tag="atproto-space-credential""#;
 
 /// The authenticating headers of one Spaces request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceAuthHeaders {
-    /// `Bearer <delegation token>` or `Atproto-Space <space credential>`.
+    /// `Atproto-Space-Credential <space credential>`.
     pub authorization: String,
     /// `Atproto-Space-Audience`, present only when a credential is used.
     pub audience: Option<String>,
@@ -44,6 +44,7 @@ pub struct SpaceAuthHeaders {
     pub signature_input: String,
     /// Full `Signature` field value, label included.
     pub signature: String,
+    pub mac: Option<crate::space_mac::MacRequest>,
 }
 
 impl SpaceAuthHeaders {
@@ -55,6 +56,13 @@ impl SpaceAuthHeaders {
         let mut fields = vec![(AUTHORIZATION, self.authorization.as_str())];
         if let Some(audience) = &self.audience {
             fields.push((HeaderName::from_static(AUDIENCE_HEADER), audience.as_str()));
+        }
+        let mac_header = self.mac.as_ref().map(crate::space_mac::MacRequest::header);
+        if let Some(value) = &mac_header {
+            fields.push((
+                HeaderName::from_static(crate::space_mac::WANT_MAC_HEADER),
+                value.as_str(),
+            ));
         }
         fields.push((
             HeaderName::from_static("signature-input"),
@@ -99,14 +107,6 @@ pub fn p256_did_key(key: &VerifyingKey) -> String {
     )
 }
 
-/// Headers for `com.atproto.space.getSpaceCredential`: the delegation token,
-/// signed with the key the credential will be bound to.
-pub fn exchange_headers(key: &SigningKey, delegation_token: &str) -> SpaceAuthHeaders {
-    let key_id = p256_did_key(key.verifying_key());
-    let params = format!("{EXCHANGE_COMPONENTS};keyid={}", sf_string(&key_id));
-    sign(key, format!("Bearer {delegation_token}"), None, params)
-}
-
 /// Headers for a request authenticated with a space credential, addressed to
 /// `audience`.
 pub fn credential_headers(key: &SigningKey, credential: &str, audience: &str) -> SpaceAuthHeaders {
@@ -125,9 +125,9 @@ pub fn signature_base(
     audience: Option<&str>,
     signature_params: &str,
 ) -> String {
-    let mut lines = vec![format!("\"authorization\": {}", authorization.trim())];
+    let mut lines = vec![format!("\"authorization\": {}", authorization)];
     if let Some(audience) = audience {
-        lines.push(format!("\"{AUDIENCE_HEADER}\": {}", audience.trim()));
+        lines.push(format!("\"{AUDIENCE_HEADER}\": {}", audience));
     }
     lines.push(format!("\"@signature-params\": {signature_params}"));
     lines.join("\n")
@@ -144,6 +144,7 @@ fn sign(
     // Verifiers accept either S; emit low-S as the reference signer does.
     let signature = signature.normalize_s().unwrap_or(signature);
     SpaceAuthHeaders {
+        mac: None,
         authorization,
         audience,
         signature_input: format!("{SIGNATURE_LABEL}={signature_params}"),
@@ -152,20 +153,6 @@ fn sign(
             STANDARD.encode(signature.to_bytes())
         ),
     }
-}
-
-/// RFC 8941 sf-string serialization.
-fn sf_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]
@@ -189,7 +176,7 @@ mod tests {
     fn signature_bytes(headers: &SpaceAuthHeaders) -> Vec<u8> {
         let encoded = headers
             .signature
-            .strip_prefix("atproto-space=:")
+            .strip_prefix("atproto-space-credential=:")
             .and_then(|s| s.strip_suffix(':'))
             .expect("byte-sequence signature field");
         STANDARD.decode(encoded).expect("standard base64")
@@ -198,7 +185,7 @@ mod tests {
     fn params(headers: &SpaceAuthHeaders) -> &str {
         headers
             .signature_input
-            .strip_prefix("atproto-space=")
+            .strip_prefix("atproto-space-credential=")
             .expect("labelled signature input")
     }
 
@@ -218,13 +205,13 @@ mod tests {
     #[test]
     fn credential_signature_base_matches_the_guide_example() {
         let base = signature_base(
-            "Atproto-Space <space-credential>",
+            "Atproto-Space-Credential <space-credential>",
             Some("<audience DID>"),
-            r#"("authorization" "atproto-space-audience")"#,
+            CREDENTIAL_COMPONENTS,
         );
-        let expected = "\"authorization\": Atproto-Space <space-credential>\n\
+        let expected = "\"authorization\": Atproto-Space-Credential <space-credential>\n\
                         \"atproto-space-audience\": <audience DID>\n\
-                        \"@signature-params\": (\"authorization\" \"atproto-space-audience\")";
+                        \"@signature-params\": (\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\"";
         assert_eq!(base.as_bytes(), expected.as_bytes());
         assert!(!base.ends_with('\n'));
     }
@@ -233,13 +220,16 @@ mod tests {
     fn credential_headers_are_formatted_and_verify() {
         let key = SigningKey::random(&mut OsRng);
         let headers = credential_headers(&key, "cred.jwt.sig", "did:plc:repoowner");
-        assert_eq!(headers.authorization, "Atproto-Space cred.jwt.sig");
+        assert_eq!(
+            headers.authorization,
+            "Atproto-Space-Credential cred.jwt.sig"
+        );
         assert_eq!(headers.audience.as_deref(), Some("did:plc:repoowner"));
         assert_eq!(
             headers.signature_input,
-            r#"atproto-space=("authorization" "atproto-space-audience")"#
+            r#"atproto-space-credential=("authorization" "atproto-space-audience");tag="atproto-space-credential""#
         );
-        assert!(headers.signature.starts_with("atproto-space=:"));
+        assert!(headers.signature.starts_with("atproto-space-credential=:"));
         assert!(headers.signature.ends_with(':'));
         assert_eq!(
             headers.key_id(),
@@ -250,34 +240,12 @@ mod tests {
     }
 
     #[test]
-    fn exchange_headers_cover_only_authorization_and_name_the_key() {
-        let key = SigningKey::random(&mut OsRng);
-        let key_id = p256_did_key(key.verifying_key());
-        let headers = exchange_headers(&key, "delegation.jwt.sig");
-        assert_eq!(headers.authorization, "Bearer delegation.jwt.sig");
-        assert_eq!(headers.audience, None);
-        assert_eq!(
-            headers.signature_input,
-            format!(r#"atproto-space=("authorization");keyid="{key_id}""#)
-        );
-        assert_eq!(headers.key_id(), Some(key_id.as_str()));
-        assert!(verifies(&headers, key.verifying_key()));
-        assert_eq!(
-            signature_base(&headers.authorization, None, params(&headers)),
-            format!(
-                "\"authorization\": Bearer delegation.jwt.sig\n\"@signature-params\": (\"authorization\");keyid=\"{key_id}\""
-            )
-        );
-    }
-
-    #[test]
     fn signature_is_raw_64_byte_low_s_r_s() {
         let key = SigningKey::random(&mut OsRng);
         for i in 0..16 {
             let headers = credential_headers(&key, &format!("cred-{i}"), "did:plc:aud");
             let bytes = signature_bytes(&headers);
             assert_eq!(bytes.len(), 64, "r||s, not DER");
-            assert_ne!(bytes[0], 0x30, "never a DER SEQUENCE");
             let signature = Signature::from_slice(&bytes).unwrap();
             assert!(signature.normalize_s().is_none(), "low-S");
         }
@@ -293,7 +261,7 @@ mod tests {
         assert!(!verifies(&changed, key.verifying_key()));
 
         let mut changed = headers.clone();
-        changed.authorization = "Atproto-Space other".into();
+        changed.authorization = "Atproto-Space-Credential other".into();
         assert!(!verifies(&changed, key.verifying_key()));
 
         let other = SigningKey::random(&mut OsRng);
@@ -324,7 +292,7 @@ mod tests {
                     .get("https://host.example/xrpc/com.atproto.space.getRepo")
                     .header(reqwest::header::AUTHORIZATION, "Bearer stale")
                     .header(AUDIENCE_HEADER, "did:plc:stale")
-                    .header("signature", "atproto-space=:c3RhbGU=:"),
+                    .header("signature", "atproto-space-credential=:c3RhbGU=:"),
             )
             .build()
             .unwrap();
@@ -336,7 +304,10 @@ mod tests {
                 .map(|v| v.to_str().unwrap())
                 .collect()
         };
-        assert_eq!(values("authorization"), vec!["Atproto-Space cred"]);
+        assert_eq!(
+            values("authorization"),
+            vec!["Atproto-Space-Credential cred"]
+        );
         assert_eq!(values(AUDIENCE_HEADER), vec!["did:plc:aud"]);
         assert_eq!(
             values("signature-input"),

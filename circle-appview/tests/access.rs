@@ -47,12 +47,22 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         .await
         .expect("Migrations must succeed");
 
+    // Explicit local lifecycle fixture: this proves route gating, not relay or
+    // live PDS readiness. Production uses the real event consumer to write it.
+    sqlx::query("INSERT INTO circle_identity_cursor(relay_url,cursor,last_event_at,last_received_at,reconciled_at,caught_up) VALUES('wss://relay.fixture.example.com/',1,now(),now(),now(),true)")
+        .execute(&pool).await.unwrap();
+    for did in [ALICE_DID, BOB_DID, AUTHORITY_DID] {
+        sqlx::query("INSERT INTO circle_account_status(did,active,pds_url,source_seq,relay_url) VALUES($1,true,'https://pds.fixture.example',1,'wss://relay.fixture.example.com/')")
+            .bind(did).execute(&pool).await.unwrap();
+    }
+
     let config = Config {
         host: "127.0.0.1".into(),
         port: 3002,
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -131,8 +141,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         AUTHORITY_DID,
         &authority_signing_key,
         Some(vec![DidService {
-            id: "#atproto_space_host".into(),
-            r#type: "AtprotoSpaceHost".into(),
+            id: "#atproto_pds".into(),
+            r#type: "AtprotoPersonalDataServer".into(),
             service_endpoint: SPACE_HOST_ENDPOINT.into(),
         }]),
     );
@@ -217,7 +227,7 @@ fn mint_delegation_token(
     let header = json!({
         "alg": "ES256",
         "typ": "atproto-delegation-token+jwt",
-        "kid": format!("{iss}#atproto")
+        "kid": "#atproto"
     });
     let claims = json!({
         "iss": iss,
@@ -393,7 +403,7 @@ async fn delegation_token_validation_passes_and_fails_on_tampering(pool: PgPool)
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn space_host_resolution_falls_back_to_atproto_pds(pool: PgPool) {
+async fn authority_host_resolution_uses_atproto_pds(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
     let pds_endpoint = "https://pds-fallback.example.com";
 
@@ -429,13 +439,9 @@ async fn space_host_resolution_falls_back_to_atproto_pds(pool: PgPool) {
     )
     .unwrap();
 
-    // Only the endpoint falls back. The service identifier is the audience of a
-    // client attestation and of a delegation token, and always names the
-    // space-host role fully qualified. Asserting "#atproto_pds" here is what let
-    // the AppView send a bare relative fragment as an `aud`, which the live PDS
-    // rejected with InvalidClientAttestation.
+    // October 22 uses the authority account PDS for both endpoint and audience.
     assert_eq!(endpoint, pds_endpoint);
-    assert_eq!(service_id, format!("{AUTHORITY_DID}#atproto_space_host"));
+    assert_eq!(service_id, format!("{AUTHORITY_DID}#atproto_pds"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -480,6 +486,42 @@ async fn check_member_access_and_cache_validation(pool: PgPool) {
     assert!(access::check_member_access(&setup.state, &space, BOB_DID)
         .await
         .is_err());
+
+    // A confirmed inactive authority denies even a cached member, and restoring
+    // activity preserves the authority-issued membership grant.
+    sqlx::query("UPDATE circle_account_status SET active=false,status='suspended' WHERE did=$1")
+        .bind(AUTHORITY_DID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        access::check_member_access(&setup.state, &space, ALICE_DID).await,
+        Err(AppError::Forbidden(_))
+    ));
+    let grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM circle_member_cache WHERE member_did=$1")
+            .bind(ALICE_DID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(grants, 1);
+    sqlx::query("UPDATE circle_account_status SET active=true,status=NULL WHERE did=$1")
+        .bind(AUTHORITY_DID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    access::check_member_access(&setup.state, &space, ALICE_DID)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE circle_account_status SET active=false,status='suspended' WHERE did=$1")
+        .bind(ALICE_DID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        access::check_member_access(&setup.state, &space, ALICE_DID).await,
+        Err(AppError::Forbidden(_))
+    ));
 }
 
 #[derive(Clone)]
@@ -580,6 +622,11 @@ async fn authority_omitted_from_member_cache_is_authorized_in_shared_gate_while_
     .execute(&pool)
     .await
     .unwrap();
+
+    // The authority is implicit in membership, but its AppView grant still
+    // requires a current policy snapshot, just like every other reader.
+    sqlx::query("INSERT INTO circle_member_cache_meta(space_uri,last_refreshed_at,member_count) VALUES($1,now(),0)")
+        .bind(&space).execute(&pool).await.unwrap();
 
     // Authority is NOT in member cache
     let outcome = access::verify_member_access(&setup.state, &space, AUTHORITY_DID)
@@ -964,14 +1011,22 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                 };
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
-                    let has_auth = req_str.contains("authorization: Bearer test-delegation-token")
-                        || req_str.contains("Authorization: Bearer test-delegation-token");
-                    // HTTP message signature over the delegation token, no DPoP.
-                    let has_signature = req_str.contains(
-                        r#"signature-input: atproto-space=("authorization");keyid="did:key:"#,
-                    ) && req_str.contains("signature: atproto-space=:");
-                    let has_dpop = req_str.to_ascii_lowercase().contains("\r\ndpop:");
-                    if has_auth && has_signature && !has_dpop {
+                    let body: serde_json::Value = req_str
+                        .split_once("\r\n\r\n")
+                        .and_then(|(_, body)| serde_json::from_str(body).ok())
+                        .unwrap_or_default();
+                    let lower = req_str.to_ascii_lowercase();
+                    let body_contract = body["space"] == "at://did:plc:auth/space/1"
+                        && body["delegationToken"] == "test-delegation-token"
+                        && body["clientAttestation"] == "test-attestation"
+                        && body["credentialKid"]
+                            .as_str()
+                            .is_some_and(|kid| kid.starts_with("did:key:"));
+                    let no_proof_headers = !lower.contains("\r\nauthorization:")
+                        && !lower.contains("\r\ndpop:")
+                        && !lower.contains("\r\nsignature:")
+                        && !lower.contains("\r\nsignature-input:");
+                    if body_contract && no_proof_headers {
                         let body = r#"{"credential":"test.space.credential.jwt"}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1040,15 +1095,14 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     .unwrap();
 
     let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let exchange_auth =
-        circle_appview::space_signature::exchange_headers(&exchange_key, "test-delegation-token");
+    let exchange_request = circle_appview::space_client::SpaceCredentialRequest {
+        space: "at://did:plc:auth/space/1".into(),
+        credential_kid: circle_appview::space_signature::p256_did_key(exchange_key.verifying_key()),
+        delegation_token: Some("test-delegation-token".into()),
+        client_attestation: Some("test-attestation".into()),
+    };
     let cred = transport_success
-        .get_space_credential(
-            &target_url,
-            &exchange_auth,
-            "at://did:plc:auth/space/1",
-            "test-attestation",
-        )
+        .get_space_credential(&target_url, &exchange_request)
         .await
         .expect("Space host credential exchange over TLS must succeed");
     assert_eq!(cred, "test.space.credential.jwt");
@@ -1060,12 +1114,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     ))
     .unwrap();
     let redirect_res = transport_success
-        .get_space_credential(
-            &redirect_url,
-            &exchange_auth,
-            "at://did:plc:auth/space/1",
-            "test-attestation",
-        )
+        .get_space_credential(&redirect_url, &exchange_request)
         .await;
     assert!(
         redirect_res.is_err(),
@@ -1445,4 +1494,78 @@ async fn test_activate_circle_missing_grant_returns_auth_required_not_404_and_pr
         }
         other => panic!("Expected Internal for upstream failure, got {other:?}"),
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn membership_and_authority_app_access_expire_after_thirty_seconds_with_expired_oauth(
+    pool: PgPool,
+) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    sqlx::query("INSERT INTO circles(space_uri,circle_id,authority_did,display_name,created_at) VALUES($1,'3jzfcijpj2m2a',$2,'TTL fixture',now())")
+        .bind(&space).bind(AUTHORITY_DID).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO circle_member_cache(space_uri,member_did,cached_at) VALUES($1,$2,now())",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO circle_member_cache_meta(space_uri,last_refreshed_at,member_count) VALUES($1,now(),1)")
+        .bind(&space).execute(&pool).await.unwrap();
+    // Use the actual OAuth and HTTP transport path. Expired access without a
+    // refresh token must never reuse an older authorization snapshot.
+    setup
+        .state
+        .oauth_service
+        .store_session(circle_appview::oauth::UserOAuthSession {
+            user_did: AUTHORITY_DID.into(),
+            access_token: "expired-local-fixture".into(),
+            refresh_token: None,
+            token_endpoint: "https://pds.fixture.example.com/oauth/token".into(),
+            auth_server_iss: "https://pds.fixture.example.com".into(),
+            expires_at: Some(Utc::now() - chrono::Duration::seconds(60)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        })
+        .await
+        .unwrap();
+    let mut state = setup.state.clone();
+    state.space_client = Arc::new(SpaceClient::new());
+    state
+        .space_client
+        .set_deps(circle_appview::space_client::SpaceClientDeps {
+            http_client: state.http_client.clone(),
+            did_resolver: state.did_resolver.clone(),
+            oauth_service: state.oauth_service.clone(),
+        });
+    access::check_member_access(&state, &space, ALICE_DID)
+        .await
+        .unwrap();
+    access::check_member_access(&state, &space, AUTHORITY_DID)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE circle_member_cache_meta SET last_refreshed_at=now()-INTERVAL '31 seconds' WHERE space_uri=$1")
+        .bind(&space).execute(&pool).await.unwrap();
+    for did in [ALICE_DID, AUTHORITY_DID] {
+        assert!(matches!(
+            access::verify_member_access(&state, &space, did)
+                .await
+                .unwrap(),
+            access::MemberAccessOutcome::IndeterminateDenied
+        ));
+    }
+    let grant: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri=$1 AND member_did=$2)",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        grant,
+        "failed OAuth refresh denies without pretending membership was removed"
+    );
 }

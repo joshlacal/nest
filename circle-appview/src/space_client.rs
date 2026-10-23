@@ -20,7 +20,19 @@ use crate::auth::{
 use crate::error::{AppError, AuthReason};
 use crate::oauth::OAuthService;
 pub use crate::space_signature::SpaceAuthHeaders;
-use crate::space_signature::{credential_headers, exchange_headers, p256_did_key};
+use crate::space_signature::{credential_headers, p256_did_key};
+
+/// October 22 credential exchange is a body-only request, with no auth headers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceCredentialRequest {
+    pub space: String,
+    pub credential_kid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_attestation: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SpaceAppAccess {
@@ -191,6 +203,11 @@ pub struct SpaceClientDeps {
 }
 
 pub trait SpaceHostTransport: Send + Sync {
+    /// Only fixture transports supply an in-process KEM identity.
+    fn fixture_kem_key(&self) -> Option<p256::PublicKey> {
+        None
+    }
+
     fn get_delegation_token<'a>(
         &'a self,
         _target_url: &'a url::Url,
@@ -208,9 +225,7 @@ pub trait SpaceHostTransport: Send + Sync {
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
-        auth: &'a SpaceAuthHeaders,
-        space_uri: &'a str,
-        client_attestation: &'a str,
+        request: &'a SpaceCredentialRequest,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>>;
 
     fn register_notify<'a>(
@@ -321,7 +336,7 @@ pub trait SpaceHostTransport: Send + Sync {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::SignedCommit,
+                        catbird_atproto::generated::com_atproto::space::Commit,
                         AppError,
                     >,
                 > + Send
@@ -606,27 +621,15 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
-        auth: &'a SpaceAuthHeaders,
-        space_uri: &'a str,
-        client_attestation: &'a str,
+        request: &'a SpaceCredentialRequest,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
         let target_url = target_url.clone();
-        let auth = auth.clone();
-        let space_uri = space_uri.to_string();
-        let client_attestation = client_attestation.to_string();
-
+        let request = request.clone();
         Box::pin(async move {
             let client = self.build_pinned_client(&target_url).await?;
-
-            let req_body = serde_json::json!({
-                "space": space_uri,
-                "clientAttestation": client_attestation,
-            });
-
-            let response = auth
-                .apply(client.post(target_url.as_str()))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&req_body)
+            let response = client
+                .post(target_url.as_str())
+                .json(&request)
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
@@ -858,13 +861,29 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             if !response.status().is_success() {
                 return Err(credential_use_error(response, "listRepoOps").await);
             }
+            let response_mac = response_mac_header(response.headers())?;
+            let mac_request = auth
+                .mac
+                .as_ref()
+                .ok_or(AppError::Unauthorized(AuthReason::BadSpaceMac))?;
             let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
                 response,
                 MAX_SPACE_RESPONSE_BYTES,
             )
             .await?;
-            let output = serde_json::from_slice(&body_bytes)
+            let output: catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput = serde_json::from_slice(&body_bytes)
                 .map_err(|e| AppError::Internal(e.to_string()))?;
+            if let Some(commit) = &output.commit {
+                crate::space_mac::verify_commit(
+                    commit,
+                    &space_uri,
+                    &repo_did,
+                    &mac_request.shared_secret,
+                    response_mac.as_deref(),
+                )?;
+            } else if response_mac.is_some() {
+                return Err(AppError::Unauthorized(AuthReason::BadSpaceMac));
+            }
             Ok(output)
         })
     }
@@ -891,7 +910,11 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             let req_url = xrpc_query::get_repo(&target_url, &space_uri, &repo_did)?;
 
             let response = auth
-                .apply(client.get(req_url.as_str()))
+                .apply(
+                    client
+                        .get(req_url.as_str())
+                        .header(reqwest::header::ACCEPT, "application/octet-stream"),
+                )
                 .send()
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to connect to Space host: {e}")))?;
@@ -899,11 +922,40 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             if !response.status().is_success() {
                 return Err(credential_use_error(response, "getRepo").await);
             }
+            if response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .is_none_or(|value| {
+                    !value
+                        .trim()
+                        .eq_ignore_ascii_case("application/octet-stream")
+                })
+            {
+                return Err(AppError::InvalidRequest(
+                    "getRepo must return STAR application/octet-stream".into(),
+                ));
+            }
 
-            let max_car_bytes = crate::commit::MAX_CAR_BYTES;
+            let response_mac = response_mac_header(response.headers())?;
+            let mac_request = auth
+                .mac
+                .as_ref()
+                .ok_or(AppError::Unauthorized(AuthReason::BadSpaceMac))?;
+            let max_car_bytes = crate::space_star::MAX_STAR_BYTES;
             let bytes =
                 crate::auth::read_bounded_authenticated_response_bytes(response, max_car_bytes)
                     .await?;
+            let commit = crate::space_star::read_commit(&bytes, &space_uri, &repo_did)?;
+            crate::space_mac::verify_commit(
+                &commit,
+                &space_uri,
+                &repo_did,
+                &mac_request.shared_secret,
+                response_mac.as_deref(),
+            )?;
+            crate::space_star::parse_repo_star(&bytes, &space_uri, &repo_did)?;
             Ok(bytes)
         })
     }
@@ -918,7 +970,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::SignedCommit,
+                        catbird_atproto::generated::com_atproto::space::Commit,
                         AppError,
                     >,
                 > + Send
@@ -944,12 +996,24 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
             if !response.status().is_success() {
                 return Err(credential_use_error(response, "getLatestCommit").await);
             }
+            let response_mac = response_mac_header(response.headers())?;
+            let mac_request = auth
+                .mac
+                .as_ref()
+                .ok_or(AppError::Unauthorized(AuthReason::BadSpaceMac))?;
             let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
                 response,
                 MAX_SPACE_RESPONSE_BYTES,
             )
             .await?;
             let output: catbird_atproto::generated::com_atproto::space::get_latest_commit::GetLatestCommitOutput = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Internal(e.to_string()))?;
+            crate::space_mac::verify_commit(
+                &output.commit,
+                &space_uri,
+                &repo_did,
+                &mac_request.shared_secret,
+                response_mac.as_deref(),
+            )?;
             Ok(output.commit)
         })
     }
@@ -1001,10 +1065,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
 #[derive(Debug, Clone)]
 pub struct RecordedSpaceHostCall {
     pub endpoint_url: String,
-    /// The signed exchange headers (`Bearer` delegation token, `keyid`).
-    pub auth: SpaceAuthHeaders,
-    pub space_uri: String,
-    pub client_attestation: String,
+    pub request: SpaceCredentialRequest,
 }
 
 /// One request the mock received with a space credential.
@@ -1048,8 +1109,7 @@ pub struct MockSpaceHostTransport {
         >,
     >,
     get_repo_responses: Mutex<HashMap<String, Vec<u8>>>,
-    latest_commits:
-        Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::SignedCommit>>,
+    latest_commits: Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::Commit>>,
     calls: Mutex<Vec<RecordedSpaceHostCall>>,
     #[allow(clippy::type_complexity)]
     blob_responses: Mutex<HashMap<String, (Option<String>, Vec<u8>)>>,
@@ -1178,7 +1238,7 @@ impl MockSpaceHostTransport {
     pub fn set_latest_commit(
         &self,
         space_and_repo: &str,
-        commit: catbird_atproto::generated::com_atproto::space::SignedCommit,
+        commit: catbird_atproto::generated::com_atproto::space::Commit,
     ) {
         let mut lock = self.latest_commits.lock().unwrap();
         lock.insert(space_and_repo.to_string(), commit);
@@ -1247,6 +1307,14 @@ impl MockSpaceHostTransport {
 }
 
 impl SpaceHostTransport for MockSpaceHostTransport {
+    fn fixture_kem_key(&self) -> Option<p256::PublicKey> {
+        Some(
+            p256::SecretKey::from_slice(&[1; 32])
+                .expect("fixture key")
+                .public_key(),
+        )
+    }
+
     fn get_delegation_token<'a>(
         &'a self,
         target_url: &'a url::Url,
@@ -1276,17 +1344,14 @@ impl SpaceHostTransport for MockSpaceHostTransport {
     fn get_space_credential<'a>(
         &'a self,
         target_url: &'a url::Url,
-        auth: &'a SpaceAuthHeaders,
-        space_uri: &'a str,
-        client_attestation: &'a str,
+        request: &'a SpaceCredentialRequest,
     ) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + 'a>> {
+        let space_uri = request.space.as_str();
         {
             let mut calls = self.calls.lock().unwrap();
             calls.push(RecordedSpaceHostCall {
                 endpoint_url: target_url.to_string(),
-                auth: auth.clone(),
-                space_uri: space_uri.to_string(),
-                client_attestation: client_attestation.to_string(),
+                request: request.clone(),
             });
         }
         let authority_did = extract_authority_from_space_uri(space_uri).unwrap_or_default();
@@ -1304,10 +1369,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                 Some(Err(e)) => Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e)),
                 None => {
                     if let Some(key) = authority_key {
-                        // Bind to the signature's keyid, as the authority does.
-                        let key_id = auth
-                            .key_id()
-                            .ok_or_else(|| AppError::Unauthorized(AuthReason::BadSpaceSignature))?;
+                        let key_id = request.credential_kid.as_str();
                         let cred = mint_mock_space_credential(
                             &key,
                             &authority_did,
@@ -1495,7 +1557,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::SignedCommit,
+                        catbird_atproto::generated::com_atproto::space::Commit,
                         AppError,
                     >,
                 > + Send
@@ -1947,11 +2009,16 @@ impl SpaceClient {
         // (cnf.kid) and every later use is signed with it.
         let ephemeral_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let key_id = p256_did_key(ephemeral_key.verifying_key());
-        let auth = exchange_headers(&ephemeral_key, delegation_token);
+        let request = SpaceCredentialRequest {
+            space: space_uri.into(),
+            credential_kid: key_id.clone(),
+            delegation_token: Some(delegation_token.into()),
+            client_attestation: Some(client_attestation.into()),
+        };
 
         let credential_jwt = self
             .transport
-            .get_space_credential(&xrpc_url, &auth, space_uri, client_attestation)
+            .get_space_credential(&xrpc_url, &request)
             .await?;
 
         let expires_at = validate_space_credential(
@@ -2053,6 +2120,33 @@ impl SpaceClient {
             .await
     }
 
+    async fn mac_auth(
+        &self,
+        signing_key: &p256::ecdsa::SigningKey,
+        credential: &str,
+        repo: &str,
+        refresh: bool,
+    ) -> Result<SpaceAuthHeaders, AppError> {
+        let kem = if let Some(key) = self.transport.fixture_kem_key() {
+            key
+        } else {
+            let deps =
+                self.deps.read().clone().ok_or_else(|| {
+                    AppError::Internal("Space client resolver not configured".into())
+                })?;
+            let doc = if refresh {
+                deps.did_resolver.resolve_identity_event(repo).await
+            } else {
+                deps.did_resolver.resolve(repo).await
+            }
+            .map_err(AppError::Unauthorized)?;
+            crate::space_mac::kem_key(&doc, repo)?
+        };
+        let mut auth = credential_headers(signing_key, credential, repo);
+        auth.mac = Some(crate::space_mac::encapsulate(&kem)?);
+        Ok(auth)
+    }
+
     /// `com.atproto.space.listRepoOps` on the repo's host; audience is the repo
     /// owner's DID.
     #[allow(clippy::too_many_arguments)]
@@ -2070,10 +2164,25 @@ impl SpaceClient {
         AppError,
     > {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.listRepoOps")?;
-        let auth = credential_headers(signing_key, space_credential, repo_did);
-        self.transport
-            .list_repo_ops(&xrpc_url, &auth, space_uri, repo_did, since, cursor)
-            .await
+        for retry in 0..2 {
+            let auth = self
+                .mac_auth(signing_key, space_credential, repo_did, retry > 0)
+                .await?;
+            let result = self
+                .transport
+                .list_repo_ops(&xrpc_url, &auth, space_uri, repo_did, since, cursor)
+                .await;
+            if retry == 0
+                && matches!(
+                    &result,
+                    Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
+                )
+            {
+                continue;
+            }
+            return result;
+        }
+        Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
     }
 
     /// `com.atproto.space.getRepo` on the repo's host; audience is the repo
@@ -2088,10 +2197,25 @@ impl SpaceClient {
         signing_key: &p256::ecdsa::SigningKey,
     ) -> Result<Vec<u8>, AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getRepo")?;
-        let auth = credential_headers(signing_key, space_credential, repo_did);
-        self.transport
-            .get_repo(&xrpc_url, &auth, space_uri, repo_did, since)
-            .await
+        for retry in 0..2 {
+            let auth = self
+                .mac_auth(signing_key, space_credential, repo_did, retry > 0)
+                .await?;
+            let result = self
+                .transport
+                .get_repo(&xrpc_url, &auth, space_uri, repo_did, since)
+                .await;
+            if retry == 0
+                && matches!(
+                    &result,
+                    Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
+                )
+            {
+                continue;
+            }
+            return result;
+        }
+        Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
     }
 
     /// `com.atproto.space.getLatestCommit` on the repo's host; audience is the
@@ -2103,12 +2227,27 @@ impl SpaceClient {
         repo_did: &str,
         space_credential: &str,
         signing_key: &p256::ecdsa::SigningKey,
-    ) -> Result<catbird_atproto::generated::com_atproto::space::SignedCommit, AppError> {
+    ) -> Result<catbird_atproto::generated::com_atproto::space::Commit, AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getLatestCommit")?;
-        let auth = credential_headers(signing_key, space_credential, repo_did);
-        self.transport
-            .get_latest_commit(&xrpc_url, &auth, space_uri, repo_did)
-            .await
+        for retry in 0..2 {
+            let auth = self
+                .mac_auth(signing_key, space_credential, repo_did, retry > 0)
+                .await?;
+            let result = self
+                .transport
+                .get_latest_commit(&xrpc_url, &auth, space_uri, repo_did)
+                .await;
+            if retry == 0
+                && matches!(
+                    &result,
+                    Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
+                )
+            {
+                continue;
+            }
+            return result;
+        }
+        Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
     }
 
     /// `com.atproto.space.getBlob` on the repo's host; audience is the repo
@@ -2264,7 +2403,6 @@ pub mod xrpc_query {
         with_params(
             target_url,
             &space::get_repo::GetRepo::<SmolStr> {
-                exclude_values: None,
                 repo: did(repo)?,
                 space: space_ref(space_uri)?,
             },
@@ -2358,7 +2496,7 @@ pub fn construct_xrpc_url(service_endpoint: &str, method: &str) -> Result<url::U
 }
 
 pub const UNBOUND_CREDENTIAL_MESSAGE: &str =
-    "Space host issues credentials without an HTTP message signature key binding (cnf.kid); Circles require a space host on the atproto Spaces 2026-10-01 alpha";
+    "Space host issues credentials without an HTTP message signature key binding (cnf.kid); Circles require a space host on the atproto Spaces 2026-10-22 alpha";
 
 /// Lifetime the reference authority gives a space credential, and the mock's.
 pub const DEFAULT_CREDENTIAL_LIFETIME_SECS: i64 = 600;
@@ -2393,7 +2531,7 @@ pub fn validate_space_credential(
 
     // Host compatibility gate, checked before anything else so the declared
     // error surfaces whatever else differs: space credentials must be bound to
-    // the exchange's HTTP signature key (cnf.kid, atproto 2026-10-01 alpha).
+    // the exchange's HTTP signature key (cnf.kid, atproto 2026-10-22 alpha).
     // Bearer credentials (Swan 2026-08-15 / 2026-09-10) and DPoP-bound ones
     // (cnf.jkt: the reference before 2026-10-01, Swan 2026-09-19) are refused.
     let cnf_kid = claims
@@ -2403,7 +2541,7 @@ pub fn validate_space_credential(
         .ok_or_else(|| AppError::UnsupportedPds(UNBOUND_CREDENTIAL_MESSAGE.into()))?;
 
     match &header.typ {
-        Some(t) if t == "atproto-space-credential+jwt" || t == "JWT" => {}
+        Some(t) if t == "atproto-space-credential+jwt" => {}
         _ => return Err(AppError::Unauthorized(AuthReason::InvalidTyp)),
     }
 
@@ -2458,6 +2596,14 @@ pub fn validate_space_credential(
         select_authority_verification_method(authority_doc, expected_iss, header.kid.as_deref())
             .map_err(AppError::Unauthorized)?;
     let key = parse_verification_key(vm).map_err(AppError::Unauthorized)?;
+    if !matches!(
+        (&key, header.alg.as_str()),
+        (crate::auth::ParsedVerifyingKey::P256(_), "ES256")
+            | (crate::auth::ParsedVerifyingKey::Secp256k1(_), "ES256K")
+            | (crate::auth::ParsedVerifyingKey::Ed25519(_), "EdDSA")
+    ) {
+        return Err(AppError::Unauthorized(AuthReason::AlgKeyMismatch));
+    }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     let sig_bytes = URL_SAFE_NO_PAD
@@ -2488,6 +2634,7 @@ pub fn credential_rejection_reason(code: &str) -> Option<AuthReason> {
         "CredentialRevoked" => Some(AuthReason::CredentialRevoked),
         "BadSpaceSignature" => Some(AuthReason::BadSpaceSignature),
         "BadSpaceAudience" => Some(AuthReason::BadSpaceAudience),
+        "BadSpaceMac" => Some(AuthReason::BadSpaceMac),
         _ => None,
     }
 }
@@ -2515,6 +2662,20 @@ async fn credential_use_error(response: reqwest::Response, op: &str) -> AppError
     AppError::Internal(format!("Space host {op} returned status {status}"))
 }
 
+fn response_mac_header(headers: &reqwest::header::HeaderMap) -> Result<Option<String>, AppError> {
+    let values = headers
+        .get_all(crate::space_mac::MAC_HEADER)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| AppError::Unauthorized(AuthReason::BadSpaceMac))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((!values.is_empty()).then(|| values.join(", ")))
+}
+
 pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
     if status.is_server_error() {
         return AppError::Internal(format!("Upstream server error ({status})"));
@@ -2540,7 +2701,7 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
         "AppNotAuthorized" => AppError::Forbidden("AppNotAuthorized".into()),
         "UserNotAuthorized" => AppError::Forbidden("UserNotAuthorized".into()),
         "NotAuthorized" => AppError::Forbidden("NotAuthorized".into()),
-        "InvalidDelegationToken" => AppError::Forbidden("InvalidDelegationToken".into()),
+        "InvalidDelegationToken" => AppError::InvalidRequest("InvalidDelegationToken".into()),
         "InvalidClientAttestation" => AppError::Forbidden("InvalidClientAttestation".into()),
         "SpaceNotFound" => AppError::NotFound("SpaceNotFound".into()),
         "SpaceDeleted" => AppError::AccessRemoved("SpaceDeleted".into()),
@@ -2548,6 +2709,7 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
         "CredentialRevoked" => AppError::Unauthorized(AuthReason::CredentialRevoked),
         "BadSpaceSignature" => AppError::Unauthorized(AuthReason::BadSpaceSignature),
         "BadSpaceAudience" => AppError::Unauthorized(AuthReason::BadSpaceAudience),
+        "BadSpaceMac" => AppError::Unauthorized(AuthReason::BadSpaceMac),
         _ => match status {
             reqwest::StatusCode::NOT_FOUND => AppError::NotFound("NotFound".into()),
             reqwest::StatusCode::FORBIDDEN => AppError::Forbidden("Forbidden".into()),
@@ -2955,11 +3117,16 @@ mod tests {
                 .map(|v| v.to_str().unwrap().to_string())
                 .collect()
         };
-        assert_eq!(header("authorization"), vec!["Atproto-Space cred"]);
+        assert_eq!(
+            header("authorization"),
+            vec!["Atproto-Space-Credential cred"]
+        );
         assert_eq!(header("atproto-space-audience"), vec![REPO]);
         assert_eq!(
             header("signature-input"),
-            vec![r#"atproto-space=("authorization" "atproto-space-audience")"#]
+            vec![
+                r#"atproto-space-credential=("authorization" "atproto-space-audience");tag="atproto-space-credential""#
+            ]
         );
         assert_eq!(header("signature"), vec![auth.signature.clone()]);
         assert!(header("dpop").is_empty(), "no Spaces DPoP proof");
@@ -2968,7 +3135,7 @@ mod tests {
     /// getSpaceCredential carries the delegation token as a Bearer token,
     /// signed over `authorization` only, naming the key in `keyid`.
     #[tokio::test]
-    async fn default_transport_exchange_sends_signed_delegation_token() {
+    async fn default_transport_exchange_sends_body_without_auth_headers() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2988,9 +3155,14 @@ mod tests {
         ))
         .unwrap();
         let key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth = exchange_headers(&key, "delegation");
+        let request = SpaceCredentialRequest {
+            space: SPACE.into(),
+            credential_kid: p256_did_key(key.verifying_key()),
+            delegation_token: Some("delegation".into()),
+            client_attestation: Some("attestation".into()),
+        };
         let credential = transport
-            .get_space_credential(&target, &auth, SPACE, "attestation")
+            .get_space_credential(&target, &request)
             .await
             .unwrap();
         assert_eq!(credential, "c");
@@ -2998,15 +3170,19 @@ mod tests {
         let received = server.received_requests().await.expect("recording on");
         let headers = &received[0].headers;
         let key_id = p256_did_key(key.verifying_key());
-        assert_eq!(headers.get("authorization").unwrap(), "Bearer delegation");
-        assert!(headers.get("atproto-space-audience").is_none());
-        assert!(headers.get("dpop").is_none());
-        assert_eq!(
-            headers.get("signature-input").unwrap().to_str().unwrap(),
-            format!(r#"atproto-space=("authorization");keyid="{key_id}""#)
-        );
+        for name in [
+            "authorization",
+            "signature-input",
+            "signature",
+            "dpop",
+            "atproto-space-audience",
+        ] {
+            assert!(headers.get(name).is_none(), "unexpected {name}");
+        }
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["space"], SPACE);
+        assert_eq!(body["credentialKid"], key_id);
+        assert_eq!(body["delegationToken"], "delegation");
         assert_eq!(body["clientAttestation"], "attestation");
     }
 
@@ -3141,10 +3317,10 @@ mod tests {
             .recorded_credential_uses()
             .into_iter()
             .map(|u| {
-                assert_eq!(u.auth.authorization, "Atproto-Space cred");
+                assert_eq!(u.auth.authorization, "Atproto-Space-Credential cred");
                 assert_eq!(
                     u.auth.signature_input,
-                    r#"atproto-space=("authorization" "atproto-space-audience")"#
+                    r#"atproto-space-credential=("authorization" "atproto-space-audience");tag="atproto-space-credential""#
                 );
                 (u.method, u.auth.audience)
             })
@@ -3193,9 +3369,9 @@ mod tests {
 
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].auth.authorization, "Bearer d1");
+        assert_eq!(calls[0].request.delegation_token.as_deref(), Some("d1"));
         assert_eq!(
-            calls[0].auth.key_id(),
+            Some(calls[0].request.credential_kid.as_str()),
             Some(p256_did_key(key_1.verifying_key()).as_str())
         );
     }
@@ -3255,5 +3431,118 @@ mod tests {
             validate_space_credential(&over, AUTHORITY, SPACE, &ours, &doc),
             Err(AppError::Unauthorized(AuthReason::LifetimeExceeded))
         ));
+    }
+    #[tokio::test]
+    async fn repository_reads_verify_wire_mac_before_returning_payload() {
+        use crate::space_mac::{compute_commit_mac, MacRequest, MAC_HEADER, WANT_MAC_HEADER};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let commit = crate::test_support::fixture_commit(SPACE, REPO, "3jzfcijpj2m2a", &[0; 2048]);
+        let star = crate::test_support::fixture_star(&commit, &[]).unwrap();
+        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        for endpoint in ["getLatestCommit", "getRepo", "listRepoOps"] {
+            for mode in ["good", "missing", "wrong", "duplicate", "type", "version"] {
+                let server = MockServer::start().await;
+                let mut auth = credential_headers(&key, "cred", REPO);
+                auth.mac = Some(MacRequest {
+                    key_share: "did:key:fixture".into(),
+                    shared_secret: [7; 32],
+                });
+                let mac =
+                    compute_commit_mac(if mode == "wrong" { &[8; 32] } else { &[7; 32] }, &commit)
+                        .unwrap();
+                let mut header = format!(
+                    "type=\"atproto-space-repo\", ver=1, mac=:{}:",
+                    base64::engine::general_purpose::STANDARD.encode(mac)
+                );
+                if mode == "duplicate" {
+                    header.push_str(", ver=1")
+                }
+                if mode == "type" {
+                    header = header.replace("atproto-space-repo", "atproto-space-record")
+                }
+                if mode == "version" {
+                    header = header.replace("ver=1", "ver=2")
+                }
+                let mut template = ResponseTemplate::new(200);
+                template = match endpoint {
+                    "getRepo" => template
+                        .set_body_bytes(star.clone())
+                        .insert_header("content-type", "application/octet-stream"),
+                    "listRepoOps" => template.set_body_json(json!({"commit":commit,"ops":[]})),
+                    _ => template.set_body_json(json!({"commit":commit})),
+                };
+                if mode != "missing" {
+                    template = template.insert_header(MAC_HEADER, header)
+                }
+                let endpoint_path = format!("/xrpc/com.atproto.space.{endpoint}");
+                Mock::given(method("GET"))
+                    .and(path(endpoint_path.clone()))
+                    .respond_with(template)
+                    .mount(&server)
+                    .await;
+                let url = url::Url::parse(&format!("{}{endpoint_path}", server.uri())).unwrap();
+                let transport = DefaultSpaceHostTransport::with_loopback(true);
+                let result = match endpoint {
+                    "getRepo" => transport
+                        .get_repo(&url, &auth, SPACE, REPO, None)
+                        .await
+                        .map(|_| ()),
+                    "listRepoOps" => transport
+                        .list_repo_ops(&url, &auth, SPACE, REPO, None, None)
+                        .await
+                        .map(|_| ()),
+                    _ => transport
+                        .get_latest_commit(&url, &auth, SPACE, REPO)
+                        .await
+                        .map(|_| ()),
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    mode == "good",
+                    "{endpoint}/{mode}: {result:?}"
+                );
+                let requests = server.received_requests().await.unwrap();
+                assert!(requests[0].headers.contains_key(WANT_MAC_HEADER));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_page_and_bounded_bad_mac_retry_gets_a_fresh_key() {
+        let mock = Arc::new(MockSpaceHostTransport::new());
+        let client = SpaceClient::with_transport(mock.clone());
+        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        for cursor in [None, Some("next")] {
+            let _ = client
+                .list_repo_ops(
+                    "https://host.example",
+                    SPACE,
+                    REPO,
+                    None,
+                    cursor,
+                    "cred",
+                    &key,
+                )
+                .await;
+        }
+        mock.reject_credential_uses(Some(AuthReason::BadSpaceMac));
+        assert!(matches!(
+            client
+                .get_latest_commit("https://host.example", SPACE, REPO, "cred", &key)
+                .await,
+            Err(AppError::Unauthorized(AuthReason::BadSpaceMac))
+        ));
+        let calls = mock.recorded_credential_uses();
+        assert_eq!(
+            calls.len(),
+            4,
+            "two pages plus one bounded two-attempt retry"
+        );
+        let shares: std::collections::HashSet<_> = calls
+            .iter()
+            .map(|c| c.auth.mac.as_ref().unwrap().key_share.clone())
+            .collect();
+        assert_eq!(shares.len(), 4);
     }
 }

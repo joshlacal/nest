@@ -729,14 +729,14 @@ impl ScenarioRunner {
             }
             if !cap_out.supports_images {
                 return Err(format!(
-                    "supports_images is not true on Nest gateway for {}",
+                    "Image qualification is unavailable (supportsImages=false) on Nest gateway for {}; this full image scenario cannot run",
                     user.name
                 ));
             }
             let rev = cap_out.protocol_revision.as_str();
-            if rev != "89deb9faca20e56fa2a262fe9746ed52bc1095ba" {
+            if rev != "ac0c9f15392f6f0298d71dc52aa88c05036150be" {
                 return Err(format!(
-                    "Space protocol revision mismatch for {}: expected '89deb9faca20e56fa2a262fe9746ed52bc1095ba', got '{rev}'",
+                    "Space protocol revision mismatch for {}: expected 'ac0c9f15392f6f0298d71dc52aa88c05036150be', got '{rev}'",
                     user.name
                 ));
             }
@@ -909,7 +909,7 @@ impl ScenarioRunner {
         space: &str,
         prev_rev: Option<&str>,
     ) -> Result<String, String> {
-        // 1. Fetch latest signed commit through Nest using generated GetLatestCommit query input
+        // Fetch and authenticate the current commit through Nest with a fresh request MAC key.
         let get_commit_url = format!(
             "{}/xrpc/com.atproto.space.getLatestCommit",
             self.config.nest_url.trim_end_matches('/')
@@ -919,8 +919,24 @@ impl ScenarioRunner {
             space: AtSpaceUri::new(space.to_string())
                 .map_err(|e| format!("Invalid space URI: {e}"))?,
         };
+        let resolver = circle_appview::auth::DidResolver::new(
+            "https://plc.directory".into(),
+            self.client.clone(),
+        );
+        let doc = resolver
+            .resolve_identity_event(&session.did)
+            .await
+            .map_err(|e| format!("DID resolution failed: {e:?}"))?;
+        let kem =
+            circle_appview::space_mac::kem_key(&doc, &session.did).map_err(|e| e.to_string())?;
+        let request_mac =
+            circle_appview::space_mac::encapsulate(&kem).map_err(|e| e.to_string())?;
         let commit_resp = session
             .apply_auth(self.client.get(&get_commit_url))
+            .header(
+                circle_appview::space_mac::WANT_MAC_HEADER,
+                request_mac.header(),
+            )
             .query(&commit_query)
             .send()
             .await
@@ -932,48 +948,36 @@ impl ScenarioRunner {
                 commit_resp.status()
             ));
         }
-        let commit_output: GetLatestCommitOutput<String> = commit_resp
+        let response_mac = commit_resp
+            .headers()
+            .get_all(circle_appview::space_mac::MAC_HEADER)
+            .iter()
+            .map(|v| v.to_str().map(str::to_owned).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let commit_output: GetLatestCommitOutput = commit_resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse GetLatestCommitOutput: {e}"))?;
         let commit = commit_output.commit;
 
-        if commit.ver != 1 {
-            return Err(format!(
-                "Expected SignedCommit ver == 1, got {}",
-                commit.ver
-            ));
-        }
-        if commit.hash.len() != 32 {
-            return Err(format!(
-                "Expected SignedCommit hash length 32, got {}",
-                commit.hash.len()
-            ));
-        }
-        if commit.ikm.len() != 32 {
-            return Err(format!(
-                "Expected SignedCommit ikm length 32, got {}",
-                commit.ikm.len()
-            ));
-        }
-        if commit.mac.len() != 32 {
-            return Err(format!(
-                "Expected SignedCommit mac length 32, got {}",
-                commit.mac.len()
-            ));
-        }
-        if commit.sig.is_empty() {
-            return Err("SignedCommit signature is empty".to_string());
-        }
+        circle_appview::space_mac::verify_commit(
+            &commit,
+            space,
+            &session.did,
+            &request_mac.shared_secret,
+            Some(&response_mac),
+        )
+        .map_err(|e| format!("Commit MAC verification failed: {e}"))?;
         let rev_str = commit.rev.as_str().to_string();
         if rev_str.is_empty() {
-            return Err("SignedCommit revision is empty".to_string());
+            return Err("Commit revision is empty".to_string());
         }
 
-        // Prove that the signed revision advances
+        // Prove that the authenticated revision advances
         if let Some(prev) = prev_rev {
             if rev_str.as_str() <= prev {
-                return Err("Signed revision did not advance".to_string());
+                return Err("Authenticated revision did not advance".to_string());
             }
         }
 
@@ -983,7 +987,7 @@ impl ScenarioRunner {
             .map_err(|e| format!("Failed to connect to Circle AppView database: {e}"))?;
 
         let start = std::time::Instant::now();
-        let expected_hash = commit.hash.as_ref();
+        let expected_hash = commit.data.as_ref();
         loop {
             let row: Option<(String, Vec<u8>)> = sqlx::query_as(
                 "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",

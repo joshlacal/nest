@@ -1,3 +1,4 @@
+mod support;
 use base64::Engine;
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
@@ -5,6 +6,7 @@ use p256::elliptic_curve::rand_core::OsRng;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
+use support::{fixture_commit, fixture_star};
 
 use circle_appview::{
     access::{self, ActiveSpaceCredential, CredentialStore, SpaceLockManager},
@@ -146,6 +148,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: None,
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -268,15 +271,9 @@ async fn test_cas_rejects_rollback_and_equal_rev_different_hash(pool: PgPool) {
     let mut lthash = LtHash::default();
     lthash.add("app.bsky.feed.post", "3l7post11111", &post_cid);
 
-    let init_commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567a234",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let init_commit = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567a234", lthash.as_bytes());
     let post_ipld = json_to_ipld(&post_val).unwrap();
-    let car_init = mint_repo_car(
+    let car_init = fixture_star(
         &init_commit,
         &[RepoRecord {
             collection: "app.bsky.feed.post".to_string(),
@@ -317,14 +314,8 @@ async fn test_cas_rejects_rollback_and_equal_rev_different_hash(pool: PgPool) {
     assert_eq!(res.latest_rev, "3l7234567a234");
 
     // 1. Full recovery rollback attempt: CAR served at older rev "3l7234567a233" -> MUST fail
-    let rollback_commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567a233",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
-    let car_rollback = mint_repo_car(&rollback_commit, &[]).unwrap();
+    let rollback_commit = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567a233", lthash.as_bytes());
+    let car_rollback = fixture_star(&rollback_commit, &[]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_rollback);
@@ -353,14 +344,13 @@ async fn test_cas_rejects_rollback_and_equal_rev_different_hash(pool: PgPool) {
         "3l7post11111",
         "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5z",
     );
-    let diff_commit = mint_signed_commit(
+    let diff_commit = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7234567a234",
         different_lthash.as_bytes(),
-        &setup.owner_signing_key,
     );
-    let car_diff = mint_repo_car(&diff_commit, &[]).unwrap();
+    let car_diff = fixture_star(&diff_commit, &[]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_diff);
@@ -517,7 +507,7 @@ async fn test_notify_write_requires_active_membership_before_work(pool: PgPool) 
 
     let body = serde_json::to_vec(
         &catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            hash: bytes::Bytes::copy_from_slice(&[0x42; 32]),
+            data: bytes::Bytes::copy_from_slice(&[0x42; 32]),
             repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(EVE_DID)),
             repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7234567a234",
@@ -570,15 +560,9 @@ async fn test_missing_operation_value_fails_atomically_without_advancing_sync_st
     let mut lthash = LtHash::default();
     lthash.add("app.bsky.feed.post", "rkey1", &cid1);
 
-    let init_commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567a234",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let init_commit = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567a234", lthash.as_bytes());
     let post_ipld = json_to_ipld(&val1).unwrap();
-    let car1 = mint_repo_car(
+    let car1 = fixture_star(
         &init_commit,
         &[RepoRecord {
             collection: "app.bsky.feed.post".to_string(),
@@ -951,7 +935,7 @@ async fn test_sweep_budget_and_shutdown_in_per_page_repo_loop(pool: PgPool) {
             space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7spacerev2a",
             )),
-            hash: bytes::Bytes::from(vec![0x11; 32]),
+            data: bytes::Bytes::from(vec![0x11; 32]),
             extra_data: None,
         },
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
@@ -960,7 +944,7 @@ async fn test_sweep_budget_and_shutdown_in_per_page_repo_loop(pool: PgPool) {
             space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7spacerev2a",
             )),
-            hash: bytes::Bytes::from(vec![0x22; 32]),
+            data: bytes::Bytes::from(vec![0x22; 32]),
             extra_data: None,
         },
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
@@ -969,7 +953,7 @@ async fn test_sweep_budget_and_shutdown_in_per_page_repo_loop(pool: PgPool) {
             space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7spacerev2a",
             )),
-            hash: bytes::Bytes::from(vec![0x33; 32]),
+            data: bytes::Bytes::from(vec![0x33; 32]),
             extra_data: None,
         },
     ];
@@ -1008,7 +992,7 @@ async fn test_sweep_budget_caps_failing_repos_at_max_repos_per_sweep(pool: PgPoo
                 space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(
                     String::from("3l7spacerev2a"),
                 ),
-                hash: bytes::Bytes::from(vec![0xAA; 32]),
+                data: bytes::Bytes::from(vec![0xAA; 32]),
                 extra_data: None,
             },
         );
@@ -1045,7 +1029,7 @@ async fn test_sweep_budget_halts_on_rejected_car_byte_limit(pool: PgPool) {
             space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7spacerev2a",
             )),
-            hash: bytes::Bytes::from(vec![0xBB; 32]),
+            data: bytes::Bytes::from(vec![0xBB; 32]),
             extra_data: None,
         },
         catbird_atproto::generated::com_atproto::space::list_repos::Repo {
@@ -1054,7 +1038,7 @@ async fn test_sweep_budget_halts_on_rejected_car_byte_limit(pool: PgPool) {
             space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
                 "3l7spacerev2a",
             )),
-            hash: bytes::Bytes::from(vec![0xCC; 32]),
+            data: bytes::Bytes::from(vec![0xCC; 32]),
             extra_data: None,
         },
     ];

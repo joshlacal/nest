@@ -86,11 +86,11 @@ pub async fn list_notifications(
             c.authority_did AS circle_owner,
             COALESCE(pref.muted, false) AS circle_muted
         FROM circle_notifications n
-        JOIN circles c ON c.space_uri = n.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
+        JOIN circles c ON c.space_uri = n.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
         JOIN circle_member_cache m ON m.space_uri = n.space_uri AND m.member_did = $1 AND m.can_read = true
-        JOIN circle_member_cache_meta meta ON meta.space_uri = n.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+        JOIN circle_member_cache_meta meta ON meta.space_uri = n.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
         LEFT JOIN circle_preferences pref ON pref.space_uri = n.space_uri AND pref.member_did = $1
-        WHERE n.recipient_did = $1
+        WHERE n.recipient_did = $1 AND n.actor_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
           AND COALESCE(pref.muted, false) = false
           AND (
               $2::TIMESTAMPTZ IS NULL
@@ -209,6 +209,17 @@ pub async fn list_notifications(
         });
     }
 
+    let spaces: std::collections::HashSet<_> = notifications
+        .iter()
+        .map(|item| item.circle.uri.as_str())
+        .collect();
+    for space in spaces {
+        crate::access::check_member_access(state, space, recipient_did).await?;
+    }
+    for notification in &notifications {
+        crate::identity_events::require_active_account(&state.db, notification.actor.did.as_str())
+            .await?;
+    }
     Ok(ListNotificationsOutput {
         cursor: next_cursor.map(SmolStr::new),
         notifications,

@@ -45,12 +45,26 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         .await
         .expect("Migrations must succeed");
 
+    // Explicit local lifecycle fixture: this proves route gating, not relay or
+    // live PDS readiness. Production uses the real event consumer to write it.
+    sqlx::query("INSERT INTO circle_identity_cursor(relay_url,cursor,last_event_at,last_received_at,reconciled_at,caught_up) VALUES('wss://relay.fixture.example.com/',1,now(),now(),now(),true)")
+        .execute(&pool).await.unwrap();
+    for did in [
+        ALICE_DID,
+        "did:web:bluecatbird.io",
+        "did:web:rotating-authority.example.com",
+    ] {
+        sqlx::query("INSERT INTO circle_account_status(did,active,pds_url,source_seq,relay_url) VALUES($1,true,'https://pds.fixture.example',1,'wss://relay.fixture.example.com/')")
+            .bind(did).execute(&pool).await.unwrap();
+    }
+
     let config = Config {
         host: "127.0.0.1".into(),
         port: 3002,
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -420,9 +434,9 @@ async fn verifies_public_health_and_capabilities_unauthenticated(pool: PgPool) {
     );
     assert_eq!(
         caps.protocol_revision.as_str(),
-        "89deb9faca20e56fa2a262fe9746ed52bc1095ba"
+        "ac0c9f15392f6f0298d71dc52aa88c05036150be"
     );
-    assert!(caps.supports_images);
+    assert!(!caps.supports_images);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1036,6 +1050,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -1094,6 +1109,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             database_url: "postgres://localhost/postgres".into(),
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
+            identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
             appview_base_url: "http://127.0.0.1:3002".into(),
@@ -1144,6 +1160,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             database_url: "postgres://localhost/postgres".into(),
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
+            identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
             appview_base_url: "http://127.0.0.1:3002".into(),
@@ -1692,7 +1709,7 @@ async fn space_authority_verifies_live_client_attestation_against_published_jwks
     };
     let setup = setup_test(pool).await;
 
-    let space_host_service = "did:web:space-authority.example.com#atproto_space_host";
+    let space_host_service = "did:web:space-authority.example.com#atproto_pds";
     let expected_client_id = &setup.state.oauth_service.client_id;
 
     // 1. Sign a live attestation
@@ -1885,6 +1902,7 @@ async fn key_rotation_with_curve_change_and_controllable_upstream(pool: PgPool) 
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -3195,11 +3213,9 @@ async fn did_resolver_last_fresh_resolution_capacity_bounding() {
     );
 }
 
-/// CIRCLES-28: the space-credential key is the one the JWT `kid` names. An
-/// authority that publishes both #atproto and #atproto_space may sign with
-/// either; the reference PDS signs with #atproto.
+/// October 22 credentials require the exact relative JWT kid #atproto.
 #[test]
-fn authority_key_selection_follows_the_credential_kid() {
+fn authority_key_selection_requires_exact_atproto_credential_kid() {
     use circle_appview::auth::select_authority_verification_method;
     const DID: &str = "did:plc:authority-kid";
     let vm = |id: &str| VerificationMethod {
@@ -3209,50 +3225,95 @@ fn authority_key_selection_follows_the_credential_kid() {
         public_key_jwk: None,
         public_key_multibase: Some(format!("z{id}")),
     };
-    let both = DidDocument {
-        id: DID.into(),
-        verification_method: vec![vm(&format!("{DID}#atproto_space")), vm("#atproto")],
-        service: vec![],
-    };
-    let only_atproto = DidDocument {
-        id: DID.into(),
-        verification_method: vec![vm("#atproto")],
-        service: vec![],
-    };
-
-    for (kid, expected) in [
-        ("#atproto", "#atproto".to_string()),
-        ("atproto", "#atproto".to_string()),
-        (&*format!("{DID}#atproto"), "#atproto".to_string()),
-        ("#atproto_space", format!("{DID}#atproto_space")),
-        ("atproto_space", format!("{DID}#atproto_space")),
-    ] {
-        let selected = select_authority_verification_method(&both, DID, Some(kid))
-            .unwrap_or_else(|e| panic!("kid {kid} must select a key, got {e:?}"));
-        assert_eq!(selected.id, expected, "kid {kid}");
-    }
-
-    // No kid: the dedicated space key is preferred.
-    assert_eq!(
-        select_authority_verification_method(&both, DID, None)
-            .unwrap()
-            .id,
-        format!("{DID}#atproto_space")
-    );
-
-    // A kid naming any other key, or another DID's key, is refused.
-    for kid in ["#atproto_label", "did:plc:someone-else#atproto", "#"] {
+    for method_id in ["#atproto".to_string(), format!("{DID}#atproto")] {
+        let doc = DidDocument {
+            id: DID.into(),
+            verification_method: vec![vm(&format!("{DID}#atproto_space")), vm(&method_id)],
+            service: vec![],
+        };
         assert_eq!(
-            select_authority_verification_method(&both, DID, Some(kid)).unwrap_err(),
-            circle_appview::error::AuthReason::InvalidKid,
-            "kid {kid}"
+            select_authority_verification_method(&doc, DID, Some("#atproto"))
+                .unwrap()
+                .id,
+            method_id
         );
+        for kid in [
+            None,
+            Some("atproto"),
+            Some("#atproto_space"),
+            Some("atproto_space"),
+            Some("#atproto_label"),
+            Some("did:plc:someone-else#atproto"),
+            Some("#"),
+            Some(&format!("{DID}#atproto")),
+        ] {
+            assert_eq!(
+                select_authority_verification_method(&doc, DID, kid).unwrap_err(),
+                AuthReason::InvalidKid,
+                "kid {kid:?}"
+            );
+        }
     }
-
-    // A kid naming a key the document does not publish has nothing to verify with.
+    let only_space = DidDocument {
+        id: DID.into(),
+        verification_method: vec![vm("#atproto_space")],
+        service: vec![],
+    };
     assert_eq!(
-        select_authority_verification_method(&only_atproto, DID, Some("#atproto_space"))
-            .unwrap_err(),
-        circle_appview::error::AuthReason::NoVerificationMethod
+        select_authority_verification_method(&only_space, DID, Some("#atproto")).unwrap_err(),
+        AuthReason::NoVerificationMethod
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn private_routes_and_capabilities_require_configured_caught_up_lifecycle(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    for (index, configured, caught_up, replay_invalid) in [
+        (0, false, true, false),
+        (1, true, false, false),
+        (2, true, true, true),
+    ] {
+        let mut state = setup.state.clone();
+        let mut config = (*state.config).clone();
+        if !configured {
+            config.identity_relay_url = None;
+        }
+        state.config = Arc::new(config);
+        sqlx::query("UPDATE circle_identity_cursor SET caught_up=$1,replay_invalid=$2")
+            .bind(caught_up)
+            .bind(replay_invalid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = create_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/xrpc/blue.catbird.circle.getCapabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let caps: GetCapabilitiesOutput =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(!caps.enabled, "unready source cannot advertise enabled");
+        let token = create_service_token(
+            &setup.p256_signing_key,
+            ALICE_DID,
+            CIRCLE_AUDIENCE,
+            "blue.catbird.circle.getFeed",
+            &format!("lifecycle-gate-{index}"),
+            60,
+            None,
+        );
+        let response = request_feed(&app, &token).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "UnsupportedPDS");
+    }
 }

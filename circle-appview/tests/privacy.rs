@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
@@ -26,6 +27,7 @@ use p256::EncodedPoint;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
+use support::{fixture_commit, fixture_star};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -37,6 +39,38 @@ const MEDIA_BASE: &str = "https://media.catbird.blue";
 const SPACE_1: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy1";
 const SPACE_2: &str =
     "at://did:plc:dave-privacy-unauthorized/space/blue.catbird.circle/3l7privacy2";
+
+/// Exercises the retained media implementation directly, without enabling the
+/// production route or claiming private-blob host qualification.
+fn media_core_fixture_router(state: AppState) -> axum::Router {
+    use axum::{
+        extract::{Extension, Query, State},
+        middleware,
+        routing::get,
+    };
+    use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
+    async fn core(
+        Extension(user): Extension<circle_appview::auth::AuthenticatedUser>,
+        Query(query): Query<GetMedia>,
+        State(state): State<AppState>,
+    ) -> Result<axum::response::Response, circle_appview::error::AppError> {
+        circle_appview::media::get_media(
+            &state,
+            user,
+            query.space.as_str(),
+            query.did.as_str(),
+            query.cid.as_str(),
+        )
+        .await
+    }
+    axum::Router::new()
+        .route("/xrpc/blue.catbird.circle.getMedia", get(core))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            circle_appview::auth::authenticate,
+        ))
+        .with_state(state)
+}
 
 fn url_encode(input: &str) -> String {
     let mut encoded = String::new();
@@ -171,6 +205,7 @@ async fn grant_active_member(
 }
 
 async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
+    support::healthy_identity_fixture(&pool, &[ALICE_DID, BOB_DID, DAVE_DID]).await;
     db::run_migrations(&pool)
         .await
         .expect("Migrations must succeed");
@@ -185,6 +220,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -874,7 +910,23 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
         Some("image/jpeg".to_string()),
         oversize_bytes,
     );
-    let app = create_router(setup.state.clone());
+    // The release route remains disabled even for an authorized member.
+    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+    let request = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(ALICE_DID),
+            url_encode(blob_cid)
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = setup.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(setup.mock_transport.recorded_blob_calls().is_empty());
+
+    let app = media_core_fixture_router(setup.state.clone());
 
     // Bob requests Alice's blob in SPACE_1 -> 200 OK with no-cache and validated content-type
     let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
@@ -983,7 +1035,7 @@ async fn media_does_not_rerun_a_refused_credential_exchange_per_request(pool: Pg
         .to_string()),
     );
 
-    let app = create_router(setup.state.clone());
+    let app = media_core_fixture_router(setup.state.clone());
     // A fresh service JWT per request: each jti is single-use.
     let media_request = || {
         let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
@@ -1064,7 +1116,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
         )
         .await;
 
-    let blob_cid = "bafkreiblobres";
+    let blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
     let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
     let space_client = Arc::new(circle_appview::space_client::SpaceClient::with_transport(
         mock_transport.clone(),
@@ -1073,6 +1125,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
     // 1. Author DID doc with wrong service ID but right type ("#custom_pds", "AtprotoPersonalDataServer")
     let custom_pds_did = "did:plc:author-wrong-id";
     grant_active_member(&pool, SPACE_1, custom_pds_did, Duration::hours(1)).await;
+    support::healthy_identity_fixture(&pool, &[custom_pds_did]).await;
     let wrong_id_doc = DidDocument {
         id: custom_pds_did.to_string(),
         verification_method: vec![],
@@ -1115,7 +1168,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
         space_client.clone(),
         setup.state.space_locks.clone(),
     );
-    let app = create_router(custom_state);
+    let app = media_core_fixture_router(custom_state);
 
     let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
     let req1 = Request::builder()
@@ -1139,6 +1192,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
     // 2. Author DID doc with suffix ID ("#fake#atproto_pds")
     let suffix_did = "did:plc:author-suffix-id";
     grant_active_member(&pool, SPACE_1, suffix_did, Duration::hours(1)).await;
+    support::healthy_identity_fixture(&pool, &[suffix_did]).await;
     let suffix_doc = DidDocument {
         id: suffix_did.to_string(),
         verification_method: vec![],
@@ -1455,7 +1509,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
         .body(Body::empty())
         .unwrap();
     let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // E. Get Post Thread
     let bob_thread_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
@@ -1757,14 +1811,8 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
         &rec_reply.cid,
     ));
 
-    let commit_bob = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        BOB_DID,
-        "3l7aaaaaaaaaa",
-        &lthash.state(),
-        &setup.bob_key,
-    );
-    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_reply]).unwrap();
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let car_bob = fixture_star(&commit_bob, &[rec_reply]).unwrap();
     let bob_key = format!("{SPACE_1}:{BOB_DID}");
     setup
         .mock_transport
@@ -1772,7 +1820,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
 
     let sync_engine = SyncEngine::new(&setup.state);
     let sync_res = sync_engine
-        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.hash.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.as_ref()))
         .await
         .unwrap();
     assert_eq!(sync_res.records_accepted, 1);
@@ -1883,7 +1931,7 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
         mock_bytes.clone(),
     );
 
-    let app = create_router(setup.state.clone());
+    let app = media_core_fixture_router(setup.state.clone());
     let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
 
     // 1. Authorized blob -> 200 OK and streams
@@ -2069,14 +2117,8 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
         &rec_like.cid,
     ));
 
-    let commit_bob = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        BOB_DID,
-        "3l7aaaaaaaaaa",
-        &lthash.state(),
-        &setup.bob_key,
-    );
-    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_like]).unwrap();
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let car_bob = fixture_star(&commit_bob, &[rec_like]).unwrap();
     let bob_key = format!("{SPACE_1}:{BOB_DID}");
     setup
         .mock_transport
@@ -2084,7 +2126,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
 
     let sync_engine = SyncEngine::new(&setup.state);
     let _ = sync_engine
-        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.hash.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.as_ref()))
         .await;
 
     // Verify NO push notification was dispatched because Bob is not a member of the space
@@ -2488,14 +2530,8 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
         &rec_meta.rkey,
         &rec_meta.cid,
     ));
-    let commit = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        ALICE_DID,
-        "3l7aaaaaaaaaa",
-        &lthash.state(),
-        &setup.alice_key,
-    );
-    let car_bytes = circle_appview::commit::mint_repo_car(&commit, &[rec_meta]).unwrap();
+    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let car_bytes = fixture_star(&commit, &[rec_meta]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_1}:{ALICE_DID}"), car_bytes);
@@ -2547,7 +2583,7 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
     let dave_jwt = mint_jwt(DAVE_DID, "com.atproto.space.notifyWrite", &setup.dave_key);
 
     let notify_dave = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(DAVE_DID)),
         repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
@@ -2576,7 +2612,7 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
         .unwrap();
 
     let notify_alice = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(ALICE_DID)),
         repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
@@ -2722,15 +2758,8 @@ async fn circle_activation_generates_notifications_for_members(pool: PgPool) {
         &rec_post.cid,
     ));
 
-    let commit_alice = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        ALICE_DID,
-        "3l7aaaaaaaaaa",
-        &lthash_alice.state(),
-        &setup.alice_key,
-    );
-    let car_alice =
-        circle_appview::commit::mint_repo_car(&commit_alice, &[rec_meta, rec_post]).unwrap();
+    let commit_alice = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", &lthash_alice.state());
+    let car_alice = fixture_star(&commit_alice, &[rec_meta, rec_post]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_1}:{ALICE_DID}"), car_alice);
@@ -2761,14 +2790,8 @@ async fn circle_activation_generates_notifications_for_members(pool: PgPool) {
         &rec_like.cid,
     ));
 
-    let commit_bob = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        BOB_DID,
-        "3l7aaaaaaaaaa",
-        &lthash_bob.state(),
-        &setup.bob_key,
-    );
-    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_like]).unwrap();
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash_bob.state());
+    let car_bob = fixture_star(&commit_bob, &[rec_like]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_1}:{BOB_DID}"), car_bob);
@@ -3915,5 +3938,49 @@ async fn get_space_unrecognized_policy_fails_closed(pool: PgPool) {
     assert!(
         res.is_err(),
         "refresh_member_cache must fail closed on unrecognized read policy"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn membership_expiring_during_profile_hydration_cannot_return_a_private_post(pool: PgPool) {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let setup = setup_privacy_test(pool.clone()).await;
+    sqlx::query("INSERT INTO circles(space_uri,circle_id,authority_did,display_name,created_at) VALUES($1,'3jzfcijpj2m2a',$2,'In-flight fixture',now())")
+        .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::seconds(30)).await;
+    let value = json!({"$type":"app.bsky.feed.post","text":"must not leave this request","createdAt":Utc::now().to_rfc3339()});
+    let cid = circle_appview::commit::compute_dagcbor_cid(&value).unwrap();
+    let uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3jzfcijpj2m2a");
+    sqlx::query("INSERT INTO circle_records(uri,cid,space_uri,author_did,collection,rkey,record_json,created_at) VALUES($1,$2,$3,$4,'app.bsky.feed.post','3jzfcijpj2m2a',$5,now())")
+        .bind(&uri).bind(cid).bind(SPACE_1).bind(ALICE_DID).bind(value).execute(&pool).await.unwrap();
+    let profile_host = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(ResponseTemplate::new(503).set_delay(std::time::Duration::from_secs(2)))
+        .mount(&profile_host)
+        .await;
+    let mut state = setup.state.clone();
+    state.profile_hydrator = Arc::new(circle_appview::hydration::ProfileHydrator::new(
+        profile_host.uri(),
+        reqwest::Client::new(),
+    ));
+    let request = tokio::spawn(async move {
+        circle_appview::feed::get_feed(&state, BOB_DID, Some(SPACE_1), Some(20), None).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while profile_host.received_requests().await.unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request reached profile hydration");
+    setup
+        .mock_transport
+        .set_space_members(SPACE_1, vec![ALICE_DID.into()]);
+    sqlx::query("UPDATE circle_member_cache_meta SET last_refreshed_at=now()-INTERVAL '31 seconds' WHERE space_uri=$1")
+        .bind(SPACE_1).execute(&pool).await.unwrap();
+    let result = request.await.unwrap();
+    assert!(
+        matches!(result, Err(circle_appview::AppError::AccessRemoved(_))),
+        "expired in-flight authorization cannot publish the previously fetched post: {result:?}"
     );
 }

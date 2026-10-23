@@ -7,6 +7,7 @@ pub mod error;
 pub mod feed;
 pub mod handlers;
 pub mod hydration;
+pub mod identity_events;
 pub mod media;
 pub mod notifications;
 pub mod notify;
@@ -17,14 +18,18 @@ pub mod push;
 pub mod reports;
 pub mod routes;
 pub mod space_client;
+pub mod space_mac;
 pub mod space_signature;
+pub mod space_star;
 pub mod sync;
 pub mod thread;
 pub mod validator;
 
 use std::future::Future;
 
-pub const CIRCLE_PROTOCOL_REVISION: &str = "89deb9faca20e56fa2a262fe9746ed52bc1095ba";
+/// Media remains disabled until private blob serving is qualified on supported hosts.
+pub const SUPPORTS_IMAGES: bool = false;
+pub const CIRCLE_PROTOCOL_REVISION: &str = "ac0c9f15392f6f0298d71dc52aa88c05036150be";
 
 pub use auth::{
     authenticate, AuthenticatedUser, DidDocument, DidResolver, PublicKeyJwk, VerificationMethod,
@@ -174,6 +179,7 @@ where
     let addr: std::net::SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on {}", addr);
+    let identity_task = identity_events::spawn(state.clone());
 
     let (sweep_handle, sweep_shutdown_tx) =
         sync::spawn_revision_sweep_task(state.clone(), std::time::Duration::from_secs(300));
@@ -195,10 +201,16 @@ where
     let _ = jti_shutdown_tx.send(true);
     let _ = rejections_shutdown_tx.send(true);
     let _ = tombstone_shutdown_tx.send(true);
+    if let Some((_, sender)) = &identity_task {
+        let _ = sender.send(true);
+    }
     let sweep_res = sweep_handle.await;
     let jti_res = jti_handle.await;
     let rejections_res = rejections_handle.await;
     let tombstone_res = tombstone_handle.await;
+    if let Some((handle, _)) = identity_task {
+        handle.await?;
+    }
     match (
         server_res,
         sweep_res,
@@ -229,3 +241,9 @@ where
         (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
     }
 }
+
+#[cfg(test)]
+extern crate self as circle_appview;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;

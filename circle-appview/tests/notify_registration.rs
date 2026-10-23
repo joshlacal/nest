@@ -2,6 +2,7 @@
 //! host, persists `expiresAt`, renews an hour before it lapses, unregisters when
 //! it loses access, and acknowledges notifyWrite before syncing.
 
+mod support;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -27,7 +28,7 @@ use circle_appview::sync::sweep_once;
 const OWNER_DID: &str = "did:plc:owner-notify-registration";
 const SPACE_URI: &str =
     "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg1";
-const SPACE_HOST: &str = "https://space.owner.example";
+const SPACE_HOST: &str = "https://pds.owner.example";
 
 struct Setup {
     state: AppState,
@@ -42,6 +43,7 @@ fn config(service_did: &str) -> Config {
         database_url: "postgres://localhost/postgres".into(),
         service_did: service_did.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -55,6 +57,7 @@ fn config(service_did: &str) -> Config {
 }
 
 async fn setup(pool: PgPool, service_did: &str) -> Setup {
+    support::healthy_identity_fixture(&pool, &[OWNER_DID]).await;
     std::env::set_var(
         "SESSION_ENCRYPTION_KEY",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -328,7 +331,7 @@ async fn notify_write_acknowledges_before_syncing(pool: PgPool) {
     let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
     let body = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[7u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[7u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(OWNER_DID)),
         repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",

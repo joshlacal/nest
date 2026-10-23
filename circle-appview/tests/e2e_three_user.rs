@@ -6,12 +6,13 @@
 //! 3. Bob replies to Alice's post within the Circle.
 //! 4. Carol likes Alice's post within the Circle.
 //! 5. Dave (unauthorized stranger) is denied discovery, feed, thread, media, write, and counts.
-//! 6. Alice adds Dave to Family -> Dave receives full Circle history and media access.
+//! 6. Alice adds Dave to Family -> Dave receives full Circle history; private media remains disabled.
 //! 7. Alice removes Bob -> Bob's access and active lease are revoked immediately;
 //!    Alice, Carol, and Dave retain full access to Circle content.
 //! 8. Public boundary verification: zero Circle URIs, private text, or private blob CIDs
 //!    appear on public search, feed, thread, or notification surfaces.
 
+mod support;
 use std::sync::Arc;
 
 use axum::{
@@ -489,12 +490,15 @@ impl ThreeUserEnv {
         let credential_store = Arc::new(CredentialStore::new());
         let space_locks = Arc::new(SpaceLockManager::new());
 
+        support::healthy_identity_fixture(&pool, &[ALICE_DID, BOB_DID, CAROL_DID, DAVE_DID]).await;
+
         let config = Config {
             host: "127.0.0.1".into(),
             port: 3002,
             database_url: "postgres://localhost/postgres".into(),
             service_did: CIRCLE_AUDIENCE.into(),
             plc_directory_url: "https://plc.directory".into(),
+            identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
             appview_base_url: "http://127.0.0.1:3002".into(),
@@ -1027,21 +1031,21 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
         Some(1)
     );
     let (alice_media_status, alice_media_bytes) = env.alice.media(&env, &post).await;
-    assert_eq!(alice_media_status, StatusCode::OK);
-    assert_eq!(
+    assert_eq!(alice_media_status, StatusCode::FORBIDDEN);
+    assert_ne!(
         alice_media_bytes,
         b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO"
     );
 
     let (bob_media_status, bob_media_bytes) = env.bob.media(&env, &post).await;
-    assert_eq!(bob_media_status, StatusCode::OK);
-    assert_eq!(
+    assert_eq!(bob_media_status, StatusCode::FORBIDDEN);
+    assert_ne!(
         bob_media_bytes,
         b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO"
     );
 
     // -----------------------------------------------------------------------
-    // Add Dave to Family -> Dave receives full history & media
+    // Add Dave to Family -> Dave receives full history; media stays disabled
     // -----------------------------------------------------------------------
 
     env.add_member(&circle, env.dave.did()).await;
@@ -1068,15 +1072,15 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
         StatusCode::OK,
         "Dave must receive 200 OK for thread after being added"
     );
-    // Dave can fetch media
+    // Media remains unavailable until private blob qualification.
     assert_eq!(
         env.dave.media_status(&env, &post).await,
-        StatusCode::OK,
-        "Dave must receive 200 OK for media after being added"
+        StatusCode::FORBIDDEN,
+        "Media must stay forbidden after membership is granted"
     );
     let (dave_media_status, dave_media_bytes) = env.dave.media(&env, &post).await;
-    assert_eq!(dave_media_status, StatusCode::OK);
-    assert_eq!(
+    assert_eq!(dave_media_status, StatusCode::FORBIDDEN);
+    assert_ne!(
         dave_media_bytes,
         b"CANARY_SECRET_FAMILY_IMAGE_BYTES_ALICE_PHOTO"
     );
@@ -1150,9 +1154,15 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
         Some(1),
         "Dave must see Bob's historical reply in thread"
     );
-    // Carol and Dave can still fetch media
-    assert_eq!(env.carol.media_status(&env, &post).await, StatusCode::OK);
-    assert_eq!(env.dave.media_status(&env, &post).await, StatusCode::OK);
+    // Even active members cannot fetch unqualified private media.
+    assert_eq!(
+        env.carol.media_status(&env, &post).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        env.dave.media_status(&env, &post).await,
+        StatusCode::FORBIDDEN
+    );
 
     // -----------------------------------------------------------------------
     // Public Boundary Verification: Zero Circle artifacts on public surfaces

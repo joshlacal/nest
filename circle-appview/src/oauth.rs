@@ -2775,6 +2775,7 @@ mod tests {
             database_url: "postgres://unused".into(),
             service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
             plc_directory_url: "https://plc.directory".into(),
+            identity_relay_url: None,
             public_appview_url: "https://public.api.bsky.app".into(),
             circle_media_base_url: url::Url::parse("https://media.circles.catbird.blue").unwrap(),
             appview_base_url: "http://127.0.0.1:3002".into(),

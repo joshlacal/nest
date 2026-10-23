@@ -12,6 +12,7 @@ pub struct Config {
     pub database_url: String,
     pub service_did: String,
     pub plc_directory_url: String,
+    pub identity_relay_url: Option<url::Url>,
     pub public_appview_url: String,
     pub circle_media_base_url: url::Url,
     pub appview_base_url: String,
@@ -35,6 +36,11 @@ impl Config {
             .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circles".to_string());
         let plc_directory_url =
             env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
+        let identity_relay_url = env::var("CIRCLE_IDENTITY_RELAY_URL")
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| crate::identity_events::validate_relay_url(&raw))
+            .transpose()?;
         let public_appview_url = env::var("PUBLIC_APPVIEW_URL")
             .unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
         let circle_media_base_url_raw = env::var("CIRCLE_MEDIA_BASE_URL")
@@ -108,15 +114,14 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-        // Upstream v1 is the only commit format. A leftover policy variable from
-        // the retired v2 fork is ignored (not fatal) so an old drop-in cannot
-        // crash-loop the service.
+        // A leftover signature-policy variable from the retired commit fork is
+        // ignored; current reads always require request-specific response MACs.
         if let Ok(policy) = env::var("COMMIT_VERIFICATION_POLICY")
             .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
         {
             tracing::warn!(
                 %policy,
-                "COMMIT_VERIFICATION_POLICY is obsolete and ignored; upstream v1 commits are always verified"
+                "COMMIT_VERIFICATION_POLICY is obsolete and ignored; Spaces response MACs are always required"
             );
         }
 
@@ -126,6 +131,7 @@ impl Config {
             database_url,
             service_did,
             plc_directory_url,
+            identity_relay_url,
             public_appview_url,
             circle_media_base_url,
             appview_base_url,

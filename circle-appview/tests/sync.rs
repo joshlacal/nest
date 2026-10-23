@@ -1,4 +1,6 @@
+mod support;
 use std::sync::Arc;
+use support::{fixture_commit, fixture_star};
 
 use axum::http::StatusCode;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -375,7 +377,6 @@ struct SyncTestSetup {
     state: AppState,
     mock_transport: Arc<MockSpaceHostTransport>,
     owner_signing_key: SigningKey,
-    bob_signing_key: SigningKey,
 }
 
 fn register_did_doc(
@@ -430,6 +431,7 @@ fn register_did_doc(
 }
 
 async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
+    support::healthy_identity_fixture(&pool, &[OWNER_DID, BOB_DID, DAVE_DID]).await;
     circle_appview::db::run_migrations(&pool)
         .await
         .expect("Migrations must succeed");
@@ -443,6 +445,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: "did:web:appview.catbird.blue".into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -545,7 +548,6 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         state,
         mock_transport,
         owner_signing_key: owner_key,
-        bob_signing_key: bob_key,
     }
 }
 
@@ -568,13 +570,7 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
     lthash.add("app.bsky.feed.post", "3l7post111111", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -660,13 +656,7 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     let mut bad_lthash = LtHash::new();
     bad_lthash.add("app.bsky.feed.post", "3l7tampered11", "bafytamperedcid");
 
-    let bad_commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        bad_lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let bad_commit = fixture_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", bad_lthash.as_bytes());
 
     let inc_op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(inc_post_cid)),
@@ -693,12 +683,11 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     let mut full_lthash = LtHash::new();
     full_lthash.add("app.bsky.feed.post", "3l7fullpost11", &full_post_cid);
 
-    let full_commit = mint_signed_commit(
+    let full_commit = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7bbbbbbbbbb",
         full_lthash.as_bytes(),
-        &setup.owner_signing_key,
     );
 
     let repo_records = vec![RepoRecord {
@@ -708,7 +697,7 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
         value: full_post_val,
     }];
 
-    let car_bytes = mint_repo_car(&full_commit, &repo_records).unwrap();
+    let car_bytes = fixture_star(&full_commit, &repo_records).unwrap();
     setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
     // 3. Run sync -> Incremental hash mismatch must transparently trigger FullRecovery!
@@ -765,13 +754,7 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
     lthash.add("app.bsky.feed.post", "3l7bobinval11", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, BOB_DID, rev, lthash.as_bytes());
 
     let invalid_op = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid)),
@@ -876,13 +859,7 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     lthash.add("app.bsky.feed.post", "3l7notifypost", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -906,7 +883,7 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     );
 
     let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
             &lthash.digest(),
         ),
         repo: Did::from(String::from(OWNER_DID)),
@@ -982,13 +959,7 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     lthash.add("app.bsky.feed.post", "3l7sweeppost1", &post_cid);
 
     let rev = "3l7aaaaaaaaaa";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -1014,7 +985,7 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     // Space host returns listRepos with updated revision and 32-byte SHA256 digest
     let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
         did: Did::from(String::from(OWNER_DID)),
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
             &lthash.digest(),
         ),
         repo_rev: Tid::from(String::from(rev)),
@@ -1405,13 +1376,7 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
     lthash.add("app.bsky.feed.post", "3l7page2reply", &reply_cid);
 
     let rev = "3l7page2termb";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     // Page 1: owner post with cursor="page2"
     let op_page1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
@@ -1466,8 +1431,8 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
     assert_eq!(result.records_accepted, 2);
 }
 #[sqlx::test(migrations = "./migrations")]
-async fn two_root_car_full_recovery_and_tampered_car_rejection(pool: PgPool) {
-    let setup = setup_sync_test(pool.clone()).await;
+async fn star_roundtrip_and_tampered_record_rejection(pool: PgPool) {
+    let _setup = setup_sync_test(pool.clone()).await;
 
     let post1_val = json!({
         "$type": "app.bsky.feed.post",
@@ -1488,13 +1453,7 @@ async fn two_root_car_full_recovery_and_tampered_car_rejection(pool: PgPool) {
     lthash.add("app.bsky.feed.post", "3l7post222222", &post2_cid);
 
     let rev = "3l7carrecovbb";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let records = vec![
         RepoRecord {
@@ -1511,29 +1470,32 @@ async fn two_root_car_full_recovery_and_tampered_car_rejection(pool: PgPool) {
         },
     ];
 
-    // 1. CAR encoding and decoding round-trip verification
-    let car_bytes = mint_repo_car(&commit, &records).unwrap();
-    let decoded = decode_repo_car(&car_bytes).unwrap();
+    // 1. STAR encoding and decoding round-trip verification
+    let car_bytes = fixture_star(&commit, &records).unwrap();
+    let decoded =
+        circle_appview::space_star::parse_repo_star(&car_bytes, SPACE_URI, OWNER_DID).unwrap();
     assert_eq!(decoded.commit.rev.as_str(), rev);
     assert_eq!(decoded.records.len(), 2);
-    assert_eq!(decoded.records[0].rkey, "3l7post111111");
-    assert_eq!(decoded.records[1].rkey, "3l7post222222");
+    assert_eq!(decoded.records[0].1, "3l7post111111");
+    assert_eq!(decoded.records[1].1, "3l7post222222");
 
-    // 2. Tampered CAR block CID rejection
+    // 2. Tampered STAR record rejection
     let mut tampered_car = car_bytes.clone();
     let last_idx = tampered_car.len() - 10;
     tampered_car[last_idx] ^= 0xff; // corrupt a record block
-    assert!(decode_repo_car(&tampered_car).is_err());
+    assert!(
+        circle_appview::space_star::parse_repo_star(&tampered_car, SPACE_URI, OWNER_DID).is_err()
+    );
 }
 /// The forwarded notifyWrite body is {space, repo, repoRev, hash, spaceRev,
 /// prevSpaceRev?}: prevSpaceRev is omitted on a space's first update, and the
 /// pre-Oct-1 `rev` field no longer parses.
 #[test]
-fn notify_write_body_parses_the_oct1_shape() {
+fn notify_write_body_parses_the_oct22_shape() {
     use catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite;
 
     let first = NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[9u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[9u8; 32]),
         repo: Did::from(String::from(OWNER_DID)),
         repo_rev: Tid::from(String::from("3l7rev234567a")),
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
@@ -1546,7 +1508,7 @@ fn notify_write_body_parses_the_oct1_shape() {
     let keys: std::collections::BTreeSet<_> = wire.as_object().unwrap().keys().cloned().collect();
     assert_eq!(
         keys,
-        ["hash", "repo", "repoRev", "space", "spaceRev"]
+        ["data", "repo", "repoRev", "space", "spaceRev"]
             .into_iter()
             .map(String::from)
             .collect()
@@ -1585,7 +1547,7 @@ async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
     use tower::ServiceExt;
 
     let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]),
         repo: Did::from(String::from(OWNER_DID)),
         repo_rev: Tid::from(String::from("3l7rev234567a")),
         space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
@@ -1658,13 +1620,7 @@ async fn full_recovery_verifies_against_authority_expected_hash_and_rejects_mism
     lthash.add("app.bsky.feed.post", "3l7hashpost1", &post_cid);
 
     let rev = "3l7hashrevaaa";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let records = vec![RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -1673,7 +1629,7 @@ async fn full_recovery_verifies_against_authority_expected_hash_and_rejects_mism
         value: post_val,
     }];
 
-    let car_bytes = mint_repo_car(&commit, &records).unwrap();
+    let car_bytes = fixture_star(&commit, &records).unwrap();
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
@@ -1681,7 +1637,7 @@ async fn full_recovery_verifies_against_authority_expected_hash_and_rejects_mism
     let sync_engine = SyncEngine::new(&setup.state);
 
     // 1. Full recovery with correct expected hash succeeds
-    let expected_hash = commit.hash.as_ref();
+    let expected_hash = commit.data.as_ref();
     let result = sync_engine
         .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(expected_hash))
         .await
@@ -1747,13 +1703,7 @@ async fn federated_repo_sync_routes_to_member_pds_endpoint(pool: PgPool) {
     bob_lthash.add("app.bsky.feed.post", "3l7bobreplyfed", &bob_reply_cid);
 
     let rev = "3l7bobfedreva";
-    let bob_commit = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        rev,
-        bob_lthash.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let bob_commit = fixture_commit(SPACE_URI, BOB_DID, rev, bob_lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(bob_reply_cid.clone())),
@@ -1827,13 +1777,7 @@ async fn ordered_operations_preserve_delete_then_recreate_on_same_path(pool: PgP
     lthash.add("app.bsky.feed.post", "3l7samepath", &new_cid);
 
     let rev = "3l7recreateaa";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_create_1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(original_cid.clone())),
@@ -1925,13 +1869,7 @@ async fn strong_reference_validation_rejects_without_fail_open_and_ignores_non_p
     lthash.add("app.bsky.feed.post", "3l7randomrep", &random_reply_cid);
 
     let rev = "3l7failopenra";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, BOB_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(random_reply_cid)),
@@ -2021,12 +1959,11 @@ async fn like_reconciliation_updates_in_place_and_preserves_cross_user_likes_on_
     let mut full_lthash = LtHash::new();
     full_lthash.add("app.bsky.feed.post", "3l7likedpost", &post_cid);
 
-    let full_commit = mint_signed_commit(
+    let full_commit = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7fullrecova",
         full_lthash.as_bytes(),
-        &setup.owner_signing_key,
     );
 
     let records = vec![RepoRecord {
@@ -2036,13 +1973,13 @@ async fn like_reconciliation_updates_in_place_and_preserves_cross_user_likes_on_
         value: post_val,
     }];
 
-    let car_bytes = mint_repo_car(&full_commit, &records).unwrap();
+    let car_bytes = fixture_star(&full_commit, &records).unwrap();
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
     let sync_engine = SyncEngine::new(&setup.state);
     let result = sync_engine
-        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(full_commit.hash.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(full_commit.data.as_ref()))
         .await
         .unwrap();
     assert_eq!(result.mode, SyncMode::FullRecovery);
@@ -2132,13 +2069,7 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7sweepp2", &post_cid);
     let rev = "3l7page2revbb";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -2170,7 +2101,7 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     let entry =
         |space_rev: &str| catbird_atproto::generated::com_atproto::space::list_repos::Repo {
             did: Did::from(String::from(OWNER_DID)),
-            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
                 &lthash.digest(),
             ),
             repo_rev: Tid::from(String::from(rev)),
@@ -2225,7 +2156,10 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     assert_eq!(list_uses.len(), 3);
     for u in &list_uses {
         assert_eq!(u.auth.audience.as_deref(), Some(OWNER_DID));
-        assert!(u.auth.authorization.starts_with("Atproto-Space "));
+        assert!(u
+            .auth
+            .authorization
+            .starts_with("Atproto-Space-Credential "));
     }
 }
 
@@ -2243,13 +2177,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7postnotify1", &post_cid);
     let rev = "3l7notifysync";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -2283,7 +2211,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     let wrong_hash = [0x99u8; 32];
     let notify_input_mismatched =
         catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
                 &wrong_hash,
             ),
             repo: Did::from(String::from(OWNER_DID)),
@@ -2340,7 +2268,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     // 2. Correct notify hash -> Accepted
     let notify_input_correct =
         catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
                 &lthash.digest(),
             ),
             repo: Did::from(String::from(OWNER_DID)),
@@ -2399,13 +2327,7 @@ async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgP
 
     let mut lthash1 = LtHash::new();
     lthash1.add("app.bsky.feed.post", "3l7postp11111", &p1_cid);
-    let commit1 = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7rev234567a",
-        lthash1.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit1 = fixture_commit(SPACE_URI, OWNER_DID, "3l7rev234567a", lthash1.as_bytes());
 
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
@@ -2446,13 +2368,7 @@ async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgP
 
     let mut lthash2 = LtHash::new();
     lthash2.add("app.bsky.feed.post", "3l7replyonly1", &reply_cid);
-    let commit2 = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7rev234567b",
-        lthash2.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit2 = fixture_commit(SPACE_URI, OWNER_DID, "3l7rev234567b", lthash2.as_bytes());
 
     let rec_reply = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -2460,7 +2376,7 @@ async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgP
         cid: reply_cid,
         value: reply_val,
     };
-    let car_bytes = mint_repo_car(&commit2, &[rec_reply]).unwrap();
+    let car_bytes = fixture_star(&commit2, &[rec_reply]).unwrap();
     setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
     let res2 = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
@@ -2488,13 +2404,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
 
     let mut lthash_a = LtHash::new();
     lthash_a.add("app.bsky.feed.post", "3l7targetp111", &p1_cid);
-    let commit_a1 = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567a234",
-        lthash_a.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit_a1 = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567a234", lthash_a.as_bytes());
 
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
@@ -2528,13 +2438,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
 
     let mut lthash_b = LtHash::new();
     lthash_b.add("app.bsky.feed.like", "3l7like111111", &l1_cid);
-    let commit_b1 = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567b234",
-        lthash_b.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit_b1 = fixture_commit(SPACE_URI, BOB_DID, "3l7234567b234", lthash_b.as_bytes());
 
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
@@ -2576,13 +2480,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
 
     lthash_b.remove("app.bsky.feed.like", "3l7like111111", &l1_cid);
     lthash_b.add("app.bsky.feed.like", "3l7like111111", &l1_invalid_cid);
-    let commit_b2 = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567c234",
-        lthash_b.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit_b2 = fixture_commit(SPACE_URI, BOB_DID, "3l7234567c234", lthash_b.as_bytes());
 
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
@@ -2621,13 +2519,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     // 4. Alice deletes post P1 -> circle_likes pointing to P1 and notifications are deleted
     let mut lthash_a2 = lthash_a.clone();
     lthash_a2.remove("app.bsky.feed.post", "3l7targetp111", &p1_cid);
-    let commit_a2 = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567d234",
-        lthash_a2.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit_a2 = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567d234", lthash_a2.as_bytes());
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
@@ -2675,13 +2567,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
 
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7cyclepost1", &post_cid);
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7cyclerev22",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, "3l7cyclerev22", lthash.as_bytes());
 
     let key = format!("{SPACE_URI}:{OWNER_DID}");
 
@@ -2719,7 +2605,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
         cid: post_cid,
         value: post_val,
     };
-    let car_bytes = mint_repo_car(&commit, &[rec]).unwrap();
+    let car_bytes = fixture_star(&commit, &[rec]).unwrap();
     setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
     let res = sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
@@ -3402,7 +3288,7 @@ async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
 
     let short_hash_input =
         catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
                 &[0x11u8; 16],
             ),
             repo: Did::from(String::from(OWNER_DID)),
@@ -3447,7 +3333,7 @@ async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
     // repoRev replaced.
     let body_with_repo_rev = |repo_rev: &str| {
         let input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
                 &[0x22u8; 32],
             ),
             repo: Did::from(String::from(DAVE_DID)),
@@ -3513,13 +3399,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7postrev1", &post_cid);
     let commit_rev = "3l7234567a234";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        commit_rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, commit_rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -3548,7 +3428,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
         cid: post_cid.clone(),
         value: post_val,
     };
-    let car_bytes = mint_repo_car(&commit, &[rec]).unwrap();
+    let car_bytes = fixture_star(&commit, &[rec]).unwrap();
     setup.mock_transport.set_get_repo_response(&key, car_bytes);
 
     // 1. Sync with matching hash and matching rev -> Succeeds in incremental mode
@@ -3556,7 +3436,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
         .sync_repo_with_expected_commit(
             SPACE_URI,
             OWNER_DID,
-            Some(commit.hash.as_ref()),
+            Some(commit.data.as_ref()),
             Some(commit_rev),
         )
         .await
@@ -3569,7 +3449,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
         .sync_repo_with_expected_commit(
             SPACE_URI,
             OWNER_DID,
-            Some(commit.hash.as_ref()),
+            Some(commit.data.as_ref()),
             Some("3l7234567b234"),
         )
         .await;
@@ -3593,12 +3473,11 @@ async fn full_recovery_retains_other_authors_when_recovering_authority(pool: PgP
     let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
     let mut lthash_owner = LtHash::new();
     lthash_owner.add("app.bsky.feed.post", "3l7p1owner", &p1_cid);
-    let commit_owner1 = mint_signed_commit(
+    let commit_owner1 = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7234567a234",
         lthash_owner.as_bytes(),
-        &setup.owner_signing_key,
     );
     let rec_p1 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -3606,7 +3485,7 @@ async fn full_recovery_retains_other_authors_when_recovering_authority(pool: PgP
         cid: p1_cid.clone(),
         value: p1_val.clone(),
     };
-    let car_p1 = mint_repo_car(&commit_owner1, &[rec_p1]).unwrap();
+    let car_p1 = fixture_star(&commit_owner1, &[rec_p1]).unwrap();
     let owner_key = format!("{SPACE_URI}:{OWNER_DID}");
     setup
         .mock_transport
@@ -3628,20 +3507,14 @@ async fn full_recovery_retains_other_authors_when_recovering_authority(pool: PgP
     let r1_cid = compute_dagcbor_cid(&r1_val).unwrap();
     let mut lthash_bob = LtHash::new();
     lthash_bob.add("app.bsky.feed.post", "3l7r1bob", &r1_cid);
-    let commit_bob = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567b234",
-        lthash_bob.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit_bob = fixture_commit(SPACE_URI, BOB_DID, "3l7234567b234", lthash_bob.as_bytes());
     let rec_r1 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7r1bob".to_string(),
         cid: r1_cid.clone(),
         value: r1_val,
     };
-    let car_bob = mint_repo_car(&commit_bob, &[rec_r1]).unwrap();
+    let car_bob = fixture_star(&commit_bob, &[rec_r1]).unwrap();
     let bob_key = format!("{SPACE_URI}:{BOB_DID}");
     setup
         .mock_transport
@@ -3657,12 +3530,11 @@ async fn full_recovery_retains_other_authors_when_recovering_authority(pool: PgP
     });
     let p2_cid = compute_dagcbor_cid(&p2_val).unwrap();
     lthash_owner.add("app.bsky.feed.post", "3l7p2owner", &p2_cid);
-    let commit_owner2 = mint_signed_commit(
+    let commit_owner2 = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7234567c234",
         lthash_owner.as_bytes(),
-        &setup.owner_signing_key,
     );
     let rec_p2 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -3676,14 +3548,14 @@ async fn full_recovery_retains_other_authors_when_recovering_authority(pool: PgP
         cid: p1_cid,
         value: p1_val,
     };
-    let car_owner_full = mint_repo_car(&commit_owner2, &[rec_p1_renew, rec_p2]).unwrap();
+    let car_owner_full = fixture_star(&commit_owner2, &[rec_p1_renew, rec_p2]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&owner_key, car_owner_full);
 
     // Force full recovery on owner
     let res_recovery = sync_engine
-        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(commit_owner2.hash.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(commit_owner2.data.as_ref()))
         .await
         .unwrap();
     assert_eq!(res_recovery.mode, SyncMode::FullRecovery);
@@ -3716,13 +3588,7 @@ async fn staged_rejection_removes_uri_from_policy_preventing_stale_deps(pool: Pg
     let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7p1target", &p1_cid);
-    let commit1 = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567a234",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit1 = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567a234", lthash.as_bytes());
     let rec_p1 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
         rkey: "3l7p1target".to_string(),
@@ -3730,7 +3596,7 @@ async fn staged_rejection_removes_uri_from_policy_preventing_stale_deps(pool: Pg
         value: p1_val,
     };
     let key = format!("{SPACE_URI}:{OWNER_DID}");
-    let car = mint_repo_car(&commit1, &[rec_p1]).unwrap();
+    let car = fixture_star(&commit1, &[rec_p1]).unwrap();
     setup.mock_transport.set_get_repo_response(&key, car);
 
     sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
@@ -3763,13 +3629,7 @@ async fn staged_rejection_removes_uri_from_policy_preventing_stale_deps(pool: Pg
     lthash.add("app.bsky.feed.post", "3l7p1target", &p1_invalid_cid);
     lthash.add("app.bsky.feed.post", "3l7replyattempt", &reply_cid);
 
-    let commit2 = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7234567b234",
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit2 = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567b234", lthash.as_bytes());
 
     let op1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(p1_invalid_cid)),
@@ -3824,12 +3684,11 @@ async fn notification_provenance_source_uri_and_comprehensive_cleanup_on_update_
     let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
     let mut lthash_owner = LtHash::new();
     lthash_owner.add("app.bsky.feed.post", "3l7notifpost1", &p1_cid);
-    let commit_owner = mint_signed_commit(
+    let commit_owner = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7234567a234",
         lthash_owner.as_bytes(),
-        &setup.owner_signing_key,
     );
     let rec_p1 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -3837,7 +3696,7 @@ async fn notification_provenance_source_uri_and_comprehensive_cleanup_on_update_
         cid: p1_cid.clone(),
         value: p1_val,
     };
-    let car_owner = mint_repo_car(&commit_owner, &[rec_p1]).unwrap();
+    let car_owner = fixture_star(&commit_owner, &[rec_p1]).unwrap();
     let owner_key = format!("{SPACE_URI}:{OWNER_DID}");
     setup
         .mock_transport
@@ -3855,20 +3714,14 @@ async fn notification_provenance_source_uri_and_comprehensive_cleanup_on_update_
     let like_cid = compute_dagcbor_cid(&like_val).unwrap();
     let mut lthash_bob = LtHash::new();
     lthash_bob.add("app.bsky.feed.like", "3l7likebob1", &like_cid);
-    let commit_bob1 = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567b234",
-        lthash_bob.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit_bob1 = fixture_commit(SPACE_URI, BOB_DID, "3l7234567b234", lthash_bob.as_bytes());
     let rec_like = RepoRecord {
         collection: "app.bsky.feed.like".to_string(),
         rkey: "3l7likebob1".to_string(),
         cid: like_cid.clone(),
         value: like_val,
     };
-    let car_bob1 = mint_repo_car(&commit_bob1, &[rec_like]).unwrap();
+    let car_bob1 = fixture_star(&commit_bob1, &[rec_like]).unwrap();
     let bob_key = format!("{SPACE_URI}:{BOB_DID}");
     setup
         .mock_transport
@@ -3893,14 +3746,8 @@ async fn notification_provenance_source_uri_and_comprehensive_cleanup_on_update_
 
     // Step 3: Bob deletes his like
     lthash_bob.remove("app.bsky.feed.like", "3l7likebob1", &like_cid);
-    let commit_bob2 = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567c234",
-        lthash_bob.as_bytes(),
-        &setup.bob_signing_key,
-    );
-    let car_bob2 = mint_repo_car(&commit_bob2, &[]).unwrap();
+    let commit_bob2 = fixture_commit(SPACE_URI, BOB_DID, "3l7234567c234", lthash_bob.as_bytes());
+    let car_bob2 = fixture_star(&commit_bob2, &[]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&bob_key, car_bob2);
@@ -3998,12 +3845,11 @@ async fn notification_source_identity_preserved_on_unchanged_recovery_and_replac
     let p1_cid = compute_dagcbor_cid(&p1_val).unwrap();
     let mut lthash_owner = LtHash::new();
     lthash_owner.add("app.bsky.feed.post", "3l7notifp1", &p1_cid);
-    let commit_owner = mint_signed_commit(
+    let commit_owner = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7234567a234",
         lthash_owner.as_bytes(),
-        &setup.owner_signing_key,
     );
     let rec_p1 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -4011,7 +3857,7 @@ async fn notification_source_identity_preserved_on_unchanged_recovery_and_replac
         cid: p1_cid.clone(),
         value: p1_val,
     };
-    let car_owner = mint_repo_car(&commit_owner, std::slice::from_ref(&rec_p1)).unwrap();
+    let car_owner = fixture_star(&commit_owner, std::slice::from_ref(&rec_p1)).unwrap();
     let owner_key = format!("{SPACE_URI}:{OWNER_DID}");
     setup
         .mock_transport
@@ -4029,20 +3875,14 @@ async fn notification_source_identity_preserved_on_unchanged_recovery_and_replac
     let like_cid = compute_dagcbor_cid(&like_val).unwrap();
     let mut lthash_bob = LtHash::new();
     lthash_bob.add("app.bsky.feed.like", "3l7like1", &like_cid);
-    let commit_bob = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567b234",
-        lthash_bob.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit_bob = fixture_commit(SPACE_URI, BOB_DID, "3l7234567b234", lthash_bob.as_bytes());
     let rec_like = RepoRecord {
         collection: "app.bsky.feed.like".to_string(),
         rkey: "3l7like1".to_string(),
         cid: like_cid.clone(),
         value: like_val.clone(),
     };
-    let car_bob = mint_repo_car(&commit_bob, std::slice::from_ref(&rec_like)).unwrap();
+    let car_bob = fixture_star(&commit_bob, std::slice::from_ref(&rec_like)).unwrap();
     let bob_key = format!("{SPACE_URI}:{BOB_DID}");
     setup
         .mock_transport
@@ -4100,12 +3940,11 @@ async fn notification_source_identity_preserved_on_unchanged_recovery_and_replac
     });
     let p2_cid = compute_dagcbor_cid(&p2_val).unwrap();
     lthash_owner.add("app.bsky.feed.post", "3l7notifp2", &p2_cid);
-    let commit_owner2 = mint_signed_commit(
+    let commit_owner2 = fixture_commit(
         SPACE_URI,
         OWNER_DID,
         "3l7234567a345",
         lthash_owner.as_bytes(),
-        &setup.owner_signing_key,
     );
     let rec_p2 = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -4113,7 +3952,7 @@ async fn notification_source_identity_preserved_on_unchanged_recovery_and_replac
         cid: p2_cid.clone(),
         value: p2_val,
     };
-    let car_owner2 = mint_repo_car(&commit_owner2, &[rec_p1, rec_p2]).unwrap();
+    let car_owner2 = fixture_star(&commit_owner2, &[rec_p1, rec_p2]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&owner_key, car_owner2);
@@ -4129,20 +3968,14 @@ async fn notification_source_identity_preserved_on_unchanged_recovery_and_replac
     let updated_like_cid = compute_dagcbor_cid(&updated_like_val).unwrap();
     lthash_bob.remove("app.bsky.feed.like", "3l7like1", &like_cid);
     lthash_bob.add("app.bsky.feed.like", "3l7like1", &updated_like_cid);
-    let commit_bob2 = mint_signed_commit(
-        SPACE_URI,
-        BOB_DID,
-        "3l7234567b345",
-        lthash_bob.as_bytes(),
-        &setup.bob_signing_key,
-    );
+    let commit_bob2 = fixture_commit(SPACE_URI, BOB_DID, "3l7234567b345", lthash_bob.as_bytes());
     let rec_updated_like = RepoRecord {
         collection: "app.bsky.feed.like".to_string(),
         rkey: "3l7like1".to_string(),
         cid: updated_like_cid.clone(),
         value: updated_like_val,
     };
-    let car_bob2 = mint_repo_car(&commit_bob2, &[rec_updated_like]).unwrap();
+    let car_bob2 = fixture_star(&commit_bob2, &[rec_updated_like]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&bob_key, car_bob2);
@@ -4734,13 +4567,7 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7sweepsch1", &post_cid);
     let rev = "3l7234567a234";
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        rev,
-        lthash.as_bytes(),
-        &setup.owner_signing_key,
-    );
+    let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
@@ -4765,7 +4592,7 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
 
     let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
         did: Did::from(String::from(OWNER_DID)),
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
             &lthash.digest(),
         ),
         repo_rev: Tid::from(String::from(rev)),
@@ -4939,7 +4766,7 @@ fn credential_use_methods(setup: &SyncTestSetup) -> Vec<&'static str> {
         .map(|u| {
             assert_eq!(
                 u.auth.authorization,
-                format!("Atproto-Space {CACHED_CREDENTIAL}"),
+                format!("Atproto-Space-Credential {CACHED_CREDENTIAL}"),
                 "only the cached credential exists in these tests"
             );
             u.method
@@ -4998,7 +4825,7 @@ async fn rejected_credential_stops_the_sweep_and_is_never_retried(pool: PgPool) 
             repos: vec![
                 catbird_atproto::generated::com_atproto::space::list_repos::Repo {
                     did: Did::from(String::from(OWNER_DID)),
-                    hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                    data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
                         &[0x11; 32],
                     ),
                     repo_rev: Tid::from(String::from("3l7234567a234")),
@@ -5066,7 +4893,7 @@ fn space_rev(i: usize) -> String {
 fn writer_entry(i: usize) -> catbird_atproto::generated::com_atproto::space::list_repos::Repo {
     catbird_atproto::generated::com_atproto::space::list_repos::Repo {
         did: Did::from(format!("did:plc:resume-writer-{i}")),
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x22; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x22; 32]),
         repo_rev: Tid::from(String::from("3l7234567a234")),
         space_rev: Tid::from(space_rev(i)),
         extra_data: None,

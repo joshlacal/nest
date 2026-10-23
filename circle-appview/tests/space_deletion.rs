@@ -4,6 +4,7 @@
 //! credential failure purges. A tombstoned Circle answers reads with the declared
 //! `AccessRemoved`, and expired tombstones are purged by a scheduled task.
 
+mod support;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -63,6 +64,7 @@ fn register_did_doc(resolver: &DidResolver, did: &str, services: Vec<DidService>
 }
 
 async fn setup(pool: PgPool) -> Setup {
+    support::healthy_identity_fixture(&pool, &[OWNER_DID, BOB_DID]).await;
     std::env::set_var(
         "SESSION_ENCRYPTION_KEY",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -73,6 +75,7 @@ async fn setup(pool: PgPool) -> Setup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),

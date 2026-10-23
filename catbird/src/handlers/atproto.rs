@@ -1690,7 +1690,12 @@ pub async fn proxy_xrpc(
                 let name_str = name.as_str();
                 if matches!(
                     name_str,
-                    "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+                    "content-type"
+                        | "content-length"
+                        | "cache-control"
+                        | "etag"
+                        | "last-modified"
+                        | "atproto-space-mac"
                 ) {
                     response = response.header(name, value);
                 }
@@ -1720,7 +1725,12 @@ pub async fn proxy_xrpc(
                 let name_str = name.as_str();
                 if matches!(
                     name_str,
-                    "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+                    "content-type"
+                        | "content-length"
+                        | "cache-control"
+                        | "etag"
+                        | "last-modified"
+                        | "atproto-space-mac"
                 ) {
                     response = response.header(name, value);
                 }
