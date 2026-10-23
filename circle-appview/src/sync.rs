@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -9,9 +9,8 @@ use crate::access::{
 };
 use crate::auth::{select_verification_method, DidResolver};
 use crate::commit::{
-    compute_dagcbor_cid, extract_and_validate_car_with_policy, parse_permissioned_car,
-    verify_commit_with_policy, CommitContext, CommitContextV2, CommitVerificationPolicy, LtHash,
-    LTHASH_SIZE,
+    compute_dagcbor_cid, extract_and_validate_car, parse_permissioned_car, verify_commit,
+    CommitContext, LtHash, LTHASH_SIZE,
 };
 use crate::config::AppState;
 use crate::error::AppError;
@@ -47,12 +46,55 @@ pub struct SyncResult {
     pub bytes_processed: usize,
 }
 
+/// Where the revision sweep resumes a space's listRepos listing that its budget
+/// cut short. Held in memory only: after a restart every space is listed from
+/// the beginning.
+///
+/// listRepos ascends by spaceRev, so restarting a cut listing from the
+/// beginning would always drop the most recently updated writers (and, in a
+/// space larger than the budget, never reach them). A cut listing resumes after
+/// the spaceRev of the last entry it finished with, which the exclusive cursor
+/// accepts. Once a listing reaches its empty final page the space's next
+/// listing starts from the beginning again, re-checking every writer,
+/// including any whose sync failed.
+#[derive(Default)]
+pub struct ListingResumePoints {
+    space_revs: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl ListingResumePoints {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The exclusive spaceRev cursor to resume `space_uri`'s listing from.
+    pub fn get(&self, space_uri: &str) -> Option<String> {
+        self.lock().get(space_uri).cloned()
+    }
+
+    fn set(&self, space_uri: &str, space_rev: String) {
+        self.lock().insert(space_uri.to_string(), space_rev);
+    }
+
+    fn clear(&self, space_uri: &str) {
+        self.lock().remove(space_uri);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.space_revs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SweepSummary {
     pub spaces_checked: usize,
     pub repos_checked: usize,
     pub repos_synced: usize,
     pub repos_failed: usize,
+    /// Spaces whose credential exchange returned SpaceDeleted and were purged.
+    pub spaces_purged: usize,
 }
 
 pub struct SyncEngine {
@@ -64,7 +106,6 @@ pub struct SyncEngine {
     oauth_service: Option<Arc<crate::oauth::OAuthService>>,
     http_client: reqwest::Client,
     push_client: Option<Arc<crate::push::CirclePushClient>>,
-    commit_verification_policy: CommitVerificationPolicy,
     total_bytes_processed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -94,7 +135,6 @@ impl SyncEngine {
             oauth_service: Some(state.oauth_service.clone()),
             http_client: state.http_client.clone(),
             push_client: state.push_client.clone(),
-            commit_verification_policy: state.config.commit_verification_policy.clone(),
             total_bytes_processed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -115,7 +155,6 @@ impl SyncEngine {
             oauth_service: None,
             http_client: reqwest::Client::new(),
             push_client: None,
-            commit_verification_policy: CommitVerificationPolicy::default(),
             total_bytes_processed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -126,10 +165,6 @@ impl SyncEngine {
     }
     pub fn with_push_client(mut self, push_client: Arc<crate::push::CirclePushClient>) -> Self {
         self.push_client = Some(push_client);
-        self
-    }
-    pub fn with_commit_verification_policy(mut self, policy: CommitVerificationPolicy) -> Self {
-        self.commit_verification_policy = policy;
         self
     }
     pub fn total_bytes_processed(&self) -> usize {
@@ -310,36 +345,10 @@ impl SyncEngine {
         let mut cursor: Option<String> = None;
         let mut terminal_commit = None;
         let mut fetch_failed = false;
-        let mut last_applied_op: Option<(
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            bytes::Bytes,
-        )> = None;
         let mut page_count = 0;
         let mut total_bytes = 0;
         let start_time = std::time::Instant::now();
 
-        let mut snapshotted_prev_rev = existing_sync
-            .as_ref()
-            .map(|(r, _)| r.clone())
-            .unwrap_or_default();
-        let mut snapshotted_prev_hash = {
-            let mut prev_h = [0u8; 32];
-            if let Some((_, h)) = &existing_sync {
-                if h.len() == 32 {
-                    prev_h.copy_from_slice(h);
-                } else if h.len() == LTHASH_SIZE {
-                    let digest = Sha256::digest(h);
-                    prev_h.copy_from_slice(&digest);
-                }
-            } else {
-                prev_h = lthash.digest();
-            }
-            prev_h
-        };
-        let mut last_applied_rev: Option<String> = None;
         loop {
             if page_count >= MAX_PAGES_PER_REPO_SYNC
                 || ops_applied >= MAX_OPS_PER_REPO_SYNC
@@ -360,13 +369,25 @@ impl SyncEngine {
                     last_rev.as_deref(),
                     cursor.as_deref(),
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                 )
                 .await;
 
             let page = match page_res {
                 Ok(p) => p,
-                Err(_) => {
+                Err(e) => {
+                    // A rejected credential is not retried by falling back to
+                    // getRepo with it: evict it and fail this sync.
+                    if crate::access::evict_rejected_credential(
+                        &self.credential_store,
+                        space_uri,
+                        &cred.token,
+                        &e,
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                     fetch_failed = true;
                     break;
                 }
@@ -383,12 +404,6 @@ impl SyncEngine {
                 let collection_str = op.collection.as_str();
                 let rkey_str = op.rkey.0.as_str();
                 let uri = format!("{space_uri}/{author_did}/{collection_str}/{rkey_str}");
-
-                // Snapshot LtHash and rev before folding in this operation (Finding 6 / Item 4)
-                snapshotted_prev_hash = lthash.digest();
-                if let Some(r) = &last_applied_rev {
-                    snapshotted_prev_rev = r.clone();
-                }
 
                 if let Some(cid) = &op.cid {
                     let cid_str = cid.as_str();
@@ -428,18 +443,6 @@ impl SyncEngine {
                     }
                     lthash.add(&format!("{collection_str}/{rkey_str}/{cid_str}"));
 
-                    last_applied_op = Some((
-                        format!("{collection_str}/{rkey_str}"),
-                        if op.prev.is_some() {
-                            "update".to_string()
-                        } else {
-                            "create".to_string()
-                        },
-                        Some(cid_str.to_string()),
-                        op.prev.as_ref().map(|p| p.to_string()),
-                        bytes::Bytes::from(val_bytes),
-                    ));
-
                     let candidate_val =
                         serde_json::to_value(data_val).unwrap_or(serde_json::Value::Null);
 
@@ -476,17 +479,9 @@ impl SyncEngine {
                     if let Some(prev) = &op.prev {
                         lthash.remove(&format!("{collection_str}/{rkey_str}/{}", prev.as_str()));
                     }
-                    last_applied_op = Some((
-                        format!("{collection_str}/{rkey_str}"),
-                        "delete".to_string(),
-                        None,
-                        op.prev.as_ref().map(|p| p.to_string()),
-                        bytes::Bytes::new(),
-                    ));
                     current_policy.remove_post(&uri);
                     staged_mutations.push(StagedMutation::DeleteRecord { uri });
                 }
-                last_applied_rev = Some(op.rev.to_string());
             }
 
             if fetch_failed {
@@ -519,7 +514,7 @@ impl SyncEngine {
                     author_did,
                     &repo_service_endpoint,
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                     &author_signing_key,
                     &policy,
                     expected_authority_hash,
@@ -530,17 +525,32 @@ impl SyncEngine {
 
         let commit_to_verify = match terminal_commit {
             Some(c) => Some(c),
-            None => self
+            None => match self
                 .space_client
                 .get_latest_commit(
                     &repo_service_endpoint,
                     space_uri,
                     author_did,
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                 )
                 .await
-                .ok(),
+            {
+                Ok(commit) => Some(commit),
+                Err(e) => {
+                    if crate::access::evict_rejected_credential(
+                        &self.credential_store,
+                        space_uri,
+                        &cred.token,
+                        &e,
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                    None
+                }
+            },
         };
 
         let commit_verified = if let Some(commit) = &commit_to_verify {
@@ -559,7 +569,7 @@ impl SyncEngine {
                                     author_did,
                                     &repo_service_endpoint,
                                     &cred.token,
-                                    &cred.dpop_key,
+                                    &cred.signing_key,
                                     &author_signing_key,
                                     &policy,
                                     expected_authority_hash,
@@ -578,7 +588,7 @@ impl SyncEngine {
                                     author_did,
                                     &repo_service_endpoint,
                                     &cred.token,
-                                    &cred.dpop_key,
+                                    &cred.signing_key,
                                     &author_signing_key,
                                     &policy,
                                     expected_authority_hash,
@@ -588,49 +598,12 @@ impl SyncEngine {
                         }
                     };
 
-                let context_v1 = CommitContext {
+                let context = CommitContext {
                     space: space_uri_parsed,
                     author: author_did_parsed,
                     rev: commit.rev.clone(),
                 };
-
-                let current_hash_digest: [u8; 32] = lthash.digest();
-
-                // Construct CommitContextV2 using trusted local state (Finding 18 / Item 4)
-                let (path, action, cid, prev_cid, val) =
-                    if let Some((p, act, c, prev_c, v)) = last_applied_op {
-                        (p, act, c, prev_c, v)
-                    } else {
-                        (
-                            "".to_string(),
-                            "".to_string(),
-                            None,
-                            None,
-                            bytes::Bytes::new(),
-                        )
-                    };
-
-                let context_v2 = CommitContextV2 {
-                    space: space_uri.to_string(),
-                    author: author_did.to_string(),
-                    rev: commit.rev.to_string(),
-                    prev_rev: snapshotted_prev_rev,
-                    hash: current_hash_digest,
-                    prev_hash: snapshotted_prev_hash,
-                    path,
-                    action,
-                    cid,
-                    prev_cid,
-                    val,
-                };
-
-                let policy_ver_res = verify_commit_with_policy(
-                    commit,
-                    Some(&context_v1),
-                    Some(&context_v2),
-                    &author_signing_key,
-                    &self.commit_verification_policy,
-                );
+                let policy_ver_res = verify_commit(commit, &context, &author_signing_key);
 
                 if policy_ver_res.is_ok() {
                     let hash_ok = match expected_authority_hash {
@@ -656,7 +629,7 @@ impl SyncEngine {
                     author_did,
                     &repo_service_endpoint,
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                     &author_signing_key,
                     &policy,
                     expected_authority_hash,
@@ -1094,7 +1067,7 @@ impl SyncEngine {
         author_did: &str,
         service_endpoint: &str,
         space_credential: &str,
-        dpop_key: &p256::ecdsa::SigningKey,
+        credential_key: &p256::ecdsa::SigningKey,
         author_signing_key: &crate::auth::ParsedVerifyingKey,
         policy: &ValidationPolicy,
         expected_authority_hash: Option<&[u8]>,
@@ -1108,7 +1081,7 @@ impl SyncEngine {
         .fetch_optional(&self.db)
         .await?;
 
-        let car_bytes = self
+        let car_bytes = match self
             .space_client
             .get_repo(
                 service_endpoint,
@@ -1116,23 +1089,31 @@ impl SyncEngine {
                 author_did,
                 None,
                 space_credential,
-                dpop_key,
+                credential_key,
             )
-            .await?;
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::access::evict_rejected_credential(
+                    &self.credential_store,
+                    space_uri,
+                    space_credential,
+                    &e,
+                )
+                .await;
+                return Err(e);
+            }
+        };
         self.record_bytes_processed(car_bytes.len());
 
         let car = parse_permissioned_car(&car_bytes)
             .await
             .map_err(|e| AppError::Internal(format!("CAR decoding failed: {e}")))?;
 
-        let (commit, records, lthash) = extract_and_validate_car_with_policy(
-            &car,
-            space_uri,
-            author_did,
-            author_signing_key,
-            &self.commit_verification_policy,
-        )
-        .map_err(|e| AppError::InvalidRequest(format!("CAR validation failed: {e}")))?;
+        let (commit, records, lthash) =
+            extract_and_validate_car(&car, space_uri, author_did, author_signing_key)
+                .map_err(|e| AppError::InvalidRequest(format!("CAR validation failed: {e}")))?;
         let latest_rev = commit.rev.to_string();
         if let Some((prev_rev, prev_hash)) = &existing_sync {
             let prev_hash_matches = prev_hash == lthash.state().as_slice()
@@ -1143,33 +1124,6 @@ impl SyncEngine {
                 return Err(AppError::InvalidRequest(
                     "Non-monotonic revision in full recovery: revision cannot rollback or equal existing with different hash".into(),
                 ));
-            }
-
-            // Conditional anchor: when commit.prev_rev == stored last_rev, require commit.prev_hash == sha256(stored last_hash)
-            if let Some(commit_prev_rev) = &commit.prev_rev {
-                if commit_prev_rev.as_str() == prev_rev.as_str() {
-                    let stored_digest: [u8; 32] = if prev_hash.len() == LTHASH_SIZE {
-                        Sha256::digest(prev_hash).into()
-                    } else if prev_hash.len() == 32 {
-                        let mut d = [0u8; 32];
-                        d.copy_from_slice(prev_hash);
-                        d
-                    } else {
-                        [0u8; 32]
-                    };
-
-                    let commit_prev_hash_matches = commit
-                        .prev_hash
-                        .as_ref()
-                        .map(|h| h.as_ref() == stored_digest.as_slice())
-                        .unwrap_or(false);
-
-                    if !commit_prev_hash_matches {
-                        return Err(AppError::InvalidRequest(
-                            "Fork detected in full recovery: commit claims descent from stored revision but prev_hash does not match stored state digest".into(),
-                        ));
-                    }
-                }
             }
         }
         // Verify against expected authority hash and rev if provided
@@ -1707,12 +1661,30 @@ pub async fn sweep_once_with_shutdown(
         summary.spaces_checked += 1;
         let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
             Ok(c) => c,
+            // ensure_space_credential has already purged and tombstoned the Circle.
+            Err(e) if crate::access::is_space_deleted(&e) => {
+                summary.spaces_purged += 1;
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
                 summary.repos_failed += 1;
                 continue;
             }
         };
+        if let Err(e) = crate::notify::ensure_registration(state, &space_uri, &cred).await {
+            tracing::warn!(
+                error = %e,
+                space = %crate::access::space_fingerprint(&space_uri),
+                "registerNotify failed during sweep; retried next sweep"
+            );
+            // The host rejected the credential and it was evicted: do not list
+            // with it. The next sweep acquires a replacement.
+            if crate::access::is_credential_rejected(&e) {
+                summary.repos_failed += 1;
+                continue;
+            }
+        }
         let authority_did = match extract_authority_did(&space_uri) {
             Ok(a) => a,
             Err(_) => continue,
@@ -1728,9 +1700,14 @@ pub async fn sweep_once_with_shutdown(
                 Ok(ep) => ep,
                 Err(_) => continue,
             };
-        let mut cursor: Option<String> = None;
+        // Resume a listing an earlier pass's budget cut short (ListingResumePoints).
+        let mut cursor: Option<String> = state.listing_resume.get(&space_uri);
         let mut seen_cursors = HashSet::new();
         let mut page_count = 0;
+        // The spaceRev of the last entry this pass finished with, and whether
+        // the next listing of this space starts from the beginning.
+        let mut last_processed: Option<String> = None;
+        let mut start_over = false;
 
         loop {
             // Check shutdown between pages
@@ -1756,14 +1733,30 @@ pub async fn sweep_once_with_shutdown(
                     &space_uri,
                     cursor.as_deref(),
                     &cred.token,
-                    &cred.dpop_key,
+                    &cred.signing_key,
                 )
                 .await;
 
             let repos_output = match list_repos_res {
                 Ok(out) => out,
-                Err(_) => break,
+                Err(e) => {
+                    crate::access::evict_rejected_credential(
+                        &state.credential_store,
+                        &space_uri,
+                        &cred.token,
+                        &e,
+                    )
+                    .await;
+                    break;
+                }
             };
+            // listRepos pages through writers in ascending spaceRev order and
+            // ends with an empty page, which omits the cursor.
+            if repos_output.repos.is_empty() {
+                start_over = true;
+                break;
+            }
+            let mut credential_rejected = false;
 
             for repo in &repos_output.repos {
                 // Cooperative shutdown check inside repo loop
@@ -1801,10 +1794,12 @@ pub async fn sweep_once_with_shutdown(
                 .await
                 .unwrap_or(None);
 
+                // A repo can reappear when it advances during pagination; the
+                // comparison against stored state makes repeats a no-op.
                 let needs_sync = match db_sync {
                     Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
                         let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                        last_rev != repo.rev.as_str() || &digest[..] != repo.hash.as_ref()
+                        last_rev != repo.repo_rev.as_str() || &digest[..] != repo.hash.as_ref()
                     }
                     _ => true,
                 };
@@ -1815,31 +1810,54 @@ pub async fn sweep_once_with_shutdown(
                             &space_uri,
                             repo_did,
                             Some(repo.hash.as_ref()),
-                            Some(repo.rev.as_str()),
+                            Some(repo.repo_rev.as_str()),
                         )
                         .await
                     {
                         Ok(_res) => {
                             summary.repos_synced += 1;
                         }
-                        Err(_) => summary.repos_failed += 1,
+                        Err(e) => {
+                            summary.repos_failed += 1;
+                            // The credential was evicted; stop using it for this
+                            // space. A resumed listing retries this repo.
+                            if crate::access::is_credential_rejected(&e) {
+                                credential_rejected = true;
+                                break;
+                            }
+                        }
                     }
                     total_bytes_processed = sync_engine.total_bytes_processed();
                 }
+                last_processed = Some(repo.space_rev.to_string());
+            }
+
+            if credential_rejected {
+                break;
             }
 
             if let Some(next_cursor) = repos_output.cursor {
                 let next_cur_str = next_cursor.to_string();
-                if next_cur_str.len() > MAX_CURSOR_LEN
-                    || seen_cursors.len() >= MAX_PAGES_PER_SWEEP
-                    || !seen_cursors.insert(next_cur_str.clone())
-                {
+                if next_cur_str.len() > MAX_CURSOR_LEN || seen_cursors.contains(&next_cur_str) {
+                    // A malformed or repeating listing is not resumed.
+                    start_over = true;
                     break;
                 }
+                if seen_cursors.len() >= MAX_PAGES_PER_SWEEP {
+                    break;
+                }
+                seen_cursors.insert(next_cur_str.clone());
                 cursor = Some(next_cur_str);
             } else {
+                start_over = true;
                 break;
             }
+        }
+
+        if start_over {
+            state.listing_resume.clear(&space_uri);
+        } else if let Some(space_rev) = last_processed {
+            state.listing_resume.set(&space_uri, space_rev);
         }
 
         // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
@@ -1891,6 +1909,7 @@ pub fn spawn_revision_sweep_task(
                                  repos_checked = summary.repos_checked,
                                 repos_synced = summary.repos_synced,
                                 repos_failed = summary.repos_failed,
+                                spaces_purged = summary.spaces_purged,
                                 "Completed scheduled revision sweep"
                             );
                         }
@@ -1905,6 +1924,23 @@ pub fn spawn_revision_sweep_task(
     (handle, shutdown_tx)
 }
 
+/// Upper bound on notifyWrite-triggered syncs running at once.
+pub const MAX_CONCURRENT_NOTIFY_SYNCS: usize = 32;
+
+static NOTIFY_SYNC_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NOTIFY_SYNCS)));
+
+/// Wait until no notifyWrite-triggered sync is running in this process.
+pub async fn wait_for_notify_syncs_idle() {
+    while NOTIFY_SYNC_PERMITS.available_permits() < MAX_CONCURRENT_NOTIFY_SYNCS {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Receives com.atproto.space.notifyWrite. Upstream fan-out is best-effort and
+/// does not wait on the receiver, so this validates the caller and the Circle,
+/// queues the sync in the background and acknowledges at once. When the queue is
+/// full the notification is dropped and the revision sweep repairs it.
 pub async fn notify_write_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1922,14 +1958,17 @@ pub async fn notify_write_handler(
         .ok_or(AppError::Unauthorized(
             crate::error::AuthReason::InvalidHeader,
         ))?;
+    // A forwarded notification is signed by the space authority and addressed
+    // to the service identifier this AppView registered with registerNotify.
     let user = crate::auth::verify_service_jwt(
         &state,
         token,
-        &state.config.service_did,
+        &state.config.notify_service_identifier(),
         Some("com.atproto.space.notifyWrite"),
     )
     .await?;
 
+    // { space, repo, repoRev, hash, spaceRev, prevSpaceRev? }
     let input: catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite =
         serde_json::from_slice(&body)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid notifyWrite body: {e}")))?;
@@ -1939,16 +1978,27 @@ pub async fn notify_write_handler(
             "Hash must be exactly 32 bytes".into(),
         ));
     }
-    if input.rev.as_str().is_empty() {
-        return Err(AppError::InvalidRequest("Rev cannot be empty".into()));
+    if input.repo_rev.as_str().is_empty() {
+        return Err(AppError::InvalidRequest("repoRev cannot be empty".into()));
     }
 
+    // Only the space host forwards to syncers; a repo host notifies the space
+    // host, never this AppView.
     let authority = extract_authority_did(input.space.as_str())?;
-    if user.did != authority && user.did != input.repo.as_str() {
+    if user.did != authority {
         return Err(AppError::Forbidden(
-            "Caller DID does not match space authority or repo author".into(),
+            "notifyWrite issuer is not the space authority".into(),
         ));
     }
+    // Space revisions are not checkpointed here: the revision sweep re-lists
+    // every space (resuming a listing its budget cut short), so a prevSpaceRev
+    // gap is repaired by a later pass.
+    tracing::debug!(
+        space = %crate::access::space_fingerprint(input.space.as_str()),
+        space_rev = ?input.space_rev.as_ref().map(|r| r.as_str()),
+        prev_space_rev = ?input.prev_space_rev.as_ref().map(|r| r.as_str()),
+        "notifyWrite received"
+    );
 
     // Finding 17 & 36: Verify caller and repo author are active members before work
     let is_member: bool = sqlx::query_scalar(
@@ -1966,15 +2016,44 @@ pub async fn notify_write_handler(
         ));
     }
 
-    let sync_engine = SyncEngine::new(&state);
-    sync_engine
-        .sync_repo_with_expected_commit(
-            input.space.as_str(),
-            input.repo.as_str(),
-            Some(input.hash.as_ref()),
-            Some(input.rev.as_str()),
-        )
-        .await?;
+    let circle_active: Option<bool> = sqlx::query_scalar(
+        "SELECT app_access_granted FROM circles WHERE space_uri = $1 AND deleted_at IS NULL",
+    )
+    .bind(input.space.as_str())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+    if circle_active != Some(true) {
+        return Err(AppError::Forbidden(
+            "Space is deleted or appAccess revoked".into(),
+        ));
+    }
+
+    match NOTIFY_SYNC_PERMITS.clone().try_acquire_owned() {
+        Ok(permit) => {
+            let space = input.space.as_str().to_string();
+            let repo = input.repo.as_str().to_string();
+            let rev = input.repo_rev.as_str().to_string();
+            let hash = input.hash.to_vec();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let res = SyncEngine::new(&state)
+                    .sync_repo_with_expected_commit(&space, &repo, Some(&hash), Some(&rev))
+                    .await;
+                if let Err(e) = res {
+                    tracing::warn!(
+                        error = %e,
+                        space = %crate::access::space_fingerprint(&space),
+                        "notifyWrite sync failed; the revision sweep will retry"
+                    );
+                }
+            });
+        }
+        Err(_) => tracing::warn!(
+            space = %crate::access::space_fingerprint(input.space.as_str()),
+            "notifyWrite sync queue full; the revision sweep will catch up"
+        ),
+    }
 
     use axum::response::IntoResponse;
     Ok(axum::http::StatusCode::OK.into_response())
@@ -2005,7 +2084,7 @@ pub async fn notify_space_deleted_handler(
     let user = crate::auth::verify_service_jwt(
         &state,
         token,
-        &state.config.service_did,
+        &state.config.notify_service_identifier(),
         Some("com.atproto.space.notifySpaceDeleted"),
     )
     .await?;

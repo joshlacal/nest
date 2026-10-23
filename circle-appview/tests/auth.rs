@@ -60,7 +60,6 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
     let state = AppState::new(config, pool.clone());
 
@@ -570,18 +569,33 @@ async fn enforces_exact_iat_exp_and_lifetime_bounds(pool: PgPool) {
         StatusCode::UNAUTHORIZED
     );
 
-    // 2. Future iat: exactly +1s in the future -> rejected (strictly iat <= now)
-    let token_future_1s = create_custom_service_token(
+    // 2. Future iat: a slightly fast issuer clock is tolerated up to
+    // SERVICE_JWT_IAT_SKEW_SECS (30 s, CIRCLES-23); beyond that it is rejected.
+    // Margins stay clear of the bound so a second tick cannot flip the result.
+    let token_future_20s = create_custom_service_token(
         &setup.p256_signing_key,
         TokenOptions {
-            iat: Some(now + 1),
+            iat: Some(now + 20),
             exp: Some(now + 60),
-            jti: Some("jti-future-1s"),
+            jti: Some("jti-future-20s"),
             ..Default::default()
         },
     );
     assert_eq!(
-        request_feed(&setup.app, &token_future_1s).await.status(),
+        request_feed(&setup.app, &token_future_20s).await.status(),
+        StatusCode::OK
+    );
+    let token_future_45s = create_custom_service_token(
+        &setup.p256_signing_key,
+        TokenOptions {
+            iat: Some(now + 45),
+            exp: Some(now + 60),
+            jti: Some("jti-future-45s"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        request_feed(&setup.app, &token_future_45s).await.status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -1031,7 +1045,6 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
     let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
     let app = create_router(app_state);
@@ -1090,7 +1103,6 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
         },
         setup.pool.clone(),
         resolver_private,
@@ -1141,7 +1153,6 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
             push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
         },
         setup.pool.clone(),
         resolver_mixed,
@@ -1520,6 +1531,37 @@ async fn did_document_endpoint_serves_single_atproto_circles_service_entry(pool:
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let doc: DidDocument = serde_json::from_slice(&body).expect("Must parse valid DidDocument");
 
+        // @atproto/identity rejects a DID document whose optional fields are
+        // `null` (publicKeyMultibase is `z.string().optional()`), so no value
+        // anywhere in the published document may be null.
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        fn assert_no_nulls(value: &serde_json::Value, at: &str) {
+            match value {
+                serde_json::Value::Null => panic!("DID document has null at {at}"),
+                serde_json::Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        assert_no_nulls(item, &format!("{at}[{i}]"));
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        assert_no_nulls(v, &format!("{at}.{k}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_nulls(&raw, "$");
+        let vm = &raw["verificationMethod"][0];
+        assert!(
+            vm.get("publicKeyMultibase").is_none(),
+            "absent publicKeyMultibase must be omitted, got {vm}"
+        );
+        assert!(
+            vm.get("publicKeyJwk").is_some_and(|jwk| jwk.is_object()),
+            "the JWK verification method must still be published, got {vm}"
+        );
+
         assert_eq!(doc.id, "did:web:circles.catbird.blue");
 
         // Must expose EXACTLY ONE service entry: #atproto_circles
@@ -1852,7 +1894,6 @@ async fn key_rotation_with_curve_change_and_controllable_upstream(pool: PgPool) 
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
     let app_state = AppState::with_did_resolver(config, setup.pool.clone(), resolver);
     let app = create_router(app_state);
@@ -2385,6 +2426,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -2426,6 +2468,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -2455,6 +2498,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -2554,6 +2598,7 @@ async fn oauth_provider_origin_mismatch_and_proof_header_absence(pool: PgPool) {
         auth_server_iss: Some(pds_fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
+        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
     };
     service
         .pending_states
@@ -3013,16 +3058,16 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
 
     let mut endpoints = std::collections::HashMap::new();
     endpoints.insert(
-        "/xrpc/com.atproto.simplespace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fpublic%2F1".to_string(),
+        "/xrpc/com.atproto.simplespace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
-            "members": [{"did": "did:plc:member-1"}, {"did": "did:plc:member-2"}]
+            "members": [{"did": "did:plc:member-1", "read": true, "write": true}, {"did": "did:plc:member-2", "read": true, "write": false}]
         }).to_string()),
     );
     endpoints.insert(
-        "/xrpc/com.atproto.simplespace.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fpublic%2F1".to_string(),
+        "/xrpc/com.atproto.simplespace.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
             "authority": "did:plc:space-auth",
-            "spaceType": "public",
+            "spaceType": "com.example.space",
             "name": "Test Space"
         }).to_string()),
     );
@@ -3073,17 +3118,53 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
 
     // 1. member_dids uses transport.build_pinned_client and succeeds over TLS with injected resolver/cert
     let members = space_client
-        .member_dids("at://did:plc:space-auth/space/public/1")
+        .member_dids("at://did:plc:space-auth/space/com.example.space/1")
         .await
         .unwrap();
     assert_eq!(members, vec!["did:plc:member-1", "did:plc:member-2"]);
 
     // 2. get_space uses transport.build_pinned_client and succeeds over TLS with injected resolver/cert
     let space_config = space_client
-        .get_space("at://did:plc:space-auth/space/public/1")
+        .get_space("at://did:plc:space-auth/space/com.example.space/1")
         .await
         .unwrap();
     assert_eq!(space_config.name.as_deref(), Some("Test Space"));
+}
+
+/// The host compatibility gate logs the refused space host's profile; the
+/// profile comes from describeServer over the pinned transport.
+#[tokio::test]
+async fn describe_space_host_reports_the_host_profile() {
+    use circle_appview::space_client::SpaceClient;
+
+    let mut endpoints = std::collections::HashMap::new();
+    endpoints.insert(
+        "/xrpc/com.atproto.server.describeServer".to_string(),
+        (
+            200,
+            serde_json::json!({
+                "did": "did:web:pds.example.com",
+                "swanProfile": "permissioned-data-0016-2026-09-10",
+                "availableUserDomains": [],
+                "inviteCodeRequired": true
+            })
+            .to_string(),
+        ),
+    );
+    let fixture = TlsOAuthFixture::spawn("pds.example.com", endpoints).await;
+    let space_client = SpaceClient::with_transport(fixture.transport());
+
+    let profile = space_client
+        .describe_space_host(&fixture.base_url)
+        .await
+        .expect("describeServer is reachable");
+    assert_eq!(
+        profile,
+        serde_json::json!({
+            "did": "did:web:pds.example.com",
+            "swanProfile": "permissioned-data-0016-2026-09-10"
+        })
+    );
 }
 
 #[tokio::test]
@@ -3111,5 +3192,67 @@ async fn did_resolver_last_fresh_resolution_capacity_bounding() {
         did_resolver.fresh_resolution_count() <= 5,
         "last_fresh_resolution must be bounded by capacity, got {}",
         did_resolver.fresh_resolution_count()
+    );
+}
+
+/// CIRCLES-28: the space-credential key is the one the JWT `kid` names. An
+/// authority that publishes both #atproto and #atproto_space may sign with
+/// either; the reference PDS signs with #atproto.
+#[test]
+fn authority_key_selection_follows_the_credential_kid() {
+    use circle_appview::auth::select_authority_verification_method;
+    const DID: &str = "did:plc:authority-kid";
+    let vm = |id: &str| VerificationMethod {
+        id: id.into(),
+        r#type: "Multikey".into(),
+        controller: DID.into(),
+        public_key_jwk: None,
+        public_key_multibase: Some(format!("z{id}")),
+    };
+    let both = DidDocument {
+        id: DID.into(),
+        verification_method: vec![vm(&format!("{DID}#atproto_space")), vm("#atproto")],
+        service: vec![],
+    };
+    let only_atproto = DidDocument {
+        id: DID.into(),
+        verification_method: vec![vm("#atproto")],
+        service: vec![],
+    };
+
+    for (kid, expected) in [
+        ("#atproto", "#atproto".to_string()),
+        ("atproto", "#atproto".to_string()),
+        (&*format!("{DID}#atproto"), "#atproto".to_string()),
+        ("#atproto_space", format!("{DID}#atproto_space")),
+        ("atproto_space", format!("{DID}#atproto_space")),
+    ] {
+        let selected = select_authority_verification_method(&both, DID, Some(kid))
+            .unwrap_or_else(|e| panic!("kid {kid} must select a key, got {e:?}"));
+        assert_eq!(selected.id, expected, "kid {kid}");
+    }
+
+    // No kid: the dedicated space key is preferred.
+    assert_eq!(
+        select_authority_verification_method(&both, DID, None)
+            .unwrap()
+            .id,
+        format!("{DID}#atproto_space")
+    );
+
+    // A kid naming any other key, or another DID's key, is refused.
+    for kid in ["#atproto_label", "did:plc:someone-else#atproto", "#"] {
+        assert_eq!(
+            select_authority_verification_method(&both, DID, Some(kid)).unwrap_err(),
+            circle_appview::error::AuthReason::InvalidKid,
+            "kid {kid}"
+        );
+    }
+
+    // A kid naming a key the document does not publish has nothing to verify with.
+    assert_eq!(
+        select_authority_verification_method(&only_atproto, DID, Some("#atproto_space"))
+            .unwrap_err(),
+        circle_appview::error::AuthReason::NoVerificationMethod
     );
 }

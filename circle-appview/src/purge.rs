@@ -135,6 +135,11 @@ pub async fn revoke_app_access(
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
+
     tx.commit().await?;
 
     // 2. Immediately revoke credentials in-memory
@@ -335,6 +340,11 @@ pub async fn delete_space(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM circle_rejections WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
+    // The space is gone at the host, so its registration is gone with it.
+    sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
         .await?;

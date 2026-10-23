@@ -1,7 +1,9 @@
 //! Permissioned repository commit and CAR verification primitives.
 //!
-//! Implements v1 (legacy) and v2 (authenticated transition) commit and CAR verification
-//! across Ed25519, P-256, and Secp256k1 curves.
+//! Implements upstream `com.atproto.space` v1 commit and CAR verification across
+//! Ed25519, P-256, and Secp256k1 curves. v1 is the only commit format: the
+//! Catbird-only v2 "authenticated transition" fork was retired with the
+//! catbird-atproto regeneration to the upstream space defs (CIRCLES-01).
 
 use bytes::Bytes;
 use cid::Cid as IpldCid;
@@ -9,13 +11,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub use catbird_atproto::generated::com_atproto::space::SignedCommit;
+// The pinned jacquard-repo also carries the superseded Spaces DPoP binding
+// (`verify_dpop`, `DpopProof`, `CnfJkt`, `CredentialClaims`); it is not
+// re-exported. Space credentials are HTTP-signature bound, see
+// `crate::space_signature`.
 pub use jacquard_repo::permissioned::{
-    apply_writes, commit_from_cbor, commit_to_cbor, format_cursor, list_repo_ops, normalize_htu,
-    parse_cursor, sign_commit, sign_commit_with_ikm, verify_dpop, ApplyWritesResult, CnfJkt,
-    CommitContext, CredentialClaims, DpopProof, LtHash, OplogAction, OplogEntry, OplogPage,
-    PermissionedCar, PermissionedError, RecordValue, SpaceTypeDeclaration, ValidatedRepoSnapshot,
-    WriteOperation, WriteResult, WriteState, CLIENT_ATTESTATION_TYP, CLOCK_SKEW_SEC,
-    DELEGATION_TOKEN_TYP, SPACE_CREDENTIAL_TYP,
+    apply_writes, commit_from_cbor, commit_to_cbor, format_cursor, list_repo_ops, parse_cursor,
+    sign_commit, sign_commit_with_ikm, ApplyWritesResult, CommitContext, LtHash, OplogAction,
+    OplogEntry, OplogPage, PermissionedCar, PermissionedError, RecordValue, SpaceTypeDeclaration,
+    ValidatedRepoSnapshot, WriteOperation, WriteResult, WriteState, CLIENT_ATTESTATION_TYP,
+    CLOCK_SKEW_SEC, DELEGATION_TOKEN_TYP, SPACE_CREDENTIAL_TYP,
 };
 
 use crate::auth::ParsedVerifyingKey;
@@ -23,34 +28,6 @@ use crate::auth::ParsedVerifyingKey;
 pub const LTHASH_SIZE: usize = 2048;
 pub const MAX_CAR_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_CAR_BLOCKS: usize = 10_000;
-
-/// Verification policy controlling commit version acceptance.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum CommitVerificationPolicy {
-    /// Strictly accept only authenticated v2 commits (default).
-    #[default]
-    StrictV2,
-    /// Dual-read mode accepting v1 commits only up to the specified cutoff revision.
-    DualReadWithCutoff { cutoff_rev: String },
-    /// Explicit migration mode accepting legacy v1 commits.
-    ExplicitMigrationPermitV1,
-}
-
-/// Commit transition context for v2 authenticated commits.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitContextV2 {
-    pub space: String,
-    pub author: String,
-    pub rev: String,
-    pub prev_rev: String,
-    pub hash: [u8; 32],
-    pub prev_hash: [u8; 32],
-    pub path: String,
-    pub action: String,
-    pub cid: Option<String>,
-    pub prev_cid: Option<String>,
-    pub val: Bytes,
-}
 
 /// Format a record element for LtHash accumulator: `{collection}/{rkey}/{cid}`
 pub fn format_lthash_element(collection: &str, rkey: &str, cid: &str) -> String {
@@ -236,278 +213,7 @@ pub async fn parse_permissioned_car(bytes: &[u8]) -> Result<PermissionedCar, Per
     PermissionedCar::new(roots, blocks)
 }
 
-/// Encode v2 commit context into the canonical length-prefixed transcript.
-pub fn encode_commit_context_v2(ctx: &CommitContextV2) -> Result<Vec<u8>, PermissionedError> {
-    let domain = b"atproto-space-v2";
-    let cid_bytes = ctx.cid.as_deref().unwrap_or("").as_bytes();
-    let prev_cid_bytes = ctx.prev_cid.as_deref().unwrap_or("").as_bytes();
-    let fields: [&[u8]; 11] = [
-        ctx.space.as_bytes(),
-        ctx.author.as_bytes(),
-        ctx.rev.as_bytes(),
-        ctx.prev_rev.as_bytes(),
-        &ctx.hash,
-        &ctx.prev_hash,
-        ctx.path.as_bytes(),
-        ctx.action.as_bytes(),
-        cid_bytes,
-        prev_cid_bytes,
-        ctx.val.as_ref(),
-    ];
-    let mut output = domain.to_vec();
-    for field in fields {
-        if field.len() > u16::MAX as usize {
-            return Err(PermissionedError::InvalidCommit(
-                "Field length exceeds u16::MAX in commit context v2".into(),
-            ));
-        }
-        output.extend_from_slice(&(field.len() as u16).to_be_bytes());
-        output.extend_from_slice(field);
-    }
-    Ok(output)
-}
-
-/// Verify a v2 SignedCommit against a CommitContextV2 and verifying key.
-pub fn verify_commit_v2(
-    commit: &SignedCommit,
-    context: &CommitContextV2,
-    key: &ParsedVerifyingKey,
-) -> Result<(), PermissionedError> {
-    if commit.ver != 2 {
-        return Err(PermissionedError::InvalidCommit(
-            "commit version mismatch: expected ver 2".into(),
-        ));
-    }
-    let commit_did = commit
-        .did
-        .as_ref()
-        .map(|d| d.as_str())
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing did".into()))?;
-    if commit_did != context.author {
-        return Err(PermissionedError::InvalidCommit(
-            "commit author DID mismatch".into(),
-        ));
-    }
-    let commit_space = commit
-        .space
-        .as_ref()
-        .map(|s| s.as_str())
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing space".into()))?;
-    if commit_space != context.space {
-        return Err(PermissionedError::InvalidCommit(
-            "commit space URI mismatch".into(),
-        ));
-    }
-    if commit.rev.as_str() != context.rev {
-        return Err(PermissionedError::InvalidCommit(
-            "commit rev mismatch".into(),
-        ));
-    }
-    let commit_prev_rev = commit
-        .prev_rev
-        .as_ref()
-        .map(|r| r.as_str())
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing prev_rev".into()))?;
-    if commit_prev_rev != context.prev_rev {
-        return Err(PermissionedError::InvalidCommit(
-            "commit prev_rev mismatch".into(),
-        ));
-    }
-    // Monotonic check: rev > prev_rev
-    if commit.rev.as_str() <= commit_prev_rev {
-        return Err(PermissionedError::InvalidCommit(
-            "non-monotonic revision: rev must be strictly greater than prev_rev".into(),
-        ));
-    }
-
-    let commit_hash: &[u8; 32] = commit
-        .hash
-        .as_ref()
-        .try_into()
-        .map_err(|_| PermissionedError::InvalidCommit("hash must contain 32 bytes".into()))?;
-    if commit_hash != &context.hash {
-        return Err(PermissionedError::InvalidCommit(
-            "commit hash mismatch".into(),
-        ));
-    }
-
-    let prev_hash_bytes = commit
-        .prev_hash
-        .as_ref()
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing prev_hash".into()))?;
-    let commit_prev_hash: &[u8; 32] = prev_hash_bytes
-        .as_ref()
-        .try_into()
-        .map_err(|_| PermissionedError::InvalidCommit("prev_hash must contain 32 bytes".into()))?;
-    if commit_prev_hash != &context.prev_hash {
-        return Err(PermissionedError::InvalidCommit(
-            "commit prev_hash mismatch".into(),
-        ));
-    }
-
-    let commit_path = commit
-        .path
-        .as_ref()
-        .map(|p| p.as_str())
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing path".into()))?;
-    if commit_path != context.path {
-        return Err(PermissionedError::InvalidCommit(
-            "commit path mismatch".into(),
-        ));
-    }
-    // Validate path format "collection/rkey"
-    let (col, rkey) = commit_path
-        .split_once('/')
-        .ok_or_else(|| PermissionedError::InvalidCommit("invalid path format in commit".into()))?;
-    if col.is_empty() || rkey.is_empty() || rkey.contains('/') {
-        return Err(PermissionedError::InvalidCommit(
-            "invalid path format in commit".into(),
-        ));
-    }
-    if rkey
-        .parse::<catbird_atproto::jacquard_common::types::string::Rkey>()
-        .is_err()
-    {
-        return Err(PermissionedError::InvalidCommit(
-            "invalid rkey in commit path".into(),
-        ));
-    }
-
-    let commit_action = commit
-        .action
-        .as_ref()
-        .map(|a| a.as_str())
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing action".into()))?;
-    if commit_action != context.action {
-        return Err(PermissionedError::InvalidCommit(
-            "commit action mismatch".into(),
-        ));
-    }
-
-    match commit_action {
-        "create" => {
-            let cid_str = commit.cid.as_ref().map(|c| c.as_str()).ok_or_else(|| {
-                PermissionedError::InvalidCommit("v2 create action missing cid".into())
-            })?;
-            parse_and_validate_strict_cid(cid_str)?;
-            if commit.prev_cid.is_some() {
-                return Err(PermissionedError::InvalidCommit(
-                    "v2 create action must not have prev_cid".into(),
-                ));
-            }
-            if context.cid.as_deref() != Some(cid_str) {
-                return Err(PermissionedError::InvalidCommit(
-                    "commit cid mismatch".into(),
-                ));
-            }
-            if context.prev_cid.is_some() {
-                return Err(PermissionedError::InvalidCommit(
-                    "context create must not have prev_cid".into(),
-                ));
-            }
-        }
-        "update" => {
-            let cid_str = commit.cid.as_ref().map(|c| c.as_str()).ok_or_else(|| {
-                PermissionedError::InvalidCommit("v2 update action missing cid".into())
-            })?;
-            parse_and_validate_strict_cid(cid_str)?;
-            let prev_cid_str = commit
-                .prev_cid
-                .as_ref()
-                .map(|c| c.as_str())
-                .ok_or_else(|| {
-                    PermissionedError::InvalidCommit("v2 update action missing prev_cid".into())
-                })?;
-            parse_and_validate_strict_cid(prev_cid_str)?;
-            if context.cid.as_deref() != Some(cid_str) {
-                return Err(PermissionedError::InvalidCommit(
-                    "commit cid mismatch".into(),
-                ));
-            }
-            if context.prev_cid.as_deref() != Some(prev_cid_str) {
-                return Err(PermissionedError::InvalidCommit(
-                    "commit prev_cid mismatch".into(),
-                ));
-            }
-        }
-        "delete" => {
-            if commit.cid.is_some() {
-                return Err(PermissionedError::InvalidCommit(
-                    "v2 delete action must not have cid".into(),
-                ));
-            }
-            let prev_cid_str = commit
-                .prev_cid
-                .as_ref()
-                .map(|c| c.as_str())
-                .ok_or_else(|| {
-                    PermissionedError::InvalidCommit("v2 delete action missing prev_cid".into())
-                })?;
-            parse_and_validate_strict_cid(prev_cid_str)?;
-            if context.cid.is_some() {
-                return Err(PermissionedError::InvalidCommit(
-                    "context delete must not have cid".into(),
-                ));
-            }
-            if context.prev_cid.as_deref() != Some(prev_cid_str) {
-                return Err(PermissionedError::InvalidCommit(
-                    "commit prev_cid mismatch".into(),
-                ));
-            }
-        }
-        other => {
-            return Err(PermissionedError::InvalidCommit(format!(
-                "unsupported commit action: {other}"
-            )));
-        }
-    }
-
-    let commit_val = commit
-        .val
-        .as_ref()
-        .ok_or_else(|| PermissionedError::InvalidCommit("v2 commit missing val".into()))?;
-    if commit_val.as_ref() != context.val.as_ref() {
-        return Err(PermissionedError::InvalidCommit(
-            "commit val mismatch".into(),
-        ));
-    }
-
-    let transcript = encode_commit_context_v2(context)?;
-
-    match key {
-        ParsedVerifyingKey::Ed25519(vk) => {
-            let sig = ed25519_dalek::Signature::from_slice(commit.sig.as_ref()).map_err(|e| {
-                PermissionedError::InvalidCommit(format!("invalid Ed25519 signature: {e}"))
-            })?;
-            use ed25519_dalek::Verifier;
-            vk.verify(&transcript, &sig).map_err(|e| {
-                PermissionedError::InvalidCommit(format!("Ed25519 signature mismatch: {e}"))
-            })?;
-        }
-        ParsedVerifyingKey::P256(vk) => {
-            let sig = p256::ecdsa::Signature::from_slice(commit.sig.as_ref()).map_err(|e| {
-                PermissionedError::InvalidCommit(format!("invalid P-256 signature: {e}"))
-            })?;
-            use p256::ecdsa::signature::Verifier;
-            vk.verify(&transcript, &sig).map_err(|e| {
-                PermissionedError::InvalidCommit(format!("P-256 signature mismatch: {e}"))
-            })?;
-        }
-        ParsedVerifyingKey::Secp256k1(vk) => {
-            let sig = k256::ecdsa::Signature::from_slice(commit.sig.as_ref()).map_err(|e| {
-                PermissionedError::InvalidCommit(format!("invalid secp256k1 signature: {e}"))
-            })?;
-            use k256::ecdsa::signature::Verifier;
-            vk.verify(&transcript, &sig).map_err(|e| {
-                PermissionedError::InvalidCommit(format!("secp256k1 signature mismatch: {e}"))
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Verify a legacy v1 SignedCommit against a CommitContext and verifying key.
+/// Verify an upstream v1 SignedCommit against a CommitContext and verifying key.
 pub fn verify_commit_v1(
     commit: &SignedCommit,
     context: &CommitContext,
@@ -518,15 +224,8 @@ pub fn verify_commit_v1(
             "expected ver 1 commit".into(),
         ));
     }
-    let ikm = commit
+    let ikm_slice: &[u8; 32] = commit
         .ikm
-        .as_ref()
-        .ok_or_else(|| PermissionedError::InvalidCommit("v1 commit missing ikm".into()))?;
-    let mac = commit
-        .mac
-        .as_ref()
-        .ok_or_else(|| PermissionedError::InvalidCommit("v1 commit missing mac".into()))?;
-    let ikm_slice: &[u8; 32] = ikm
         .as_ref()
         .try_into()
         .map_err(|_| PermissionedError::InvalidCommit("ikm must contain 32 bytes".into()))?;
@@ -535,7 +234,8 @@ pub fn verify_commit_v1(
         .as_ref()
         .try_into()
         .map_err(|_| PermissionedError::InvalidCommit("hash must contain 32 bytes".into()))?;
-    let mac_slice: &[u8; 32] = mac
+    let mac_slice: &[u8; 32] = commit
+        .mac
         .as_ref()
         .try_into()
         .map_err(|_| PermissionedError::InvalidCommit("mac must contain 32 bytes".into()))?;
@@ -581,70 +281,17 @@ pub fn verify_commit_v1(
     Ok(())
 }
 
-/// Verify a commit under an explicit CommitVerificationPolicy.
-pub fn verify_commit_with_policy(
-    commit: &SignedCommit,
-    context_v1: Option<&CommitContext>,
-    context_v2: Option<&CommitContextV2>,
-    key: &ParsedVerifyingKey,
-    policy: &CommitVerificationPolicy,
-) -> Result<(), PermissionedError> {
-    match commit.ver {
-        2 => {
-            let ctx = context_v2.ok_or_else(|| {
-                PermissionedError::InvalidCommit(
-                    "v2 commit verification requires CommitContextV2".into(),
-                )
-            })?;
-            verify_commit_v2(commit, ctx, key)
-        }
-        1 => match policy {
-            CommitVerificationPolicy::StrictV2 => Err(PermissionedError::InvalidCommit(
-                "v1 commits rejected under StrictV2 verification policy".into(),
-            )),
-            CommitVerificationPolicy::DualReadWithCutoff { cutoff_rev } => {
-                if commit.rev.as_str() > cutoff_rev.as_str() {
-                    return Err(PermissionedError::InvalidCommit(format!(
-                        "v1 commit revision {} exceeds allowed cutoff {}",
-                        commit.rev, cutoff_rev
-                    )));
-                }
-                let ctx = context_v1.ok_or_else(|| {
-                    PermissionedError::InvalidCommit(
-                        "v1 commit verification requires CommitContext".into(),
-                    )
-                })?;
-                verify_commit_v1(commit, ctx, key)
-            }
-            CommitVerificationPolicy::ExplicitMigrationPermitV1 => {
-                let ctx = context_v1.ok_or_else(|| {
-                    PermissionedError::InvalidCommit(
-                        "v1 commit verification requires CommitContext".into(),
-                    )
-                })?;
-                verify_commit_v1(commit, ctx, key)
-            }
-        },
-        other => Err(PermissionedError::InvalidCommit(format!(
-            "unsupported commit version: {other}"
-        ))),
-    }
-}
-
-/// Verify a signed commit with default policy (StrictV2 / dual read).
+/// Verify a signed commit. v1 is the only supported format.
 pub fn verify_commit(
     commit: &SignedCommit,
     context: &CommitContext,
     key: &ParsedVerifyingKey,
 ) -> Result<(), PermissionedError> {
-    // For legacy callers passing CommitContext, try v1 verification
-    if commit.ver == 1 {
-        verify_commit_v1(commit, context, key)
-    } else {
-        Err(PermissionedError::InvalidCommit(
-            "v2 commit requires verify_commit_v2 or verify_commit_with_policy with CommitContextV2"
-                .into(),
-        ))
+    match commit.ver {
+        1 => verify_commit_v1(commit, context, key),
+        other => Err(PermissionedError::InvalidCommit(format!(
+            "unsupported commit version: {other}"
+        ))),
     }
 }
 
@@ -690,31 +337,6 @@ pub fn extract_and_validate_car(
     space_uri: &str,
     author_did: &str,
     key: &ParsedVerifyingKey,
-) -> Result<
-    (
-        SignedCommit,
-        Vec<(String, String, String, serde_json::Value)>,
-        LtHash,
-    ),
-    PermissionedError,
-> {
-    extract_and_validate_car_with_policy(
-        car,
-        space_uri,
-        author_did,
-        key,
-        &CommitVerificationPolicy::default(),
-    )
-}
-
-/// Extract and validate a permissioned CAR file under an explicit CommitVerificationPolicy.
-#[allow(clippy::type_complexity)]
-pub fn extract_and_validate_car_with_policy(
-    car: &PermissionedCar,
-    space_uri: &str,
-    author_did: &str,
-    key: &ParsedVerifyingKey,
-    policy: &CommitVerificationPolicy,
 ) -> Result<
     (
         SignedCommit,
@@ -775,53 +397,12 @@ pub fn extract_and_validate_car_with_policy(
         ));
     }
 
-    let context_v1 = CommitContext {
+    let context = CommitContext {
         space: space_uri_parsed,
         author: author_did_parsed,
         rev: commit.rev.to_string().into(),
     };
-
-    let prev_rev = commit
-        .prev_rev
-        .as_ref()
-        .map(|r| r.to_string())
-        .unwrap_or_default();
-    let prev_hash = commit
-        .prev_hash
-        .as_ref()
-        .and_then(|h| h.as_ref().try_into().ok())
-        .unwrap_or([0u8; 32]);
-
-    let hash: [u8; 32] = lthash.digest();
-    let path = commit
-        .path
-        .as_ref()
-        .map(|p| p.to_string())
-        .unwrap_or_default();
-    let action = commit
-        .action
-        .as_ref()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let cid = commit.cid.as_ref().map(|c| c.to_string());
-    let prev_cid = commit.prev_cid.as_ref().map(|c| c.to_string());
-    let val = commit.val.clone().unwrap_or_default();
-
-    let context_v2 = CommitContextV2 {
-        space: space_uri.to_string(),
-        author: author_did.to_string(),
-        rev: commit.rev.to_string(),
-        prev_rev,
-        hash,
-        prev_hash,
-        path,
-        action,
-        cid,
-        prev_cid,
-        val,
-    };
-
-    verify_commit_with_policy(&commit, Some(&context_v1), Some(&context_v2), key, policy)?;
+    verify_commit(&commit, &context, key)?;
     // Check that record_blocks.len() == index.len() to reject extra unreferenced blocks (Finding minor)
     let record_blocks = &car.blocks[2..];
     if record_blocks.len() != index.len() {
@@ -936,7 +517,7 @@ pub fn compute_commit_mac(mac_key: &[u8; 32], hash: &[u8]) -> Result<[u8; 32], P
     Ok(mac.finalize().into_bytes().into())
 }
 
-/// Mint a legacy v1 signed commit.
+/// Mint an upstream v1 signed commit.
 pub fn mint_signed_commit(
     space: &str,
     author: &str,
@@ -956,56 +537,13 @@ pub fn mint_signed_commit(
 
     SignedCommit {
         hash: bytes::Bytes::copy_from_slice(hash.as_ref()),
-        ikm: Some(bytes::Bytes::copy_from_slice(&ikm)),
-        mac: Some(bytes::Bytes::copy_from_slice(&mac)),
+        ikm: bytes::Bytes::copy_from_slice(&ikm),
+        mac: bytes::Bytes::copy_from_slice(&mac),
         rev: rev.to_string().into(),
         sig: bytes::Bytes::copy_from_slice(&sig.to_bytes()),
         ver: 1,
-        action: None,
-        cid: None,
-        did: None,
-        path: None,
-        prev_cid: None,
-        prev_hash: None,
-        prev_rev: None,
-        space: None,
-        val: None,
         extra_data: None,
     }
-}
-
-/// Mint a v2 signed commit using P-256.
-pub fn mint_signed_commit_v2_p256(
-    ctx: &CommitContextV2,
-    signing_key: &p256::ecdsa::SigningKey,
-) -> Result<SignedCommit, PermissionedError> {
-    let transcript = encode_commit_context_v2(ctx)?;
-    let sig: p256::ecdsa::Signature =
-        p256::ecdsa::signature::Signer::sign(signing_key, &transcript);
-
-    Ok(SignedCommit {
-        ver: 2,
-        rev: ctx.rev.clone().into(),
-        prev_rev: Some(ctx.prev_rev.clone().into()),
-        did: Some(ctx.author.clone().into()),
-        space: Some(
-            catbird_atproto::jacquard_common::types::string::AtUri::new(
-                jacquard_common::SmolStr::new(&ctx.space),
-            )
-            .map_err(|e| PermissionedError::InvalidCommit(e.to_string()))?,
-        ),
-        hash: Bytes::copy_from_slice(&ctx.hash),
-        prev_hash: Some(Bytes::copy_from_slice(&ctx.prev_hash)),
-        path: Some(ctx.path.clone().into()),
-        action: Some(ctx.action.clone().into()),
-        cid: ctx.cid.as_ref().map(|c| c.clone().into()),
-        prev_cid: ctx.prev_cid.as_ref().map(|c| c.clone().into()),
-        val: Some(ctx.val.clone()),
-        sig: Bytes::copy_from_slice(&sig.to_bytes()),
-        ikm: None,
-        mac: None,
-        extra_data: None,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

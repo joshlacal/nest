@@ -194,8 +194,6 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy:
-            circle_appview::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
     };
 
     let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
@@ -252,6 +250,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         credential_store,
         space_client,
         space_locks,
+        listing_resume: Default::default(),
         profile_hydrator: profile_hydrator.clone(),
         oauth_service,
         push_client: None,
@@ -380,7 +379,7 @@ async fn unauthorized_user_cannot_fetch_media_or_notifications(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "mock-space-token".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -642,7 +641,7 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -853,7 +852,7 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -926,6 +925,110 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
     assert_ne!(resp.status(), StatusCode::OK);
 }
 
+/// getMedia reacquires a lapsed credential on demand, but a refused exchange is
+/// not rerun for every image request: the second request answers 404 without a
+/// delegation token or space-host call, and never reaches getBlob.
+#[sqlx::test(migrations = "./migrations")]
+async fn media_does_not_rerun_a_refused_credential_exchange_per_request(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted)
+        VALUES ($1, '3l7privacyaaa', $2, 'Media Space', now(), true)
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'bafyrec1', $2, $3, 'app.bsky.feed.post', '3l7post1', $4, now())
+        "#,
+    )
+    .bind(format!("{SPACE_1}/app.bsky.feed.post/3l7post1"))
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post with image",
+        "createdAt": "2026-08-24T12:00:00.000Z",
+        "embed": {
+            "$type": "app.bsky.embed.images",
+            "images": [{ "alt": "", "image": { "$type": "blob", "ref": { "$link": blob_cid }, "mimeType": "image/png", "size": 4 } }]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{blob_cid}"),
+        Some("image/png".to_string()),
+        vec![0x89, 0x50, 0x4E, 0x47],
+    );
+    // No credential is cached and the authority refuses the exchange.
+    setup.mock_transport.set_credential_response(
+        SPACE_1,
+        Err(json!({
+            "error": "AppNotAuthorized",
+            "message": "Client AppView not permitted to read Space"
+        })
+        .to_string()),
+    );
+
+    let app = create_router(setup.state.clone());
+    // A fresh service JWT per request: each jti is single-use.
+    let media_request = || {
+        let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+        Request::builder()
+            .uri(format!(
+                "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+                url_encode(SPACE_1),
+                url_encode(ALICE_DID),
+                url_encode(blob_cid),
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {bob_jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    for _ in 0..2 {
+        let resp = app.clone().oneshot(media_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    // Positive control: the first request did run the exchange.
+    assert_eq!(
+        setup.mock_transport.recorded_delegation_token_calls().len(),
+        1
+    );
+    assert_eq!(setup.mock_transport.recorded_calls().len(), 1);
+    assert!(setup.mock_transport.recorded_blob_calls().is_empty());
+
+    // Once a credential is held (the sweep acquired one), media is served.
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred".into(),
+                signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+        )
+        .await;
+    let resp = app.clone().oneshot(media_request()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(setup.mock_transport.recorded_blob_calls().len(), 1);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) {
     let setup = setup_privacy_test(pool.clone()).await;
@@ -955,7 +1058,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "active-cred-media-res".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1165,7 +1268,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-1".into(),
-                dpop_key: cred_key_1,
+                signing_key: cred_key_1,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1179,7 +1282,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
             SPACE_2.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-2".into(),
-                dpop_key: cred_key_2,
+                signing_key: cred_key_2,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1598,7 +1701,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1733,7 +1836,7 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1914,7 +2017,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -2023,7 +2126,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-live".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -2446,9 +2549,13 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
     let notify_dave = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(DAVE_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
             .unwrap(),
         extra_data: None,
@@ -2471,9 +2578,13 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
     let notify_alice = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
         hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(ALICE_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
             .unwrap(),
         extra_data: None,
@@ -3440,7 +3551,7 @@ async fn revocation_durability_commits_state_flip_and_credentials_before_purge(p
             SPACE_1.to_string(),
             circle_appview::access::ActiveSpaceCredential {
                 token: "dpop_token_123".into(),
-                dpop_key: p256_key,
+                signing_key: p256_key,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         )
@@ -3536,7 +3647,7 @@ async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_
             SPACE_1.to_string(),
             circle_appview::access::ActiveSpaceCredential {
                 token: "dpop_token_active".into(),
-                dpop_key: p256_key,
+                signing_key: p256_key,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         )

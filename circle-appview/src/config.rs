@@ -1,6 +1,5 @@
 use crate::access::CredentialStore;
 use crate::auth::DidResolver;
-use crate::commit::CommitVerificationPolicy;
 use crate::oauth::OAuthService;
 use crate::space_client::SpaceClient;
 use sqlx::PgPool;
@@ -22,7 +21,6 @@ pub struct Config {
     pub push_key_id: String,
     pub push_signing_key_path: Option<String>,
     pub push_signing_key_hex: Option<String>,
-    pub commit_verification_policy: CommitVerificationPolicy,
 }
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
@@ -110,19 +108,17 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-        let commit_verification_policy = match env::var("COMMIT_VERIFICATION_POLICY")
+        // Upstream v1 is the only commit format. A leftover policy variable from
+        // the retired v2 fork is ignored (not fatal) so an old drop-in cannot
+        // crash-loop the service.
+        if let Ok(policy) = env::var("COMMIT_VERIFICATION_POLICY")
             .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
-            .as_deref()
         {
-            Ok("explicit_migration_permit_v1") | Ok("migration_permit_v1") | Ok("v1") => {
-                CommitVerificationPolicy::ExplicitMigrationPermitV1
-            }
-            Ok(s) if s.starts_with("dual_read:") => {
-                let cutoff = s.trim_start_matches("dual_read:").to_string();
-                CommitVerificationPolicy::DualReadWithCutoff { cutoff_rev: cutoff }
-            }
-            _ => CommitVerificationPolicy::StrictV2,
-        };
+            tracing::warn!(
+                %policy,
+                "COMMIT_VERIFICATION_POLICY is obsolete and ignored; upstream v1 commits are always verified"
+            );
+        }
 
         Ok(Self {
             host,
@@ -139,8 +135,20 @@ impl Config {
             push_key_id,
             push_signing_key_path,
             push_signing_key_hex,
-            commit_verification_policy,
         })
+    }
+}
+
+impl Config {
+    /// Service identifier passed to `com.atproto.space.registerNotify`: this
+    /// AppView's DID plus the `#atproto_circles` service entry that space hosts
+    /// resolve to deliver notifyWrite and notifySpaceDeleted.
+    pub fn notify_service_identifier(&self) -> String {
+        if self.service_did.contains('#') {
+            self.service_did.clone()
+        } else {
+            format!("{}#atproto_circles", self.service_did)
+        }
     }
 }
 
@@ -241,6 +249,8 @@ pub struct AppState {
     pub credential_store: Arc<CredentialStore>,
     pub space_client: Arc<SpaceClient>,
     pub space_locks: Arc<crate::access::SpaceLockManager>,
+    /// Where the revision sweep resumes budget-cut listRepos listings.
+    pub listing_resume: Arc<crate::sync::ListingResumePoints>,
     pub profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
     pub oauth_service: Arc<OAuthService>,
     pub push_client: Option<Arc<crate::push::CirclePushClient>>,
@@ -333,6 +343,7 @@ impl AppState {
             credential_store,
             space_client,
             space_locks,
+            listing_resume: Arc::new(crate::sync::ListingResumePoints::new()),
             profile_hydrator,
             oauth_service,
             push_client,

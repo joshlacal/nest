@@ -14,58 +14,100 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
+/// A space credential and the ephemeral P-256 key it is bound to (`cnf.kid`).
+/// Every use is signed with that key (RFC 9421 HTTP message signature).
 #[derive(Debug, Clone)]
 pub struct ActiveSpaceCredential {
     pub token: String,
-    pub dpop_key: p256::ecdsa::SigningKey,
+    pub signing_key: p256::ecdsa::SigningKey,
+    /// The credential's own `exp`; nothing assumes a fixed lifetime.
     pub expires_at: DateTime<Utc>,
+}
+
+/// A cached credential is handed out only while it has at least this long left,
+/// so a request (or a sweep's run of requests, bounded at 30 s) never starts on
+/// a credential about to expire. Sized for the 600 s credentials authorities
+/// issue by default, with room for clock skew. Shorter-lived credentials use a
+/// proportionally smaller margin (see [`renewal_margin`]).
+pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
+
+/// The renewal margin for a credential with `lifetime` left when it is stored:
+/// [`CREDENTIAL_RENEWAL_MARGIN`], or half the lifetime when that is shorter.
+/// Issuers may choose any lifetime up to 3600 s, so a credential of a minute or
+/// less is still served for the first half of its life instead of never.
+pub fn renewal_margin(lifetime: chrono::Duration) -> chrono::Duration {
+    std::cmp::min(CREDENTIAL_RENEWAL_MARGIN, lifetime / 2)
+}
+
+/// After an acquisition for a request fails, requests for that space do not run
+/// the exchange again for this long (see [`ensure_space_credential_for_request`]).
+pub const FAILED_ACQUISITION_RETRY_DELAY: chrono::Duration = chrono::Duration::seconds(60);
+
+struct StoredCredential {
+    cred: ActiveSpaceCredential,
+    /// When [`CredentialStore::get`] stops serving it.
+    renew_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
 pub struct CredentialStore {
-    values: RwLock<HashMap<String, ActiveSpaceCredential>>,
+    values: RwLock<HashMap<String, StoredCredential>>,
+    /// Space URI -> when request-path acquisition may be tried again.
+    failed_acquisitions: RwLock<HashMap<String, DateTime<Utc>>>,
 }
 
 impl CredentialStore {
     pub fn new() -> Self {
-        Self {
-            values: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub async fn insert(&self, space: String, cred: ActiveSpaceCredential) {
-        if cred.expires_at <= Utc::now() {
-            return;
-        }
-
-        let mut lock = self.values.write().await;
-        let now = Utc::now();
-        lock.retain(|_, v| v.expires_at > now);
-
-        if let Some(existing) = lock.get(&space) {
-            if cred.expires_at >= existing.expires_at {
-                lock.insert(space, cred);
-            }
-        } else {
-            lock.insert(space, cred);
-        }
+        self.insert_at(space, cred, Utc::now()).await
     }
 
+    async fn insert_at(&self, space: String, cred: ActiveSpaceCredential, now: DateTime<Utc>) {
+        if cred.expires_at <= now {
+            return;
+        }
+        self.failed_acquisitions.write().await.remove(&space);
+
+        // Credentials are stored as soon as they are issued, so the time left
+        // now is their lifetime.
+        let renew_at = cred.expires_at - renewal_margin(cred.expires_at - now);
+        let mut lock = self.values.write().await;
+        lock.retain(|_, v| v.cred.expires_at > now);
+
+        if lock
+            .get(&space)
+            .is_some_and(|existing| cred.expires_at < existing.cred.expires_at)
+        {
+            return;
+        }
+        lock.insert(space, StoredCredential { cred, renew_at });
+    }
+
+    /// The cached credential for `space`, unless it is within its renewal
+    /// margin ([`renewal_margin`]) of its expiry (the caller then acquires a
+    /// fresh credential with a fresh key).
     pub async fn get(&self, space: &str) -> Option<ActiveSpaceCredential> {
-        let now = Utc::now();
+        self.get_at(space, Utc::now()).await
+    }
+
+    async fn get_at(&self, space: &str, now: DateTime<Utc>) -> Option<ActiveSpaceCredential> {
         {
             let lock = self.values.read().await;
-            let cred = lock.get(space)?;
-            if cred.expires_at > now {
-                return Some(cred.clone());
+            let stored = lock.get(space)?;
+            if stored.renew_at > now {
+                return Some(stored.cred.clone());
             }
         }
 
         let mut lock = self.values.write().await;
-        if let Some(cred) = lock.get(space) {
-            if cred.expires_at <= now {
-                lock.remove(space);
-            }
+        if lock
+            .get(space)
+            .is_some_and(|stored| stored.cred.expires_at <= now)
+        {
+            lock.remove(space);
         }
         None
     }
@@ -75,10 +117,42 @@ impl CredentialStore {
         lock.remove(space);
     }
 
+    /// Remove the credential for `space` only if it is still `token`, so a
+    /// replacement acquired concurrently is kept. Returns whether it was removed.
+    pub async fn remove_if_token(&self, space: &str, token: &str) -> bool {
+        let mut lock = self.values.write().await;
+        if lock
+            .get(space)
+            .is_some_and(|stored| stored.cred.token == token)
+        {
+            lock.remove(space);
+            return true;
+        }
+        false
+    }
+
+    /// Remember that acquiring a credential for `space` failed, so request
+    /// handlers stop retrying it for [`FAILED_ACQUISITION_RETRY_DELAY`].
+    pub async fn note_failed_acquisition(&self, space: &str) {
+        let now = Utc::now();
+        let mut lock = self.failed_acquisitions.write().await;
+        lock.retain(|_, retry_at| *retry_at > now);
+        lock.insert(space.to_string(), now + FAILED_ACQUISITION_RETRY_DELAY);
+    }
+
+    /// True while a failed acquisition for `space` is recent.
+    pub async fn acquisition_failed_recently(&self, space: &str) -> bool {
+        self.failed_acquisitions
+            .read()
+            .await
+            .get(space)
+            .is_some_and(|retry_at| *retry_at > Utc::now())
+    }
+
     pub async fn count(&self) -> usize {
         let mut lock = self.values.write().await;
         let now = Utc::now();
-        lock.retain(|_, v| v.expires_at > now);
+        lock.retain(|_, v| v.cred.expires_at > now);
         lock.len()
     }
 }
@@ -227,6 +301,72 @@ pub struct DelegationTokenClaims {
     pub exp: i64,
     pub iat: i64,
     pub jti: String,
+}
+
+/// XRPC error a space host returns from getSpaceCredential once the space is
+/// deleted. `parse_xrpc_error` maps it to `AppError::AccessRemoved(SPACE_DELETED)`.
+pub const SPACE_DELETED: &str = "SpaceDeleted";
+
+/// True when a host rejected the space credential itself: `CredentialRevoked`,
+/// `BadSpaceSignature` or `BadSpaceAudience`. The same credential must not be
+/// retried.
+pub fn is_credential_rejected(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::Unauthorized(
+            AuthReason::CredentialRevoked
+                | AuthReason::BadSpaceSignature
+                | AuthReason::BadSpaceAudience
+        )
+    )
+}
+
+/// Evict the credential `token` for `space_uri` when `err` rejects it. The next
+/// operation reacquires one through [`ensure_space_credential`], which needs a
+/// still-authorized OAuth session and the authority's consent; nothing retries
+/// the rejected credential. Returns whether `err` was a credential rejection.
+pub async fn evict_rejected_credential(
+    credential_store: &CredentialStore,
+    space_uri: &str,
+    token: &str,
+    err: &AppError,
+) -> bool {
+    if !is_credential_rejected(err) {
+        return false;
+    }
+    if credential_store.remove_if_token(space_uri, token).await {
+        tracing::warn!(
+            error = %err,
+            space = %space_fingerprint(space_uri),
+            "Space credential rejected by host; evicted, a replacement is acquired on next use"
+        );
+    }
+    true
+}
+
+/// True only for a space host's declared `SpaceDeleted`. Every other credential
+/// failure (authorization, transport, 5xx) must leave Circle data in place.
+pub fn is_space_deleted(err: &AppError) -> bool {
+    matches!(err, AppError::AccessRemoved(code) if code == SPACE_DELETED)
+}
+
+/// A syncer that missed notifySpaceDeleted learns of the deletion at its next
+/// credential exchange and must delete every copy (permissioned-data proposal,
+/// "Space deletion"). Purges projections, the member cache, the credential and
+/// the notify registration, and tombstones the Circle so reads return
+/// `AccessRemoved` until the tombstone expires.
+pub async fn purge_deleted_space(db: &PgPool, credential_store: &CredentialStore, space_uri: &str) {
+    match crate::purge::delete_space(db, credential_store, space_uri).await {
+        Ok(()) => tracing::info!(
+            space = %space_fingerprint(space_uri),
+            "Space host reported SpaceDeleted; purged Circle data"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            space = %space_fingerprint(space_uri),
+            "Space host reported SpaceDeleted but the purge failed; it is retried at the next credential exchange"
+        ),
+    }
 }
 
 pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
@@ -434,8 +574,11 @@ pub async fn verify_member_access(
         }
     };
 
+    // A tombstoned Circle (space deleted or appAccess revoked) answers with the
+    // declared AccessRemoved, which tells devices to purge their caches. NotFound
+    // or Forbidden surface on the client as a network error and nothing is purged.
     if circle_deleted || !circle_app_access {
-        return Err(AppError::NotFound(
+        return Err(AppError::AccessRemoved(
             "Circle deleted or appAccess revoked".into(),
         ));
     }
@@ -563,6 +706,8 @@ pub async fn refresh_member_cache(
         .is_explicit_revocation(expected_client_id)
     {
         tracing::warn!(space_uri = %space_uri, "Space appAccess explicitly omits client_id, revoking");
+        // Unregister while the space credential is still cached; revocation drops it.
+        crate::notify::unregister(state, space_uri).await;
         let mut revoke_res =
             crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await;
         if revoke_res.is_err() {
@@ -825,7 +970,7 @@ pub async fn activate_circle(
         .map_err(AppError::Unauthorized)?;
     let author_signing_key = parse_verification_key(author_vm).map_err(AppError::Unauthorized)?;
 
-    let car_bytes = state
+    let car_bytes = match state
         .space_client
         .get_repo(
             &repo_service_endpoint,
@@ -833,13 +978,19 @@ pub async fn activate_circle(
             &authority_did,
             None,
             &cred.token,
-            &cred.dpop_key,
+            &cred.signing_key,
         )
         .await
-        .map_err(|e| {
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            evict_rejected_credential(&state.credential_store, space_uri, &cred.token, &e).await;
             tracing::warn!(error = %e, space_uri = %space_uri, "Failed to fetch authority repo during activation");
-            AppError::Internal(format!("Could not read the Space: repo fetch failed ({e})"))
-        })?;
+            return Err(AppError::Internal(format!(
+                "Could not read the Space: repo fetch failed ({e})"
+            )));
+        }
+    };
 
     let car = crate::commit::parse_permissioned_car(&car_bytes)
         .await
@@ -848,13 +999,8 @@ pub async fn activate_circle(
             AppError::Internal(format!("Could not read the Space: CAR decoding failed ({e})"))
         })?;
 
-    let (_commit, records, _lthash) = crate::commit::extract_and_validate_car_with_policy(
-        &car,
-        space_uri,
-        &authority_did,
-        &author_signing_key,
-        &state.config.commit_verification_policy,
-    )
+    let (_commit, records, _lthash) =
+        crate::commit::extract_and_validate_car(&car, space_uri, &authority_did, &author_signing_key)
     .map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "CAR validation failed during activation");
         AppError::Internal(format!("Could not read the Space: CAR validation failed ({e})"))
@@ -921,6 +1067,12 @@ pub async fn activate_circle(
     // so notification triggers correctly detect active members.
     let members = refresh_member_cache(state, space_uri).await?;
 
+    // 6b. Register for notifyWrite / notifySpaceDeleted at the space host. Best
+    // effort: the revision sweep retries a failed registration.
+    if let Err(e) = crate::notify::ensure_registration(state, space_uri, &cred).await {
+        tracing::warn!(error = %e, space = %space_fingerprint(space_uri), "registerNotify failed during activation");
+    }
+
     // 7. Sync the repo so children (circle_records, etc.) have their FK parent and notifications are generated.
     let sync_engine = crate::sync::SyncEngine::new(state);
     if let Err(e) = sync_engine.sync_repo(space_uri, &authority_did).await {
@@ -977,6 +1129,58 @@ pub async fn ensure_space_credential(
         preferred_user_did,
     )
     .await
+}
+
+/// [`ensure_space_credential`] for a request handler. A failed acquisition is
+/// remembered for [`FAILED_ACQUISITION_RETRY_DELAY`]; until then requests for
+/// that space fail at once instead of each minting a delegation token and
+/// calling a space host that is refusing the exchange. The failure is noted
+/// under the per-space lock, so requests queued behind it see it too.
+pub async fn ensure_space_credential_for_request(
+    state: &AppState,
+    space_uri: &str,
+    preferred_user_did: Option<&str>,
+) -> Result<ActiveSpaceCredential, AppError> {
+    let recently_failed =
+        || AppError::NotFound("Space credential acquisition failed recently".into());
+    if let Some(cred) = state.credential_store.get(space_uri).await {
+        return Ok(cred);
+    }
+    if state
+        .credential_store
+        .acquisition_failed_recently(space_uri)
+        .await
+    {
+        return Err(recently_failed());
+    }
+
+    let _lock_guard = state.space_locks.acquire(space_uri).await;
+    // Another request may have acquired, or failed to acquire, while this one waited.
+    if state
+        .credential_store
+        .acquisition_failed_recently(space_uri)
+        .await
+    {
+        return Err(recently_failed());
+    }
+    let result = ensure_space_credential_from_parts(
+        &state.db,
+        &state.space_client,
+        &state.credential_store,
+        &state.did_resolver,
+        &state.oauth_service,
+        &state.http_client,
+        space_uri,
+        preferred_user_did,
+    )
+    .await;
+    if result.is_err() {
+        state
+            .credential_store
+            .note_failed_acquisition(space_uri)
+            .await;
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1071,7 +1275,7 @@ pub async fn ensure_space_credential_from_parts(
     // 7. Step 2: Sign client attestation and exchange for Space credential
     let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
 
-    let (credential_jwt, ephemeral_dpop_key, expires_at) = space_client
+    let exchanged = space_client
         .exchange_credential(
             &space_host_endpoint,
             space_uri,
@@ -1080,11 +1284,32 @@ pub async fn ensure_space_credential_from_parts(
             &authority_did,
             &authority_doc,
         )
-        .await?;
+        .await;
+    let (credential_jwt, ephemeral_signing_key, expires_at) = match exchanged {
+        Ok(exchanged) => exchanged,
+        Err(e) if is_space_deleted(&e) => {
+            purge_deleted_space(db, credential_store, space_uri).await;
+            return Err(e);
+        }
+        Err(e @ AppError::UnsupportedPds(_)) => {
+            let profile = space_client
+                .describe_space_host(&space_host_endpoint)
+                .await
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unavailable".into());
+            tracing::warn!(
+                space_host = %space_host_endpoint,
+                host_profile = %profile,
+                "Refusing space host: credential is not bound to an HTTP signature key (cnf.kid)"
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     let cred = ActiveSpaceCredential {
         token: credential_jwt,
-        dpop_key: ephemeral_dpop_key,
+        signing_key: ephemeral_signing_key,
         expires_at,
     };
 
@@ -1159,6 +1384,107 @@ mod tests {
             !service.starts_with('#'),
             "audience must be fully qualified"
         );
+    }
+
+    fn credential(token: &str, expires_in: chrono::Duration) -> ActiveSpaceCredential {
+        ActiveSpaceCredential {
+            token: token.into(),
+            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            expires_at: Utc::now() + expires_in,
+        }
+    }
+
+    /// A 600 s credential is served until it is within the renewal margin of
+    /// its own exp, then the caller acquires a fresh one. A credential shorter
+    /// than twice the margin is served for the first half of its life.
+    #[tokio::test]
+    async fn credential_store_renews_within_the_margin_of_actual_expiry() {
+        assert_eq!(
+            renewal_margin(chrono::Duration::seconds(600)),
+            CREDENTIAL_RENEWAL_MARGIN
+        );
+        assert_eq!(
+            renewal_margin(chrono::Duration::seconds(30)),
+            chrono::Duration::seconds(15)
+        );
+
+        let store = CredentialStore::new();
+        let issued = Utc::now();
+        let at = |secs: i64| issued + chrono::Duration::seconds(secs);
+        let issued_for = |token: &str, secs: i64| ActiveSpaceCredential {
+            token: token.into(),
+            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            expires_at: at(secs),
+        };
+
+        store
+            .insert_at("space-a".into(), issued_for("fresh", 600), issued)
+            .await;
+        assert_eq!(store.get_at("space-a", at(0)).await.unwrap().token, "fresh");
+        assert!(store.get_at("space-a", at(539)).await.is_some());
+        assert!(
+            store.get_at("space-a", at(541)).await.is_none(),
+            "within 60 s of exp"
+        );
+
+        // 55 s credential: the old fixed 60 s margin never served it.
+        store
+            .insert_at("space-b".into(), issued_for("short", 55), issued)
+            .await;
+        assert_eq!(store.get_at("space-b", at(0)).await.unwrap().token, "short");
+        assert!(store.get_at("space-b", at(27)).await.is_some());
+        assert!(store.get_at("space-b", at(28)).await.is_none());
+
+        // Through the public API with the real clock.
+        store
+            .insert(
+                "space-c".into(),
+                credential("fresh", chrono::Duration::seconds(600)),
+            )
+            .await;
+        assert_eq!(store.get("space-c").await.unwrap().token, "fresh");
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_are_evicted_and_others_kept() {
+        let store = CredentialStore::new();
+        for reason in [
+            AuthReason::CredentialRevoked,
+            AuthReason::BadSpaceSignature,
+            AuthReason::BadSpaceAudience,
+        ] {
+            store
+                .insert(
+                    "space".into(),
+                    credential("c1", chrono::Duration::seconds(600)),
+                )
+                .await;
+            let err = AppError::Unauthorized(reason);
+            assert!(evict_rejected_credential(&store, "space", "c1", &err).await);
+            assert!(store.get("space").await.is_none(), "{reason:?} evicts");
+        }
+
+        // A transient failure keeps the credential.
+        store
+            .insert(
+                "space".into(),
+                credential("c1", chrono::Duration::seconds(600)),
+            )
+            .await;
+        let transient = AppError::Internal("Space host getRepo returned status 502".into());
+        assert!(!evict_rejected_credential(&store, "space", "c1", &transient).await);
+        assert!(store.get("space").await.is_some());
+
+        // A replacement acquired meanwhile is not evicted for the old token.
+        store
+            .insert(
+                "space".into(),
+                credential("c2", chrono::Duration::seconds(900)),
+            )
+            .await;
+        let revoked = AppError::Unauthorized(AuthReason::CredentialRevoked);
+        assert!(evict_rejected_credential(&store, "space", "c1", &revoked).await);
+        assert_eq!(store.get("space").await.unwrap().token, "c2");
     }
 
     fn register_test_did_doc(
@@ -1302,7 +1628,7 @@ mod tests {
         // Pre-populate credential store with unexpired credential
         let existing_cred = ActiveSpaceCredential {
             token: "already_cached_token".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
             expires_at: Utc::now() + chrono::Duration::hours(2),
         };
         credential_store
@@ -1632,7 +1958,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: crate::commit::CommitVerificationPolicy::default(),
         });
 
         let http_client = reqwest::Client::new();
@@ -1649,6 +1974,7 @@ mod tests {
             credential_store: credential_store.clone(),
             space_client,
             space_locks: Arc::new(SpaceLockManager::new()),
+            listing_resume: Default::default(),
             profile_hydrator,
             oauth_service,
             push_client: None,
@@ -1675,6 +2001,159 @@ mod tests {
         // The chain must have run exactly once due to the per-space lock and double-checked caching
         assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
         assert_eq!(mock_transport.recorded_calls().len(), 1);
+    }
+
+    /// An AppState over `mock_transport` holding an OAuth session for
+    /// TEST_USER_DID, for request-path acquisition tests.
+    async fn request_path_state(
+        pool: PgPool,
+        mock_transport: Arc<MockSpaceHostTransport>,
+    ) -> AppState {
+        setup_test_key();
+        let did_resolver = Arc::new(DidResolver::new(
+            "https://plc.directory".into(),
+            reqwest::Client::new(),
+        ));
+        register_test_did_doc(
+            &did_resolver,
+            TEST_USER_DID,
+            &p256::ecdsa::SigningKey::random(&mut OsRng),
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_USER_PDS.into(),
+            }],
+        );
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &p256::ecdsa::SigningKey::random(&mut OsRng),
+            vec![DidService {
+                id: "#atproto_space_host".into(),
+                r#type: "AtprotoSpaceHost".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            "https://circles.catbird.blue".into(),
+            p256::ecdsa::SigningKey::random(&mut OsRng),
+            None,
+        ));
+        oauth_service
+            .store_session(UserOAuthSession {
+                user_did: TEST_USER_DID.into(),
+                access_token: "test_access_token".into(),
+                refresh_token: None,
+                token_endpoint: format!("{TEST_USER_PDS}/oauth/token"),
+                auth_server_iss: TEST_USER_PDS.into(),
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                scope: "atproto".into(),
+                dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            })
+            .await
+            .unwrap();
+        let config = Arc::new(crate::config::Config {
+            host: "127.0.0.1".into(),
+            port: 3002,
+            database_url: "postgres://localhost/postgres".into(),
+            service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
+            plc_directory_url: "https://plc.directory".into(),
+            public_appview_url: "https://public.api.bsky.app".into(),
+            circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
+            appview_base_url: "http://127.0.0.1:3002".into(),
+            oauth_key_id: None,
+            oauth_signing_key_path: None,
+            oauth_signing_key_hex: None,
+            push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
+            push_signing_key_path: None,
+            push_signing_key_hex: None,
+        });
+        let http_client = reqwest::Client::new();
+        AppState {
+            profile_hydrator: Arc::new(crate::hydration::ProfileHydrator::new(
+                config.public_appview_url.clone(),
+                http_client.clone(),
+            )),
+            config,
+            db: pool,
+            http_client,
+            did_resolver,
+            credential_store: Arc::new(CredentialStore::new()),
+            space_client: Arc::new(SpaceClient::with_transport(mock_transport)),
+            space_locks: Arc::new(SpaceLockManager::new()),
+            listing_resume: Default::default(),
+            oauth_service,
+            push_client: None,
+        }
+    }
+
+    /// A refused exchange is remembered: concurrent and later requests for the
+    /// space do not each mint a delegation token and call the space host, and a
+    /// credential acquired elsewhere (the sweep) is served again at once.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn request_path_acquisition_failure_is_not_rerun_per_request(pool: PgPool) {
+        let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_credential_response(
+            TEST_SPACE_URI,
+            Err(serde_json::json!({
+                "error": "AppNotAuthorized",
+                "message": "Client AppView not permitted to read Space"
+            })
+            .to_string()),
+        );
+        let state = request_path_state(pool, mock_transport.clone()).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                ensure_space_credential_for_request(&state, TEST_SPACE_URI, Some(TEST_USER_DID))
+                    .await
+            }));
+        }
+        for handle in handles {
+            assert!(handle.await.unwrap().is_err());
+        }
+        // Positive control: the chain did run, exactly once.
+        assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
+        assert_eq!(mock_transport.recorded_calls().len(), 1);
+
+        assert!(
+            ensure_space_credential_for_request(&state, TEST_SPACE_URI, Some(TEST_USER_DID))
+                .await
+                .is_err()
+        );
+        assert_eq!(mock_transport.recorded_delegation_token_calls().len(), 1);
+        assert_eq!(mock_transport.recorded_calls().len(), 1);
+
+        // Another space is unaffected by this space's failure.
+        assert!(
+            !state
+                .credential_store
+                .acquisition_failed_recently("at://did:plc:other/space/blue.catbird.circle/x")
+                .await
+        );
+
+        state
+            .credential_store
+            .insert(
+                TEST_SPACE_URI.into(),
+                credential("from-sweep", chrono::Duration::seconds(600)),
+            )
+            .await;
+        let served =
+            ensure_space_credential_for_request(&state, TEST_SPACE_URI, Some(TEST_USER_DID))
+                .await
+                .expect("a stored credential is served");
+        assert_eq!(served.token, "from-sweep");
+        assert!(
+            !state
+                .credential_store
+                .acquisition_failed_recently(TEST_SPACE_URI)
+                .await,
+            "a stored credential clears the failure"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1996,8 +2475,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy:
-                crate::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
@@ -2013,6 +2490,7 @@ mod tests {
             credential_store: credential_store.clone(),
             space_client,
             space_locks: Arc::new(SpaceLockManager::new()),
+            listing_resume: Default::default(),
             profile_hydrator,
             oauth_service,
             push_client: None,
@@ -2067,6 +2545,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(member_rows.len(), 2);
+
+        // Activation registered for notifications at the authority's space host
+        // with the configured service id (CIRCLES-06).
+        let registration: Option<(String, String)> = sqlx::query_as(
+            "SELECT service, space_host_endpoint FROM circle_notify_registrations WHERE space_uri = $1",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let (service, endpoint) = registration.expect("activation must register for notifications");
+        assert_eq!(service, state.config.notify_service_identifier());
+        assert_eq!(endpoint, TEST_SPACE_HOST);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2212,8 +2703,6 @@ mod tests {
             push_key_id: "did:web:circles.catbird.blue#atproto_circles".into(),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy:
-                crate::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
         });
 
         let profile_hydrator = Arc::new(crate::hydration::ProfileHydrator::new(
@@ -2229,6 +2718,7 @@ mod tests {
             credential_store: credential_store.clone(),
             space_client,
             space_locks: Arc::new(SpaceLockManager::new()),
+            listing_resume: Default::default(),
             profile_hydrator,
             oauth_service,
             push_client: None,

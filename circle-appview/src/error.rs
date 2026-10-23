@@ -24,6 +24,7 @@ pub enum AuthReason {
     InvalidKid,
     MissingKid,
     NoVerificationMethod,
+    MissingOAuthSession,
     InvalidKeyType,
     InvalidCurve,
     InvalidCoordinates,
@@ -47,6 +48,12 @@ pub enum AuthReason {
     IdMismatch,
     SsrfBlocked,
     AlgKeyMismatch,
+    /// A repo or space host revoked the space credential (`CredentialRevoked`).
+    CredentialRevoked,
+    /// A host refused the request's HTTP message signature (`BadSpaceSignature`).
+    BadSpaceSignature,
+    /// A host refused the request's `Atproto-Space-Audience` (`BadSpaceAudience`).
+    BadSpaceAudience,
 }
 
 impl std::fmt::Display for AuthReason {
@@ -64,6 +71,7 @@ impl std::fmt::Display for AuthReason {
             Self::InvalidKid => "invalid_kid",
             Self::MissingKid => "missing_kid",
             Self::NoVerificationMethod => "no_verification_method",
+            Self::MissingOAuthSession => "missing_oauth_session",
             Self::InvalidKeyType => "invalid_key_type",
             Self::InvalidCurve => "invalid_curve",
             Self::InvalidCoordinates => "invalid_coordinates",
@@ -87,6 +95,9 @@ impl std::fmt::Display for AuthReason {
             Self::IdMismatch => "id_mismatch",
             Self::SsrfBlocked => "ssrf_blocked",
             Self::AlgKeyMismatch => "alg_key_mismatch",
+            Self::CredentialRevoked => "credential_revoked",
+            Self::BadSpaceSignature => "bad_space_signature",
+            Self::BadSpaceAudience => "bad_space_audience",
         };
         write!(f, "{s}")
     }
@@ -113,6 +124,10 @@ pub enum AppError {
 
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
+
+    /// The Circle's space host cannot serve Circles (declared `UnsupportedPDS`).
+    #[error("Unsupported PDS: {0}")]
+    UnsupportedPds(String),
 
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
@@ -165,6 +180,10 @@ impl IntoResponse for AppError {
                     "TooManyRequests",
                     msg.clone(),
                 )
+            }
+            AppError::UnsupportedPds(msg) => {
+                tracing::warn!(error_code = "UnsupportedPDS", "Unsupported space host");
+                (StatusCode::BAD_REQUEST, "UnsupportedPDS", msg.clone())
             }
             AppError::Database(_err) => {
                 tracing::error!(

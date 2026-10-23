@@ -153,6 +153,7 @@ pub fn build_post_view(
             repost: None,
             bookmarked: None,
             embedding_disabled: None,
+            known_likers: None,
             pinned: None,
             reply_disabled: None,
             thread_muted: None,

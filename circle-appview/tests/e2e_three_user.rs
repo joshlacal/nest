@@ -504,7 +504,6 @@ impl ThreeUserEnv {
             push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
             push_signing_key_path: None,
             push_signing_key_hex: None,
-            commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
         };
         let profile_hydrator = Arc::new(ProfileHydrator::new(
             config.public_appview_url.clone(),
@@ -526,6 +525,7 @@ impl ThreeUserEnv {
             credential_store,
             space_client,
             space_locks,
+            listing_resume: Default::default(),
             profile_hydrator: profile_hydrator.clone(),
             oauth_service,
             push_client: None,
@@ -631,7 +631,7 @@ impl ThreeUserEnv {
                 space_uri.clone(),
                 ActiveSpaceCredential {
                     token: "family-circle-space-token".into(),
-                    dpop_key: cred_key,
+                    signing_key: cred_key,
                     expires_at: Utc::now() + Duration::hours(2),
                 },
             )
