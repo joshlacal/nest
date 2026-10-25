@@ -37,10 +37,18 @@ impl TestDb {
             .expect("Failed to connect to admin postgres");
 
         let db_name = format!("test_push_sec_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
-            .execute(&admin_pool)
-            .await
-            .expect("Failed to create test database");
+        // PostgreSQL identifiers cannot be bound. This is a fixed prefix plus
+        // a generated UUID, never account data or an external identifier.
+        assert!(db_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{}\"",
+            db_name
+        )))
+        .execute(&admin_pool)
+        .await
+        .expect("Failed to create test database");
 
         let mut test_url = url::Url::parse(&base_url).unwrap();
         test_url.set_path(&db_name);
@@ -90,10 +98,14 @@ impl Drop for TestDb {
         let admin_pool = self.admin_pool.clone();
         let db_name = self.db_name.clone();
         tokio::spawn(async move {
-            let _ = sqlx::query(&format!(
+            // The same private fixture identifier was checked at creation.
+            assert!(db_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
                 db_name
-            ))
+            )))
             .execute(&admin_pool)
             .await;
         });

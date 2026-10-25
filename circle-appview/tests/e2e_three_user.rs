@@ -12,6 +12,7 @@
 //! 8. Public boundary verification: zero Circle URIs, private text, or private blob CIDs
 //!    appear on public search, feed, thread, or notification surfaces.
 
+use p256::elliptic_curve::Generate;
 mod support;
 use std::sync::Arc;
 
@@ -25,8 +26,8 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -94,11 +95,11 @@ fn register_did_doc(
     pds_endpoint: Option<&str>,
 ) {
     let vk = key.verifying_key();
-    let point = EncodedPoint::from(vk);
+    let point = Sec1Point::from(vk);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let p256_sec1 = vk.to_encoded_point(true);
+    let p256_sec1 = vk.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
@@ -451,10 +452,10 @@ impl ThreeUserEnv {
             .await
             .expect("Migrations must succeed");
 
-        let alice_key = SigningKey::random(&mut OsRng);
-        let bob_key = SigningKey::random(&mut OsRng);
-        let carol_key = SigningKey::random(&mut OsRng);
-        let dave_key = SigningKey::random(&mut OsRng);
+        let alice_key = SigningKey::generate_from_rng(&mut rand::rng());
+        let bob_key = SigningKey::generate_from_rng(&mut rand::rng());
+        let carol_key = SigningKey::generate_from_rng(&mut rand::rng());
+        let dave_key = SigningKey::generate_from_rng(&mut rand::rng());
 
         let alice = TestUser {
             did: ALICE_DID.into(),
@@ -513,7 +514,7 @@ impl ThreeUserEnv {
             config.public_appview_url.clone(),
             reqwest::Client::new(),
         ));
-        let oauth_signing_key = SigningKey::random(&mut OsRng);
+        let oauth_signing_key = SigningKey::generate_from_rng(&mut rand::rng());
         let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
             pool.clone(),
             config.appview_base_url.clone(),
@@ -628,7 +629,7 @@ impl ThreeUserEnv {
         .unwrap();
 
         // Grant active space credential to state
-        let cred_key = SigningKey::random(&mut OsRng);
+        let cred_key = SigningKey::generate_from_rng(&mut rand::rng());
         self.state
             .credential_store
             .insert(

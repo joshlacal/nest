@@ -450,20 +450,21 @@ pub async fn purge_deleted_author(pool: &PgPool, author: &str) -> Result<(), Pur
             .await?;
         tx.commit().await?;
     }
-    for (table, predicate) in [
-        ("circle_notifications", "actor_did=$1 OR recipient_did=$1"),
-        ("circle_reports", "reporter_did=$1"),
-        ("circle_preferences", "member_did=$1"),
-        ("circle_repo_sync_state", "author_did=$1"),
-        ("circle_member_cache", "member_did=$1"),
-        ("oauth_sessions", "user_did=$1"),
+    for statement in [
+        "DELETE FROM circle_notifications WHERE ctid IN (SELECT ctid FROM circle_notifications WHERE actor_did=$1 OR recipient_did=$1 LIMIT $2)",
+        "DELETE FROM circle_reports WHERE ctid IN (SELECT ctid FROM circle_reports WHERE reporter_did=$1 LIMIT $2)",
+        "DELETE FROM circle_preferences WHERE ctid IN (SELECT ctid FROM circle_preferences WHERE member_did=$1 LIMIT $2)",
+        "DELETE FROM circle_repo_sync_state WHERE ctid IN (SELECT ctid FROM circle_repo_sync_state WHERE author_did=$1 LIMIT $2)",
+        "DELETE FROM circle_member_cache WHERE ctid IN (SELECT ctid FROM circle_member_cache WHERE member_did=$1 LIMIT $2)",
+        "DELETE FROM oauth_sessions WHERE ctid IN (SELECT ctid FROM oauth_sessions WHERE user_did=$1 LIMIT $2)",
     ] {
         loop {
-            // Table/predicate strings are fixed literals above, not user input.
-            let deleted = sqlx::query(&format!(
-                "DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE {predicate} LIMIT $2)"
-            ))
-            .bind(author).bind(BATCH).execute(pool).await?.rows_affected();
+            let deleted = sqlx::query(statement)
+                .bind(author)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected();
             if deleted < BATCH as u64 {
                 break;
             }

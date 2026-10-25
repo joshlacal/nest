@@ -2,6 +2,7 @@
 //! host, persists `expiresAt`, renews an hour before it lapses, unregisters when
 //! it loses access, and acknowledges notifyWrite before syncing.
 
+use p256::elliptic_curve::Generate;
 mod support;
 use std::sync::Arc;
 
@@ -9,8 +10,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use sqlx::PgPool;
 
 use circle_appview::access::{ActiveSpaceCredential, CredentialStore, SpaceLockManager};
@@ -67,8 +68,8 @@ async fn setup(pool: PgPool, service_did: &str) -> Setup {
         config.plc_directory_url.clone(),
         reqwest::Client::builder().no_proxy().build().unwrap(),
     ));
-    let owner_key = SigningKey::random(&mut OsRng);
-    let point = EncodedPoint::from(owner_key.verifying_key());
+    let owner_key = SigningKey::generate_from_rng(&mut rand::rng());
+    let point = Sec1Point::from(owner_key.verifying_key());
     did_resolver.insert_cached(
         OWNER_DID.into(),
         DidDocument {
@@ -145,7 +146,7 @@ async fn setup(pool: PgPool, service_did: &str) -> Setup {
 fn credential(expires_at: DateTime<Utc>) -> ActiveSpaceCredential {
     ActiveSpaceCredential {
         token: "space.credential.jwt".into(),
-        signing_key: SigningKey::random(&mut OsRng),
+        signing_key: SigningKey::generate_from_rng(&mut rand::rng()),
         expires_at,
     }
 }

@@ -106,7 +106,10 @@ async fn verified_incident_roots() -> Vec<reqwest::Certificate> {
             let der = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .expect("root PEM should decode");
-            let fingerprint = format!("{:X}", sha2::Sha256::digest(&der));
+            let fingerprint = sha2::Sha256::digest(&der)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
             assert_eq!(fingerprint, expected_fingerprint, "root {name} changed");
             reqwest::Certificate::from_der(&der).expect("root DER should parse")
         })

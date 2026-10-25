@@ -18,8 +18,9 @@ use p256::ecdsa::{
     signature::{Signer, Verifier},
     Signature, SigningKey, VerifyingKey,
 };
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::DecodePrivateKey;
-use p256::EncodedPoint;
+use p256::Sec1Point;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -94,7 +95,7 @@ pub struct DpopProofClaims {
 
 /// Extract PublicP256Jwk from an EC P-256 VerifyingKey
 pub fn public_p256_jwk_from_verifying_key(vk: &VerifyingKey) -> PublicP256Jwk {
-    let encoded_point = vk.to_encoded_point(false);
+    let encoded_point = vk.to_sec1_point(false);
     let x_bytes = encoded_point.x().expect("uncompressed point has x");
     let y_bytes = encoded_point.y().expect("uncompressed point has y");
     PublicP256Jwk {
@@ -175,7 +176,7 @@ pub fn generate_dpop_proof(
     };
 
     let mut random_bytes = [0u8; 24];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random_bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut random_bytes);
     let jti = URL_SAFE_NO_PAD.encode(random_bytes);
 
     let claims = DpopProofClaims {
@@ -256,9 +257,9 @@ pub fn verify_dpop_proof(
     point_bytes.extend_from_slice(&x_bytes);
     point_bytes.extend_from_slice(&y_bytes);
 
-    let encoded_point = EncodedPoint::from_bytes(&point_bytes)
+    let encoded_point = Sec1Point::from_bytes(&point_bytes)
         .map_err(|e| AppError::BadRequest(format!("invalid P-256 encoded point: {e}")))?;
-    let verifying_key = VerifyingKey::from_encoded_point(&encoded_point)
+    let verifying_key = VerifyingKey::from_sec1_point(&encoded_point)
         .map_err(|e| AppError::BadRequest(format!("invalid P-256 verifying key: {e}")))?;
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
@@ -878,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_rfc7638_jkt_calculation() {
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let signing_key = SigningKey::generate_from_rng(&mut rand::rng());
         let jwk = public_p256_jwk_from_signing_key(&signing_key);
 
         assert_eq!(jwk.kty, "EC");
@@ -894,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_dpop_proof_generation_and_verification() {
-        let dpop_key = SigningKey::random(&mut rand::thread_rng());
+        let dpop_key = SigningKey::generate_from_rng(&mut rand::rng());
         let dpop_jkt = p256_jwk_thumbprint(&dpop_key);
 
         let method = "POST";
@@ -954,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_parse_p256_signing_key() {
-        let key = SigningKey::random(&mut rand::thread_rng());
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
         let sec1_bytes = key.to_bytes();
         let base64_sec1 = STANDARD.encode(sec1_bytes);
 

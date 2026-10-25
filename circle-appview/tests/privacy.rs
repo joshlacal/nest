@@ -1,3 +1,4 @@
+use p256::elliptic_curve::Generate;
 mod support;
 use axum::{
     body::{to_bytes, Body},
@@ -22,8 +23,8 @@ use circle_appview::{
 };
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::Signature;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -103,11 +104,11 @@ fn register_did_doc(
     pds_endpoint: Option<&str>,
 ) {
     let vk = key.verifying_key();
-    let point = EncodedPoint::from(vk);
+    let point = Sec1Point::from(vk);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let p256_sec1 = vk.to_encoded_point(true);
+    let p256_sec1 = vk.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
@@ -210,9 +211,9 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         .await
         .expect("Migrations must succeed");
 
-    let alice_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let bob_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let dave_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let alice_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+    let bob_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+    let dave_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     let config = Config {
         host: "127.0.0.1".into(),
@@ -246,7 +247,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         config.public_appview_url.clone(),
         reqwest::Client::new(),
     ));
-    let oauth_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let oauth_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
         pool.clone(),
         config.appview_base_url.clone(),
@@ -299,7 +300,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         auth_server_iss: "https://pds.alice.test".to_string(),
         expires_at: Some(Utc::now() + Duration::hours(1)),
         scope: "blue.catbird.circle".to_string(),
-        dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     state
         .oauth_service
@@ -407,7 +408,7 @@ async fn unauthorized_user_cannot_fetch_media_or_notifications(pool: PgPool) {
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
     // Store active credential for SPACE_1 in state
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -669,7 +670,7 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -880,7 +881,7 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -1071,7 +1072,7 @@ async fn media_does_not_rerun_a_refused_credential_exchange_per_request(pool: Pg
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+                signing_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
                 expires_at: Utc::now() + Duration::minutes(10),
             },
         )
@@ -1102,7 +1103,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -1314,7 +1315,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
     grant_active_member(&pool, SPACE_2, BOB_DID, Duration::hours(1)).await;
 
     // 3. Store active credentials in credential store for both spaces
-    let cred_key_1 = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key_1 = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -1328,7 +1329,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
         )
         .await;
 
-    let cred_key_2 = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key_2 = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -1651,7 +1652,7 @@ async fn push_client_logs_only_static_content_on_push_failure() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     // Push service returns 502 (delivery failed). The AppView client must surface the
     // error and emit only static log lines — never the recipient DID.
@@ -1703,7 +1704,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let mock_server = MockServer::start().await;
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     let service_did = "did:web:circles.catbird.blue";
     let key_id = "did:web:circles.catbird.blue#atproto_circles";
@@ -1747,7 +1748,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -1876,7 +1877,7 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -2015,7 +2016,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let service_did = "did:web:circles.catbird.blue";
     let key_id = "did:web:circles.catbird.blue#atproto_circles";
     let audience = "https://api.catbird.blue";
@@ -2057,7 +2058,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     // Note: BOB_DID is NOT a member (or lost membership)
 
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -2160,7 +2161,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
-    let cred_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let cred_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -3566,7 +3567,7 @@ async fn revocation_durability_commits_state_flip_and_credentials_before_purge(p
     .await
     .unwrap();
 
-    let p256_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let p256_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store
@@ -3662,7 +3663,7 @@ async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_
     .unwrap();
 
     // Seed credential in store
-    let p256_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let p256_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     setup
         .state
         .credential_store

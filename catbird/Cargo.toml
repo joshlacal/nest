@@ -7,90 +7,89 @@ license = "MIT"
 
 [dependencies]
 # Web Framework
-axum = { version = "0.7", features = ["macros"] }
-axum-extra = { version = "0.9", features = ["cookie", "typed-header"] }
-tower = { version = "0.4", features = ["util", "timeout"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "request-id"] }
-tower_governor = "0.4"
+axum = { version = "0.8.9", features = ["macros"] }
+axum-extra = { version = "0.12.6", features = ["cookie", "typed-header"] }
+tower = { version = "0.5.3", features = ["util", "timeout"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace", "request-id"] }
+tower_governor = "0.8.0"
 
 # Async Runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 
 # HTTP Client
-reqwest = { version = "0.13", features = ["rustls", "json", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
-flate2 = "1.0"
-brotli = "8.0"
+reqwest = { version = "0.13.5", features = ["rustls", "json", "form", "query", "cookies", "multipart", "stream", "brotli", "gzip", "deflate"] }
+flate2 = "1.1.10"
+brotli = "9.1.0"
 # Jacquard (AT Protocol)
-jacquard-oauth = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["default"] }
-jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }
-jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["dns", "cache"] }
-jose-jwk = { version = "0.1", features = ["p256"] }
-catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto.git", rev = "e7ff2a3bb17f7d668889cae5f34a2d8d6755647c", features = ["namespace-bluecatbird", "namespace-site-standard"] }
+jacquard-oauth = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", features = ["default"] }
+jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", features = ["reqwest-client"] }
+jacquard-identity = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", features = ["dns", "cache"] }
+jose-jwk = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.1.2", default-features = false, features = ["p256"] }
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671", features = ["namespace-bluecatbird", "namespace-site-standard"] }
 
 # Encryption
-aes-gcm = "0.10"
-dashmap = "6"
+aes-gcm = "0.11.1"
+dashmap = "6.2.1"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Crypto for DPoP and Client Assertions
-p256 = { version = "0.13", features = ["jwk", "ecdsa", "pkcs8"] }
-base64 = "0.22"
-sha2 = "0.10"
-hmac = "0.12"
-rand = "0.8"
-subtle = "2.6"
-multibase = "0.9"
+p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
+base64 = "0.23.1"
+sha2 = "0.11.1"
+hmac = "0.13.0"
+rand = "0.10.3"
+subtle = "2.6.1"
+multibase = "0.9.3"
 
 # Session Storage
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "time", "chrono", "uuid", "json"] }
+redis = { version = "1.8.0", features = ["tokio-comp", "connection-manager"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "time", "chrono", "uuid", "json"] }
 
 # Configuration
-dotenvy = "0.15"
-config = "0.14"
+dotenvy = "0.15.7"
+config = "0.15.27"
 
 # Logging & Tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # Error Handling
-thiserror = "1.0"
-anyhow = "1.0"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
 
 # CLI (for session_migrate binary)
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 
 # Utilities
-uuid = { version = "1.0", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-url = "2.5"
-futures-util = "0.3"
-regex = "1"
-async-trait = "0.1"
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+url = "2.5.8"
+futures-util = "0.3.34"
+regex = "1.13.1"
+async-trait = "0.1.92"
 
 # Metrics
-prometheus = { version = "0.13", default-features = false }
-lazy_static = "1.4"
-http = "1.0"
-bytes = "1.0"
-urlencoding = "2.1"
-time = "0.3"
-smol_str = { version = "0.3", features = ["serde"] }
-ipnet = "2.10"
-a2 = "0.10"
+prometheus = { version = "0.14.0", default-features = false }
+lazy_static = "1.5.1"
+http = "1.5.0"
+bytes = "1.12.1"
+urlencoding = "2.1.3"
+time = "0.3.55"
+smol_str = { version = "0.3.7", features = ["serde"] }
+ipnet = "2.12.2"
+a2 = { git = "https://github.com/joshlacal/a2", rev = "09f296e010cbcd2fc9a385f7c650716847bd47c0", version = "0.10.0" }
 
 [dev-dependencies]
-axum-test = "15"
-tokio-test = "0.4"
-wiremock = "0.6"
-testcontainers = "0.18"
-testcontainers-modules = { version = "0.6", features = ["redis"] }
+axum-test = "21.1.0"
+tokio-test = "0.4.6"
+wiremock = "0.6.5"
+testcontainers-modules = { version = "0.15.0", features = ["redis"] }
 # Exercise a2's exact Hyper-Rustls connector in the opt-in live incident probe.
-hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "http2", "webpki-roots", "ring"] }
-rustls = "0.22"
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "webpki-tokio", "ring"] }
+rustls = "0.23.46"
 
 [lints.rust]
 dead_code = "allow"

@@ -15,8 +15,9 @@ use circle_appview::{
     },
 };
 use p256::ecdsa::signature::Signer;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+use p256::elliptic_curve::Generate;
+
+use p256::Sec1Point;
 use serde_json::json;
 use sqlx::PgPool;
 use std::future::Future;
@@ -74,9 +75,9 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_signing_key_hex: None,
     };
 
-    let alice_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let bob_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let authority_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let alice_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+    let bob_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+    let authority_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     let mock_transport = Arc::new(MockSpaceHostTransport::new());
     let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
@@ -90,7 +91,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         config.public_appview_url.clone(),
         reqwest::Client::new(),
     ));
-    let oauth_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let oauth_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
         pool.clone(),
         config.appview_base_url.clone(),
@@ -167,11 +168,11 @@ fn register_did_doc(
     services: Option<Vec<DidService>>,
 ) {
     let vk = key.verifying_key();
-    let point = EncodedPoint::from(vk);
+    let point = Sec1Point::from(vk);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let p256_sec1 = vk.to_encoded_point(true);
+    let p256_sec1 = vk.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
@@ -257,7 +258,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     assert!(store.get(&space).await.is_none());
     assert_eq!(store.count().await, 0);
 
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let cred1 = ActiveSpaceCredential {
         token: "jwt_token_1".into(),
         signing_key: signing_key.clone(),
@@ -1094,7 +1095,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     ))
     .unwrap();
 
-    let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let exchange_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let exchange_request = circle_appview::space_client::SpaceCredentialRequest {
         space: "at://did:plc:auth/space/1".into(),
         credential_kid: circle_appview::space_signature::p256_did_key(exchange_key.verifying_key()),
@@ -1366,7 +1367,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
         .await;
 
     let did_resolver = Arc::new(DidResolver::new(mock_server.uri(), reqwest::Client::new()));
-    let alice_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let alice_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let pds_service = vec![DidService {
         id: "did:plc:authspace#atproto_pds".into(),
         r#type: "AtprotoPersonalDataServer".into(),
@@ -1380,7 +1381,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
     );
 
     // Create OAuth service and pre-seed active session
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
         pool,
         "http://127.0.0.1:3002".into(),
@@ -1395,7 +1396,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
         auth_server_iss: mock_server.uri(),
         expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
         scope: "blue.catbird.circle".to_string(),
-        dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     let _ = oauth_service.store_session(session).await;
 
@@ -1527,7 +1528,7 @@ async fn membership_and_authority_app_access_expire_after_thirty_seconds_with_ex
             auth_server_iss: "https://pds.fixture.example.com".into(),
             expires_at: Some(Utc::now() - chrono::Duration::seconds(60)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         })
         .await
         .unwrap();

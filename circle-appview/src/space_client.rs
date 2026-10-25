@@ -2,7 +2,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use p256::ecdsa::signature::Signer;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate;
+
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2007,7 +2008,7 @@ impl SpaceClient {
 
         // A fresh key per credential; the authority binds the credential to it
         // (cnf.kid) and every later use is signed with it.
-        let ephemeral_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let ephemeral_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let key_id = p256_did_key(ephemeral_key.verifying_key());
         let request = SpaceCredentialRequest {
             space: space_uri.into(),
@@ -3081,7 +3082,7 @@ mod tests {
         let transport = DefaultSpaceHostTransport::with_loopback(true);
         let target =
             url::Url::parse(&format!("{}/xrpc/com.atproto.space.getBlob", server.uri())).unwrap();
-        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let auth = credential_headers(&key, "cred", REPO);
         let (content_type, bytes) = transport
             .get_blob(&target, &auth, SPACE, REPO, CID)
@@ -3154,7 +3155,7 @@ mod tests {
             server.uri()
         ))
         .unwrap();
-        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let request = SpaceCredentialRequest {
             space: SPACE.into(),
             credential_kid: p256_did_key(key.verifying_key()),
@@ -3222,7 +3223,7 @@ mod tests {
             let target =
                 url::Url::parse(&format!("{}/xrpc/com.atproto.space.getRepo", server.uri()))
                     .unwrap();
-            let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+            let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
             let err = transport
                 .get_repo(
                     &target,
@@ -3255,7 +3256,7 @@ mod tests {
     }
 
     fn authority_doc(key: &p256::ecdsa::SigningKey) -> DidDocument {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         DidDocument {
             id: AUTHORITY.into(),
             verification_method: vec![crate::auth::VerificationMethod {
@@ -3293,7 +3294,7 @@ mod tests {
     async fn audience_is_derived_from_the_operation() {
         let mock = Arc::new(MockSpaceHostTransport::new());
         let client = SpaceClient::with_transport(mock.clone());
-        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let ep = "https://host.example";
         let service = "did:web:circles.example#atproto_circles";
 
@@ -3345,7 +3346,7 @@ mod tests {
     /// returned is bound to exactly that key.
     #[tokio::test]
     async fn exchange_binds_each_credential_to_a_fresh_key() {
-        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let authority_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let doc = authority_doc(&authority_key);
         let mock = Arc::new(MockSpaceHostTransport::new());
         mock.set_authority_signing_key(AUTHORITY, authority_key);
@@ -3380,10 +3381,14 @@ mod tests {
     /// credential from a host on an older alpha is the declared UnsupportedPDS.
     #[test]
     fn credential_must_be_bound_to_our_key_id() {
-        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let authority_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let doc = authority_doc(&authority_key);
-        let ours = p256_did_key(p256::ecdsa::SigningKey::random(&mut OsRng).verifying_key());
-        let theirs = p256_did_key(p256::ecdsa::SigningKey::random(&mut OsRng).verifying_key());
+        let ours = p256_did_key(
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()).verifying_key(),
+        );
+        let theirs = p256_did_key(
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()).verifying_key(),
+        );
         let expires = Utc::now() + chrono::Duration::seconds(DEFAULT_CREDENTIAL_LIFETIME_SECS);
 
         let bound = mint_mock_space_credential(&authority_key, AUTHORITY, SPACE, &ours, expires);
@@ -3414,9 +3419,11 @@ mod tests {
 
     #[test]
     fn credential_lifetime_is_bounded_at_3600_seconds() {
-        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let authority_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let doc = authority_doc(&authority_key);
-        let ours = p256_did_key(p256::ecdsa::SigningKey::random(&mut OsRng).verifying_key());
+        let ours = p256_did_key(
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()).verifying_key(),
+        );
         let now = Utc::now().timestamp();
         let claims = |iat: i64, exp: i64| {
             json!({"iss": AUTHORITY, "sub": SPACE, "iat": iat, "exp": exp,
@@ -3439,7 +3446,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let commit = crate::test_support::fixture_commit(SPACE, REPO, "3jzfcijpj2m2a", &[0; 2048]);
         let star = crate::test_support::fixture_star(&commit, &[]).unwrap();
-        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         for endpoint in ["getLatestCommit", "getRepo", "listRepoOps"] {
             for mode in ["good", "missing", "wrong", "duplicate", "type", "version"] {
                 let server = MockServer::start().await;
@@ -3512,7 +3519,7 @@ mod tests {
     async fn every_page_and_bounded_bad_mac_retry_gets_a_fresh_key() {
         let mock = Arc::new(MockSpaceHostTransport::new());
         let client = SpaceClient::with_transport(mock.clone());
-        let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         for cursor in [None, Some("next")] {
             let _ = client
                 .list_repo_ops(

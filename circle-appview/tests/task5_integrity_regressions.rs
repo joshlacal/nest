@@ -1,8 +1,9 @@
+use p256::elliptic_curve::Generate;
 mod support;
 use base64::Engine;
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -87,11 +88,11 @@ fn register_did_doc(
     services: Option<Vec<DidService>>,
 ) {
     let vk = key.verifying_key();
-    let point = p256::EncodedPoint::from(vk);
+    let point = p256::Sec1Point::from(vk);
     let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let p256_sec1 = vk.to_encoded_point(true);
+    let p256_sec1 = vk.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
@@ -159,8 +160,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_signing_key_path: None,
         push_signing_key_hex: None,
     };
-    let owner_signing_key = SigningKey::random(&mut OsRng);
-    let bob_signing_key = SigningKey::random(&mut OsRng);
+    let owner_signing_key = SigningKey::generate_from_rng(&mut rand::rng());
+    let bob_signing_key = SigningKey::generate_from_rng(&mut rand::rng());
 
     let mock_transport = Arc::new(MockSpaceHostTransport::new());
     let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
@@ -174,7 +175,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         config.public_appview_url.clone(),
         reqwest::Client::new(),
     ));
-    let oauth_signing_key = SigningKey::random(&mut OsRng);
+    let oauth_signing_key = SigningKey::generate_from_rng(&mut rand::rng());
     let oauth_service = Arc::new(circle_appview::oauth::OAuthService::new(
         pool.clone(),
         config.appview_base_url.clone(),
@@ -240,7 +241,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
             SPACE_URI.to_string(),
             ActiveSpaceCredential {
                 token: "test-space-token".into(),
-                signing_key: SigningKey::random(&mut OsRng),
+                signing_key: SigningKey::generate_from_rng(&mut rand::rng()),
                 expires_at: Utc::now() + chrono::Duration::hours(1),
             },
         )
@@ -474,7 +475,7 @@ async fn test_notify_write_requires_active_membership_before_work(pool: PgPool) 
 
     // Non-member DID
     const EVE_DID: &str = "did:plc:eve-not-member";
-    let eve_key = SigningKey::random(&mut OsRng);
+    let eve_key = SigningKey::generate_from_rng(&mut rand::rng());
     register_did_doc(&setup.state.did_resolver, EVE_DID, &eve_key, None);
 
     // A forwarded notification comes from the space authority; Eve signing her
@@ -916,7 +917,8 @@ async fn test_car_validation_accepts_only_upstream_v1_commits(pool: PgPool) {
     );
 
     // 3. A v1 commit for a different author fails signature/context verification.
-    let other_key = ParsedVerifyingKey::P256(*SigningKey::random(&mut OsRng).verifying_key());
+    let other_key =
+        ParsedVerifyingKey::P256(*SigningKey::generate_from_rng(&mut rand::rng()).verifying_key());
     assert!(
         extract_and_validate_car(&parsed_car, SPACE_URI, OWNER_DID, &other_key).is_err(),
         "a v1 commit must not verify under another key"

@@ -4,6 +4,7 @@
 //! credential failure purges. A tombstoned Circle answers reads with the declared
 //! `AccessRemoved`, and expired tombstones are purged by a scheduled task.
 
+use p256::elliptic_curve::Generate;
 mod support;
 use std::sync::Arc;
 
@@ -11,8 +12,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -39,8 +40,8 @@ struct Setup {
 }
 
 fn register_did_doc(resolver: &DidResolver, did: &str, services: Vec<DidService>) {
-    let key = SigningKey::random(&mut OsRng);
-    let point = EncodedPoint::from(key.verifying_key());
+    let key = SigningKey::generate_from_rng(&mut rand::rng());
+    let point = Sec1Point::from(key.verifying_key());
     resolver.insert_cached(
         did.into(),
         DidDocument {
@@ -138,7 +139,7 @@ async fn setup(pool: PgPool) -> Setup {
             auth_server_iss: "https://pds.owner.example".into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: SigningKey::random(&mut OsRng),
+            dpop_key: SigningKey::generate_from_rng(&mut rand::rng()),
         })
         .await
         .unwrap();
@@ -206,13 +207,27 @@ async fn seed_active_circle(pool: &PgPool) {
 }
 
 async fn count(pool: &PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM {table} WHERE space_uri = $1"
-    ))
-    .bind(SPACE_URI)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    let query = match table {
+        "circle_member_cache" => "SELECT count(*) FROM circle_member_cache WHERE space_uri = $1",
+        "circle_member_cache_meta" => {
+            "SELECT count(*) FROM circle_member_cache_meta WHERE space_uri = $1"
+        }
+        "circle_records" => "SELECT count(*) FROM circle_records WHERE space_uri = $1",
+        "circle_likes" => "SELECT count(*) FROM circle_likes WHERE space_uri = $1",
+        "circle_repo_sync_state" => {
+            "SELECT count(*) FROM circle_repo_sync_state WHERE space_uri = $1"
+        }
+        "circle_notifications" => "SELECT count(*) FROM circle_notifications WHERE space_uri = $1",
+        "circle_preferences" => "SELECT count(*) FROM circle_preferences WHERE space_uri = $1",
+        "circle_reports" => "SELECT count(*) FROM circle_reports WHERE space_uri = $1",
+        "circle_rejections" => "SELECT count(*) FROM circle_rejections WHERE space_uri = $1",
+        _ => panic!("unknown projection table"),
+    };
+    sqlx::query_scalar(query)
+        .bind(SPACE_URI)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 const PROJECTION_TABLES: [&str; 9] = [

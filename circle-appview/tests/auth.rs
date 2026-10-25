@@ -19,8 +19,9 @@ use circle_appview::{
 };
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::Signature;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+use p256::elliptic_curve::Generate;
+
+use p256::Sec1Point;
 use serde_json::json;
 use sqlx::PgPool;
 use std::future::Future;
@@ -78,17 +79,17 @@ async fn setup_test(pool: PgPool) -> TestSetup {
     let state = AppState::new(config, pool.clone());
 
     // Generate P-256 key pair
-    let p256_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let p256_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let p256_verifying_key = p256_signing_key.verifying_key();
-    let point = EncodedPoint::from(p256_verifying_key);
+    let point = Sec1Point::from(p256_verifying_key);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
     // Generate secp256k1 key pair
-    let secp_signing_key = k256::ecdsa::SigningKey::random(&mut OsRng);
+    let secp_signing_key = k256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     // Multikey P-256 (0x1200 prefix -> varint [0x80, 0x24])
-    let p256_sec1 = p256_verifying_key.to_encoded_point(true);
+    let p256_sec1 = p256_verifying_key.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
@@ -760,7 +761,7 @@ async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: P
     // 2. Register BOB with secp256k1 Multikey
     let bob_did = "did:plc:bob-secp256k1";
     let secp_vk = setup.secp_signing_key.verifying_key();
-    let secp_sec1 = secp_vk.to_encoded_point(true);
+    let secp_sec1 = secp_vk.to_sec1_point(true);
     let mut secp_multikey_bytes = vec![0xe7, 0x01];
     secp_multikey_bytes.extend_from_slice(secp_sec1.as_bytes());
     let secp_multikey = multibase::encode(multibase::Base::Base58Btc, &secp_multikey_bytes);
@@ -827,7 +828,7 @@ async fn enforces_algorithm_curve_matching_and_verification_method_types(pool: P
     // 5. Invalid verification method type: arbitrary type carrying P-256 key -> rejected
     let charlie_did = "did:plc:charlie-invalid-type";
     let p256_vk = setup.p256_signing_key.verifying_key();
-    let point = EncodedPoint::from(p256_vk);
+    let point = Sec1Point::from(p256_vk);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
@@ -872,7 +873,7 @@ async fn rejects_invalid_cryptographic_signature(pool: PgPool) {
     let setup = setup_test(pool).await;
 
     // Sign with an unrelated private key
-    let wrong_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let wrong_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let bad_sig_token = create_service_token(
         &wrong_key,
         ALICE_DID,
@@ -1008,7 +1009,7 @@ async fn handles_did_web_transport_resolution_and_ssrf_policies(pool: PgPool) {
 
     // 1. Successful public resolution through injected transport (NO cache pre-insertion)
     let public_did = "did:web:bluecatbird.io";
-    let point = EncodedPoint::from(setup.p256_signing_key.verifying_key());
+    let point = Sec1Point::from(setup.p256_signing_key.verifying_key());
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
@@ -1445,7 +1446,7 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
 
     // Bad signature token containing issuer, JTI, and LXM canaries
     let bad_sig_token = create_service_token(
-        &p256::ecdsa::SigningKey::random(&mut OsRng),
+        &p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         iss_canary,
         CIRCLE_AUDIENCE,
         lxm_canary,
@@ -1865,9 +1866,9 @@ async fn key_rotation_with_curve_change_and_controllable_upstream(pool: PgPool) 
     let public_socket: SocketAddr = "93.184.216.34:443".parse().unwrap();
 
     // Key A: Initial active key is P-256
-    let key_a = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let key_a = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let vk_a = key_a.verifying_key();
-    let point_a = EncodedPoint::from(vk_a);
+    let point_a = Sec1Point::from(vk_a);
     let x_a = URL_SAFE_NO_PAD.encode(point_a.x().unwrap());
     let y_a = URL_SAFE_NO_PAD.encode(point_a.y().unwrap());
 
@@ -1961,9 +1962,9 @@ async fn key_rotation_with_curve_change_and_controllable_upstream(pool: PgPool) 
     );
 
     // 3. Upstream rotation: DID rotates to Key B (secp256k1 / ES256K)
-    let key_b = k256::ecdsa::SigningKey::random(&mut OsRng);
+    let key_b = k256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let secp_vk = key_b.verifying_key();
-    let secp_sec1 = secp_vk.to_encoded_point(true);
+    let secp_sec1 = secp_vk.to_sec1_point(true);
     let mut secp_multikey_bytes = vec![0xe7, 0x01];
     secp_multikey_bytes.extend_from_slice(secp_sec1.as_bytes());
     let secp_multikey = multibase::encode(multibase::Base::Base58Btc, &secp_multikey_bytes);
@@ -2413,14 +2414,14 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
     let service = OAuthService::with_transport(
         pool.clone(),
         "http://127.0.0.1:3002".to_string(),
-        p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         None,
         transport,
     );
     let http_client = reqwest::Client::new();
 
     // Pre-seed an existing active session for the victim user
-    let victim_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+    let victim_dpop_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let victim_session = UserOAuthSession {
         user_did: victim_did.to_string(),
         access_token: "victim-original-access-token-123".to_string(),
@@ -2444,7 +2445,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
-        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     service
         .pending_states
@@ -2486,7 +2487,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
-        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     service
         .pending_states
@@ -2516,7 +2517,7 @@ async fn oauth_callback_preserves_victim_session_and_enforces_subject_binding(po
         auth_server_iss: Some(fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
-        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     service
         .pending_states
@@ -2578,7 +2579,7 @@ async fn oauth_provider_origin_mismatch_and_proof_header_absence(pool: PgPool) {
     let service = OAuthService::with_transport(
         pool.clone(),
         "http://127.0.0.1:3002".to_string(),
-        p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         None,
         transport,
     );
@@ -2616,7 +2617,7 @@ async fn oauth_provider_origin_mismatch_and_proof_header_absence(pool: PgPool) {
         auth_server_iss: Some(pds_fixture.base_url.clone()),
         created_at: Utc::now(),
         in_flight: false,
-        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     service
         .pending_states
@@ -2645,7 +2646,7 @@ async fn oauth_provider_origin_mismatch_and_proof_header_absence(pool: PgPool) {
         auth_server_iss: pds_fixture.base_url.clone(),
         expires_at: Some(Utc::now() - chrono::Duration::seconds(100)), // expired
         scope: "blue.catbird.circle".to_string(),
-        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     service.store_session(session_attack).await.unwrap();
 
@@ -3094,7 +3095,7 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
     let transport = fixture.transport();
     let space_client = SpaceClient::with_transport(transport.clone());
 
-    let oauth_signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+    let oauth_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let oauth_service = Arc::new(OAuthService::with_transport(
         pool.clone(),
         "http://127.0.0.1:3002".to_string(),
@@ -3112,7 +3113,7 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
         auth_server_iss: fixture.base_url.clone(),
         expires_at: Some(Utc::now() + chrono::Duration::seconds(3600)),
         scope: "blue.catbird.circle".to_string(),
-        dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+        dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
     };
     oauth_service.store_session(session).await.unwrap();
 

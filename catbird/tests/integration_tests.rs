@@ -6,6 +6,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use p256::elliptic_curve::Generate;
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -72,7 +73,7 @@ mod tests {
         };
         use p256::ecdsa::SigningKey;
 
-        let dpop_signing_key = SigningKey::random(&mut rand::thread_rng());
+        let dpop_signing_key = SigningKey::generate_from_rng(&mut rand::rng());
         let dpop_jkt = p256_jwk_thumbprint(&dpop_signing_key);
 
         let now = 1700000000;
@@ -423,7 +424,7 @@ mod tests {
         state_obj.session_encryption_key = Some(enc_key);
         let state = Arc::new(state_obj);
         let app = catbird::routes::atproto::create_router(state.clone()).with_state(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let server = TestServer::new(app);
 
         let session_id = Uuid::new_v4().to_string();
         let browser_nonce = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V".to_string();
@@ -943,7 +944,7 @@ mod tests {
             "atproto-proxy",
             axum::http::HeaderValue::from_static(appview_target),
         );
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = catbird::middleware::JacquardDpopData {

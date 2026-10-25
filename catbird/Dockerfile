@@ -6,9 +6,11 @@
 # =============================================================================
 
 # Stage 1: Build
-FROM rust:1.90-slim-bookworm AS builder
+FROM rust:1.99.1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS builder
 
 WORKDIR /app
+
+ARG CARGO_BUILD_JOBS=2
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -16,33 +18,22 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for dependency caching
+# Source and migrations are both compile-time inputs.
+# Shared contract/APNs crates resolve from the immutable Cargo.lock revisions.
 COPY Cargo.toml Cargo.lock ./
-
-# Create dummy src for dependency compilation
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Build dependencies only
-RUN cargo build --release --locked && rm -rf src
-
-# Copy actual source code
 COPY src ./src
-
-# Touch main.rs to ensure rebuild
-RUN touch src/main.rs
-
-# Build the actual binary
-RUN cargo build --release --locked
+COPY migrations ./migrations
+RUN cargo build --release --locked --bin catbird
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:13.7-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 
 WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
+    libssl3t64 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

@@ -8,11 +8,9 @@ use base64::{
     Engine,
 };
 pub use catbird_atproto::generated::com_atproto::space::Commit;
-use hmac::{Hmac, Mac};
-use p256::{
-    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
-    PublicKey, SecretKey,
-};
+use hmac::{Hmac, KeyInit, Mac};
+use p256::elliptic_curve::Generate;
+use p256::{elliptic_curve::sec1::ToSec1Point, PublicKey, SecretKey};
 use sha2::Sha256;
 
 pub const WANT_MAC_HEADER: &str = "atproto-space-want-mac";
@@ -60,17 +58,17 @@ pub fn kem_key(doc: &DidDocument, did: &str) -> Result<PublicKey, AppError> {
     }
     match parse_verification_key(vm).map_err(AppError::Unauthorized)? {
         ParsedVerifyingKey::P256(key) => {
-            PublicKey::from_sec1_bytes(key.to_encoded_point(false).as_bytes()).map_err(|_| bad())
+            PublicKey::from_sec1_bytes(key.to_sec1_point(false).as_bytes()).map_err(|_| bad())
         }
         _ => Err(bad()),
     }
 }
 pub fn encapsulate(author: &PublicKey) -> Result<MacRequest, AppError> {
-    let ephemeral = SecretKey::random(&mut OsRng);
+    let ephemeral = SecretKey::generate_from_rng(&mut rand::rng());
     let public = ephemeral.public_key();
     let shared_secret = derive_secret(&ephemeral, author, &public, author)?;
     let mut multikey = vec![0x80, 0x24];
-    multikey.extend_from_slice(public.to_encoded_point(true).as_bytes());
+    multikey.extend_from_slice(public.to_sec1_point(true).as_bytes());
     Ok(MacRequest {
         key_share: format!(
             "did:key:{}",
@@ -93,8 +91,8 @@ pub fn derive_secret(
     let mut info = vec![0, 32];
     info.extend_from_slice(prefix);
     info.extend_from_slice(b"shared_secret");
-    info.extend_from_slice(syncer.to_encoded_point(false).as_bytes());
-    info.extend_from_slice(author.to_encoded_point(false).as_bytes());
+    info.extend_from_slice(syncer.to_sec1_point(false).as_bytes());
+    info.extend_from_slice(author.to_sec1_point(false).as_bytes());
     let mut output = [0; 32];
     hkdf::Hkdf::<Sha256>::new(Some(&[]), &input)
         .expand(&info, &mut output)
@@ -216,7 +214,7 @@ mod tests {
     }
     #[test]
     fn fresh_request_keys() {
-        let author = SecretKey::random(&mut OsRng).public_key();
+        let author = SecretKey::generate_from_rng(&mut rand::rng()).public_key();
         assert_ne!(encapsulate(&author).unwrap(), encapsulate(&author).unwrap());
     }
     #[test]
@@ -313,7 +311,7 @@ mod tests {
         .unwrap();
         let key = kem_key(&doc, &doc.id).expect("PLC raw P-256 verification suite is supported");
         let mut multikey = vec![0x80, 0x24];
-        multikey.extend_from_slice(key.to_encoded_point(true).as_bytes());
+        multikey.extend_from_slice(key.to_sec1_point(true).as_bytes());
         let mut modern = doc.clone();
         let vm = modern
             .verification_method

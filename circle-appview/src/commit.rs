@@ -322,7 +322,7 @@ fn compute_mac_local(ikm: &[u8; 32], context: &[u8], hash: &[u8; 32]) -> [u8; 32
     let mut key = [0; 32];
     hkdf.expand(context, &mut key)
         .expect("fixed output length is valid");
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("HMAC accepts any key");
     mac.update(hash);
     mac.finalize().into_bytes().into()
@@ -509,7 +509,7 @@ pub fn derive_commit_mac_key(ikm: &[u8], ctx: &[u8]) -> Result<[u8; 32], Permiss
 }
 
 pub fn compute_commit_mac(mac_key: &[u8; 32], hash: &[u8]) -> Result<[u8; 32], PermissionedError> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
         .map_err(|e| PermissionedError::InvalidCommit(e.to_string()))?;
     mac.update(hash);
@@ -525,7 +525,7 @@ pub fn mint_signed_commit(
     signing_key: &p256::ecdsa::SigningKey,
 ) -> SignedCommit {
     let mut ikm = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ikm);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut ikm);
 
     let hash = Sha256::digest(lthash_state);
     let ctx = compute_commit_context(space, author, rev, &ikm).expect("valid commit parameters");

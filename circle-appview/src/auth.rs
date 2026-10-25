@@ -173,8 +173,8 @@ pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, Au
         x_bytes.copy_from_slice(&x);
         let mut y_bytes = p256::FieldBytes::default();
         y_bytes.copy_from_slice(&y);
-        let ep = p256::EncodedPoint::from_affine_coordinates(&x_bytes, &y_bytes, false);
-        let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&ep)
+        let ep = p256::Sec1Point::from_affine_coordinates(&x_bytes, &y_bytes, false);
+        let vk = p256::ecdsa::VerifyingKey::from_sec1_point(&ep)
             .map_err(|_| AuthReason::InvalidCoordinates)?;
         return Ok(ParsedVerifyingKey::P256(vk));
     }
@@ -184,8 +184,8 @@ pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, Au
         x_bytes.copy_from_slice(&x);
         let mut y_bytes = k256::FieldBytes::default();
         y_bytes.copy_from_slice(&y);
-        let ep = k256::EncodedPoint::from_affine_coordinates(&x_bytes, &y_bytes, false);
-        let vk = k256::ecdsa::VerifyingKey::from_encoded_point(&ep)
+        let ep = k256::Sec1Point::from_affine_coordinates(&x_bytes, &y_bytes, false);
+        let vk = k256::ecdsa::VerifyingKey::from_sec1_point(&ep)
             .map_err(|_| AuthReason::InvalidCoordinates)?;
         return Ok(ParsedVerifyingKey::Secp256k1(vk));
     }
@@ -1113,7 +1113,6 @@ pub async fn authenticate(
 }
 
 // Extractor for AuthenticatedUser from request extensions
-#[axum::async_trait]
 impl<S> FromRequestParts<S> for AuthenticatedUser
 where
     S: Send + Sync,

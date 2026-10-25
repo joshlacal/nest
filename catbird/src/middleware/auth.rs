@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn classifies_transient_redis_error_as_temporarily_unavailable() {
-        let redis_err = redis::RedisError::from((redis::ErrorKind::IoError, "connection refused"));
+        let redis_err = redis::RedisError::from((redis::ErrorKind::Io, "connection refused"));
         let mapped = classify_auth_error(AppError::Redis(redis_err));
         match mapped {
             AppError::AtprotoResponse {

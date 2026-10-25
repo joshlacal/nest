@@ -9,6 +9,7 @@ use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::CatbirdSession;
 use futures_util::StreamExt;
+use p256::elliptic_curve::Generate;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::sync::Arc;
@@ -1292,7 +1293,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {
@@ -1396,7 +1397,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {

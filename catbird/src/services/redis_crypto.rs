@@ -4,10 +4,11 @@
 //! v1 legacy format: base64(nonce_12bytes || ciphertext || gcm_tag_16bytes)
 
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng, Payload},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use base64::Engine;
+use rand::TryRng;
 
 const NONCE_LEN: usize = 12;
 pub const V2_PREFIX: &str = "v2:";
@@ -70,7 +71,7 @@ fn append_field(buf: &mut Vec<u8>, field: &[u8]) {
     buf.extend_from_slice(field);
 }
 
-fn seal_with_rng_aad<R: RngCore>(
+fn seal_with_rng_aad<R: rand::TryRng>(
     key: &[u8; 32],
     plaintext: &[u8],
     aad: &[u8],
@@ -102,7 +103,7 @@ fn seal_with_rng_aad<R: RngCore>(
 
 /// Encrypt plaintext with AES-256-GCM and AAD. Returns "v2:" || base64(nonce || ciphertext).
 pub fn seal_with_aad(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<String, SealError> {
-    seal_with_rng_aad(key, plaintext, aad, OsRng)
+    seal_with_rng_aad(key, plaintext, aad, rand::rngs::SysRng)
 }
 
 /// Dual-read decryptor for persistent session records.
@@ -200,7 +201,7 @@ pub fn seal_v2_with_metadata(
 
     let cipher = Aes256Gcm::new_from_slice(key).expect("valid key length");
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|_| SealError::RandomnessFailed)?;
     let nonce = Nonce::from(nonce_bytes);
@@ -429,23 +430,19 @@ mod tests {
 
     struct FailingRng;
 
-    impl RngCore for FailingRng {
-        fn next_u32(&mut self) -> u32 {
-            0
+    impl rand::TryRng for FailingRng {
+        type Error = std::io::Error;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err(std::io::Error::other("forced rng failure"))
         }
-        fn next_u64(&mut self) -> u64 {
-            0
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err(std::io::Error::other("forced rng failure"))
         }
-        fn fill_bytes(&mut self, _dest: &mut [u8]) {
-            panic!("unexpected call to fill_bytes");
-        }
-        fn try_fill_bytes(
-            &mut self,
-            _dest: &mut [u8],
-        ) -> Result<(), aes_gcm::aead::rand_core::Error> {
-            Err(aes_gcm::aead::rand_core::Error::new(Box::new(
-                std::io::Error::new(std::io::ErrorKind::Other, "forced rng failure"),
-            )))
+
+        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("forced rng failure"))
         }
     }
 
