@@ -3,7 +3,7 @@
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use base64::Engine;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
 use p256::SecretKey;
 use std::collections::HashMap;
@@ -163,7 +163,7 @@ impl KeyStore {
             .iter()
             .map(|key| {
                 let public_key = key.secret_key.public_key();
-                let ec_point = public_key.to_encoded_point(false);
+                let ec_point = public_key.to_sec1_point(false);
                 let x = ec_point
                     .x()
                     .map(|bytes| b64.encode(bytes))

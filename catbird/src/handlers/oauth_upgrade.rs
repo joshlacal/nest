@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn test_map_upgrade_error_redis_failure() {
         let redis_err = redis::RedisError::from((
-            redis::ErrorKind::ResponseError,
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
             "connection timed out to redis://sensitive-auth@host:6379",
         ));
         let app_err = map_upgrade_error(UpgradeError::Redis(redis_err));

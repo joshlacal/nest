@@ -10,6 +10,7 @@ use crate::models::CatbirdSession;
 use crate::services::{AtProtoClient, ProxyResponse};
 use axum::http::StatusCode;
 use chrono::Utc;
+use p256::elliptic_curve::Generate;
 use std::sync::Arc;
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
 pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circles";
@@ -217,7 +218,7 @@ impl ServiceAuthProvider {
         }
 
         // Ephemeral DPoP key fallback for testing or sessions without registry entries
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         JacquardDpopData {

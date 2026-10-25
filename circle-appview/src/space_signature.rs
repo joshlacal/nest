@@ -19,6 +19,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+#[cfg(test)]
+use p256::elliptic_curve::Generate;
 
 /// The signature label in `Signature-Input` and `Signature`.
 pub const SIGNATURE_LABEL: &str = "atproto-space-credential";
@@ -97,7 +99,7 @@ impl SpaceAuthHeaders {
 /// The `did:key` form of a P-256 public key: multicodec `p256-pub`, compressed
 /// SEC1 point, base58btc multibase.
 pub fn p256_did_key(key: &VerifyingKey) -> String {
-    let point = key.to_encoded_point(true);
+    let point = key.to_sec1_point(true);
     let mut bytes = Vec::with_capacity(P256_PUB_MULTICODEC.len() + point.len());
     bytes.extend_from_slice(&P256_PUB_MULTICODEC);
     bytes.extend_from_slice(point.as_bytes());
@@ -142,7 +144,7 @@ fn sign(
     let base = signature_base(&authorization, audience.as_deref(), &signature_params);
     let signature: Signature = key.sign(base.as_bytes());
     // Verifiers accept either S; emit low-S as the reference signer does.
-    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature = signature.normalize_s();
     SpaceAuthHeaders {
         mac: None,
         authorization,
@@ -159,7 +161,6 @@ fn sign(
 mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier;
-    use p256::elliptic_curve::rand_core::OsRng;
 
     /// Parse a P-256 `did:key` (the verifier's side of [`p256_did_key`]).
     /// `None` for any other key type or malformed input.
@@ -218,7 +219,7 @@ mod tests {
 
     #[test]
     fn credential_headers_are_formatted_and_verify() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
         let headers = credential_headers(&key, "cred.jwt.sig", "did:plc:repoowner");
         assert_eq!(
             headers.authorization,
@@ -241,19 +242,19 @@ mod tests {
 
     #[test]
     fn signature_is_raw_64_byte_low_s_r_s() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
         for i in 0..16 {
             let headers = credential_headers(&key, &format!("cred-{i}"), "did:plc:aud");
             let bytes = signature_bytes(&headers);
             assert_eq!(bytes.len(), 64, "r||s, not DER");
             let signature = Signature::from_slice(&bytes).unwrap();
-            assert!(signature.normalize_s().is_none(), "low-S");
+            assert_eq!(signature.normalize_s(), signature, "low-S");
         }
     }
 
     #[test]
     fn changed_audience_or_token_or_key_fails_verification() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
         let headers = credential_headers(&key, "cred", "did:plc:aud");
 
         let mut changed = headers.clone();
@@ -264,13 +265,13 @@ mod tests {
         changed.authorization = "Atproto-Space-Credential other".into();
         assert!(!verifies(&changed, key.verifying_key()));
 
-        let other = SigningKey::random(&mut OsRng);
+        let other = SigningKey::generate_from_rng(&mut rand::rng());
         assert!(!verifies(&headers, other.verifying_key()));
     }
 
     #[test]
     fn p256_did_key_round_trips_and_uses_the_p256_multicodec() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
         let did_key = p256_did_key(key.verifying_key());
         assert!(did_key.starts_with("did:key:zDn"), "{did_key}");
         assert_eq!(parse_p256_did_key(&did_key), Some(*key.verifying_key()));
@@ -284,7 +285,7 @@ mod tests {
     /// a second field.
     #[test]
     fn apply_replaces_existing_auth_headers() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
         let headers = credential_headers(&key, "cred", "did:plc:aud");
         let request = headers
             .apply(

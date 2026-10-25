@@ -20,9 +20,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use p256::ecdsa::signature::Signer;
-use p256::EncodedPoint;
+use p256::elliptic_curve::Generate;
+use p256::Sec1Point;
 use parking_lot::RwLock;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -179,7 +180,7 @@ pub fn encrypt_secret(
         .map_err(|e| AppError::Internal(format!("Cipher init error: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from(nonce_bytes);
 
     let aad = format!("v1:{user_did}");
@@ -376,7 +377,7 @@ impl OAuthService {
         let redirect_uri = format!("{base_url}/oauth/callback");
 
         let verifying_key = *signing_key.verifying_key();
-        let ep = EncodedPoint::from(&verifying_key);
+        let ep = Sec1Point::from(&verifying_key);
         let x = URL_SAFE_NO_PAD.encode(ep.x().expect("x coordinate"));
         let y = URL_SAFE_NO_PAD.encode(ep.y().expect("y coordinate"));
 
@@ -544,16 +545,16 @@ impl OAuthService {
         }
 
         let mut verifier_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut verifier_bytes);
+        rand::rng().fill_bytes(&mut verifier_bytes);
         let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
 
         let challenge_hash = Sha256::digest(code_verifier.as_bytes());
         let code_challenge = URL_SAFE_NO_PAD.encode(challenge_hash);
 
         let mut state_bytes = [0u8; 24];
-        rand::thread_rng().fill_bytes(&mut state_bytes);
+        rand::rng().fill_bytes(&mut state_bytes);
         let state = URL_SAFE_NO_PAD.encode(state_bytes);
-        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let dpop_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let redirect_uri = format!("{}/oauth/callback", self.base_url);
 
         // Try PAR first if supported
@@ -903,7 +904,7 @@ impl OAuthService {
             }
         };
 
-        let new_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let new_dpop_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let iss_url = url::Url::parse(&session.auth_server_iss).map_err(|e| {
             AppError::InvalidRequest(format!("Invalid auth server issuer URL: {e}"))
         })?;
@@ -1553,7 +1554,7 @@ pub fn create_dpop_proof(
     let jti = Uuid::new_v4().to_string();
 
     let verifying_key = *key.verifying_key();
-    let ep = EncodedPoint::from(&verifying_key);
+    let ep = Sec1Point::from(&verifying_key);
     let x = URL_SAFE_NO_PAD.encode(ep.x().expect("x coord"));
     let y = URL_SAFE_NO_PAD.encode(ep.y().expect("y coord"));
 
@@ -1962,7 +1963,7 @@ mod tests {
 
     #[test]
     fn user_oauth_session_debug_redacts_tokens_and_key() {
-        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let dpop_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let session = UserOAuthSession {
             user_did: "did:plc:alice-debug-test".to_string(),
             access_token: "super-secret-access-token-12345".to_string(),
@@ -2032,14 +2033,14 @@ mod tests {
         pool: PgPool,
     ) {
         setup_test_encryption_key();
-        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let service = OAuthService::new(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
             signing_key,
             None,
         );
-        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let dpop_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let original_verifying_key = *dpop_key.verifying_key();
 
         let session = UserOAuthSession {
@@ -2125,7 +2126,7 @@ mod tests {
             .expect("DPoP proof signed by loaded key must verify against original verifying key");
 
         // Simulate service restart: create fresh OAuthService with same DB pool
-        let restart_signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let restart_signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let restarted_service = OAuthService::new(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
@@ -2166,7 +2167,7 @@ mod tests {
         let service = OAuthService::new(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
         );
         let active_session = UserOAuthSession {
@@ -2177,7 +2178,7 @@ mod tests {
             auth_server_iss: "https://pds.example".to_string(),
             expires_at: Some(Utc::now() + Duration::hours(1)),
             scope: CIRCLE_SCOPE.to_string(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
 
         let expired_session = UserOAuthSession {
@@ -2188,7 +2189,7 @@ mod tests {
             auth_server_iss: "https://pds.example".to_string(),
             expires_at: Some(Utc::now() - Duration::hours(1)),
             scope: CIRCLE_SCOPE.to_string(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
 
         let no_expiry_session = UserOAuthSession {
@@ -2199,7 +2200,7 @@ mod tests {
             auth_server_iss: "https://pds.example".to_string(),
             expires_at: None,
             scope: CIRCLE_SCOPE.to_string(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
 
         service.store_session(active_session).await.unwrap();
@@ -2232,7 +2233,7 @@ mod tests {
         let service = OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
             Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         );
@@ -2248,7 +2249,7 @@ mod tests {
             auth_server_iss: Some(mock_server.uri()),
             created_at: Utc::now(),
             in_flight: false,
-            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         service
             .pending_states
@@ -2337,7 +2338,7 @@ mod tests {
         let service = OAuthService::new(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
         );
         let expired_state = "expired-state".to_string();
@@ -2352,7 +2353,7 @@ mod tests {
             auth_server_iss: Some("https://pds.expired.example".to_string()),
             created_at: Utc::now() - Duration::seconds(PENDING_STATE_TTL_SECS + 30),
             in_flight: false,
-            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
 
         let fresh_pending = PendingOAuthState {
@@ -2364,7 +2365,7 @@ mod tests {
             auth_server_iss: Some("https://pds.fresh.example".to_string()),
             created_at: Utc::now(),
             in_flight: false,
-            dpop_key: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
 
         {
@@ -2399,14 +2400,14 @@ mod tests {
         let service = Arc::new(OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
             Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         ));
         let http_client = reqwest::Client::new();
 
         let user_did = "did:plc:concurrent-refresh-user";
-        let initial_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let initial_dpop_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         // Store an expired session with a refresh token
         let expired_session = UserOAuthSession {
@@ -2480,7 +2481,7 @@ mod tests {
         let service = OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
             Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         );
@@ -2654,7 +2655,7 @@ mod tests {
         let service = OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
             Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         );
@@ -2728,7 +2729,7 @@ mod tests {
         let service = Arc::new(OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
             Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         ));
@@ -2849,7 +2850,7 @@ mod tests {
         let service = OAuthService::with_transport(
             pool.clone(),
             "http://127.0.0.1:3002".to_string(),
-            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
             Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
         );

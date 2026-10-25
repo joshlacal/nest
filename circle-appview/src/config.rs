@@ -2,6 +2,7 @@ use crate::access::CredentialStore;
 use crate::auth::DidResolver;
 use crate::oauth::OAuthService;
 use crate::space_client::SpaceClient;
+use p256::elliptic_curve::Generate;
 use sqlx::PgPool;
 use std::env;
 use std::sync::Arc;
@@ -306,7 +307,7 @@ impl AppState {
                      client_assertion will fail signature verification. Set \
                      OAUTH_SIGNING_KEY_PATH or OAUTH_SIGNING_KEY_HEX."
                 );
-                p256::ecdsa::SigningKey::random(&mut rand::thread_rng())
+                p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng())
             }
         };
 
@@ -438,13 +439,14 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::try_load_signing_key;
+    use p256::elliptic_curve::Generate;
 
     /// `openssl ecparam -genkey -name prime256v1 -noout` emits SEC1, not PKCS#8.
     /// Failing to load it used to fall back to an ephemeral key, which silently
     /// broke every OAuth token exchange with `invalid_client`.
     #[test]
     fn loads_sec1_pem_key_from_file() {
-        let key = p256::SecretKey::random(&mut rand::thread_rng());
+        let key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let pem = key
             .to_sec1_pem(p256::pkcs8::LineEnding::LF)
             .expect("encode sec1");
@@ -464,7 +466,7 @@ mod tests {
     /// Raw 32-byte hex must also work, since that is the other documented form.
     #[test]
     fn loads_raw_hex_key() {
-        let key = p256::SecretKey::random(&mut rand::thread_rng());
+        let key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         let loaded = try_load_signing_key(None, Some(&hex)).expect("hex key must load");
         assert_eq!(loaded.to_bytes(), key.to_bytes());

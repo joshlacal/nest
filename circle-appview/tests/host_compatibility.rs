@@ -4,6 +4,7 @@
 //! auth failure that the client reads as "sign in again". That covers bearer
 //! hosts and DPoP-bound (`cnf.jkt`) hosts on an older alpha alike.
 
+use p256::elliptic_curve::Generate;
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
@@ -12,8 +13,8 @@ use base64::Engine;
 use chrono::Utc;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use sqlx::PgPool;
 
 use circle_appview::access::{self, CredentialStore, SpaceLockManager};
@@ -33,7 +34,7 @@ const OWNER_DID: &str = "did:plc:owner-host-gate";
 const SPACE_URI: &str = "at://did:plc:owner-host-gate/space/blue.catbird.circle/3l7hostgate11";
 
 fn owner_doc(key: &SigningKey) -> DidDocument {
-    let point = EncodedPoint::from(key.verifying_key());
+    let point = Sec1Point::from(key.verifying_key());
     DidDocument {
         id: OWNER_DID.into(),
         verification_method: vec![VerificationMethod {
@@ -96,12 +97,12 @@ fn credential_with_cnf(key: &SigningKey, typ: &str, cnf: Option<serde_json::Valu
 }
 
 fn fresh_key_id() -> String {
-    p256_did_key(SigningKey::random(&mut OsRng).verifying_key())
+    p256_did_key(SigningKey::generate_from_rng(&mut rand::rng()).verifying_key())
 }
 
 #[test]
 fn unbound_credential_is_refused_as_unsupported_pds() {
-    let key = SigningKey::random(&mut OsRng);
+    let key = SigningKey::generate_from_rng(&mut rand::rng());
     let doc = owner_doc(&key);
     let key_id = fresh_key_id();
     for typ in ["atproto-space-credential+jwt", "at+jwt"] {
@@ -134,7 +135,7 @@ fn unbound_credential_is_refused_as_unsupported_pds() {
 
 #[test]
 fn bound_credentials_still_pass_and_wrong_binding_is_an_auth_failure() {
-    let key = SigningKey::random(&mut OsRng);
+    let key = SigningKey::generate_from_rng(&mut rand::rng());
     let doc = owner_doc(&key);
     let expires = Utc::now() + chrono::Duration::seconds(600);
     let ours = fresh_key_id();
@@ -163,7 +164,7 @@ async fn activation_refuses_a_bearer_space_host_without_creating_a_circle(pool: 
         "SESSION_ENCRYPTION_KEY",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     );
-    let owner_key = SigningKey::random(&mut OsRng);
+    let owner_key = SigningKey::generate_from_rng(&mut rand::rng());
     let config = Config {
         host: "127.0.0.1".into(),
         port: 3002,
@@ -206,7 +207,7 @@ async fn activation_refuses_a_bearer_space_host_without_creating_a_circle(pool: 
             auth_server_iss: "https://pds.owner.example".into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: SigningKey::random(&mut OsRng),
+            dpop_key: SigningKey::generate_from_rng(&mut rand::rng()),
         })
         .await
         .unwrap();

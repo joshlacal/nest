@@ -4,50 +4,50 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
-jacquard-repo = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
-jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["crypto-ed25519", "crypto-k256", "crypto-p256"] }
-catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto.git", rev = "0f0c40a85eda97e1279df7d073bf09a806db49ea", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
-bytes = { version = "1", features = ["serde"] }
-cid = "0.11"
-multihash = "0.19.3"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-iroh-car = "0.5"
-n0-future = "0.3"
-parking_lot = "0.12"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+axum = { version = "0.8.9", features = ["macros"] }
+tokio = { version = "1.54.1", features = ["full"] }
+reqwest = { version = "0.13.5", features = ["json", "stream", "form", "query"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
+jacquard-repo = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", }
+jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", features = ["crypto-ed25519", "crypto-k256", "crypto-p256"] }
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
+bytes = { version = "1.12.1", features = ["serde"] }
+cid = "0.11.3"
+multihash = "0.19.5"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+iroh-car = "0.5.1"
+n0-future = "0.3.2"
+parking_lot = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 # `pem` is required to accept SEC1 keys ("BEGIN EC PRIVATE KEY"), which is what
 # `openssl ecparam -genkey` produces by default.
-p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "ecdh"] }
-k256 = { version = "0.13", features = ["ecdsa", "jwk"] }
-multibase = "0.9"
-sha2 = "0.10"
-hmac = "0.12"
-hkdf = "0.12"
-blake3 = "1"
-aes-gcm = "0.10"
-serde_ipld_dagcbor = "0.6"
-serde_bytes = "0.11"
-base64 = "0.22"
-rand = "0.8"
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-url = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
-futures-util = "0.3"
-ciborium = "0.2"
-thiserror = "1"
-anyhow = "1"
+p256 = { version = "0.14.0", features = ["ecdsa", "pem", "ecdh"] }
+k256 = { version = "0.14.0", features = ["ecdsa"] }
+multibase = "0.9.3"
+sha2 = "0.11.1"
+hmac = "0.13.0"
+hkdf = "0.13.0"
+blake3 = "1.8.7"
+aes-gcm = "0.11.1"
+serde_ipld_dagcbor = "0.7.0"
+serde_bytes = "0.11.19"
+base64 = "0.23.1"
+rand = "0.10.3"
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+url = "2.5.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+futures-util = "0.3.34"
+ciborium = "0.2.2"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
 
 [dev-dependencies]
-tower = { version = "0.4", features = ["util"] }
-rcgen = "0.13"
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
-wiremock = "0.6"
+tower = { version = "0.5.3", features = ["util"] }
+rcgen = "0.14.10"
+tokio-rustls = "0.26.6"
+rustls = { version = "0.23.46", features = ["ring"] }
+wiremock = "0.6.5"

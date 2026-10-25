@@ -3,7 +3,7 @@
 //! Stores session data in Redis with required AES-256-GCM encryption and
 //! HMAC-SHA256 bearer key fingerprinting under an explicit v2 namespace.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jacquard_common::session::SessionStoreError;
 use jacquard_common::types::did::Did;
 
@@ -811,7 +811,7 @@ impl RedisAuthStore {
             // Stale index detected: evict stale fp_index_key so it does not persist across ticks
             let _ = redis::cmd("DEL")
                 .arg(&fp_index_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
 
             // Self-healing: if did_index points to an active alternative session for this DID matching expected_fp, self-heal
@@ -833,7 +833,7 @@ impl RedisAuthStore {
                     if !alt_retired {
                         if let Ok(Some(alt_enc)) = redis::cmd("GET")
                             .arg(&alt_session_k)
-                            .query_async::<_, Option<String>>(&mut conn)
+                            .query_async::<Option<String>>(&mut conn)
                             .await
                         {
                             if let Ok(alt_json) = open_strict(&self.encryption_key, &alt_enc) {
@@ -1025,7 +1025,7 @@ impl RedisAuthStore {
                 }
 
                 let enc_opt: Option<String> = match get_v {
-                    redis::Value::Data(d) => String::from_utf8(d).ok(),
+                    redis::Value::BulkString(d) => String::from_utf8(d).ok(),
                     _ => None,
                 };
                 let Some(enc_data) = enc_opt else {

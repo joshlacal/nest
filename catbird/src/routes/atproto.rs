@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 use base64::Engine;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use std::sync::Arc;
 
 use crate::config::AppState;
@@ -152,7 +152,7 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(crate::handlers::chat_poll::update_mute_status),
         )
         .route(
-            "/*lexicon",
+            "/{*lexicon}",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),
         )
         .layer(DefaultBodyLimit::max(11 * 1024 * 1024)) // 11 MB for blob uploads (10 MB + overhead)
@@ -252,7 +252,7 @@ async fn did_document(
             .iter()
             .map(|key| {
                 let public_key = key.secret_key.public_key();
-                let encoded = public_key.to_encoded_point(false);
+                let encoded = public_key.to_sec1_point(false);
                 let x = encoded
                     .x()
                     .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))

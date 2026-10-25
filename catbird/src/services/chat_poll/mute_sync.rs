@@ -2,6 +2,7 @@
 //! conversation list via `chat.bsky.convo.listConvos` and syncs the muted
 //! set into the `chat_muted_convos` table.
 
+use p256::elliptic_curve::Generate;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -475,7 +476,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {
@@ -583,7 +584,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {
@@ -700,7 +701,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {
@@ -808,7 +809,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {
@@ -921,7 +922,7 @@ mod tests {
             granted_scopes: vec!["atproto".to_string()],
         };
 
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
         let dpop_data = crate::middleware::JacquardDpopData {

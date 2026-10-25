@@ -19,7 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jacquard_oauth::scopes::Scope;
 use jacquard_oauth::session::ClientSessionData;
-use rand::RngCore;
+use rand::Rng;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -391,7 +391,7 @@ pub fn compute_sha256_hex(data: &[u8]) -> String {
 /// Generate a 32-byte cryptographically secure random exchange code encoded as 43-character base64url (no padding).
 pub fn generate_exchange_code() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

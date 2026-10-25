@@ -1,3 +1,4 @@
+use p256::elliptic_curve::Generate;
 mod support;
 use std::sync::Arc;
 use support::{fixture_commit, fixture_star};
@@ -7,8 +8,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -332,7 +333,7 @@ fn lthash_additive_homomorphic_properties() {
 
 #[test]
 fn commit_verification_succeeds_and_fails_on_tampering() {
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate_from_rng(&mut rand::rng());
     let verifying_key = signing_key.verifying_key();
     let parsed_vk = ParsedVerifyingKey::P256(*verifying_key);
 
@@ -386,11 +387,11 @@ fn register_did_doc(
     services: Option<Vec<DidService>>,
 ) {
     let vk = key.verifying_key();
-    let point = EncodedPoint::from(vk);
+    let point = Sec1Point::from(vk);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let p256_sec1 = vk.to_encoded_point(true);
+    let p256_sec1 = vk.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);
@@ -436,8 +437,8 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         .await
         .expect("Migrations must succeed");
 
-    let owner_key = SigningKey::random(&mut OsRng);
-    let bob_key = SigningKey::random(&mut OsRng);
+    let owner_key = SigningKey::generate_from_rng(&mut rand::rng());
+    let bob_key = SigningKey::generate_from_rng(&mut rand::rng());
 
     let config = Config {
         host: "127.0.0.1".into(),
@@ -495,7 +496,7 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
     let space_locks = Arc::new(SpaceLockManager::new());
 
     // Pre-populate credential in store for space
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate_from_rng(&mut rand::rng());
     credential_store
         .insert(
             SPACE_URI.to_string(),
@@ -1192,7 +1193,7 @@ fn dagcbor_cid_with_nested_links_and_raw_bytes() {
 
 #[test]
 fn drisl_canonical_shortest_key_first_and_reorder_rejection() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     let rec_z = RepoRecord {
         collection: "app.bsky.feed.post".to_string(),
@@ -1577,7 +1578,7 @@ async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
     assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
 
     // 2. Unauthorized caller DID -> 403 Forbidden
-    let attacker_key = SigningKey::random(&mut OsRng);
+    let attacker_key = SigningKey::generate_from_rng(&mut rand::rng());
     let attacker_did = "did:plc:attacker-evil-99";
     register_did_doc(&setup.state.did_resolver, attacker_did, &attacker_key, None);
 
@@ -2005,7 +2006,7 @@ async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
 
     let transport = DefaultSpaceHostTransport::new(); // production transport (allow_loopback = false)
     let auth = circle_appview::space_signature::credential_headers(
-        &SigningKey::random(&mut OsRng),
+        &SigningKey::generate_from_rng(&mut rand::rng()),
         "cred",
         OWNER_DID,
     );
@@ -2623,7 +2624,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
 
 #[test]
 fn strict_car_rejects_noncanonical_signed_commit_dagcbor() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
     let commit = mint_signed_commit(
@@ -2734,7 +2735,7 @@ fn strict_car_rejects_noncanonical_signed_commit_dagcbor() {
 
 #[test]
 fn strict_car_rejects_signed_commit_with_extra_data_float() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
     let commit = mint_signed_commit(
@@ -2817,14 +2818,20 @@ fn strict_car_rejects_signed_commit_with_extra_data_float() {
         res.is_err(),
         "SignedCommit containing float must be rejected by strict IPLD decoding"
     );
-    assert!(res
-        .unwrap_err()
-        .to_string()
-        .contains("Floating point numbers are forbidden"));
+    let error = res.unwrap_err().to_string();
+    // Jacquard 0.13 rejects float32 (CBOR marker 250) during Data decoding,
+    // before the explicit InvalidNumber walk used by earlier versions.
+    assert!(
+        error.contains("Floating point numbers are forbidden")
+            || error.contains(
+                "Non-canonical DAG-CBOR SignedCommit: Unsupported { name: \"any\", found: 250 }"
+            ),
+        "{error}"
+    );
 }
 #[test]
 fn strict_car_rejects_signed_commit_with_unknown_extra_data() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
     let commit = mint_signed_commit(
@@ -2916,7 +2923,7 @@ fn strict_car_rejects_signed_commit_with_unknown_extra_data() {
 
 #[test]
 fn strict_car_rejects_cidv0_and_unblessed_cidv1_codecs() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
     let commit = mint_signed_commit(
@@ -3005,7 +3012,7 @@ fn strict_car_rejects_cidv0_and_unblessed_cidv1_codecs() {
 
 #[test]
 fn strict_car_rejects_non_minimal_and_overflowing_varints() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
     let commit = mint_signed_commit(
@@ -3081,7 +3088,7 @@ fn strict_car_rejects_non_minimal_and_overflowing_varints() {
 
 #[test]
 fn strict_car_rejects_duplicate_map_keys_in_ipld_and_drisl() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
     let commit = mint_signed_commit(
@@ -3163,7 +3170,7 @@ fn strict_car_rejects_duplicate_map_keys_in_ipld_and_drisl() {
 }
 #[test]
 fn strict_car_rejects_duplicate_map_keys_in_record_block() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let signing_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     // Construct a record with duplicate map keys in CBOR
     // Canonically 3 entries (with duplicate 'text' key):

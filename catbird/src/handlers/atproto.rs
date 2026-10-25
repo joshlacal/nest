@@ -15,6 +15,7 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
 use futures_util::StreamExt;
 use jacquard_common::types::{did::Did, string::Handle};
+use p256::elliptic_curve::Generate;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -207,7 +208,7 @@ pub async fn login(
         .arg(&sealed_flow)
         .arg("EX")
         .arg(600)
-        .query_async::<_, ()>(&mut conn)
+        .query_async::<()>(&mut conn)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to persist OAuthFlowRecord to Redis");
@@ -305,7 +306,7 @@ pub async fn oauth_callback(
 
         let redirect_to: Option<String> = match redis::cmd("GET")
             .arg(&flow_key)
-            .query_async::<_, Option<String>>(&mut conn)
+            .query_async::<Option<String>>(&mut conn)
             .await
         {
             Ok(Some(sealed)) => {
@@ -327,7 +328,7 @@ pub async fn oauth_callback(
         if let Err(e) = redis::cmd("DEL")
             .arg(&flow_key)
             .arg(&claim_key)
-            .query_async::<_, ()>(&mut conn)
+            .query_async::<()>(&mut conn)
             .await
         {
             tracing::error!(error = %e, "OAuth denial state cleanup failed");
@@ -390,7 +391,7 @@ pub async fn oauth_callback(
     let Some(sealed_str) = sealed_flow else {
         let _ = redis::cmd("DEL")
             .arg(&claim_key)
-            .query_async::<_, ()>(&mut conn)
+            .query_async::<()>(&mut conn)
             .await;
         tracing::error!(
             "OAuth session expired or invalid: missing flow record for state {}",
@@ -411,7 +412,7 @@ pub async fn oauth_callback(
         Err(e) => {
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
             tracing::error!(error = %e, "Failed to decrypt OAuth flow record");
             return Err(AppError::Unauthorized(
@@ -425,7 +426,7 @@ pub async fn oauth_callback(
         Err(e) => {
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
             tracing::error!(error = %e, "Failed to deserialize OAuth flow record");
             return Err(AppError::Unauthorized(
@@ -437,7 +438,7 @@ pub async fn oauth_callback(
     if flow_record.version != 2 {
         let _ = redis::cmd("DEL")
             .arg(&claim_key)
-            .query_async::<_, ()>(&mut conn)
+            .query_async::<()>(&mut conn)
             .await;
         tracing::error!(
             "Unsupported OAuth flow record version: {}",
@@ -456,7 +457,7 @@ pub async fn oauth_callback(
         let (Some(r), Some(nonce)) = (&flow_record.redirect_to, &flow_record.browser_nonce) else {
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
             tracing::error!("Exchange flow state missing redirect_to or nonce in flow record");
             return Err(AppError::Unauthorized(
@@ -467,7 +468,7 @@ pub async fn oauth_callback(
         if !is_allowed_redirect(r) || !is_valid_base64url_43(nonce) {
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
             tracing::error!(
                 "Exchange flow state invalid: disallowed redirect URL or malformed nonce"
@@ -482,7 +483,7 @@ pub async fn oauth_callback(
             None => {
                 let _ = redis::cmd("DEL")
                     .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
+                    .query_async::<()>(&mut conn)
                     .await;
                 tracing::error!("Invalid redirect_to origin in exchange flow");
                 return Err(AppError::BadRequest("Invalid redirect_to origin".into()));
@@ -494,7 +495,7 @@ pub async fn oauth_callback(
         if let Some(r) = &flow_record.redirect_to {
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
             tracing::error!("Direct mode callback disallowed with redirect_to: {}", r);
             return Err(AppError::BadRequest(
@@ -513,7 +514,7 @@ pub async fn oauth_callback(
             (None, _) => {
                 let _ = redis::cmd("DEL")
                     .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
+                    .query_async::<()>(&mut conn)
                     .await;
                 tracing::error!("Direct mode callback rejected: missing browser nonce cookie");
                 return Err(AppError::Unauthorized(
@@ -523,7 +524,7 @@ pub async fn oauth_callback(
             (Some(_), None) => {
                 let _ = redis::cmd("DEL")
                     .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
+                    .query_async::<()>(&mut conn)
                     .await;
                 tracing::error!(
                     "Direct mode callback rejected: flow record missing expected browser nonce"
@@ -535,7 +536,7 @@ pub async fn oauth_callback(
             (Some(_), Some(_)) => {
                 let _ = redis::cmd("DEL")
                     .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
+                    .query_async::<()>(&mut conn)
                     .await;
                 tracing::error!("Direct mode callback rejected: browser nonce cookie mismatched");
                 return Err(AppError::Unauthorized(
@@ -575,7 +576,7 @@ pub async fn oauth_callback(
             // Release claim on transient token failure, but retain flow record state for retry
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
             return Err(AppError::OAuth(
                 "OAuth authorization callback failed".into(),
@@ -647,7 +648,7 @@ pub async fn oauth_callback(
                 .arg(&sealed_session_id)
                 .arg("EX")
                 .arg(60) // 60s TTL
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Failed to store exchange key in Redis");
@@ -725,7 +726,7 @@ pub async fn oauth_callback(
             if let Err(e) = redis::cmd("DEL")
                 .arg(&flow_key)
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await
             {
                 tracing::warn!(error = %e, "OAuth callback state cleanup failed after success (ignored)");
@@ -747,7 +748,7 @@ pub async fn oauth_callback(
             if let Some(ex_key) = &stored_exchange_key {
                 let _ = redis::cmd("DEL")
                     .arg(ex_key)
-                    .query_async::<_, ()>(&mut conn)
+                    .query_async::<()>(&mut conn)
                     .await;
             }
 
@@ -764,7 +765,7 @@ pub async fn oauth_callback(
             // 4. Release claim key
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
-                .query_async::<_, ()>(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await;
 
             metrics::record_oauth_login(false);
@@ -1324,7 +1325,13 @@ pub fn compute_exchange_redis_key(
     hasher.update(&[0x00]);
     hasher.update(canonical_origin.as_bytes());
     let digest = hasher.finalize();
-    format!("exchange:{:x}", digest)
+    format!(
+        "exchange:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 /// Validate 43-character unpadded base64url string ([A-Za-z0-9_-])
@@ -1338,10 +1345,10 @@ pub fn is_valid_base64url_43(s: &str) -> bool {
 pub fn generate_exchange_code() -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use rand::RngCore;
+    use rand::Rng;
 
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -1352,7 +1359,7 @@ async fn atomic_getdel(
 ) -> Result<Option<String>, redis::RedisError> {
     match redis::cmd("GETDEL")
         .arg(key)
-        .query_async::<_, Option<String>>(conn)
+        .query_async::<Option<String>>(conn)
         .await
     {
         Ok(val) => Ok(val),
@@ -2435,7 +2442,7 @@ mod tests {
         config.server.base_url = "https://catbird.test".to_string();
         config.oauth.scopes = vec!["atproto".to_string()];
 
-        let signing_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let signing_key = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let key_store = crate::services::KeyStore::from_key("catbird-test-key", signing_key);
 
         let scopes = vec![

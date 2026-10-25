@@ -8,6 +8,8 @@ use base64::Engine;
 use catbird_atproto::generated::blue_catbird::circle::CircleSummary;
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use p256::elliptic_curve::Generate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -1328,8 +1330,8 @@ mod tests {
     use crate::auth::{DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod};
     use crate::oauth::{OAuthService, UserOAuthSession};
     use crate::space_client::{MockSpaceHostTransport, SpaceClient};
-    use p256::elliptic_curve::rand_core::OsRng;
-    use p256::EncodedPoint;
+
+    use p256::Sec1Point;
     use std::sync::Arc;
     fn setup_test_key() {
         std::env::set_var(
@@ -1381,7 +1383,7 @@ mod tests {
     fn credential(token: &str, expires_in: chrono::Duration) -> ActiveSpaceCredential {
         ActiveSpaceCredential {
             token: token.into(),
-            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            signing_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             expires_at: Utc::now() + expires_in,
         }
     }
@@ -1405,7 +1407,7 @@ mod tests {
         let at = |secs: i64| issued + chrono::Duration::seconds(secs);
         let issued_for = |token: &str, secs: i64| ActiveSpaceCredential {
             token: token.into(),
-            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            signing_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             expires_at: at(secs),
         };
 
@@ -1485,7 +1487,7 @@ mod tests {
         signing_key: &p256::ecdsa::SigningKey,
         services: Vec<DidService>,
     ) {
-        let ep = EncodedPoint::from(signing_key.verifying_key());
+        let ep = Sec1Point::from(signing_key.verifying_key());
         let x = URL_SAFE_NO_PAD.encode(ep.x().expect("x"));
         let y = URL_SAFE_NO_PAD.encode(ep.y().expect("y"));
         let jwk = PublicKeyJwk {
@@ -1513,9 +1515,9 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_success_populates_store(pool: PgPool) {
         setup_test_key();
-        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let user_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let auth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         let did_resolver = Arc::new(DidResolver::new(
             "https://plc.directory".into(),
@@ -1563,7 +1565,7 @@ mod tests {
             auth_server_iss: TEST_USER_PDS.into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -1609,7 +1611,7 @@ mod tests {
             "https://plc.directory".into(),
             reqwest::Client::new(),
         ));
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
             "https://circles.catbird.blue".into(),
@@ -1620,7 +1622,7 @@ mod tests {
         // Pre-populate credential store with unexpired credential
         let existing_cred = ActiveSpaceCredential {
             token: "already_cached_token".into(),
-            signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            signing_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             expires_at: Utc::now() + chrono::Duration::hours(2),
         };
         credential_store
@@ -1649,9 +1651,9 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_app_not_authorized_surfaced(pool: PgPool) {
         setup_test_key();
-        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let user_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let auth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         let did_resolver = Arc::new(DidResolver::new(
             "https://plc.directory".into(),
@@ -1706,7 +1708,7 @@ mod tests {
             auth_server_iss: TEST_USER_PDS.into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -1748,7 +1750,7 @@ mod tests {
             "https://plc.directory".into(),
             reqwest::Client::new(),
         ));
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
             "https://circles.catbird.blue".into(),
@@ -1786,7 +1788,7 @@ mod tests {
             "https://plc.directory".into(),
             reqwest::Client::new(),
         ));
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
             "https://circles.catbird.blue".into(),
@@ -1831,7 +1833,7 @@ mod tests {
             "http://127.0.0.1:1".into(),
             reqwest::Client::new(),
         ));
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
             "https://circles.catbird.blue".into(),
@@ -1847,7 +1849,7 @@ mod tests {
             auth_server_iss: TEST_USER_PDS.into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -1882,9 +1884,9 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn test_ensure_space_credential_concurrent_runs_chain_once(pool: PgPool) {
         setup_test_key();
-        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let user_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let auth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         let did_resolver = Arc::new(DidResolver::new(
             "https://plc.directory".into(),
@@ -1931,7 +1933,7 @@ mod tests {
             auth_server_iss: TEST_USER_PDS.into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -2010,7 +2012,7 @@ mod tests {
         register_test_did_doc(
             &did_resolver,
             TEST_USER_DID,
-            &p256::ecdsa::SigningKey::random(&mut OsRng),
+            &p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             vec![DidService {
                 id: "#atproto_pds".into(),
                 r#type: "AtprotoPersonalDataServer".into(),
@@ -2020,7 +2022,7 @@ mod tests {
         register_test_did_doc(
             &did_resolver,
             TEST_AUTHORITY_DID,
-            &p256::ecdsa::SigningKey::random(&mut OsRng),
+            &p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             vec![DidService {
                 id: "#atproto_pds".into(),
                 r#type: "AtprotoPersonalDataServer".into(),
@@ -2030,7 +2032,7 @@ mod tests {
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
             "https://circles.catbird.blue".into(),
-            p256::ecdsa::SigningKey::random(&mut OsRng),
+            p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             None,
         ));
         oauth_service
@@ -2042,7 +2044,7 @@ mod tests {
                 auth_server_iss: TEST_USER_PDS.into(),
                 expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
                 scope: "atproto".into(),
-                dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+                dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
             })
             .await
             .unwrap();
@@ -2153,9 +2155,9 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn test_sync_lock_with_ensure_space_credential_from_parts_no_deadlock(pool: PgPool) {
         setup_test_key();
-        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let user_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let auth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         let did_resolver = Arc::new(DidResolver::new(
             "https://plc.directory".into(),
@@ -2203,7 +2205,7 @@ mod tests {
             auth_server_iss: TEST_USER_PDS.into(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -2320,9 +2322,9 @@ mod tests {
 
         let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
 
-        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let user_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let auth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         let http_client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -2390,7 +2392,7 @@ mod tests {
             auth_server_iss: pds_endpoint.clone(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -2402,7 +2404,7 @@ mod tests {
             auth_server_iss: pds_endpoint.clone(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(auth_session).await.unwrap();
 
@@ -2565,9 +2567,9 @@ mod tests {
 
         let (pds_endpoint, _mock_pds_handle) = start_mock_pds_tls_server().await;
 
-        let user_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let auth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let user_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let auth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let oauth_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
         let http_client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -2635,7 +2637,7 @@ mod tests {
             auth_server_iss: pds_endpoint.clone(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(user_session).await.unwrap();
 
@@ -2647,7 +2649,7 @@ mod tests {
             auth_server_iss: pds_endpoint.clone(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             scope: "atproto".into(),
-            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+            dpop_key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng()),
         };
         oauth_service.store_session(auth_session).await.unwrap();
 

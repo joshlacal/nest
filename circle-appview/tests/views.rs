@@ -1,3 +1,4 @@
+use p256::elliptic_curve::Generate;
 mod support;
 use axum::{
     body::{to_bytes, Body},
@@ -29,8 +30,8 @@ use circle_appview::{
 };
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::Signature;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+
+use p256::Sec1Point;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -131,9 +132,9 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         .await
         .expect("Migrations must succeed");
 
-    let alice_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let bob_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let charlie_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let alice_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+    let bob_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+    let charlie_key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
 
     let config = Config {
         host: "127.0.0.1".into(),
@@ -244,11 +245,11 @@ fn register_did_doc(
     key: &p256::ecdsa::SigningKey,
 ) {
     let vk = key.verifying_key();
-    let point = EncodedPoint::from(vk);
+    let point = Sec1Point::from(vk);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
 
-    let p256_sec1 = vk.to_encoded_point(true);
+    let p256_sec1 = vk.to_sec1_point(true);
     let mut p256_multikey_bytes = vec![0x80, 0x24];
     p256_multikey_bytes.extend_from_slice(p256_sec1.as_bytes());
     let p256_multikey = multibase::encode(multibase::Base::Base58Btc, &p256_multikey_bytes);

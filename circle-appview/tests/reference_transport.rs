@@ -10,7 +10,8 @@ use circle_appview::{
     space_signature::{credential_headers, p256_did_key},
     space_star::parse_repo_star,
 };
-use p256::{ecdsa::SigningKey, elliptic_curve::rand_core::OsRng};
+use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::Generate;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -66,7 +67,7 @@ async fn actual_reference_hosts_verify_exchange_commit_ops_and_star() {
         "ac0c9f15392f6f0298d71dc52aa88c05036150be"
     );
     let transport = DefaultSpaceHostTransport::with_loopback(true);
-    let key = SigningKey::random(&mut OsRng);
+    let key = SigningKey::generate_from_rng(&mut rand::rng());
     let kid = p256_did_key(key.verifying_key());
     let request = SpaceCredentialRequest {
         space: context.space.clone(),

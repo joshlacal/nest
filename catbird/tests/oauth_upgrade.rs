@@ -33,9 +33,9 @@ use jacquard_oauth::scopes::{IdentityScope, Scope, Scopes, TransitionScope};
 use jacquard_oauth::session::{ClientData, ClientSessionData, DpopClientData};
 use jacquard_oauth::types::{OAuthTokenType, TokenSet};
 use serde_json::{json, Value};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
 use testcontainers_modules::redis::Redis;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::ContainerAsync;
 use tokio::sync::Barrier;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -513,7 +513,7 @@ async fn setup_test_server_with_resolver(
 
     let state = Arc::new(state_obj);
     let app = create_router(state.clone()).with_state(state.clone());
-    let server = TestServer::new(app).expect("create TestServer");
+    let server = TestServer::new(app);
 
     (state, server, upgrade_service, redis_guard)
 }
@@ -562,7 +562,7 @@ async fn start_local_redis() -> Option<(String, LocalRedis)> {
         for _ in 0..100 {
             if let Ok(mut connection) = client.get_multiplexed_async_connection().await {
                 if redis::cmd("PING")
-                    .query_async::<_, String>(&mut connection)
+                    .query_async::<String>(&mut connection)
                     .await
                     .is_ok()
                 {
