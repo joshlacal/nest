@@ -5,6 +5,8 @@
 //! Suspension gates serving without changing membership or deleting projections.
 //! Confirmed deletion persists the gate before the idempotent purge, then advances
 //! the cursor only after purge succeeds. A crash therefore replays unfinished work.
+//! A PDS that does not confirm a status denies only that account; the event is
+//! still checkpointed and the account is re-checked later.
 use crate::{auth, AppError, AppState};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -20,6 +22,19 @@ const MAX_CONNECTION_SECS: u64 = 300;
 const CURSOR_FLUSH_EVENTS: usize = 256;
 const HEALTH_SECS: i64 = 60;
 const CONSUMER_LOCK: i64 = 0x434952434c454944;
+/// Bounds one current-PDS confirmation (DID resolution plus getRepoStatus) so a
+/// slow host cannot hold the sequential consumer.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+/// Inactive, non-terminal ledger states for an account whose current PDS did not
+/// confirm a status. They deny serving that account only and are re-checked.
+const UNCONFIRMED: &str = "unconfirmed";
+/// As UNCONFIRMED, after the relay reported the account deleted. A later
+/// RepoNotFound from the current PDS then completes the deletion.
+const DELETION_UNCONFIRMED: &str = "deletion_unconfirmed";
+const RECHECK_TICK_SECS: u64 = 60;
+const RECHECK_AFTER_SECS: f64 = 300.0;
+const RECHECK_BATCH: i64 = 50;
+const RECHECK_BUDGET: Duration = Duration::from_secs(15);
 
 pub fn validate_relay_url(raw: &str) -> anyhow::Result<url::Url> {
     let url = url::Url::parse(raw)?;
@@ -87,6 +102,7 @@ struct Body {
     did: Option<String>,
     time: Option<DateTime<Utc>>,
     active: Option<bool>,
+    status: Option<String>,
     name: Option<String>,
     error: Option<String>,
 }
@@ -97,6 +113,9 @@ struct Event {
     did: Option<String>,
     identity: bool,
     account: bool,
+    /// The relay reported `#account active=false status=deleted`. This is only a
+    /// hint: deletion also needs RepoNotFound from the DID's current PDS.
+    deletion_hint: bool,
 }
 
 fn decode_frame(bytes: &[u8]) -> anyhow::Result<Option<Event>> {
@@ -164,6 +183,9 @@ fn decode_frame(bytes: &[u8]) -> anyhow::Result<Option<Event>> {
         did: body.did,
         identity: kind == "#identity",
         account: kind == "#account",
+        deletion_hint: kind == "#account"
+            && body.active == Some(false)
+            && body.status.as_deref() == Some("deleted"),
     }))
 }
 
@@ -180,46 +202,193 @@ struct ConfirmedStatus {
     pds_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct XrpcError {
+    error: Option<String>,
+}
+#[derive(Debug)]
+enum Confirmation {
+    /// The current PDS answered getRepoStatus for exactly this DID.
+    Status(ConfirmedStatus),
+    /// The current PDS answered `RepoNotFound`: it no longer hosts this DID.
+    RepoNotFound { pds_url: String },
+}
+/// The current PDS did not confirm a status. Nothing was written yet.
+struct Unconfirmed {
+    reason: anyhow::Error,
+    pds_url: Option<String>,
+    deletion_hint: bool,
+}
+
 /// Called for newly encountered accounts too, so enrolling after bootstrap cannot
-/// evade account lifecycle gating. A failed confirmation does not change grants.
+/// evade account lifecycle gating. A failed confirmation does not change grants
+/// or the ledger; it is returned so the caller can deny the request.
 pub async fn refresh_account(
     state: &AppState,
     did: &str,
     relay: &str,
     seq: i64,
 ) -> anyhow::Result<()> {
-    let previous_pds: Option<String> = sqlx::query_scalar(
-        "SELECT pds_url FROM circle_account_status WHERE did=$1 AND status='deleted'",
-    )
-    .bind(did)
-    .fetch_optional(&state.db)
-    .await?;
-    let confirmed = if let Some(pds_url) = previous_pds {
-        ConfirmedStatus {
+    let transport = crate::space_client::DefaultSpaceHostTransport::new();
+    match refresh(state, did, relay, seq, false, &transport).await? {
+        None => Ok(()),
+        Some(unconfirmed) => Err(unconfirmed.reason),
+    }
+}
+
+/// Confirms `did` at its current PDS and applies a confirmed outcome. Returns
+/// `Err` only for local (database) failures, and `Some` when the PDS did not
+/// confirm a status. Deletion needs the PDS: either an explicit `deleted`
+/// status, or RepoNotFound after the relay reported this account deleted (the
+/// reference PDS removes the account before sequencing that event). A relay
+/// hint alone, or RepoNotFound alone, never purges.
+async fn refresh(
+    state: &AppState,
+    did: &str,
+    relay: &str,
+    seq: i64,
+    deletion_hint: bool,
+    transport: &crate::space_client::DefaultSpaceHostTransport,
+) -> anyhow::Result<Option<Unconfirmed>> {
+    let previous: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT status, pds_url FROM circle_account_status WHERE did=$1")
+            .bind(did)
+            .fetch_optional(&state.db)
+            .await?;
+    let previous_status = previous.as_ref().and_then(|(status, _)| status.as_deref());
+    if let Some((Some(status), pds_url)) = &previous {
+        if status == "deleted" {
+            // Resume a terminal deletion without requiring the DID to resolve.
+            let confirmed = ConfirmedStatus {
+                active: false,
+                status: Some("deleted".into()),
+                pds_url: pds_url.clone(),
+            };
+            apply_confirmed_status(state, did, relay, seq, confirmed).await?;
+            return Ok(None);
+        }
+    }
+    let deletion_hint = deletion_hint || previous_status == Some(DELETION_UNCONFIRMED);
+    let already_gated = matches!(previous_status, Some(UNCONFIRMED | DELETION_UNCONFIRMED));
+    let confirmed = match confirm_status(state, did, transport).await {
+        Ok(Confirmation::Status(status)) => status,
+        Ok(Confirmation::RepoNotFound { pds_url }) if deletion_hint => ConfirmedStatus {
             active: false,
             status: Some("deleted".into()),
             pds_url,
+        },
+        Ok(Confirmation::RepoNotFound { pds_url }) => {
+            return Ok(Some(Unconfirmed {
+                reason: anyhow::anyhow!(
+                    "PDS answered RepoNotFound without an account deletion event"
+                ),
+                pds_url: Some(pds_url),
+                deletion_hint,
+            }))
         }
-    } else {
-        confirm_status(state, did).await?
+        Err(reason) => {
+            return Ok(Some(Unconfirmed {
+                reason,
+                pds_url: None,
+                deletion_hint,
+            }))
+        }
     };
-    apply_confirmed_status(state, did, relay, seq, confirmed).await
+    if already_gated && confirmed.status.as_deref() == Some("deleted") {
+        // Reads are already denied, so purge before the terminal write. If the
+        // purge fails, the row stays unconfirmed and a re-check resumes it.
+        purge_account(state, did).await?;
+    }
+    apply_confirmed_status(state, did, relay, seq, confirmed).await?;
+    Ok(None)
 }
 
-async fn confirm_status(state: &AppState, did: &str) -> anyhow::Result<ConfirmedStatus> {
-    confirm_status_with_transport(
-        state,
-        did,
-        &crate::space_client::DefaultSpaceHostTransport::new(),
+/// Consumer path: a confirmation failure denies only that account. It records
+/// the account as unconfirmed (inactive) and never holds the cursor or blocks
+/// readiness for anyone else. The next lifecycle event for the DID or
+/// `recheck_unconfirmed` confirms it again.
+async fn refresh_or_gate(
+    state: &AppState,
+    did: &str,
+    relay: &str,
+    seq: i64,
+    deletion_hint: bool,
+    transport: &crate::space_client::DefaultSpaceHostTransport,
+) -> anyhow::Result<()> {
+    let Some(unconfirmed) = refresh(state, did, relay, seq, deletion_hint, transport).await? else {
+        return Ok(());
+    };
+    tracing::warn!(
+        error = %unconfirmed.reason,
+        "Current PDS did not confirm an account status; denying that account until it is re-checked"
+    );
+    let status = if unconfirmed.deletion_hint {
+        DELETION_UNCONFIRMED
+    } else {
+        UNCONFIRMED
+    };
+    // Same terminal and ordering guards as apply_confirmed_status. confirmed_at
+    // records this attempt and orders re-checks.
+    sqlx::query(
+        "INSERT INTO circle_account_status(did,active,status,pds_url,source_seq,relay_url) VALUES($1,false,$2,COALESCE($3,''),$4,$5) \
+         ON CONFLICT(did) DO UPDATE SET active=false,status=EXCLUDED.status,pds_url=COALESCE($3,circle_account_status.pds_url),\
+         source_seq=EXCLUDED.source_seq,relay_url=EXCLUDED.relay_url,confirmed_at=now() \
+         WHERE circle_account_status.status IS DISTINCT FROM 'deleted' \
+         AND (circle_account_status.relay_url != EXCLUDED.relay_url OR circle_account_status.source_seq <= EXCLUDED.source_seq)")
+        .bind(did).bind(status).bind(unconfirmed.pds_url).bind(seq).bind(relay)
+        .execute(&state.db).await?;
+    Ok(())
+}
+
+/// Confirms unconfirmed accounts again, oldest attempt first. Bounded in count
+/// and time so the sequential consumer keeps up with the stream; each account
+/// is retried no sooner than RECHECK_AFTER_SECS after its last attempt.
+async fn recheck_unconfirmed(
+    state: &AppState,
+    relay: &str,
+    seq: i64,
+    transport: &crate::space_client::DefaultSpaceHostTransport,
+) -> anyhow::Result<()> {
+    let started = tokio::time::Instant::now();
+    let due: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT did, source_seq FROM circle_account_status WHERE NOT active AND status IN ($1,$2) \
+         AND confirmed_at < now() - make_interval(secs => $3) ORDER BY confirmed_at, did LIMIT $4",
+    )
+    .bind(UNCONFIRMED)
+    .bind(DELETION_UNCONFIRMED)
+    .bind(RECHECK_AFTER_SECS)
+    .bind(RECHECK_BATCH)
+    .fetch_all(&state.db)
+    .await?;
+    for (did, source_seq) in due {
+        if started.elapsed() >= RECHECK_BUDGET {
+            break;
+        }
+        // A re-check is at least as fresh as the event that left the account
+        // unconfirmed, so it is applied at no lower a sequence.
+        refresh_or_gate(state, &did, relay, seq.max(source_seq), false, transport).await?;
+    }
+    Ok(())
+}
+
+async fn confirm_status(
+    state: &AppState,
+    did: &str,
+    transport: &crate::space_client::DefaultSpaceHostTransport,
+) -> anyhow::Result<Confirmation> {
+    tokio::time::timeout(
+        CONFIRM_TIMEOUT,
+        confirm_status_with_transport(state, did, transport),
     )
     .await
+    .map_err(|_| anyhow::anyhow!("Account status confirmation timed out"))?
 }
 
 async fn confirm_status_with_transport(
     state: &AppState,
     did: &str,
     transport: &crate::space_client::DefaultSpaceHostTransport,
-) -> anyhow::Result<ConfirmedStatus> {
+) -> anyhow::Result<Confirmation> {
     // KEM keys are read from this same DID-document cache; invalidating it also
     // prevents reuse of an old KEM key on the next Space response-MAC request.
     state.did_resolver.invalidate_cached(did);
@@ -242,8 +411,18 @@ async fn confirm_status_with_transport(
     target.query_pairs_mut().append_pair("did", did);
     let client = transport.build_pinned_client(&target).await?;
     let response = client.get(target).send().await?;
-    // RepoNotFound, an HTTP error, network loss, or an unresolvable DID is NOT a
-    // deletion confirmation. Hold the cursor and retry rather than infer deletion.
+    if matches!(response.status().as_u16(), 400 | 404) {
+        // The reference PDS answers 400 RepoNotFound once it no longer hosts the
+        // DID. Reported as such; it is not by itself a deletion (see refresh).
+        let bytes = auth::read_bounded_public_response_bytes(response, 16 * 1024).await?;
+        let error: XrpcError = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            error.error.as_deref() == Some("RepoNotFound"),
+            "PDS did not confirm account status"
+        );
+        return Ok(Confirmation::RepoNotFound { pds_url: endpoint });
+    }
+    // An HTTP error, network loss, or an unresolvable DID confirms nothing.
     anyhow::ensure!(
         response.status().is_success(),
         "PDS did not confirm account status"
@@ -255,11 +434,11 @@ async fn confirm_status_with_transport(
         status.status.as_ref().is_none_or(|s| s.len() <= 128),
         "Account status exceeds limit"
     );
-    Ok(ConfirmedStatus {
+    Ok(Confirmation::Status(ConfirmedStatus {
         active: status.active,
         status: if status.active { None } else { status.status },
         pds_url: endpoint,
-    })
+    }))
 }
 
 async fn relevant_account(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error> {
@@ -308,22 +487,47 @@ async fn apply_confirmed_status(
     if deleted {
         // Cursor has not advanced. Any failure below is retried, including after
         // process restart, while the durable inactive gate already denies reads.
-        let mut after = String::new();
-        loop {
-            let spaces: Vec<String> = sqlx::query_scalar(
-                "SELECT space_uri FROM circles WHERE authority_did=$1 AND space_uri>$2 ORDER BY space_uri LIMIT 100")
-                .bind(did).bind(&after).fetch_all(&state.db).await?;
-            if spaces.is_empty() {
-                break;
-            }
-            for space in spaces {
-                crate::purge::delete_space(&state.db, &state.credential_store, &space).await?;
-                after = space;
-            }
-        }
-        crate::purge::purge_deleted_author(&state.db, did).await?;
+        purge_account(state, did).await?;
     }
     Ok(())
+}
+
+/// Deletes every Space the account is the authority of, then its author
+/// payloads. Idempotent, so a repeated or resumed purge is safe.
+async fn purge_account(state: &AppState, did: &str) -> anyhow::Result<()> {
+    let mut after = String::new();
+    loop {
+        let spaces: Vec<String> = sqlx::query_scalar(
+            "SELECT space_uri FROM circles WHERE authority_did=$1 AND space_uri>$2 ORDER BY space_uri LIMIT 100")
+            .bind(did).bind(&after).fetch_all(&state.db).await?;
+        if spaces.is_empty() {
+            break;
+        }
+        for space in spaces {
+            crate::purge::delete_space(&state.db, &state.credential_store, &space).await?;
+            after = space;
+        }
+    }
+    crate::purge::purge_deleted_author(&state.db, did).await?;
+    Ok(())
+}
+
+/// Applies one `#identity`/`#account` event, then checkpoints it.
+async fn process_lifecycle_event(
+    state: &AppState,
+    relay: &str,
+    event: &Event,
+    transport: &crate::space_client::DefaultSpaceHostTransport,
+) -> anyhow::Result<()> {
+    let did = event
+        .did
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Missing account DID"))?;
+    state.did_resolver.invalidate_cached(did);
+    if relevant_account(&state.db, did).await? {
+        refresh_or_gate(state, did, relay, event.seq, event.deletion_hint, transport).await?;
+    }
+    checkpoint(&state.db, relay, event).await
 }
 
 async fn checkpoint(pool: &PgPool, relay: &str, event: &Event) -> anyhow::Result<()> {
@@ -334,7 +538,12 @@ async fn checkpoint(pool: &PgPool, relay: &str, event: &Event) -> anyhow::Result
     Ok(())
 }
 
-async fn reconcile_known_accounts(state: &AppState, relay: &str, seq: i64) -> anyhow::Result<()> {
+async fn reconcile_known_accounts(
+    state: &AppState,
+    relay: &str,
+    seq: i64,
+    transport: &crate::space_client::DefaultSpaceHostTransport,
+) -> anyhow::Result<()> {
     let mut after: String =
         sqlx::query_scalar("SELECT reconcile_after FROM circle_identity_cursor WHERE relay_url=$1")
             .bind(relay)
@@ -351,7 +560,7 @@ async fn reconcile_known_accounts(state: &AppState, relay: &str, seq: i64) -> an
             break;
         }
         for did in dids {
-            refresh_account(state, &did, relay, seq).await?;
+            refresh_or_gate(state, &did, relay, seq, false, transport).await?;
             after = did;
             sqlx::query("UPDATE circle_identity_cursor SET reconcile_after=$2 WHERE relay_url=$1")
                 .bind(relay)
@@ -380,6 +589,7 @@ async fn consume_connection(state: &AppState, relay: &url::Url) -> anyhow::Resul
     .bind(relay.as_str())
     .fetch_optional(&state.db)
     .await?;
+    let transport = crate::space_client::DefaultSpaceHostTransport::new();
     let mut url = relay.clone();
     url.set_path("/xrpc/com.atproto.sync.subscribeRepos");
     if let Some((cursor, _)) = saved {
@@ -414,6 +624,12 @@ async fn consume_connection(state: &AppState, relay: &url::Url) -> anyhow::Resul
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     let mut ping_nonce = Vec::new();
     let mut flush = tokio::time::interval(Duration::from_secs(1));
+    // Starts one tick after connecting so it never delays the first fresh event.
+    let mut recheck = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(RECHECK_TICK_SECS),
+        Duration::from_secs(RECHECK_TICK_SECS),
+    );
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(MAX_CONNECTION_SECS);
     loop {
         tokio::select! {
@@ -423,6 +639,9 @@ async fn consume_connection(state: &AppState, relay: &url::Url) -> anyhow::Resul
                 socket.send(Message::Ping(ping_nonce.clone().into())).await?;
             },
             _ = flush.tick() => if let Some(event) = pending.take() { checkpoint(&state.db,relay.as_str(),&event).await?; },
+            _ = recheck.tick() => if let (true, Some(seq)) = (reconciled, last_seq) {
+                recheck_unconfirmed(state,relay.as_str(),seq,&transport).await?;
+            },
             message = socket.next() => {
                 let message = message.ok_or_else(|| anyhow::anyhow!("Relay disconnected"))??;
                 match message {
@@ -441,16 +660,11 @@ async fn consume_connection(state: &AppState, relay: &url::Url) -> anyhow::Resul
                             sqlx::query("INSERT INTO circle_identity_cursor(relay_url,cursor,blocked_reason,last_connected_at) \
                                 VALUES($1,$2,'Initial account reconciliation',now()) ON CONFLICT(relay_url) DO NOTHING")
                                 .bind(relay.as_str()).bind(event.seq.saturating_sub(1)).execute(&state.db).await?;
-                            reconcile_known_accounts(state,relay.as_str(),event.seq.saturating_sub(1)).await?;
+                            reconcile_known_accounts(state,relay.as_str(),event.seq.saturating_sub(1),&transport).await?;
                             reconciled = true;
                         }
                         if event.identity || event.account {
-                            let did = event.did.as_deref().unwrap();
-                            state.did_resolver.invalidate_cached(did);
-                            if relevant_account(&state.db,did).await? {
-                                refresh_account(state,did,relay.as_str(),event.seq).await?;
-                            }
-                            checkpoint(&state.db,relay.as_str(),&event).await?;
+                            process_lifecycle_event(state,relay.as_str(),&event,&transport).await?;
                         }
                         last_seq = Some(event.seq);
                         pending = Some(event);
@@ -596,8 +810,18 @@ mod tests {
         let event = decode_frame(&bytes).unwrap().unwrap();
         assert!(event.account);
         assert_eq!(event.did.as_deref(), Some(AUTHOR));
-        // No relay-supplied status survives in Event. Only PDS confirmation can
+        // Only a deletion hint survives in Event. Only PDS confirmation can
         // construct the ConfirmedStatus consumed by the state mutation path.
+        assert!(event.deletion_hint);
+        assert!(
+            !decode_frame(&frame(
+                "#account",
+                json!({"seq":12,"did":AUTHOR,"active":false,"status":"suspended","time":Utc::now()})
+            ))
+            .unwrap()
+            .unwrap()
+            .deletion_hint
+        );
         assert!(decode_frame(&frame("#info", json!({"name":"OutdatedCursor"}))).is_err());
         let mut extra = bytes;
         extra.push(0);
@@ -660,6 +884,338 @@ mod tests {
             status: status.map(String::from),
             pds_url: "https://pds.example".into(),
         }
+    }
+
+    /// A pinned-TLS stand-in for each DID's current PDS plus a PLC directory that
+    /// points every listed DID at it. `getRepoStatus` answers come from
+    /// `responses` by DID; an unlisted DID gets a 500.
+    struct PdsFixture {
+        transport: crate::space_client::DefaultSpaceHostTransport,
+        responses: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, (u16, serde_json::Value)>>,
+        >,
+        _plc: wiremock::MockServer,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl PdsFixture {
+        async fn start(app: &mut AppState, dids: &[&str]) -> Self {
+            use crate::space_client::{DefaultSpaceHostTransport, SpaceHostDnsResolver};
+            use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["pds.lifecycle.example".into()])
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            let certificate = reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap();
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                )
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let responses: Arc<
+                std::sync::Mutex<std::collections::HashMap<String, (u16, serde_json::Value)>>,
+            > = Default::default();
+            let answers = responses.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    let mut request = [0; 8192];
+                    let n = stream.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..n]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    assert!(path.starts_with("/xrpc/com.atproto.sync.getRepoStatus?did="));
+                    let did = url::Url::parse(&format!("https://fixture{path}"))
+                        .unwrap()
+                        .query_pairs()
+                        .find(|(k, _)| k == "did")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let (code, body) = answers
+                        .lock()
+                        .unwrap()
+                        .get(&did)
+                        .cloned()
+                        .unwrap_or((500, json!({"error":"InternalServerError"})));
+                    let body = body.to_string();
+                    stream.write_all(format!("HTTP/1.1 {code} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+            });
+            struct FixtureDns(SocketAddr);
+            impl SpaceHostDnsResolver for FixtureDns {
+                fn resolve_dns<'a>(
+                    &'a self,
+                    _host: &'a str,
+                    _port: u16,
+                ) -> Pin<
+                    Box<
+                        dyn Future<Output = Result<Vec<SocketAddr>, crate::error::AuthReason>>
+                            + Send
+                            + 'a,
+                    >,
+                > {
+                    Box::pin(async move { Ok(vec![self.0]) })
+                }
+            }
+            let plc = wiremock::MockServer::start().await;
+            for did in dids {
+                let doc = json!({"id":did,"verificationMethod":[],
+                    "service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":format!("https://pds.lifecycle.example:{}",addr.port())}]});
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path(format!("/{did}")))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&doc))
+                    .mount(&plc)
+                    .await;
+            }
+            app.did_resolver = Arc::new(crate::DidResolver::new(
+                plc.uri(),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ));
+            Self {
+                transport: DefaultSpaceHostTransport::with_test_fixture(
+                    Arc::new(FixtureDns(addr)),
+                    Some(certificate),
+                    true,
+                ),
+                responses,
+                _plc: plc,
+                server,
+            }
+        }
+
+        fn answer(&self, did: &str, code: u16, body: serde_json::Value) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(did.into(), (code, body));
+        }
+    }
+
+    impl Drop for PdsFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn lifecycle_event(kind: &str, body: serde_json::Value) -> Event {
+        decode_frame(&frame(kind, body)).unwrap().unwrap()
+    }
+
+    async fn cursor(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT cursor FROM circle_identity_cursor WHERE relay_url=$1")
+            .bind(RELAY)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn record_count(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM circle_records")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// F1: the reference PDS deletes the account row before it sequences
+    /// `#account deleted`, so getRepoStatus answers 400 RepoNotFound. That pair
+    /// is a confirmed deletion: purge, checkpoint, and stay ready for everyone.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reference_account_deletion_purges_and_keeps_readiness(pool: PgPool) {
+        seed(&pool).await;
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[AUTHOR, OWNER]).await;
+        pds.answer(
+            AUTHOR,
+            400,
+            json!({"error":"RepoNotFound","message":"Could not find repo for DID"}),
+        );
+        let deleted = lifecycle_event(
+            "#account",
+            json!({"seq":10,"did":AUTHOR,"active":false,"status":"deleted","time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &deleted, &pds.transport)
+            .await
+            .unwrap();
+        assert!(matches!(
+            require_active_account(&pool, AUTHOR).await,
+            Err(AppError::AccessRemoved(_))
+        ));
+        assert_eq!(
+            record_count(&pool).await,
+            0,
+            "deleted author payload purged"
+        );
+        assert_eq!(cursor(&pool).await, 10, "event checkpointed");
+        assert!(
+            is_healthy(&pool, RELAY).await.unwrap(),
+            "readiness unaffected"
+        );
+        require_active_account(&pool, OWNER).await.unwrap();
+        // A later active hint and an active PDS answer cannot resurrect it.
+        pds.answer(AUTHOR, 200, json!({"did":AUTHOR,"active":true}));
+        let active = lifecycle_event(
+            "#account",
+            json!({"seq":11,"did":AUTHOR,"active":true,"time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &active, &pds.transport)
+            .await
+            .unwrap();
+        assert!(matches!(
+            require_active_account(&pool, AUTHOR).await,
+            Err(AppError::AccessRemoved(_))
+        ));
+    }
+
+    async fn ledger_status(pool: &PgPool, did: &str) -> Option<(bool, Option<String>)> {
+        sqlx::query_as("SELECT active, status FROM circle_account_status WHERE did=$1")
+            .bind(did)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// F1: a PDS that does not confirm a status (5xx, or a deletion hint it
+    /// cannot back up) denies only that account. The event is checkpointed,
+    /// readiness stays healthy, nothing is purged, and a later re-check settles it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unconfirmed_account_is_denied_alone_and_rechecked_later(pool: PgPool) {
+        seed(&pool).await;
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[AUTHOR, OWNER]).await;
+        pds.answer(OWNER, 500, json!({"error":"InternalServerError"}));
+        let identity =
+            lifecycle_event("#identity", json!({"seq":10,"did":OWNER,"time":Utc::now()}));
+        process_lifecycle_event(&app, RELAY, &identity, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, OWNER).await,
+            Some((false, Some(UNCONFIRMED.into())))
+        );
+        assert!(matches!(
+            require_active_account(&pool, OWNER).await,
+            Err(AppError::Forbidden(_))
+        ));
+        require_active_account(&pool, AUTHOR).await.unwrap();
+        assert_eq!(cursor(&pool).await, 10);
+        assert!(is_healthy(&pool, RELAY).await.unwrap());
+
+        // A relay deletion hint the PDS cannot back up never purges.
+        pds.answer(AUTHOR, 503, json!({"error":"Unavailable"}));
+        let hint = lifecycle_event(
+            "#account",
+            json!({"seq":11,"did":AUTHOR,"active":false,"status":"deleted","time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &hint, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, AUTHOR).await,
+            Some((false, Some(DELETION_UNCONFIRMED.into())))
+        );
+        assert_eq!(record_count(&pool).await, 1, "hint alone never purges");
+        let circle_alive: bool =
+            sqlx::query_scalar("SELECT deleted_at IS NULL FROM circles WHERE space_uri=$1")
+                .bind(SPACE)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(circle_alive, "an unconfirmed authority keeps its Circles");
+        assert_eq!(cursor(&pool).await, 11);
+        assert!(is_healthy(&pool, RELAY).await.unwrap());
+
+        // The PDSes recover. A re-check waits RECHECK_AFTER_SECS after the
+        // last attempt, then confirms both accounts.
+        pds.answer(OWNER, 200, json!({"did":OWNER,"active":true}));
+        pds.answer(
+            AUTHOR,
+            400,
+            json!({"error":"RepoNotFound","message":"Could not find repo for DID"}),
+        );
+        recheck_unconfirmed(&app, RELAY, 11, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, OWNER).await,
+            Some((false, Some(UNCONFIRMED.into()))),
+            "not re-checked before its retry interval"
+        );
+        sqlx::query("UPDATE circle_account_status SET confirmed_at=now()-interval '10 minutes'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        recheck_unconfirmed(&app, RELAY, 11, &pds.transport)
+            .await
+            .unwrap();
+        require_active_account(&pool, OWNER).await.unwrap();
+        assert!(matches!(
+            require_active_account(&pool, AUTHOR).await,
+            Err(AppError::AccessRemoved(_))
+        ));
+        assert_eq!(
+            record_count(&pool).await,
+            0,
+            "persisted deletion hint plus RepoNotFound completes the deletion"
+        );
+        assert!(is_healthy(&pool, RELAY).await.unwrap());
+    }
+
+    /// F1: initial reconciliation completes even when a known account cannot be
+    /// confirmed. RepoNotFound without a relay deletion event is not a deletion.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reconcile_completes_when_a_known_account_cannot_be_confirmed(pool: PgPool) {
+        seed(&pool).await;
+        sqlx::query("UPDATE circle_identity_cursor SET reconciled_at=NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[AUTHOR, OWNER]).await;
+        pds.answer(OWNER, 200, json!({"did":OWNER,"active":true}));
+        pds.answer(
+            AUTHOR,
+            400,
+            json!({"error":"RepoNotFound","message":"Could not find repo for DID"}),
+        );
+        reconcile_known_accounts(&app, RELAY, 9, &pds.transport)
+            .await
+            .unwrap();
+        let reconciled: bool = sqlx::query_scalar(
+            "SELECT reconciled_at IS NOT NULL FROM circle_identity_cursor WHERE relay_url=$1",
+        )
+        .bind(RELAY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(reconciled);
+        require_active_account(&pool, OWNER).await.unwrap();
+        assert_eq!(
+            ledger_status(&pool, AUTHOR).await,
+            Some((false, Some(UNCONFIRMED.into())))
+        );
+        assert_eq!(
+            record_count(&pool).await,
+            1,
+            "RepoNotFound alone never purges"
+        );
+        // The on-request path for a first-seen account still refuses, and writes
+        // nothing, when the PDS does not confirm a status.
+        assert!(refresh_account(&app, "did:plc:lifecyclestranger", RELAY, 0)
+            .await
+            .is_err());
+        assert_eq!(
+            ledger_status(&pool, "did:plc:lifecyclestranger").await,
+            None
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -782,6 +1338,7 @@ mod tests {
             did: Some(OWNER.into()),
             identity: false,
             account: true,
+            deletion_hint: true,
         };
         checkpoint(&pool, RELAY, &event).await.unwrap();
         // Repeat the same event as a second crash/reconnect replay.
@@ -811,6 +1368,7 @@ mod tests {
             did: None,
             identity: false,
             account: false,
+            deletion_hint: false,
         };
         checkpoint(&pool, RELAY, &event).await.unwrap();
         assert!(!is_healthy(&pool, RELAY).await.unwrap());
@@ -943,9 +1501,14 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        let confirmed = confirm_status_with_transport(&app, AUTHOR, &transport)
-            .await
-            .unwrap();
+        let Confirmation::Status(confirmed) =
+            confirm_status_with_transport(&app, AUTHOR, &transport)
+                .await
+                .unwrap()
+        else {
+            panic!("an active account answers with a status");
+        };
+        assert!(hint.deletion_hint);
         assert!(
             confirmed.active,
             "relay deletion hint cannot override active current PDS"
@@ -967,11 +1530,14 @@ mod tests {
                 .is_err(),
             "mismatched DID must not confirm deletion"
         );
+        // RepoNotFound is reported, not concluded: refresh() purges only when
+        // the relay also reported this account deleted.
         assert!(
-            confirm_status_with_transport(&app, AUTHOR, &transport)
-                .await
-                .is_err(),
-            "RepoNotFound must not confirm deletion"
+            matches!(
+                confirm_status_with_transport(&app, AUTHOR, &transport).await,
+                Ok(Confirmation::RepoNotFound { .. })
+            ),
+            "RepoNotFound must not be a confirmed status"
         );
         require_active_account(&pool, AUTHOR).await.unwrap();
         serving.await.unwrap();
