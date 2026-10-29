@@ -1784,3 +1784,289 @@ async fn listed_member_regranted_read_sees_quiet_circle_through_own_listing(pool
         vec![space.clone()]
     );
 }
+
+async fn former_member_row_count(pool: &PgPool, space: &str, did: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM circle_former_members WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(space)
+    .bind(did)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn sorted(mut uris: Vec<String>) -> Vec<String> {
+    uris.sort();
+    uris
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn relisted_member_loses_former_row_and_frees_the_cap(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let readded = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2readded");
+    let removed: Vec<String> = (0..access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST)
+        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2removed{i}"))
+        .collect();
+    for space in std::iter::once(&readded).chain(&removed) {
+        seed_circle_with_members(&setup, space, &[BOB_DID]).await;
+        set_host_members(&setup, space, &[]);
+        access::refresh_member_cache(&setup.state, space)
+            .await
+            .unwrap();
+        assert_eq!(former_member_row_count(&pool, space, BOB_DID).await, 1);
+    }
+
+    // The owner re-adds Bob to one Circle and some other request refreshes it.
+    set_host_members(&setup, &readded, &[BOB_DID]);
+    access::refresh_member_cache(&setup.state, &readded)
+        .await
+        .unwrap();
+    assert_eq!(
+        former_member_row_count(&pool, &readded, BOB_DID).await,
+        0,
+        "a refresh that lists the member again forgets the former-member row"
+    );
+
+    // The re-added Circle now comes through the member branch, so the whole
+    // former-member cap goes to the Circles Bob is still removed from.
+    age_member_caches(&pool).await;
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![readded.clone()]
+    );
+    assert_eq!(
+        fresh_member_cache_count(&pool).await,
+        1 + removed.len() as i64,
+        "a stale former-member row must not take a slot from the cap"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn former_member_host_failures_are_retried_at_most_every_thirty_seconds(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let cap = access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST;
+    // Ordered by URI: the first `cap` Circles are picked first and their host fails.
+    let spaces: Vec<String> = (0..=cap)
+        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2throttle{i}"))
+        .collect();
+    let (failing, waiting) = spaces.split_at(cap as usize);
+    for space in &spaces {
+        seed_circle_with_members(&setup, space, &[BOB_DID]).await;
+        set_host_members(&setup, space, &[]);
+        access::refresh_member_cache(&setup.state, space)
+            .await
+            .unwrap();
+    }
+    for space in failing {
+        setup
+            .mock_transport
+            .set_space_members_error(space, "Upstream unavailable".to_string());
+    }
+    age_member_caches(&pool).await;
+
+    // First listing: the cap goes to the failing Circles and none refreshes.
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, 0);
+
+    // Every host recovers and lists Bob again. Within 30 s the failed
+    // Circles are not retried, so a host call to one would show up as a
+    // fresh cache; the Circle that waited gets its turn instead.
+    for space in &spaces {
+        set_host_members(&setup, space, &[BOB_DID]);
+    }
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        waiting.to_vec(),
+        "a former-member Circle is checked at most once per 30 s"
+    );
+    assert_eq!(fresh_member_cache_count(&pool).await, 1);
+
+    // Once 30 s have passed the failed Circles are retried.
+    sqlx::query(
+        "UPDATE circle_former_members SET last_checked_at = now() - INTERVAL '31 seconds' WHERE member_did = $1",
+    )
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sorted(listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await),
+        spaces
+    );
+}
+
+/// GETs an XRPC query as `did` and returns the body of its 200 response.
+async fn xrpc_get_ok(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+    method: &str,
+) -> axum::body::Bytes {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt;
+
+    let jwt = mint_service_jwt(did, method, signing_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/{method}"))
+        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    body
+}
+
+/// The Circle of every post `did` sees through unified blue.catbird.circle.getFeed.
+async fn feed_circles(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<String> {
+    use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
+
+    let body = xrpc_get_ok(setup, did, signing_key, "blue.catbird.circle.getFeed").await;
+    let output: GetFeedOutput = serde_json::from_slice(&body).unwrap();
+    output
+        .feed
+        .iter()
+        .map(|item| item.circle.uri.as_str().to_string())
+        .collect()
+}
+
+/// The Circle of every notification `did` sees through blue.catbird.circle.listNotifications.
+async fn notification_circles(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<String> {
+    use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
+
+    let body = xrpc_get_ok(
+        setup,
+        did,
+        signing_key,
+        "blue.catbird.circle.listNotifications",
+    )
+    .await;
+    let output: ListNotificationsOutput = serde_json::from_slice(&body).unwrap();
+    output
+        .notifications
+        .iter()
+        .map(|n| n.circle.uri.as_str().to_string())
+        .collect()
+}
+
+async fn cache_profile(setup: &TestSetup, did: &str, handle: &str) {
+    use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
+    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+    use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+
+    setup
+        .state
+        .profile_hydrator
+        .set_cached_profile(
+            did,
+            ProfileViewBasic {
+                did: Did::new(SmolStr::new(did)).unwrap(),
+                handle: Handle::new(SmolStr::new(handle)).unwrap(),
+                display_name: None,
+                avatar: None,
+                associated: None,
+                viewer: None,
+                labels: None,
+                created_at: None,
+                pronouns: None,
+                status: None,
+                verification: None,
+                debug: None,
+                extra_data: None,
+            },
+        )
+        .await;
+}
+
+/// Seeds a Circle that lists Bob, with an owner post and a notification for Bob,
+/// then has the owner remove and re-add Bob with nobody else touching the Circle.
+async fn seed_quiet_circle_bob_was_readded_to(setup: &TestSetup) -> String {
+    let space = space_uri();
+    cache_profile(setup, AUTHORITY_DID, "authority.test").await;
+    cache_profile(setup, BOB_DID, "bob.test").await;
+    seed_circle_with_members(setup, &space, &[BOB_DID]).await;
+    let post = json!({"$type": "app.bsky.feed.post", "text": "Owner post", "createdAt": Utc::now().to_rfc3339()});
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at)
+        VALUES ($1, 'bafyreicidreadded', $2, $3, 'app.bsky.feed.post', 'post1', $4, now(), now())
+        "#,
+    )
+    .bind(format!("{space}/app.bsky.feed.post/post1"))
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .bind(&post)
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, source_uri, created_at) VALUES ($1, $2, $3, $4, 'like', $5, now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(BOB_DID)
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .bind(format!("{space}/app.bsky.feed.like/like1"))
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        feed_circles(setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+    assert_eq!(
+        notification_circles(setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+
+    set_host_members(setup, &space, &[]);
+    access::refresh_member_cache(&setup.state, &space)
+        .await
+        .unwrap();
+    assert!(feed_circles(setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert!(notification_circles(setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+
+    set_host_members(setup, &space, &[BOB_DID]);
+    age_member_caches(&setup.pool).await;
+    space
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readded_member_sees_quiet_circle_again_through_own_unified_feed(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = seed_quiet_circle_bob_was_readded_to(&setup).await;
+    assert_eq!(
+        feed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space],
+        "a re-added member's unified feed must revalidate the Circle they left"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readded_member_sees_quiet_circle_again_through_own_notifications(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = seed_quiet_circle_bob_was_readded_to(&setup).await;
+    assert_eq!(
+        notification_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space],
+        "a re-added member's notifications must revalidate the Circle they left"
+    );
+}
