@@ -1325,6 +1325,17 @@ mod tests {
                 .await
                 .unwrap();
         assert!(deleted);
+        let tombstone: (String, String) =
+            sqlx::query_as("SELECT display_name, circle_id FROM circles WHERE space_uri=$1")
+                .bind(SPACE)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            tombstone,
+            ("Circle".into(), String::new()),
+            "authority deletion keeps no private Circle metadata"
+        );
         let seq: i64 =
             sqlx::query_scalar("SELECT cursor FROM circle_identity_cursor WHERE relay_url=$1")
                 .bind(RELAY)

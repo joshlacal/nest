@@ -2490,6 +2490,17 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
             .unwrap();
     assert!(!revoked_access);
     assert!(deleted_at.is_some());
+    let (name, circle_id): (String, String) =
+        sqlx::query_as("SELECT display_name, circle_id FROM circles WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (name.as_str(), circle_id.as_str()),
+        ("Circle", ""),
+        "revocation must not retain the private Circle name or id"
+    );
 
     // 3. refresh_member_cache must fail-closed and NOT resurrect app_access_granted
     let refresh_res = refresh_member_cache(&setup.state, SPACE_1).await;
@@ -3777,6 +3788,28 @@ async fn delete_space_purges_member_cache_and_expired_tombstones_are_cleaned(poo
         member_count.0, 0,
         "circle_member_cache must be purged in delete_space cascade"
     );
+
+    // 3b. The tombstone keeps no private metadata, and a repeated delivery
+    // neither restores it nor extends the retention window.
+    let first: (String, String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT display_name, circle_id, deleted_at FROM circles WHERE space_uri = $1",
+    )
+    .bind(SPACE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((first.0.as_str(), first.1.as_str()), ("Circle", ""));
+    delete_space(&pool, &setup.state.credential_store, SPACE_1)
+        .await
+        .unwrap();
+    let repeated: (String, String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT display_name, circle_id, deleted_at FROM circles WHERE space_uri = $1",
+    )
+    .bind(SPACE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repeated, first);
 
     // 4. Manually backdate tombstone to 40 days ago
     sqlx::query("UPDATE circles SET deleted_at = now() - INTERVAL '40 days' WHERE space_uri = $1")

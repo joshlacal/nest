@@ -250,6 +250,26 @@ async fn assert_fully_purged(setup: &Setup, pool: &PgPool) {
         setup.state.credential_store.get(SPACE_URI).await.is_none(),
         "the space credential must be dropped"
     );
+    // The tombstone keeps no private metadata copied from the Space (section 6).
+    let (name, circle_id, created_at, deleted_at): (
+        String,
+        String,
+        chrono::DateTime<Utc>,
+        Option<chrono::DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT display_name, circle_id, created_at, deleted_at FROM circles WHERE space_uri = $1",
+    )
+    .bind(SPACE_URI)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(name, "Circle", "private Circle name must be blanked");
+    assert_eq!(circle_id, "", "private Circle id must be blanked");
+    assert_eq!(
+        Some(created_at),
+        deleted_at,
+        "creation time must be blanked"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

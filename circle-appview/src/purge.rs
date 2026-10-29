@@ -71,6 +71,8 @@ pub async fn remove_member(pool: &PgPool, space: &str, member: &str) -> Result<(
 /// appAccess removal lifecycle:
 /// 1. Persists grant state in its own transaction first: disables private serving immediately
 ///    (app_access_granted = false, app_access_revoked_at = now(), deleted_at = now()) and advances access_epoch.
+///    The private name, id and creation time copied from the metadata record are blanked;
+///    a re-grant re-activates and rewrites them.
 /// 2. Revokes/deletes Space credentials from in-memory CredentialStore.
 /// 3. Performs bounded batch purge of projected private data so a large purge failure cannot leave the Circle serving.
 pub async fn revoke_app_access(
@@ -87,7 +89,10 @@ pub async fn revoke_app_access(
         SET app_access_granted = false,
             app_access_revoked_at = now(),
             access_epoch = access_epoch + 1,
-            deleted_at = COALESCE(deleted_at, now())
+            deleted_at = COALESCE(deleted_at, now()),
+            display_name = 'Circle',
+            circle_id = '',
+            created_at = COALESCE(deleted_at, now())
         WHERE space_uri = $1
         RETURNING access_epoch
         "#,
@@ -107,7 +112,10 @@ pub async fn revoke_app_access(
                 SET app_access_granted = false,
                     app_access_revoked_at = now(),
                     access_epoch = circles.access_epoch + 1,
-                    deleted_at = COALESCE(circles.deleted_at, now())
+                    deleted_at = COALESCE(circles.deleted_at, now()),
+                    display_name = 'Circle',
+                    circle_id = '',
+                    created_at = COALESCE(circles.deleted_at, now())
                 RETURNING access_epoch
                 "#,
             )
@@ -300,9 +308,13 @@ pub async fn delete_space(
 ) -> Result<(), PurgeError> {
     let mut tx = pool.begin().await?;
 
-    // Linearizable tombstone: mark deleted_at = now()
+    // Linearizable tombstone. It keeps only what AccessRemoved answers need, and
+    // blanks the private name, id and creation time copied from the Space's
+    // metadata record (repeat deliveries too). COALESCE keeps the first
+    // tombstone time, so retention is not extended.
     sqlx::query(
-        "UPDATE circles SET deleted_at = now() WHERE space_uri = $1 AND deleted_at IS NULL",
+        "UPDATE circles SET deleted_at = COALESCE(deleted_at, now()), display_name = 'Circle', \
+         circle_id = '', created_at = COALESCE(deleted_at, now()) WHERE space_uri = $1",
     )
     .bind(space)
     .execute(&mut *tx)

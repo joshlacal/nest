@@ -723,7 +723,7 @@ pub async fn refresh_member_cache(
         if let Err(e) = revoke_res {
             tracing::error!(error = %e, space_uri = %space_uri, "Failed to revoke app access and purge circle data; writing durable invalidation marker");
             let _ = sqlx::query(
-                "UPDATE circles SET app_access_granted = false, deleted_at = COALESCE(deleted_at, now()), access_epoch = access_epoch + 1 WHERE space_uri = $1",
+                "UPDATE circles SET app_access_granted = false, deleted_at = COALESCE(deleted_at, now()), access_epoch = access_epoch + 1, display_name = 'Circle', circle_id = '', created_at = COALESCE(deleted_at, now()) WHERE space_uri = $1",
             )
             .bind(space_uri)
             .execute(&state.db)
