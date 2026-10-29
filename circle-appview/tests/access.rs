@@ -1569,3 +1569,218 @@ async fn membership_and_authority_app_access_expire_after_thirty_seconds_with_ex
         "failed OAuth refresh denies without pretending membership was removed"
     );
 }
+
+/// Lists the Circles `did` sees through blue.catbird.circle.listCircles.
+async fn listed_circles(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<String> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
+    use tower::ServiceExt;
+
+    let jwt = mint_service_jwt(did, "blue.catbird.circle.listCircles", signing_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let output: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    output
+        .circles
+        .iter()
+        .map(|c| c.uri.as_str().to_string())
+        .collect()
+}
+
+/// Seeds an active Circle whose mock host lists `members`, and caches that list.
+async fn seed_circle_with_members(setup: &TestSetup, space: &str, members: &[&str]) {
+    setup.mock_transport.set_space_config(
+        space,
+        circle_appview::space_client::SpaceConfig {
+            authority: AUTHORITY_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-test".to_string(),
+            app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Test Circle".to_string()),
+            description: None,
+        },
+    );
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3jzfcijpj2m2a', $2, 'Test Circle', now(), true)",
+    )
+    .bind(space)
+    .bind(AUTHORITY_DID)
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+    set_host_members(setup, space, members);
+    access::refresh_member_cache(&setup.state, space)
+        .await
+        .unwrap();
+}
+
+fn set_host_members(setup: &TestSetup, space: &str, members: &[&str]) {
+    setup
+        .mock_transport
+        .set_space_members(space, members.iter().map(|m| m.to_string()).collect());
+}
+
+/// Ages every Circle's member cache past the 30-second freshness window.
+async fn age_member_caches(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE circle_member_cache_meta SET last_refreshed_at = now() - INTERVAL '10 minutes'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn fresh_member_cache_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM circle_member_cache_meta WHERE last_refreshed_at > now() - INTERVAL '30 seconds'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readded_member_sees_quiet_circle_again_through_own_listing(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    seed_circle_with_members(&setup, &space, &[BOB_DID]).await;
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+
+    // The owner removes Bob; a refresh drops his cache row entirely.
+    set_host_members(&setup, &space, &[]);
+    access::refresh_member_cache(&setup.state, &space)
+        .await
+        .unwrap();
+    let bob_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(&space)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bob_rows, 0, "removal deletes the member's cache row");
+
+    // The owner re-adds Bob and nobody else touches this quiet Circle.
+    set_host_members(&setup, &space, &[BOB_DID]);
+    age_member_caches(&pool).await;
+
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()],
+        "a re-added member's own listing must revalidate the Circle they left"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn former_member_revalidation_is_capped_and_reveals_nothing(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let spaces: Vec<String> = (0..7)
+        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2former{i}"))
+        .collect();
+    for space in &spaces {
+        seed_circle_with_members(&setup, space, &[BOB_DID]).await;
+        set_host_members(&setup, space, &[]);
+        access::refresh_member_cache(&setup.state, space)
+            .await
+            .unwrap();
+    }
+    age_member_caches(&pool).await;
+
+    // Alice was never a member of any of them: her listing makes no host call.
+    assert!(listed_circles(&setup, ALICE_DID, &setup.alice_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, 0);
+
+    // Bob is still removed everywhere. Each listing revalidates at most the
+    // per-request cap, in rotation, and never lists a Circle he cannot read.
+    let cap = access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST;
+    assert!(cap < spaces.len() as i64);
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, cap);
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, spaces.len() as i64);
+
+    // Purging a Circle, then the account, drops the former-member rows.
+    let former_rows = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM circle_former_members WHERE member_did = $1",
+        )
+        .bind(BOB_DID)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(former_rows(pool.clone()).await, spaces.len() as i64);
+    circle_appview::purge::delete_space(&pool, &setup.state.credential_store, &spaces[0])
+        .await
+        .unwrap();
+    assert_eq!(former_rows(pool.clone()).await, spaces.len() as i64 - 1);
+    circle_appview::purge::purge_deleted_author(&pool, BOB_DID)
+        .await
+        .unwrap();
+    assert_eq!(former_rows(pool.clone()).await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn listed_member_regranted_read_sees_quiet_circle_through_own_listing(pool: PgPool) {
+    use circle_appview::space_client::SpaceMember;
+
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    seed_circle_with_members(&setup, &space, &[]).await;
+    let bob = |read: bool| SpaceMember {
+        did: BOB_DID.to_string(),
+        read,
+        write: true,
+    };
+
+    // Bob stays on the member list but without read access.
+    setup
+        .mock_transport
+        .set_space_members_detailed(&space, vec![bob(false)]);
+    access::refresh_member_cache(&setup.state, &space)
+        .await
+        .unwrap();
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+
+    // The owner grants read again and nobody else touches the Circle.
+    setup
+        .mock_transport
+        .set_space_members_detailed(&space, vec![bob(true)]);
+    age_member_caches(&pool).await;
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+}

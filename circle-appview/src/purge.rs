@@ -14,12 +14,21 @@ pub enum PurgeError {
 pub async fn remove_member(pool: &PgPool, space: &str, member: &str) -> Result<(), PurgeError> {
     let mut tx = pool.begin().await?;
 
-    // 1. Evict member from cache
+    // 1. Evict member from cache, and remember them so a re-add is noticed
+    //    through their own listings (see access::revalidate_stale_member_spaces)
     sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2")
         .bind(space)
         .bind(member)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "INSERT INTO circle_former_members (space_uri, member_did, removed_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (space_uri, member_did) DO UPDATE SET removed_at = EXCLUDED.removed_at",
+    )
+    .bind(space)
+    .bind(member)
+    .execute(&mut *tx)
+    .await?;
 
     // 2. Advance circles access_epoch, increment generation, then assign circle_member_cache_meta.access_epoch = circles.access_epoch
     let new_epoch: (i64,) = sqlx::query_as(
@@ -229,6 +238,28 @@ pub async fn purge_circle_projected_data(pool: &PgPool, space: &str) -> Result<(
         }
     }
 
+    // Former members
+    loop {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM circle_former_members
+            WHERE ctid IN (
+                SELECT ctid FROM circle_former_members
+                WHERE space_uri = $1
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(space)
+        .bind(BATCH_SIZE)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if deleted < BATCH_SIZE as u64 {
+            break;
+        }
+    }
+
     // Likes
     loop {
         let deleted = sqlx::query(
@@ -324,6 +355,10 @@ pub async fn delete_space(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM circle_former_members WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
         .await?;
@@ -468,6 +503,7 @@ pub async fn purge_deleted_author(pool: &PgPool, author: &str) -> Result<(), Pur
         ("circle_preferences", "member_did=$1"),
         ("circle_repo_sync_state", "author_did=$1"),
         ("circle_member_cache", "member_did=$1"),
+        ("circle_former_members", "member_did=$1"),
         ("oauth_sessions", "user_did=$1"),
     ] {
         loop {

@@ -656,18 +656,28 @@ pub async fn check_member_access(
     }
 }
 
+/// Most Circles a former member's single listing request revalidates.
+/// The rest wait for later requests (least recently checked first).
+pub const MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST: i64 = 5;
+
 /// Revalidates any candidate spaces for a user where the member cache is stale (> 30s).
 /// For each stale space, attempts to refresh the member cache from the owner's PDS.
 /// Unreadable spaces remain stale and thus excluded by the freshness gate (fail-closed).
+///
+/// Candidates are the user's own Circles, Circles whose cached member list
+/// includes the user (whatever their read flag), and, capped per request,
+/// Circles a refresh dropped the user from. The host sends no membership
+/// notification, so this is how a re-added member's own listing finds a quiet
+/// Circle again. A user who was never on a member list causes no refresh.
 pub async fn revalidate_stale_member_spaces(
     state: &AppState,
     user_did: &str,
 ) -> Result<(), AppError> {
-    let stale_spaces: Vec<(String,)> = sqlx::query_as(
+    let mut stale_spaces: Vec<String> = sqlx::query_scalar(
         r#"
         SELECT DISTINCT c.space_uri
         FROM circles c
-        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.can_read = true
+        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         WHERE c.deleted_at IS NULL
           AND (c.authority_did = $1 OR m.member_did IS NOT NULL)
@@ -679,7 +689,42 @@ pub async fn revalidate_stale_member_spaces(
     .await
     .map_err(AppError::Database)?;
 
-    for (space_uri,) in stale_spaces {
+    // Claim the least recently checked former-member Circles, at most once
+    // per 30 s each, so a Circle whose host keeps failing cannot hold the cap.
+    let former_spaces: Vec<String> = sqlx::query_scalar(
+        r#"
+        WITH picked AS (
+            SELECT f.space_uri
+            FROM circle_former_members f
+            JOIN circles c ON c.space_uri = f.space_uri
+            LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = f.space_uri
+            WHERE f.member_did = $1
+              AND c.deleted_at IS NULL
+              AND (meta.last_refreshed_at IS NULL OR meta.last_refreshed_at <= now() - INTERVAL '30 seconds')
+              AND (f.last_checked_at IS NULL OR f.last_checked_at <= now() - INTERVAL '30 seconds')
+            ORDER BY f.last_checked_at ASC NULLS FIRST, f.space_uri ASC
+            LIMIT $2
+            FOR UPDATE OF f SKIP LOCKED
+        )
+        UPDATE circle_former_members f
+        SET last_checked_at = now()
+        FROM picked
+        WHERE f.space_uri = picked.space_uri AND f.member_did = $1
+        RETURNING f.space_uri
+        "#,
+    )
+    .bind(user_did)
+    .bind(MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST)
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+    for space_uri in former_spaces {
+        if !stale_spaces.contains(&space_uri) {
+            stale_spaces.push(space_uri);
+        }
+    }
+
+    for space_uri in stale_spaces {
         let _ = refresh_member_cache(state, &space_uri).await;
     }
 
@@ -798,6 +843,14 @@ pub async fn refresh_member_cache(
     .await
     .map_err(AppError::Database)?;
 
+    let listed_dids: Vec<String> = members.iter().map(|m| m.did.clone()).collect();
+    let listed: std::collections::HashSet<&str> = listed_dids.iter().map(String::as_str).collect();
+    let dropped_dids: Vec<String> = existing_members
+        .iter()
+        .filter(|(did, _, _)| !listed.contains(did.as_str()))
+        .map(|(did, _, _)| did.clone())
+        .collect();
+
     let existing_set: std::collections::HashSet<(String, bool, bool)> =
         existing_members.into_iter().collect();
     let new_set: std::collections::HashSet<(String, bool, bool)> = members
@@ -842,6 +895,30 @@ pub async fn refresh_member_cache(
         .bind(&m.did)
         .bind(m.read)
         .bind(m.write)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+    }
+
+    // Remember who was dropped so their own listings can find the Circle again
+    // if they are re-added (see revalidate_stale_member_spaces); forget anyone
+    // the host lists again.
+    sqlx::query("DELETE FROM circle_former_members WHERE space_uri = $1 AND member_did = ANY($2)")
+        .bind(space_uri)
+        .bind(&listed_dids)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+    if !dropped_dids.is_empty() {
+        sqlx::query(
+            r#"
+            INSERT INTO circle_former_members (space_uri, member_did, removed_at)
+            SELECT $1, dropped.did, now() FROM unnest($2::text[]) AS dropped(did)
+            ON CONFLICT (space_uri, member_did) DO UPDATE SET removed_at = EXCLUDED.removed_at
+            "#,
+        )
+        .bind(space_uri)
+        .bind(&dropped_dids)
         .execute(&mut *tx)
         .await
         .map_err(AppError::Database)?;

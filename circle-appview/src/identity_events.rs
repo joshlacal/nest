@@ -448,6 +448,7 @@ async fn relevant_account(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error>
         "SELECT EXISTS(SELECT 1 FROM circle_account_status WHERE did=$1) \
         OR EXISTS(SELECT 1 FROM circles WHERE authority_did=$1) \
         OR EXISTS(SELECT 1 FROM circle_member_cache WHERE member_did=$1) \
+        OR EXISTS(SELECT 1 FROM circle_former_members WHERE member_did=$1) \
         OR EXISTS(SELECT 1 FROM circle_records WHERE author_did=$1) \
         OR EXISTS(SELECT 1 FROM circle_repo_sync_state WHERE author_did=$1)",
     )
