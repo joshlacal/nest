@@ -1830,6 +1830,13 @@ async fn relisted_member_loses_former_row_and_frees_the_cap(pool: PgPool) {
 
     // The re-added Circle now comes through the member branch, so the whole
     // former-member cap goes to the Circles Bob is still removed from.
+    //
+    // The count below catches a kept former-member row only because
+    // `3k2readded` sorts before every `3k2removed*`: never-checked rows are
+    // picked in `space_uri` order, so a kept row would take a cap slot and
+    // leave one removed Circle unrefreshed. Sorted last, it would fall outside
+    // the cap and the count would pass anyway. The `former_member_row_count`
+    // assertion above is the check that does not depend on that order.
     age_member_caches(&pool).await;
     assert_eq!(
         listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
