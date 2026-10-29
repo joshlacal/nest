@@ -1041,7 +1041,9 @@ pub async fn activate_circle(
     parsed_meta.sort_by_key(|(_, _, created_at)| *created_at);
     let (circle_id, display_name, created_at) = parsed_meta.pop().unwrap();
 
-    // 5. INSERT the circles parent row.
+    // 5. INSERT the circles parent row. Reviving a tombstone (revoked or
+    // deleted, whose created_at was scrubbed) takes the metadata record's
+    // createdAt, as for a new Circle; an active row keeps its created_at.
     sqlx::query(
         r#"
         INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at, app_access_granted, app_access_revoked_at, access_epoch)
@@ -1050,6 +1052,7 @@ pub async fn activate_circle(
         SET circle_id = EXCLUDED.circle_id,
             authority_did = EXCLUDED.authority_did,
             display_name = EXCLUDED.display_name,
+            created_at = CASE WHEN circles.deleted_at IS NULL THEN circles.created_at ELSE EXCLUDED.created_at END,
             deleted_at = NULL,
             app_access_granted = true,
             app_access_revoked_at = NULL,

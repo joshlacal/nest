@@ -2490,16 +2490,23 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
             .unwrap();
     assert!(!revoked_access);
     assert!(deleted_at.is_some());
-    let (name, circle_id): (String, String) =
-        sqlx::query_as("SELECT display_name, circle_id FROM circles WHERE space_uri = $1")
-            .bind(SPACE_1)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (name, circle_id, revoked_created_at): (String, String, chrono::DateTime<Utc>) =
+        sqlx::query_as(
+            "SELECT display_name, circle_id, created_at FROM circles WHERE space_uri = $1",
+        )
+        .bind(SPACE_1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         (name.as_str(), circle_id.as_str()),
         ("Circle", ""),
         "revocation must not retain the private Circle name or id"
+    );
+    assert_eq!(
+        Some(revoked_created_at),
+        deleted_at,
+        "revocation must not retain the private Circle creation time"
     );
 
     // 3. refresh_member_cache must fail-closed and NOT resurrect app_access_granted
@@ -2564,6 +2571,59 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
     assert!(
         restored_deleted.is_none(),
         "Re-activation must clear deleted_at"
+    );
+    let regranted_created_at = "2026-08-24T12:00:00Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+    let (restored_created_at,): (chrono::DateTime<Utc>,) =
+        sqlx::query_as("SELECT created_at FROM circles WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        restored_created_at, regranted_created_at,
+        "Re-activation must restore created_at (the listCircles sort key) from the metadata record"
+    );
+
+    // 5. Activating the already active Circle again keeps its created_at, so it
+    // does not move in listCircles even if the metadata record says otherwise.
+    let meta_val = json!({
+        "$type": "blue.catbird.circle.metadata",
+        "circleId": "3l7aaaaaaaabb",
+        "name": "Lifecycle Space Re-activated",
+        "createdAt": "2026-09-01T00:00:00Z"
+    });
+    let meta_cid = circle_appview::commit::compute_dagcbor_cid(&meta_val).unwrap();
+    let rec_meta = circle_appview::commit::RepoRecord {
+        collection: "blue.catbird.circle.metadata".into(),
+        rkey: "self".into(),
+        cid: meta_cid,
+        value: meta_val,
+    };
+    let mut lthash = circle_appview::commit::LtHash::default();
+    lthash.add(&circle_appview::commit::format_lthash_element(
+        &rec_meta.collection,
+        &rec_meta.rkey,
+        &rec_meta.cid,
+    ));
+    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaab", &lthash.state());
+    let car_bytes = fixture_star(&commit, &[rec_meta]).unwrap();
+    setup
+        .mock_transport
+        .set_get_repo_response(&format!("{SPACE_1}:{ALICE_DID}"), car_bytes);
+    activate_circle(&setup.state, ALICE_DID, SPACE_1)
+        .await
+        .unwrap();
+    let (active_created_at,): (chrono::DateTime<Utc>,) =
+        sqlx::query_as("SELECT created_at FROM circles WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        active_created_at, regranted_created_at,
+        "Activating an active Circle must keep its created_at"
     );
 }
 
