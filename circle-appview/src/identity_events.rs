@@ -297,6 +297,8 @@ async fn refresh(
     if already_gated && confirmed.status.as_deref() == Some("deleted") {
         // Reads are already denied, so purge before the terminal write. If the
         // purge fails, the row stays unconfirmed and a re-check resumes it.
+        // apply_confirmed_status purges again once 'deleted' is accepted;
+        // purge_account is idempotent, so that pass only re-checks done work.
         purge_account(state, did).await?;
     }
     apply_confirmed_status(state, did, relay, seq, confirmed).await?;
