@@ -1,0 +1,14 @@
+{
+  "client_id": "https://catbird.blue/oauth-client-metadata.json",
+  "client_name": "Catbird",
+  "client_uri": "https://catbird.blue",
+  "application_type": "web",
+  "redirect_uris": ["https://catbird.blue/oauth/callback/atproto"],
+  "response_types": ["code"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "scope": "atproto transition:generic transition:chat.bsky space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update",
+  "token_endpoint_auth_method": "private_key_jwt",
+  "token_endpoint_auth_signing_alg": "ES256",
+  "jwks_uri": "https://catbird.blue/.well-known/jwks.json",
+  "dpop_bound_access_tokens": true
+}
