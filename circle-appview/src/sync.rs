@@ -213,7 +213,7 @@ impl SyncEngine {
 
         if !circle_active.is_some_and(|(granted,)| granted) {
             return Err(AppError::Forbidden(
-                "Space is deleted or appAccess revoked".into(),
+                "Space is deleted or allowedApps revoked".into(),
             ));
         }
 
@@ -247,7 +247,7 @@ impl SyncEngine {
                     None
                 } else {
                     return Err(AppError::Forbidden(
-                        "Author is not an active member with appAccess for this Space".into(),
+                        "Author is not an active member of this Space under its allowedApps".into(),
                     ));
                 }
             }
@@ -1979,7 +1979,7 @@ pub async fn notify_write_handler(
 
     if !is_member && input.repo.as_str() != authority {
         return Err(AppError::Forbidden(
-            "Repo author is not an active member with appAccess for this Space".into(),
+            "Repo author is not an active member of this Space under its allowedApps".into(),
         ));
     }
 
@@ -1992,7 +1992,7 @@ pub async fn notify_write_handler(
     .map_err(AppError::Database)?;
     if circle_active != Some(true) {
         return Err(AppError::Forbidden(
-            "Space is deleted or appAccess revoked".into(),
+            "Space is deleted or allowedApps revoked".into(),
         ));
     }
 

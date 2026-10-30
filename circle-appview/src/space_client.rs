@@ -42,85 +42,30 @@ pub enum SpaceAppAccess {
 }
 
 impl SpaceAppAccess {
-    pub fn parse(val: &serde_json::Value) -> Self {
-        if let Some(arr) = val.as_array() {
-            if arr.is_empty() {
-                return SpaceAppAccess::Unknown(None);
-            }
-            let mut list = Vec::new();
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    list.push(s.to_string());
-                }
-            }
-            if list.is_empty() {
-                return SpaceAppAccess::Unknown(None);
-            }
-            return SpaceAppAccess::AllowList(list);
+    /// Maps a memberspace policy's `allowedApps` (October 29 Spaces alpha).
+    /// Absent means any app may read (`Open`). An array is an allow-list, and an
+    /// empty array is an authoritative revocation. Anything else, including an
+    /// array with no readable entries, degrades to `Unknown`, which denies
+    /// without purging.
+    pub fn from_allowed_apps(val: Option<&serde_json::Value>) -> Self {
+        let Some(val) = val else {
+            return SpaceAppAccess::Open;
+        };
+        let Some(arr) = val.as_array() else {
+            return SpaceAppAccess::Unknown(Some("allowedApps".to_string()));
+        };
+        if arr.is_empty() {
+            return SpaceAppAccess::AllowList(Vec::new());
         }
-        if let Some(s) = val.as_str() {
-            if s == "com.atproto.simplespace.defs#open" || s == "#open" || s == "open" {
-                return SpaceAppAccess::Open;
-            }
-            return SpaceAppAccess::Unknown(Some(s.to_string()));
+        let list: Vec<String> = arr
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        if list.is_empty() {
+            return SpaceAppAccess::Unknown(Some("allowedApps".to_string()));
         }
-        if let Some(obj) = val.as_object() {
-            let type_str = obj.get("$type").and_then(|v| v.as_str());
-            if let Some(t) = type_str {
-                if t == "com.atproto.simplespace.defs#open" || t.ends_with("#open") || t == "open" {
-                    return SpaceAppAccess::Open;
-                }
-                if t == "com.atproto.simplespace.defs#allowList"
-                    || t.ends_with("#allowList")
-                    || t == "allowList"
-                {
-                    let allowed = obj
-                        .get("allowed")
-                        .or_else(|| obj.get("allowList"))
-                        .and_then(|v| v.as_array());
-                    if let Some(arr) = allowed {
-                        if arr.is_empty() {
-                            return SpaceAppAccess::AllowList(Vec::new());
-                        }
-                        let mut list = Vec::new();
-                        for item in arr {
-                            if let Some(s) = item.as_str() {
-                                list.push(s.to_string());
-                            }
-                        }
-                        if list.is_empty() {
-                            return SpaceAppAccess::Unknown(Some(t.to_string()));
-                        }
-                        return SpaceAppAccess::AllowList(list);
-                    } else {
-                        return SpaceAppAccess::Unknown(Some(t.to_string()));
-                    }
-                }
-                return SpaceAppAccess::Unknown(Some(t.to_string()));
-            } else {
-                let allowed = obj
-                    .get("allowed")
-                    .or_else(|| obj.get("allowList"))
-                    .and_then(|v| v.as_array());
-                if let Some(arr) = allowed {
-                    if arr.is_empty() {
-                        return SpaceAppAccess::Unknown(None);
-                    }
-                    let mut list = Vec::new();
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            list.push(s.to_string());
-                        }
-                    }
-                    if list.is_empty() {
-                        return SpaceAppAccess::Unknown(None);
-                    }
-                    return SpaceAppAccess::AllowList(list);
-                }
-                return SpaceAppAccess::Unknown(None);
-            }
-        }
-        SpaceAppAccess::Unknown(None)
+        SpaceAppAccess::AllowList(list)
     }
 
     pub fn grants_access(&self, client_id: &str) -> bool {
@@ -147,13 +92,52 @@ pub enum SpacePolicy {
     Unknown(Option<String>),
 }
 
+pub const MEMBERSPACE_POLICY_TYPE: &str = "com.atproto.memberspace.policy";
+pub const MANAGEDSPACE_POLICY_TYPE: &str = "com.atproto.managedspace.policy";
+
+/// Circle-relevant view of a space `policy` union from `com.atproto.space.getSpace`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSpacePolicy {
+    pub app_access: SpaceAppAccess,
+    pub read_policy: SpacePolicy,
+    pub write_policy: SpacePolicy,
+}
+
 impl SpacePolicy {
-    pub fn parse(val: &serde_json::Value) -> Self {
-        match val.get("$type").and_then(serde_json::Value::as_str) {
-            Some("com.atproto.simplespace.defs#publicPolicy") => Self::Public,
-            Some("com.atproto.simplespace.defs#memberListPolicy") => Self::MemberList,
-            Some("com.atproto.simplespace.defs#managingAppPolicy") => Self::ManagingApp,
-            other => Self::Unknown(other.map(str::to_owned)),
+    fn from_public_flag(val: Option<&serde_json::Value>, field: &str) -> Self {
+        match val {
+            None | Some(serde_json::Value::Bool(false)) => Self::MemberList,
+            Some(serde_json::Value::Bool(true)) => Self::Public,
+            Some(_) => Self::Unknown(Some(format!("{MEMBERSPACE_POLICY_TYPE}#{field}"))),
+        }
+    }
+
+    /// Maps the October 29 policy union onto the read/write/app-access model the
+    /// Circle AppView already enforces. Only a memberspace without public read or
+    /// write is supported; managedspace, personalspace and unknown `$type`s are
+    /// refused without purging, as unsupported Oct 22 policies were.
+    pub fn parse_policy(policy: &serde_json::Value) -> ParsedSpacePolicy {
+        let type_str = policy.get("$type").and_then(serde_json::Value::as_str);
+        match type_str {
+            Some(MEMBERSPACE_POLICY_TYPE) => ParsedSpacePolicy {
+                app_access: SpaceAppAccess::from_allowed_apps(policy.get("allowedApps")),
+                read_policy: Self::from_public_flag(policy.get("publicRead"), "publicRead"),
+                write_policy: Self::from_public_flag(policy.get("publicWrite"), "publicWrite"),
+            },
+            // managedspace has no app allow-list; the policy itself is refused.
+            Some(MANAGEDSPACE_POLICY_TYPE) => ParsedSpacePolicy {
+                app_access: SpaceAppAccess::Open,
+                read_policy: Self::ManagingApp,
+                write_policy: Self::ManagingApp,
+            },
+            other => {
+                let other = other.map(str::to_owned);
+                ParsedSpacePolicy {
+                    app_access: SpaceAppAccess::Unknown(other.clone()),
+                    read_policy: Self::Unknown(other.clone()),
+                    write_policy: Self::Unknown(other),
+                }
+            }
         }
     }
 
@@ -1701,7 +1685,7 @@ impl SpaceClient {
             .await
     }
 
-    /// Fetch member DIDs and their read/write flags via `com.atproto.simplespace.listMembers` from the owner's PDS using AppView's OAuth session.
+    /// Fetch member DIDs and their read/write flags via `com.atproto.memberspace.listMembers` from the owner's PDS using AppView's OAuth session.
     /// Enforces bounds on pages, total members, bytes, cursor length, duration, concurrency, and repeated cursor detection.
     /// Stages all results and only returns when completely fetched without truncation (fails closed).
     pub async fn list_members(&self, space: &str) -> Result<Vec<SpaceMember>, AppError> {
@@ -1769,7 +1753,7 @@ impl SpaceClient {
             }
 
             let req_url = xrpc_query::list_members(
-                &construct_xrpc_url(&pds_endpoint, "com.atproto.simplespace.listMembers")?,
+                &construct_xrpc_url(&pds_endpoint, "com.atproto.memberspace.listMembers")?,
                 space,
                 cursor.as_deref(),
             )?;
@@ -1847,7 +1831,7 @@ impl SpaceClient {
         Ok(staged_members)
     }
 
-    /// Fetch member DIDs authorized for read via `com.atproto.simplespace.listMembers`.
+    /// Fetch member DIDs authorized for read via `com.atproto.memberspace.listMembers`.
     /// Filters out members with `read = false` to prevent unauthorized read access.
     pub async fn member_dids(&self, space: &str) -> Result<Vec<String>, AppError> {
         let members = self.list_members(space).await?;
@@ -1858,7 +1842,7 @@ impl SpaceClient {
             .collect())
     }
 
-    /// Fetch space config via `com.atproto.simplespace.getSpace` from the owner's PDS using AppView's OAuth session.
+    /// Fetch the space policy via `com.atproto.space.getSpace` from the owner's PDS using AppView's OAuth session.
     pub async fn get_space(&self, space: &str) -> Result<SpaceConfig, AppError> {
         if let Some(fut) = self.transport.get_space(space) {
             return fut.await;
@@ -1886,7 +1870,7 @@ impl SpaceClient {
             .await?;
 
         let req_url = xrpc_query::get_space(
-            &construct_xrpc_url(&pds_endpoint, "com.atproto.simplespace.getSpace")?,
+            &construct_xrpc_url(&pds_endpoint, "com.atproto.space.getSpace")?,
             space,
         )?;
         let client = self.transport.build_pinned_client(&req_url).await?;
@@ -1905,26 +1889,12 @@ impl SpaceClient {
             return Err(parse_xrpc_error(status, &body));
         }
 
+        // October 29: getSpace returns `{ uri, policy }`; the policy union carries
+        // the whole access configuration.
         #[derive(Deserialize)]
-        struct RawSpaceConfig {
+        struct RawSpaceView {
             #[serde(default)]
-            authority: Option<String>,
-            #[serde(default, rename = "spaceType")]
-            space_type: Option<String>,
-            #[serde(default)]
-            skey: Option<String>,
-            #[serde(default, rename = "appAccess")]
-            app_access: Option<serde_json::Value>,
-            #[serde(default, rename = "readPolicy")]
-            read_policy: Option<serde_json::Value>,
-            #[serde(default, rename = "writePolicy")]
-            write_policy: Option<serde_json::Value>,
-            #[serde(default, rename = "userPolicy")]
-            user_policy: Option<serde_json::Value>,
-            #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
-            description: Option<String>,
+            policy: Option<serde_json::Value>,
         }
 
         let body_bytes = crate::auth::read_bounded_authenticated_response_bytes(
@@ -1932,39 +1902,30 @@ impl SpaceClient {
             crate::oauth::MAX_OAUTH_RESPONSE_BYTES,
         )
         .await?;
-        let raw: RawSpaceConfig = serde_json::from_slice(&body_bytes)
+        let raw: RawSpaceView = serde_json::from_slice(&body_bytes)
             .map_err(|e| AppError::Internal(format!("Failed to parse getSpace output: {e}")))?;
 
-        let app_access = raw
-            .app_access
-            .as_ref()
-            .map(SpaceAppAccess::parse)
-            .unwrap_or(SpaceAppAccess::Unknown(None));
+        let parsed = match raw.policy.as_ref() {
+            Some(policy) => SpacePolicy::parse_policy(policy),
+            None => ParsedSpacePolicy {
+                app_access: SpaceAppAccess::Unknown(None),
+                read_policy: SpacePolicy::Unknown(None),
+                write_policy: SpacePolicy::Unknown(None),
+            },
+        };
 
-        let read_policy = raw
-            .read_policy
-            .as_ref()
-            .map(SpacePolicy::parse)
-            .unwrap_or(SpacePolicy::Unknown(None));
-
-        let write_policy = raw
-            .write_policy
-            .as_ref()
-            .map(SpacePolicy::parse)
-            .unwrap_or(SpacePolicy::Unknown(None));
-
-        let (auth, st, sk) = parse_space_uri_parts(space)?;
+        let (authority, space_type, skey) = parse_space_uri_parts(space)?;
 
         Ok(SpaceConfig {
-            authority: raw.authority.unwrap_or(auth),
-            space_type: raw.space_type.unwrap_or(st),
-            skey: raw.skey.unwrap_or(sk),
-            app_access,
-            read_policy,
-            write_policy,
-            user_policy: raw.user_policy.map(|v| v.to_string()),
-            name: raw.name,
-            description: raw.description,
+            authority,
+            space_type,
+            skey,
+            app_access: parsed.app_access,
+            read_policy: parsed.read_policy,
+            write_policy: parsed.write_policy,
+            user_policy: None,
+            name: None,
+            description: None,
         })
     }
 
@@ -2297,13 +2258,13 @@ fn parse_space_uri_parts(space: &str) -> Result<(String, String, String), AppErr
     ))
 }
 
-/// Query URLs for the space-host and simplespace reads, built from the
+/// Query URLs for the space-host, getSpace and memberspace reads, built from the
 /// lexicon-generated `catbird_atproto` params structs so the wire keys come from
 /// the lexicon rather than hand-typed strings. A hand-typed `did` in place of
 /// getBlob's `repo` once made every Circle image request fail upstream.
 pub mod xrpc_query {
     use super::AppError;
-    use catbird_atproto::generated::com_atproto::{simplespace, space};
+    use catbird_atproto::generated::com_atproto::{memberspace, space};
     use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
     use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
     use catbird_atproto::jacquard_common::types::string::{Cid, Did, Tid};
@@ -2441,7 +2402,7 @@ pub mod xrpc_query {
     pub fn get_space(target_url: &url::Url, space_uri: &str) -> Result<url::Url, AppError> {
         with_params(
             target_url,
-            &simplespace::get_space::GetSpace::<SmolStr> {
+            &space::get_space::GetSpace::<SmolStr> {
                 space: space_ref(space_uri)?,
             },
         )
@@ -2454,7 +2415,7 @@ pub mod xrpc_query {
     ) -> Result<url::Url, AppError> {
         with_params(
             target_url,
-            &simplespace::list_members::ListMembers::<SmolStr> {
+            &memberspace::list_members::ListMembers::<SmolStr> {
                 cursor: cursor.map(SmolStr::new),
                 limit: None,
                 space: space_ref(space_uri)?,
@@ -3008,7 +2969,7 @@ mod tests {
         expected.iter().map(|k| k.to_string()).collect()
     }
 
-    /// Every space-host and simplespace read must carry exactly the lexicon's
+    /// Every space-host, getSpace and memberspace read must carry exactly the lexicon's
     /// parameter names. getBlob once sent `did` where the lexicon requires `repo`.
     #[test]
     fn xrpc_query_keys_match_the_lexicon_params() {

@@ -58,19 +58,20 @@ use catbird_atproto::generated::blue_catbird::circle::list_notifications::{
     ListNotificationsOutput as CircleListNotificationsOutput,
 };
 use catbird_atproto::generated::blue_catbird::circle::NotificationReason as CircleNotificationReason;
+use catbird_atproto::generated::com_atproto::memberspace::policy::Policy as MemberspacePolicy;
+use catbird_atproto::generated::com_atproto::memberspace::put_member::PutMember;
+use catbird_atproto::generated::com_atproto::memberspace::remove_member::RemoveMember;
 use catbird_atproto::generated::com_atproto::repo::create_record::{
     CreateRecord, CreateRecordOutput,
 };
 use catbird_atproto::generated::com_atproto::repo::strong_ref::StrongRef;
 use catbird_atproto::generated::com_atproto::repo::upload_blob::UploadBlobOutput;
 use catbird_atproto::generated::com_atproto::server::describe_server::DescribeServerOutput;
-use catbird_atproto::generated::com_atproto::simplespace::create_space::{
-    CreateSpace, CreateSpaceAppAccess, CreateSpaceReadPolicy, CreateSpaceWritePolicy,
-};
-use catbird_atproto::generated::com_atproto::simplespace::put_member::PutMember;
-use catbird_atproto::generated::com_atproto::simplespace::remove_member::RemoveMember;
 use catbird_atproto::generated::com_atproto::space::apply_writes::{
     ApplyWrites, ApplyWritesOutput, ApplyWritesOutputResultsItem, ApplyWritesWritesItem, Create,
+};
+use catbird_atproto::generated::com_atproto::space::create_space::{
+    CreateSpace, CreateSpacePolicy,
 };
 use catbird_atproto::generated::com_atproto::space::get_latest_commit::{
     GetLatestCommit, GetLatestCommitOutput,
@@ -734,9 +735,9 @@ impl ScenarioRunner {
                 ));
             }
             let rev = cap_out.protocol_revision.as_str();
-            if rev != "ac0c9f15392f6f0298d71dc52aa88c05036150be" {
+            if rev != "5d88b414a98de1ada22c94c78fa0667a7028163c" {
                 return Err(format!(
-                    "Space protocol revision mismatch for {}: expected 'ac0c9f15392f6f0298d71dc52aa88c05036150be', got '{rev}'",
+                    "Space protocol revision mismatch for {}: expected '5d88b414a98de1ada22c94c78fa0667a7028163c', got '{rev}'",
                     user.name
                 ));
             }
@@ -1543,32 +1544,25 @@ impl ScenarioRunner {
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_03_CREATE_CIRCLE_START");
         let create_space_url = format!(
-            "{}/xrpc/com.atproto.simplespace.createSpace",
+            "{}/xrpc/com.atproto.space.createSpace",
             self.config.nest_url.trim_end_matches('/')
         );
         let skey = "3l7e2eskey123456";
         let circle_id = "3l7e2ecircle1234";
+        // A member-list Circle readable only through this AppView's client_id.
         let create_space_input: CreateSpace<String> = CreateSpace {
-            app_access: CreateSpaceAppAccess::AllowList(Box::new(
-                catbird_atproto::generated::com_atproto::simplespace::AllowList {
-                    allowed: vec![self.config.circle_appview_client_id.clone()],
-                    extra_data: None,
-                },
-            )),
+            policy: CreateSpacePolicy::MemberspacePolicy(Box::new(MemberspacePolicy {
+                allowed_apps: Some(vec![self.config.circle_appview_client_id.clone()]),
+                public_read: Some(false),
+                public_write: Some(false),
+                publish_members: None,
+                publish_policy: None,
+                extra_data: None,
+            })),
             skey: Some(
                 catbird_atproto::jacquard_common::types::string::RecordKey::any_static(skey)
                     .unwrap(),
             ),
-            read_policy: CreateSpaceReadPolicy::MemberListPolicy(Box::new(
-                catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
-                    extra_data: None,
-                },
-            )),
-            write_policy: CreateSpaceWritePolicy::MemberListPolicy(Box::new(
-                catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
-                    extra_data: None,
-                },
-            )),
             space_type: Nsid::new("blue.catbird.circle".into())
                 .map_err(|e| format!("Invalid NSID: {e}"))?,
             extra_data: None,
@@ -1610,9 +1604,9 @@ impl ScenarioRunner {
         )
         .await?;
 
-        // Alice adds Bob and Carol via simplespace.putMember
+        // Alice adds Bob and Carol via memberspace.putMember
         let put_member_url = format!(
-            "{}/xrpc/com.atproto.simplespace.putMember",
+            "{}/xrpc/com.atproto.memberspace.putMember",
             self.config.nest_url.trim_end_matches('/')
         );
         for user in [&self.config.bob, &self.config.carol] {
@@ -2599,7 +2593,7 @@ impl ScenarioRunner {
         let pre_bob_remove_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
 
         let remove_member_url = format!(
-            "{}/xrpc/com.atproto.simplespace.removeMember",
+            "{}/xrpc/com.atproto.memberspace.removeMember",
             self.config.nest_url.trim_end_matches('/')
         );
         let remove_bob_input = RemoveMember {

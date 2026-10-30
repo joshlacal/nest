@@ -13,7 +13,7 @@
 //!   the repo owner's DID for repo reads and the space authority's bare DID for
 //!   space-host operations.
 //!
-//! Mirrors `packages/space/src/http-signature.ts` at atproto ac0c9f15392f6f0298d71dc52aa88c05036150be.
+//! Mirrors `packages/space/src/http-signature.ts` at atproto 5d88b414a98de1ada22c94c78fa0667a7028163c.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;

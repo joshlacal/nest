@@ -77,7 +77,7 @@ pub async fn remove_member(pool: &PgPool, space: &str, member: &str) -> Result<(
     Ok(())
 }
 
-/// appAccess removal lifecycle:
+/// allowedApps removal lifecycle:
 /// 1. Persists grant state in its own transaction first: disables private serving immediately
 ///    (app_access_granted = false, app_access_revoked_at = now(), deleted_at = now()) and advances access_epoch.
 ///    The private name, id and creation time copied from the metadata record are blanked;

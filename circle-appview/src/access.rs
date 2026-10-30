@@ -556,7 +556,7 @@ pub async fn verify_member_access(
     space_uri: &str,
     user_did: &str,
 ) -> Result<MemberAccessOutcome, AppError> {
-    // 1. Check if the circle exists, is not deleted, and appAccess is granted
+    // 1. Check if the circle exists, is not deleted, and allowedApps is granted
     let space_row: Option<(Option<DateTime<Utc>>, bool, i64, String)> = sqlx::query_as(
         "SELECT deleted_at, app_access_granted, access_epoch, authority_did FROM circles WHERE space_uri = $1",
     )
@@ -572,12 +572,12 @@ pub async fn verify_member_access(
         }
     };
 
-    // A tombstoned Circle (space deleted or appAccess revoked) answers with the
+    // A tombstoned Circle (space deleted or allowedApps revoked) answers with the
     // declared AccessRemoved, which tells devices to purge their caches. NotFound
     // or Forbidden surface on the client as a network error and nothing is purged.
     if circle_deleted || !circle_app_access {
         return Err(AppError::AccessRemoved(
-            "Circle deleted or appAccess revoked".into(),
+            "Circle deleted or allowedApps revoked".into(),
         ));
     }
 
@@ -731,18 +731,18 @@ pub async fn revalidate_stale_member_spaces(
     Ok(())
 }
 
-/// Refreshes the member list cache by calling com.atproto.simplespace.listMembers on the owner's PDS.
+/// Refreshes the member list cache by calling com.atproto.memberspace.listMembers on the owner's PDS.
 pub async fn refresh_member_cache(
     state: &AppState,
     space_uri: &str,
 ) -> Result<Vec<String>, AppError> {
-    // 1. Verify appAccess with get_space on the owner's PDS before updating any cache
+    // 1. Verify allowedApps with get_space on the owner's PDS before updating any cache
     let space_config = match state.space_client.get_space(space_uri).await {
         Ok(cfg) => cfg,
         Err(e) => {
             tracing::warn!(error = %e, "get_space failed during refresh_member_cache, denying non-destructively");
             return Err(AppError::Forbidden(format!(
-                "Unable to verify appAccess: {e}"
+                "Unable to verify allowedApps: {e}"
             )));
         }
     };
@@ -751,7 +751,7 @@ pub async fn refresh_member_cache(
         .app_access
         .is_explicit_revocation(expected_client_id)
     {
-        tracing::warn!(space_uri = %space_uri, "Space appAccess explicitly omits client_id, revoking");
+        tracing::warn!(space_uri = %space_uri, "Space allowedApps explicitly omits client_id, revoking");
         // Unregister while the space credential is still cached; revocation drops it.
         crate::notify::unregister(state, space_uri).await;
         let mut revoke_res =
@@ -780,27 +780,28 @@ pub async fn refresh_member_cache(
             .execute(&state.db)
             .await;
         }
-        return Err(AppError::Forbidden("Space appAccess revoked".into()));
+        return Err(AppError::Forbidden("Space allowedApps revoked".into()));
     } else if !space_config.app_access.grants_access(expected_client_id) {
-        tracing::warn!(space_uri = %space_uri, "Space appAccess policy does not grant access, denying without purge");
+        tracing::warn!(space_uri = %space_uri, "Space allowedApps policy does not grant access, denying without purge");
         return Err(AppError::Forbidden(
-            "Space appAccess policy denies access".into(),
+            "Space allowedApps policy denies access".into(),
         ));
     }
 
-    // Fail closed if read_policy or write_policy is unrecognized or unsupported
+    // Fail closed if the policy is unrecognized or unsupported (only a
+    // non-public memberspace is)
     if !space_config.read_policy.is_supported() || !space_config.write_policy.is_supported() {
         tracing::warn!(
             space_uri = %space_uri,
             read_policy = ?space_config.read_policy,
             write_policy = ?space_config.write_policy,
-            "Space readPolicy or writePolicy is unrecognized or unsupported, failing closed"
+            "Space policy is unrecognized or unsupported, failing closed"
         );
         return Err(AppError::Forbidden(
             "Space policy is unrecognized or unsupported".into(),
         ));
     }
-    // Check if the circle is deleted or appAccess is not granted in the circles table
+    // Check if the circle is deleted or allowedApps is not granted in the circles table
     let circle_row: Option<(bool, Option<DateTime<Utc>>, i64)> = sqlx::query_as(
         "SELECT app_access_granted, deleted_at, access_epoch FROM circles WHERE space_uri = $1",
     )
@@ -816,7 +817,7 @@ pub async fn refresh_member_cache(
 
     if !app_access_granted || is_deleted {
         return Err(AppError::Forbidden(
-            "Circle is inactive or appAccess revoked".into(),
+            "Circle is inactive or allowedApps revoked".into(),
         ));
     }
 
@@ -970,6 +971,21 @@ pub fn space_fingerprint(space_uri: &str) -> String {
     format!("space_{hex_part}")
 }
 
+/// Activation has already confirmed through the owner's getSpace that the Space
+/// exists. Since the October 29 Spaces alpha, an authority refuses a user its
+/// policy does not authorize with `SpaceNotFound` rather than `UserNotAuthorized`,
+/// and checks `allowedApps` only after the user, so a `SpaceNotFound` from the
+/// credential exchange here is a refusal. It keeps the `Forbidden` answer that
+/// `UserNotAuthorized` and `AppNotAuthorized` produce.
+fn activation_credential_error(e: AppError) -> AppError {
+    match e {
+        AppError::NotFound(code) if code == "SpaceNotFound" => AppError::Forbidden(
+            "Space credential refused (SpaceNotFound): the Space policy does not authorize this caller or app".into(),
+        ),
+        other => other,
+    }
+}
+
 /// Activates a Circle by verifying Space on PDS and returning defs#circleSummary.
 pub async fn activate_circle(
     state: &AppState,
@@ -999,21 +1015,21 @@ pub async fn activate_circle(
         e
     })?;
 
-    // Verify appAccess names this AppView's client_id
+    // Verify allowedApps names this AppView's client_id
     let expected_client_id = &state.oauth_service.client_id;
     if !space_config.app_access.grants_access(expected_client_id) {
         return Err(AppError::Forbidden(
-            "Space appAccess does not authorize this Circle AppView client_id".into(),
+            "Space allowedApps does not authorize this Circle AppView client_id".into(),
         ));
     }
 
-    // Verify policies are supported (fail closed on malformed/unrecognized policy)
+    // Verify the policy is supported (fail closed on malformed/unrecognized policy)
     if !space_config.read_policy.is_supported() || !space_config.write_policy.is_supported() {
         tracing::warn!(
             space_uri = %space_uri,
             read_policy = ?space_config.read_policy,
             write_policy = ?space_config.write_policy,
-            "Space readPolicy or writePolicy is unrecognized or unsupported during activation, failing closed"
+            "Space policy is unrecognized or unsupported during activation, failing closed"
         );
         return Err(AppError::Forbidden(
             "Space policy is unrecognized or unsupported".into(),
@@ -1043,7 +1059,7 @@ pub async fn activate_circle(
     // 3. Acquire a Space credential under the calling user's OAuth session first.
     let cred = ensure_space_credential(state, space_uri, Some(user_did)).await.map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "Failed to acquire space credential during activation");
-        e
+        activation_credential_error(e)
     })?;
 
     // 4. Fetch and parse the authority's repo IN MEMORY to discover and validate
@@ -2347,22 +2363,17 @@ mod tests {
                         return;
                     };
                     let req_str = String::from_utf8_lossy(&buf[..n]);
-                    if req_str.starts_with("GET /xrpc/com.atproto.simplespace.getSpace") {
+                    if req_str.starts_with("GET /xrpc/com.atproto.space.getSpace") {
                         let body = serde_json::json!({
-                            "authority": TEST_AUTHORITY_DID,
-                            "spaceType": "blue.catbird.circle",
-                            "skey": "3k2space1",
-                            "appAccess": {
-                                "$type": "com.atproto.space.defs#allowList",
-                                "allowed": ["https://circles.catbird.blue/oauth/client-metadata.json"]
-                            },
-                            "readPolicy": {
-                                "$type": "com.atproto.simplespace.defs#memberListPolicy"
-                            },
-                            "writePolicy": {
-                                "$type": "com.atproto.simplespace.defs#memberListPolicy"
-                            },
-                            "name": "Test Circle Space"
+                            "uri": TEST_SPACE_URI,
+                            "policy": {
+                                "$type": "com.atproto.memberspace.policy",
+                                "publicRead": false,
+                                "publicWrite": false,
+                                "allowedApps": ["https://circles.catbird.blue/oauth/client-metadata.json"],
+                                "publishPolicy": false,
+                                "publishMembers": false
+                            }
                         }).to_string();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2370,7 +2381,7 @@ mod tests {
                             body
                         );
                         let _ = tls_stream.write_all(response.as_bytes()).await;
-                    } else if req_str.starts_with("GET /xrpc/com.atproto.simplespace.listMembers") {
+                    } else if req_str.starts_with("GET /xrpc/com.atproto.memberspace.listMembers") {
                         let body = serde_json::json!({
                             "members": [
                                 { "did": TEST_USER_DID, "read": true, "write": true },
@@ -2825,5 +2836,26 @@ mod tests {
                 .unwrap();
 
         assert!(circle_row.is_none(), "NO circles row must exist in DB");
+    }
+
+    #[test]
+    fn activation_maps_credential_space_not_found_to_forbidden() {
+        match activation_credential_error(AppError::NotFound("SpaceNotFound".into())) {
+            AppError::Forbidden(msg) => assert!(msg.contains("SpaceNotFound"), "{msg}"),
+            other => panic!("Expected Forbidden, got {other:?}"),
+        }
+        // Other refusals keep their existing mapping.
+        assert!(matches!(
+            activation_credential_error(AppError::Forbidden("UserNotAuthorized".into())),
+            AppError::Forbidden(msg) if msg == "UserNotAuthorized"
+        ));
+        assert!(matches!(
+            activation_credential_error(AppError::AccessRemoved("SpaceDeleted".into())),
+            AppError::AccessRemoved(_)
+        ));
+        assert!(matches!(
+            activation_credential_error(AppError::NotFound("NotFound".into())),
+            AppError::NotFound(_)
+        ));
     }
 }

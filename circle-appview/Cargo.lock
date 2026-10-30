@@ -378,7 +378,7 @@ dependencies = [
 [[package]]
 name = "catbird-atproto"
 version = "0.1.0"
-source = "git+https://github.com/joshlacal/catbird-atproto.git?rev=d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad#d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad"
+source = "git+https://github.com/joshlacal/catbird-atproto.git?rev=f40e8795ff8690092440971a9b5e5496e3f8430f#f40e8795ff8690092440971a9b5e5496e3f8430f"
 dependencies = [
  "bytes",
  "jacquard-common",

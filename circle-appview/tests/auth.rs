@@ -434,7 +434,7 @@ async fn verifies_public_health_and_capabilities_unauthenticated(pool: PgPool) {
     );
     assert_eq!(
         caps.protocol_revision.as_str(),
-        "ac0c9f15392f6f0298d71dc52aa88c05036150be"
+        "5d88b414a98de1ada22c94c78fa0667a7028163c"
     );
     assert!(!caps.supports_images);
 }
@@ -3076,17 +3076,23 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
 
     let mut endpoints = std::collections::HashMap::new();
     endpoints.insert(
-        "/xrpc/com.atproto.simplespace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
+        "/xrpc/com.atproto.memberspace.listMembers?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
             "members": [{"did": "did:plc:member-1", "read": true, "write": true}, {"did": "did:plc:member-2", "read": true, "write": false}]
         }).to_string()),
     );
     endpoints.insert(
-        "/xrpc/com.atproto.simplespace.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
+        "/xrpc/com.atproto.space.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
-            "authority": "did:plc:space-auth",
-            "spaceType": "com.example.space",
-            "name": "Test Space"
+            "uri": "at://did:plc:space-auth/space/com.example.space/1",
+            "policy": {
+                "$type": "com.atproto.memberspace.policy",
+                "publicRead": false,
+                "publicWrite": false,
+                "allowedApps": ["http://127.0.0.1:3002/oauth/client-metadata.json"],
+                "publishPolicy": false,
+                "publishMembers": false
+            }
         }).to_string()),
     );
     let fixture = TlsOAuthFixture::spawn("pds.example.com", endpoints).await;
@@ -3146,7 +3152,23 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
         .get_space("at://did:plc:space-auth/space/com.example.space/1")
         .await
         .unwrap();
-    assert_eq!(space_config.name.as_deref(), Some("Test Space"));
+    assert_eq!(space_config.authority, "did:plc:space-auth");
+    assert_eq!(space_config.space_type, "com.example.space");
+    assert_eq!(space_config.skey, "1");
+    assert_eq!(
+        space_config.app_access,
+        circle_appview::space_client::SpaceAppAccess::AllowList(vec![
+            "http://127.0.0.1:3002/oauth/client-metadata.json".to_string()
+        ])
+    );
+    assert_eq!(
+        space_config.read_policy,
+        circle_appview::space_client::SpacePolicy::MemberList
+    );
+    assert_eq!(
+        space_config.write_policy,
+        circle_appview::space_client::SpacePolicy::MemberList
+    );
 }
 
 /// The host compatibility gate logs the refused space host's profile; the
