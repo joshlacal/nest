@@ -82,6 +82,7 @@ const LUA_COMMIT_SCRIPT: &str = r#"
 -- 9: new_fp_index_key (hashed)
 -- 10: old_fp_index_key (hashed)
 -- 11: did_index_key
+-- 12: account_erasure_key
 -- ARGV:
 -- 1: candidate_fingerprint (HMAC fingerprint of candidate_session_id)
 -- 2: old_fingerprint (HMAC fingerprint of old_session_id)
@@ -94,6 +95,10 @@ const LUA_COMMIT_SCRIPT: &str = r#"
 -- 9: receipt_ttl
 -- 10: originating_flow_state_fp (HMAC fingerprint of originating state)
 -- 11: expected_old_session_blob (exact sealed session CAS)
+
+if KEYS[12] and redis.call('EXISTS', KEYS[12]) == 1 then
+    return {4, "account_cleanup_pending"}
+end
 
 local existing_receipt = redis.call('GET', KEYS[2])
 if existing_receipt then
@@ -150,6 +155,18 @@ end
 return {0, ARGV[5]}
 "#;
 
+/// An idempotent receipt remains usable only while its exact candidate session
+/// is live. Receipt existence alone is not authorization after logout.
+const LUA_RECEIPT_LIVE_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then
+    return 0
+end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('GET', KEYS[4]) ~= ARGV[2] then return 0 end
+if redis.call('GET', KEYS[5]) ~= ARGV[3] then return 0 end
+return 1
+"#;
+
 /// Lua script for atomic upgrade start:
 /// - Checks if retired tombstone exists (returns 2 for inactive/logged-out old session)
 /// - Checks if live pending upgrade exists (returns 1 if pending upgrade exists, cleans up stale pointer)
@@ -166,7 +183,10 @@ const LUA_START_SCRIPT: &str = r#"
 -- 3: flow_ttl
 -- 4: flow_key_prefix
 
-if redis.call('EXISTS', KEYS[3]) == 1 then
+if redis.call('EXISTS', KEYS[3]) == 1 or (KEYS[4] and redis.call('EXISTS', KEYS[4]) == 1) then
+    return 2
+end
+if KEYS[5] and redis.call('GET', KEYS[5]) ~= ARGV[5] then
     return 2
 end
 
@@ -183,6 +203,19 @@ end
 
 redis.call('SETEX', KEYS[2], tonumber(ARGV[3]), ARGV[2])
 redis.call('SETEX', KEYS[1], tonumber(ARGV[3]), ARGV[1])
+return 0
+"#;
+
+/// A finished provider callback cannot recreate a candidate after logout.
+const LUA_STAGE_CANDIDATE_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+    return 1
+end
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then
+    return 1
+end
+redis.call('SETEX', KEYS[4], tonumber(ARGV[3]), ARGV[2])
+redis.call('SETEX', KEYS[5], tonumber(ARGV[5]), ARGV[4])
 return 0
 "#;
 
@@ -628,10 +661,13 @@ impl OAuthUpgradeService {
             .key(&pending_key)
             .key(&flow_k)
             .key(&retired_k)
+            .key(format!("{}account_erasure:{}", self.key_prefix, old_did))
+            .key(&old_session_k)
             .arg(&state_fp)
             .arg(&encrypted)
             .arg(UPGRADE_FLOW_TTL_SECONDS)
             .arg(&flow_key_prefix)
+            .arg(&flow_state.expected_old_session_blob)
             .invoke_async(&mut conn)
             .await?;
 
@@ -861,9 +897,6 @@ impl OAuthUpgradeService {
         );
         let staged_encrypted = seal_v2_with_metadata(self.enc_key(), &staged_json, &cand_meta)
             .map_err(|e| UpgradeError::Internal(format!("Failed to seal candidate: {e}")))?;
-        // Save staged candidate outside ordinary session/index
-        conn.set_ex::<_, _, ()>(&cand_key, staged_encrypted, UPGRADE_CANDIDATE_TTL_SECONDS)
-            .await?;
         // Save exchange state under composite key
         let exchange_state = UpgradeExchangeState {
             candidate_session_id: candidate_session_id.clone(),
@@ -887,8 +920,27 @@ impl OAuthUpgradeService {
         );
         let exchange_encrypted = seal_v2_with_metadata(self.enc_key(), &exchange_json, &ex_meta)
             .map_err(|e| UpgradeError::Internal(format!("Failed to seal exchange: {e}")))?;
-        conn.set_ex::<_, _, ()>(&ex_key, exchange_encrypted, UPGRADE_EXCHANGE_TTL_SECONDS)
+        // The callback can finish after logout. Stage both secret-bearing keys
+        // atomically only while its original session and account remain live.
+        let staged: i32 = redis::Script::new(LUA_STAGE_CANDIDATE_SCRIPT)
+            .key(self.retired_key(&exchange_state.old_session_id))
+            .key(format!(
+                "{}account_erasure:{}",
+                self.key_prefix, exchange_state.did
+            ))
+            .key(self.session_key(&exchange_state.did, &exchange_state.old_session_id))
+            .key(&cand_key)
+            .key(&ex_key)
+            .arg(&staged_candidate.expected_old_session_blob)
+            .arg(staged_encrypted)
+            .arg(UPGRADE_CANDIDATE_TTL_SECONDS)
+            .arg(exchange_encrypted)
+            .arg(UPGRADE_EXCHANGE_TTL_SECONDS)
+            .invoke_async(&mut conn)
             .await?;
+        if staged != 0 {
+            return Err(UpgradeError::OldSessionInactive);
+        }
         Ok(UpgradeCallbackResult {
             exchange_code,
             candidate_session_id,
@@ -1044,6 +1096,10 @@ impl OAuthUpgradeService {
             .key(&new_fp_index_k)
             .key(&old_fp_index_k)
             .key(&did_index_k)
+            .key(format!(
+                "{}account_erasure:{}",
+                self.key_prefix, candidate.did
+            ))
             .arg(&cand_fp)
             .arg(&old_fp)
             .arg(&candidate.did)
@@ -1059,28 +1115,10 @@ impl OAuthUpgradeService {
             .await?;
 
         match script_res.0 {
-            0 | 1 => {
-                let (json, metadata, _) = open_v2_with_metadata(
-                    self.enc_key(),
-                    &script_res.1,
-                    "upgrade_receipt",
-                    &receipt_k,
-                )
-                .map_err(|e| {
-                    UpgradeError::Internal(format!("Commit receipt decryption failed: {e}"))
-                })?;
-                let final_receipt: UpgradeReceipt = serde_json::from_str(&json)?;
-                if let Some(meta_lineage) = metadata.lineage {
-                    let expected_receipt_lineage_fp =
-                        self.fingerprint(&final_receipt.old_session_id);
-                    if meta_lineage != expected_receipt_lineage_fp {
-                        return Err(UpgradeError::Internal(
-                            "Receipt lineage mismatch with envelope metadata".into(),
-                        ));
-                    }
-                }
-                Ok(final_receipt)
-            }
+            0 | 1 => self
+                .get_receipt(candidate_session_id)
+                .await?
+                .ok_or(UpgradeError::OldSessionInactive),
             2 => Err(UpgradeError::CompetingCandidateWon),
             3 => {
                 if let Some(receipt) = self.get_receipt(candidate_session_id).await? {
@@ -1113,20 +1151,52 @@ impl OAuthUpgradeService {
                         UpgradeError::Internal(format!("Receipt decryption failed: {e}"))
                     })?;
             let receipt: UpgradeReceipt = serde_json::from_str(&json)?;
-            if let Some(meta_did) = metadata.did {
-                if meta_did != receipt.did {
-                    return Err(UpgradeError::Internal(
-                        "Receipt DID mismatch with envelope metadata".into(),
-                    ));
-                }
+            if metadata.did.as_deref() != Some(receipt.did.as_str())
+                || metadata.lineage.as_deref()
+                    != Some(self.fingerprint(&receipt.old_session_id).as_str())
+            {
+                return Err(UpgradeError::OldSessionInactive);
             }
-            if let Some(meta_lineage) = metadata.lineage {
-                let expected_receipt_lineage_fp = self.fingerprint(&receipt.old_session_id);
-                if meta_lineage != expected_receipt_lineage_fp {
-                    return Err(UpgradeError::Internal(
-                        "Receipt lineage mismatch with envelope metadata".into(),
-                    ));
-                }
+            if receipt.candidate_session_id != candidate_session_id || receipt.status != "committed"
+            {
+                return Err(UpgradeError::OldSessionInactive);
+            }
+            let session_key = self.session_key(&receipt.did, candidate_session_id);
+            let session_blob: Option<String> = conn.get(&session_key).await?;
+            let Some(session_blob) = session_blob else {
+                return Err(UpgradeError::OldSessionInactive);
+            };
+            let (session_json, session_metadata, _) =
+                open_v2_with_metadata(self.enc_key(), &session_blob, "session", &session_key)
+                    .map_err(|_| UpgradeError::OldSessionInactive)?;
+            let session: ClientSessionData = serde_json::from_str(&session_json)
+                .map_err(|_| UpgradeError::OldSessionInactive)?;
+            if session.account_did.as_str() != receipt.did
+                || session.session_id.as_str() != candidate_session_id
+                || session_metadata
+                    .did
+                    .as_deref()
+                    .is_some_and(|did| did != receipt.did)
+                || session_metadata.lineage.is_some()
+            {
+                return Err(UpgradeError::OldSessionInactive);
+            }
+            let live: i32 = redis::Script::new(LUA_RECEIPT_LIVE_SCRIPT)
+                .key(&receipt_k)
+                .key(format!(
+                    "{}account_erasure:{}",
+                    self.key_prefix, receipt.did
+                ))
+                .key(self.retired_key(candidate_session_id))
+                .key(&session_key)
+                .key(self.session_index_key(candidate_session_id))
+                .arg(&encrypted)
+                .arg(&session_blob)
+                .arg(&receipt.did)
+                .invoke_async(&mut conn)
+                .await?;
+            if live != 1 {
+                return Err(UpgradeError::OldSessionInactive);
             }
             return Ok(Some(receipt));
         }
@@ -2191,5 +2261,334 @@ mod tests {
             decrypted_meta.lineage.as_deref(),
             Some(computed_lineage_fp.as_str())
         );
+    }
+}
+
+#[cfg(test)]
+mod disposable_fence_tests {
+    use super::*;
+    use jacquard_oauth::session::DpopClientData;
+    use jacquard_oauth::types::{OAuthTokenType, TokenSet};
+    use std::collections::BTreeSet;
+
+    const KEY: [u8; 32] = [0x24; 32];
+    const DID: &str = "did:plc:syntheticupgrade";
+
+    struct Fixture {
+        service: OAuthUpgradeService,
+        keys: BTreeSet<String>,
+    }
+    impl Fixture {
+        async fn new() -> Self {
+            assert_eq!(std::env::var("LITE_PUSH_DISPOSABLE").as_deref(), Ok("1"));
+            let address = std::env::var("TASK7_ACCOUNT_CLEANUP_FIXTURE_REDIS_URL")
+                .expect("explicit task7 disposable Redis URL");
+            let url = url::Url::parse(&address).unwrap();
+            assert_eq!(url.scheme(), "redis");
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+            assert_ne!(url.port().expect("explicit fixture port"), 6379);
+            let connection =
+                redis::aio::ConnectionManager::new(redis::Client::open(address).unwrap())
+                    .await
+                    .unwrap();
+            Self {
+                service: OAuthUpgradeService::new(
+                    connection,
+                    format!("task7:v2:upgrade_fixture_{}:", Uuid::new_v4().simple()),
+                    600,
+                    KEY,
+                    None,
+                ),
+                keys: BTreeSet::new(),
+            }
+        }
+        fn fence(&self) -> String {
+            format!("{}account_erasure:{DID}", self.service.key_prefix)
+        }
+        async fn put(&mut self, key: &str, value: &str) {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .arg("EX")
+                .arg(600)
+                .query_async::<_, ()>(&mut self.service.redis.clone())
+                .await
+                .unwrap();
+            self.keys.insert(key.to_owned());
+        }
+        async fn absent(&self, keys: &[String]) {
+            let count: usize = redis::cmd("EXISTS")
+                .arg(keys)
+                .query_async(&mut self.service.redis.clone())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "a fenced operation wrote state");
+        }
+        async fn finish(self) {
+            let keys: Vec<_> = self.keys.into_iter().collect();
+            if !keys.is_empty() {
+                redis::cmd("DEL")
+                    .arg(keys)
+                    .query_async::<_, usize>(&mut self.service.redis.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        async fn seed_candidate(&mut self, old: &str, candidate: &str) {
+            let old_key = self.service.session_key(DID, old);
+            let old_index = self.service.session_index_key(old);
+            self.put(&old_key, "synthetic-old-session-cas").await;
+            self.put(&old_index, DID).await;
+            let staged = StagedCandidateSession {
+                candidate_session_id: candidate.into(),
+                old_session_id: old.into(),
+                did: DID.into(),
+                flow_state: self.service.fingerprint("synthetic-flow"),
+                granted_scopes: vec!["atproto".into()],
+                session_data_json: serde_json::to_string(&grant(candidate)).unwrap(),
+                created_at: current_timestamp_secs(),
+                expected_old_session_blob: "synthetic-old-session-cas".into(),
+            };
+            let candidate_key = self.service.candidate_key(candidate);
+            let sealed = seal_v2_with_metadata(
+                &KEY,
+                &serde_json::to_string(&staged).unwrap(),
+                &EnvelopeMetadata::new(
+                    "upgrade_candidate",
+                    &candidate_key,
+                    Some(DID),
+                    Some(&self.service.fingerprint(old)),
+                ),
+            )
+            .unwrap();
+            self.put(&candidate_key, &sealed).await;
+            for key in [
+                self.service.receipt_key(candidate),
+                self.service.retired_key(old),
+                self.service.retired_key(candidate),
+                self.service.session_key(DID, candidate),
+                self.service.session_index_key(candidate),
+                self.service.session_fp_index_key(candidate),
+                self.service.session_fp_index_key(old),
+                self.service.did_index_key(DID),
+                self.service.pending_upgrade_key(old),
+                self.fence(),
+            ] {
+                self.keys.insert(key);
+            }
+        }
+    }
+
+    fn grant(bearer: &str) -> ClientSessionData {
+        let did = jacquard_common::types::did::Did::new_owned(DID.to_string()).unwrap();
+        let dpop_key: jose_jwk::Key = serde_json::from_value(serde_json::json!({
+            "kty":"EC", "crv":"P-256", "x":"f83OJ3D2xFMTbKEBaGizdGlIUKEWx5q15odEB00stfg",
+            "y":"x_daaqundbgUvJV358vRBgULGnpH7aRFZZDYyEiNg2g", "d":"jpsQnnGQmL-YxOmH1UmOBHg10OJ45DBTWh0n52qxzMQ"
+        })).unwrap();
+        ClientSessionData {
+            account_did: did.clone(),
+            session_id: bearer.to_owned().into(),
+            host_url: jacquard_common::deps::fluent_uri::Uri::parse("http://127.0.0.1:9")
+                .unwrap()
+                .to_owned(),
+            authserver_url: "http://127.0.0.1:9".into(),
+            authserver_token_endpoint: "".into(),
+            authserver_revocation_endpoint: None,
+            scopes: jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("atproto"))
+                .unwrap(),
+            dpop_data: DpopClientData {
+                dpop_key,
+                dpop_authserver_nonce: "".into(),
+                dpop_host_nonce: "".into(),
+            },
+            token_set: TokenSet {
+                iss: "http://127.0.0.1:9".into(),
+                sub: did,
+                aud: "http://127.0.0.1:9".into(),
+                scope: Some("atproto".into()),
+                refresh_token: Some("synthetic-fixture-refresh".into()),
+                access_token: "synthetic-fixture-access".into(),
+                token_type: OAuthTokenType::DPoP,
+                expires_at: None,
+            },
+            resolved_scopes: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit disposable Redis fixture"]
+    async fn disposable_upgrade_start_and_stage_reject_logout_races() {
+        let mut fixture = Fixture::new().await;
+        let old = Uuid::new_v4().to_string();
+        let candidate = Uuid::new_v4().to_string();
+        let old_key = fixture.service.session_key(DID, &old);
+        let retired = fixture.service.retired_key(&old);
+        let fence = fixture.fence();
+        let pending = fixture.service.pending_upgrade_key(&old);
+        let flow = fixture.service.flow_key("synthetic-flow");
+        let candidate_key = fixture.service.candidate_key(&candidate);
+        let exchange = fixture
+            .service
+            .exchange_key(&old, "synthetic-code", "synthetic-nonce");
+        for key in [&retired, &fence, &pending, &flow, &candidate_key, &exchange] {
+            fixture.keys.insert(key.clone());
+        }
+        fixture.put(&old_key, "captured-old").await;
+        let captured: String = redis::cmd("GET")
+            .arg(&old_key)
+            .query_async(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        // Logout wins after the callback read, before the candidate write.
+        redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(&retired)
+            .arg("logout")
+            .arg("EX")
+            .arg(600)
+            .ignore()
+            .cmd("DEL")
+            .arg(&old_key)
+            .ignore()
+            .query_async::<_, ()>(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        let stage: i32 = redis::Script::new(LUA_STAGE_CANDIDATE_SCRIPT)
+            .key(&retired)
+            .key(&fence)
+            .key(&old_key)
+            .key(&candidate_key)
+            .key(&exchange)
+            .arg(&captured)
+            .arg("candidate-secret")
+            .arg(600)
+            .arg("exchange-secret")
+            .arg(300)
+            .invoke_async(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        assert_eq!(stage, 1);
+        fixture
+            .absent(&[candidate_key.clone(), exchange.clone()])
+            .await;
+        let started: i32 = redis::Script::new(LUA_START_SCRIPT)
+            .key(&pending)
+            .key(&flow)
+            .key(&retired)
+            .key(&fence)
+            .key(&old_key)
+            .arg(fixture.service.fingerprint("synthetic-flow"))
+            .arg("flow-secret")
+            .arg(600)
+            .arg(format!("{}upgrade_flow:", fixture.service.key_prefix))
+            .arg(&captured)
+            .invoke_async(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        assert_eq!(started, 2);
+        fixture.absent(&[pending, flow]).await;
+        // Even a replacement old-key value cannot validate the captured blob.
+        redis::cmd("DEL")
+            .arg(&retired)
+            .query_async::<_, usize>(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        fixture.put(&old_key, "newer-blob").await;
+        let changed: i32 = redis::Script::new(LUA_STAGE_CANDIDATE_SCRIPT)
+            .key(&retired)
+            .key(&fence)
+            .key(&old_key)
+            .key(&candidate_key)
+            .key(&exchange)
+            .arg(&captured)
+            .arg("candidate-secret")
+            .arg(600)
+            .arg("exchange-secret")
+            .arg(300)
+            .invoke_async(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        fixture.absent(&[candidate_key, exchange]).await;
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit disposable Redis fixture"]
+    async fn disposable_upgrade_commit_lua_rejects_erasure_fence() {
+        let mut fixture = Fixture::new().await;
+        let old = Uuid::new_v4().to_string();
+        let candidate = Uuid::new_v4().to_string();
+        fixture.seed_candidate(&old, &candidate).await;
+        fixture
+            .put(&fixture.fence(), "synthetic-cleanup-receipt")
+            .await;
+        assert!(matches!(
+            fixture.service.commit_upgrade(&candidate).await,
+            Err(UpgradeError::OldSessionInactive)
+        ));
+        fixture
+            .absent(&[
+                fixture.service.session_key(DID, &candidate),
+                fixture.service.session_index_key(&candidate),
+                fixture.service.receipt_key(&candidate),
+            ])
+            .await;
+        let old_still_there: bool = redis::cmd("EXISTS")
+            .arg(fixture.service.session_key(DID, &old))
+            .query_async(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        assert!(
+            old_still_there,
+            "rejected commit must leave existing data unchanged"
+        );
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit disposable Redis fixture"]
+    async fn disposable_upgrade_receipt_fast_path_checks_live_candidate() {
+        let mut fixture = Fixture::new().await;
+        let old = Uuid::new_v4().to_string();
+        let candidate = Uuid::new_v4().to_string();
+        fixture.seed_candidate(&old, &candidate).await;
+        let first = fixture.service.commit_upgrade(&candidate).await.unwrap();
+        let retry = fixture.service.commit_upgrade(&candidate).await.unwrap();
+        assert_eq!(first, retry, "live candidate keeps legitimate idempotency");
+        let fence = fixture.fence();
+        fixture.put(&fence, "synthetic-cleanup-receipt").await;
+        assert!(matches!(
+            fixture.service.commit_upgrade(&candidate).await,
+            Err(UpgradeError::OldSessionInactive)
+        ));
+        redis::cmd("DEL")
+            .arg(&fence)
+            .query_async::<_, usize>(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        let candidate_retired = fixture.service.retired_key(&candidate);
+        fixture.put(&candidate_retired, "logout").await;
+        assert!(matches!(
+            fixture.service.get_receipt(&candidate).await,
+            Err(UpgradeError::OldSessionInactive)
+        ));
+        assert!(matches!(
+            fixture.service.commit_upgrade(&candidate).await,
+            Err(UpgradeError::OldSessionInactive)
+        ));
+        // Removing the tombstone cannot make a missing candidate session active.
+        redis::cmd("DEL")
+            .arg(&candidate_retired)
+            .arg(fixture.service.session_key(DID, &candidate))
+            .query_async::<_, usize>(&mut fixture.service.redis.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.service.commit_upgrade(&candidate).await,
+            Err(UpgradeError::OldSessionInactive)
+        ));
+        fixture.finish().await;
     }
 }

@@ -787,8 +787,11 @@ impl AtProtoClient {
 }
 
 /// Redacts query parameters from URLs for privacy-safe tracing.
-fn sanitize_url_for_logging(url: &str) -> &str {
-    url.split('?').next().unwrap_or(url)
+/// Strips the query string and fragment so logs never carry parameter values
+/// (actor identifiers, cursors, search terms) or bearer fragments.
+pub fn sanitize_url_for_logging(url: &str) -> &str {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    &url[..end]
 }
 
 /// Filter client headers before forwarding to upstream PDS using a strict positive allowlist.
@@ -1432,5 +1435,26 @@ mod tests {
             }
             other => panic!("Expected ResponseTooLarge, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod url_logging_tests {
+    use super::sanitize_url_for_logging;
+
+    #[test]
+    fn strips_query_and_fragment() {
+        assert_eq!(
+            sanitize_url_for_logging("https://pds.example/xrpc/a.b?actor=did:plc:x&q=s"),
+            "https://pds.example/xrpc/a.b"
+        );
+        assert_eq!(
+            sanitize_url_for_logging("https://catbird.blue/oauth/callback#session_id=secret"),
+            "https://catbird.blue/oauth/callback"
+        );
+        assert_eq!(
+            sanitize_url_for_logging("https://x.example/p"),
+            "https://x.example/p"
+        );
     }
 }

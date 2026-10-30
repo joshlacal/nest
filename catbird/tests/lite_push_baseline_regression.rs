@@ -16,6 +16,9 @@ use sqlx::{Pool, Postgres};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
+#[path = "support/cleanup_auth.rs"]
+mod cleanup_auth;
+
 const DID: &str = "did:plc:baselinecontrol";
 const ACTOR: &str = "did:plc:baselineactor";
 
@@ -94,6 +97,7 @@ struct Fixture {
     pool: Pool<Postgres>,
     fake: Arc<FakeApns>,
     redis_url: String,
+    auth_store: Arc<catbird::services::RedisAuthStore>,
 }
 
 impl Fixture {
@@ -112,8 +116,29 @@ impl Fixture {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         admin.close().await;
         eprintln!("Baseline regression fixture retained in disposable cluster: {name}");
-        sqlx::query("INSERT INTO push_accounts(account_did,session_id,pds_url) VALUES($1,'fixture-session','http://127.0.0.1:9')")
-            .bind(DID).execute(&pool).await.unwrap();
+        let auth_store = cleanup_auth::store().await;
+        let bearer = Uuid::new_v4().to_string();
+        use jacquard_oauth::authstore::ClientAuthStore;
+        auth_store
+            .upsert_session(cleanup_auth::grant(DID, &bearer, "http://127.0.0.1:9"))
+            .await
+            .unwrap();
+        let generation = auth_store.next_auth_generation().await.unwrap();
+        let fingerprint = catbird::services::push::registry::session_fingerprint(&bearer);
+        sqlx::query("INSERT INTO push_accounts(account_did,session_id,session_fingerprint,pds_url,auth_generation) VALUES($1,$2,$2,'http://127.0.0.1:9',$3)")
+            .bind(DID).bind(fingerprint).bind(generation).execute(&pool).await.unwrap();
+        // Explicit complete preference input for this delivery fixture.
+        sqlx::query("INSERT INTO push_preferences(account_did,preferences_json) VALUES($1,$2)")
+            .bind(DID)
+            .bind(
+                serde_json::to_value(
+                    catbird::services::push::types::PushPreferencesDocument::default(),
+                )
+                .unwrap(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
         for index in 1..=devices {
             sqlx::query("INSERT INTO user_devices(did,device_token,platform,app_id,is_active,apns_environment,updated_at) VALUES($1,$2,'ios','blue.catbird.fixture',true,'sandbox',NOW() - make_interval(secs => $3))")
                 .bind(DID).bind(format!("device-{index}")).bind(index as f64)
@@ -121,14 +146,15 @@ impl Fixture {
         }
         sqlx::query("INSERT INTO actor_moderation_verdict(recipient_did,actor_did,verdict,generation) VALUES($1,$2,'{}',1)")
             .bind(DID).bind(ACTOR).execute(&pool).await.unwrap();
-        let event = json!({"recipientDid":DID,"senderDid":ACTOR,"convoId":"fixture-convo","messageId":"fixture-message","messageText":"","sentAt":chrono::Utc::now().to_rfc3339(),"authGeneration":1,"logRev":"0000003"});
-        sqlx::query("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) VALUES($1,$2,'chat_message','fixture-message','chat.bsky.convo.getLog',$3,$4,'baseline-fixture-event',1)")
-            .bind(DID).bind(ACTOR).bind(event).bind(chrono::Utc::now().timestamp())
+        let event = json!({"recipientDid":DID,"senderDid":ACTOR,"convoId":"fixture-convo","messageId":"fixture-message","messageText":"","sentAt":chrono::Utc::now().to_rfc3339(),"authGeneration":generation,"logRev":"0000003"});
+        sqlx::query("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) VALUES($1,$2,'chat_message','fixture-message','chat.bsky.convo.getLog',$3,$4,'baseline-fixture-event',$5)")
+            .bind(DID).bind(ACTOR).bind(event).bind(chrono::Utc::now().timestamp()).bind(generation)
             .execute(&pool).await.unwrap();
         Self {
             pool,
             fake: Arc::new(FakeApns::default()),
             redis_url,
+            auth_store,
         }
     }
 
@@ -140,10 +166,12 @@ impl Fixture {
         let services = Arc::new(
             PushServices::new(self.pool.clone(), push_config)
                 .unwrap()
+                .with_auth_store(self.auth_store.clone())
                 .with_apns_sender(self.fake.clone()),
         );
         let mut config = AppConfig::test_default();
         config.redis.url = self.redis_url.clone();
+        config.redis.key_prefix = self.auth_store.key_prefix().into();
         let redis = redis::aio::ConnectionManager::new(
             redis::Client::open(self.redis_url.as_str()).unwrap(),
         )
@@ -160,10 +188,10 @@ impl Fixture {
             catmos_jacquard_client: None,
             catmos_oauth_scopes: vec![],
             trusted_proxies: vec![],
-            auth_store: None,
+            auth_store: Some(self.auth_store.clone()),
             push: Some(services.clone()),
             dpop_nonce_cache: Arc::new(catbird::services::DpopNonceCache::new()),
-            session_encryption_key: None,
+            session_encryption_key: Some(cleanup_auth::KEY),
             active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
             session_index_ready: Arc::new(AtomicBool::new(true)),
@@ -228,4 +256,34 @@ async fn accepted_request_with_lost_response_is_not_blindly_resent() {
         Some(&1),
         "timeout does not prove APNs rejected an accepted push"
     );
+}
+
+// These source-age cases extend the two historical replay controls above.
+#[tokio::test]
+async fn old_social_source_event_in_fresh_queue_never_sends() {
+    for kind in ["like", "repost", "follow", "mention"] {
+        let fixture = Fixture::new(1).await;
+        sqlx::query("UPDATE push_event_queue SET notification_type=$1, event_timestamp=$2, created_at=NOW()")
+            .bind(kind).bind(chrono::Utc::now().timestamp() - 2 * 86400)
+            .execute(&fixture.pool).await.unwrap();
+        fixture.process().await;
+        assert!(
+            fixture.fake.attempts.lock().await.is_empty(),
+            "old {kind} reached APNs"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM push_event_queue")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "old {kind} must leave the ready queue");
+    }
+}
+
+#[tokio::test]
+async fn fresh_social_source_event_keeps_normal_delivery() {
+    let fixture = Fixture::new(1).await;
+    sqlx::query("UPDATE push_event_queue SET notification_type='like', event_timestamp=$1, created_at=NOW()")
+        .bind(chrono::Utc::now().timestamp()).execute(&fixture.pool).await.unwrap();
+    fixture.process().await;
+    assert_eq!(fixture.fake.accepted.lock().await.get("device-1"), Some(&1));
 }

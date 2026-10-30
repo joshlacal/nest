@@ -27,7 +27,7 @@ use crate::middleware::JacquardDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{
     oauth_upgrade::FIXED_UPGRADE_CALLBACK_URL, CatbirdSession, ExchangeRequest, ExchangeResponse,
-    LogoutResponse, OAuthCallback, SessionInfo,
+    OAuthCallback, SessionInfo,
 };
 use crate::services::{
     AtProtoClient, MlsAuthService, ProxyResponse, ServiceAuthProvider, CIRCLE_ENDPOINTS,
@@ -42,6 +42,49 @@ pub enum OAuthMode {
 }
 
 pub const OAUTH_DIRECT_NONCE_COOKIE_NAME: &str = "catbird_oauth_direct_nonce";
+
+fn validate_direct_browser_nonce(
+    cookie_nonce: Option<&str>,
+    expected_nonce: Option<&str>,
+    allow_missing_cookie: bool,
+) -> Result<(), &'static str> {
+    match (cookie_nonce, expected_nonce) {
+        (Some(cookie), Some(expected)) if !cookie.is_empty() && cookie == expected => Ok(()),
+        // Temporary legacy TestFlight exception; never accept a mismatched or empty cookie.
+        (None, Some(expected)) if allow_missing_cookie && !expected.is_empty() => {
+            tracing::warn!("Direct OAuth callback accepted without browser nonce cookie: temporary compatibility enabled");
+            Ok(())
+        }
+        (None, _) => Err("Direct OAuth callback browser nonce missing"),
+        (Some(_), None) => Err("Direct OAuth callback flow record missing nonce"),
+        (Some(_), Some(_)) => Err("Direct OAuth callback browser nonce mismatched"),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn direct_browser_nonce_compatibility_preserves_binding_when_present() {
+    for enabled in [false, true] {
+        assert!(validate_direct_browser_nonce(Some("nonce"), Some("nonce"), enabled).is_ok());
+        assert!(validate_direct_browser_nonce(Some("wrong"), Some("nonce"), enabled).is_err());
+        assert!(validate_direct_browser_nonce(Some(""), Some("nonce"), enabled).is_err());
+        assert!(validate_direct_browser_nonce(Some(""), Some(""), enabled).is_err());
+        assert!(validate_direct_browser_nonce(Some("nonce"), None, enabled).is_err());
+        assert!(validate_direct_browser_nonce(None, None, enabled).is_err());
+        assert!(validate_direct_browser_nonce(None, Some(""), enabled).is_err());
+    }
+    assert!(validate_direct_browser_nonce(None, Some("nonce"), false).is_err());
+    assert!(validate_direct_browser_nonce(None, Some("nonce"), true).is_ok());
+}
+
+fn direct_callback_redirect(session_id: &str, is_catmos: bool, legacy_handoff: bool) -> String {
+    if legacy_handoff && !is_catmos {
+        // Fixed native callback only; never use a caller-supplied redirect for bearer handoff.
+        build_app_redirect("", session_id)
+    } else {
+        "/".to_string()
+    }
+}
 
 /// Returns a non-replayable fingerprint of a session ID for privacy-safe logging.
 pub fn redact_session_id(id: &str) -> String {
@@ -502,46 +545,20 @@ pub async fn oauth_callback(
             ));
         }
 
-        // Direct mode browser nonce verification (Finding 21):
-        // Verify that the browser presented the direct-mode nonce cookie matching the flow record.
-        let cookie_nonce = jar.get(OAUTH_DIRECT_NONCE_COOKIE_NAME).map(|c| c.value());
-        let expected_nonce = flow_record.browser_nonce.as_deref();
-        match (cookie_nonce, expected_nonce) {
-            (Some(c_nonce), Some(e_nonce)) if !c_nonce.is_empty() && c_nonce == e_nonce => {
-                // Valid browser nonce; verified before token exchange!
-            }
-            (None, _) => {
-                let _ = redis::cmd("DEL")
-                    .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await;
-                tracing::error!("Direct mode callback rejected: missing browser nonce cookie");
-                return Err(AppError::Unauthorized(
-                    "Direct OAuth callback browser nonce missing".into(),
-                ));
-            }
-            (Some(_), None) => {
-                let _ = redis::cmd("DEL")
-                    .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await;
-                tracing::error!(
-                    "Direct mode callback rejected: flow record missing expected browser nonce"
-                );
-                return Err(AppError::Unauthorized(
-                    "Direct OAuth callback flow record missing nonce".into(),
-                ));
-            }
-            (Some(_), Some(_)) => {
-                let _ = redis::cmd("DEL")
-                    .arg(&claim_key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await;
-                tracing::error!("Direct mode callback rejected: browser nonce cookie mismatched");
-                return Err(AppError::Unauthorized(
-                    "Direct OAuth callback browser nonce mismatched".into(),
-                ));
-            }
+        // Default-off compatibility for legacy TestFlight's missing browser cookie only.
+        let allow_missing_cookie =
+            std::env::var("NEST_ALLOW_MISSING_DIRECT_OAUTH_COOKIE").as_deref() == Ok("true");
+        if let Err(message) = validate_direct_browser_nonce(
+            jar.get(OAUTH_DIRECT_NONCE_COOKIE_NAME).map(|c| c.value()),
+            flow_record.browser_nonce.as_deref(),
+            allow_missing_cookie,
+        ) {
+            let _ = redis::cmd("DEL")
+                .arg(&claim_key)
+                .query_async::<_, ()>(&mut conn)
+                .await;
+            tracing::error!(message, "Direct mode callback rejected");
+            return Err(AppError::Unauthorized(message.into()));
         }
         None
     };
@@ -679,12 +696,11 @@ pub async fn oauth_callback(
                 .same_site(SameSite::Lax)
                 .max_age(time::Duration::ZERO)
                 .build();
-            let redirect_target = "/";
+            let legacy_handoff =
+                std::env::var("NEST_LEGACY_DIRECT_OAUTH_HANDOFF").as_deref() == Ok("true");
+            let redirect_target = direct_callback_redirect(&session_id, is_catmos, legacy_handoff);
 
-            (
-                jar.add(cookie).add(direct_cleanup_cookie),
-                redirect_target.to_string(),
-            )
+            (jar.add(cookie).add(direct_cleanup_cookie), redirect_target)
         };
         // 4. Construct response
         let response = Response::builder()
@@ -1100,117 +1116,81 @@ pub fn build_app_redirect(state: &str, session_id: &str) -> String {
 /// POST /auth/logout
 pub async fn logout(
     State(state): State<Arc<AppState>>,
-    Extension(session): Extension<CatbirdSession>,
+    headers: HeaderMap,
     jar: CookieJar,
-) -> AppResult<(CookieJar, Json<LogoutResponse>)> {
-    let jacquard_client = state
-        .jacquard_client
-        .as_ref()
-        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
-
-    let did = jacquard_common::types::did::Did::new(session.did.as_str())
-        .map_err(|e| AppError::Internal(format!("Invalid DID: {e}")))?;
-    let session_id_str = session.id.to_string();
-    let session_fp = redact_session_id(&session_id_str);
-
-    // 1. Preserve OAuthSession metadata in memory before local deletion so remote revocation can be attempted
-    let preserved_oauth_session = jacquard_client.restore(&did, &session_id_str).await.ok();
-
-    // 2. Mandatory local delete from auth_store FIRST (fail-closed locally)
-    if let Some(store) = state.auth_store.as_ref() {
-        use jacquard_oauth::authstore::ClientAuthStore;
-        store
-            .delete_session(&did, &session_id_str)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    did = %session.did,
-                    session_fp = %session_fp,
-                    error = %e,
-                    "Failed mandatory local session delete on logout"
-                );
-                AppError::AuthTemporarilyUnavailable(
-                    "Logout temporarily unavailable; please retry".into(),
-                )
-            })?;
-    }
-
-    // 3. Best-effort push revocation (cleanup failure does not reactivate bearer)
-    let push_registry = state.push_registry();
-
-    if let Some(registry) = push_registry {
-        if let Err(e) = registry
-            .mark_auth_revoked_if_session(&session.did, &session_id_str)
-            .await
-        {
-            tracing::warn!(
-                did = %session.did,
-                session_fp = %session_fp,
-                error = %e,
-                "Best-effort push auth revocation failed on logout"
-            );
+) -> AppResult<(StatusCode, CookieJar, Json<Value>)> {
+    use crate::services::logout_cleanup::{
+        self, CleanupError, Completion, LogoutRequest, RedisCleanupStore,
+    };
+    let bearer = if let Some(header) = headers.get("authorization") {
+        header
+            .to_str()
+            .ok()
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .ok_or(AppError::InvalidSession)?
+    } else {
+        jar.get(SESSION_COOKIE_NAME)
+            .map(|cookie| cookie.value().to_owned())
+            .ok_or(AppError::InvalidSession)?
+    };
+    let request = LogoutRequest::for_runtime(bearer).map_err(|_| AppError::InvalidSession)?;
+    let store = state.auth_store.as_deref().ok_or_else(|| {
+        AppError::AuthTemporarilyUnavailable("Logout store is unavailable".into())
+    })?;
+    // This route deliberately does not use refresh-capable auth middleware. The
+    // coordinator authorizes the bearer from a live local record or its sealed receipt.
+    let result = logout_cleanup::run_runtime_cleanup(&state, &request).await;
+    let (status, cleanup, message) = match result {
+        Ok(cleanup) => {
+            let (status, message) = match cleanup.completion {
+                Completion::Complete => (StatusCode::OK, "Logged out and cleanup completed"),
+                Completion::Pending => (StatusCode::ACCEPTED, "Logout cleanup pending"),
+                Completion::Failed => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session retired; cleanup or upstream revocation is unconfirmed",
+                ),
+            };
+            (status, Some(cleanup), message)
         }
-    }
-
-    // 4. Remote authorization-server logout/revocation: local-first ordering is preserved (local deletion already succeeded in step 2).
-    // Genuine oauth_session.logout() is the only remote revocation arm.
-    // If no preserved session was available or if remote logout fails, persist a durable retry marker in Redis.
-    let remote_revoked = match preserved_oauth_session {
-        Some(oauth_session) => oauth_session.logout().await.map_err(|e| {
-            tracing::warn!(
-                did = %session.did,
-                session_fp = %session_fp,
-                error = %e,
-                "Preserved OAuthSession remote logout/revocation failed"
-            );
-            e.to_string()
-        }),
-        None => {
-            tracing::warn!(
-                did = %session.did,
-                session_fp = %session_fp,
-                "Could not restore OAuthSession for remote revocation before local delete"
-            );
-            Err("missing preserved OAuth session".to_string())
+        Err(CleanupError::Unauthorized) => return Err(AppError::InvalidSession),
+        Err(_) => {
+            // A storage acknowledgement can fail after retirement. Return only
+            // persisted evidence; never turn a retryable error into HTTP 200.
+            let receipt = RedisCleanupStore { store }
+                .response_for_request(&request)
+                .await
+                .ok()
+                .flatten();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                receipt,
+                "Logout completion could not be confirmed; retry safely",
+            )
         }
     };
-    if let Err(e) = remote_revoked {
-        tracing::warn!(
-            did = %session.did,
-            session_fp = %session_fp,
-            error = %e,
-            "Remote OAuth grant revocation failed on logout; persisting durable retry marker"
-        );
-        let prefix = state
-            .auth_store
-            .as_ref()
-            .map(|s| s.key_prefix())
-            .unwrap_or("catbird:v2:session:");
-        let retry_key = format!("{}revoke_retry:{}_{}", prefix, session.did, session_fp);
-        let mut conn = state.redis.clone();
-        let _: Result<(), _> = redis::cmd("SETEX")
-            .arg(&retry_key)
-            .arg(86400 * 7) // 7 days retention
-            .arg(&session_id_str)
-            .query_async(&mut conn)
-            .await;
-    }
-    let cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Strict)
-        .secure(true)
-        .max_age(time::Duration::ZERO)
-        .build();
-
-    tracing::info!(did = %session.did, "User logged out successfully");
-
+    let retired = cleanup.as_ref().is_some_and(|value| value.session_retired);
+    let jar = if retired {
+        jar.remove(
+            Cookie::build((SESSION_COOKIE_NAME, ""))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Strict)
+                .secure(true)
+                .max_age(time::Duration::ZERO)
+                .build(),
+        )
+    } else {
+        jar
+    };
     Ok((
-        jar.remove(cookie),
-        Json(LogoutResponse {
-            success: true,
-            message: "Logged out".to_string(),
-        }),
+        status,
+        jar,
+        Json(serde_json::json!({
+            "success": status == StatusCode::OK, "message": message, "cleanup":cleanup
+        })),
     ))
 }
 
@@ -1474,7 +1454,7 @@ pub async fn proxy_xrpc(
         request_id = %request_id,
         lexicon = %lexicon,
         method = %method,
-        query = ?query_string,
+        query_keys = ?query_string.as_deref().map(query_param_names),
         content_type = ?content_type,
         body_bytes = body_bytes.len(),
         body_shape = ?body_shape,
@@ -1740,6 +1720,22 @@ pub async fn proxy_xrpc(
 }
 
 /// Extract JSON shape information for logging (top-level keys and array lengths)
+/// Parameter names from a raw query string, without values. Values carry actor
+/// identifiers, cursors and search terms, so only the names are ever logged.
+fn query_param_names(query: &str) -> Vec<String> {
+    const MAX_PARAMS: usize = 20;
+    const MAX_NAME_LEN: usize = 64;
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .take(MAX_PARAMS)
+        .map(|pair| {
+            let name = pair.split('=').next().unwrap_or_default();
+            name.chars().take(MAX_NAME_LEN).collect()
+        })
+        .collect()
+}
+
 fn json_shape(data: &[u8]) -> Option<String> {
     let json: Value = serde_json::from_slice(data).ok()?;
     Some(describe_json_shape(&json, 0))
@@ -1808,17 +1804,44 @@ async fn apply_moderation_mutation(
             let Some(root) = body.get("root").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
-            if lexicon == "app.bsky.graph.muteThread" {
-                push.thread_mutes.mute_thread(&session.did, root).await?;
-            } else {
-                push.thread_mutes.unmute_thread(&session.did, root).await?;
-            }
+            let store = state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
+            push.thread_mutes
+                .set_thread_mute_authenticated(
+                    store,
+                    &session.did,
+                    &session.id.to_string(),
+                    root,
+                    lexicon == "app.bsky.graph.muteThread",
+                )
+                .await?;
         }
         "app.bsky.graph.muteActor"
         | "app.bsky.graph.unmuteActor"
         | "app.bsky.graph.muteActorList"
         | "app.bsky.graph.unmuteActorList" => {
-            push.moderation.invalidate_recipient(&session.did).await?;
+            let store = state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
+            let pool = state
+                .push_db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Push database unavailable"))?;
+            let mut tx = pool.begin().await?;
+            crate::services::push::lock::acquire_account_lock(&mut tx, &session.did).await?;
+            store
+                .validate_live_session_local(&session.did, &session.id.to_string())
+                .await?;
+            sqlx::query("UPDATE push_accounts SET moderation_generation = moderation_generation + 1 WHERE account_did = $1")
+                .bind(&session.did).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM actor_moderation_verdict WHERE recipient_did = $1")
+                .bind(&session.did)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
         }
         // Blocks and list blocks are repo records, so they arrive as generic
         // record writes rather than dedicated procedures.
@@ -1827,7 +1850,26 @@ async fn apply_moderation_mutation(
         | "com.atproto.repo.applyWrites"
             if moderation_record_write(&body) =>
         {
-            push.moderation.invalidate_recipient(&session.did).await?;
+            let store = state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
+            let pool = state
+                .push_db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Push database unavailable"))?;
+            let mut tx = pool.begin().await?;
+            crate::services::push::lock::acquire_account_lock(&mut tx, &session.did).await?;
+            store
+                .validate_live_session_local(&session.did, &session.id.to_string())
+                .await?;
+            sqlx::query("UPDATE push_accounts SET moderation_generation = moderation_generation + 1 WHERE account_did = $1")
+                .bind(&session.did).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM actor_moderation_verdict WHERE recipient_did = $1")
+                .bind(&session.did)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
         }
         _ => {}
     }
@@ -2331,28 +2373,22 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_mode_callback_cookie_and_location_invariants() {
+    fn direct_callback_handoff_matches_legacy_app_without_affecting_other_clients() {
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
-
-        // Direct mode sets HttpOnly, SameSite=Strict cookie with session_id
-        let cookie = Cookie::build((SESSION_COOKIE_NAME, session_id))
-            .path("/")
-            .http_only(true)
-            .secure(true)
-            .same_site(SameSite::Strict)
-            .max_age(time::Duration::days(30))
-            .build();
-
-        assert_eq!(cookie.name(), SESSION_COOKIE_NAME);
-        assert_eq!(cookie.value(), session_id);
-        assert_eq!(cookie.http_only(), Some(true));
-        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
-        assert_eq!(cookie.secure(), Some(true));
-
-        // Direct mode location is strictly "/" (never contains session_id)
-        let location = "/";
-        assert!(!location.contains(session_id));
-        assert_eq!(location, "/");
+        let target = direct_callback_redirect(session_id, false, true);
+        let url = url::Url::parse(&target).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("catbird.blue"));
+        assert_eq!(url.path(), "/oauth/callback");
+        assert_eq!(url.query(), None);
+        // The old SDK reads session_id from the fragment, not a query code or browser cookie.
+        assert_eq!(
+            url.fragment(),
+            Some(format!("session_id={session_id}").as_str())
+        );
+        assert_eq!(direct_callback_redirect(session_id, false, false), "/");
+        assert_eq!(direct_callback_redirect(session_id, true, true), "/");
+        assert_eq!(direct_callback_redirect(session_id, true, false), "/");
     }
 
     #[test]
@@ -2397,56 +2433,41 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running Redis (REDIS_URL)"]
-    async fn test_logout_remote_revocation_fallback_and_retry_marker_logic() {
-        use axum::extract::State;
-        use axum::Extension;
-        use axum_extra::extract::CookieJar;
-        use chrono::Utc;
-        use jacquard_common::IntoStatic;
-        use uuid::Uuid;
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let redis_client = redis::Client::open(redis_url.as_str())
-            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
-        let redis = redis::aio::ConnectionManager::new(redis_client)
+    #[ignore = "requires explicit disposable Redis fixture"]
+    async fn test_logout_fixed_no_stored_retry_policy_and_truthful_failure() {
+        use crate::services::logout_cleanup::{
+            CleanupError, CredentialRetention, LogoutRequest, RedisCleanupStore,
+        };
+        use jacquard_oauth::authstore::ClientAuthStore;
+        assert_eq!(std::env::var("LITE_PUSH_DISPOSABLE").as_deref(), Ok("1"));
+        let url =
+            url::Url::parse(&std::env::var("REDIS_URL").expect("explicit fixture URL")).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_ne!(url.port().expect("explicit port"), 6379);
+        let redis = redis::aio::ConnectionManager::new(redis::Client::open(url.as_str()).unwrap())
             .await
-            .expect("REDIS_URL connection must succeed when test is executed");
-
-        let test_id = Uuid::new_v4().simple().to_string();
-        let prefix = format!("catbird:v2:test_{test_id}:");
-        let key = [0x42u8; 32];
-        let auth_store = Arc::new(
-            crate::services::RedisAuthStore::from_key(redis.clone(), prefix.clone(), 86400, key)
-                .expect("auth store creation"),
+            .unwrap();
+        let prefix = format!(
+            "catbird:v2:logout_handler_fixture_{}:",
+            uuid::Uuid::new_v4().simple()
         );
-
-        let mut config = crate::config::AppConfig::test_default();
-        config.server.base_url = "https://catbird.test".to_string();
-        config.oauth.scopes = vec!["atproto".to_string()];
-
-        let signing_key = p256::SecretKey::random(&mut rand::thread_rng());
-        let key_store = crate::services::KeyStore::from_key("catbird-test-key", signing_key);
-
-        let scopes = vec![
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse("atproto")
-                .unwrap()
-                .into_static(),
-        ];
-
-        let state_proto = crate::config::AppState {
-            config: Arc::new(config),
+        let key = [0x42; 32];
+        let store = Arc::new(
+            crate::services::RedisAuthStore::from_key(redis.clone(), prefix.clone(), 86400, key)
+                .unwrap(),
+        );
+        let state = Arc::new(crate::config::AppState {
+            config: Arc::new(crate::config::AppConfig::test_default()),
             http_client: reqwest::Client::new(),
-            raw_http_client: crate::services::build_hardened_raw_http_client()
-                .expect("hardened raw client"),
+            raw_http_client: reqwest::Client::new(),
             redis: redis.clone(),
             push_db: None,
-            key_store: Some(Arc::new(key_store.clone())),
+            key_store: None,
             jacquard_client: None,
             catmos_jacquard_client: None,
             catmos_oauth_scopes: vec![],
             trusted_proxies: vec![],
-            auth_store: Some(auth_store.clone()),
+            auth_store: Some(store.clone()),
             push: None,
             dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
             session_encryption_key: Some(key),
@@ -2454,85 +2475,114 @@ mod tests {
             rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
             session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_index_readiness: Arc::new(tokio::sync::Notify::new()),
-        };
-
-        let jacquard_client = crate::config::AppState::build_jacquard_client(
-            &state_proto,
-            &key_store,
-            &auth_store,
-            "https://catbird.test/client-metadata.json",
-            "https://catbird.test/auth/callback",
-            &scopes,
-        )
-        .expect("build jacquard client");
-
-        let state = Arc::new(crate::config::AppState {
-            jacquard_client: Some(Arc::new(jacquard_client)),
-            ..state_proto
         });
-
-        let did = "did:plc:test_logout_user";
-        let session_id = Uuid::new_v4();
-        let session_id_str = session_id.to_string();
-        let session_fp = redact_session_id(&session_id_str);
-
-        let session = crate::models::CatbirdSession {
-            id: session_id,
-            did: did.to_string(),
-            handle: "user.test".to_string(),
-            pds_url: "https://pds.test".to_string(),
-            access_token: "mock_access".to_string(),
-            refresh_token: "mock_refresh".to_string(),
-            scopes: vec!["atproto".to_string()],
-            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
-            created_at: Utc::now(),
-            last_used_at: Utc::now(),
-            granted_scopes: vec!["atproto".to_string()],
+        let header = |bearer: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+            headers
         };
-
-        let jar = CookieJar::new();
-
-        // 1. Invoke the real logout handler.
-        // Because no OAuth session was pre-installed in the mock auth server, restore fails/returns None.
-        // This MUST treat remote revocation as failed and persist the durable retry marker to Redis.
-        let (_, Json(resp)) = logout(State(state.clone()), Extension(session.clone()), jar)
-            .await
-            .expect("logout handler must succeed");
-
-        assert!(resp.success);
-        assert_eq!(resp.message, "Logged out");
-
-        // 2. Verify that the durable retry marker was written to Redis with the expected key, session_id, and 7-day TTL
-        let retry_key = format!("{}revoke_retry:{}_{}", prefix, did, session_fp);
-        let mut conn = redis.clone();
-        let stored_val: Option<String> = redis::cmd("GET")
-            .arg(&retry_key)
-            .query_async(&mut conn)
-            .await
-            .expect("GET retry_key");
-
-        assert_eq!(
-            stored_val,
-            Some(session_id_str.clone()),
-            "Durable retry marker MUST be written to Redis when remote revocation fails"
-        );
-
-        let ttl: i64 = redis::cmd("TTL")
-            .arg(&retry_key)
-            .query_async(&mut conn)
-            .await
-            .expect("TTL retry_key");
+        let missing = uuid::Uuid::new_v4().to_string();
         assert!(
-            ttl > 0 && ttl <= 86400 * 7,
-            "Retry marker TTL must be set up to 7 days, got {ttl}"
+            matches!(
+                logout(State(state.clone()), header(&missing), CookieJar::new()).await,
+                Err(AppError::InvalidSession)
+            ),
+            "raw UUID is not local authentication"
         );
-
-        // Cleanup
-        let _: () = redis::cmd("DEL")
-            .arg(&retry_key)
+        let did = "did:plc:syntheticlogout";
+        let bearer = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert_session(crate::services::revocation::tests::session(did, &bearer))
+            .await
+            .unwrap();
+        let (status, _, Json(response)) =
+            logout(State(state.clone()), header(&bearer), CookieJar::new())
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response["success"], false);
+        assert_eq!(response["cleanup"]["session_retired"], true);
+        assert_eq!(response["cleanup"]["upstream_revocation"], "unconfirmed");
+        assert_eq!(response["cleanup"]["account_cleanup"]["status"], "failed");
+        assert!(store
+            .read_session_local(did, &bearer)
+            .await
+            .unwrap()
+            .is_none());
+        let mut conn = redis.clone();
+        let backend = RedisCleanupStore { store: &store };
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(backend.grant_key(&store.fingerprint(&bearer)))
             .query_async(&mut conn)
             .await
             .unwrap();
+        assert!(!exists);
+        let other_did = "did:plc:syntheticretry";
+        let retry = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert_session(crate::services::revocation::tests::session(
+                other_did, &retry,
+            ))
+            .await
+            .unwrap();
+        let disallowed = LogoutRequest::new(
+            retry.clone(),
+            CredentialRetention::ApprovedSealedRetry { seconds: 600 },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                crate::services::logout_cleanup::run_runtime_cleanup(&state, &disallowed).await,
+                Err(CleanupError::InvalidRetentionPolicy)
+            ),
+            "runtime cannot be overridden into credential retention"
+        );
+        assert!(
+            store
+                .read_session_local(other_did, &retry)
+                .await
+                .unwrap()
+                .is_some(),
+            "rejection precedes retirement"
+        );
+        let grant_key = backend.grant_key(&store.fingerprint(&retry));
+        let journal_key = backend.journal_key(&store.fingerprint(&retry));
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&grant_key)
+            .arg(&journal_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(exists, 0);
+        let (status, _, Json(response)) =
+            logout(State(state.clone()), header(&retry), CookieJar::new())
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response["cleanup"]["upstream_revocation"], "unconfirmed");
+        let (_, _, Json(response)) = logout(State(state.clone()), header(&retry), CookieJar::new())
+            .await
+            .unwrap();
+        assert_eq!(response["success"], false);
+        assert_eq!(response["cleanup"]["session_retired"], true);
+        crate::services::logout_cleanup::retry_cleanup_pass(&state)
+            .await
+            .unwrap();
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&grant_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            !exists,
+            "logout and its worker never persist a retry credential"
+        );
+        assert!(
+            crate::services::revocation::run_retry_pass(&state, chrono::Utc::now().timestamp())
+                .await
+                .is_err(),
+            "legacy worker cannot bypass lifecycle ownership"
+        );
     }
 
     #[test]
@@ -2570,5 +2620,32 @@ mod tests {
             crate::services::redis_crypto::seal_with_aad(&key, session_id.as_bytes(), &aad)
                 .unwrap();
         assert!(v2_sealed.starts_with(crate::services::redis_crypto::V2_PREFIX));
+    }
+}
+
+#[cfg(test)]
+mod query_logging_tests {
+    use super::query_param_names;
+
+    #[test]
+    fn logs_parameter_names_but_never_values() {
+        let names = query_param_names("actor=did%3Aplc%3Aabc&q=private+search&cursor=xyz&flag");
+        assert_eq!(names, vec!["actor", "q", "cursor", "flag"]);
+        let joined = names.join(",");
+        assert!(!joined.contains("did"));
+        assert!(!joined.contains("private"));
+        assert!(!joined.contains("xyz"));
+    }
+
+    #[test]
+    fn bounds_parameter_count_and_name_length() {
+        let many = (0..50)
+            .map(|i| format!("p{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert_eq!(query_param_names(&many).len(), 20);
+        let long = format!("{}=v", "n".repeat(500));
+        assert_eq!(query_param_names(&long)[0].len(), 64);
+        assert!(query_param_names("").is_empty());
     }
 }

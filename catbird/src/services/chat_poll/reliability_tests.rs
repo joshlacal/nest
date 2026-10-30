@@ -14,11 +14,7 @@ impl TestDb {
         let dsn = std::env::var("DATABASE_URL").expect("explicit disposable DATABASE_URL required");
         let mut url = url::Url::parse(&dsn).unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
-        assert_eq!(
-            url.port(),
-            Some(55471),
-            "dedicated LITE-001 PostgreSQL only"
-        );
+        assert_eq!(url.port(), Some(55473), "dedicated task-7 PostgreSQL only");
         assert_eq!(url.username(), "lite_push_test");
         let admin = Pool::<Postgres>::connect(&dsn).await.unwrap();
         let name = format!("lite_poller_{}", uuid::Uuid::new_v4().simple());
@@ -371,7 +367,7 @@ async fn poller_live_getlog_priming_and_reopening_emit_no_push() {
         .mount(&pds)
         .await;
     let redis_dsn = std::env::var("REDIS_URL").expect("explicit disposable REDIS_URL required");
-    assert_eq!(redis_dsn, "redis://127.0.0.1:56381");
+    assert_eq!(redis_dsn, "redis://127.0.0.1:56383");
     let client = redis::Client::open(redis_dsn).unwrap();
     let mut subscriber = client.get_async_pubsub().await.unwrap();
     subscriber.subscribe("chat_push").await.unwrap();
@@ -783,5 +779,61 @@ async fn poller_prime_seeds_source_mute_without_alerting() {
         .await
         .unwrap();
     assert_eq!(db.counts().await, (0, 0, 1));
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated disposable LITE-001 PostgreSQL"]
+async fn stale_auth_failure_cannot_unenroll_newer_sign_in() {
+    let db = TestDb::new().await;
+    let original = db.account().await;
+    let successful_at: time::OffsetDateTime = sqlx::query_scalar(
+        "SELECT last_successful_poll_at FROM chat_poll_state WHERE account_did=$1",
+    )
+    .bind(&original.account_did)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let scheduler = ChatPollScheduler::new(db.pool.clone());
+    // Session generation 1 starts its network request; a new registration
+    // supersedes it before the old request reports a terminal auth error.
+    sqlx::query("UPDATE push_accounts SET auth_generation=2 WHERE account_did=$1")
+        .bind(&original.account_did)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!scheduler
+        .unenroll_account_if_auth_generation(&original.account_did, 1)
+        .await
+        .unwrap());
+    assert!(!scheduler
+        .unenroll_account_if_auth_generation(&original.account_did, 0)
+        .await
+        .unwrap());
+    let retained = db.row().await;
+    assert_eq!(retained.chat_cursor, original.chat_cursor);
+    assert_eq!(retained.primed_at, original.primed_at);
+    let retained_successful_at: time::OffsetDateTime = sqlx::query_scalar(
+        "SELECT last_successful_poll_at FROM chat_poll_state WHERE account_did=$1",
+    )
+    .bind(&original.account_did)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_successful_at, successful_at);
+    assert!(scheduler
+        .unenroll_account_if_auth_generation(&original.account_did, 2)
+        .await
+        .unwrap());
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat_poll_state WHERE account_did=$1")
+            .bind(&original.account_did)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "current terminal auth failure should still unenroll"
+    );
     db.finish().await;
 }

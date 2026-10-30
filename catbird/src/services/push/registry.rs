@@ -6,7 +6,10 @@ use crate::{
     models::CatbirdSession,
 };
 
-use super::types::{PushAccountRow, RegisterPushInput, RegistrationRow, UnregisterPushInput};
+use super::types::{
+    PushAccountRow, PushAccountSignOut, RegisterPushInput, RegistrationRow, SignOutPushOutcome,
+    UnregisterPushInput,
+};
 
 pub const MAX_ACTIVE_DEVICES_PER_ACCOUNT: i64 = 10;
 pub const MAX_FANOUT_PER_NOTIFICATION: i64 = 10;
@@ -37,6 +40,21 @@ pub fn normalize_or_hash_session_fingerprint(session_id: &str) -> String {
     }
 }
 
+/// Fingerprint-only writers are the default: a raw bearer session ID must never be
+/// written to `push_accounts.session_id`. `PUSH_ACCOUNTS_PHASE2_WRITERS=0|false` restores
+/// the legacy raw writes and exists only as an emergency rollback switch.
+pub fn phase2_writers_from_env() -> bool {
+    parse_phase2_writers(
+        std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_phase2_writers(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some(v) if v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
 #[derive(Clone)]
 pub struct PushRegistry {
     db_pool: Pool<Postgres>,
@@ -45,13 +63,12 @@ pub struct PushRegistry {
     max_inactive_devices_per_account: i64,
     max_fanout_per_notification: i64,
     phase2_writers: bool,
+    auth_store: Option<std::sync::Arc<crate::services::RedisAuthStore>>,
 }
 
 impl PushRegistry {
     pub fn new(db_pool: Pool<Postgres>, service_did: String) -> Self {
-        let phase2_writers = std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let phase2_writers = phase2_writers_from_env();
         Self {
             db_pool,
             service_did,
@@ -59,6 +76,7 @@ impl PushRegistry {
             max_inactive_devices_per_account: 20,
             max_fanout_per_notification: MAX_FANOUT_PER_NOTIFICATION,
             phase2_writers,
+            auth_store: None,
         }
     }
 
@@ -69,9 +87,7 @@ impl PushRegistry {
         max_inactive_devices_per_account: i64,
         max_fanout_per_notification: i64,
     ) -> Self {
-        let phase2_writers = std::env::var("PUSH_ACCOUNTS_PHASE2_WRITERS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let phase2_writers = phase2_writers_from_env();
         Self {
             db_pool,
             service_did,
@@ -79,6 +95,7 @@ impl PushRegistry {
             max_inactive_devices_per_account,
             max_fanout_per_notification,
             phase2_writers,
+            auth_store: None,
         }
     }
     pub fn with_config(db_pool: Pool<Postgres>, config: &crate::config::PushConfig) -> Self {
@@ -96,6 +113,31 @@ impl PushRegistry {
     pub fn with_phase2_writers(mut self, enabled: bool) -> Self {
         self.phase2_writers = enabled;
         self
+    }
+
+    pub fn with_auth_store(
+        mut self,
+        store: std::sync::Arc<crate::services::RedisAuthStore>,
+    ) -> Self {
+        self.auth_store = Some(store);
+        self
+    }
+
+    fn required_auth_store(&self) -> Result<&crate::services::RedisAuthStore> {
+        self.auth_store
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("local session write guard is not configured"))
+    }
+
+    async fn validate_session_write(&self, did: &str, session_id: &str) -> Result<()> {
+        self.required_auth_store()?
+            .validate_live_session_local(did, session_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn next_auth_generation(&self) -> Result<i64> {
+        Ok(self.required_auth_store()?.next_auth_generation().await?)
     }
 
     pub fn set_phase2_writers(&mut self, enabled: bool) {
@@ -130,6 +172,8 @@ impl PushRegistry {
     ) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        self.validate_session_write(did, new_session).await?;
+        let auth_generation = self.next_auth_generation().await?;
         let session_fp = normalize_or_hash_session_fingerprint(new_session);
         let session_id_bind: &str = if self.phase2_writers {
             &session_fp
@@ -148,14 +192,14 @@ impl PushRegistry {
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, NULL, 1, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, $5, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
             SET session_id = EXCLUDED.session_id,
                 session_fingerprint = EXCLUDED.session_fingerprint,
                 pds_url = EXCLUDED.pds_url,
                 auth_revoked_at = NULL,
-                auth_generation = push_accounts.auth_generation + 1,
+                auth_generation = $5,
                 last_seen_at = NOW(),
                 updated_at = NOW()
             "#,
@@ -164,6 +208,7 @@ impl PushRegistry {
         .bind(session_id_bind)
         .bind(&session_fp)
         .bind(pds_url)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -176,6 +221,9 @@ impl PushRegistry {
     pub async fn touch_account_session(&self, session: &CatbirdSession) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, &session.did).await?;
+        self.validate_session_write(&session.did, &session.id.to_string())
+            .await?;
+        let auth_generation = self.next_auth_generation().await?;
         let raw_session = session.id.to_string();
         let session_fp = normalize_or_hash_session_fingerprint(&raw_session);
         let session_id_bind: &str = if self.phase2_writers {
@@ -195,7 +243,7 @@ impl PushRegistry {
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, NULL, 1, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, $5, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
             SET session_id = EXCLUDED.session_id,
@@ -212,6 +260,7 @@ impl PushRegistry {
         .bind(session_id_bind)
         .bind(&session_fp)
         .bind(&session.pds_url)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -221,7 +270,10 @@ impl PushRegistry {
 
     /// Replaces the session only when the account still has the expected old session.
     /// Clears auth_revoked_at and retains polling state on successful upgrade.
-    /// Returns zero when the account is missing or its session has changed (stale CAS no-op).
+    /// Device ownership moves independently of the account pointer CAS: another
+    /// device may already supply the account's push grant. The return value is
+    /// still the number of account-pointer rows changed. Redis-link errors are
+    /// retryable after SQL ownership commits, so logout already sees the successor.
     pub async fn replace_account_session(
         &self,
         did: &str,
@@ -230,6 +282,8 @@ impl PushRegistry {
     ) -> Result<u64> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        self.validate_session_write(did, new_session_id).await?;
+        let auth_generation = self.next_auth_generation().await?;
         let old_fp = normalize_or_hash_session_fingerprint(old_session_id);
         let new_fp = normalize_or_hash_session_fingerprint(new_session_id);
         let new_session_bind: &str = if self.phase2_writers {
@@ -243,7 +297,7 @@ impl PushRegistry {
             SET session_id = $1,
                 session_fingerprint = $2,
                 auth_revoked_at = NULL,
-                auth_generation = push_accounts.auth_generation + 1,
+                auth_generation = $6,
                 last_seen_at = NOW(),
                 updated_at = NOW()
             WHERE account_did = $3
@@ -255,10 +309,114 @@ impl PushRegistry {
         .bind(did)
         .bind(&old_fp)
         .bind(old_session_id)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
         let affected = result.rows_affected();
+        let store = self.required_auth_store()?;
+        let mut conn = store.redis_connection();
+        let mut link_error = None;
+        // Legacy rows may have only a reverse link. Adopt a NULL SQL owner only
+        // when its current device link exactly proves the old session; never
+        // overwrite a different non-NULL SQL owner using a stale Redis link.
+        let legacy_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM user_devices WHERE did=$1 AND auth_session_fingerprint IS NULL",
+        )
+        .bind(did)
+        .fetch_all(&mut *tx)
+        .await?;
+        for device_id in legacy_ids {
+            let owner: redis::RedisResult<Option<String>> = redis::cmd("GET")
+                .arg(format!(
+                    "{}push_device_session:{}",
+                    store.key_prefix(),
+                    device_id
+                ))
+                .query_async(&mut conn)
+                .await;
+            match owner {
+                Ok(Some(owner)) if owner == old_fp => {
+                    sqlx::query("UPDATE user_devices SET auth_session_fingerprint=$3,updated_at=NOW() WHERE did=$1 AND id=$2 AND auth_session_fingerprint IS NULL")
+                        .bind(did).bind(device_id).bind(&new_fp).execute(&mut *tx).await?;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    link_error = Some(anyhow::anyhow!(
+                        "legacy upgrade device ownership remains unverified"
+                    ));
+                }
+            }
+        }
+        // Never infer ownership from the account's current push-session pointer.
+        // A different live session can own that pointer while these devices still
+        // belong to the old grant being upgraded.
+        sqlx::query(
+            "UPDATE user_devices SET auth_session_fingerprint=$3,updated_at=NOW() WHERE did=$1 AND auth_session_fingerprint=$2",
+        )
+        .bind(did)
+        .bind(&old_fp)
+        .bind(&new_fp)
+        .execute(&mut *tx)
+        .await?;
+        // Also include already-migrated rows: a receipt retry must repair links
+        // after an earlier SQL commit whose Redis response was unavailable.
+        let owned_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM user_devices WHERE did=$1 AND auth_session_fingerprint=$2",
+        )
+        .bind(did)
+        .bind(&new_fp)
+        .fetch_all(&mut *tx)
+        .await?;
+        for device_id in owned_ids {
+            let repaired: redis::RedisResult<i32> = redis::Script::new(
+                r#"
+                if redis.call('EXISTS',KEYS[4]) == 1 or redis.call('EXISTS',KEYS[5]) == 1
+                  or redis.call('EXISTS',KEYS[6]) == 0 then return 0 end
+                local owner=redis.call('GET',KEYS[1])
+                if owner and owner ~= ARGV[2] then redis.call('SREM',ARGV[5] .. owner,ARGV[3]) end
+                redis.call('SET',KEYS[1],ARGV[2],'EX',ARGV[4])
+                redis.call('SREM',KEYS[2],ARGV[3])
+                redis.call('SADD',KEYS[3],ARGV[3]); redis.call('EXPIRE',KEYS[3],ARGV[4])
+                return 1
+            "#,
+            )
+            .key(format!(
+                "{}push_device_session:{}",
+                store.key_prefix(),
+                device_id
+            ))
+            .key(format!(
+                "{}push_session_devices:{}",
+                store.key_prefix(),
+                old_fp
+            ))
+            .key(format!(
+                "{}push_session_devices:{}",
+                store.key_prefix(),
+                new_fp
+            ))
+            .key(store.retired_key(new_session_id))
+            .key(store.account_erasure_key(did))
+            .key(store.session_key(did, new_session_id))
+            .arg(&old_fp)
+            .arg(&new_fp)
+            .arg(device_id.to_string())
+            .arg(crate::services::SESSION_INDEX_TTL_SECONDS)
+            .arg(format!("{}push_session_devices:", store.key_prefix()))
+            .invoke_async(&mut conn)
+            .await;
+            if !matches!(repaired, Ok(1)) {
+                link_error = Some(anyhow::anyhow!(
+                    "upgrade device-link repair remains incomplete"
+                ));
+            }
+        }
+        // Do not roll proven ownership back merely because link repair failed:
+        // the successor is already live, and its logout must own these devices.
         tx.commit().await?;
+        if let Some(error) = link_error {
+            return Err(error);
+        }
 
         Ok(affected)
     }
@@ -278,6 +436,9 @@ impl PushRegistry {
         )
         .await?;
 
+        self.validate_session_write(&session.did, &session.id.to_string())
+            .await?;
+        let auth_generation = self.next_auth_generation().await?;
         let raw_session = session.id.to_string();
         let session_fp = normalize_or_hash_session_fingerprint(&raw_session);
         let session_id_bind: &str = if self.phase2_writers {
@@ -297,7 +458,7 @@ impl PushRegistry {
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, NULL, 1, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, $5, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
             SET session_id = EXCLUDED.session_id,
@@ -314,6 +475,7 @@ impl PushRegistry {
         .bind(session_id_bind)
         .bind(&session_fp)
         .bind(&session.pds_url)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
 
@@ -382,18 +544,20 @@ impl PushRegistry {
                 app_id,
                 service_did,
                 age_restricted,
+                auth_session_fingerprint,
                 is_active,
                 last_registered_at,
                 last_error,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), NULL, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), NULL, NOW())
             ON CONFLICT (device_token, did)
             DO UPDATE
             SET platform = EXCLUDED.platform,
                 app_id = EXCLUDED.app_id,
                 service_did = EXCLUDED.service_did,
                 age_restricted = EXCLUDED.age_restricted,
+                auth_session_fingerprint = EXCLUDED.auth_session_fingerprint,
                 is_active = TRUE,
                 last_registered_at = NOW(),
                 last_invalidated_at = NULL,
@@ -407,6 +571,7 @@ impl PushRegistry {
         .bind(&input.app_id)
         .bind(&input.service_did)
         .bind(input.age_restricted.unwrap_or(false))
+        .bind(&session_fp)
         .execute(&mut *tx)
         .await?;
         // Deterministic inactive-device cleanup: bound total retained inactive rows per account
@@ -444,30 +609,46 @@ impl PushRegistry {
         )
         .await?;
 
+        self.validate_session_write(&session.did, &session.id.to_string())
+            .await?;
+        let auth_generation = self.next_auth_generation().await?;
+        let raw_session = session.id.to_string();
+        let session_fp = normalize_or_hash_session_fingerprint(&raw_session);
+        let session_id_bind: &str = if self.phase2_writers {
+            &session_fp
+        } else {
+            &raw_session
+        };
         sqlx::query(
             r#"
             INSERT INTO push_accounts (
                 account_did,
                 session_id,
+                session_fingerprint,
                 pds_url,
                 auth_revoked_at,
                 auth_generation,
                 last_seen_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, NULL, 1, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, NULL, $6, NOW(), NOW())
             ON CONFLICT (account_did)
             DO UPDATE
-            SET pds_url = EXCLUDED.pds_url,
+            SET session_id = EXCLUDED.session_id,
+                pds_url = EXCLUDED.pds_url,
                 auth_revoked_at = NULL,
                 last_seen_at = NOW(),
                 updated_at = NOW()
-            WHERE push_accounts.session_id = EXCLUDED.session_id
+            WHERE push_accounts.session_fingerprint = EXCLUDED.session_fingerprint
+               OR push_accounts.session_id = $5
             "#,
         )
         .bind(&session.did)
-        .bind(session.id.to_string())
+        .bind(session_id_bind)
+        .bind(&session_fp)
         .bind(&session.pds_url)
+        .bind(&raw_session)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
 
@@ -494,34 +675,42 @@ impl PushRegistry {
         Ok(())
     }
 
-    pub async fn deactivate_invalid_token(
+    /// Apply a late APNs rejection only to the exact device and authorization
+    /// epoch which produced the send. Erasure and fresh registration can occur
+    /// after the send transaction releases its lock, even for the same token.
+    pub async fn deactivate_invalid_token_if_current(
         &self,
         did: &str,
+        device_id: uuid::Uuid,
         device_token: &str,
+        auth_generation: i64,
         error: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if auth_generation <= 0 {
+            return Ok(false);
+        }
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_and_device_lock(&mut tx, did, device_token)
             .await?;
-        sqlx::query(
-            r#"
-            UPDATE user_devices
-            SET is_active = FALSE,
-                last_error = $3,
-                last_invalidated_at = NOW(),
-                updated_at = NOW()
-            WHERE did = $1
-              AND device_token = $2
-            "#,
-        )
-        .bind(did)
-        .bind(device_token)
-        .bind(error)
-        .execute(&mut *tx)
-        .await?;
+        let changed = sqlx::query(
+            "UPDATE user_devices d SET is_active=FALSE,last_error=$5,last_invalidated_at=NOW(),updated_at=NOW() \
+             FROM push_accounts p WHERE d.did=$1 AND d.id=$2 AND d.device_token=$3 AND d.is_active \
+             AND p.account_did=d.did AND p.auth_generation=$4 AND p.auth_revoked_at IS NULL"
+        ).bind(did).bind(device_id).bind(device_token).bind(auth_generation).bind(error)
+            .execute(&mut *tx).await?.rows_affected() != 0;
+        if changed {
+            // Keep unenrollment in the same lock/epoch boundary as invalidation.
+            // A separate DID-only follow-up could erase a new login's poll row.
+            sqlx::query(
+                "DELETE FROM chat_poll_state WHERE account_did=$1 AND NOT EXISTS \
+                (SELECT 1 FROM user_devices WHERE did=$1 AND is_active)",
+            )
+            .bind(did)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
-
-        Ok(())
+        Ok(changed)
     }
 
     pub async fn list_active_registrations(&self, did: &str) -> Result<Vec<RegistrationRow>> {
@@ -569,31 +758,38 @@ impl PushRegistry {
         Ok(row.is_some())
     }
 
-    /// Records the APNs environment ("production"/"sandbox") that a device
-    /// token was actually delivered on, learned via try-and-learn in
-    /// `ApnsDelivery::send`. Called only when it differs from what's on file.
-    pub async fn set_apns_environment(
+    /// Persist a learned APNs environment only for the original device and
+    /// authorization epoch. A late response cannot alter a replacement row.
+    pub async fn set_apns_environment_if_current(
         &self,
         did: &str,
+        device_id: uuid::Uuid,
         device_token: &str,
+        auth_generation: i64,
         env: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE user_devices
-            SET apns_environment = $3,
-                updated_at = NOW()
-            WHERE did = $1
-              AND device_token = $2
-            "#,
+    ) -> Result<bool> {
+        if auth_generation <= 0 {
+            return Ok(false);
+        }
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_and_device_lock(&mut tx, did, device_token)
+            .await?;
+        let changed = sqlx::query(
+            "UPDATE user_devices d SET apns_environment=$5,updated_at=NOW() FROM push_accounts p \
+             WHERE d.did=$1 AND d.id=$2 AND d.device_token=$3 AND d.is_active \
+             AND p.account_did=d.did AND p.auth_generation=$4 AND p.auth_revoked_at IS NULL",
         )
         .bind(did)
+        .bind(device_id)
         .bind(device_token)
+        .bind(auth_generation)
         .bind(env)
-        .execute(&self.db_pool)
-        .await?;
-
-        Ok(())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            != 0;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     pub async fn get_push_account(&self, did: &str) -> Result<Option<PushAccountRow>> {
@@ -618,17 +814,19 @@ impl PushRegistry {
     pub async fn mark_auth_revoked(&self, did: &str) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let auth_generation = self.next_auth_generation().await?;
 
         sqlx::query(
             r#"
             UPDATE push_accounts
             SET auth_revoked_at = NOW(),
-                auth_generation = push_accounts.auth_generation + 1,
+                auth_generation = $2,
                 updated_at = NOW()
             WHERE account_did = $1
             "#,
         )
         .bind(did)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
 
@@ -648,13 +846,14 @@ impl PushRegistry {
     pub async fn mark_auth_revoked_if_session(&self, did: &str, session_id: &str) -> Result<u64> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let auth_generation = self.next_auth_generation().await?;
 
         let session_fp = normalize_or_hash_session_fingerprint(session_id);
         let result = sqlx::query(
             r#"
             UPDATE push_accounts
             SET auth_revoked_at = NOW(),
-                auth_generation = push_accounts.auth_generation + 1,
+                auth_generation = $4,
                 updated_at = NOW()
             WHERE account_did = $1
               AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2)
@@ -663,6 +862,7 @@ impl PushRegistry {
         .bind(did)
         .bind(&session_fp)
         .bind(session_id)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
         let affected = result.rows_affected();
@@ -677,34 +877,289 @@ impl PushRegistry {
         Ok(affected)
     }
 
-    pub async fn clear_auth_revoked(&self, did: &str) -> Result<()> {
+    /// Row ID of a device registration, used to link it to the registering session.
+    pub async fn device_row_id(&self, did: &str, device_token: &str) -> Result<Option<uuid::Uuid>> {
+        Ok(
+            sqlx::query_scalar("SELECT id FROM user_devices WHERE did = $1 AND device_token = $2")
+                .bind(did)
+                .bind(device_token)
+                .fetch_optional(&self.db_pool)
+                .await?,
+        )
+    }
+
+    /// Registration's Redis link is a separate write after SQL commit. Recheck
+    /// the actual SQL owner under the account lock so a delayed old request cannot
+    /// overwrite a newer registration or recreate a deleted device's link.
+    pub async fn link_device_session(
+        &self,
+        did: &str,
+        device_id: uuid::Uuid,
+        raw_session_id: &str,
+    ) -> Result<()> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
-        sqlx::query(
+        self.validate_session_write(did, raw_session_id).await?;
+        let fp = normalize_or_hash_session_fingerprint(raw_session_id);
+        let owns:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_devices WHERE did=$1 AND id=$2 AND is_active=TRUE AND auth_session_fingerprint=$3)")
+            .bind(did).bind(device_id).bind(&fp).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(
+            owns,
+            "device registration ownership changed before link write"
+        );
+        super::session_devices::link(self.required_auth_store()?, device_id, raw_session_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn active_device_ids(&self, did: &str) -> Result<Vec<uuid::Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM user_devices WHERE did = $1 AND is_active = TRUE ORDER BY updated_at DESC",
+        )
+        .bind(did)
+        .fetch_all(&self.db_pool)
+        .await?)
+    }
+
+    /// Ends one session's notification access in a single transaction: deactivates the
+    /// devices that session registered and, only if it is the account's push session,
+    /// hands the account over to `handover_fp` (a live session's fingerprint) or revokes
+    /// it. Preferences, mutes and subscriptions are deliberately left in place.
+    pub async fn sign_out_session(
+        &self,
+        did: &str,
+        raw_session_id: &str,
+        own_device_ids: &[uuid::Uuid],
+        handover_fp: Option<&str>,
+    ) -> Result<SignOutPushOutcome> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let session_fp = normalize_or_hash_session_fingerprint(raw_session_id);
+        let auth_generation = self.next_auth_generation().await?;
+
+        let devices_deactivated = if own_device_ids.is_empty() {
+            0
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE user_devices
+                SET is_active = FALSE,
+                    last_invalidated_at = NOW(),
+                    last_error = 'session_signed_out',
+                    updated_at = NOW()
+                WHERE did = $1 AND id = ANY($2) AND is_active = TRUE
+                "#,
+            )
+            .bind(did)
+            .bind(own_device_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+
+        let is_push_session: bool = sqlx::query_scalar(
             r#"
-            UPDATE push_accounts
-            SET auth_revoked_at = NULL,
-                auth_generation = push_accounts.auth_generation + 1,
-                updated_at = NOW()
-            WHERE account_did = $1
+            SELECT EXISTS (
+                SELECT 1 FROM push_accounts
+                WHERE account_did = $1
+                  AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2)
+            )
             "#,
         )
         .bind(did)
-        .execute(&mut *tx)
+        .bind(&session_fp)
+        .bind(raw_session_id)
+        .fetch_one(&mut *tx)
         .await?;
+
+        let account = match (is_push_session, handover_fp) {
+            (false, _) => PushAccountSignOut::NotPushSession,
+            (true, Some(next_fp)) => {
+                // Only a fingerprint is ever written here, regardless of phase2_writers.
+                sqlx::query(
+                    r#"
+                    UPDATE push_accounts
+                    SET session_id = $2,
+                        session_fingerprint = $2,
+                        auth_revoked_at = NULL,
+                        auth_generation = $3,
+                        updated_at = NOW()
+                    WHERE account_did = $1
+                    "#,
+                )
+                .bind(did)
+                .bind(next_fp)
+                .bind(auth_generation)
+                .execute(&mut *tx)
+                .await?;
+                PushAccountSignOut::HandedOver
+            }
+            (true, None) => {
+                sqlx::query(
+                    r#"
+                    UPDATE push_accounts
+                    SET auth_revoked_at = NOW(),
+                        auth_generation = $2,
+                        updated_at = NOW()
+                    WHERE account_did = $1
+                    "#,
+                )
+                .bind(did)
+                .bind(auth_generation)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM chat_poll_state WHERE account_did = $1")
+                    .bind(did)
+                    .execute(&mut *tx)
+                    .await?;
+                PushAccountSignOut::Revoked
+            }
+        };
+
         tx.commit().await?;
-        Ok(())
+        Ok(SignOutPushOutcome {
+            devices_deactivated,
+            account,
+        })
+    }
+
+    /// Retryable logout effects. Read ownership while holding the same account
+    /// lock as registration; compare-delete links only after SQL commit succeeds.
+    pub async fn cleanup_retired_session(
+        &self,
+        did: &str,
+        leaving_fp: &str,
+    ) -> Result<SignOutPushOutcome> {
+        let store = self.required_auth_store()?;
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let ids: Vec<(uuid::Uuid, bool, Option<String>)> = sqlx::query_as(
+            "SELECT id,is_active,auth_session_fingerprint FROM user_devices WHERE did=$1",
+        )
+        .bind(did)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut conn = store.redis_connection();
+        let mut owned = Vec::new();
+        let mut handover = None;
+        for (id, active, sql_owner) in ids {
+            let owner = match sql_owner {
+                Some(fp) => Some(fp),
+                None => {
+                    redis::cmd("GET")
+                        .arg(format!("{}push_device_session:{}", store.key_prefix(), id))
+                        .query_async::<_, Option<String>>(&mut conn)
+                        .await?
+                }
+            };
+            anyhow::ensure!(
+                !active || owner.is_some(),
+                "active device ownership is unproven"
+            );
+            match owner {
+                Some(fp) if fp == leaving_fp => owned.push(id),
+                Some(fp) if active => {
+                    // A Redis upgrade may have retired a predecessor before SQL
+                    // ownership migration committed. Do not guess that this row
+                    // belongs to the caller, but do not call device cleanup
+                    // complete while its current owner is no longer locally live.
+                    let other = store.resolve_session_fingerprint_local(did, &fp).await?;
+                    let Some(other) = other else {
+                        anyhow::bail!("active device ownership requires lifecycle reconciliation");
+                    };
+                    anyhow::ensure!(
+                        store
+                            .read_session_local(did, other.session_id.as_str())
+                            .await?
+                            .is_some(),
+                        "active device owner is retired or fenced"
+                    );
+                    if handover.is_none() {
+                        handover = Some(fp);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Private APNs registration data is removed, not merely made inactive.
+        // Historical delivery UUIDs have no device FK and remain account-owned
+        // replay metadata until the final-session account erasure.
+        let legacy_preferences: bool =
+            sqlx::query_scalar("SELECT to_regclass('notification_preferences') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if legacy_preferences {
+            sqlx::query("DELETE FROM notification_preferences WHERE user_id=ANY($1)")
+                .bind(&owned)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let devices_deactivated =
+            sqlx::query("DELETE FROM user_devices WHERE did=$1 AND id=ANY($2)")
+                .bind(did)
+                .bind(&owned)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        let generation = self.next_auth_generation().await?;
+        let changed = if let Some(next) = &handover {
+            sqlx::query("UPDATE push_accounts SET session_id=$3,session_fingerprint=$3,auth_revoked_at=NULL,auth_generation=$4,updated_at=NOW() WHERE account_did=$1 AND COALESCE(session_fingerprint,encode(sha256(session_id::bytea),'hex'))=$2")
+                .bind(did).bind(leaving_fp).bind(next).bind(generation).execute(&mut *tx).await?.rows_affected()
+        } else {
+            let changed = sqlx::query("UPDATE push_accounts SET auth_revoked_at=NOW(),auth_generation=$3,updated_at=NOW() WHERE account_did=$1 AND COALESCE(session_fingerprint,encode(sha256(session_id::bytea),'hex'))=$2")
+                .bind(did).bind(leaving_fp).bind(generation).execute(&mut *tx).await?.rows_affected();
+            if changed > 0 {
+                sqlx::query("DELETE FROM chat_poll_state WHERE account_did=$1")
+                    .bind(did)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            changed
+        };
+        tx.commit().await?;
+        for id in &owned {
+            let _: i32 = redis::Script::new("local owner=redis.call('GET',KEYS[1]); if owner then redis.call('SREM',ARGV[3] .. owner,ARGV[2]); redis.call('DEL',KEYS[1]); end; redis.call('SREM',KEYS[2],ARGV[2]); return 1")
+                .key(format!("{}push_device_session:{}",store.key_prefix(),id))
+                .key(format!("{}push_session_devices:{}",store.key_prefix(),leaving_fp))
+                .arg(leaving_fp).arg(id.to_string()).arg(format!("{}push_session_devices:",store.key_prefix())).invoke_async(&mut conn).await?;
+        }
+        let _: () = redis::cmd("DEL")
+            .arg(format!(
+                "{}push_session_devices:{}",
+                store.key_prefix(),
+                leaving_fp
+            ))
+            .query_async(&mut conn)
+            .await?;
+        let account = if changed == 0 {
+            PushAccountSignOut::NotPushSession
+        } else if handover.is_some() {
+            PushAccountSignOut::HandedOver
+        } else {
+            PushAccountSignOut::Revoked
+        };
+        Ok(SignOutPushOutcome {
+            devices_deactivated,
+            account,
+        })
+    }
+
+    pub async fn clear_auth_revoked(&self, did: &str) -> Result<()> {
+        anyhow::bail!("clearing revoked auth requires a live session proof")
     }
 
     pub async fn clear_auth_revoked_if_session(&self, did: &str, session_id: &str) -> Result<u64> {
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        self.validate_session_write(did, session_id).await?;
+        let auth_generation = self.next_auth_generation().await?;
         let session_fp = normalize_or_hash_session_fingerprint(session_id);
         let result = sqlx::query(
             r#"
             UPDATE push_accounts
             SET auth_revoked_at = NULL,
-                auth_generation = push_accounts.auth_generation + 1,
+                auth_generation = $4,
                 updated_at = NOW()
             WHERE account_did = $1 AND (session_fingerprint = $2 OR session_id = $3 OR session_id = $2)
             "#,
@@ -712,6 +1167,7 @@ impl PushRegistry {
         .bind(did)
         .bind(&session_fp)
         .bind(session_id)
+        .bind(auth_generation)
         .execute(&mut *tx)
         .await?;
         let affected = result.rows_affected();
@@ -744,6 +1200,10 @@ mod tests {
         let pool = Pool::<Postgres>::connect_lazy("postgres://localhost/test").unwrap();
         let registry = PushRegistry::new(pool, "did:web:push.catbird.blue".to_string());
 
+        assert!(
+            registry.required_auth_store().is_err(),
+            "unconfigured registry must never permit an authenticated write"
+        );
         assert_eq!(registry.service_did(), "did:web:push.catbird.blue");
         assert!(registry
             .validate_service_did("did:web:push.catbird.blue")
@@ -1688,5 +2148,16 @@ mod tests {
             ..valid.clone()
         };
         assert!(empty_app_id.validate().is_err());
+    }
+
+    #[test]
+    fn phase2_writers_default_on_and_only_explicit_false_disables() {
+        assert!(parse_phase2_writers(None));
+        assert!(parse_phase2_writers(Some("1")));
+        assert!(parse_phase2_writers(Some("true")));
+        assert!(parse_phase2_writers(Some("")));
+        assert!(!parse_phase2_writers(Some("0")));
+        assert!(!parse_phase2_writers(Some("false")));
+        assert!(!parse_phase2_writers(Some(" FALSE ")));
     }
 }

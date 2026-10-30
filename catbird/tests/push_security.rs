@@ -21,16 +21,19 @@ use std::sync::Arc;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
+#[path = "support/cleanup_auth.rs"]
+mod cleanup_auth;
+
 struct TestDb {
     admin_pool: Pool<Postgres>,
     db_name: String,
     pool: Pool<Postgres>,
+    auth_store: Arc<catbird::services::RedisAuthStore>,
 }
 
 impl TestDb {
     async fn new() -> Self {
-        let base_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
+        let base_url = cleanup_auth::disposable_url("DATABASE_URL", "postgres", 5432);
 
         let admin_pool = Pool::<Postgres>::connect(&base_url)
             .await
@@ -73,6 +76,7 @@ impl TestDb {
             admin_pool,
             db_name,
             pool,
+            auth_store: cleanup_auth::store().await,
         }
     }
 
@@ -85,6 +89,7 @@ impl TestDb {
         for sql in [
             include_str!("../migrations/20261002000100_chat_poll_catchup_hold.up.sql"),
             include_str!("../migrations/20261002000200_push_delivery_receipts.up.sql"),
+            include_str!("../migrations/20261008000100_device_auth_session.up.sql"),
         ] {
             sqlx::raw_sql(sql)
                 .execute(&self.pool)
@@ -109,9 +114,9 @@ impl Drop for TestDb {
     }
 }
 
-fn make_session(did: &str) -> CatbirdSession {
+async fn make_session(store: &catbird::services::RedisAuthStore, did: &str) -> CatbirdSession {
     let now = Utc::now();
-    CatbirdSession {
+    let session = CatbirdSession {
         id: Uuid::new_v4(),
         did: did.to_string(),
         handle: "user.test".to_string(),
@@ -123,17 +128,28 @@ fn make_session(did: &str) -> CatbirdSession {
         created_at: now,
         last_used_at: now,
         granted_scopes: vec!["atproto".to_string()],
-    }
+    };
+    cleanup_auth::seed(store, &session).await;
+    session
 }
 
-fn make_services(pool: Pool<Postgres>) -> PushServices {
+fn make_services(
+    pool: Pool<Postgres>,
+    auth_store: Arc<catbird::services::RedisAuthStore>,
+) -> PushServices {
     let mut config = PushConfig::default();
     config.service_did = Some("did:web:push.catbird.blue".to_string());
-    PushServices::new(pool, config).unwrap()
+    PushServices::new(pool, config)
+        .unwrap()
+        .with_auth_store(auth_store)
 }
 
-async fn make_test_app_state(pool: Pool<Postgres>, services: Arc<PushServices>) -> Arc<AppState> {
-    let config = catbird::config::AppConfig {
+async fn make_test_app_state(
+    pool: Pool<Postgres>,
+    services: Arc<PushServices>,
+    auth_store: Arc<catbird::services::RedisAuthStore>,
+) -> Arc<AppState> {
+    let mut config = catbird::config::AppConfig {
         server: catbird::config::ServerConfig {
             host: "127.0.0.1".into(),
             port: 3000,
@@ -164,11 +180,9 @@ async fn make_test_app_state(pool: Pool<Postgres>, services: Arc<PushServices>) 
         circle: Default::default(),
     };
     let http_client = reqwest::Client::new();
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let redis_client = redis::Client::open(redis_url.as_str()).unwrap();
-    let redis = redis::aio::ConnectionManager::new(redis_client)
-        .await
-        .expect("Redis connection manager failed");
+    config.redis.url = cleanup_auth::disposable_url("REDIS_URL", "redis", 6379);
+    config.redis.key_prefix = auth_store.key_prefix().into();
+    let redis = auth_store.redis_connection();
 
     Arc::new(AppState {
         config: Arc::new(config),
@@ -181,15 +195,35 @@ async fn make_test_app_state(pool: Pool<Postgres>, services: Arc<PushServices>) 
         catmos_jacquard_client: None,
         catmos_oauth_scopes: vec![],
         trusted_proxies: vec![],
-        auth_store: None,
+        auth_store: Some(auth_store),
         push: Some(services),
         dpop_nonce_cache: Arc::new(catbird::services::DpopNonceCache::new()),
-        session_encryption_key: None,
+        session_encryption_key: Some(cleanup_auth::KEY),
         active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
         session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         session_index_readiness: Arc::new(tokio::sync::Notify::new()),
     })
+}
+
+/// Simulates the fixture's complete preference restore after registration.
+async fn register(
+    services: &PushServices,
+    _store: &catbird::services::RedisAuthStore,
+    session: &CatbirdSession,
+    input: &RegisterPushInput,
+) -> anyhow::Result<()> {
+    services
+        .registry
+        .upsert_registration(session, input)
+        .await?;
+    if services.preferences.get(&session.did).await?.is_none() {
+        services
+            .preferences
+            .put(&session.did, &PushPreferencesDocument::default())
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -220,6 +254,13 @@ impl ObservingFakeApns {
     }
 }
 
+// A suppressed send or lost barrier partner must fail the fixture, not hang it.
+async fn wait_for_test_barrier(barrier: &Barrier) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait())
+        .await
+        .expect("push-security test barrier timed out");
+}
+
 #[async_trait::async_trait]
 impl ApnsSender for ObservingFakeApns {
     async fn send(
@@ -228,10 +269,10 @@ impl ApnsSender for ObservingFakeApns {
         notification: &ApnsNotification,
     ) -> anyhow::Result<&'static str> {
         if let Some(enter) = &self.enter_barrier {
-            enter.wait().await;
+            wait_for_test_barrier(enter).await;
         }
         if let Some(exit) = &self.exit_barrier {
-            exit.wait().await;
+            wait_for_test_barrier(exit).await;
         }
         if let Some(duration) = self.pause_duration {
             tokio::time::sleep(duration).await;
@@ -366,7 +407,8 @@ async fn test_true_concurrent_token_claims_race() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
-    let services = Arc::new(make_services(pool.clone()));
+    let auth_store = test_db.auth_store.clone();
+    let services = Arc::new(make_services(pool.clone(), auth_store.clone()));
 
     let shared_token = "1111222233334444555566667777888811112222333344445555666677778888";
     let concurrency = 8;
@@ -376,10 +418,11 @@ async fn test_true_concurrent_token_claims_race() {
     for i in 0..concurrency {
         let services = services.clone();
         let barrier = barrier.clone();
+        let auth_store = auth_store.clone();
         let did = format!("did:plc:concurrent_user_{}", i);
 
         handles.push(tokio::spawn(async move {
-            let session = make_session(&did);
+            let session = make_session(&auth_store, &did).await;
             let input = RegisterPushInput {
                 service_did: "did:web:push.catbird.blue".to_string(),
                 token: shared_token.to_string(),
@@ -387,11 +430,8 @@ async fn test_true_concurrent_token_claims_race() {
                 app_id: "blue.catbird".to_string(),
                 age_restricted: Some(false),
             };
-            barrier.wait().await;
-            services
-                .registry
-                .upsert_registration(&session, &input)
-                .await
+            wait_for_test_barrier(&barrier).await;
+            register(&services, &auth_store, &session, &input).await
         }));
     }
 
@@ -462,17 +502,20 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let mut fake_apns = ObservingFakeApns::new();
     fake_apns.pause_duration = Some(std::time::Duration::from_millis(3000));
     let fake_apns = Arc::new(fake_apns);
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let recipient_did = "did:plc:long_send_user";
     let token1 = "1111222233334444555566667777888811112222333344445555666677778888";
     let token2 = "9999888877776666555544443333222299998888777766665555444433332222";
-    let session = make_session(recipient_did);
+    let session = make_session(&auth_store, recipient_did).await;
 
     for token in &[token1, token2] {
         let reg_input = RegisterPushInput {
@@ -482,9 +525,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             app_id: "blue.catbird".to_string(),
             age_restricted: Some(false),
         };
-        services
-            .registry
-            .upsert_registration(&session, &reg_input)
+        register(&services, &auth_store, &session, &reg_input)
             .await
             .unwrap();
     }
@@ -509,7 +550,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-1', 'app.bsky.feed.like/1',
-                '{}'::jsonb, 1700000000, 'dedupe-1', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-1', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(recipient_did)
@@ -539,7 +580,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
 
     // Scenario A2: Explicit Heartbeat Race during Lock Acquisition / Multi-device delivery
     let recipient_did_a2 = "did:plc:heartbeat_race_user";
-    let session_a2 = make_session(recipient_did_a2);
+    let session_a2 = make_session(&auth_store, recipient_did_a2).await;
     for token in &[token1, token2] {
         let reg_input = RegisterPushInput {
             service_did: "did:web:push.catbird.blue".to_string(),
@@ -548,9 +589,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             app_id: "blue.catbird".to_string(),
             age_restricted: Some(false),
         };
-        services
-            .registry
-            .upsert_registration(&session_a2, &reg_input)
+        register(&services, &auth_store, &session_a2, &reg_input)
             .await
             .unwrap();
     }
@@ -572,7 +611,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-race', 'app.bsky.feed.like/race',
-                '{}'::jsonb, 1700000000, 'dedupe-race', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-race', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(recipient_did_a2)
@@ -615,7 +654,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
 
     // Scenario B: Two Claimers — Worker 1 loses lease to Worker 2 mid-flight
     let recipient_did_b = "did:plc:two_claimers_user";
-    let session_b = make_session(recipient_did_b);
+    let session_b = make_session(&auth_store, recipient_did_b).await;
     let token1_b = "1212121212121212121212121212121212121212121212121212121212121212";
     let token2_b = "3434343434343434343434343434343434343434343434343434343434343434";
     for token in &[token1_b, token2_b] {
@@ -626,9 +665,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             app_id: "blue.catbird".to_string(),
             age_restricted: Some(false),
         };
-        services
-            .registry
-            .upsert_registration(&session_b, &reg_input)
+        register(&services, &auth_store, &session_b, &reg_input)
             .await
             .unwrap();
     }
@@ -649,8 +686,10 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
         enter_b.clone(),
         exit_b.clone(),
     ));
-    let services_w1 = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns_w1.clone()));
-    let state_w1 = make_test_app_state(pool.clone(), services_w1.clone()).await;
+    let services_w1 = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns_w1.clone()),
+    );
+    let state_w1 = make_test_app_state(pool.clone(), services_w1.clone(), auth_store.clone()).await;
 
     // Enqueue a second event
     sqlx::query(
@@ -660,7 +699,7 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-2', 'app.bsky.feed.like/2',
-                '{}'::jsonb, 1700000001, 'dedupe-2', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-2', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(recipient_did_b)
@@ -673,19 +712,19 @@ async fn test_long_send_two_claimers_and_heartbeat_cas() {
         tokio::spawn(async move { s1_clone.process_queue_batch(&st1_clone).await });
 
     // Wait for Worker 1 to start sending device 1
-    enter_b.wait().await;
+    wait_for_test_barrier(&enter_b).await;
     // While Worker 1 is paused on device 1, simulate lease expiration and Worker 2 stealing the lease
     sqlx::query("UPDATE push_event_queue SET leased_until = NOW() - INTERVAL '1 second' WHERE dedupe_key = 'dedupe-2'")
         .execute(&pool)
         .await
         .unwrap();
 
-    let services_w2 = Arc::new(make_services(pool.clone()));
+    let services_w2 = Arc::new(make_services(pool.clone(), auth_store.clone()));
     let claimed_w2 = services_w2.queue.claim_ready(1).await.unwrap();
     let row_w2 = claimed_w2[0].clone();
     assert_eq!(row_w2.event_cid, "bafy-cid-2");
 
-    exit_b.wait().await;
+    wait_for_test_barrier(&exit_b).await;
     let res_w1 = worker1_handle.await.unwrap();
     assert!(res_w1.is_ok());
 
@@ -716,14 +755,17 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let fake_apns = Arc::new(ObservingFakeApns::new());
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let recipient_did = "did:plc:user_barrier_revocation_test";
     let token = "2222333344445555666677778888999922223333444455556666777788889999";
-    let session = make_session(recipient_did);
+    let session = make_session(&auth_store, recipient_did).await;
 
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
@@ -732,9 +774,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session, &reg_input)
+    register(&services, &auth_store, &session, &reg_input)
         .await
         .unwrap();
 
@@ -758,7 +798,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-rev1', 'app.bsky.feed.like/rev1',
-                '{}'::jsonb, 1700000000, 'dedupe-rev1', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rev1', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(recipient_did)
@@ -774,16 +814,18 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
     apns_barrier.sends = fake_apns.sends.clone();
     let apns_barrier = Arc::new(apns_barrier);
 
-    let services_barrier =
-        Arc::new(make_services(pool.clone()).with_apns_sender(apns_barrier.clone()));
-    let state_barrier = make_test_app_state(pool.clone(), services_barrier.clone()).await;
+    let services_barrier = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(apns_barrier.clone()),
+    );
+    let state_barrier =
+        make_test_app_state(pool.clone(), services_barrier.clone(), auth_store.clone()).await;
     let worker_handle = tokio::spawn({
         let s = services_barrier.clone();
         let st = state_barrier.clone();
         async move { s.process_queue_batch(&st).await }
     });
 
-    enter_barrier.wait().await;
+    wait_for_test_barrier(&enter_barrier).await;
 
     let mutator_done = Arc::new(AtomicBool::new(false));
     let mutator_handle = tokio::spawn({
@@ -802,7 +844,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
         "mark_auth_revoked must be blocked by advisory lock while APNs send is in flight"
     );
 
-    exit_barrier.wait().await;
+    wait_for_test_barrier(&exit_barrier).await;
     worker_handle.await.unwrap().unwrap();
     mutator_handle.await.unwrap();
     assert!(mutator_done.load(Ordering::SeqCst));
@@ -817,7 +859,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-rev2', 'app.bsky.feed.like/rev2',
-                '{}'::jsonb, 1700000001, 'dedupe-rev2', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rev2', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(recipient_did)
@@ -832,8 +874,8 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
         "claim_ready must skip rows for revoked accounts"
     );
 
-    // User re-authenticates (clearing auth_revoked_at, but bumping auth_generation to 3)
-    let new_session = make_session(recipient_did);
+    // User re-authenticates, clearing revocation and issuing a new authorization epoch.
+    let new_session = make_session(&auth_store, recipient_did).await;
     services
         .registry
         .activate_account_session(
@@ -844,7 +886,7 @@ async fn test_mid_send_auth_revocation_serialization_barrier() {
         .await
         .unwrap();
 
-    // Now worker claims the row, but pre-send fence detects stale generation (1 != 3) and rejects it
+    // Now the pre-send fence rejects the row captured under the previous authorization epoch.
     let processed_reauth = services.process_queue_batch(&state).await.unwrap();
     assert_eq!(
         processed_reauth, 1,
@@ -864,15 +906,18 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let fake_apns = Arc::new(ObservingFakeApns::new());
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let subscriber_did = "did:plc:unsub_subscriber";
     let subject_did = "did:plc:author";
     let token = "3333444455556666777788889999000033334444555566667777888899990000";
-    let session = make_session(subscriber_did);
+    let session = make_session(&auth_store, subscriber_did).await;
 
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
@@ -881,9 +926,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session, &reg_input)
+    register(&services, &auth_store, &session, &reg_input)
         .await
         .unwrap();
 
@@ -919,7 +962,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'activity_post', 'bafy-cid-act1', 'app.bsky.feed.post/1',
-                '{}'::jsonb, 1700000000, 'dedupe-act1', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-act1', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(subscriber_did)
@@ -936,9 +979,11 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
     apns_barrier.sends = fake_apns.sends.clone();
     let apns_barrier = Arc::new(apns_barrier);
 
-    let services_barrier =
-        Arc::new(make_services(pool.clone()).with_apns_sender(apns_barrier.clone()));
-    let state_barrier = make_test_app_state(pool.clone(), services_barrier.clone()).await;
+    let services_barrier = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(apns_barrier.clone()),
+    );
+    let state_barrier =
+        make_test_app_state(pool.clone(), services_barrier.clone(), auth_store.clone()).await;
 
     let worker_handle = tokio::spawn({
         let s = services_barrier.clone();
@@ -946,7 +991,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
         async move { s.process_queue_batch(&st).await }
     });
 
-    enter_barrier.wait().await;
+    wait_for_test_barrier(&enter_barrier).await;
 
     // Mutator unsubscribes mid-flight
     let mutator_done = Arc::new(AtomicBool::new(false));
@@ -974,7 +1019,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
         "Unsubscribe must be blocked by advisory lock during APNs send"
     );
 
-    exit_barrier.wait().await;
+    wait_for_test_barrier(&exit_barrier).await;
     worker_handle.await.unwrap().unwrap();
     mutator_handle.await.unwrap();
     assert!(mutator_done.load(Ordering::SeqCst));
@@ -989,7 +1034,7 @@ async fn test_mid_send_activity_unsubscribe_serialization_barrier() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'activity_post', 'bafy-cid-act2', 'app.bsky.feed.post/2',
-                '{}'::jsonb, 1700000001, 'dedupe-act2', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-act2', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(subscriber_did)
@@ -1014,16 +1059,19 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let fake_apns = Arc::new(ObservingFakeApns::new());
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let user_did = "did:plc:mute_user";
     let actor_did = "did:plc:author";
     let thread_root = "at://did:plc:author/app.bsky.feed.post/root1";
     let token = "5555444455556666777788889999000055554444555566667777888899990000";
-    let session = make_session(user_did);
+    let session = make_session(&auth_store, user_did).await;
 
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
@@ -1032,9 +1080,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session, &reg_input)
+    register(&services, &auth_store, &session, &reg_input)
         .await
         .unwrap();
 
@@ -1059,7 +1105,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
             thread_root_uri, event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'reply', 'bafy-cid-rep1', 'app.bsky.feed.post/rep1',
-                $3, '{}'::jsonb, 1700000000, 'dedupe-rep1', NOW(), 1)
+                $3, '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rep1', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(user_did)
@@ -1077,9 +1123,11 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
     apns_barrier.sends = fake_apns.sends.clone();
     let apns_barrier = Arc::new(apns_barrier);
 
-    let services_barrier =
-        Arc::new(make_services(pool.clone()).with_apns_sender(apns_barrier.clone()));
-    let state_barrier = make_test_app_state(pool.clone(), services_barrier.clone()).await;
+    let services_barrier = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(apns_barrier.clone()),
+    );
+    let state_barrier =
+        make_test_app_state(pool.clone(), services_barrier.clone(), auth_store.clone()).await;
 
     let worker_handle = tokio::spawn({
         let s = services_barrier.clone();
@@ -1087,7 +1135,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
         async move { s.process_queue_batch(&st).await }
     });
 
-    enter_barrier.wait().await;
+    wait_for_test_barrier(&enter_barrier).await;
 
     // Mutator mutes thread mid-flight
     let mutator_done = Arc::new(AtomicBool::new(false));
@@ -1108,7 +1156,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
         "mute_thread must be blocked by advisory lock during APNs send"
     );
 
-    exit_barrier.wait().await;
+    wait_for_test_barrier(&exit_barrier).await;
     worker_handle.await.unwrap().unwrap();
     mutator_handle.await.unwrap();
     assert!(mutator_done.load(Ordering::SeqCst));
@@ -1123,7 +1171,7 @@ async fn test_mid_send_thread_mute_serialization_barrier() {
             thread_root_uri, event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, $2, 'reply', 'bafy-cid-rep2', 'app.bsky.feed.post/rep2',
-                $3, '{}'::jsonb, 1700000001, 'dedupe-rep2', NOW(), 1)
+                $3, '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-rep2', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(user_did)
@@ -1149,14 +1197,17 @@ async fn test_enqueue_before_logout_claim_after_reauth() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let fake_apns = Arc::new(ObservingFakeApns::new());
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let recipient_did = "did:plc:user_stale_reauth_test";
     let token = "7777888899990000111122223333444477778888999900001111222233334444";
-    let session = make_session(recipient_did);
+    let session = make_session(&auth_store, recipient_did).await;
 
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
@@ -1165,9 +1216,7 @@ async fn test_enqueue_before_logout_claim_after_reauth() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session, &reg_input)
+    register(&services, &auth_store, &session, &reg_input)
         .await
         .unwrap();
 
@@ -1183,7 +1232,7 @@ async fn test_enqueue_before_logout_claim_after_reauth() {
     .await
     .unwrap();
 
-    // Enqueue push event BEFORE logout (generation 1)
+    // Enqueue under the current authorization epoch BEFORE logout.
     sqlx::query(
         r#"
         INSERT INTO push_event_queue (
@@ -1191,7 +1240,7 @@ async fn test_enqueue_before_logout_claim_after_reauth() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:actor', 'like', 'bafy-cid-stale', 'app.bsky.feed.like/stale',
-                '{}'::jsonb, 1700000000, 'dedupe-stale', NOW(), 1)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-stale', NOW(), (SELECT auth_generation FROM push_accounts WHERE account_did = $1))
         "#,
     )
     .bind(recipient_did)
@@ -1199,15 +1248,15 @@ async fn test_enqueue_before_logout_claim_after_reauth() {
     .await
     .unwrap();
 
-    // User logs out (auth revoked -> generation bumped to 2)
+    // User logs out, invalidating the previous authorization epoch.
     services
         .registry
         .mark_auth_revoked(recipient_did)
         .await
         .unwrap();
 
-    // User logs in again / re-authenticates (generation bumped to 3, auth_revoked_at cleared)
-    let new_session = make_session(recipient_did);
+    // User logs in again, issuing a fresh authorization epoch and clearing revocation.
+    let new_session = make_session(&auth_store, recipient_did).await;
     services
         .registry
         .activate_account_session(
@@ -1246,13 +1295,18 @@ async fn test_concurrent_quota_final_slot_race_and_fanout() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let mut config = PushConfig::default();
     config.service_did = Some("did:web:push.catbird.blue".to_string());
     config.max_active_devices_per_account = 2;
     config.max_inactive_devices_per_account = 3;
     config.max_fanout_per_notification = 2;
-    let services = Arc::new(PushServices::new(pool.clone(), config).unwrap());
+    let services = Arc::new(
+        PushServices::new(pool.clone(), config)
+            .unwrap()
+            .with_auth_store(auth_store.clone()),
+    );
 
     let did = "did:plc:quota_race_user";
     let concurrency = 10;
@@ -1262,10 +1316,11 @@ async fn test_concurrent_quota_final_slot_race_and_fanout() {
     for i in 0..concurrency {
         let services = services.clone();
         let barrier = barrier.clone();
+        let auth_store = auth_store.clone();
         let token = format!("quota_token_{:064}", i);
 
         handles.push(tokio::spawn(async move {
-            let session = make_session(did);
+            let session = make_session(&auth_store, did).await;
             let input = RegisterPushInput {
                 service_did: "did:web:push.catbird.blue".to_string(),
                 token,
@@ -1273,11 +1328,8 @@ async fn test_concurrent_quota_final_slot_race_and_fanout() {
                 app_id: "blue.catbird".to_string(),
                 age_restricted: Some(false),
             };
-            barrier.wait().await;
-            services
-                .registry
-                .upsert_registration(&session, &input)
-                .await
+            wait_for_test_barrier(&barrier).await;
+            register(&services, &auth_store, &session, &input).await
         }));
     }
 
@@ -1330,7 +1382,8 @@ async fn test_strict_moderation_validation_and_cache_preservation() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
-    let services = make_services(pool.clone());
+    let auth_store = test_db.auth_store.clone();
+    let services = make_services(pool.clone(), auth_store.clone());
 
     // 1. Strict parser validation of malformed types
     assert!(ModerationVerdict::try_from_viewer_json(Some(&json!({"muted": null}))).is_err());
@@ -1371,7 +1424,7 @@ async fn test_strict_moderation_validation_and_cache_preservation() {
     let recipient_did = "did:plc:mod_recipient";
     let actor_did = "did:plc:mod_actor";
     let token = "4444555566667777888899990000111144445555666677778888999900001111";
-    let session = make_session(recipient_did);
+    let session = make_session(&auth_store, recipient_did).await;
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
         token: token.to_string(),
@@ -1379,9 +1432,7 @@ async fn test_strict_moderation_validation_and_cache_preservation() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session, &reg_input)
+    register(&services, &auth_store, &session, &reg_input)
         .await
         .unwrap();
 
@@ -1431,8 +1482,9 @@ async fn test_strict_moderation_validation_and_cache_preservation() {
         .mount(&mock_pds)
         .await;
 
-    let mut session_live = make_session(recipient_did);
+    let mut session_live = make_session(&auth_store, recipient_did).await;
     session_live.pds_url = mock_pds.uri();
+    cleanup_auth::seed(&auth_store, &session_live).await;
     services
         .registry
         .activate_account_session(
@@ -1442,7 +1494,8 @@ async fn test_strict_moderation_validation_and_cache_preservation() {
         )
         .await
         .unwrap();
-    let state = make_test_app_state(pool.clone(), Arc::new(services.clone())).await;
+    let state =
+        make_test_app_state(pool.clone(), Arc::new(services.clone()), auth_store.clone()).await;
 
     // Start live fetch in background task
     let mod_resolver = services.moderation.clone();
@@ -1485,7 +1538,8 @@ async fn test_fenced_lease_expiry_and_false_cas() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
-    let queue = make_services(pool.clone()).queue;
+    let auth_store = test_db.auth_store.clone();
+    let queue = make_services(pool.clone(), auth_store.clone()).queue;
 
     let recipient_did = "did:plc:cas_test_user";
     sqlx::query(
@@ -1564,14 +1618,17 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let fake_apns = Arc::new(ObservingFakeApns::new());
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let recipient_did = "did:plc:mid_poll_reauth_user";
     let token = "1111222233334444555566667777888811112222333344445555666677778888";
-    let session_1 = make_session(recipient_did);
+    let session_1 = make_session(&auth_store, recipient_did).await;
 
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
@@ -1580,9 +1637,7 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session_1, &reg_input)
+    register(&services, &auth_store, &session_1, &reg_input)
         .await
         .unwrap();
 
@@ -1606,8 +1661,16 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(captured_gen, 1, "Initial account generation must be 1");
-    assert_eq!(captured_session_id, session_1.id.to_string());
+    assert!(
+        captured_gen > 0,
+        "Initial account generation must be issued"
+    );
+    // Phase-2 writers (the default) store only the non-replayable fingerprint, never the bearer.
+    assert_eq!(
+        captured_session_id,
+        catbird::services::push::registry::session_fingerprint(&session_1.id.to_string())
+    );
+    assert_ne!(captured_session_id, session_1.id.to_string());
 
     // Mid-poll: user logs out and re-authenticates with a new session while network call is in flight
     services
@@ -1615,7 +1678,7 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
         .mark_auth_revoked(recipient_did)
         .await
         .unwrap();
-    let session_2 = make_session(recipient_did);
+    let session_2 = make_session(&auth_store, recipient_did).await;
     services
         .registry
         .activate_account_session(recipient_did, &session_2.id.to_string(), &session_2.pds_url)
@@ -1628,12 +1691,12 @@ async fn test_mid_poll_reauth_stale_event_rejected() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        current_gen, 3,
-        "Account generation after logout + reauth must be 3"
+    assert!(
+        current_gen > captured_gen,
+        "Reauth must issue a newer generation"
     );
 
-    // Network call completes; event is constructed using the pre-network captured generation (1)
+    // Network call completes using the authorization epoch captured before the call.
     let chat_event = catbird::services::chat_poll::types::ChatPushEvent {
         recipient_did: recipient_did.to_string(),
         sender_did: "did:plc:chat_sender".to_string(),
@@ -1693,14 +1756,17 @@ async fn test_firehose_candidate_generation_and_reauth_fence() {
     let test_db = TestDb::new().await;
     test_db.run_hardening_migration().await;
     let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
 
     let fake_apns = Arc::new(ObservingFakeApns::new());
-    let services = Arc::new(make_services(pool.clone()).with_apns_sender(fake_apns.clone()));
-    let state = make_test_app_state(pool.clone(), services.clone()).await;
+    let services = Arc::new(
+        make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake_apns.clone()),
+    );
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
 
     let recipient_did = "did:plc:firehose_reauth_user";
     let token = "5555666677778888999900001111222255556666777788889999000011112222";
-    let session = make_session(recipient_did);
+    let session = make_session(&auth_store, recipient_did).await;
 
     let reg_input = RegisterPushInput {
         service_did: "did:web:push.catbird.blue".to_string(),
@@ -1709,9 +1775,7 @@ async fn test_firehose_candidate_generation_and_reauth_fence() {
         app_id: "blue.catbird".to_string(),
         age_restricted: Some(false),
     };
-    services
-        .registry
-        .upsert_registration(&session, &reg_input)
+    register(&services, &auth_store, &session, &reg_input)
         .await
         .unwrap();
 
@@ -1734,9 +1798,9 @@ async fn test_firehose_candidate_generation_and_reauth_fence() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(producing_gen, 1);
+    assert!(producing_gen > 0);
 
-    // Firehose enqueues candidate with explicit auth_generation 1
+    // Firehose enqueues the candidate with its explicitly captured authorization epoch.
     sqlx::query(
         r#"
         INSERT INTO push_event_queue (
@@ -1744,7 +1808,7 @@ async fn test_firehose_candidate_generation_and_reauth_fence() {
             event_record_json, event_timestamp, dedupe_key, available_at, auth_generation
         )
         VALUES ($1, 'did:plc:firehose_actor', 'like', 'bafy-firehose-1', 'app.bsky.feed.like/1',
-                '{}'::jsonb, 1700000000, 'dedupe-firehose-1', NOW(), $2)
+                '{}'::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT, 'dedupe-firehose-1', NOW(), $2)
         "#,
     )
     .bind(recipient_did)
@@ -1760,15 +1824,15 @@ async fn test_firehose_candidate_generation_and_reauth_fence() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(stored_gen, 1);
+    assert_eq!(stored_gen, producing_gen);
 
-    // User logs out and re-authenticates (gen -> 2 -> 3)
+    // User logs out and re-authenticates, invalidating the captured epoch.
     services
         .registry
         .mark_auth_revoked(recipient_did)
         .await
         .unwrap();
-    let session_2 = make_session(recipient_did);
+    let session_2 = make_session(&auth_store, recipient_did).await;
     services
         .registry
         .activate_account_session(recipient_did, &session_2.id.to_string(), &session_2.pds_url)
@@ -1824,4 +1888,1242 @@ fn test_shared_writer_lock_keys_identical() {
             "Account and device keys must have distinct domain separators"
         );
     }
+}
+
+/// A completed provider response can wait behind account erasure and a fresh
+/// login after the send transaction has released its lock. Exercise the real
+/// guarded outcome writers against that ordering, using real SQL and Redis.
+#[tokio::test]
+async fn late_apns_outcome_preserves_fresh_same_token_registration() {
+    let test_db = TestDb::new().await;
+    test_db.run_hardening_migration().await;
+    let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
+    let services = Arc::new(make_services(pool.clone(), auth_store.clone()));
+    let did = "did:plc:lateapnsfixture";
+    let token = "ab".repeat(32);
+    let input = RegisterPushInput {
+        service_did: "did:web:push.catbird.blue".into(),
+        token: token.clone(),
+        platform: "ios".into(),
+        app_id: "blue.catbird".into(),
+        age_restricted: Some(false),
+    };
+    let old = make_session(&auth_store, did).await;
+    register(&services, &auth_store, &old, &input)
+        .await
+        .unwrap();
+    let old_device = services
+        .registry
+        .device_row_id(did, &token)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_generation: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let captured = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let old_response = {
+        let services = services.clone();
+        let captured = captured.clone();
+        let resume = resume.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            wait_for_test_barrier(&captured).await;
+            wait_for_test_barrier(&resume).await;
+            let environment_changed = services
+                .registry
+                .set_apns_environment_if_current(
+                    did,
+                    old_device,
+                    &token,
+                    old_generation,
+                    "production",
+                )
+                .await
+                .unwrap();
+            let device_disabled = services
+                .registry
+                .deactivate_invalid_token_if_current(
+                    did,
+                    old_device,
+                    &token,
+                    old_generation,
+                    "apns_unregistered",
+                )
+                .await
+                .unwrap();
+            (environment_changed, device_disabled)
+        })
+    };
+    wait_for_test_barrier(&captured).await;
+    // Synthetic erasure of this fixture's three populated account tables. The
+    // production erasure inventory has separate all-table transaction fixtures.
+    use jacquard_oauth::authstore::ClientAuthStore;
+    let parsed_did: jacquard_common::types::did::Did =
+        jacquard_common::types::did::Did::new_owned(did.to_string()).unwrap();
+    auth_store
+        .delete_session(&parsed_did, &old.id.to_string())
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    catbird::services::push::lock::acquire_account_lock(&mut tx, did)
+        .await
+        .unwrap();
+    for query in [
+        "DELETE FROM push_preferences WHERE account_did=$1",
+        "DELETE FROM user_devices WHERE did=$1",
+        "DELETE FROM push_accounts WHERE account_did=$1",
+    ] {
+        sqlx::query(query)
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let fresh = make_session(&auth_store, did).await;
+    register(&services, &auth_store, &fresh, &input)
+        .await
+        .unwrap();
+    let new_device = services
+        .registry
+        .device_row_id(did, &token)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_generation: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(old_device, new_device);
+    assert!(new_generation > old_generation);
+    sqlx::query("INSERT INTO chat_poll_state(account_did,pds_host) VALUES($1,'fixture.invalid')")
+        .bind(did)
+        .execute(&pool)
+        .await
+        .unwrap();
+    wait_for_test_barrier(&resume).await;
+    assert_eq!(old_response.await.unwrap(), (false, false));
+    // Each component of the captured identity is independently required.
+    assert!(!services
+        .registry
+        .deactivate_invalid_token_if_current(
+            did,
+            old_device,
+            &token,
+            new_generation,
+            "stale_device"
+        )
+        .await
+        .unwrap());
+    assert!(!services
+        .registry
+        .deactivate_invalid_token_if_current(did, new_device, &token, old_generation, "stale_epoch")
+        .await
+        .unwrap());
+    let actual: (bool, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT is_active,apns_environment,last_error FROM user_devices WHERE id=$1",
+    )
+    .bind(new_device)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, (true, None, None));
+    let polling: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat_poll_state WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(polling, 1);
+    assert!(services
+        .registry
+        .set_apns_environment_if_current(did, new_device, &token, new_generation, "sandbox")
+        .await
+        .unwrap());
+    assert!(services
+        .registry
+        .deactivate_invalid_token_if_current(
+            did,
+            new_device,
+            &token,
+            new_generation,
+            "apns_unregistered"
+        )
+        .await
+        .unwrap());
+    let polling: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat_poll_state WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        polling, 0,
+        "current invalid token still unenrolls within the guarded transaction"
+    );
+}
+
+/// A restore marker cannot be removed or promoted by ordinary preference edits,
+/// and a marker written after decision evaluation is checked again before send.
+#[tokio::test]
+async fn restored_preferences_retry_and_survive_client_edits() {
+    use catbird::services::push::decision::QueueDisposition;
+    use catbird::services::push::types::PutPreferencesInput;
+    let test_db = TestDb::new().await;
+    test_db.run_hardening_migration().await;
+    let pool = test_db.pool.clone();
+    let auth_store = test_db.auth_store.clone();
+    let fake = Arc::new(ObservingFakeApns::new());
+    let services =
+        Arc::new(make_services(pool.clone(), auth_store.clone()).with_apns_sender(fake.clone()));
+    let state = make_test_app_state(pool.clone(), services.clone(), auth_store.clone()).await;
+    let did = "did:plc:restoregatefixture";
+    let actor = "did:plc:restoregateactor";
+    let session = make_session(&auth_store, did).await;
+    let input = RegisterPushInput {
+        service_did: "did:web:push.catbird.blue".into(),
+        token: "cd".repeat(32),
+        platform: "ios".into(),
+        app_id: "blue.catbird".into(),
+        age_restricted: Some(false),
+    };
+    register(&services, &auth_store, &session, &input)
+        .await
+        .unwrap();
+    let generation: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO actor_moderation_verdict(recipient_did,actor_did,verdict,display_label,generation) \
+        SELECT account_did,$2,'{}'::jsonb,'Synthetic',moderation_generation FROM push_accounts WHERE account_did=$1")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) \
+        VALUES($1,$2,'like','fixture-cid','app.bsky.feed.like/fixture','{}'::jsonb,$3,'fixture-restore-gate',$4)")
+        .bind(did).bind(actor).bind(Utc::now().timestamp()).bind(generation).execute(&pool).await.unwrap();
+    let row = services.queue.claim_ready(1).await.unwrap().pop().unwrap();
+    assert!(matches!(
+        services
+            .decision
+            .evaluate(&state, &services, &row)
+            .await
+            .unwrap(),
+        QueueDisposition::Deliver(_)
+    ));
+    let metadata = json!({
+        "version": 1, "source": "bluesky_login", "status": "Complete", "snapshotComplete": true,
+        "automaticPushReady": false, "authGeneration": generation,
+        "sourceStatus": {"actorPreferences":"Complete","notificationPreferences":"Complete","chatPreferences":"Complete","activitySubscriptions":"Complete","conversationMutes":"Complete","threadMutes":"Unsupported"},
+        "blockers":["threadMuteStateUnavailable"],"unknown":["threadMutes"],"unsupported":["threadMutes"],
+        "providerChatRequest":{"include":"all","push":true},
+        "appliedStatus":{"activitySubscriptions":"Complete","conversationMutes":"Complete"}
+    });
+    let mut tx = pool.begin().await.unwrap();
+    catbird::services::push::lock::acquire_account_lock(&mut tx, did)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE push_preferences SET preferences_json=jsonb_set(preferences_json,'{_catbirdRestore}',$2) WHERE account_did=$1")
+        .bind(did).bind(&metadata).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        services
+            .verify_pre_send_fence(
+                did,
+                actor,
+                &input.token,
+                "like",
+                None,
+                Some((row.id, row.lease_token.unwrap(), generation)),
+                Some(generation)
+            )
+            .await
+            .unwrap(),
+        PreSendFenceOutcome::RestorePending
+    );
+    assert!(matches!(
+        services
+            .decision
+            .evaluate(&state, &services, &row)
+            .await
+            .unwrap(),
+        QueueDisposition::Retry("preferences_restore_required")
+    ));
+
+    // Neither a full typed replacement nor a client-supplied reserved key clears
+    // the server marker. Exercise authenticated and internal typed writers.
+    services
+        .preferences
+        .put_authenticated(
+            &auth_store,
+            did,
+            &session.id.to_string(),
+            &PushPreferencesDocument::default(),
+        )
+        .await
+        .unwrap();
+    let patch: PutPreferencesInput = serde_json::from_value(json!({"chat":{"include":"all","push":false},"_catbirdRestore":{"automaticPushReady":true}})).unwrap();
+    services
+        .preferences
+        .patch_authenticated(&auth_store, did, &session.id.to_string(), Some(patch))
+        .await
+        .unwrap();
+    services
+        .preferences
+        .put(did, &PushPreferencesDocument::default())
+        .await
+        .unwrap();
+    services
+        .preferences
+        .patch(
+            did,
+            serde_json::from_value(json!({"chat":{"include":"all","push":true}})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let preserved: serde_json::Value = sqlx::query_scalar(
+        "SELECT preferences_json->'_catbirdRestore' FROM push_preferences WHERE account_did=$1",
+    )
+    .bind(did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(preserved, metadata);
+
+    // Let the actual queue worker claim it again. Missing readiness must retain
+    // retryable work with a reason and never reach the fake provider.
+    sqlx::query("UPDATE push_event_queue SET leased_until=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    assert!(fake.sends.lock().await.is_empty());
+    let retry: (Option<String>, Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT delivery_hold_reason,last_error,lease_token IS NULL,available_at>NOW() FROM push_event_queue WHERE id=$1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry.0, None, "readiness must not create a durable hold");
+    assert_eq!(retry.1.as_deref(), Some("preferences_restore_required"));
+    assert!(retry.2 && retry.3, "retry releases its lease and backs off");
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 0);
+
+    // Corrupt and unsupported readiness values stay blocked rather than falling
+    // through serde's legacy defaults. No supported true writer exists yet.
+    for marker in [
+        serde_json::Value::Null,
+        json!("bad"),
+        json!({"automaticPushReady":true}),
+        json!({"version":1,"source":"bluesky_login","snapshotComplete":true,"automaticPushReady":true,"authGeneration":generation}),
+    ] {
+        sqlx::query("UPDATE push_preferences SET preferences_json=jsonb_set(preferences_json,'{_catbirdRestore}',$2) WHERE account_did=$1")
+            .bind(did).bind(marker).execute(&pool).await.unwrap();
+        assert!(services
+            .preferences
+            .get_for_delivery(did)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            services
+                .verify_pre_send_fence(
+                    did,
+                    actor,
+                    &input.token,
+                    "like",
+                    None,
+                    None,
+                    Some(generation)
+                )
+                .await
+                .unwrap(),
+            PreSendFenceOutcome::RestorePending
+        );
+    }
+    sqlx::query("DELETE FROM push_preferences WHERE account_did=$1")
+        .bind(did)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(services
+        .preferences
+        .put_authenticated(
+            &auth_store,
+            did,
+            &session.id.to_string(),
+            &PushPreferencesDocument::default()
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        services
+            .verify_pre_send_fence(
+                did,
+                actor,
+                &input.token,
+                "like",
+                None,
+                None,
+                Some(generation)
+            )
+            .await
+            .unwrap(),
+        PreSendFenceOutcome::RestorePending
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM push_preferences WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "typed PUT cannot recreate permissive state after erasure"
+    );
+}
+
+/// Actual queue/APNs execution is independent of the provider's push flag.
+/// The provider endpoint is configured in both directions and must receive no
+/// preference read or write; actor moderation is a current synthetic cache row.
+#[tokio::test]
+async fn explicit_catbird_consent_delivers_independently_and_rejects_old_source_events() {
+    use catbird::services::push::decision::QueueDisposition;
+    use catbird::services::push::types::PutPreferencesInput;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn enqueue(
+        pool: &Pool<Postgres>,
+        did: &str,
+        actor: &str,
+        generation: i64,
+        key: &str,
+        source_time: i64,
+    ) -> i64 {
+        sqlx::query_scalar("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) VALUES($1,$2,'follow',$3,'app.bsky.graph.follow/fixture','{}'::jsonb,$4,$3,$5) RETURNING id")
+            .bind(did).bind(actor).bind(key).bind(source_time).bind(generation)
+            .fetch_one(pool).await.unwrap()
+    }
+    async fn choose(
+        services: &PushServices,
+        store: &catbird::services::RedisAuthStore,
+        session: &CatbirdSession,
+        input: serde_json::Value,
+    ) {
+        let input: PutPreferencesInput = serde_json::from_value(input).unwrap();
+        services
+            .preferences
+            .patch_authenticated(store, &session.did, &session.id.to_string(), Some(input))
+            .await
+            .unwrap();
+    }
+
+    let test_db = TestDb::new().await;
+    test_db.run_hardening_migration().await;
+    let pool = test_db.pool.clone();
+    let store = test_db.auth_store.clone();
+    let provider = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.notification.getPreferences"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"preferences":{"follow":{"include":"all","list":true,"push":false}}}),
+        ))
+        .expect(0)
+        .mount(&provider)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&provider)
+        .await;
+    let fake = Arc::new(ObservingFakeApns::new());
+    let services =
+        Arc::new(make_services(pool.clone(), store.clone()).with_apns_sender(fake.clone()));
+    let state = make_test_app_state(pool.clone(), services.clone(), store.clone()).await;
+    let did = "did:plc:independentconsent";
+    let actor = "did:plc:independentactor";
+    let mut session = make_session(&store, did).await;
+    session.pds_url = provider.uri();
+    cleanup_auth::seed(&store, &session).await;
+    let registration = RegisterPushInput {
+        service_did: "did:web:push.catbird.blue".into(),
+        token: "dc".repeat(32),
+        platform: "ios".into(),
+        app_id: "blue.catbird".into(),
+        age_restricted: Some(false),
+    };
+    // Use production initialization, never the permissive legacy test helper.
+    services
+        .registry
+        .upsert_registration(&session, &registration)
+        .await
+        .unwrap();
+    catbird::services::login_apply::ensure_local_preferences(&pool, &store, &session)
+        .await
+        .unwrap();
+    let generation: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO actor_moderation_verdict(recipient_did,actor_did,verdict,display_label,generation) SELECT account_did,$2,'{}'::jsonb,'Synthetic',moderation_generation FROM push_accounts WHERE account_did=$1")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    let required_id = enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        "consent-required",
+        Utc::now().timestamp() - 1,
+    )
+    .await;
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    let retry_state: (Option<String>, Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT delivery_hold_reason,last_error,lease_token IS NULL,available_at>NOW() FROM push_event_queue WHERE id=$1",
+    )
+    .bind(required_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retry_state.0, None,
+        "missing consent must remain reclaimable"
+    );
+    assert_eq!(
+        retry_state.1.as_deref(),
+        Some("preferences_restore_required")
+    );
+    assert!(
+        retry_state.2 && retry_state.3,
+        "retry releases its lease and schedules backoff"
+    );
+    assert!(fake.sends.lock().await.is_empty());
+
+    // A metadata-only forgery cannot count as an explicit local choice.
+    let forged: PutPreferencesInput = serde_json::from_value(json!({"_catbirdRestore":{"localConsent":"Configured","automaticPushReady":true,"consentSourceTime":1}})).unwrap();
+    assert!(services
+        .preferences
+        .patch_authenticated(&store, did, &session.id.to_string(), Some(forged))
+        .await
+        .is_err());
+    assert!(services
+        .preferences
+        .get_for_delivery(did)
+        .await
+        .unwrap()
+        .is_none());
+    let before: i64 =
+        sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    choose(&services,&store,&session,json!({"follow":{"push":true},"_catbirdRestore":{"automaticPushReady":true,"consentSourceTime":1}})).await;
+    let metadata: serde_json::Value = sqlx::query_scalar(
+        "SELECT preferences_json->'_catbirdRestore' FROM push_preferences WHERE account_did=$1",
+    )
+    .bind(did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let cutoff = metadata["consentSourceTime"].as_i64().unwrap();
+    assert!(cutoff >= before);
+    assert_eq!(metadata["localConsent"], "Configured");
+    assert_eq!(metadata["automaticPushReady"], false);
+    assert_eq!(metadata["authGeneration"], generation);
+    let response =
+        catbird::services::login_apply::ensure_local_preferences(&pool, &store, &session)
+            .await
+            .unwrap();
+    let status = catbird::services::login_apply::setup_status_response(
+        &response.body,
+        services
+            .preferences
+            .get_for_delivery(did)
+            .await
+            .unwrap()
+            .is_some(),
+    );
+    assert_eq!(status["status"], "configured");
+    assert_eq!(status["deliveryScope"], "per_event");
+
+    // Advance only this fixture's backoff. The worker must reclaim the same
+    // consent-pending row after repair, then reject its original source time.
+    // No global requeue or clearing of durable delivery holds is involved.
+    sqlx::query("UPDATE push_event_queue SET available_at=NOW() WHERE id=$1")
+        .bind(required_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    let pending_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_event_queue WHERE id=$1)")
+            .bind(required_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !pending_exists,
+        "repaired consent must reclaim and drop the pre-consent event"
+    );
+    assert!(fake.sends.lock().await.is_empty());
+
+    enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        "provider-off-catbird-on",
+        cutoff,
+    )
+    .await;
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    assert_eq!(
+        fake.sends.lock().await.len(),
+        1,
+        "provider-off must not suppress an independently enabled Catbird follow"
+    );
+    let old_id = enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        "preconsent-replay",
+        cutoff - 1,
+    )
+    .await;
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    let old_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_event_queue WHERE id=$1)")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !old_exists,
+        "new enqueue time cannot revive a pre-consent source event"
+    );
+    assert_eq!(fake.sends.lock().await.len(), 1);
+
+    // Decision uses its snapshot; the final fence must independently re-read
+    // q.event_timestamp and the persisted consent under the shared account lock.
+    enqueue(&pool, did, actor, generation, "late-source-fence", cutoff).await;
+    let row = services.queue.claim_ready(1).await.unwrap().pop().unwrap();
+    assert!(matches!(
+        services
+            .decision
+            .evaluate(&state, &services, &row)
+            .await
+            .unwrap(),
+        QueueDisposition::Deliver(_)
+    ));
+    sqlx::query("UPDATE push_event_queue SET event_timestamp=$2 WHERE id=$1")
+        .bind(row.id)
+        .bind(cutoff - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        services
+            .verify_pre_send_fence(
+                did,
+                actor,
+                &registration.token,
+                "follow",
+                None,
+                Some((row.id, row.lease_token.unwrap(), generation)),
+                Some(generation)
+            )
+            .await
+            .unwrap(),
+        PreSendFenceOutcome::SourceEventBeforeConsent
+    );
+    sqlx::query("UPDATE push_event_queue SET leased_until=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    services.process_queue_batch(&state).await.unwrap();
+    assert_eq!(fake.sends.lock().await.len(), 1);
+    assert!(provider.received_requests().await.unwrap().is_empty());
+    provider.verify().await;
+    provider.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.notification.getPreferences"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"preferences":{"follow":{"include":"all","list":true,"push":true}}}),
+        ))
+        .expect(0)
+        .mount(&provider)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&provider)
+        .await;
+    choose(
+        &services,
+        &store,
+        &session,
+        json!({"follow":{"push":false}}),
+    )
+    .await;
+    let preserved_cutoff: i64 = sqlx::query_scalar("SELECT (preferences_json->'_catbirdRestore'->>'consentSourceTime')::bigint FROM push_preferences WHERE account_did=$1").bind(did).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        preserved_cutoff, cutoff,
+        "ordinary edits must not reset the replay boundary"
+    );
+    enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        "provider-on-catbird-off",
+        cutoff,
+    )
+    .await;
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    assert_eq!(
+        fake.sends.lock().await.len(),
+        1,
+        "provider-on must not enable independently disabled Catbird push"
+    );
+
+    choose(
+        &services,
+        &store,
+        &session,
+        json!({"follow":{"push":true,"include":"follows"}}),
+    )
+    .await;
+    let follows_id = enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        "following-proof-required",
+        cutoff,
+    )
+    .await;
+    services.process_queue_batch(&state).await.unwrap();
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT delivery_hold_reason FROM push_event_queue WHERE id=$1")
+            .bind(follows_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        reason, None,
+        "unknown relationship evidence must retry, not become a permanent category hold"
+    );
+    assert_eq!(fake.sends.lock().await.len(), 1);
+    sqlx::query("UPDATE actor_moderation_verdict SET verdict=jsonb_set(verdict,'{following}','false'),fetched_at=NOW() WHERE recipient_did=$1 AND actor_did=$2")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE push_event_queue SET available_at=NOW() WHERE id=$1")
+        .bind(follows_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    services.process_queue_batch(&state).await.unwrap();
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_event_queue WHERE id=$1)")
+            .bind(follows_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!exists, "verified not-following suppresses the event");
+    assert_eq!(fake.sends.lock().await.len(), 1);
+    // A second unknown-proof row must deliver after the proof is repaired,
+    // without enqueueing a replacement notification or changing its cutoff.
+    sqlx::query("UPDATE actor_moderation_verdict SET verdict=verdict-'following',fetched_at=NOW() WHERE recipient_did=$1 AND actor_did=$2")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    let repaired_id = enqueue(&pool, did, actor, generation, "repaired-following", cutoff).await;
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    let pending_hold: Option<String> =
+        sqlx::query_scalar("SELECT delivery_hold_reason FROM push_event_queue WHERE id=$1")
+            .bind(repaired_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending_hold, None);
+    assert_eq!(fake.sends.lock().await.len(), 1);
+    sqlx::query("UPDATE actor_moderation_verdict SET verdict=jsonb_set(verdict,'{following}','true'),fetched_at=NOW() WHERE recipient_did=$1 AND actor_did=$2")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE push_event_queue SET available_at=NOW() WHERE id=$1")
+        .bind(repaired_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(services.process_queue_batch(&state).await.unwrap(), 1);
+    assert_eq!(
+        fake.sends.lock().await.len(),
+        2,
+        "repaired following proof permits the same queued Catbird event"
+    );
+    let repaired_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_event_queue WHERE id=$1)")
+            .bind(repaired_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!repaired_exists);
+    assert!(
+        provider.received_requests().await.unwrap().is_empty(),
+        "Catbird choices must never read or write provider notification preferences"
+    );
+    provider.verify().await;
+}
+
+/// Account-level consent survives a second live device and nonfinal handover;
+/// per-event authorization still rejects work captured under the previous epoch.
+#[tokio::test]
+async fn account_consent_survives_live_session_activation_and_handover() {
+    use catbird::services::push::registry::session_fingerprint;
+    use catbird::services::push::types::{PushAccountSignOut, PutPreferencesInput};
+    let test_db = TestDb::new().await;
+    test_db.run_hardening_migration().await;
+    let pool = test_db.pool.clone();
+    let store = test_db.auth_store.clone();
+    let services = make_services(pool.clone(), store.clone());
+    let did = "did:plc:accountconsentlife";
+    let actor = "did:plc:accountconsentactor";
+    let a = make_session(&store, did).await;
+    let b = make_session(&store, did).await;
+    let input_a = RegisterPushInput {
+        service_did: "did:web:push.catbird.blue".into(),
+        token: "ca".repeat(32),
+        platform: "ios".into(),
+        app_id: "blue.catbird".into(),
+        age_restricted: Some(false),
+    };
+    let input_b = RegisterPushInput {
+        token: "cb".repeat(32),
+        ..input_a.clone()
+    };
+    services
+        .registry
+        .upsert_registration(&a, &input_a)
+        .await
+        .unwrap();
+    catbird::services::login_apply::ensure_local_preferences(&pool, &store, &a)
+        .await
+        .unwrap();
+    let choice: PutPreferencesInput =
+        serde_json::from_value(json!({"follow":{"push":true}})).unwrap();
+    services
+        .preferences
+        .patch_authenticated(&store, did, &a.id.to_string(), Some(choice))
+        .await
+        .unwrap();
+    let generation_a: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // Represent an already-established choice without sleeping. This distinct
+    // past cutoff makes an accidental reset on B's later PUT observable.
+    sqlx::query("UPDATE push_preferences SET preferences_json=jsonb_set(preferences_json,'{_catbirdRestore,consentSourceTime}',to_jsonb((preferences_json->'_catbirdRestore'->>'consentSourceTime')::bigint-60)) WHERE account_did=$1")
+        .bind(did).execute(&pool).await.unwrap();
+    let original: serde_json::Value =
+        sqlx::query_scalar("SELECT preferences_json FROM push_preferences WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let cutoff = original["_catbirdRestore"]["consentSourceTime"]
+        .as_i64()
+        .unwrap();
+    sqlx::query("INSERT INTO actor_moderation_verdict(recipient_did,actor_did,verdict,display_label,generation) SELECT account_did,$2,'{}'::jsonb,'Synthetic',moderation_generation FROM push_accounts WHERE account_did=$1")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) VALUES($1,$2,'follow','before-b','app.bsky.graph.follow/lifetime','{}'::jsonb,$3,'before-b',$4)")
+        .bind(did).bind(actor).bind(cutoff).bind(generation_a).execute(&pool).await.unwrap();
+    let queued_a = services.queue.claim_ready(1).await.unwrap().pop().unwrap();
+
+    services
+        .registry
+        .activate_account_session(did, &b.id.to_string(), &b.pds_url)
+        .await
+        .unwrap();
+    services
+        .registry
+        .upsert_registration(&b, &input_b)
+        .await
+        .unwrap();
+    let generation_b: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(generation_b > generation_a);
+    let after_activation: serde_json::Value =
+        sqlx::query_scalar("SELECT preferences_json FROM push_preferences WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after_activation, original);
+    assert!(
+        services
+            .preferences
+            .get_for_delivery(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .follow
+            .push,
+        "a legitimate B login must preserve A's account consent"
+    );
+    assert_eq!(
+        services
+            .verify_pre_send_fence(
+                did,
+                actor,
+                &input_a.token,
+                "follow",
+                None,
+                Some((queued_a.id, queued_a.lease_token.unwrap(), generation_a)),
+                Some(generation_b)
+            )
+            .await
+            .unwrap(),
+        PreSendFenceOutcome::Revoked,
+        "old queued epoch remains independently fenced"
+    );
+
+    let choice: PutPreferencesInput =
+        serde_json::from_value(json!({"follow":{"push":true}})).unwrap();
+    services
+        .preferences
+        .patch_authenticated(&store, did, &b.id.to_string(), Some(choice))
+        .await
+        .unwrap();
+    let after_edit: serde_json::Value =
+        sqlx::query_scalar("SELECT preferences_json FROM push_preferences WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut expected = original.clone();
+    expected["_catbirdRestore"]["authGeneration"] = json!(generation_b);
+    assert_eq!(
+        after_edit, expected,
+        "explicit PUT updates provenance but preserves choices and the original account cutoff"
+    );
+
+    // Simulate the coordinator's irreversible local retirement boundary, then
+    // invoke its actual SQL/device-cleanup effect. A is still a verified live
+    // device owner, so B's nonfinal departure hands the account back to A.
+    let mut conn = store.redis_connection();
+    let _: () = redis::cmd("SET")
+        .arg(store.retired_key(&b.id.to_string()))
+        .arg("synthetic-logout")
+        .arg("EX")
+        .arg(store.retired_ttl())
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let outcome = services
+        .registry
+        .cleanup_retired_session(did, &session_fingerprint(&b.id.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(outcome.account, PushAccountSignOut::HandedOver);
+    let generation_handover: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(generation_handover > generation_b);
+    let after_handover: serde_json::Value =
+        sqlx::query_scalar("SELECT preferences_json FROM push_preferences WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after_handover, after_edit);
+    assert!(
+        services
+            .preferences
+            .get_for_delivery(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .follow
+            .push
+    );
+    assert_eq!(
+        after_handover["_catbirdRestore"]["consentSourceTime"],
+        cutoff
+    );
+    let fresh_id: i64 = sqlx::query_scalar("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) VALUES($1,$2,'follow','after-handover','app.bsky.graph.follow/lifetime','{}'::jsonb,$3,'after-handover',$4) RETURNING id")
+        .bind(did).bind(actor).bind(cutoff).bind(generation_handover).fetch_one(&pool).await.unwrap();
+    let fresh = services
+        .queue
+        .claim_ready(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == fresh_id)
+        .unwrap();
+    assert_eq!(
+        services
+            .verify_pre_send_fence(
+                did,
+                actor,
+                &input_a.token,
+                "follow",
+                None,
+                Some((fresh.id, fresh.lease_token.unwrap(), generation_handover)),
+                Some(generation_handover)
+            )
+            .await
+            .unwrap(),
+        PreSendFenceOutcome::Authorized,
+        "retained consent still authorizes new work after handover"
+    );
+    let active_tokens: Vec<String> = sqlx::query_scalar("SELECT device_token FROM user_devices WHERE did=$1 AND is_active=TRUE ORDER BY device_token").bind(did).fetch_all(&pool).await.unwrap();
+    assert_eq!(active_tokens, vec![input_a.token]);
+}
+
+#[tokio::test]
+async fn reset_chat_uses_complete_empty_snapshot_and_prime_then_independent_push() {
+    use catbird::services::chat_poll::scheduler::ChatPollScheduler;
+    use catbird::services::push::types::PutPreferencesInput;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn enqueue(
+        pool: &Pool<Postgres>,
+        did: &str,
+        actor: &str,
+        generation: i64,
+        cutoff: i64,
+        key: &str,
+        convo: &str,
+    ) -> i64 {
+        sqlx::query_scalar("INSERT INTO push_event_queue(recipient_did,actor_did,notification_type,event_cid,event_path,event_record_json,event_timestamp,dedupe_key,auth_generation) VALUES($1,$2,'chat_message',$3,'chat.bsky.convo.getLog',$4,$5,$3,$6) RETURNING id")
+            .bind(did).bind(actor).bind(key).bind(json!({"convoId":convo,"messageId":key,"logRev":key})).bind(cutoff).bind(generation).fetch_one(pool).await.unwrap()
+    }
+    let test_db = TestDb::new().await;
+    test_db.run_hardening_migration().await;
+    let pool = test_db.pool.clone();
+    let store = test_db.auth_store.clone();
+    let provider = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/xrpc/chat.bsky.notification.getPreferences"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"preferences":{"chat":{"include":"all","push":false},"chatRequest":{"include":"all","push":false}}}))).expect(0).mount(&provider).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&provider)
+        .await;
+    let fake = Arc::new(ObservingFakeApns::new());
+    let services =
+        Arc::new(make_services(pool.clone(), store.clone()).with_apns_sender(fake.clone()));
+    let state = make_test_app_state(pool.clone(), services.clone(), store.clone()).await;
+    let did = "did:plc:chatbootstrapfixture";
+    let actor = "did:plc:chatbootstrapactor";
+    let mut session = make_session(&store, did).await;
+    session.pds_url = provider.uri();
+    cleanup_auth::seed(&store, &session).await;
+    let input = RegisterPushInput {
+        service_did: "did:web:push.catbird.blue".into(),
+        token: "ce".repeat(32),
+        platform: "ios".into(),
+        app_id: "blue.catbird".into(),
+        age_restricted: Some(false),
+    };
+    services
+        .registry
+        .upsert_registration(&session, &input)
+        .await
+        .unwrap();
+    catbird::services::login_apply::ensure_local_preferences(&pool, &store, &session)
+        .await
+        .unwrap();
+    let choice: PutPreferencesInput =
+        serde_json::from_value(json!({"chat":{"push":true,"include":"all"}})).unwrap();
+    services
+        .preferences
+        .patch_authenticated(&store, did, &session.id.to_string(), Some(choice))
+        .await
+        .unwrap();
+    let generation: i64 =
+        sqlx::query_scalar("SELECT auth_generation FROM push_accounts WHERE account_did=$1")
+            .bind(did)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let cutoff:i64=sqlx::query_scalar("SELECT (preferences_json->'_catbirdRestore'->>'consentSourceTime')::bigint FROM push_preferences WHERE account_did=$1").bind(did).fetch_one(&pool).await.unwrap();
+    sqlx::query("INSERT INTO actor_moderation_verdict(recipient_did,actor_did,verdict,display_label,generation) SELECT account_did,$2,'{}'::jsonb,'Synthetic',moderation_generation FROM push_accounts WHERE account_did=$1")
+        .bind(did).bind(actor).execute(&pool).await.unwrap();
+    let scheduler = ChatPollScheduler::new(pool.clone());
+    scheduler
+        .enroll_account_authenticated(&session, &store, "fixture.invalid")
+        .await
+        .unwrap();
+    assert!(scheduler
+        .needs_initial_mute_sync(did, generation)
+        .await
+        .unwrap());
+    let pending = enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        cutoff,
+        "chat-pending-bootstrap",
+        "visible",
+    )
+    .await;
+    services.process_queue_batch(&state).await.unwrap();
+    assert!(fake.sends.lock().await.is_empty());
+    let pending_state: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT delivery_hold_reason,last_error FROM push_event_queue WHERE id=$1")
+            .bind(pending)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending_state.0, None);
+    assert!(pending_state.1.unwrap().contains("chat_bootstrap_pending"));
+    // This is the production complete-snapshot commit seam; no completion is
+    // stamped by missing, partial, stale or ordinary local-mutation input.
+    assert!(!scheduler
+        .sync_muted_convos_fenced(did, &[], 0, generation + 1)
+        .await
+        .unwrap());
+    assert!(scheduler
+        .needs_initial_mute_sync(did, generation)
+        .await
+        .unwrap());
+    assert!(scheduler
+        .sync_muted_convos_fenced(did, &[], 0, generation)
+        .await
+        .unwrap());
+    assert!(!scheduler
+        .needs_initial_mute_sync(did, generation)
+        .await
+        .unwrap());
+    let snapshot:serde_json::Value=sqlx::query_scalar("SELECT preferences_json->'_catbirdRestore'->'chatMuteSnapshot' FROM push_preferences WHERE account_did=$1").bind(did).fetch_one(&pool).await.unwrap();
+    assert_eq!(snapshot["authGeneration"], generation);
+    assert_eq!(snapshot["muteGeneration"], 1);
+    assert!(snapshot["completedAt"].as_i64().unwrap() > 0);
+    // Complete mute knowledge alone cannot authorize unprimed chat.
+    sqlx::query("UPDATE push_event_queue SET available_at=NOW() WHERE id=$1")
+        .bind(pending)
+        .execute(&pool)
+        .await
+        .unwrap();
+    services.process_queue_batch(&state).await.unwrap();
+    assert!(fake.sends.lock().await.is_empty());
+    // Existing task-4 prime transaction fixtures prove silent log priming; this
+    // worker fixture independently tests the persisted completion prerequisite.
+    scheduler.mark_primed(did).await.unwrap();
+    sqlx::query("UPDATE push_event_queue SET available_at=NOW() WHERE id=$1")
+        .bind(pending)
+        .execute(&pool)
+        .await
+        .unwrap();
+    services.process_queue_batch(&state).await.unwrap();
+    assert_eq!(
+        fake.sends.lock().await.len(),
+        1,
+        "provider chat push off must not veto Catbird on"
+    );
+    // A known mutation maintains completeness while still changing the final
+    // mute veto. It must not pause unrelated conversations until periodic sync.
+    scheduler
+        .set_convo_muted_authenticated(&session, &store, "muted", true)
+        .await
+        .unwrap();
+    assert!(!scheduler
+        .needs_initial_mute_sync(did, generation)
+        .await
+        .unwrap());
+    enqueue(&pool, did, actor, generation, cutoff, "chat-muted", "muted").await;
+    services.process_queue_batch(&state).await.unwrap();
+    assert_eq!(fake.sends.lock().await.len(), 1);
+    let before = scheduler.mute_generation(did).await.unwrap();
+    assert!(!scheduler
+        .sync_muted_convos_fenced(did, &[], before - 1, generation)
+        .await
+        .unwrap());
+    assert!(scheduler.is_convo_muted(did, "muted").await.unwrap());
+    let late = enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        cutoff,
+        "chat-late-read",
+        "visible",
+    )
+    .await;
+    let row = services.queue.claim_ready(1).await.unwrap().pop().unwrap();
+    assert_eq!(row.id, late);
+    sqlx::query("INSERT INTO chat_notified_watermarks(account_did,convo_id,last_rev,last_read_rev) VALUES($1,'visible','chat-late-read','chat-late-read') ON CONFLICT(account_did,convo_id) DO UPDATE SET last_read_rev=EXCLUDED.last_read_rev")
+        .bind(did).execute(&pool).await.unwrap();
+    assert_eq!(
+        services
+            .verify_pre_send_fence(
+                did,
+                actor,
+                &input.token,
+                "chat_message",
+                None,
+                Some((row.id, row.lease_token.unwrap(), generation)),
+                Some(generation)
+            )
+            .await
+            .unwrap(),
+        PreSendFenceOutcome::ChatRead
+    );
+    services
+        .queue
+        .delete_fenced(row.id, row.lease_token.unwrap(), row.lease_version)
+        .await
+        .unwrap();
+    provider.verify().await;
+    assert!(provider.received_requests().await.unwrap().is_empty());
+    provider.reset().await;
+    Mock::given(method("GET")).and(path("/xrpc/chat.bsky.notification.getPreferences"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"preferences":{"chat":{"include":"all","push":true},"chatRequest":{"include":"all","push":true}}}))).expect(0).mount(&provider).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&provider)
+        .await;
+    let choice: PutPreferencesInput =
+        serde_json::from_value(json!({"chat":{"push":false}})).unwrap();
+    services
+        .preferences
+        .patch_authenticated(&store, did, &session.id.to_string(), Some(choice))
+        .await
+        .unwrap();
+    enqueue(
+        &pool,
+        did,
+        actor,
+        generation,
+        cutoff,
+        "chat-provider-on-catbird-off",
+        "other",
+    )
+    .await;
+    services.process_queue_batch(&state).await.unwrap();
+    assert_eq!(fake.sends.lock().await.len(), 1);
+    assert!(provider.received_requests().await.unwrap().is_empty());
+    provider.verify().await;
 }

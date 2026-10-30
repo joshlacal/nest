@@ -78,19 +78,28 @@ pub async fn poll_account(
     // Resolve session + DPoP data for this account and capture auth_generation before network
     let (session_id, pds_url, auth_generation) =
         lookup_push_account(db_pool, &row.account_did).await?;
-    let (session, dpop) =
-        match resolve_background_session(state, &row.account_did, &session_id, &pds_url).await {
-            Ok(pair) => pair,
-            Err(err) if is_auth_revocation_error(&err) => {
-                tracing::info!(
-                    did = %row.account_did,
-                    "Auth revoked for chat poll account; unenrolling"
-                );
-                scheduler.unenroll_account(&row.account_did).await?;
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        };
+    let (session, dpop) = match resolve_background_session(
+        state,
+        &row.account_did,
+        &session_id,
+        &pds_url,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(err) if is_auth_revocation_error(&err) => {
+            let unenrolled = scheduler
+                .unenroll_account_if_auth_generation(&row.account_did, auth_generation)
+                .await?;
+            tracing::info!(
+                did = %row.account_did,
+                unenrolled,
+                "Chat poll authentication failed; unenrollment fenced to captured session generation"
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     poll_account_with_session(
         state,
@@ -151,7 +160,9 @@ pub(crate) async fn poll_account_with_session(
                     elapsed = ?elapsed,
                     "Prime pass time slice elapsed; yielding to reschedule without blocking later DIDs"
                 );
-                scheduler.reschedule(&row.account_did, 5).await?;
+                scheduler
+                    .reschedule_fenced(&row.account_did, 5, auth_generation)
+                    .await?;
                 return Ok(());
             }
 
@@ -252,7 +263,9 @@ pub(crate) async fn poll_account_with_session(
                         elapsed = ?prime_start.elapsed(),
                         "Prime pass timed out against remaining time slice; yielding to reschedule"
                     );
-                    scheduler.reschedule(&row.account_did, 5).await?;
+                    scheduler
+                        .reschedule_fenced(&row.account_did, 5, auth_generation)
+                        .await?;
                     return Ok(());
                 }
             };
@@ -265,7 +278,9 @@ pub(crate) async fn poll_account_with_session(
                         pds = %row.pds_host,
                         "Prime pass paused: local PDS rate budget exhausted"
                     );
-                    scheduler.reschedule(&row.account_did, 10).await?;
+                    scheduler
+                        .reschedule_fenced(&row.account_did, 10, auth_generation)
+                        .await?;
                     return Ok(());
                 }
                 PrimeStepResult::PdsRateLimited {
@@ -302,15 +317,16 @@ pub(crate) async fn poll_account_with_session(
                         }
                     }
 
-                    let body_snippet: String =
-                        String::from_utf8_lossy(&body).chars().take(300).collect();
                     tracing::warn!(
                         did = %row.account_did,
                         status,
-                        body = %body_snippet,
+                        error_code = ?xrpc_error_code(&body),
+                        body_bytes = body.len(),
                         "Prime pass got non-200; will resume next cycle"
                     );
-                    scheduler.reschedule(&row.account_did, 120).await?;
+                    scheduler
+                        .reschedule_fenced(&row.account_did, 120, auth_generation)
+                        .await?;
                     return Ok(());
                 }
                 PrimeStepResult::Success {
@@ -343,6 +359,23 @@ pub(crate) async fn poll_account_with_session(
         return Ok(());
     }
 
+    // Reuse the bounded complete listConvos snapshot before a reset account's
+    // first alerting poll. Priming above stays silent; do not wait 600 seconds
+    // for the periodic sync or treat an unsynced empty table as authoritative.
+    if scheduler
+        .needs_initial_mute_sync(&row.account_did, auth_generation)
+        .await?
+    {
+        super::mute_sync::sync_mutes_for_account(state, db_pool, scheduler, &row.account_did)
+            .await?;
+        if scheduler
+            .needs_initial_mute_sync(&row.account_did, auth_generation)
+            .await?
+        {
+            anyhow::bail!("Chat bootstrap mute snapshot remains unverified");
+        }
+    }
+
     let outcome = fetch_log_page(
         state,
         session,
@@ -361,7 +394,9 @@ pub(crate) async fn poll_account_with_session(
                 pds = %row.pds_host,
                 "Chat poll skipped: local PDS rate budget exhausted"
             );
-            scheduler.reschedule(&row.account_did, 10).await?;
+            scheduler
+                .reschedule_fenced(&row.account_did, 10, auth_generation)
+                .await?;
             return Ok(());
         }
         FetchLogOutcome::PdsRateLimited {
@@ -405,19 +440,23 @@ pub(crate) async fn poll_account_with_session(
             did = %row.account_did,
             "Chat poll got 401; will retry on next cycle"
         );
-        scheduler.reschedule(&row.account_did, 120).await?;
+        scheduler
+            .reschedule_fenced(&row.account_did, 120, auth_generation)
+            .await?;
         return Ok(());
     }
 
     if status != 200 {
-        let body_text = String::from_utf8_lossy(&body);
         tracing::warn!(
             did = %row.account_did,
             status = status,
-            body = %body_text.chars().take(200).collect::<String>(),
+            error_code = ?xrpc_error_code(&body),
+            body_bytes = body.len(),
             "Chat poll unexpected status"
         );
-        scheduler.reschedule(&row.account_did, 60).await?;
+        scheduler
+            .reschedule_fenced(&row.account_did, 60, auth_generation)
+            .await?;
         return Ok(());
     }
 
@@ -1062,6 +1101,9 @@ async fn persist_log_page(
     }
 
     verify_page_authorization(&mut tx, &row.account_did, auth_generation).await?;
+    sqlx::query("SAVEPOINT event_page")
+        .execute(&mut *tx)
+        .await?;
 
     let watermarks: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
         "SELECT convo_id, last_rev FROM chat_notified_watermarks WHERE account_did = $1",
@@ -1124,14 +1166,17 @@ async fn persist_log_page(
             // A fresh successful poll time alone cannot prove that every source
             // message is recent. Preserve the entire page for catch-up review.
             if sent_at < chrono::Utc::now() - chrono::Duration::hours(24) {
-                tx.rollback().await?;
+                sqlx::query("ROLLBACK TO SAVEPOINT event_page")
+                    .execute(&mut *tx)
+                    .await?;
                 sqlx::query(
                     "UPDATE chat_poll_state SET catch_up_required_at = COALESCE(catch_up_required_at, NOW()), catch_up_reason = COALESCE(catch_up_reason, 'source_message_older_than_24h') WHERE account_did = $1 AND chat_cursor IS NOT DISTINCT FROM $2",
                 )
                 .bind(&row.account_did)
                 .bind(&row.chat_cursor)
-                .execute(db_pool)
+                .execute(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 return Ok(());
             }
             let push_event = ChatPushEvent {
@@ -2446,3 +2491,32 @@ mod tests {
 #[cfg(test)]
 #[path = "reliability_tests.rs"]
 mod reliability_tests;
+
+/// The XRPC `error` code from an upstream error body, if any. Error bodies are not
+/// logged verbatim: a `getLog` response can contain message text.
+pub(super) fn xrpc_error_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.as_str()?;
+    let valid = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    valid.then(|| code.to_string())
+}
+
+#[cfg(test)]
+mod xrpc_error_code_tests {
+    use super::xrpc_error_code;
+
+    #[test]
+    fn extracts_only_well_formed_error_codes() {
+        assert_eq!(
+            xrpc_error_code(br#"{"error":"InvalidToken","message":"secret detail"}"#),
+            Some("InvalidToken".to_string())
+        );
+        assert_eq!(xrpc_error_code(br#"{"logs":[{"text":"hello"}]}"#), None);
+        assert_eq!(xrpc_error_code(br#"{"error":"has spaces in it"}"#), None);
+        assert_eq!(xrpc_error_code(b"<html>bad gateway</html>"), None);
+    }
+}

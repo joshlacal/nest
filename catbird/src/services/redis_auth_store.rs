@@ -81,45 +81,22 @@ pub fn fingerprint_id(key: &[u8; 32], id: &str) -> String {
 /// - If hashed session exists, touches sliding TTL on hashed index key and SHA-256 fp index key, returning session data
 /// - Returns nil on miss
 const LUA_GET_SESSION_SCRIPT: &str = r#"
--- KEYS:
--- 1: hashed_session_key
--- 2: hashed_index_key
--- 3: hashed_retired_key
--- 4: hashed_fp_index_key
--- 5: did_index_key
+if redis.call('EXISTS', KEYS[3]) == 1 then return nil end
+if KEYS[6] and redis.call('EXISTS', KEYS[6]) == 1 then return nil end
+return redis.call('GET', KEYS[1])
+"#;
 
--- ARGV:
--- 1: session_ttl
--- 2: session_index_ttl
--- 3: did
--- 4: hmac_fingerprint
-
-if redis.call('EXISTS', KEYS[3]) == 1 then
-    return nil
-end
-
-local data = redis.call('GETEX', KEYS[1], 'EX', tonumber(ARGV[1]))
-if data then
-    local hashed_index_did = redis.call('GETEX', KEYS[2], 'EX', tonumber(ARGV[2]))
-    if not hashed_index_did and ARGV[3] and ARGV[3] ~= '' then
-        redis.call('SETEX', KEYS[2], tonumber(ARGV[2]), ARGV[3])
-    end
-    if KEYS[4] and KEYS[4] ~= '' then
-        local fp_val = redis.call('GETEX', KEYS[4], 'EX', tonumber(ARGV[1]))
-        if not fp_val and ARGV[4] and ARGV[4] ~= '' then
-            redis.call('SETEX', KEYS[4], tonumber(ARGV[1]), ARGV[4])
-        end
-    end
-    if KEYS[5] and KEYS[5] ~= '' then
-        local did_val = redis.call('GETEX', KEYS[5], 'EX', tonumber(ARGV[1]))
-        if not did_val and ARGV[4] and ARGV[4] ~= '' then
-            redis.call('SETEX', KEYS[5], tonumber(ARGV[1]), ARGV[4])
-        end
-    end
-    return data
-end
-
-return nil
+// Called only after AES-GCM authentication and exact session identity checks.
+// A pre-logout read cannot slide or reconstruct anything after retirement.
+const LUA_TOUCH_VERIFIED_SESSION: &str = r#"
+if redis.call('EXISTS',KEYS[3]) == 1 or redis.call('EXISTS',KEYS[6]) == 1
+  or redis.call('GET',KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('EXPIRE',KEYS[1],ARGV[2])
+redis.call('SETEX',KEYS[2],ARGV[3],ARGV[4])
+redis.call('SETEX',KEYS[4],ARGV[2],ARGV[5])
+local current=redis.call('GET',KEYS[5])
+if not current or current == ARGV[5] then redis.call('SETEX',KEYS[5],ARGV[2],ARGV[5]) end
+return 1
 "#;
 
 /// Lua script for atomic DID index lookup (HMAC keys only, no raw key args):
@@ -128,60 +105,13 @@ return nil
 /// - If DID found in hashed index, refreshes TTL on hashed session key if present
 /// - Returns nil on miss
 const LUA_LOOKUP_INDEX_SCRIPT: &str = r#"
--- KEYS:
--- 1: hashed_index_key
--- 2: hashed_retired_key
-
--- ARGV:
--- 1: session_index_ttl
--- 2: session_ttl
--- 3: key_prefix
--- 4: fingerprint
-
-if redis.call('EXISTS', KEYS[2]) == 1 then
-    return nil
-end
-
-local did = redis.call('GETEX', KEYS[1], 'EX', tonumber(ARGV[1]))
-if did then
-    local hashed_session_key = ARGV[3] .. 'session:' .. did .. '_' .. ARGV[4]
-    if redis.call('EXISTS', hashed_session_key) == 1 then
-        redis.call('EXPIRE', hashed_session_key, tonumber(ARGV[2]))
-    end
-    return did
-end
-
-return nil
-"#;
-
-/// Lua script for atomic session index write with retirement protection:
-/// - Refuses write if retired tombstone exists (returns 1)
-/// - Sets hashed session index and SHA-256 fp index entries (returns 0)
-const LUA_WRITE_INDEX_SCRIPT: &str = r#"
--- KEYS:
--- 1: hashed_index_key
--- 2: hashed_retired_key
--- 3: hashed_fp_index_key
--- 4: did_index_key
-
--- ARGV:
--- 1: did
--- 2: session_index_ttl
--- 3: session_ttl
--- 4: hmac_fingerprint
-
-if redis.call('EXISTS', KEYS[2]) == 1 then
-    return 1
-end
-
-redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), ARGV[1])
-if KEYS[3] and KEYS[3] ~= '' and ARGV[4] and ARGV[4] ~= '' then
-    redis.call('SETEX', KEYS[3], tonumber(ARGV[3]), ARGV[4])
-end
-if KEYS[4] and KEYS[4] ~= '' and ARGV[4] and ARGV[4] ~= '' then
-    redis.call('SETEX', KEYS[4], tonumber(ARGV[3]), ARGV[4])
-end
-return 0
+if redis.call('EXISTS', KEYS[2]) == 1 then return nil end
+local did = redis.call('GET', KEYS[1])
+if not did then return nil end
+if redis.call('EXISTS',ARGV[3] .. 'account_erasure:' .. did) == 1 then return nil end
+local session_key = ARGV[3] .. 'session:' .. did .. '_' .. ARGV[4]
+if redis.call('EXISTS',session_key) == 0 then return nil end
+return did
 "#;
 
 /// Lua script for atomic session upsert with retirement protection:
@@ -204,6 +134,9 @@ const LUA_UPSERT_SESSION_SCRIPT: &str = r#"
 
 if redis.call('EXISTS', KEYS[3]) == 1 then
     return 1
+end
+if KEYS[6] and redis.call('EXISTS', KEYS[6]) == 1 then
+    return 2
 end
 
 redis.call('SETEX', KEYS[1], tonumber(ARGV[3]), ARGV[1])
@@ -260,7 +193,9 @@ redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
 if KEYS[6] and KEYS[6] ~= '' then
-    redis.call('DEL', KEYS[6])
+    if not ARGV[5] or redis.call('GET',KEYS[6]) == ARGV[5] then
+        redis.call('DEL', KEYS[6])
+    end
 end
 return 0
 "#;
@@ -306,30 +241,13 @@ end
 
 local session_key = ARGV[1] .. 'session:' .. ARGV[2] .. '_' .. hmac_fp
 
-if is_fallback == 0 then
-    local data = redis.call('GETEX', session_key, 'EX', tonumber(ARGV[3]))
-    if data then
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-        local session_index_key = ARGV[1] .. 'session_index:' .. hmac_fp
-        local index_ttl = tonumber(ARGV[5] or ARGV[3])
-        redis.call('EXPIRE', session_index_key, index_ttl)
-        if KEYS[2] and KEYS[2] ~= '' then
-            redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
-        end
-        return {0, data, hmac_fp, tonumber(ARGV[3])}
-    end
-    return nil
-else
-    local data = redis.call('GET', session_key)
-    if data then
-        local ttl = redis.call('TTL', session_key)
-        if ttl <= 0 then
-            ttl = tonumber(ARGV[3])
-        end
-        return {1, data, hmac_fp, ttl}
-    end
-    return nil
-end
+if redis.call('EXISTS',ARGV[1] .. 'account_erasure:' .. ARGV[2]) == 1 then return nil end
+local data=redis.call('GET',session_key)
+if not data then return nil end
+local ttl=redis.call('TTL',session_key)
+if ttl<=0 then return nil end
+return {is_fallback,data,hmac_fp,ttl}
+
 "#;
 
 /// Lua script for atomic installation of missing fingerprint index and DID index:
@@ -346,19 +264,20 @@ const LUA_INSTALL_FP_INDEX_SCRIPT: &str = r#"
 -- 1: hmac_fp
 -- 2: ttl
 
-if redis.call('EXISTS', KEYS[4]) == 1 then
-    return 1
+if redis.call('EXISTS',KEYS[4]) == 1 then return 1 end
+if KEYS[5] and redis.call('EXISTS',KEYS[5]) == 1 then return 1 end
+local data=redis.call('GET',KEYS[3])
+if not data or (ARGV[3] and data ~= ARGV[3]) then return 1 end
+local remaining=redis.call('TTL',KEYS[3])
+if remaining<=0 then return 1 end
+local ttl=math.min(remaining,tonumber(ARGV[2]))
+redis.call('SETEX',KEYS[1],ttl,ARGV[1])
+if KEYS[2] and KEYS[2] ~= '' then
+    local current=redis.call('GET',KEYS[2])
+    if not current or current==ARGV[1] then redis.call('SETEX',KEYS[2],ttl,ARGV[1]) end
 end
+return 0
 
-if redis.call('EXISTS', KEYS[3]) == 1 then
-    redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), ARGV[1])
-    if KEYS[2] and KEYS[2] ~= '' then
-        redis.call('SETEX', KEYS[2], tonumber(ARGV[2]), ARGV[1])
-    end
-    return 0
-end
-
-return 1
 "#;
 
 fn redis_err(e: redis::RedisError) -> SessionStoreError {
@@ -382,6 +301,9 @@ fn validate_session_identity<D: jacquard_common::BosStr>(
             expected_did.as_str(),
             session.account_did.as_str()
         )));
+    }
+    if session.token_set.sub.as_str() != expected_did.as_str() {
+        return Err(other_err("Session token subject mismatch"));
     }
     if session.session_id.as_str() != expected_session_id {
         return Err(other_err(&format!(
@@ -501,6 +423,70 @@ impl RedisAuthStore {
     pub fn session_ttl(&self) -> u64 {
         self.session_ttl
     }
+
+    /// Account erasure fences stop new grants and stale authenticated writers until
+    /// the final-session cleanup has finished. Values are cleanup receipt UUIDs.
+    pub fn account_erasure_key(&self, did: &str) -> String {
+        format!("{}account_erasure:{}", self.key_prefix, did)
+    }
+
+    /// Validate a local bearer without contacting the provider or extending any TTL.
+    /// Call while holding the PostgreSQL account lock immediately before a write;
+    /// an earlier HTTP authentication check is not sufficient after logout.
+    pub async fn read_session_local(
+        &self,
+        did: &str,
+        session_id: &str,
+    ) -> Result<Option<ClientSessionData>, SessionStoreError> {
+        let parsed_did = Did::new(did).map_err(|_| other_err("invalid account DID"))?;
+        let session_key = self.session_key(did, session_id);
+        let mut conn = self.redis_connection();
+        let encrypted: Option<String> = redis::Script::new(
+            "if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then return nil end return redis.call('GET', KEYS[1])",
+        )
+        .key(&session_key)
+        .key(self.retired_key(session_id))
+        .key(self.account_erasure_key(did))
+        .invoke_async(&mut conn)
+        .await
+        .map_err(redis_err)?;
+        let Some(encrypted) = encrypted else {
+            return Ok(None);
+        };
+        let (json, metadata, _) =
+            open_v2_with_metadata(&self.encryption_key, &encrypted, "session", &session_key)
+                .map_err(|_| other_err("invalid local session envelope"))?;
+        if metadata.did.as_deref().is_some_and(|stored| stored != did) {
+            return Err(other_err("local session DID mismatch"));
+        }
+        let session = serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+        validate_session_identity(session, &parsed_did, session_id).map(Some)
+    }
+
+    pub async fn validate_live_session_local(
+        &self,
+        did: &str,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        self.read_session_local(did, session_id)
+            .await?
+            .ok_or_else(|| other_err("session retired or account erasure pending"))?;
+        Ok(())
+    }
+
+    /// A non-identifying global epoch survives account deletion, preventing old
+    /// background work from matching a newly inserted account's generation.
+    pub async fn next_auth_generation(&self) -> Result<i64, SessionStoreError> {
+        let mut conn = self.redis_connection();
+        redis::Script::new(
+            "redis.call('SET', KEYS[1], ARGV[1], 'NX'); return redis.call('INCR', KEYS[1])",
+        )
+        .key(format!("{}auth_generation_sequence", self.key_prefix))
+        .arg(chrono::Utc::now().timestamp_micros())
+        .invoke_async(&mut conn)
+        .await
+        .map_err(redis_err)
+    }
     pub fn reconcile_cursor(&self) -> u64 {
         self.reconcile_cursor
             .load(std::sync::atomic::Ordering::Acquire)
@@ -591,7 +577,7 @@ impl RedisAuthStore {
 
     /// Look up the DID associated with a session_id.
     ///
-    /// Hashed lookup with sliding expiration on every successful read.
+    /// Read-only hashed pointer lookup; TTL slides only after authenticated grant read.
     /// Returns None if session is retired or absent.
     pub async fn lookup_did_for_session(
         &self,
@@ -616,32 +602,74 @@ impl RedisAuthStore {
         Ok(did)
     }
 
-    /// Write the session_id→DID index entry if not retired.
+    async fn touch_verified_session(
+        &self,
+        did: &str,
+        session_id: &str,
+        encrypted: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let mut conn = self.redis.clone();
+        let changed: i32 = redis::Script::new(LUA_TOUCH_VERIFIED_SESSION)
+            .key(self.session_key(did, session_id))
+            .key(self.session_index_key(session_id))
+            .key(self.retired_key(session_id))
+            .key(self.session_fp_index_key(session_id))
+            .key(self.did_index_key(did))
+            .key(self.account_erasure_key(did))
+            .arg(encrypted)
+            .arg(self.session_ttl)
+            .arg(SESSION_INDEX_TTL_SECONDS)
+            .arg(did)
+            .arg(self.fingerprint(session_id))
+            .invoke_async(&mut conn)
+            .await
+            .map_err(redis_err)?;
+        Ok(changed == 1)
+    }
+
+    /// Repair/slide indexes only through an authenticated, locally live grant read.
     pub async fn write_session_index(
         &self,
         session_id: &str,
         did: &str,
     ) -> Result<(), redis::RedisError> {
-        let hashed_index = self.session_index_key(session_id);
-        let hashed_retired = self.retired_key(session_id);
-        let hashed_fp_index = self.session_fp_index_key(session_id);
-        let did_idx_key = self.did_index_key(did);
-        let hmac_fp = self.fingerprint(session_id);
-
-        let mut conn = self.redis.clone();
-        let script = redis::Script::new(LUA_WRITE_INDEX_SCRIPT);
-        let _: i32 = script
-            .key(&hashed_index)
-            .key(&hashed_retired)
-            .key(&hashed_fp_index)
-            .key(&did_idx_key)
-            .arg(did)
-            .arg(SESSION_INDEX_TTL_SECONDS)
-            .arg(self.session_ttl)
-            .arg(&hmac_fp)
-            .invoke_async(&mut conn)
-            .await?;
+        let did = Did::new(did).map_err(|_| {
+            redis::RedisError::from((redis::ErrorKind::ResponseError, "invalid session identity"))
+        })?;
+        let live = self.get_session(&did, session_id).await.map_err(|_| {
+            redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "session authentication unavailable",
+            ))
+        })?;
+        if live.is_none() {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "session no longer live",
+            )));
+        }
         Ok(())
+    }
+
+    fn decode_bound_session(
+        &self,
+        key: &str,
+        did: &str,
+        encrypted: &str,
+    ) -> Result<ClientSessionData, SessionStoreError> {
+        let (json, metadata, _) =
+            open_v2_with_metadata(&self.encryption_key, encrypted, "session", key)
+                .map_err(|_| other_err("Session envelope authentication failed"))?;
+        let session: ClientSessionData =
+            serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+        if session.account_did.as_str() != did
+            || session.token_set.sub.as_str() != did
+            || metadata.did.as_deref().is_some_and(|value| value != did)
+            || self.session_key(did, session.session_id.as_str()) != key
+        {
+            return Err(other_err("Session envelope identity mismatch"));
+        }
+        Ok(session)
     }
 
     /// Look up an active, non-retired session for a given DID and verify that its
@@ -656,6 +684,27 @@ impl RedisAuthStore {
         &self,
         did: &str,
         expected_fingerprint: &str,
+    ) -> Result<Option<ClientSessionData>, SessionStoreError> {
+        self.resolve_session_fingerprint_inner(did, expected_fingerprint, true)
+            .await
+    }
+
+    /// Cleanup authority checks must not keep another device's session alive
+    /// simply because a pending cleanup is retried in the background.
+    pub async fn resolve_session_fingerprint_local(
+        &self,
+        did: &str,
+        expected_fingerprint: &str,
+    ) -> Result<Option<ClientSessionData>, SessionStoreError> {
+        self.resolve_session_fingerprint_inner(did, expected_fingerprint, false)
+            .await
+    }
+
+    async fn resolve_session_fingerprint_inner(
+        &self,
+        did: &str,
+        expected_fingerprint: &str,
+        slide_expiration: bool,
     ) -> Result<Option<ClientSessionData>, SessionStoreError> {
         let expected_fp = crate::services::push::registry::normalize_or_hash_session_fingerprint(
             expected_fingerprint,
@@ -737,10 +786,7 @@ impl RedisAuthStore {
                         let Some(enc_data) = enc else {
                             continue;
                         };
-                        let Ok(json) = open_strict(&self.encryption_key, &enc_data) else {
-                            continue;
-                        };
-                        let Ok(cand_session) = serde_json::from_str::<ClientSessionData>(&json)
+                        let Ok(cand_session) = self.decode_bound_session(&key_name, did, &enc_data)
                         else {
                             continue;
                         };
@@ -763,13 +809,15 @@ impl RedisAuthStore {
                                 .key(&did_index_key)
                                 .key(&candidate_session_k)
                                 .key(&candidate_retired_k)
+                                .key(self.account_erasure_key(did))
                                 .arg(&candidate_hmac)
                                 .arg(candidate_ttl.max(1))
+                                .arg(&enc_data)
                                 .invoke_async(&mut conn)
                                 .await;
                             if let Ok(0) = verdict {
                                 recovered_session =
-                                    Some((0, enc_data, candidate_hmac, candidate_ttl));
+                                    Some((1, enc_data, candidate_hmac, candidate_ttl));
                                 break;
                             }
                         }
@@ -791,11 +839,8 @@ impl RedisAuthStore {
             }
         };
 
-        let json = open_strict(&self.encryption_key, &encrypted)
-            .map_err(|e| other_err(&format!("Session decryption failed: {e}")))?;
-
-        let session: ClientSessionData =
-            serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+        let session_key = format!("{}session:{}_{}", self.key_prefix, did, hmac_fp);
+        let session = self.decode_bound_session(&session_key, did, &encrypted)?;
 
         if session.account_did.as_str() != did {
             return Err(other_err(&format!(
@@ -809,10 +854,8 @@ impl RedisAuthStore {
             crate::services::push::registry::session_fingerprint(session.session_id.as_str());
         if computed_fp != expected_fp && session.session_id.as_str() != expected_fingerprint {
             // Stale index detected: evict stale fp_index_key so it does not persist across ticks
-            let _ = redis::cmd("DEL")
-                .arg(&fp_index_key)
-                .query_async::<_, ()>(&mut conn)
-                .await;
+            let _:redis::RedisResult<i32>=redis::Script::new("if redis.call('GET',KEYS[1]) == ARGV[1] then redis.call('DEL',KEYS[1]); end; return 1")
+                .key(&fp_index_key).arg(&hmac_fp).invoke_async(&mut conn).await;
 
             // Self-healing: if did_index points to an active alternative session for this DID matching expected_fp, self-heal
             let alt_hmac: Option<String> = redis::cmd("GET")
@@ -836,9 +879,9 @@ impl RedisAuthStore {
                             .query_async::<_, Option<String>>(&mut conn)
                             .await
                         {
-                            if let Ok(alt_json) = open_strict(&self.encryption_key, &alt_enc) {
-                                if let Ok(alt_session) =
-                                    serde_json::from_str::<ClientSessionData>(&alt_json)
+                            if let Ok(alt_session) =
+                                self.decode_bound_session(&alt_session_k, did, &alt_enc)
+                            {
                                 {
                                     let alt_computed =
                                         crate::services::push::registry::session_fingerprint(
@@ -854,8 +897,10 @@ impl RedisAuthStore {
                                             .key(&did_index_key)
                                             .key(&alt_session_k)
                                             .key(&alt_retired_k)
+                                            .key(self.account_erasure_key(did))
                                             .arg(&alt_fp)
                                             .arg(ttl.max(1))
+                                            .arg(&alt_enc)
                                             .invoke_async(&mut conn)
                                             .await;
                                         if let Ok(0) = verdict {
@@ -883,8 +928,10 @@ impl RedisAuthStore {
                 .key(&did_index_key)
                 .key(&session_k)
                 .key(&retired_k)
+                .key(self.account_erasure_key(did))
                 .arg(&hmac_fp)
                 .arg(ttl.max(1))
+                .arg(&encrypted)
                 .invoke_async(&mut conn)
                 .await
                 .map_err(redis_err)?;
@@ -893,6 +940,14 @@ impl RedisAuthStore {
             }
         }
 
+        if slide_expiration
+            && status == 0
+            && !self
+                .touch_verified_session(did, session.session_id.as_str(), &encrypted)
+                .await?
+        {
+            return Ok(None);
+        }
         Ok(Some(session))
     }
 
@@ -953,6 +1008,8 @@ impl RedisAuthStore {
             retired_key: String,
             hmac_fp: String,
             ttl: i64,
+            encrypted: String,
+            fence_key: String,
         }
 
         for chunk in session_keys.chunks(batch_size) {
@@ -1033,29 +1090,13 @@ impl RedisAuthStore {
                     continue;
                 };
 
-                let json = match open_strict(&self.encryption_key, &enc_data) {
-                    Ok(j) => j,
+                let session = match self.decode_bound_session(&key_name, &did, &enc_data) {
+                    Ok(session) => session,
                     Err(_) => {
                         failed += 1;
-                        tracing::warn!(key = %key_name, "Session decryption failed during reconciliation");
                         continue;
                     }
                 };
-
-                let session = match serde_json::from_str::<ClientSessionData>(&json) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        failed += 1;
-                        tracing::warn!(key = %key_name, "Session json deserialization failed during reconciliation");
-                        continue;
-                    }
-                };
-
-                if session.account_did.as_str() != did {
-                    failed += 1;
-                    tracing::warn!(key = %key_name, did = %did, "Session account DID mismatch during reconciliation");
-                    continue;
-                }
 
                 let sha256_fp = crate::services::push::registry::session_fingerprint(
                     session.session_id.as_str(),
@@ -1070,6 +1111,8 @@ impl RedisAuthStore {
                     retired_key,
                     hmac_fp,
                     ttl,
+                    encrypted: enc_data,
+                    fence_key: self.account_erasure_key(&did),
                 });
             }
 
@@ -1083,13 +1126,15 @@ impl RedisAuthStore {
                 write_pipe
                     .cmd("EVAL")
                     .arg(LUA_INSTALL_FP_INDEX_SCRIPT)
-                    .arg(4) // 4 keys: fp_index_key, did_index_key, session_key, retired_key
+                    .arg(5) // includes account fence
                     .arg(&item.fp_index_key)
                     .arg(&item.did_index_key)
                     .arg(&item.key_name)
                     .arg(&item.retired_key)
+                    .arg(&item.fence_key)
                     .arg(&item.hmac_fp)
-                    .arg(item.ttl.max(1));
+                    .arg(item.ttl.max(1))
+                    .arg(&item.encrypted);
             }
 
             let write_results: Vec<redis::Value> = match write_pipe.query_async(&mut conn).await {
@@ -1181,6 +1226,7 @@ impl ClientAuthStore for RedisAuthStore {
             .key(&hashed_retired_key)
             .key(&hashed_fp_index_key)
             .key(&did_idx_key)
+            .key(self.account_erasure_key(did.as_str()))
             .arg(self.session_ttl)
             .arg(SESSION_INDEX_TTL_SECONDS)
             .arg(did.as_str())
@@ -1207,6 +1253,13 @@ impl ClientAuthStore for RedisAuthStore {
                 }
             }
 
+            if !self
+                .touch_verified_session(did.as_str(), session_id, &encrypted)
+                .await?
+            {
+                return Ok(None);
+            }
+
             // Safe dual-read re-encrypt on access: if session was stored as legacy v1, upgrade it to v2 envelope with AAD
             if is_v1 {
                 let meta =
@@ -1215,9 +1268,12 @@ impl ClientAuthStore for RedisAuthStore {
                     .map_err(|e| {
                         other_err(&format!("Session reseal failed during migration: {e}"))
                     })?;
-                conn.set_ex::<_, _, ()>(&hashed_session_key, v2_encrypted, self.session_ttl)
-                    .await
-                    .map_err(redis_err)?;
+                // Never recreate a retired grant from a pre-logout legacy read.
+                let _: i32 = redis::Script::new(
+                    "if redis.call('EXISTS',KEYS[2]) == 1 or redis.call('EXISTS',KEYS[3]) == 1 or redis.call('GET',KEYS[1]) ~= ARGV[1] then return 0 end redis.call('SET',KEYS[1],ARGV[2],'XX','KEEPTTL'); return 1",
+                ).key(&hashed_session_key).key(&hashed_retired_key)
+                    .key(self.account_erasure_key(did.as_str())).arg(&encrypted).arg(v2_encrypted)
+                    .invoke_async(&mut conn).await.map_err(redis_err)?;
             }
 
             return Ok(Some(session));
@@ -1251,6 +1307,7 @@ impl ClientAuthStore for RedisAuthStore {
             .key(&hashed_retired)
             .key(&hashed_fp_index)
             .key(&did_idx_key)
+            .key(self.account_erasure_key(session.account_did.as_str()))
             .arg(&encrypted)
             .arg(session.account_did.as_str())
             .arg(self.session_ttl)
@@ -1261,6 +1318,9 @@ impl ClientAuthStore for RedisAuthStore {
             .map_err(redis_err)?;
         if res == 1 {
             return Err(other_err("session has been retired"));
+        }
+        if res == 2 {
+            return Err(other_err("account erasure pending"));
         }
 
         Ok(())
@@ -1293,6 +1353,7 @@ impl ClientAuthStore for RedisAuthStore {
             .arg("logout")
             .arg(&self.key_prefix)
             .arg(did.as_str())
+            .arg(self.fingerprint(session_id))
             .invoke_async(&mut conn)
             .await
             .map_err(redis_err)?;
@@ -2431,10 +2492,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires running Redis (REDIS_URL)"]
     async fn test_resolve_session_recovery_and_install_script_fails_closed_on_retired_verdict() {
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let redis_client = redis::Client::open(redis_url.as_str())
-            .unwrap_or_else(|_| redis::Client::open("redis://localhost").unwrap());
+        assert_eq!(std::env::var("LITE_PUSH_DISPOSABLE").as_deref(), Ok("1"));
+        let redis_url = std::env::var("REDIS_URL").expect("explicit disposable Redis URL");
+        let parsed_url = url::Url::parse(&redis_url).expect("fixture URL");
+        assert_eq!(parsed_url.scheme(), "redis");
+        assert_eq!(parsed_url.host_str(), Some("127.0.0.1"));
+        assert_ne!(parsed_url.port().expect("explicit fixture port"), 6379);
+        let redis_client = redis::Client::open(redis_url.as_str()).expect("fixture Redis client");
         let redis_mgr = redis::aio::ConnectionManager::new(redis_client)
             .await
             .expect("REDIS_URL connection must succeed when test is executed");
@@ -2452,10 +2516,25 @@ mod tests {
 
         let mut conn = redis_mgr.clone();
 
-        // Prepare session payload
+        // Use the production session envelope (class/key/DID AAD). An unbound
+        // seal_strict blob is intentionally rejected by the real resolver.
         let session = make_test_session_data(did, session_id);
-        let enc = seal_strict(&key, &serde_json::to_string(&session).unwrap()).unwrap();
         let sess_key = format!("{prefix}session:{did}_{hmac_fp}");
+        let enc = seal_v2_with_metadata(
+            &key,
+            &serde_json::to_string(&session).unwrap(),
+            &EnvelopeMetadata::new("session", &sess_key, Some(did), None),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .decode_bound_session(&sess_key, did, &enc)
+                .unwrap()
+                .session_id
+                .as_str(),
+            session_id,
+            "the fixture must pass real envelope and identity authentication"
+        );
         let ret_key = format!("{prefix}upgrade_retired:{hmac_fp}");
         let fp_index_key = store.session_fp_index_key(&sha256_fp);
         let did_index_key = store.did_index_key(did);
@@ -2532,12 +2611,57 @@ mod tests {
             "Fingerprint index MUST be installed after unretired recovery"
         );
 
+        // 6. Model retirement between authenticated read and index install.
+        // Keep the verified ciphertext snapshot, remove the healed pointers, then
+        // install a tombstone before invoking the exact production CAS script.
+        let verified = store.decode_bound_session(&sess_key, did, &enc).unwrap();
+        assert_eq!(verified.session_id.as_str(), session_id);
+        let _: () = redis::cmd("DEL")
+            .arg(&fp_index_key)
+            .arg(&did_index_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SETEX")
+            .arg(&ret_key)
+            .arg(3600)
+            .arg("logout")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let verdict: i32 = redis::Script::new(LUA_INSTALL_FP_INDEX_SCRIPT)
+            .key(&fp_index_key)
+            .key(&did_index_key)
+            .key(&sess_key)
+            .key(&ret_key)
+            .key(store.account_erasure_key(did))
+            .arg(&hmac_fp)
+            .arg(3600)
+            .arg(&enc)
+            .invoke_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            verdict, 1,
+            "retirement after authentication must reject index install"
+        );
+        let installed: i64 = redis::cmd("EXISTS")
+            .arg(&fp_index_key)
+            .arg(&did_index_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            installed, 0,
+            "neither index may be resurrected by the raced read"
+        );
+
         // Cleanup
         let _: () = redis::cmd("DEL")
             .arg(&sess_key)
             .arg(&ret_key)
             .arg(&fp_index_key)
-            .arg(format!("{prefix}did_to_session:{did}"))
+            .arg(&did_index_key)
             .query_async(&mut conn)
             .await
             .unwrap();

@@ -333,7 +333,7 @@ impl jacquard_common::http_client::HttpClient for HardenedHttpClient {
 
         // 1. SSRF and scheme validation: validate URI scheme and host before sending
         if let Err(e) = validate_pds_url(&uri_str) {
-            tracing::warn!(uri = %uri_str, error = %e, "HardenedHttpClient: Request rejected by URL/SSRF policy");
+            tracing::warn!(uri = %crate::services::atproto_client::sanitize_url_for_logging(&uri_str), error = %e, "HardenedHttpClient: Request rejected by URL/SSRF policy");
             return Err(HardenedHttpClientError::Ssrf(e.to_string()));
         }
 
@@ -355,7 +355,7 @@ impl jacquard_common::http_client::HttpClient for HardenedHttpClient {
         {
             if content_length > self.max_response_size {
                 tracing::warn!(
-                    uri = %uri_str,
+                    uri = %crate::services::atproto_client::sanitize_url_for_logging(&uri_str),
                     content_length = content_length,
                     max_size = self.max_response_size,
                     "HardenedHttpClient: Response Content-Length exceeded maximum allowed limit"
@@ -373,7 +373,7 @@ impl jacquard_common::http_client::HttpClient for HardenedHttpClient {
             let chunk = chunk_res?;
             if body_bytes.len() + chunk.len() > self.max_response_size {
                 tracing::warn!(
-                    uri = %uri_str,
+                    uri = %crate::services::atproto_client::sanitize_url_for_logging(&uri_str),
                     max_size = self.max_response_size,
                     "HardenedHttpClient: Response body stream exceeded maximum allowed limit"
                 );
@@ -411,7 +411,7 @@ impl jacquard_common::http_client::HttpClient for HardenedHttpClient {
                         )
                     {
                         tracing::error!(
-                            uri = %uri_str,
+                            uri = %crate::services::atproto_client::sanitize_url_for_logging(&uri_str),
                             error = %val_err,
                             "HardenedHttpClient: Discovered OAuth server metadata failed endpoint validation"
                         );

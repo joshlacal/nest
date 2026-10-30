@@ -24,6 +24,28 @@ pub struct ModerationVerdict {
     pub blocking_by_list: bool,
     pub muted_only_reposts: bool,
     pub muted_only_quoteposts: bool,
+    /// None is an old/unqualified cache entry. The provider field is an AT-URI;
+    /// this minimal projection records only the verified relationship result.
+    pub following: Option<bool>,
+}
+
+fn valid_follow_record_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("at://") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let (Some(authority), Some(collection), Some(rkey), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    jacquard_common::types::did::Did::new(authority).is_ok()
+        && collection == "app.bsky.graph.follow"
+        && !rkey.is_empty()
+        && rkey.len() <= 512
+        && rkey
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._~:-".contains(&byte))
 }
 
 impl ModerationVerdict {
@@ -135,6 +157,15 @@ impl ModerationVerdict {
                 }
             }
         }
+        let following = match viewer.get("following") {
+            None => false,
+            Some(Value::String(uri)) if valid_follow_record_uri(uri) => true,
+            Some(_) => {
+                return Err(anyhow!(
+                    "viewerState.following must be an app.bsky.graph.follow AT-URI"
+                ))
+            }
+        };
         Ok(Self {
             muted,
             muted_by_list,
@@ -143,6 +174,7 @@ impl ModerationVerdict {
             blocking_by_list,
             muted_only_reposts,
             muted_only_quoteposts,
+            following: Some(following),
         })
     }
 
@@ -237,6 +269,17 @@ impl ActorModerationResolver {
         recipient_did: &str,
         actor_did: &str,
     ) -> Result<ActorModeration> {
+        self.resolve_for_notification(state, recipient_did, actor_did, false)
+            .await
+    }
+
+    pub async fn resolve_for_notification(
+        &self,
+        state: &Arc<AppState>,
+        recipient_did: &str,
+        actor_did: &str,
+        require_following: bool,
+    ) -> Result<ActorModeration> {
         let cached_row = sqlx::query(
             r#"
             SELECT verdict, display_label, fetched_at
@@ -271,7 +314,11 @@ impl ActorModerationResolver {
 
         if let Some((verdict, display_label, fetched_at)) = &cached {
             let age = OffsetDateTime::now_utc() - *fetched_at;
-            if age >= Duration::ZERO && age < self.ttl {
+            if age >= Duration::ZERO
+                && age < self.ttl
+                && (!require_following
+                    || (verdict.following.is_some() && age < Duration::seconds(30)))
+            {
                 return Ok(ActorModeration {
                     verdict: *verdict,
                     display_label: display_label.clone(),
@@ -297,7 +344,8 @@ impl ActorModerationResolver {
                 // added long after the cached answer leak during an outage.
                 match cached {
                     Some((verdict, display_label, fetched_at))
-                        if OffsetDateTime::now_utc() - fetched_at <= STALE_VERDICT_CEILING =>
+                        if !require_following
+                            && OffsetDateTime::now_utc() - fetched_at <= STALE_VERDICT_CEILING =>
                     {
                         tracing::warn!(
                             recipient = %recipient_did,
@@ -378,7 +426,7 @@ impl ActorModerationResolver {
     ) -> Result<ActorModeration> {
         let account = sqlx::query(
             r#"
-            SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url, auth_revoked_at, moderation_generation
+            SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url, auth_revoked_at, moderation_generation, auth_generation
             FROM push_accounts
             WHERE account_did = $1
             "#,
@@ -405,6 +453,7 @@ impl ActorModerationResolver {
         let session_id = account.try_get::<String, _>("session_id")?;
         let pds_url = account.try_get::<String, _>("pds_url")?;
         let captured_gen: i64 = account.try_get("moderation_generation").unwrap_or(1);
+        let captured_auth_gen: i64 = account.try_get("auth_generation")?;
 
         let (session, dpop) =
             match super::resolve_background_session(state, recipient_did, &session_id, &pds_url)
@@ -474,8 +523,23 @@ impl ActorModerationResolver {
                  cannot evaluate moderation"
             ));
         };
-        let verdict = ModerationVerdict::try_from_viewer_json(Some(viewer))
+        let mut verdict = ModerationVerdict::try_from_viewer_json(Some(viewer))
             .map_err(|err| anyhow!("app.bsky.actor.getProfile returned malformed viewer state for {recipient_did}: {err}"))?;
+        if profile.get("did").and_then(Value::as_str) != Some(actor_did) {
+            // Existing moderation behavior remains independent, but a following
+            // proof must identify the exact actor requested by this event.
+            verdict.following = None;
+        }
+        if let Some(uri) = viewer.get("following").and_then(Value::as_str) {
+            let owner = uri
+                .strip_prefix("at://")
+                .and_then(|rest| rest.split('/').next());
+            if owner != Some(recipient_did) {
+                return Err(anyhow!(
+                    "viewerState.following does not belong to authenticated recipient"
+                ));
+            }
+        }
         let display_label = actor_label_from_profile_json(&profile);
 
         let verdict_json = serde_json::to_value(verdict)?;
@@ -485,10 +549,18 @@ impl ActorModerationResolver {
         // this fetch was in flight (i.e., a mute/block landed mid-fetch).
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, recipient_did).await?;
+        let store = state
+            .auth_store
+            .as_deref()
+            .ok_or_else(|| anyhow!("Session store unavailable"))?;
+        store
+            .validate_live_session_local(recipient_did, &session.id.to_string())
+            .await?;
         let current_gen: Option<i64> = sqlx::query_scalar(
-            "SELECT moderation_generation FROM push_accounts WHERE account_did = $1",
+            "SELECT moderation_generation FROM push_accounts WHERE account_did = $1 AND auth_generation = $2 AND auth_revoked_at IS NULL",
         )
         .bind(recipient_did)
+        .bind(captured_auth_gen)
         .fetch_optional(&mut *tx)
         .await?;
         if current_gen != Some(captured_gen) {
@@ -576,6 +648,31 @@ fn truncate(value: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn following_proof_distinguishes_verified_absence_from_legacy_cache() {
+        let legacy: ModerationVerdict = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(legacy.following, None);
+        assert_eq!(
+            ModerationVerdict::try_from_viewer_json(Some(&serde_json::json!({})))
+                .unwrap()
+                .following,
+            Some(false)
+        );
+        assert_eq!(ModerationVerdict::try_from_viewer_json(Some(&serde_json::json!({"following":"at://did:plc:recipient/app.bsky.graph.follow/3abc"}))).unwrap().following,Some(true));
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("at://did:plc:recipient/app.bsky.feed.post/3abc"),
+            serde_json::json!("at://did:plc:recipient/app.bsky.graph.follow/3abc?x=1"),
+        ] {
+            assert!(ModerationVerdict::try_from_viewer_json(Some(
+                &serde_json::json!({"following":value})
+            ))
+            .is_err());
+        }
+    }
     use serde_json::json;
     #[test]
     fn test_try_from_viewer_json_malformed_non_object_fails() {
@@ -595,7 +692,13 @@ mod tests {
         let empty_obj = json!({});
         let verdict = ModerationVerdict::try_from_viewer_json(Some(&empty_obj))
             .expect("empty object is valid viewerState");
-        assert_eq!(verdict, ModerationVerdict::default());
+        assert_eq!(
+            verdict,
+            ModerationVerdict {
+                following: Some(false),
+                ..ModerationVerdict::default()
+            }
+        );
         assert!(!verdict.suppresses_all());
     }
     #[test]

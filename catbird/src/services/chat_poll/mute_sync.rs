@@ -45,12 +45,7 @@ pub async fn sync_all_mutes(
 
     for did in &dids {
         if let Err(err) = sync_mutes_for_account(state, db_pool, scheduler, did).await {
-            if is_auth_revocation_error(&err) {
-                tracing::info!(did = %did, "Auth revoked during mute sync; unenrolling");
-                let _ = scheduler.unenroll_account(did).await;
-            } else {
-                tracing::warn!(did = %did, error = %err, "Mute sync failed for account");
-            }
+            tracing::warn!(did = %did, error = %err, "Mute sync failed for account");
         }
     }
 
@@ -67,7 +62,7 @@ pub(crate) async fn sync_mutes_for_account(
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
 
-    let (session_id, pds_url) =
+    let (session_id, pds_url, auth_generation) =
         match tokio::time::timeout(MAX_MUTE_SYNC_DURATION, lookup_push_account(db_pool, did)).await
         {
             Ok(res) => res?,
@@ -98,7 +93,15 @@ pub(crate) async fn sync_mutes_for_account(
     )
     .await
     {
-        Ok(res) => res?,
+        Ok(Ok(pair)) => pair,
+        Ok(Err(err)) => {
+            if is_auth_revocation_error(&err) {
+                scheduler
+                    .unenroll_account_if_auth_generation(did, auth_generation)
+                    .await?;
+            }
+            return Err(err);
+        }
         Err(_) => {
             tracing::warn!(did = %did, "Mute sync session resolution timed out");
             return Err(anyhow!(
@@ -108,9 +111,25 @@ pub(crate) async fn sync_mutes_for_account(
         }
     };
 
-    sync_mutes_for_session(state, scheduler, &session, &dpop, did, start_time).await
+    let result = sync_mutes_for_session_fenced(
+        state,
+        scheduler,
+        &session,
+        &dpop,
+        did,
+        start_time,
+        Some(auth_generation),
+    )
+    .await;
+    if result.as_ref().err().is_some_and(is_auth_revocation_error) {
+        scheduler
+            .unenroll_account_if_auth_generation(did, auth_generation)
+            .await?;
+    }
+    result
 }
 
+#[cfg(test)]
 pub(crate) async fn sync_mutes_for_session(
     state: &Arc<AppState>,
     scheduler: &ChatPollScheduler,
@@ -118,6 +137,18 @@ pub(crate) async fn sync_mutes_for_session(
     dpop: &crate::middleware::JacquardDpopData,
     did: &str,
     start_time: std::time::Instant,
+) -> Result<()> {
+    sync_mutes_for_session_fenced(state, scheduler, session, dpop, did, start_time, None).await
+}
+
+async fn sync_mutes_for_session_fenced(
+    state: &Arc<AppState>,
+    scheduler: &ChatPollScheduler,
+    session: &crate::models::CatbirdSession,
+    dpop: &crate::middleware::JacquardDpopData,
+    did: &str,
+    start_time: std::time::Instant,
+    expected_auth_generation: Option<i64>,
 ) -> Result<()> {
     let remaining = MAX_MUTE_SYNC_DURATION
         .checked_sub(start_time.elapsed())
@@ -258,15 +289,7 @@ pub(crate) async fn sync_mutes_for_session(
         let body_bytes = match response {
             crate::services::ProxyResponse::Buffered { status, body, .. } => {
                 if !(200..300).contains(&status) {
-                    return Err(anyhow!(
-                        "listConvos returned {} for {}: {}",
-                        status,
-                        did,
-                        String::from_utf8_lossy(&body)
-                            .chars()
-                            .take(200)
-                            .collect::<String>()
-                    ));
+                    return Err(list_convos_error(status, &body));
                 }
                 body
             }
@@ -332,10 +355,28 @@ pub(crate) async fn sync_mutes_for_session(
         };
 
         // Bulk-replace the muted set in the database ONLY on full clean completion within deadline
-        let applied = match tokio::time::timeout(
-            commit_remaining,
-            scheduler.sync_muted_convos(did, &staged_muted_ids, mute_generation),
-        )
+        let applied = match tokio::time::timeout(commit_remaining, async {
+            match expected_auth_generation {
+                Some(auth_generation) => {
+                    scheduler
+                        .sync_muted_convos_fenced(
+                            did,
+                            &staged_muted_ids,
+                            mute_generation,
+                            auth_generation,
+                        )
+                        .await
+                }
+                #[cfg(test)]
+                None => {
+                    scheduler
+                        .sync_muted_convos(did, &staged_muted_ids, mute_generation)
+                        .await
+                }
+                #[cfg(not(test))]
+                None => Err(anyhow!("Missing authorization generation")),
+            }
+        })
         .await
         {
             Ok(res) => res?,
@@ -370,10 +411,10 @@ pub(crate) async fn sync_mutes_for_session(
     }
 }
 
-/// Look up session_id and pds_url from push_accounts for a given DID.
-async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(String, String)> {
-    let row = sqlx::query_as::<_, (String, String)>(
-        "SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
+/// Capture session identity and authorization generation before network work.
+async fn lookup_push_account(db_pool: &Pool<Postgres>, did: &str) -> Result<(String, String, i64)> {
+    let row = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT COALESCE(session_fingerprint, encode(sha256(session_id::bytea), 'hex')) AS session_id, pds_url, auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
     )
     .bind(did)
     .fetch_optional(db_pool)
@@ -967,5 +1008,40 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 0, "No mutes must be committed on timeout");
+    }
+}
+
+// Error responses may contain private conversation text. Only bounded protocol
+// codes and response size may reach the caller's structured diagnostic log.
+fn list_convos_error(status: u16, body: &[u8]) -> anyhow::Error {
+    anyhow!(
+        "listConvos returned status={} error_code={:?} body_bytes={}",
+        status,
+        super::poller::xrpc_error_code(body),
+        body.len()
+    )
+}
+
+#[cfg(test)]
+mod error_privacy_tests {
+    use super::list_convos_error;
+
+    #[test]
+    fn upstream_error_diagnostics_do_not_include_conversation_text() {
+        for body in [
+            br#"{"error":"InvalidToken","message":"PRIVATE_CONVERSATION_BODY"}"#.as_slice(),
+            br#"{"error":"PRIVATE_CONVERSATION_BODY with spaces","convos":[{"text":"PRIVATE_CONVERSATION_BODY"}]}"#.as_slice(),
+            b"<html>PRIVATE_CONVERSATION_BODY</html>".as_slice(),
+        ] {
+            let error = list_convos_error(503, body).to_string();
+            assert!(error.contains("status=503"));
+            assert!(error.contains(&format!("body_bytes={}", body.len())));
+            assert!(!error.contains("PRIVATE_CONVERSATION_BODY"));
+        }
+        assert!(
+            list_convos_error(401, br#"{"error":"InvalidToken","message":"secret"}"#)
+                .to_string()
+                .contains("InvalidToken")
+        );
     }
 }

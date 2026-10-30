@@ -194,6 +194,21 @@ impl ChatPollScheduler {
         Ok(())
     }
 
+    /// An old poll's backoff must not change a newly signed-in enrollment.
+    pub async fn reschedule_fenced(
+        &self,
+        did: &str,
+        delay_secs: i64,
+        auth_generation: i64,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        sqlx::query("UPDATE chat_poll_state SET next_poll_at = NOW() + make_interval(secs => $2) WHERE account_did = $1 AND EXISTS (SELECT 1 FROM push_accounts WHERE account_did = $1 AND auth_generation = $3 AND auth_revoked_at IS NULL)")
+            .bind(did).bind(delay_secs).bind(auth_generation).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // MARK: - PDS Back-off
 
     /// Reschedule all accounts on the given PDS host after a 429 response.
@@ -236,6 +251,34 @@ impl ChatPollScheduler {
     /// because the user has the app in the foreground. Returns the number of
     /// rows updated so callers can detect a missing enrollment (0 rows).
     pub async fn update_foreground_lease(&self, did: &str, secs: i64) -> Result<u64> {
+        self.update_foreground_lease_inner(did, secs, None).await
+    }
+
+    pub async fn update_foreground_lease_authenticated(
+        &self,
+        session: &crate::models::CatbirdSession,
+        store: &crate::services::RedisAuthStore,
+        secs: i64,
+    ) -> Result<u64> {
+        self.update_foreground_lease_inner(
+            &session.did,
+            secs,
+            Some((store, session.id.to_string())),
+        )
+        .await
+    }
+
+    async fn update_foreground_lease_inner(
+        &self,
+        did: &str,
+        secs: i64,
+        guard: Option<(&crate::services::RedisAuthStore, String)>,
+    ) -> Result<u64> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        if let Some((store, bearer)) = guard {
+            store.validate_live_session_local(did, &bearer).await?;
+        }
         let result = sqlx::query(
             r#"
             UPDATE chat_poll_state
@@ -249,9 +292,10 @@ impl ChatPollScheduler {
         .bind(secs)
         .bind(TIER_HOT)
         .bind(tier_interval_secs(TIER_HOT))
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -262,6 +306,34 @@ impl ChatPollScheduler {
     /// If the account is already enrolled the PDS host is updated but existing
     /// cursor / tier data is preserved.
     pub async fn enroll_account(&self, did: &str, pds_host: &str) -> Result<()> {
+        self.enroll_account_inner(did, pds_host, None).await
+    }
+
+    pub async fn enroll_account_authenticated(
+        &self,
+        session: &crate::models::CatbirdSession,
+        store: &crate::services::RedisAuthStore,
+        pds_host: &str,
+    ) -> Result<()> {
+        self.enroll_account_inner(
+            &session.did,
+            pds_host,
+            Some((store, session.id.to_string())),
+        )
+        .await
+    }
+
+    async fn enroll_account_inner(
+        &self,
+        did: &str,
+        pds_host: &str,
+        guard: Option<(&crate::services::RedisAuthStore, String)>,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        if let Some((store, bearer)) = guard {
+            store.validate_live_session_local(did, &bearer).await?;
+        }
         sqlx::query(
             r#"
             INSERT INTO chat_poll_state (account_did, pds_host, poll_tier, next_poll_at)
@@ -273,9 +345,10 @@ impl ChatPollScheduler {
         .bind(did)
         .bind(pds_host)
         .bind(TIER_WARM)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -287,6 +360,30 @@ impl ChatPollScheduler {
             .await?;
 
         Ok(())
+    }
+
+    /// A terminal error for an old background session must not unenroll a
+    /// newer sign-in that won while the network request was in flight.
+    pub async fn unenroll_account_if_auth_generation(
+        &self,
+        did: &str,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        if expected_generation <= 0 {
+            return Ok(false);
+        }
+        let mut tx = self.db_pool.begin().await?;
+        crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        let deleted = sqlx::query(
+            "DELETE FROM chat_poll_state WHERE account_did = $1 AND EXISTS \
+             (SELECT 1 FROM push_accounts WHERE account_did = $1 AND auth_generation = $2)",
+        )
+        .bind(did)
+        .bind(expected_generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected() != 0)
     }
 
     /// Unenroll only if the account has no active devices — atomic, so a
@@ -332,6 +429,32 @@ impl ChatPollScheduler {
 
     /// Insert or remove a single muted conversation entry with quota enforcement.
     pub async fn set_convo_muted(&self, did: &str, convo_id: &str, muted: bool) -> Result<()> {
+        self.set_convo_muted_inner(did, convo_id, muted, None).await
+    }
+
+    pub async fn set_convo_muted_authenticated(
+        &self,
+        session: &crate::models::CatbirdSession,
+        store: &crate::services::RedisAuthStore,
+        convo_id: &str,
+        muted: bool,
+    ) -> Result<()> {
+        self.set_convo_muted_inner(
+            &session.did,
+            convo_id,
+            muted,
+            Some((store, session.id.to_string())),
+        )
+        .await
+    }
+
+    async fn set_convo_muted_inner(
+        &self,
+        did: &str,
+        convo_id: &str,
+        muted: bool,
+        guard: Option<(&crate::services::RedisAuthStore, String)>,
+    ) -> Result<()> {
         if muted {
             if !is_valid_convo_id(convo_id) {
                 anyhow::bail!("Invalid conversation ID format or length");
@@ -339,6 +462,9 @@ impl ChatPollScheduler {
 
             let mut tx = self.db_pool.begin().await?;
             crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+            if let Some((store, bearer)) = &guard {
+                store.validate_live_session_local(did, bearer).await?;
+            }
 
             // Serialize quota cardinality with shared account advisory transaction lock across all writers
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext('chat_muted_convos:' || $1))")
@@ -394,6 +520,9 @@ impl ChatPollScheduler {
             // Allow delete/unmute of legacy invalid rows regardless of creation-time syntax
             let mut tx = self.db_pool.begin().await?;
             crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+            if let Some((store, bearer)) = &guard {
+                store.validate_live_session_local(did, bearer).await?;
+            }
             sqlx::query("DELETE FROM chat_muted_convos WHERE account_did = $1 AND convo_id = $2")
                 .bind(did)
                 .bind(convo_id)
@@ -417,6 +546,28 @@ impl ChatPollScheduler {
         .unwrap_or(0))
     }
 
+    /// A reset account must establish the complete mute set, including a
+    /// successfully empty set, before its first normal (alerting) log poll.
+    pub async fn needs_initial_mute_sync(&self, did: &str, auth_generation: i64) -> Result<bool> {
+        let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
+            "SELECT pp.preferences_json,COALESCE(mg.generation,0) FROM push_preferences pp LEFT JOIN chat_mute_sync_generations mg USING(account_did) WHERE pp.account_did=$1",
+        ).bind(did).fetch_optional(&self.db_pool).await?;
+        let Some((payload, generation)) = row else {
+            return Ok(true);
+        };
+        if payload
+            .get(crate::services::push::preferences::RESTORE_METADATA_KEY)
+            .is_none()
+        {
+            return Ok(false);
+        }
+        Ok(!crate::services::push::preferences::chat_snapshot_matches(
+            &payload,
+            auth_generation,
+            generation,
+        ))
+    }
+
     /// Bulk-replace the full set of muted conversations for a DID.
     ///
     /// Runs inside a transaction: deletes all existing mute rows for the DID,
@@ -428,6 +579,36 @@ impl ChatPollScheduler {
         did: &str,
         convo_ids: &[String],
         expected_generation: i64,
+    ) -> Result<bool> {
+        self.sync_muted_convos_inner(did, convo_ids, expected_generation, None)
+            .await
+    }
+
+    pub async fn sync_muted_convos_fenced(
+        &self,
+        did: &str,
+        convo_ids: &[String],
+        expected_generation: i64,
+        expected_auth_generation: i64,
+    ) -> Result<bool> {
+        if expected_auth_generation <= 0 {
+            return Ok(false);
+        }
+        self.sync_muted_convos_inner(
+            did,
+            convo_ids,
+            expected_generation,
+            Some(expected_auth_generation),
+        )
+        .await
+    }
+
+    async fn sync_muted_convos_inner(
+        &self,
+        did: &str,
+        convo_ids: &[String],
+        expected_generation: i64,
+        expected_auth_generation: Option<i64>,
     ) -> Result<bool> {
         let mut deduped = std::collections::HashSet::new();
         for convo_id in convo_ids {
@@ -447,6 +628,13 @@ impl ChatPollScheduler {
 
         let mut tx = self.db_pool.begin().await?;
         crate::services::push::lock::acquire_account_lock(&mut tx, did).await?;
+        if let Some(expected) = expected_auth_generation {
+            let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_accounts WHERE account_did = $1 AND auth_generation = $2 AND auth_revoked_at IS NULL)")
+                .bind(did).bind(expected).fetch_one(&mut *tx).await?;
+            if !live {
+                return Ok(false);
+            }
+        }
         let generation = sqlx::query_scalar::<_, i64>(
             "SELECT generation FROM chat_mute_sync_generations WHERE account_did = $1",
         )
@@ -483,6 +671,12 @@ impl ChatPollScheduler {
         }
 
         bump_mute_generation(&mut tx, did).await?;
+        if let Some(auth_generation) = expected_auth_generation {
+            // Only this complete, fenced replacement can establish snapshot
+            // completeness. A local one-conversation change cannot invent it.
+            sqlx::query("UPDATE push_preferences SET preferences_json=jsonb_set(preferences_json,'{_catbirdRestore,chatMuteSnapshot}',jsonb_build_object('authGeneration',$2::bigint,'muteGeneration',mg.generation,'completedAt',FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::bigint)) FROM chat_mute_sync_generations mg WHERE push_preferences.account_did=$1 AND mg.account_did=$1 AND preferences_json->'_catbirdRestore'->>'source'='catbird_local' AND jsonb_typeof(preferences_json->'_catbirdRestore')='object'")
+                .bind(did).bind(auth_generation).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
 
         Ok(true)
@@ -567,6 +761,11 @@ async fn bump_mute_generation(tx: &mut sqlx::Transaction<'_, Postgres>, did: &st
         "INSERT INTO chat_mute_sync_generations(account_did, generation) VALUES ($1, 1) ON CONFLICT(account_did) DO UPDATE SET generation = chat_mute_sync_generations.generation + 1",
     )
     .bind(did).execute(&mut **tx).await?;
+    // Applying a known local mutation to an already complete current set keeps
+    // that set complete. Advance its proof only from the exact prior mutation
+    // generation; missing/stale proof remains missing/stale until a full sync.
+    sqlx::query("UPDATE push_preferences pp SET preferences_json=jsonb_set(pp.preferences_json,'{_catbirdRestore,chatMuteSnapshot,muteGeneration}',to_jsonb(mg.generation)) FROM chat_mute_sync_generations mg,push_accounts pa WHERE pp.account_did=$1 AND mg.account_did=$1 AND pa.account_did=$1 AND pa.auth_revoked_at IS NULL AND pp.preferences_json->'_catbirdRestore'->'chatMuteSnapshot'->'authGeneration'=to_jsonb(pa.auth_generation) AND pp.preferences_json->'_catbirdRestore'->'chatMuteSnapshot'->'muteGeneration'=to_jsonb(mg.generation-1)")
+        .bind(did).execute(&mut **tx).await?;
     Ok(())
 }
 
