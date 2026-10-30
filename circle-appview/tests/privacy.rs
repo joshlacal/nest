@@ -3143,9 +3143,9 @@ async fn app_access_unrecognized_variant_denies_without_purging_data(pool: PgPoo
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPool) {
+async fn app_access_malformed_allowed_apps_denies_without_purging_data(pool: PgPool) {
     use circle_appview::access::refresh_member_cache;
-    use circle_appview::space_client::{SpaceAppAccess, SpaceConfig};
+    use circle_appview::space_client::{SpaceConfig, SpacePolicy};
     use serde_json::json;
 
     let setup = setup_privacy_test(pool.clone()).await;
@@ -3176,11 +3176,13 @@ async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPoo
     .await
     .unwrap();
 
-    // 2. Parse wire json missing allowed array
+    // 2. Parse a memberspace policy whose allowedApps is not an array. (An absent
+    // allowedApps means any app may read, so malformed is the fail-closed case.)
     let wire_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList"
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": null
     });
-    let parsed_access = SpaceAppAccess::parse(&wire_json);
+    let parsed_access = SpacePolicy::parse_policy(&wire_json).app_access;
 
     setup.mock_transport.set_space_config(
         SPACE_1,
@@ -3201,7 +3203,7 @@ async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPoo
     let res = refresh_member_cache(&setup.state, SPACE_1).await;
     assert!(
         res.is_err(),
-        "refresh_member_cache must fail closed on absent allowed array"
+        "refresh_member_cache must fail closed on malformed allowedApps"
     );
 
     // 4. Circle data MUST NOT be purged
@@ -3214,11 +3216,11 @@ async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPoo
 
     assert!(
         app_access,
-        "Circle app_access_granted must remain true when allowed array is absent"
+        "Circle app_access_granted must remain true when allowedApps is malformed"
     );
     assert!(
         deleted_at.is_none(),
-        "Circle deleted_at must remain NULL when allowed array is absent"
+        "Circle deleted_at must remain NULL when allowedApps is malformed"
     );
 
     let record_count: (i64,) =
@@ -3229,14 +3231,14 @@ async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPoo
             .unwrap();
     assert_eq!(
         record_count.0, 1,
-        "circle_records must NOT be purged when allowed array is absent"
+        "circle_records must NOT be purged when allowedApps is malformed"
     );
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn app_access_explicit_empty_allowed_array_revokes_and_purges_data(pool: PgPool) {
     use circle_appview::access::refresh_member_cache;
-    use circle_appview::space_client::{SpaceAppAccess, SpaceConfig};
+    use circle_appview::space_client::{SpaceConfig, SpacePolicy};
     use serde_json::json;
 
     let setup = setup_privacy_test(pool.clone()).await;
@@ -3269,10 +3271,10 @@ async fn app_access_explicit_empty_allowed_array_revokes_and_purges_data(pool: P
 
     // 2. Parse wire json with genuine empty allowed array
     let wire_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": []
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": []
     });
-    let parsed_access = SpaceAppAccess::parse(&wire_json);
+    let parsed_access = SpacePolicy::parse_policy(&wire_json).app_access;
 
     setup.mock_transport.set_space_config(
         SPACE_1,
@@ -3328,7 +3330,7 @@ async fn app_access_explicit_empty_allowed_array_revokes_and_purges_data(pool: P
 #[sqlx::test(migrations = "./migrations")]
 async fn app_access_object_entry_allowed_array_denies_without_purging_data(pool: PgPool) {
     use circle_appview::access::refresh_member_cache;
-    use circle_appview::space_client::{SpaceAppAccess, SpaceConfig};
+    use circle_appview::space_client::{SpaceConfig, SpacePolicy};
     use serde_json::json;
 
     let setup = setup_privacy_test(pool.clone()).await;
@@ -3361,10 +3363,10 @@ async fn app_access_object_entry_allowed_array_denies_without_purging_data(pool:
 
     // 2. Parse wire json with object entries in allowed array
     let wire_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": [{"unreadable": true}]
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": [{"unreadable": true}]
     });
-    let parsed_access = SpaceAppAccess::parse(&wire_json);
+    let parsed_access = SpacePolicy::parse_policy(&wire_json).app_access;
 
     setup.mock_transport.set_space_config(
         SPACE_1,
@@ -3419,26 +3421,23 @@ async fn app_access_object_entry_allowed_array_denies_without_purging_data(pool:
 
 #[test]
 fn app_access_wire_parsing_discriminates_open_allowlist_and_unknown() {
-    use circle_appview::space_client::SpaceAppAccess;
+    use circle_appview::space_client::{SpaceAppAccess, SpacePolicy};
     use serde_json::json;
 
     let client = "https://circles.catbird.blue/oauth/client-metadata.json";
+    let access = |policy: serde_json::Value| SpacePolicy::parse_policy(&policy).app_access;
 
-    // Case 1: #open policy
-    let open_json = json!({
-        "$type": "com.atproto.simplespace.defs#open"
-    });
-    let parsed_open = SpaceAppAccess::parse(&open_json);
+    // Case 1: allowedApps omitted means any app may read
+    let parsed_open = access(json!({ "$type": "com.atproto.memberspace.policy" }));
     assert_eq!(parsed_open, SpaceAppAccess::Open);
     assert!(parsed_open.grants_access(client));
     assert!(!parsed_open.is_explicit_revocation(client));
 
-    // Case 2: #allowList with matching client
-    let allow_match_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": [client, "other-client"]
-    });
-    let parsed_match = SpaceAppAccess::parse(&allow_match_json);
+    // Case 2: allowedApps naming this client
+    let parsed_match = access(json!({
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": [client, "other-client"]
+    }));
     assert_eq!(
         parsed_match,
         SpaceAppAccess::AllowList(vec![client.to_string(), "other-client".to_string()])
@@ -3446,12 +3445,11 @@ fn app_access_wire_parsing_discriminates_open_allowlist_and_unknown() {
     assert!(parsed_match.grants_access(client));
     assert!(!parsed_match.is_explicit_revocation(client));
 
-    // Case 3: #allowList omitting client
-    let allow_omit_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": ["other-client-only"]
-    });
-    let parsed_omit = SpaceAppAccess::parse(&allow_omit_json);
+    // Case 3: allowedApps omitting this client
+    let parsed_omit = access(json!({
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": ["other-client-only"]
+    }));
     assert_eq!(
         parsed_omit,
         SpaceAppAccess::AllowList(vec!["other-client-only".to_string()])
@@ -3459,103 +3457,46 @@ fn app_access_wire_parsing_discriminates_open_allowlist_and_unknown() {
     assert!(!parsed_omit.grants_access(client));
     assert!(parsed_omit.is_explicit_revocation(client));
 
-    // Case 4: #allowList with genuine empty allowed array (authoritative revocation)
-    let allow_empty_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": []
-    });
-    let parsed_empty = SpaceAppAccess::parse(&allow_empty_json);
+    // Case 4: empty allowedApps (authoritative revocation)
+    let parsed_empty = access(json!({
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": []
+    }));
     assert_eq!(parsed_empty, SpaceAppAccess::AllowList(vec![]));
     assert!(!parsed_empty.grants_access(client));
     assert!(parsed_empty.is_explicit_revocation(client));
 
-    // Case 5: #allowList with absent allowed field (must degrade to Unknown, not purge)
-    let allow_absent_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList"
-    });
-    let parsed_absent = SpaceAppAccess::parse(&allow_absent_json);
-    assert_eq!(
-        parsed_absent,
-        SpaceAppAccess::Unknown(Some("com.atproto.simplespace.defs#allowList".to_string()))
-    );
-    assert!(!parsed_absent.grants_access(client));
-    assert!(!parsed_absent.is_explicit_revocation(client));
+    // Cases 5-6: allowedApps that is not an array degrades to Unknown, not purge
+    for malformed in [json!(null), json!(client), json!({ "allowed": [client] })] {
+        let parsed = access(json!({
+            "$type": "com.atproto.memberspace.policy",
+            "allowedApps": malformed
+        }));
+        assert_eq!(
+            parsed,
+            SpaceAppAccess::Unknown(Some("allowedApps".to_string()))
+        );
+        assert!(!parsed.grants_access(client));
+        assert!(!parsed.is_explicit_revocation(client));
+    }
 
-    // Case 6: #allowList with null allowed field (must degrade to Unknown, not purge)
-    let allow_null_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": null
-    });
-    let parsed_null = SpaceAppAccess::parse(&allow_null_json);
-    assert_eq!(
-        parsed_null,
-        SpaceAppAccess::Unknown(Some("com.atproto.simplespace.defs#allowList".to_string()))
-    );
-    assert!(!parsed_null.grants_access(client));
-    assert!(!parsed_null.is_explicit_revocation(client));
-
-    // Case 7: #allowList with renamed allowed field (must degrade to Unknown, not purge)
-    let allow_renamed_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "permitted": [client]
-    });
-    let parsed_renamed = SpaceAppAccess::parse(&allow_renamed_json);
-    assert_eq!(
-        parsed_renamed,
-        SpaceAppAccess::Unknown(Some("com.atproto.simplespace.defs#allowList".to_string()))
-    );
-    assert!(!parsed_renamed.grants_access(client));
-    assert!(!parsed_renamed.is_explicit_revocation(client));
-
-    // Case 8: Legacy bare array [] from wire (must degrade to Unknown, not purge)
-    let legacy_empty_json = json!([]);
-    let parsed_legacy_empty = SpaceAppAccess::parse(&legacy_empty_json);
-    assert_eq!(parsed_legacy_empty, SpaceAppAccess::Unknown(None));
-    assert!(!parsed_legacy_empty.grants_access(client));
-    assert!(!parsed_legacy_empty.is_explicit_revocation(client));
-
-    // Case 9: Legacy bare array with entries
-    let legacy_entries_json = json!([client, "other-client"]);
-    let parsed_legacy_entries = SpaceAppAccess::parse(&legacy_entries_json);
-    assert_eq!(
-        parsed_legacy_entries,
-        SpaceAppAccess::AllowList(vec![client.to_string(), "other-client".to_string()])
-    );
-    assert!(parsed_legacy_entries.grants_access(client));
-    assert!(!parsed_legacy_entries.is_explicit_revocation(client));
-
-    // Case 10: Unrecognized policy variant
-    let unknown_json = json!({
-        "$type": "com.custom.future#customAppAccess",
-        "customField": true
-    });
-    let parsed_unknown = SpaceAppAccess::parse(&unknown_json);
-    assert_eq!(
-        parsed_unknown,
-        SpaceAppAccess::Unknown(Some("com.custom.future#customAppAccess".to_string()))
-    );
-    assert!(!parsed_unknown.grants_access(client));
-    assert!(!parsed_unknown.is_explicit_revocation(client));
-
-    // Case 11: #allowList with non-string object entries (must degrade to Unknown, not purge)
-    let allow_objects_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": [{"bad": "entry"}, {"nested": 123}]
-    });
-    let parsed_objects = SpaceAppAccess::parse(&allow_objects_json);
+    // Case 7: allowedApps with no readable entries degrades to Unknown, not purge
+    let parsed_objects = access(json!({
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": [{"bad": "entry"}, 123]
+    }));
     assert_eq!(
         parsed_objects,
-        SpaceAppAccess::Unknown(Some("com.atproto.simplespace.defs#allowList".to_string()))
+        SpaceAppAccess::Unknown(Some("allowedApps".to_string()))
     );
     assert!(!parsed_objects.grants_access(client));
     assert!(!parsed_objects.is_explicit_revocation(client));
 
-    // Case 12: #allowList with partially readable array containing matching client
-    let allow_partial_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": [client, {"invalid": 123}, 456]
-    });
-    let parsed_partial = SpaceAppAccess::parse(&allow_partial_json);
+    // Case 8: partially readable allowedApps containing this client
+    let parsed_partial = access(json!({
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": [client, {"invalid": 123}, 456]
+    }));
     assert_eq!(
         parsed_partial,
         SpaceAppAccess::AllowList(vec![client.to_string()])
@@ -3563,12 +3504,11 @@ fn app_access_wire_parsing_discriminates_open_allowlist_and_unknown() {
     assert!(parsed_partial.grants_access(client));
     assert!(!parsed_partial.is_explicit_revocation(client));
 
-    // Case 13: #allowList with partially readable array omitting client
-    let allow_partial_omit_json = json!({
-        "$type": "com.atproto.simplespace.defs#allowList",
-        "allowed": ["other-client", {"invalid": 123}]
-    });
-    let parsed_partial_omit = SpaceAppAccess::parse(&allow_partial_omit_json);
+    // Case 9: partially readable allowedApps omitting this client
+    let parsed_partial_omit = access(json!({
+        "$type": "com.atproto.memberspace.policy",
+        "allowedApps": ["other-client", {"invalid": 123}]
+    }));
     assert_eq!(
         parsed_partial_omit,
         SpaceAppAccess::AllowList(vec!["other-client".to_string()])
@@ -3576,33 +3516,91 @@ fn app_access_wire_parsing_discriminates_open_allowlist_and_unknown() {
     assert!(!parsed_partial_omit.grants_access(client));
     assert!(parsed_partial_omit.is_explicit_revocation(client));
 
-    // Case 14: Untagged object with non-string object entries (must degrade to Unknown, not purge)
-    let untagged_objects_json = json!({
-        "allowed": [{"bad": "entry"}]
-    });
-    let parsed_untagged_objects = SpaceAppAccess::parse(&untagged_objects_json);
-    assert_eq!(parsed_untagged_objects, SpaceAppAccess::Unknown(None));
-    assert!(!parsed_untagged_objects.grants_access(client));
-    assert!(!parsed_untagged_objects.is_explicit_revocation(client));
-
-    // Case 15: Untagged object with partially readable array
-    let untagged_partial_json = json!({
-        "allowed": [client, {"invalid": 123}]
-    });
-    let parsed_untagged_partial = SpaceAppAccess::parse(&untagged_partial_json);
+    // Case 10: an unknown policy $type denies without purging
+    let parsed_unknown =
+        access(json!({ "$type": "com.custom.future#policy", "allowedApps": [client] }));
     assert_eq!(
-        parsed_untagged_partial,
-        SpaceAppAccess::AllowList(vec![client.to_string()])
+        parsed_unknown,
+        SpaceAppAccess::Unknown(Some("com.custom.future#policy".to_string()))
     );
-    assert!(parsed_untagged_partial.grants_access(client));
-    assert!(!parsed_untagged_partial.is_explicit_revocation(client));
+    assert!(!parsed_unknown.grants_access(client));
+    assert!(!parsed_unknown.is_explicit_revocation(client));
 
-    // Case 16: Bare array with non-string entries (must degrade to Unknown, not purge)
-    let bare_non_strings_json = json!([{"bad": "entry"}, 123]);
-    let parsed_bare_non_strings = SpaceAppAccess::parse(&bare_non_strings_json);
-    assert_eq!(parsed_bare_non_strings, SpaceAppAccess::Unknown(None));
-    assert!(!parsed_bare_non_strings.grants_access(client));
-    assert!(!parsed_bare_non_strings.is_explicit_revocation(client));
+    // Case 11: a policy without $type denies without purging
+    let parsed_untyped = access(json!({ "allowedApps": [client] }));
+    assert_eq!(parsed_untyped, SpaceAppAccess::Unknown(None));
+    assert!(!parsed_untyped.grants_access(client));
+    assert!(!parsed_untyped.is_explicit_revocation(client));
+}
+
+#[test]
+fn space_policy_union_maps_to_supported_member_list_only() {
+    use circle_appview::space_client::{SpaceAppAccess, SpacePolicy};
+    use serde_json::json;
+
+    // A memberspace with defaults is the only supported Circle policy.
+    let member = SpacePolicy::parse_policy(&json!({
+        "$type": "com.atproto.memberspace.policy",
+        "publicRead": false,
+        "publicWrite": false,
+        "publishPolicy": true,
+        "publishMembers": true
+    }));
+    assert_eq!(member.read_policy, SpacePolicy::MemberList);
+    assert_eq!(member.write_policy, SpacePolicy::MemberList);
+    assert!(member.read_policy.is_supported() && member.write_policy.is_supported());
+    assert_eq!(member.app_access, SpaceAppAccess::Open);
+
+    // Omitted booleans default to false.
+    let defaults = SpacePolicy::parse_policy(&json!({ "$type": "com.atproto.memberspace.policy" }));
+    assert_eq!(defaults.read_policy, SpacePolicy::MemberList);
+    assert_eq!(defaults.write_policy, SpacePolicy::MemberList);
+
+    // publicRead / publicWrite are public policies, which Circles refuse.
+    let public_read = SpacePolicy::parse_policy(&json!({
+        "$type": "com.atproto.memberspace.policy",
+        "publicRead": true
+    }));
+    assert_eq!(public_read.read_policy, SpacePolicy::Public);
+    assert_eq!(public_read.write_policy, SpacePolicy::MemberList);
+    assert!(!public_read.read_policy.is_supported());
+    let public_write = SpacePolicy::parse_policy(&json!({
+        "$type": "com.atproto.memberspace.policy",
+        "publicWrite": true
+    }));
+    assert_eq!(public_write.write_policy, SpacePolicy::Public);
+    assert!(!public_write.write_policy.is_supported());
+
+    // A non-boolean flag fails closed.
+    let malformed = SpacePolicy::parse_policy(&json!({
+        "$type": "com.atproto.memberspace.policy",
+        "publicRead": "yes"
+    }));
+    assert!(matches!(
+        malformed.read_policy,
+        SpacePolicy::Unknown(Some(_))
+    ));
+    assert!(!malformed.read_policy.is_supported());
+
+    // managedspace is a managing-app policy, which Circles refuse.
+    let managed = SpacePolicy::parse_policy(&json!({
+        "$type": "com.atproto.managedspace.policy",
+        "managingApp": "did:web:example.com#forum"
+    }));
+    assert_eq!(managed.read_policy, SpacePolicy::ManagingApp);
+    assert_eq!(managed.write_policy, SpacePolicy::ManagingApp);
+    assert!(!managed.read_policy.is_supported());
+    assert!(!managed.app_access.is_explicit_revocation("any-client"));
+
+    // personalspace and unknown types are unrecognized and refused without purge.
+    let personal =
+        SpacePolicy::parse_policy(&json!({ "$type": "com.atproto.personalspace.policy" }));
+    assert_eq!(
+        personal.read_policy,
+        SpacePolicy::Unknown(Some("com.atproto.personalspace.policy".to_string()))
+    );
+    assert!(!personal.read_policy.is_supported());
+    assert!(!personal.app_access.is_explicit_revocation("any-client"));
 }
 
 #[sqlx::test(migrations = "./migrations")]

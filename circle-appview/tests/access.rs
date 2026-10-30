@@ -1356,7 +1356,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
     let space = "at://did:plc:authspace/space/1";
 
     Mock::given(method("GET"))
-        .and(path("/xrpc/com.atproto.simplespace.listMembers"))
+        .and(path("/xrpc/com.atproto.memberspace.listMembers"))
         .and(query_param("space", space))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "members": [{"did": "did:plc:user1", "read": true, "write": true}],

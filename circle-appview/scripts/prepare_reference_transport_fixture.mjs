@@ -45,14 +45,13 @@ const [authority, alice, bob] = await Promise.all(['authority', 'alice', 'bob'].
 const skey = `circles-rust-${randomBytes(8).toString('hex')}`;
 const spaceType = 'app.bsky.group';
 const space = `at://${authority.did}/space/${spaceType}/${skey}`;
-await request(authority.service, 'POST', 'com.atproto.simplespace.createSpace', {
+// A memberspace without allowedApps lets any app read, as the Oct 22 `#open` did.
+await request(authority.service, 'POST', 'com.atproto.space.createSpace', {
   spaceType, skey,
-  readPolicy: { $type: 'com.atproto.simplespace.defs#memberListPolicy' },
-  writePolicy: { $type: 'com.atproto.simplespace.defs#memberListPolicy' },
-  appAccess: { $type: 'com.atproto.simplespace.defs#open' },
+  policy: { $type: 'com.atproto.memberspace.policy' },
 }, authority.accessJwt);
 for (const [index, member] of [alice, bob].entries()) {
-  await request(authority.service, 'POST', 'com.atproto.simplespace.putMember', { space, did: member.did, read: true, write: true }, authority.accessJwt);
+  await request(authority.service, 'POST', 'com.atproto.memberspace.putMember', { space, did: member.did, read: true, write: true }, authority.accessJwt);
   await request(member.service, 'POST', 'com.atproto.space.putRecord', {
     space, repo: member.did, collection: 'app.bsky.feed.post', rkey: '3jzfcijpj2m2a',
     record: { $type: 'app.bsky.feed.post', text: `Local Rust transport qualification fixture ${index + 1}`, createdAt: new Date().toISOString() },
@@ -60,7 +59,7 @@ for (const [index, member] of [alice, bob].entries()) {
 }
 const delegated = await request(alice.service, 'GET', 'com.atproto.space.getDelegationToken', { space }, alice.accessJwt);
 const context = {
-  sourceRevision: 'ac0c9f15392f6f0298d71dc52aa88c05036150be', space,
+  sourceRevision: '5d88b414a98de1ada22c94c78fa0667a7028163c', space,
   authority: { did: authority.did, service: localService(authority.service), document: await document(authority.did) },
   delegationToken: delegated.token,
   repos: await Promise.all([alice, bob].map(async (account) => ({ did: account.did, service: localService(account.service), document: await document(account.did), expectedRecords: 1 }))),

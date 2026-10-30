@@ -29,7 +29,7 @@ use std::future::Future;
 
 /// Media remains disabled until private blob serving is qualified on supported hosts.
 pub const SUPPORTS_IMAGES: bool = false;
-pub const CIRCLE_PROTOCOL_REVISION: &str = "ac0c9f15392f6f0298d71dc52aa88c05036150be";
+pub const CIRCLE_PROTOCOL_REVISION: &str = "5d88b414a98de1ada22c94c78fa0667a7028163c";
 
 pub use auth::{
     authenticate, AuthenticatedUser, DidDocument, DidResolver, PublicKeyJwk, VerificationMethod,

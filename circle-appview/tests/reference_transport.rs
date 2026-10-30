@@ -63,7 +63,7 @@ async fn actual_reference_hosts_verify_exchange_commit_ops_and_star() {
             .expect("context schema");
     assert_eq!(
         context.source_revision,
-        "ac0c9f15392f6f0298d71dc52aa88c05036150be"
+        "5d88b414a98de1ada22c94c78fa0667a7028163c"
     );
     let transport = DefaultSpaceHostTransport::with_loopback(true);
     let key = SigningKey::random(&mut OsRng);
