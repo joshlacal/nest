@@ -14,11 +14,7 @@ impl TestDb {
         let dsn = std::env::var("DATABASE_URL").expect("explicit disposable DATABASE_URL required");
         let mut url = url::Url::parse(&dsn).unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
-        assert_eq!(
-            url.port(),
-            Some(55473),
-            "dedicated task-7 PostgreSQL only"
-        );
+        assert_eq!(url.port(), Some(55473), "dedicated task-7 PostgreSQL only");
         assert_eq!(url.username(), "lite_push_test");
         let admin = Pool::<Postgres>::connect(&dsn).await.unwrap();
         let name = format!("lite_poller_{}", uuid::Uuid::new_v4().simple());

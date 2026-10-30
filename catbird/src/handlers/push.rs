@@ -53,12 +53,11 @@ async fn link_device_to_session(state: &AppState, session: &CatbirdSession, toke
         return;
     };
     let result = match push.registry.device_row_id(&session.did, token).await {
-        Ok(Some(device_id)) => {
-            push.registry
-                .link_device_session(&session.did, device_id, &session.id.to_string())
-                .await
-                .map_err(|e| e.to_string())
-        }
+        Ok(Some(device_id)) => push
+            .registry
+            .link_device_session(&session.did, device_id, &session.id.to_string())
+            .await
+            .map_err(|e| e.to_string()),
         Ok(None) => Ok(()),
         Err(e) => Err(e.to_string()),
     };

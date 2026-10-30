@@ -957,10 +957,10 @@ async fn run_rekey(
     batch_size: usize,
     dry_run: bool,
 ) -> Result<(), anyhow::Error> {
-    use catbird::services::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
     use catbird::services::redis_crypto::{
         open_session_dual_read, seal_v2_with_metadata, EnvelopeMetadata,
     };
+    use catbird::services::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
 
     fn looks_like_raw_uuid(s: &str) -> bool {
         s.len() == 36
@@ -1037,13 +1037,19 @@ async fn run_rekey(
                 res
             };
             if let (Some(blob), ttl @ 1..) = (blob, ttl) {
-                match catbird::services::redis_crypto::open_v2_with_metadata(&key_bytes, &blob, "session", k) {
+                match catbird::services::redis_crypto::open_v2_with_metadata(
+                    &key_bytes, &blob, "session", k,
+                ) {
                     Err(e) => {
                         eprintln!("rekey: hashed key '{k}' does not decrypt: {e}");
                         failed += 1;
                     }
                     Ok((plain, _meta, _is_v1)) => {
-                        if serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&plain).is_ok() {
+                        if serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(
+                            &plain,
+                        )
+                        .is_ok()
+                        {
                             skipped += 1;
                         } else {
                             let v: serde_json::Value = match serde_json::from_str(&plain) {
@@ -1056,15 +1062,23 @@ async fn run_rekey(
                             };
                             let upgraded = upgrade_session_json(v);
                             let upgraded_str = serde_json::to_string(&upgraded)?;
-                            match serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&upgraded_str) {
+                            match serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(
+                                &upgraded_str,
+                            ) {
                                 Ok(_) => {
                                     if dry_run {
                                         println!("would upgrade payload of {k} (ttl {ttl})");
                                     } else {
                                         let hashed_did = rest.rsplitn(2, '_').nth(1);
-                                        let meta = EnvelopeMetadata::new("session", k, hashed_did, None);
-                                        let v2 = seal_v2_with_metadata(&key_bytes, &upgraded_str, &meta)
-                                            .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
+                                        let meta =
+                                            EnvelopeMetadata::new("session", k, hashed_did, None);
+                                        let v2 =
+                                            seal_v2_with_metadata(&key_bytes, &upgraded_str, &meta)
+                                                .map_err(|e| {
+                                                    anyhow::anyhow!(
+                                                        "rekey: reseal failed for '{k}': {e}"
+                                                    )
+                                                })?;
                                         let _: () = redis::cmd("SET")
                                             .arg(k)
                                             .arg(&v2)
@@ -1128,8 +1142,14 @@ async fn run_rekey(
                 continue;
             }
         };
-        let sid_in_blob = json.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
-        let did_in_blob = json.get("account_did").and_then(|s| s.as_str()).unwrap_or("");
+        let sid_in_blob = json
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let did_in_blob = json
+            .get("account_did")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
         if sid_in_blob != raw_sid || did_in_blob != did {
             eprintln!(
                 "rekey: identity mismatch for '{k}' (payload sid/did do not match key parts); skipping"
@@ -1148,7 +1168,9 @@ async fn run_rekey(
 
         let upgraded = upgrade_session_json(json.clone());
         let json_str = serde_json::to_string(&upgraded)?;
-        if let Err(e) = serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&json_str) {
+        if let Err(e) =
+            serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&json_str)
+        {
             eprintln!("rekey: '{k}' fails typed parse even after upgrade: {e}");
             failed += 1;
             continue;
@@ -1158,7 +1180,9 @@ async fn run_rekey(
             .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
 
         if dry_run {
-            if let Err(e) = serde_json::from_slice::<jacquard_oauth::session::ClientSessionData>(&plain) {
+            if let Err(e) =
+                serde_json::from_slice::<jacquard_oauth::session::ClientSessionData>(&plain)
+            {
                 eprintln!("typed-parse FAILS for {k}: {e}");
             }
             println!("would rekey {k} -> {new_session_key} (ttl {ttl})");

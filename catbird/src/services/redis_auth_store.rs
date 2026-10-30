@@ -685,20 +685,27 @@ impl RedisAuthStore {
         did: &str,
         expected_fingerprint: &str,
     ) -> Result<Option<ClientSessionData>, SessionStoreError> {
-        self.resolve_session_fingerprint_inner(did,expected_fingerprint,true).await
+        self.resolve_session_fingerprint_inner(did, expected_fingerprint, true)
+            .await
     }
 
     /// Cleanup authority checks must not keep another device's session alive
     /// simply because a pending cleanup is retried in the background.
     pub async fn resolve_session_fingerprint_local(
-        &self,did:&str,expected_fingerprint:&str,
-    )->Result<Option<ClientSessionData>,SessionStoreError> {
-        self.resolve_session_fingerprint_inner(did,expected_fingerprint,false).await
+        &self,
+        did: &str,
+        expected_fingerprint: &str,
+    ) -> Result<Option<ClientSessionData>, SessionStoreError> {
+        self.resolve_session_fingerprint_inner(did, expected_fingerprint, false)
+            .await
     }
 
     async fn resolve_session_fingerprint_inner(
-        &self,did:&str,expected_fingerprint:&str,slide_expiration:bool,
-    )->Result<Option<ClientSessionData>,SessionStoreError> {
+        &self,
+        did: &str,
+        expected_fingerprint: &str,
+        slide_expiration: bool,
+    ) -> Result<Option<ClientSessionData>, SessionStoreError> {
         let expected_fp = crate::services::push::registry::normalize_or_hash_session_fingerprint(
             expected_fingerprint,
         );
@@ -933,7 +940,8 @@ impl RedisAuthStore {
             }
         }
 
-        if slide_expiration && status == 0
+        if slide_expiration
+            && status == 0
             && !self
                 .touch_verified_session(did, session.session_id.as_str(), &encrypted)
                 .await?
@@ -2519,7 +2527,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            store.decode_bound_session(&sess_key, did, &enc).unwrap().session_id.as_str(),
+            store
+                .decode_bound_session(&sess_key, did, &enc)
+                .unwrap()
+                .session_id
+                .as_str(),
             session_id,
             "the fixture must pass real envelope and identity authentication"
         );
@@ -2629,14 +2641,20 @@ mod tests {
             .invoke_async(&mut conn)
             .await
             .unwrap();
-        assert_eq!(verdict, 1, "retirement after authentication must reject index install");
+        assert_eq!(
+            verdict, 1,
+            "retirement after authentication must reject index install"
+        );
         let installed: i64 = redis::cmd("EXISTS")
             .arg(&fp_index_key)
             .arg(&did_index_key)
             .query_async(&mut conn)
             .await
             .unwrap();
-        assert_eq!(installed, 0, "neither index may be resurrected by the raced read");
+        assert_eq!(
+            installed, 0,
+            "neither index may be resurrected by the raced read"
+        );
 
         // Cleanup
         let _: () = redis::cmd("DEL")

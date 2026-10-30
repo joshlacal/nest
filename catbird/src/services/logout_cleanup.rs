@@ -707,16 +707,15 @@ fn redis_glob_escape(value: &str) -> String {
 /// request has an unknown provider outcome; it must never be called revoked.
 pub const PROVIDER_REVOKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub async fn with_revocation_deadline<F>(
-    attempt: F,
-    deadline: std::time::Duration,
-) -> RevokeOutcome
+pub async fn with_revocation_deadline<F>(attempt: F, deadline: std::time::Duration) -> RevokeOutcome
 where
     F: std::future::Future<Output = RevokeOutcome>,
 {
     match tokio::time::timeout(deadline, attempt).await {
         Ok(outcome) => outcome,
-        Err(_) => RevokeOutcome::Failed("provider revocation deadline exceeded; outcome unconfirmed".into()),
+        Err(_) => RevokeOutcome::Failed(
+            "provider revocation deadline exceeded; outcome unconfirmed".into(),
+        ),
     }
 }
 
@@ -1104,7 +1103,10 @@ impl RedisCleanupStore<'_> {
         if journal.retained_credential || journal.credential_expires_at.is_some() {
             return Err(CleanupError::ReceiptConflict);
         }
-        Ok(CleanupAttempt { journal, grant: None })
+        Ok(CleanupAttempt {
+            journal,
+            grant: None,
+        })
     }
 }
 
@@ -1223,10 +1225,7 @@ pub async fn retry_cleanup_pass(state: &crate::config::AppState) -> Result<usize
                 .await
                 .map_err(|_| CleanupError::StorageUnavailable)?;
             let Some(encoded) = encoded else { continue };
-            let attempt = match backend
-                .internal_attempt(&key, &encoded)
-                .await
-            {
+            let attempt = match backend.internal_attempt(&key, &encoded).await {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -1257,10 +1256,7 @@ pub async fn retry_cleanup_pass(state: &crate::config::AppState) -> Result<usize
                 .await
                 .map_err(|_| CleanupError::StorageUnavailable)?;
             if let Some(refreshed) = refreshed {
-                if let Ok(attempt) = backend
-                    .internal_attempt(&key, &refreshed)
-                    .await
-                {
+                if let Ok(attempt) = backend.internal_attempt(&key, &refreshed).await {
                     attempted += 1;
                     let _ = continue_cleanup(
                         &backend,

@@ -1119,45 +1119,79 @@ pub async fn logout(
     headers: HeaderMap,
     jar: CookieJar,
 ) -> AppResult<(StatusCode, CookieJar, Json<Value>)> {
-    use crate::services::logout_cleanup::{self, CleanupError, Completion, LogoutRequest, RedisCleanupStore};
+    use crate::services::logout_cleanup::{
+        self, CleanupError, Completion, LogoutRequest, RedisCleanupStore,
+    };
     let bearer = if let Some(header) = headers.get("authorization") {
-        header.to_str().ok().and_then(|h| h.strip_prefix("Bearer "))
-            .map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)
+        header
+            .to_str()
+            .ok()
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
             .ok_or(AppError::InvalidSession)?
     } else {
-        jar.get(SESSION_COOKIE_NAME).map(|cookie| cookie.value().to_owned()).ok_or(AppError::InvalidSession)?
+        jar.get(SESSION_COOKIE_NAME)
+            .map(|cookie| cookie.value().to_owned())
+            .ok_or(AppError::InvalidSession)?
     };
     let request = LogoutRequest::for_runtime(bearer).map_err(|_| AppError::InvalidSession)?;
-    let store = state.auth_store.as_deref()
-        .ok_or_else(|| AppError::AuthTemporarilyUnavailable("Logout store is unavailable".into()))?;
+    let store = state.auth_store.as_deref().ok_or_else(|| {
+        AppError::AuthTemporarilyUnavailable("Logout store is unavailable".into())
+    })?;
     // This route deliberately does not use refresh-capable auth middleware. The
     // coordinator authorizes the bearer from a live local record or its sealed receipt.
     let result = logout_cleanup::run_runtime_cleanup(&state, &request).await;
     let (status, cleanup, message) = match result {
         Ok(cleanup) => {
-            let (status,message) = match cleanup.completion {
-                Completion::Complete => (StatusCode::OK,"Logged out and cleanup completed"),
-                Completion::Pending => (StatusCode::ACCEPTED,"Logout cleanup pending"),
-                Completion::Failed => (StatusCode::SERVICE_UNAVAILABLE,"Session retired; cleanup or upstream revocation is unconfirmed"),
+            let (status, message) = match cleanup.completion {
+                Completion::Complete => (StatusCode::OK, "Logged out and cleanup completed"),
+                Completion::Pending => (StatusCode::ACCEPTED, "Logout cleanup pending"),
+                Completion::Failed => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session retired; cleanup or upstream revocation is unconfirmed",
+                ),
             };
-            (status,Some(cleanup),message)
+            (status, Some(cleanup), message)
         }
         Err(CleanupError::Unauthorized) => return Err(AppError::InvalidSession),
         Err(_) => {
             // A storage acknowledgement can fail after retirement. Return only
             // persisted evidence; never turn a retryable error into HTTP 200.
-            let receipt = RedisCleanupStore {store}.response_for_request(&request).await.ok().flatten();
-            (StatusCode::SERVICE_UNAVAILABLE,receipt,"Logout completion could not be confirmed; retry safely")
+            let receipt = RedisCleanupStore { store }
+                .response_for_request(&request)
+                .await
+                .ok()
+                .flatten();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                receipt,
+                "Logout completion could not be confirmed; retry safely",
+            )
         }
     };
     let retired = cleanup.as_ref().is_some_and(|value| value.session_retired);
     let jar = if retired {
-        jar.remove(Cookie::build((SESSION_COOKIE_NAME, "")).path("/").http_only(true)
-            .same_site(SameSite::Strict).secure(true).max_age(time::Duration::ZERO).build())
-    } else { jar };
-    Ok((status,jar,Json(serde_json::json!({
-        "success": status == StatusCode::OK, "message": message, "cleanup":cleanup
-    }))))
+        jar.remove(
+            Cookie::build((SESSION_COOKIE_NAME, ""))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Strict)
+                .secure(true)
+                .max_age(time::Duration::ZERO)
+                .build(),
+        )
+    } else {
+        jar
+    };
+    Ok((
+        status,
+        jar,
+        Json(serde_json::json!({
+            "success": status == StatusCode::OK, "message": message, "cleanup":cleanup
+        })),
+    ))
 }
 
 /// Get current session info
@@ -1770,25 +1804,43 @@ async fn apply_moderation_mutation(
             let Some(root) = body.get("root").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
-            let store = state.auth_store.as_deref().ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
-            push.thread_mutes.set_thread_mute_authenticated(
-                store, &session.did, &session.id.to_string(), root,
-                lexicon == "app.bsky.graph.muteThread",
-            ).await?;
+            let store = state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
+            push.thread_mutes
+                .set_thread_mute_authenticated(
+                    store,
+                    &session.did,
+                    &session.id.to_string(),
+                    root,
+                    lexicon == "app.bsky.graph.muteThread",
+                )
+                .await?;
         }
         "app.bsky.graph.muteActor"
         | "app.bsky.graph.unmuteActor"
         | "app.bsky.graph.muteActorList"
         | "app.bsky.graph.unmuteActorList" => {
-            let store = state.auth_store.as_deref().ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
-            let pool = state.push_db.as_ref().ok_or_else(|| anyhow::anyhow!("Push database unavailable"))?;
+            let store = state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
+            let pool = state
+                .push_db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Push database unavailable"))?;
             let mut tx = pool.begin().await?;
             crate::services::push::lock::acquire_account_lock(&mut tx, &session.did).await?;
-            store.validate_live_session_local(&session.did, &session.id.to_string()).await?;
+            store
+                .validate_live_session_local(&session.did, &session.id.to_string())
+                .await?;
             sqlx::query("UPDATE push_accounts SET moderation_generation = moderation_generation + 1 WHERE account_did = $1")
                 .bind(&session.did).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM actor_moderation_verdict WHERE recipient_did = $1")
-                .bind(&session.did).execute(&mut *tx).await?;
+                .bind(&session.did)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
         // Blocks and list blocks are repo records, so they arrive as generic
@@ -1798,15 +1850,25 @@ async fn apply_moderation_mutation(
         | "com.atproto.repo.applyWrites"
             if moderation_record_write(&body) =>
         {
-            let store = state.auth_store.as_deref().ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
-            let pool = state.push_db.as_ref().ok_or_else(|| anyhow::anyhow!("Push database unavailable"))?;
+            let store = state
+                .auth_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Session store unavailable"))?;
+            let pool = state
+                .push_db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Push database unavailable"))?;
             let mut tx = pool.begin().await?;
             crate::services::push::lock::acquire_account_lock(&mut tx, &session.did).await?;
-            store.validate_live_session_local(&session.did, &session.id.to_string()).await?;
+            store
+                .validate_live_session_local(&session.did, &session.id.to_string())
+                .await?;
             sqlx::query("UPDATE push_accounts SET moderation_generation = moderation_generation + 1 WHERE account_did = $1")
                 .bind(&session.did).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM actor_moderation_verdict WHERE recipient_did = $1")
-                .bind(&session.did).execute(&mut *tx).await?;
+                .bind(&session.did)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
         _ => {}
@@ -2373,50 +2435,154 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires explicit disposable Redis fixture"]
     async fn test_logout_fixed_no_stored_retry_policy_and_truthful_failure() {
-        use crate::services::logout_cleanup::{CleanupError, CredentialRetention, LogoutRequest, RedisCleanupStore};
+        use crate::services::logout_cleanup::{
+            CleanupError, CredentialRetention, LogoutRequest, RedisCleanupStore,
+        };
         use jacquard_oauth::authstore::ClientAuthStore;
-        assert_eq!(std::env::var("LITE_PUSH_DISPOSABLE").as_deref(),Ok("1"));
-        let url=url::Url::parse(&std::env::var("REDIS_URL").expect("explicit fixture URL")).unwrap();
-        assert_eq!(url.host_str(),Some("127.0.0.1"));assert_ne!(url.port().expect("explicit port"),6379);
-        let redis=redis::aio::ConnectionManager::new(redis::Client::open(url.as_str()).unwrap()).await.unwrap();
-        let prefix=format!("catbird:v2:logout_handler_fixture_{}:",uuid::Uuid::new_v4().simple());
-        let key=[0x42;32];
-        let store=Arc::new(crate::services::RedisAuthStore::from_key(redis.clone(),prefix.clone(),86400,key).unwrap());
-        let state=Arc::new(crate::config::AppState {
-            config:Arc::new(crate::config::AppConfig::test_default()),http_client:reqwest::Client::new(),raw_http_client:reqwest::Client::new(),
-            redis:redis.clone(),push_db:None,key_store:None,jacquard_client:None,catmos_jacquard_client:None,
-            catmos_oauth_scopes:vec![],trusted_proxies:vec![],auth_store:Some(store.clone()),push:None,
-            dpop_nonce_cache:Arc::new(crate::services::DpopNonceCache::new()),session_encryption_key:Some(key),
-            active_stream_semaphore:Arc::new(tokio::sync::Semaphore::new(10)),rate_limit:Arc::new(crate::middleware::RateLimitState::default()),
-            session_index_ready:Arc::new(std::sync::atomic::AtomicBool::new(true)),session_index_readiness:Arc::new(tokio::sync::Notify::new()),
+        assert_eq!(std::env::var("LITE_PUSH_DISPOSABLE").as_deref(), Ok("1"));
+        let url =
+            url::Url::parse(&std::env::var("REDIS_URL").expect("explicit fixture URL")).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_ne!(url.port().expect("explicit port"), 6379);
+        let redis = redis::aio::ConnectionManager::new(redis::Client::open(url.as_str()).unwrap())
+            .await
+            .unwrap();
+        let prefix = format!(
+            "catbird:v2:logout_handler_fixture_{}:",
+            uuid::Uuid::new_v4().simple()
+        );
+        let key = [0x42; 32];
+        let store = Arc::new(
+            crate::services::RedisAuthStore::from_key(redis.clone(), prefix.clone(), 86400, key)
+                .unwrap(),
+        );
+        let state = Arc::new(crate::config::AppState {
+            config: Arc::new(crate::config::AppConfig::test_default()),
+            http_client: reqwest::Client::new(),
+            raw_http_client: reqwest::Client::new(),
+            redis: redis.clone(),
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: Some(store.clone()),
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: Some(key),
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         });
-        let header=|bearer:&str| {let mut headers=HeaderMap::new();headers.insert("authorization",format!("Bearer {bearer}").parse().unwrap());headers};
-        let missing=uuid::Uuid::new_v4().to_string();
-        assert!(matches!(logout(State(state.clone()),header(&missing),CookieJar::new()).await,Err(AppError::InvalidSession)),"raw UUID is not local authentication");
-        let did="did:plc:syntheticlogout";let bearer=uuid::Uuid::new_v4().to_string();
-        store.upsert_session(crate::services::revocation::tests::session(did,&bearer)).await.unwrap();
-        let (status,_,Json(response))=logout(State(state.clone()),header(&bearer),CookieJar::new()).await.unwrap();
-        assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);assert_eq!(response["success"],false);
-        assert_eq!(response["cleanup"]["session_retired"],true);assert_eq!(response["cleanup"]["upstream_revocation"],"unconfirmed");
-        assert_eq!(response["cleanup"]["account_cleanup"]["status"],"failed");
-        assert!(store.read_session_local(did,&bearer).await.unwrap().is_none());
-        let mut conn=redis.clone();let backend=RedisCleanupStore {store:&store};
-        let exists:bool=redis::cmd("EXISTS").arg(backend.grant_key(&store.fingerprint(&bearer))).query_async(&mut conn).await.unwrap();assert!(!exists);
-        let other_did="did:plc:syntheticretry";let retry=uuid::Uuid::new_v4().to_string();
-        store.upsert_session(crate::services::revocation::tests::session(other_did,&retry)).await.unwrap();
-        let disallowed=LogoutRequest::new(retry.clone(),CredentialRetention::ApprovedSealedRetry {seconds:600}).unwrap();
-        assert!(matches!(crate::services::logout_cleanup::run_runtime_cleanup(&state,&disallowed).await,Err(CleanupError::InvalidRetentionPolicy)),"runtime cannot be overridden into credential retention");
-        assert!(store.read_session_local(other_did,&retry).await.unwrap().is_some(),"rejection precedes retirement");
-        let grant_key=backend.grant_key(&store.fingerprint(&retry));
-        let journal_key=backend.journal_key(&store.fingerprint(&retry));
-        let exists:i64=redis::cmd("EXISTS").arg(&grant_key).arg(&journal_key).query_async(&mut conn).await.unwrap();assert_eq!(exists,0);
-        let (status,_,Json(response))=logout(State(state.clone()),header(&retry),CookieJar::new()).await.unwrap();
-        assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);assert_eq!(response["cleanup"]["upstream_revocation"],"unconfirmed");
-        let (_,_,Json(response))=logout(State(state.clone()),header(&retry),CookieJar::new()).await.unwrap();
-        assert_eq!(response["success"],false);assert_eq!(response["cleanup"]["session_retired"],true);
-        crate::services::logout_cleanup::retry_cleanup_pass(&state).await.unwrap();
-        let exists:bool=redis::cmd("EXISTS").arg(&grant_key).query_async(&mut conn).await.unwrap();assert!(!exists,"logout and its worker never persist a retry credential");
-        assert!(crate::services::revocation::run_retry_pass(&state,chrono::Utc::now().timestamp()).await.is_err(),"legacy worker cannot bypass lifecycle ownership");
+        let header = |bearer: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+            headers
+        };
+        let missing = uuid::Uuid::new_v4().to_string();
+        assert!(
+            matches!(
+                logout(State(state.clone()), header(&missing), CookieJar::new()).await,
+                Err(AppError::InvalidSession)
+            ),
+            "raw UUID is not local authentication"
+        );
+        let did = "did:plc:syntheticlogout";
+        let bearer = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert_session(crate::services::revocation::tests::session(did, &bearer))
+            .await
+            .unwrap();
+        let (status, _, Json(response)) =
+            logout(State(state.clone()), header(&bearer), CookieJar::new())
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response["success"], false);
+        assert_eq!(response["cleanup"]["session_retired"], true);
+        assert_eq!(response["cleanup"]["upstream_revocation"], "unconfirmed");
+        assert_eq!(response["cleanup"]["account_cleanup"]["status"], "failed");
+        assert!(store
+            .read_session_local(did, &bearer)
+            .await
+            .unwrap()
+            .is_none());
+        let mut conn = redis.clone();
+        let backend = RedisCleanupStore { store: &store };
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(backend.grant_key(&store.fingerprint(&bearer)))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(!exists);
+        let other_did = "did:plc:syntheticretry";
+        let retry = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert_session(crate::services::revocation::tests::session(
+                other_did, &retry,
+            ))
+            .await
+            .unwrap();
+        let disallowed = LogoutRequest::new(
+            retry.clone(),
+            CredentialRetention::ApprovedSealedRetry { seconds: 600 },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                crate::services::logout_cleanup::run_runtime_cleanup(&state, &disallowed).await,
+                Err(CleanupError::InvalidRetentionPolicy)
+            ),
+            "runtime cannot be overridden into credential retention"
+        );
+        assert!(
+            store
+                .read_session_local(other_did, &retry)
+                .await
+                .unwrap()
+                .is_some(),
+            "rejection precedes retirement"
+        );
+        let grant_key = backend.grant_key(&store.fingerprint(&retry));
+        let journal_key = backend.journal_key(&store.fingerprint(&retry));
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&grant_key)
+            .arg(&journal_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(exists, 0);
+        let (status, _, Json(response)) =
+            logout(State(state.clone()), header(&retry), CookieJar::new())
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response["cleanup"]["upstream_revocation"], "unconfirmed");
+        let (_, _, Json(response)) = logout(State(state.clone()), header(&retry), CookieJar::new())
+            .await
+            .unwrap();
+        assert_eq!(response["success"], false);
+        assert_eq!(response["cleanup"]["session_retired"], true);
+        crate::services::logout_cleanup::retry_cleanup_pass(&state)
+            .await
+            .unwrap();
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&grant_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            !exists,
+            "logout and its worker never persist a retry credential"
+        );
+        assert!(
+            crate::services::revocation::run_retry_pass(&state, chrono::Utc::now().timestamp())
+                .await
+                .is_err(),
+            "legacy worker cannot bypass lifecycle ownership"
+        );
     }
 
     #[test]
