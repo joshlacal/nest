@@ -69,9 +69,20 @@ pub struct VerificationMethod {
     pub id: String,
     pub r#type: String,
     pub controller: String,
-    #[serde(default, rename = "publicKeyJwk")]
+    // Absent keys must be omitted, never `null`: @atproto/identity declares
+    // publicKeyMultibase as an optional string and rejects the whole DID
+    // document on `null`, which made the AppView unresolvable for registerNotify.
+    #[serde(
+        default,
+        rename = "publicKeyJwk",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_key_jwk: Option<PublicKeyJwk>,
-    #[serde(default, rename = "publicKeyMultibase")]
+    #[serde(
+        default,
+        rename = "publicKeyMultibase",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_key_multibase: Option<String>,
 }
 
@@ -80,9 +91,9 @@ pub struct PublicKeyJwk {
     pub kty: String,
     pub crv: String,
     pub x: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub y: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
 }
 
@@ -184,12 +195,25 @@ pub fn parse_public_key_jwk(jwk: &PublicKeyJwk) -> Result<ParsedVerifyingKey, Au
 
 pub fn parse_verification_key(vm: &VerificationMethod) -> Result<ParsedVerifyingKey, AuthReason> {
     if let Some(multibase_str) = &vm.public_key_multibase {
-        if vm.r#type != "Multikey" {
-            return Err(AuthReason::InvalidKeyType);
-        }
-
         let (_base, decoded) =
             multibase::decode(multibase_str).map_err(|_| AuthReason::InvalidMultikey)?;
+
+        // PLC's established verification suites carry raw SEC1 bytes; Multikey
+        // carries a multicodec prefix. Both are emitted/accepted by atproto.
+        match vm.r#type.as_str() {
+            "EcdsaSecp256r1VerificationKey2019" => {
+                return p256::ecdsa::VerifyingKey::from_sec1_bytes(&decoded)
+                    .map(ParsedVerifyingKey::P256)
+                    .map_err(|_| AuthReason::InvalidCoordinates);
+            }
+            "EcdsaSecp256k1VerificationKey2019" => {
+                return k256::ecdsa::VerifyingKey::from_sec1_bytes(&decoded)
+                    .map(ParsedVerifyingKey::Secp256k1)
+                    .map_err(|_| AuthReason::InvalidCoordinates);
+            }
+            "Multikey" => {}
+            _ => return Err(AuthReason::InvalidKeyType),
+        }
 
         // Ed25519 multicodec prefix: 0xed -> varint [0xed, 0x01]
         if decoded.starts_with(&[0xed, 0x01]) {
@@ -627,6 +651,16 @@ impl DidResolver {
         self.resolve_internal(did, true).await
     }
 
+    /// Trusted lifecycle reconciliation bypasses the untrusted JWT refresh cooldown.
+    /// Still bounded by the shared resolver semaphore and pinned public transport.
+    pub async fn resolve_identity_event(&self, did: &str) -> Result<DidDocument, AuthReason> {
+        let _permit = public_flow_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthReason::DidResolutionFailed)?;
+        self.resolve_internal(did, true).await
+    }
+
     async fn resolve_internal(
         &self,
         did: &str,
@@ -862,6 +896,13 @@ pub fn select_verification_method<'a>(
     Err(AuthReason::NoVerificationMethod)
 }
 
+/// Future `iat` tolerated on inbound service-auth JWTs (CIRCLES-23).
+pub const SERVICE_JWT_IAT_SKEW_SECS: i64 = 30;
+
+/// Select a space authority's credential-signing key.
+///
+/// October 22 credentials require the JWT kid to be exactly `#atproto`.
+/// The DID document method may use its absolute or relative identifier.
 pub fn select_authority_verification_method<'a>(
     doc: &'a DidDocument,
     authority_did: &str,
@@ -875,40 +916,19 @@ pub fn select_authority_verification_method<'a>(
         return Err(AuthReason::NoVerificationMethod);
     }
 
-    let expected_full_space = format!("{authority_did}#atproto_space");
-    let expected_full_atproto = format!("{authority_did}#atproto");
-
-    // Exact dedicated key #atproto_space first, fallback to #atproto
-    let dedicated = doc.verification_method.iter().find(|vm| {
-        (vm.id == "#atproto_space" || vm.id == expected_full_space)
-            && vm.controller == authority_did
-    });
-
-    let selected = if let Some(vm) = dedicated {
-        vm
-    } else {
-        doc.verification_method
-            .iter()
-            .find(|vm| {
-                (vm.id == "#atproto" || vm.id == expected_full_atproto)
-                    && vm.controller == authority_did
-            })
-            .ok_or(AuthReason::NoVerificationMethod)?
-    };
-
-    if let Some(target_kid) = kid {
-        let matches = target_kid == selected.id
-            || (target_kid == "#atproto_space" && selected.id == expected_full_space)
-            || (target_kid == "#atproto" && selected.id == expected_full_atproto)
-            || (target_kid == expected_full_space && selected.id == "#atproto_space")
-            || (target_kid == expected_full_atproto && selected.id == "#atproto");
-
-        if !matches {
-            return Err(AuthReason::InvalidKid);
-        }
+    if kid != Some("#atproto") {
+        return Err(AuthReason::InvalidKid);
     }
-
-    Ok(selected)
+    let full = format!("{authority_did}#atproto");
+    let mut matches = doc
+        .verification_method
+        .iter()
+        .filter(|vm| vm.id == "#atproto" || vm.id == full);
+    let method = matches.next().ok_or(AuthReason::NoVerificationMethod)?;
+    if matches.next().is_some() || method.controller != authority_did {
+        return Err(AuthReason::InvalidKid);
+    }
+    Ok(method)
 }
 
 pub async fn verify_service_jwt(
@@ -953,8 +973,11 @@ pub async fn verify_service_jwt(
 
     let now = Utc::now().timestamp();
 
-    // iat <= now (strictly now or past; no future clock skew allowed)
-    if iat > now {
+    // Tolerate a slightly fast issuer clock: forwarded notifyWrite and
+    // notifySpaceDeleted JWTs from a space host a few seconds ahead were
+    // rejected outright. Upstream service auth does not check iat at all; the
+    // 60 s lifetime and exp checks below still bound the token.
+    if iat > now + SERVICE_JWT_IAT_SKEW_SECS {
         return Err(AppError::Unauthorized(AuthReason::FutureIat));
     }
 

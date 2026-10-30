@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
@@ -6,7 +7,7 @@ use circle_appview::{
     auth::{DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod},
     config::{AppState, Config},
     db,
-    error::AuthReason,
+    error::{AppError, AuthReason},
     routes::create_router,
     space_client::{
         DefaultSpaceHostTransport, MockSpaceHostTransport, SpaceClient, SpaceHostDnsResolver,
@@ -46,12 +47,22 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         .await
         .expect("Migrations must succeed");
 
+    // Explicit local lifecycle fixture: this proves route gating, not relay or
+    // live PDS readiness. Production uses the real event consumer to write it.
+    sqlx::query("INSERT INTO circle_identity_cursor(relay_url,cursor,last_event_at,last_received_at,reconciled_at,caught_up) VALUES('wss://relay.fixture.example.com/',1,now(),now(),now(),true)")
+        .execute(&pool).await.unwrap();
+    for did in [ALICE_DID, BOB_DID, AUTHORITY_DID] {
+        sqlx::query("INSERT INTO circle_account_status(did,active,pds_url,source_seq,relay_url) VALUES($1,true,'https://pds.fixture.example',1,'wss://relay.fixture.example.com/')")
+            .bind(did).execute(&pool).await.unwrap();
+    }
+
     let config = Config {
         host: "127.0.0.1".into(),
         port: 3002,
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse("https://media.catbird.blue").unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -61,7 +72,6 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy: circle_appview::commit::CommitVerificationPolicy::default(),
     };
 
     let alice_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
@@ -102,6 +112,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
             app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
                 oauth_service.client_id.clone(),
             ]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Test Circle".to_string()),
             description: Some("Test Circle Desc".to_string()),
@@ -116,6 +128,7 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         credential_store,
         space_client,
         space_locks,
+        listing_resume: Default::default(),
         profile_hydrator,
         oauth_service,
         push_client: None,
@@ -128,8 +141,8 @@ async fn setup_test(pool: PgPool) -> TestSetup {
         AUTHORITY_DID,
         &authority_signing_key,
         Some(vec![DidService {
-            id: "#atproto_space_host".into(),
-            r#type: "AtprotoSpaceHost".into(),
+            id: "#atproto_pds".into(),
+            r#type: "AtprotoPersonalDataServer".into(),
             service_endpoint: SPACE_HOST_ENDPOINT.into(),
         }]),
     );
@@ -214,7 +227,7 @@ fn mint_delegation_token(
     let header = json!({
         "alg": "ES256",
         "typ": "atproto-delegation-token+jwt",
-        "kid": format!("{iss}#atproto")
+        "kid": "#atproto"
     });
     let claims = json!({
         "iss": iss,
@@ -247,7 +260,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let cred1 = ActiveSpaceCredential {
         token: "jwt_token_1".into(),
-        dpop_key: signing_key.clone(),
+        signing_key: signing_key.clone(),
         expires_at: Utc::now() + chrono::Duration::hours(1),
     };
 
@@ -261,7 +274,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     // Monotonic overwrite with longer lifetime
     let cred2 = ActiveSpaceCredential {
         token: "jwt_token_2".into(),
-        dpop_key: signing_key.clone(),
+        signing_key: signing_key.clone(),
         expires_at: Utc::now() + chrono::Duration::hours(2),
     };
     store.insert(space.clone(), cred2).await;
@@ -270,7 +283,7 @@ async fn dpop_proof_and_credential_store_lifecycle(pool: PgPool) {
     // Overwrite with shorter lifetime is ignored
     let cred_shorter = ActiveSpaceCredential {
         token: "jwt_token_shorter".into(),
-        dpop_key: signing_key,
+        signing_key,
         expires_at: Utc::now() + chrono::Duration::minutes(30),
     };
     store.insert(space.clone(), cred_shorter).await;
@@ -390,7 +403,7 @@ async fn delegation_token_validation_passes_and_fails_on_tampering(pool: PgPool)
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn space_host_resolution_falls_back_to_atproto_pds(pool: PgPool) {
+async fn authority_host_resolution_uses_atproto_pds(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
     let pds_endpoint = "https://pds-fallback.example.com";
 
@@ -426,13 +439,9 @@ async fn space_host_resolution_falls_back_to_atproto_pds(pool: PgPool) {
     )
     .unwrap();
 
-    // Only the endpoint falls back. The service identifier is the audience of a
-    // client attestation and of a delegation token, and always names the
-    // space-host role fully qualified. Asserting "#atproto_pds" here is what let
-    // the AppView send a bare relative fragment as an `aud`, which the live PDS
-    // rejected with InvalidClientAttestation.
+    // October 22 uses the authority account PDS for both endpoint and audience.
     assert_eq!(endpoint, pds_endpoint);
-    assert_eq!(service_id, format!("{AUTHORITY_DID}#atproto_space_host"));
+    assert_eq!(service_id, format!("{AUTHORITY_DID}#atproto_pds"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -477,6 +486,42 @@ async fn check_member_access_and_cache_validation(pool: PgPool) {
     assert!(access::check_member_access(&setup.state, &space, BOB_DID)
         .await
         .is_err());
+
+    // A confirmed inactive authority denies even a cached member, and restoring
+    // activity preserves the authority-issued membership grant.
+    sqlx::query("UPDATE circle_account_status SET active=false,status='suspended' WHERE did=$1")
+        .bind(AUTHORITY_DID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        access::check_member_access(&setup.state, &space, ALICE_DID).await,
+        Err(AppError::Forbidden(_))
+    ));
+    let grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM circle_member_cache WHERE member_did=$1")
+            .bind(ALICE_DID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(grants, 1);
+    sqlx::query("UPDATE circle_account_status SET active=true,status=NULL WHERE did=$1")
+        .bind(AUTHORITY_DID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    access::check_member_access(&setup.state, &space, ALICE_DID)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE circle_account_status SET active=false,status='suspended' WHERE did=$1")
+        .bind(ALICE_DID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        access::check_member_access(&setup.state, &space, ALICE_DID).await,
+        Err(AppError::Forbidden(_))
+    ));
 }
 
 #[derive(Clone)]
@@ -563,6 +608,70 @@ async fn unreadable_member_list_denies_without_signalling_removal(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn authority_omitted_from_member_cache_is_authorized_in_shared_gate_while_outsider_fails_closed(
+    pool: PgPool,
+) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3k2space1tidx', $2, 'Test Circle', now(), true)",
+    )
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The authority is implicit in membership, but its AppView grant still
+    // requires a current policy snapshot, just like every other reader.
+    sqlx::query("INSERT INTO circle_member_cache_meta(space_uri,last_refreshed_at,member_count) VALUES($1,now(),0)")
+        .bind(&space).execute(&pool).await.unwrap();
+
+    // Authority is NOT in member cache
+    let outcome = access::verify_member_access(&setup.state, &space, AUTHORITY_DID)
+        .await
+        .expect("verify_member_access must succeed for space authority");
+    assert_eq!(outcome, access::MemberAccessOutcome::Authorized);
+
+    access::check_member_access(&setup.state, &space, AUTHORITY_DID)
+        .await
+        .expect("check_member_access must succeed for space authority");
+
+    // Outsider (Bob) fails closed
+    let bob_err = access::check_member_access(&setup.state, &space, BOB_DID)
+        .await
+        .expect_err("check_member_access must deny outsider");
+    assert!(
+        matches!(
+            bob_err,
+            circle_appview::error::AppError::Forbidden(_)
+                | circle_appview::error::AppError::AccessRemoved(_)
+        ),
+        "Expected Forbidden or AccessRemoved for outsider, got {bob_err:?}"
+    );
+
+    // When circle app_access is revoked or deleted, authority is also denied (invariants preserved)
+    sqlx::query("UPDATE circles SET app_access_granted = false WHERE space_uri = $1")
+        .bind(&space)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let revoked_err = access::check_member_access(&setup.state, &space, AUTHORITY_DID)
+        .await
+        .expect_err("check_member_access must deny when appAccess revoked");
+    // AccessRemoved (not NotFound) so the device purges its cached Circle (CIRCLES-04).
+    assert!(
+        matches!(
+            revoked_err,
+            circle_appview::error::AppError::AccessRemoved(_)
+        ),
+        "Expected AccessRemoved for revoked space, got {revoked_err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
 
@@ -577,6 +686,8 @@ async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
         app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
             service_did.clone()
         ]),
+        read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+        write_policy: circle_appview::space_client::SpacePolicy::MemberList,
         user_policy: None,
         name: Some("Test".to_string()),
         description: None,
@@ -595,6 +706,8 @@ async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
         app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![
             expected_client_id.clone(),
         ]),
+        read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+        write_policy: circle_appview::space_client::SpacePolicy::MemberList,
         user_policy: None,
         name: Some("Test".to_string()),
         description: None,
@@ -898,11 +1011,22 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                 };
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
-                    let has_auth = req_str.contains("authorization: Bearer test-delegation-token")
-                        || req_str.contains("Authorization: Bearer test-delegation-token");
-                    let has_dpop = req_str.contains("dpop: test-dpop-proof")
-                        || req_str.contains("DPoP: test-dpop-proof");
-                    if has_auth && has_dpop {
+                    let body: serde_json::Value = req_str
+                        .split_once("\r\n\r\n")
+                        .and_then(|(_, body)| serde_json::from_str(body).ok())
+                        .unwrap_or_default();
+                    let lower = req_str.to_ascii_lowercase();
+                    let body_contract = body["space"] == "at://did:plc:auth/space/1"
+                        && body["delegationToken"] == "test-delegation-token"
+                        && body["clientAttestation"] == "test-attestation"
+                        && body["credentialKid"]
+                            .as_str()
+                            .is_some_and(|kid| kid.starts_with("did:key:"));
+                    let no_proof_headers = !lower.contains("\r\nauthorization:")
+                        && !lower.contains("\r\ndpop:")
+                        && !lower.contains("\r\nsignature:")
+                        && !lower.contains("\r\nsignature-input:");
+                    if body_contract && no_proof_headers {
                         let body = r#"{"credential":"test.space.credential.jwt"}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -970,14 +1094,15 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     ))
     .unwrap();
 
+    let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let exchange_request = circle_appview::space_client::SpaceCredentialRequest {
+        space: "at://did:plc:auth/space/1".into(),
+        credential_kid: circle_appview::space_signature::p256_did_key(exchange_key.verifying_key()),
+        delegation_token: Some("test-delegation-token".into()),
+        client_attestation: Some("test-attestation".into()),
+    };
     let cred = transport_success
-        .get_space_credential(
-            &target_url,
-            "test-delegation-token",
-            "test-dpop-proof",
-            "at://did:plc:auth/space/1",
-            "test-attestation",
-        )
+        .get_space_credential(&target_url, &exchange_request)
         .await
         .expect("Space host credential exchange over TLS must succeed");
     assert_eq!(cred, "test.space.credential.jwt");
@@ -989,13 +1114,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     ))
     .unwrap();
     let redirect_res = transport_success
-        .get_space_credential(
-            &redirect_url,
-            "test-delegation-token",
-            "test-dpop-proof",
-            "at://did:plc:auth/space/1",
-            "test-attestation",
-        )
+        .get_space_credential(&redirect_url, &exchange_request)
         .await;
     assert!(
         redirect_res.is_err(),
@@ -1240,7 +1359,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
         .and(path("/xrpc/com.atproto.simplespace.listMembers"))
         .and(query_param("space", space))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "members": [{"did": "did:plc:user1"}],
+            "members": [{"did": "did:plc:user1", "read": true, "write": true}],
             "cursor": "repeated_cursor_token"
         })))
         .mount(&mock_server)
@@ -1292,5 +1411,669 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
         res.is_err(),
         "Repeated pagination cursor must fail closed: got {:?}",
         res
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_activate_circle_missing_grant_returns_auth_required_not_404_and_preserves_not_found_and_upstream(
+    pool: PgPool,
+) {
+    let setup = setup_test(pool.clone()).await;
+    register_did_doc(
+        &setup.state.did_resolver,
+        AUTHORITY_DID,
+        &setup.authority_signing_key,
+        Some(vec![DidService {
+            id: "#atproto_pds".into(),
+            r#type: "AtprotoPersonalDataServer".into(),
+            service_endpoint: SPACE_HOST_ENDPOINT.into(),
+        }]),
+    );
+
+    // 1. Missing AppView OAuth grant: AUTHORITY_DID has no session in oauth_sessions.
+    // An unconfigured space triggers get_space which tries to fetch a token for AUTHORITY_DID.
+    let ungranted_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/ungranted");
+    let missing_grant_res =
+        access::activate_circle(&setup.state, ALICE_DID, &ungranted_space).await;
+
+    match missing_grant_res {
+        Err(AppError::Unauthorized(reason)) => {
+            assert_eq!(reason, AuthReason::MissingOAuthSession);
+            let resp = AppError::Unauthorized(reason).into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+        other => panic!("Expected missing OAuth session to require authorization, got {other:?}"),
+    }
+
+    // Verify no database writes occurred before access authorization
+    let circle_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circles")
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        circle_count.0, 0,
+        "No circle row must be written on authorization failure"
+    );
+
+    let member_cache_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM circle_member_cache")
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        member_cache_count.0, 0,
+        "No member cache row must be written on authorization failure"
+    );
+
+    // 2. True NotFound: when PDS returns SpaceNotFound, it must return NotFound (404), not 401 or 500
+    let not_found_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/nonexistent");
+    setup
+        .mock_transport
+        .set_space_config_error(&not_found_space, "SpaceNotFound".into());
+
+    let not_found_res = access::activate_circle(&setup.state, ALICE_DID, &not_found_space).await;
+    match not_found_res {
+        Err(AppError::NotFound(_)) => {
+            let resp = not_found_res.unwrap_err().into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+        other => panic!("Expected NotFound for true missing space, got {other:?}"),
+    }
+
+    // 3. Upstream failure: when PDS returns server error / unavailable, it must retain Internal (500), not 404
+    let upstream_err_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/upstream-err");
+    setup.mock_transport.set_space_config_error(
+        &upstream_err_space,
+        "Upstream server error (503 Service Unavailable)".into(),
+    );
+
+    let upstream_res = access::activate_circle(&setup.state, ALICE_DID, &upstream_err_space).await;
+    match upstream_res {
+        Err(AppError::Internal(_)) => {
+            let resp = upstream_res.unwrap_err().into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        other => panic!("Expected Internal for upstream failure, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn membership_and_authority_app_access_expire_after_thirty_seconds_with_expired_oauth(
+    pool: PgPool,
+) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    sqlx::query("INSERT INTO circles(space_uri,circle_id,authority_did,display_name,created_at) VALUES($1,'3jzfcijpj2m2a',$2,'TTL fixture',now())")
+        .bind(&space).bind(AUTHORITY_DID).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO circle_member_cache(space_uri,member_did,cached_at) VALUES($1,$2,now())",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO circle_member_cache_meta(space_uri,last_refreshed_at,member_count) VALUES($1,now(),1)")
+        .bind(&space).execute(&pool).await.unwrap();
+    // Use the actual OAuth and HTTP transport path. Expired access without a
+    // refresh token must never reuse an older authorization snapshot.
+    setup
+        .state
+        .oauth_service
+        .store_session(circle_appview::oauth::UserOAuthSession {
+            user_did: AUTHORITY_DID.into(),
+            access_token: "expired-local-fixture".into(),
+            refresh_token: None,
+            token_endpoint: "https://pds.fixture.example.com/oauth/token".into(),
+            auth_server_iss: "https://pds.fixture.example.com".into(),
+            expires_at: Some(Utc::now() - chrono::Duration::seconds(60)),
+            scope: "atproto".into(),
+            dpop_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+        })
+        .await
+        .unwrap();
+    let mut state = setup.state.clone();
+    state.space_client = Arc::new(SpaceClient::new());
+    state
+        .space_client
+        .set_deps(circle_appview::space_client::SpaceClientDeps {
+            http_client: state.http_client.clone(),
+            did_resolver: state.did_resolver.clone(),
+            oauth_service: state.oauth_service.clone(),
+        });
+    access::check_member_access(&state, &space, ALICE_DID)
+        .await
+        .unwrap();
+    access::check_member_access(&state, &space, AUTHORITY_DID)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE circle_member_cache_meta SET last_refreshed_at=now()-INTERVAL '31 seconds' WHERE space_uri=$1")
+        .bind(&space).execute(&pool).await.unwrap();
+    for did in [ALICE_DID, AUTHORITY_DID] {
+        assert!(matches!(
+            access::verify_member_access(&state, &space, did)
+                .await
+                .unwrap(),
+            access::MemberAccessOutcome::IndeterminateDenied
+        ));
+    }
+    let grant: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri=$1 AND member_did=$2)",
+    )
+    .bind(&space)
+    .bind(ALICE_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        grant,
+        "failed OAuth refresh denies without pretending membership was removed"
+    );
+}
+
+/// Lists the Circles `did` sees through blue.catbird.circle.listCircles.
+async fn listed_circles(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<String> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
+    use tower::ServiceExt;
+
+    let jwt = mint_service_jwt(did, "blue.catbird.circle.listCircles", signing_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/xrpc/blue.catbird.circle.listCircles")
+        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let output: ListCirclesOutput = serde_json::from_slice(&body).unwrap();
+    output
+        .circles
+        .iter()
+        .map(|c| c.uri.as_str().to_string())
+        .collect()
+}
+
+/// Seeds an active Circle whose mock host lists `members`, and caches that list.
+async fn seed_circle_with_members(setup: &TestSetup, space: &str, members: &[&str]) {
+    setup.mock_transport.set_space_config(
+        space,
+        circle_appview::space_client::SpaceConfig {
+            authority: AUTHORITY_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-test".to_string(),
+            app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Test Circle".to_string()),
+            description: None,
+        },
+    );
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3jzfcijpj2m2a', $2, 'Test Circle', now(), true)",
+    )
+    .bind(space)
+    .bind(AUTHORITY_DID)
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+    set_host_members(setup, space, members);
+    access::refresh_member_cache(&setup.state, space)
+        .await
+        .unwrap();
+}
+
+fn set_host_members(setup: &TestSetup, space: &str, members: &[&str]) {
+    setup
+        .mock_transport
+        .set_space_members(space, members.iter().map(|m| m.to_string()).collect());
+}
+
+/// Ages every Circle's member cache past the 30-second freshness window.
+async fn age_member_caches(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE circle_member_cache_meta SET last_refreshed_at = now() - INTERVAL '10 minutes'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn fresh_member_cache_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM circle_member_cache_meta WHERE last_refreshed_at > now() - INTERVAL '30 seconds'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readded_member_sees_quiet_circle_again_through_own_listing(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    seed_circle_with_members(&setup, &space, &[BOB_DID]).await;
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+
+    // The owner removes Bob; a refresh drops his cache row entirely.
+    set_host_members(&setup, &space, &[]);
+    access::refresh_member_cache(&setup.state, &space)
+        .await
+        .unwrap();
+    let bob_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(&space)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bob_rows, 0, "removal deletes the member's cache row");
+
+    // The owner re-adds Bob and nobody else touches this quiet Circle.
+    set_host_members(&setup, &space, &[BOB_DID]);
+    age_member_caches(&pool).await;
+
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()],
+        "a re-added member's own listing must revalidate the Circle they left"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn former_member_revalidation_is_capped_and_reveals_nothing(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let spaces: Vec<String> = (0..7)
+        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2former{i}"))
+        .collect();
+    for space in &spaces {
+        seed_circle_with_members(&setup, space, &[BOB_DID]).await;
+        set_host_members(&setup, space, &[]);
+        access::refresh_member_cache(&setup.state, space)
+            .await
+            .unwrap();
+    }
+    age_member_caches(&pool).await;
+
+    // Alice was never a member of any of them: her listing makes no host call.
+    assert!(listed_circles(&setup, ALICE_DID, &setup.alice_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, 0);
+
+    // Bob is still removed everywhere. Each listing revalidates at most the
+    // per-request cap, in rotation, and never lists a Circle he cannot read.
+    let cap = access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST;
+    assert!(cap < spaces.len() as i64);
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, cap);
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, spaces.len() as i64);
+
+    // Purging a Circle, then the account, drops the former-member rows.
+    let former_rows = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM circle_former_members WHERE member_did = $1",
+        )
+        .bind(BOB_DID)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(former_rows(pool.clone()).await, spaces.len() as i64);
+    circle_appview::purge::delete_space(&pool, &setup.state.credential_store, &spaces[0])
+        .await
+        .unwrap();
+    assert_eq!(former_rows(pool.clone()).await, spaces.len() as i64 - 1);
+    circle_appview::purge::purge_deleted_author(&pool, BOB_DID)
+        .await
+        .unwrap();
+    assert_eq!(former_rows(pool.clone()).await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn listed_member_regranted_read_sees_quiet_circle_through_own_listing(pool: PgPool) {
+    use circle_appview::space_client::SpaceMember;
+
+    let setup = setup_test(pool.clone()).await;
+    let space = space_uri();
+    seed_circle_with_members(&setup, &space, &[]).await;
+    let bob = |read: bool| SpaceMember {
+        did: BOB_DID.to_string(),
+        read,
+        write: true,
+    };
+
+    // Bob stays on the member list but without read access.
+    setup
+        .mock_transport
+        .set_space_members_detailed(&space, vec![bob(false)]);
+    access::refresh_member_cache(&setup.state, &space)
+        .await
+        .unwrap();
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+
+    // The owner grants read again and nobody else touches the Circle.
+    setup
+        .mock_transport
+        .set_space_members_detailed(&space, vec![bob(true)]);
+    age_member_caches(&pool).await;
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+}
+
+async fn former_member_row_count(pool: &PgPool, space: &str, did: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM circle_former_members WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(space)
+    .bind(did)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn sorted(mut uris: Vec<String>) -> Vec<String> {
+    uris.sort();
+    uris
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn relisted_member_loses_former_row_and_frees_the_cap(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let readded = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2readded");
+    let removed: Vec<String> = (0..access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST)
+        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2removed{i}"))
+        .collect();
+    for space in std::iter::once(&readded).chain(&removed) {
+        seed_circle_with_members(&setup, space, &[BOB_DID]).await;
+        set_host_members(&setup, space, &[]);
+        access::refresh_member_cache(&setup.state, space)
+            .await
+            .unwrap();
+        assert_eq!(former_member_row_count(&pool, space, BOB_DID).await, 1);
+    }
+
+    // The owner re-adds Bob to one Circle and some other request refreshes it.
+    set_host_members(&setup, &readded, &[BOB_DID]);
+    access::refresh_member_cache(&setup.state, &readded)
+        .await
+        .unwrap();
+    assert_eq!(
+        former_member_row_count(&pool, &readded, BOB_DID).await,
+        0,
+        "a refresh that lists the member again forgets the former-member row"
+    );
+
+    // The re-added Circle now comes through the member branch, so the whole
+    // former-member cap goes to the Circles Bob is still removed from.
+    //
+    // The count below catches a kept former-member row only because
+    // `3k2readded` sorts before every `3k2removed*`: never-checked rows are
+    // picked in `space_uri` order, so a kept row would take a cap slot and
+    // leave one removed Circle unrefreshed. Sorted last, it would fall outside
+    // the cap and the count would pass anyway. The `former_member_row_count`
+    // assertion above is the check that does not depend on that order.
+    age_member_caches(&pool).await;
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![readded.clone()]
+    );
+    assert_eq!(
+        fresh_member_cache_count(&pool).await,
+        1 + removed.len() as i64,
+        "a stale former-member row must not take a slot from the cap"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn former_member_host_failures_are_retried_at_most_every_thirty_seconds(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let cap = access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST;
+    // Ordered by URI: the first `cap` Circles are picked first and their host fails.
+    let spaces: Vec<String> = (0..=cap)
+        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2throttle{i}"))
+        .collect();
+    let (failing, waiting) = spaces.split_at(cap as usize);
+    for space in &spaces {
+        seed_circle_with_members(&setup, space, &[BOB_DID]).await;
+        set_host_members(&setup, space, &[]);
+        access::refresh_member_cache(&setup.state, space)
+            .await
+            .unwrap();
+    }
+    for space in failing {
+        setup
+            .mock_transport
+            .set_space_members_error(space, "Upstream unavailable".to_string());
+    }
+    age_member_caches(&pool).await;
+
+    // First listing: the cap goes to the failing Circles and none refreshes.
+    assert!(listed_circles(&setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert_eq!(fresh_member_cache_count(&pool).await, 0);
+
+    // Every host recovers and lists Bob again. Within 30 s the failed
+    // Circles are not retried, so a host call to one would show up as a
+    // fresh cache; the Circle that waited gets its turn instead.
+    for space in &spaces {
+        set_host_members(&setup, space, &[BOB_DID]);
+    }
+    assert_eq!(
+        listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        waiting.to_vec(),
+        "a former-member Circle is checked at most once per 30 s"
+    );
+    assert_eq!(fresh_member_cache_count(&pool).await, 1);
+
+    // Once 30 s have passed the failed Circles are retried.
+    sqlx::query(
+        "UPDATE circle_former_members SET last_checked_at = now() - INTERVAL '31 seconds' WHERE member_did = $1",
+    )
+    .bind(BOB_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sorted(listed_circles(&setup, BOB_DID, &setup.bob_signing_key).await),
+        spaces
+    );
+}
+
+/// GETs an XRPC query as `did` and returns the body of its 200 response.
+async fn xrpc_get_ok(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+    method: &str,
+) -> axum::body::Bytes {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt;
+
+    let jwt = mint_service_jwt(did, method, signing_key);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/xrpc/{method}"))
+        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = setup.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    body
+}
+
+/// The Circle of every post `did` sees through unified blue.catbird.circle.getFeed.
+async fn feed_circles(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<String> {
+    use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
+
+    let body = xrpc_get_ok(setup, did, signing_key, "blue.catbird.circle.getFeed").await;
+    let output: GetFeedOutput = serde_json::from_slice(&body).unwrap();
+    output
+        .feed
+        .iter()
+        .map(|item| item.circle.uri.as_str().to_string())
+        .collect()
+}
+
+/// The Circle of every notification `did` sees through blue.catbird.circle.listNotifications.
+async fn notification_circles(
+    setup: &TestSetup,
+    did: &str,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<String> {
+    use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
+
+    let body = xrpc_get_ok(
+        setup,
+        did,
+        signing_key,
+        "blue.catbird.circle.listNotifications",
+    )
+    .await;
+    let output: ListNotificationsOutput = serde_json::from_slice(&body).unwrap();
+    output
+        .notifications
+        .iter()
+        .map(|n| n.circle.uri.as_str().to_string())
+        .collect()
+}
+
+async fn cache_profile(setup: &TestSetup, did: &str, handle: &str) {
+    use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
+    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+    use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+
+    setup
+        .state
+        .profile_hydrator
+        .set_cached_profile(
+            did,
+            ProfileViewBasic {
+                did: Did::new(SmolStr::new(did)).unwrap(),
+                handle: Handle::new(SmolStr::new(handle)).unwrap(),
+                display_name: None,
+                avatar: None,
+                associated: None,
+                viewer: None,
+                labels: None,
+                created_at: None,
+                pronouns: None,
+                status: None,
+                verification: None,
+                debug: None,
+                extra_data: None,
+            },
+        )
+        .await;
+}
+
+/// Seeds a Circle that lists Bob, with an owner post and a notification for Bob,
+/// then has the owner remove and re-add Bob with nobody else touching the Circle.
+async fn seed_quiet_circle_bob_was_readded_to(setup: &TestSetup) -> String {
+    let space = space_uri();
+    cache_profile(setup, AUTHORITY_DID, "authority.test").await;
+    cache_profile(setup, BOB_DID, "bob.test").await;
+    seed_circle_with_members(setup, &space, &[BOB_DID]).await;
+    let post = json!({"$type": "app.bsky.feed.post", "text": "Owner post", "createdAt": Utc::now().to_rfc3339()});
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at)
+        VALUES ($1, 'bafyreicidreadded', $2, $3, 'app.bsky.feed.post', 'post1', $4, now(), now())
+        "#,
+    )
+    .bind(format!("{space}/app.bsky.feed.post/post1"))
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .bind(&post)
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO circle_notifications (id, recipient_did, space_uri, actor_did, reason, source_uri, created_at) VALUES ($1, $2, $3, $4, 'like', $5, now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(BOB_DID)
+    .bind(&space)
+    .bind(AUTHORITY_DID)
+    .bind(format!("{space}/app.bsky.feed.like/like1"))
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        feed_circles(setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+    assert_eq!(
+        notification_circles(setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space.clone()]
+    );
+
+    set_host_members(setup, &space, &[]);
+    access::refresh_member_cache(&setup.state, &space)
+        .await
+        .unwrap();
+    assert!(feed_circles(setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+    assert!(notification_circles(setup, BOB_DID, &setup.bob_signing_key)
+        .await
+        .is_empty());
+
+    set_host_members(setup, &space, &[BOB_DID]);
+    age_member_caches(&setup.pool).await;
+    space
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readded_member_sees_quiet_circle_again_through_own_unified_feed(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = seed_quiet_circle_bob_was_readded_to(&setup).await;
+    assert_eq!(
+        feed_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space],
+        "a re-added member's unified feed must revalidate the Circle they left"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readded_member_sees_quiet_circle_again_through_own_notifications(pool: PgPool) {
+    let setup = setup_test(pool.clone()).await;
+    let space = seed_quiet_circle_bob_was_readded_to(&setup).await;
+    assert_eq!(
+        notification_circles(&setup, BOB_DID, &setup.bob_signing_key).await,
+        vec![space],
+        "a re-added member's notifications must revalidate the Circle they left"
     );
 }

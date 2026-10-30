@@ -14,12 +14,21 @@ pub enum PurgeError {
 pub async fn remove_member(pool: &PgPool, space: &str, member: &str) -> Result<(), PurgeError> {
     let mut tx = pool.begin().await?;
 
-    // 1. Evict member from cache
+    // 1. Evict member from cache, and remember them so a re-add is noticed
+    //    through their own listings (see access::revalidate_stale_member_spaces)
     sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2")
         .bind(space)
         .bind(member)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "INSERT INTO circle_former_members (space_uri, member_did, removed_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (space_uri, member_did) DO UPDATE SET removed_at = EXCLUDED.removed_at",
+    )
+    .bind(space)
+    .bind(member)
+    .execute(&mut *tx)
+    .await?;
 
     // 2. Advance circles access_epoch, increment generation, then assign circle_member_cache_meta.access_epoch = circles.access_epoch
     let new_epoch: (i64,) = sqlx::query_as(
@@ -71,6 +80,8 @@ pub async fn remove_member(pool: &PgPool, space: &str, member: &str) -> Result<(
 /// appAccess removal lifecycle:
 /// 1. Persists grant state in its own transaction first: disables private serving immediately
 ///    (app_access_granted = false, app_access_revoked_at = now(), deleted_at = now()) and advances access_epoch.
+///    The private name, id and creation time copied from the metadata record are blanked;
+///    a re-grant re-activates and rewrites them.
 /// 2. Revokes/deletes Space credentials from in-memory CredentialStore.
 /// 3. Performs bounded batch purge of projected private data so a large purge failure cannot leave the Circle serving.
 pub async fn revoke_app_access(
@@ -87,7 +98,10 @@ pub async fn revoke_app_access(
         SET app_access_granted = false,
             app_access_revoked_at = now(),
             access_epoch = access_epoch + 1,
-            deleted_at = COALESCE(deleted_at, now())
+            deleted_at = COALESCE(deleted_at, now()),
+            display_name = 'Circle',
+            circle_id = '',
+            created_at = COALESCE(deleted_at, now())
         WHERE space_uri = $1
         RETURNING access_epoch
         "#,
@@ -107,7 +121,10 @@ pub async fn revoke_app_access(
                 SET app_access_granted = false,
                     app_access_revoked_at = now(),
                     access_epoch = circles.access_epoch + 1,
-                    deleted_at = COALESCE(circles.deleted_at, now())
+                    deleted_at = COALESCE(circles.deleted_at, now()),
+                    display_name = 'Circle',
+                    circle_id = '',
+                    created_at = COALESCE(circles.deleted_at, now())
                 RETURNING access_epoch
                 "#,
             )
@@ -134,6 +151,11 @@ pub async fn revoke_app_access(
     .bind(new_epoch)
     .execute(&mut *tx)
     .await?;
+
+    sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
 
@@ -201,6 +223,28 @@ pub async fn purge_circle_projected_data(pool: &PgPool, space: &str) -> Result<(
             DELETE FROM circle_member_cache
             WHERE ctid IN (
                 SELECT ctid FROM circle_member_cache
+                WHERE space_uri = $1
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(space)
+        .bind(BATCH_SIZE)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if deleted < BATCH_SIZE as u64 {
+            break;
+        }
+    }
+
+    // Former members
+    loop {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM circle_former_members
+            WHERE ctid IN (
+                SELECT ctid FROM circle_former_members
                 WHERE space_uri = $1
                 LIMIT $2
             )
@@ -295,9 +339,13 @@ pub async fn delete_space(
 ) -> Result<(), PurgeError> {
     let mut tx = pool.begin().await?;
 
-    // Linearizable tombstone: mark deleted_at = now()
+    // Linearizable tombstone. It keeps only what AccessRemoved answers need, and
+    // blanks the private name, id and creation time copied from the Space's
+    // metadata record (repeat deliveries too). COALESCE keeps the first
+    // tombstone time, so retention is not extended.
     sqlx::query(
-        "UPDATE circles SET deleted_at = now() WHERE space_uri = $1 AND deleted_at IS NULL",
+        "UPDATE circles SET deleted_at = COALESCE(deleted_at, now()), display_name = 'Circle', \
+         circle_id = '', created_at = COALESCE(deleted_at, now()) WHERE space_uri = $1",
     )
     .bind(space)
     .execute(&mut *tx)
@@ -307,6 +355,10 @@ pub async fn delete_space(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM circle_member_cache WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM circle_former_members WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
         .await?;
@@ -335,6 +387,11 @@ pub async fn delete_space(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM circle_rejections WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
+    // The space is gone at the host, so its registration is gone with it.
+    sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
         .await?;
@@ -404,5 +461,61 @@ pub async fn deactivate_author(pool: &PgPool, author: &str) -> Result<(), PurgeE
         .await?;
 
     tx.commit().await?;
+    Ok(())
+}
+
+/// Confirmed account deletion removes private author payloads. This is never
+/// called for suspension/deactivation hints. The account ledger gates reads
+/// before this resumable, bounded cleanup begins.
+pub async fn purge_deleted_author(pool: &PgPool, author: &str) -> Result<(), PurgeError> {
+    const BATCH: i64 = 500;
+    loop {
+        let mut tx = pool.begin().await?;
+        let uris: Vec<String> = sqlx::query_scalar(
+            "SELECT uri FROM circle_records WHERE author_did=$1 ORDER BY uri LIMIT $2 FOR UPDATE",
+        )
+        .bind(author)
+        .bind(BATCH)
+        .fetch_all(&mut *tx)
+        .await?;
+        if uris.is_empty() {
+            break;
+        }
+        sqlx::query(
+            "DELETE FROM circle_notifications WHERE subject_uri=ANY($1) OR source_uri=ANY($1)",
+        )
+        .bind(&uris)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM circle_reports WHERE subject_uri=ANY($1)")
+            .bind(&uris)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM circle_records WHERE uri=ANY($1)")
+            .bind(&uris)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+    for (table, predicate) in [
+        ("circle_notifications", "actor_did=$1 OR recipient_did=$1"),
+        ("circle_reports", "reporter_did=$1"),
+        ("circle_preferences", "member_did=$1"),
+        ("circle_repo_sync_state", "author_did=$1"),
+        ("circle_member_cache", "member_did=$1"),
+        ("circle_former_members", "member_did=$1"),
+        ("oauth_sessions", "user_did=$1"),
+    ] {
+        loop {
+            // Table/predicate strings are fixed literals above, not user input.
+            let deleted = sqlx::query(&format!(
+                "DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE {predicate} LIMIT $2)"
+            ))
+            .bind(author).bind(BATCH).execute(pool).await?.rows_affected();
+            if deleted < BATCH as u64 {
+                break;
+            }
+        }
+    }
     Ok(())
 }

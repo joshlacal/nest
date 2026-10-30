@@ -1,6 +1,5 @@
 use crate::access::CredentialStore;
 use crate::auth::DidResolver;
-use crate::commit::CommitVerificationPolicy;
 use crate::oauth::OAuthService;
 use crate::space_client::SpaceClient;
 use sqlx::PgPool;
@@ -13,6 +12,7 @@ pub struct Config {
     pub database_url: String,
     pub service_did: String,
     pub plc_directory_url: String,
+    pub identity_relay_url: Option<url::Url>,
     pub public_appview_url: String,
     pub circle_media_base_url: url::Url,
     pub appview_base_url: String,
@@ -22,7 +22,6 @@ pub struct Config {
     pub push_key_id: String,
     pub push_signing_key_path: Option<String>,
     pub push_signing_key_hex: Option<String>,
-    pub commit_verification_policy: CommitVerificationPolicy,
 }
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
@@ -37,6 +36,11 @@ impl Config {
             .unwrap_or_else(|_| "did:web:circles.catbird.blue#atproto_circles".to_string());
         let plc_directory_url =
             env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
+        let identity_relay_url = env::var("CIRCLE_IDENTITY_RELAY_URL")
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| crate::identity_events::validate_relay_url(&raw))
+            .transpose()?;
         let public_appview_url = env::var("PUBLIC_APPVIEW_URL")
             .unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
         let circle_media_base_url_raw = env::var("CIRCLE_MEDIA_BASE_URL")
@@ -110,19 +114,16 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-        let commit_verification_policy = match env::var("COMMIT_VERIFICATION_POLICY")
+        // A leftover signature-policy variable from the retired commit fork is
+        // ignored; current reads always require request-specific response MACs.
+        if let Ok(policy) = env::var("COMMIT_VERIFICATION_POLICY")
             .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
-            .as_deref()
         {
-            Ok("explicit_migration_permit_v1") | Ok("migration_permit_v1") | Ok("v1") => {
-                CommitVerificationPolicy::ExplicitMigrationPermitV1
-            }
-            Ok(s) if s.starts_with("dual_read:") => {
-                let cutoff = s.trim_start_matches("dual_read:").to_string();
-                CommitVerificationPolicy::DualReadWithCutoff { cutoff_rev: cutoff }
-            }
-            _ => CommitVerificationPolicy::StrictV2,
-        };
+            tracing::warn!(
+                %policy,
+                "COMMIT_VERIFICATION_POLICY is obsolete and ignored; Spaces response MACs are always required"
+            );
+        }
 
         Ok(Self {
             host,
@@ -130,6 +131,7 @@ impl Config {
             database_url,
             service_did,
             plc_directory_url,
+            identity_relay_url,
             public_appview_url,
             circle_media_base_url,
             appview_base_url,
@@ -139,8 +141,20 @@ impl Config {
             push_key_id,
             push_signing_key_path,
             push_signing_key_hex,
-            commit_verification_policy,
         })
+    }
+}
+
+impl Config {
+    /// Service identifier passed to `com.atproto.space.registerNotify`: this
+    /// AppView's DID plus the `#atproto_circles` service entry that space hosts
+    /// resolve to deliver notifyWrite and notifySpaceDeleted.
+    pub fn notify_service_identifier(&self) -> String {
+        if self.service_did.contains('#') {
+            self.service_did.clone()
+        } else {
+            format!("{}#atproto_circles", self.service_did)
+        }
     }
 }
 
@@ -241,6 +255,8 @@ pub struct AppState {
     pub credential_store: Arc<CredentialStore>,
     pub space_client: Arc<SpaceClient>,
     pub space_locks: Arc<crate::access::SpaceLockManager>,
+    /// Where the revision sweep resumes budget-cut listRepos listings.
+    pub listing_resume: Arc<crate::sync::ListingResumePoints>,
     pub profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
     pub oauth_service: Arc<OAuthService>,
     pub push_client: Option<Arc<crate::push::CirclePushClient>>,
@@ -333,6 +349,7 @@ impl AppState {
             credential_store,
             space_client,
             space_locks,
+            listing_resume: Arc::new(crate::sync::ListingResumePoints::new()),
             profile_hydrator,
             oauth_service,
             push_client,

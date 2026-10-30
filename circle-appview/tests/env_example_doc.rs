@@ -253,7 +253,6 @@ fn test_dockerignore_rules_exclude_sensitive_files() {
         "nest/circle-appview/Cargo.toml",
         "nest/circle-appview/Cargo.lock",
         "nest/circle-appview/.env.example",
-        "catbird-atproto/src/lib.rs",
     ];
     for path in parent_inclusions {
         assert!(
@@ -263,6 +262,7 @@ fn test_dockerignore_rules_exclude_sensitive_files() {
     }
 
     let parent_exclusions = [
+        "catbird-atproto/src/lib.rs",
         "nest/circle-appview/.env",
         "nest/circle-appview/.env.production",
         "nest/circle-appview/server.key",

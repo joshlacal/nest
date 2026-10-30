@@ -799,6 +799,7 @@ fn sanitize_url_for_logging(url: &str) -> &str {
 /// - content-type
 /// - atproto-proxy
 /// - atproto-accept-labelers
+/// - atproto-space-want-mac (per-request key share; required for authenticated Space reads)
 /// All other headers (e.g. host, forwarded, x-forwarded-*, sec-*, cookie, authorization, dpop, hop-by-hop) are dropped.
 pub fn filter_client_headers(client_headers: &HeaderMap, out_headers: &mut HeaderMap) {
     for (name, value) in client_headers.iter() {
@@ -811,6 +812,7 @@ pub fn filter_client_headers(client_headers: &HeaderMap, out_headers: &mut Heade
                 | "content-type"
                 | "atproto-proxy"
                 | "atproto-accept-labelers"
+                | "atproto-space-want-mac"
         ) {
             if name_lower == "content-type" && out_headers.contains_key(CONTENT_TYPE) {
                 continue;
@@ -1000,6 +1002,11 @@ mod tests {
         );
 
         // Allowlisted headers:
+        let want_mac = r#"type="atproto-space-repo", ver=1, key_share="did:key:ephemeral""#;
+        client_headers.insert(
+            HeaderName::from_static("atproto-space-want-mac"),
+            HeaderValue::from_str(want_mac).unwrap(),
+        );
         client_headers.insert(
             HeaderName::from_static("accept"),
             HeaderValue::from_static("application/json"),
@@ -1043,6 +1050,7 @@ mod tests {
         assert!(!out_headers.contains_key("dpop"));
         assert!(!out_headers.contains_key("x-custom-header"));
         assert_eq!(out_headers.get("authorization").unwrap(), "DPoP pds-token");
+        assert_eq!(out_headers.get("atproto-space-want-mac").unwrap(), want_mac);
         assert_eq!(out_headers.get("accept").unwrap(), "application/json");
         assert_eq!(
             out_headers.get("accept-language").unwrap(),

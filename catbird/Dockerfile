@@ -23,7 +23,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies only
-RUN cargo build --release && rm -rf src
+RUN cargo build --release --locked && rm -rf src
 
 # Copy actual source code
 COPY src ./src
@@ -32,7 +32,7 @@ COPY src ./src
 RUN touch src/main.rs
 
 # Build the actual binary
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

@@ -54,7 +54,7 @@ pub async fn get_post_thread(
             pref.muted
         FROM circles c
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $2
-        WHERE c.space_uri = $1 AND c.deleted_at IS NULL AND c.app_access_granted = true
+        WHERE c.space_uri = $1 AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
         "#,
     )
     .bind(space_uri)
@@ -117,7 +117,7 @@ pub async fn get_post_thread(
             r.indexed_at,
             r.parent_uri,
             r.root_uri,
-            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
             (
                 SELECT count(*)
                 FROM circle_records rep
@@ -129,14 +129,14 @@ pub async fn get_post_thread(
                     OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE($1, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
                 )
                   AND rep.space_uri = $3
-                  AND rep.deleted_at IS NULL
+                  AND rep.deleted_at IS NULL AND rep.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                   AND (
                       rep.root_uri IS NULL
                       OR EXISTS (
                           SELECT 1 FROM circle_records root
                           WHERE (root.uri = rep.root_uri OR REGEXP_REPLACE(root.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                             AND root.space_uri = $3
-                            AND root.deleted_at IS NULL
+                            AND root.deleted_at IS NULL AND root.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                             AND root.collection = 'app.bsky.feed.post'
                       )
                   )
@@ -146,19 +146,19 @@ pub async fn get_post_thread(
                           SELECT 1 FROM circle_records p
                           WHERE (p.uri = rep.parent_uri OR REGEXP_REPLACE(p.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                             AND p.space_uri = $3
-                            AND p.deleted_at IS NULL
+                            AND p.deleted_at IS NULL AND p.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                             AND p.collection = 'app.bsky.feed.post'
                       )
                   )
             ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
         FROM circle_records r
-        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
-        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
+        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4 AND m.can_read = true
         WHERE (r.uri = $1 OR r.uri = $2)
           AND r.space_uri = $3
           AND r.collection = 'app.bsky.feed.post'
-          AND r.deleted_at IS NULL
+          AND r.deleted_at IS NULL AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
         "#,
     )
     .bind(post_uri)
@@ -300,7 +300,7 @@ pub async fn get_post_thread(
                 r.indexed_at,
                 r.parent_uri,
                 r.root_uri,
-                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
+                (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3) AS like_count,
                 (
                     SELECT count(*)
                     FROM circle_records rep
@@ -312,14 +312,14 @@ pub async fn get_post_thread(
                         OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE($1, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
                     )
                       AND rep.space_uri = $3
-                      AND rep.deleted_at IS NULL
+                      AND rep.deleted_at IS NULL AND rep.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                       AND (
                           rep.root_uri IS NULL
                           OR EXISTS (
                               SELECT 1 FROM circle_records root
                               WHERE (root.uri = rep.root_uri OR REGEXP_REPLACE(root.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                                 AND root.space_uri = $3
-                                AND root.deleted_at IS NULL
+                                AND root.deleted_at IS NULL AND root.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                                 AND root.collection = 'app.bsky.feed.post'
                           )
                       )
@@ -329,19 +329,19 @@ pub async fn get_post_thread(
                               SELECT 1 FROM circle_records p
                               WHERE (p.uri = rep.parent_uri OR REGEXP_REPLACE(p.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
                                 AND p.space_uri = $3
-                                AND p.deleted_at IS NULL
+                                AND p.deleted_at IS NULL AND p.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                                 AND p.collection = 'app.bsky.feed.post'
                           )
                       )
                 ) AS reply_count,
-                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
+                (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') OR l.post_uri = $1 OR l.post_uri = $2) AND l.space_uri = $3 AND l.author_did = $4) AS viewer_like_uri
             FROM circle_records r
-            JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL
-            JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4
+            JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+            JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $4 AND m.can_read = true
             WHERE (r.uri = $1 OR r.uri = $2)
               AND r.space_uri = $3
               AND r.collection = 'app.bsky.feed.post'
-              AND r.deleted_at IS NULL
+              AND r.deleted_at IS NULL AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
             "#,
         )
         .bind(&p_uri)
@@ -528,6 +528,10 @@ pub async fn get_post_thread(
         extra_data: None,
     };
 
+    access::check_member_access(state, space_uri, user_did).await?;
+    for did in &all_dids {
+        crate::identity_events::require_active_account(&state.db, did).await?;
+    }
     Ok(GetPostThreadOutput {
         thread: main_thread_view,
         circle: circle_summary,
@@ -572,8 +576,32 @@ async fn fetch_replies_batch(
         }
     }
 
+    // Normalize context and count replies once per batch. Repeating the
+    // nested context lookup for each of 500 rows can outlive the access TTL.
     let rows = sqlx::query_as(
         r#"
+        WITH active_context AS MATERIALIZED (
+            SELECT uri, collection,
+                REGEXP_REPLACE(uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') AS canonical_uri,
+                REGEXP_REPLACE(parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') AS canonical_parent,
+                REGEXP_REPLACE(root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') AS canonical_root
+            FROM circle_records
+            WHERE space_uri = $2 AND deleted_at IS NULL
+              AND author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+        ), reply_counts AS (
+            SELECT rep.canonical_parent, count(*) AS count
+            FROM active_context rep
+            WHERE (rep.canonical_root IS NULL OR EXISTS (
+                SELECT 1 FROM active_context root
+                WHERE root.canonical_uri = rep.canonical_root
+                  AND root.collection = 'app.bsky.feed.post'
+            )) AND (rep.canonical_parent IS NULL OR EXISTS (
+                SELECT 1 FROM active_context parent
+                WHERE parent.canonical_uri = rep.canonical_parent
+                  AND parent.collection = 'app.bsky.feed.post'
+            ))
+            GROUP BY rep.canonical_parent
+        )
         SELECT
             r.uri,
             r.cid,
@@ -583,46 +611,18 @@ async fn fetch_replies_batch(
             r.indexed_at,
             r.parent_uri,
             r.root_uri,
-            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri) AS like_count,
-            (
-                SELECT count(*)
-                FROM circle_records rep
-                WHERE (
-                    rep.parent_uri = r.uri
-                    OR REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
-                )
-                  AND rep.space_uri = r.space_uri
-                  AND rep.deleted_at IS NULL
-                  AND (
-                      rep.root_uri IS NULL
-                      OR EXISTS (
-                          SELECT 1 FROM circle_records root
-                          WHERE (root.uri = rep.root_uri OR REGEXP_REPLACE(root.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.root_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
-                            AND root.space_uri = $2
-                            AND root.deleted_at IS NULL
-                            AND root.collection = 'app.bsky.feed.post'
-                      )
-                  )
-                  AND (
-                      rep.parent_uri IS NULL
-                      OR EXISTS (
-                          SELECT 1 FROM circle_records p
-                          WHERE (p.uri = rep.parent_uri OR REGEXP_REPLACE(p.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(rep.parent_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1'))
-                            AND p.space_uri = $2
-                            AND p.deleted_at IS NULL
-                            AND p.collection = 'app.bsky.feed.post'
-                      )
-                  )
-            ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri AND l.author_did = $3) AS viewer_like_uri
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri) AS like_count,
+            COALESCE(reply_counts.count, 0) AS reply_count,
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE (l.post_uri = r.uri OR REGEXP_REPLACE(l.post_uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1') = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')) AND l.space_uri = r.space_uri AND l.author_did = $3) AS viewer_like_uri
         FROM circle_records r
-        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $3
-        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+        LEFT JOIN reply_counts ON reply_counts.canonical_parent = REGEXP_REPLACE(r.uri, '^.*(did:[^/]+/app\.bsky\..*)$', 'at://\1')
+        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
+        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $3 AND m.can_read = true
+        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
         WHERE r.parent_uri = ANY($1)
           AND r.space_uri = $2
           AND r.collection = 'app.bsky.feed.post'
-          AND r.deleted_at IS NULL
+          AND r.deleted_at IS NULL AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
         ORDER BY r.created_at ASC, r.uri ASC
         LIMIT $4
         "#,

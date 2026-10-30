@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
@@ -26,6 +27,7 @@ use p256::EncodedPoint;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
+use support::{fixture_commit, fixture_star};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -37,6 +39,38 @@ const MEDIA_BASE: &str = "https://media.catbird.blue";
 const SPACE_1: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy1";
 const SPACE_2: &str =
     "at://did:plc:dave-privacy-unauthorized/space/blue.catbird.circle/3l7privacy2";
+
+/// Exercises the retained media implementation directly, without enabling the
+/// production route or claiming private-blob host qualification.
+fn media_core_fixture_router(state: AppState) -> axum::Router {
+    use axum::{
+        extract::{Extension, Query, State},
+        middleware,
+        routing::get,
+    };
+    use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
+    async fn core(
+        Extension(user): Extension<circle_appview::auth::AuthenticatedUser>,
+        Query(query): Query<GetMedia>,
+        State(state): State<AppState>,
+    ) -> Result<axum::response::Response, circle_appview::error::AppError> {
+        circle_appview::media::get_media(
+            &state,
+            user,
+            query.space.as_str(),
+            query.did.as_str(),
+            query.cid.as_str(),
+        )
+        .await
+    }
+    axum::Router::new()
+        .route("/xrpc/blue.catbird.circle.getMedia", get(core))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            circle_appview::auth::authenticate,
+        ))
+        .with_state(state)
+}
 
 fn url_encode(input: &str) -> String {
     let mut encoded = String::new();
@@ -171,6 +205,7 @@ async fn grant_active_member(
 }
 
 async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
+    support::healthy_identity_fixture(&pool, &[ALICE_DID, BOB_DID, DAVE_DID]).await;
     db::run_migrations(&pool)
         .await
         .expect("Migrations must succeed");
@@ -185,6 +220,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         database_url: "postgres://localhost/postgres".into(),
         service_did: CIRCLE_AUDIENCE.into(),
         plc_directory_url: "https://plc.directory".into(),
+        identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
         circle_media_base_url: url::Url::parse(MEDIA_BASE).unwrap(),
         appview_base_url: "http://127.0.0.1:3002".into(),
@@ -194,8 +230,6 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         push_key_id: format!("{CIRCLE_AUDIENCE}#atproto_circles"),
         push_signing_key_path: None,
         push_signing_key_hex: None,
-        commit_verification_policy:
-            circle_appview::commit::CommitVerificationPolicy::ExplicitMigrationPermitV1,
     };
 
     let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
@@ -236,6 +270,8 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
                 oauth_service.client_id.clone(),
                 CIRCLE_AUDIENCE.to_string(),
             ]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Space 1".to_string()),
             description: Some("Test Space 1".to_string()),
@@ -250,6 +286,7 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         credential_store,
         space_client,
         space_locks,
+        listing_resume: Default::default(),
         profile_hydrator: profile_hydrator.clone(),
         oauth_service,
         push_client: None,
@@ -378,7 +415,7 @@ async fn unauthorized_user_cannot_fetch_media_or_notifications(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "mock-space-token".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -640,7 +677,7 @@ async fn member_removal_space_deletion_and_account_deactivation_purge_exact_scop
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -851,7 +888,7 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -873,7 +910,23 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
         Some("image/jpeg".to_string()),
         oversize_bytes,
     );
-    let app = create_router(setup.state.clone());
+    // The release route remains disabled even for an authorized member.
+    let token = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+    let request = Request::builder()
+        .uri(format!(
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+            url_encode(SPACE_1),
+            url_encode(ALICE_DID),
+            url_encode(blob_cid)
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = setup.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(setup.mock_transport.recorded_blob_calls().is_empty());
+
+    let app = media_core_fixture_router(setup.state.clone());
 
     // Bob requests Alice's blob in SPACE_1 -> 200 OK with no-cache and validated content-type
     let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
@@ -924,6 +977,110 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
     assert_ne!(resp.status(), StatusCode::OK);
 }
 
+/// getMedia reacquires a lapsed credential on demand, but a refused exchange is
+/// not rerun for every image request: the second request answers 404 without a
+/// delegation token or space-host call, and never reaches getBlob.
+#[sqlx::test(migrations = "./migrations")]
+async fn media_does_not_rerun_a_refused_credential_exchange_per_request(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted)
+        VALUES ($1, '3l7privacyaaa', $2, 'Media Space', now(), true)
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    let blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'bafyrec1', $2, $3, 'app.bsky.feed.post', '3l7post1', $4, now())
+        "#,
+    )
+    .bind(format!("{SPACE_1}/app.bsky.feed.post/3l7post1"))
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post with image",
+        "createdAt": "2026-08-24T12:00:00.000Z",
+        "embed": {
+            "$type": "app.bsky.embed.images",
+            "images": [{ "alt": "", "image": { "$type": "blob", "ref": { "$link": blob_cid }, "mimeType": "image/png", "size": 4 } }]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{blob_cid}"),
+        Some("image/png".to_string()),
+        vec![0x89, 0x50, 0x4E, 0x47],
+    );
+    // No credential is cached and the authority refuses the exchange.
+    setup.mock_transport.set_credential_response(
+        SPACE_1,
+        Err(json!({
+            "error": "AppNotAuthorized",
+            "message": "Client AppView not permitted to read Space"
+        })
+        .to_string()),
+    );
+
+    let app = media_core_fixture_router(setup.state.clone());
+    // A fresh service JWT per request: each jti is single-use.
+    let media_request = || {
+        let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+        Request::builder()
+            .uri(format!(
+                "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+                url_encode(SPACE_1),
+                url_encode(ALICE_DID),
+                url_encode(blob_cid),
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {bob_jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    for _ in 0..2 {
+        let resp = app.clone().oneshot(media_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    // Positive control: the first request did run the exchange.
+    assert_eq!(
+        setup.mock_transport.recorded_delegation_token_calls().len(),
+        1
+    );
+    assert_eq!(setup.mock_transport.recorded_calls().len(), 1);
+    assert!(setup.mock_transport.recorded_blob_calls().is_empty());
+
+    // Once a credential is held (the sweep acquired one), media is served.
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred".into(),
+                signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+        )
+        .await;
+    let resp = app.clone().oneshot(media_request()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(setup.mock_transport.recorded_blob_calls().len(), 1);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) {
     let setup = setup_privacy_test(pool.clone()).await;
@@ -953,13 +1110,13 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "active-cred-media-res".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
         .await;
 
-    let blob_cid = "bafkreiblobres";
+    let blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
     let mock_transport = Arc::new(circle_appview::space_client::MockSpaceHostTransport::new());
     let space_client = Arc::new(circle_appview::space_client::SpaceClient::with_transport(
         mock_transport.clone(),
@@ -968,6 +1125,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
     // 1. Author DID doc with wrong service ID but right type ("#custom_pds", "AtprotoPersonalDataServer")
     let custom_pds_did = "did:plc:author-wrong-id";
     grant_active_member(&pool, SPACE_1, custom_pds_did, Duration::hours(1)).await;
+    support::healthy_identity_fixture(&pool, &[custom_pds_did]).await;
     let wrong_id_doc = DidDocument {
         id: custom_pds_did.to_string(),
         verification_method: vec![],
@@ -1010,7 +1168,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
         space_client.clone(),
         setup.state.space_locks.clone(),
     );
-    let app = create_router(custom_state);
+    let app = media_core_fixture_router(custom_state);
 
     let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
     let req1 = Request::builder()
@@ -1034,6 +1192,7 @@ async fn media_endpoint_resolution_rejects_wrong_id_and_suffix_id(pool: PgPool) 
     // 2. Author DID doc with suffix ID ("#fake#atproto_pds")
     let suffix_did = "did:plc:author-suffix-id";
     grant_active_member(&pool, SPACE_1, suffix_did, Duration::hours(1)).await;
+    support::healthy_identity_fixture(&pool, &[suffix_did]).await;
     let suffix_doc = DidDocument {
         id: suffix_did.to_string(),
         verification_method: vec![],
@@ -1163,7 +1322,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-1".into(),
-                dpop_key: cred_key_1,
+                signing_key: cred_key_1,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1177,7 +1336,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
             SPACE_2.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-2".into(),
-                dpop_key: cred_key_2,
+                signing_key: cred_key_2,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1350,7 +1509,7 @@ async fn tracing_and_logs_contain_no_private_identifiers(pool: PgPool) {
         .body(Body::empty())
         .unwrap();
     let resp = setup.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // E. Get Post Thread
     let bob_thread_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getPostThread", &setup.bob_key);
@@ -1596,7 +1755,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1652,14 +1811,8 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
         &rec_reply.cid,
     ));
 
-    let commit_bob = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        BOB_DID,
-        "3l7aaaaaaaaaa",
-        &lthash.state(),
-        &setup.bob_key,
-    );
-    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_reply]).unwrap();
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let car_bob = fixture_star(&commit_bob, &[rec_reply]).unwrap();
     let bob_key = format!("{SPACE_1}:{BOB_DID}");
     setup
         .mock_transport
@@ -1667,7 +1820,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
 
     let sync_engine = SyncEngine::new(&setup.state);
     let sync_res = sync_engine
-        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.hash.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.as_ref()))
         .await
         .unwrap();
     assert_eq!(sync_res.records_accepted, 1);
@@ -1731,7 +1884,7 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1778,7 +1931,7 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
         mock_bytes.clone(),
     );
 
-    let app = create_router(setup.state.clone());
+    let app = media_core_fixture_router(setup.state.clone());
     let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
 
     // 1. Authorized blob -> 200 OK and streams
@@ -1912,7 +2065,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -1964,14 +2117,8 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
         &rec_like.cid,
     ));
 
-    let commit_bob = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        BOB_DID,
-        "3l7aaaaaaaaaa",
-        &lthash.state(),
-        &setup.bob_key,
-    );
-    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_like]).unwrap();
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let car_bob = fixture_star(&commit_bob, &[rec_like]).unwrap();
     let bob_key = format!("{SPACE_1}:{BOB_DID}");
     setup
         .mock_transport
@@ -1979,7 +2126,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
 
     let sync_engine = SyncEngine::new(&setup.state);
     let _ = sync_engine
-        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.hash.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.as_ref()))
         .await;
 
     // Verify NO push notification was dispatched because Bob is not a member of the space
@@ -2021,7 +2168,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
             SPACE_1.to_string(),
             ActiveSpaceCredential {
                 token: "space-cred-live".into(),
-                dpop_key: cred_key,
+                signing_key: cred_key,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         )
@@ -2343,6 +2490,24 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
             .unwrap();
     assert!(!revoked_access);
     assert!(deleted_at.is_some());
+    let (name, circle_id, revoked_created_at): (String, String, chrono::DateTime<Utc>) =
+        sqlx::query_as(
+            "SELECT display_name, circle_id, created_at FROM circles WHERE space_uri = $1",
+        )
+        .bind(SPACE_1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (name.as_str(), circle_id.as_str()),
+        ("Circle", ""),
+        "revocation must not retain the private Circle name or id"
+    );
+    assert_eq!(
+        Some(revoked_created_at),
+        deleted_at,
+        "revocation must not retain the private Circle creation time"
+    );
 
     // 3. refresh_member_cache must fail-closed and NOT resurrect app_access_granted
     let refresh_res = refresh_member_cache(&setup.state, SPACE_1).await;
@@ -2383,14 +2548,8 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
         &rec_meta.rkey,
         &rec_meta.cid,
     ));
-    let commit = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        ALICE_DID,
-        "3l7aaaaaaaaaa",
-        &lthash.state(),
-        &setup.alice_key,
-    );
-    let car_bytes = circle_appview::commit::mint_repo_car(&commit, &[rec_meta]).unwrap();
+    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let car_bytes = fixture_star(&commit, &[rec_meta]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_1}:{ALICE_DID}"), car_bytes);
@@ -2412,6 +2571,59 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
     assert!(
         restored_deleted.is_none(),
         "Re-activation must clear deleted_at"
+    );
+    let regranted_created_at = "2026-08-24T12:00:00Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+    let (restored_created_at,): (chrono::DateTime<Utc>,) =
+        sqlx::query_as("SELECT created_at FROM circles WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        restored_created_at, regranted_created_at,
+        "Re-activation must restore created_at (the listCircles sort key) from the metadata record"
+    );
+
+    // 5. Activating the already active Circle again keeps its created_at, so it
+    // does not move in listCircles even if the metadata record says otherwise.
+    let meta_val = json!({
+        "$type": "blue.catbird.circle.metadata",
+        "circleId": "3l7aaaaaaaabb",
+        "name": "Lifecycle Space Re-activated",
+        "createdAt": "2026-09-01T00:00:00Z"
+    });
+    let meta_cid = circle_appview::commit::compute_dagcbor_cid(&meta_val).unwrap();
+    let rec_meta = circle_appview::commit::RepoRecord {
+        collection: "blue.catbird.circle.metadata".into(),
+        rkey: "self".into(),
+        cid: meta_cid,
+        value: meta_val,
+    };
+    let mut lthash = circle_appview::commit::LtHash::default();
+    lthash.add(&circle_appview::commit::format_lthash_element(
+        &rec_meta.collection,
+        &rec_meta.rkey,
+        &rec_meta.cid,
+    ));
+    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaab", &lthash.state());
+    let car_bytes = fixture_star(&commit, &[rec_meta]).unwrap();
+    setup
+        .mock_transport
+        .set_get_repo_response(&format!("{SPACE_1}:{ALICE_DID}"), car_bytes);
+    activate_circle(&setup.state, ALICE_DID, SPACE_1)
+        .await
+        .unwrap();
+    let (active_created_at,): (chrono::DateTime<Utc>,) =
+        sqlx::query_as("SELECT created_at FROM circles WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        active_created_at, regranted_created_at,
+        "Activating an active Circle must keep its created_at"
     );
 }
 
@@ -2442,11 +2654,15 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
     let dave_jwt = mint_jwt(DAVE_DID, "com.atproto.space.notifyWrite", &setup.dave_key);
 
     let notify_dave = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(DAVE_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
             .unwrap(),
         extra_data: None,
@@ -2467,11 +2683,15 @@ async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgP
         .unwrap();
 
     let notify_alice = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        hash: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
         repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(ALICE_DID)),
-        rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
+        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
             "3l7aaaaaaaaaa",
         )),
+        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
+            String::from("3l7spacerev2a"),
+        )),
+        prev_space_rev: None,
         space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
             .unwrap(),
         extra_data: None,
@@ -2609,15 +2829,8 @@ async fn circle_activation_generates_notifications_for_members(pool: PgPool) {
         &rec_post.cid,
     ));
 
-    let commit_alice = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        ALICE_DID,
-        "3l7aaaaaaaaaa",
-        &lthash_alice.state(),
-        &setup.alice_key,
-    );
-    let car_alice =
-        circle_appview::commit::mint_repo_car(&commit_alice, &[rec_meta, rec_post]).unwrap();
+    let commit_alice = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", &lthash_alice.state());
+    let car_alice = fixture_star(&commit_alice, &[rec_meta, rec_post]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_1}:{ALICE_DID}"), car_alice);
@@ -2648,14 +2861,8 @@ async fn circle_activation_generates_notifications_for_members(pool: PgPool) {
         &rec_like.cid,
     ));
 
-    let commit_bob = circle_appview::commit::mint_signed_commit(
-        SPACE_1,
-        BOB_DID,
-        "3l7aaaaaaaaaa",
-        &lthash_bob.state(),
-        &setup.bob_key,
-    );
-    let car_bob = circle_appview::commit::mint_repo_car(&commit_bob, &[rec_like]).unwrap();
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash_bob.state());
+    let car_bob = fixture_star(&commit_bob, &[rec_like]).unwrap();
     setup
         .mock_transport
         .set_get_repo_response(&format!("{SPACE_1}:{BOB_DID}"), car_bob);
@@ -2720,6 +2927,8 @@ async fn app_access_open_policy_grants_access_and_preserves_projected_data(pool:
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-open".to_string(),
             app_access: SpaceAppAccess::Open,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Open Policy Space".to_string()),
             description: None,
@@ -2804,6 +3013,8 @@ async fn app_access_explicit_allow_list_omitting_client_revokes_and_purges_data(
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-omit".to_string(),
             app_access: SpaceAppAccess::AllowList(vec!["did:example:other-appview".to_string()]),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("AllowList Omit Space".to_string()),
             description: None,
@@ -2887,6 +3098,8 @@ async fn app_access_unrecognized_variant_denies_without_purging_data(pool: PgPoo
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-unknown".to_string(),
             app_access: SpaceAppAccess::Unknown(Some("com.future.policy#customPolicy".to_string())),
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Unknown Policy Space".to_string()),
             description: None,
@@ -2976,6 +3189,8 @@ async fn app_access_absent_allowed_array_denies_without_purging_data(pool: PgPoo
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-absent".to_string(),
             app_access: parsed_access,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Absent Allowed Space".to_string()),
             description: None,
@@ -3066,6 +3281,8 @@ async fn app_access_explicit_empty_allowed_array_revokes_and_purges_data(pool: P
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-empty".to_string(),
             app_access: parsed_access,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Empty Allowed Space".to_string()),
             description: None,
@@ -3156,6 +3373,8 @@ async fn app_access_object_entry_allowed_array_denies_without_purging_data(pool:
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-objectentry".to_string(),
             app_access: parsed_access,
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Object Entry Space".to_string()),
             description: None,
@@ -3426,7 +3645,7 @@ async fn revocation_durability_commits_state_flip_and_credentials_before_purge(p
             SPACE_1.to_string(),
             circle_appview::access::ActiveSpaceCredential {
                 token: "dpop_token_123".into(),
-                dpop_key: p256_key,
+                signing_key: p256_key,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         )
@@ -3522,7 +3741,7 @@ async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_
             SPACE_1.to_string(),
             circle_appview::access::ActiveSpaceCredential {
                 token: "dpop_token_active".into(),
-                dpop_key: p256_key,
+                signing_key: p256_key,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         )
@@ -3536,6 +3755,8 @@ async fn refresh_member_cache_explicit_revocation_failure_branch_is_durable_and_
             space_type: "blue.catbird.circle".to_string(),
             skey: "skey-1".to_string(),
             app_access: SpaceAppAccess::AllowList(vec![]), // Explicitly revokes
+            read_policy: circle_appview::space_client::SpacePolicy::MemberList,
+            write_policy: circle_appview::space_client::SpacePolicy::MemberList,
             user_policy: None,
             name: Some("Revoked Space".into()),
             description: None,
@@ -3628,6 +3849,28 @@ async fn delete_space_purges_member_cache_and_expired_tombstones_are_cleaned(poo
         "circle_member_cache must be purged in delete_space cascade"
     );
 
+    // 3b. The tombstone keeps no private metadata, and a repeated delivery
+    // neither restores it nor extends the retention window.
+    let first: (String, String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT display_name, circle_id, deleted_at FROM circles WHERE space_uri = $1",
+    )
+    .bind(SPACE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((first.0.as_str(), first.1.as_str()), ("Circle", ""));
+    delete_space(&pool, &setup.state.credential_store, SPACE_1)
+        .await
+        .unwrap();
+    let repeated: (String, String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT display_name, circle_id, deleted_at FROM circles WHERE space_uri = $1",
+    )
+    .bind(SPACE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repeated, first);
+
     // 4. Manually backdate tombstone to 40 days ago
     sqlx::query("UPDATE circles SET deleted_at = now() - INTERVAL '40 days' WHERE space_uri = $1")
         .bind(SPACE_1)
@@ -3645,4 +3888,192 @@ async fn delete_space_purges_member_cache_and_expired_tombstones_are_cleaned(poo
         .await
         .unwrap();
     assert_eq!(remaining.0, 0, "Tombstone row must be completely removed");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn write_only_member_does_not_gain_circles_read_authorization_from_cache(pool: PgPool) {
+    use circle_appview::access::{
+        check_member_access, refresh_member_cache, verify_member_access, MemberAccessOutcome,
+    };
+    use circle_appview::space_client::{SpaceConfig, SpaceMember, SpacePolicy};
+
+    let setup = setup_privacy_test(pool.clone()).await;
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted) VALUES ($1, '3l7writeonly', $2, 'Write Only Member Space', now(), true)",
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Configure space config with MemberList policy
+    setup.mock_transport.set_space_config(
+        SPACE_1,
+        SpaceConfig {
+            authority: ALICE_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-writeonly".to_string(),
+            app_access: circle_appview::space_client::SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: SpacePolicy::MemberList,
+            write_policy: SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Write Only Member Space".to_string()),
+            description: None,
+        },
+    );
+
+    // 2. Bob is write-only: read = false, write = true
+    setup.mock_transport.set_space_members_detailed(
+        SPACE_1,
+        vec![
+            SpaceMember {
+                did: ALICE_DID.to_string(),
+                read: true,
+                write: true,
+            },
+            SpaceMember {
+                did: BOB_DID.to_string(),
+                read: false,
+                write: true,
+            },
+        ],
+    );
+
+    // 3. refresh_member_cache returns only reading members
+    let reading_members = refresh_member_cache(&setup.state, SPACE_1).await.unwrap();
+    assert!(
+        !reading_members.contains(&BOB_DID.to_string()),
+        "refresh_member_cache must NOT return write-only member Bob in reading members list"
+    );
+    assert!(
+        reading_members.contains(&ALICE_DID.to_string()),
+        "refresh_member_cache must include Alice who has read=true"
+    );
+
+    // 4. Verify circle_member_cache database row stores can_read=false, can_write=true for Bob
+    let bob_flags: (bool, bool) = sqlx::query_as(
+        "SELECT can_read, can_write FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2",
+    )
+    .bind(SPACE_1)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bob_flags,
+        (false, true),
+        "Bob must have can_read=false and can_write=true in cache table"
+    );
+
+    // 5. verify_member_access must DENY Bob read access
+    let access_outcome = verify_member_access(&setup.state, SPACE_1, BOB_DID)
+        .await
+        .unwrap();
+    assert_eq!(
+        access_outcome,
+        MemberAccessOutcome::DeniedNotMember,
+        "verify_member_access must deny read access to write-only member Bob"
+    );
+
+    // 6. check_member_access must fail with AccessRemoved for Bob
+    let check_res = check_member_access(&setup.state, SPACE_1, BOB_DID).await;
+    assert!(
+        check_res.is_err(),
+        "check_member_access must reject write-only member Bob"
+    );
+
+    // 7. Verify circle_member_cache_meta member_count only counts reading members (Alice, count = 1)
+    let (member_count,): (i32,) =
+        sqlx::query_as("SELECT member_count FROM circle_member_cache_meta WHERE space_uri = $1")
+            .bind(SPACE_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        member_count, 1,
+        "member_count in meta must count only reading members"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_space_unrecognized_policy_fails_closed(pool: PgPool) {
+    use circle_appview::access::refresh_member_cache;
+    use circle_appview::space_client::{SpaceAppAccess, SpaceConfig, SpacePolicy};
+
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    // Mock get_space returning unrecognized read_policy
+    setup.mock_transport.set_space_config(
+        SPACE_1,
+        SpaceConfig {
+            authority: ALICE_DID.to_string(),
+            space_type: "blue.catbird.circle".to_string(),
+            skey: "skey-badpolicy".to_string(),
+            app_access: SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: SpacePolicy::Unknown(Some("custom.unknown.policy".to_string())),
+            write_policy: SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Bad Policy Space".to_string()),
+            description: None,
+        },
+    );
+
+    let res = refresh_member_cache(&setup.state, SPACE_1).await;
+    assert!(
+        res.is_err(),
+        "refresh_member_cache must fail closed on unrecognized read policy"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn membership_expiring_during_profile_hydration_cannot_return_a_private_post(pool: PgPool) {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let setup = setup_privacy_test(pool.clone()).await;
+    sqlx::query("INSERT INTO circles(space_uri,circle_id,authority_did,display_name,created_at) VALUES($1,'3jzfcijpj2m2a',$2,'In-flight fixture',now())")
+        .bind(SPACE_1).bind(ALICE_DID).execute(&pool).await.unwrap();
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::seconds(30)).await;
+    let value = json!({"$type":"app.bsky.feed.post","text":"must not leave this request","createdAt":Utc::now().to_rfc3339()});
+    let cid = circle_appview::commit::compute_dagcbor_cid(&value).unwrap();
+    let uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3jzfcijpj2m2a");
+    sqlx::query("INSERT INTO circle_records(uri,cid,space_uri,author_did,collection,rkey,record_json,created_at) VALUES($1,$2,$3,$4,'app.bsky.feed.post','3jzfcijpj2m2a',$5,now())")
+        .bind(&uri).bind(cid).bind(SPACE_1).bind(ALICE_DID).bind(value).execute(&pool).await.unwrap();
+    let profile_host = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(ResponseTemplate::new(503).set_delay(std::time::Duration::from_secs(2)))
+        .mount(&profile_host)
+        .await;
+    let mut state = setup.state.clone();
+    state.profile_hydrator = Arc::new(circle_appview::hydration::ProfileHydrator::new(
+        profile_host.uri(),
+        reqwest::Client::new(),
+    ));
+    let request = tokio::spawn(async move {
+        circle_appview::feed::get_feed(&state, BOB_DID, Some(SPACE_1), Some(20), None).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while profile_host.received_requests().await.unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request reached profile hydration");
+    setup
+        .mock_transport
+        .set_space_members(SPACE_1, vec![ALICE_DID.into()]);
+    sqlx::query("UPDATE circle_member_cache_meta SET last_refreshed_at=now()-INTERVAL '31 seconds' WHERE space_uri=$1")
+        .bind(SPACE_1).execute(&pool).await.unwrap();
+    let result = request.await.unwrap();
+    assert!(
+        matches!(result, Err(circle_appview::AppError::AccessRemoved(_))),
+        "expired in-flight authorization cannot publish the previously fetched post: {result:?}"
+    );
 }

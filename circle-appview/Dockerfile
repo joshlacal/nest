@@ -13,14 +13,13 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace dependencies
-COPY catbird-atproto ./catbird-atproto
+# Copy only this service; shared contracts resolve from the locked Git revision.
 COPY nest/circle-appview ./nest/circle-appview
 
 WORKDIR /app/nest/circle-appview
 
 # Build the binary
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

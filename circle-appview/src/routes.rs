@@ -97,6 +97,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            require_lifecycle_ready,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             auth::authenticate,
         ));
 
@@ -150,11 +154,36 @@ async fn did_document_handler(State(state): State<AppState>) -> Json<crate::auth
     Json(state.did_document())
 }
 
-async fn get_capabilities() -> Json<GetCapabilitiesOutput> {
+async fn lifecycle_ready(state: &AppState) -> bool {
+    let Some(relay) = &state.config.identity_relay_url else {
+        return false;
+    };
+    crate::identity_events::is_healthy(&state.db, relay.as_str())
+        .await
+        .unwrap_or(false)
+}
+
+async fn require_lifecycle_ready(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !lifecycle_ready(&state).await {
+        tracing::warn!("Circle request denied: account lifecycle synchronization is unavailable");
+        return AppError::UnsupportedPds(
+            "Circle account lifecycle synchronization is not ready".into(),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+async fn get_capabilities(State(state): State<AppState>) -> Json<GetCapabilitiesOutput> {
     Json(GetCapabilitiesOutput {
-        enabled: true,
+        enabled: lifecycle_ready(&state).await,
         protocol_revision: CIRCLE_PROTOCOL_REVISION.into(),
-        supports_images: true,
+        supports_images: crate::SUPPORTS_IMAGES,
         extra_data: None,
     })
 }
@@ -186,6 +215,7 @@ async fn list_circles_handler(
     State(state): State<AppState>,
 ) -> Result<Json<ListCirclesOutput>, AppError> {
     tracing::debug!("Handling listCircles request");
+    access::ensure_active_account(&state, &user.did).await?;
     access::revalidate_stale_member_spaces(&state, &user.did).await?;
     let limit = query.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
@@ -225,17 +255,17 @@ async fn list_circles_handler(
             COALESCE(pref.muted, false) AS muted,
             meta.member_count
         FROM circles c
-        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1
+        LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.can_read = true
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $1
-        WHERE c.deleted_at IS NULL AND c.app_access_granted = true
+        WHERE c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
           AND (
               c.authority_did = $1
               OR (
                   m.member_did IS NOT NULL
                   AND meta.app_access_granted = true
                   AND meta.access_epoch = c.access_epoch
-                  AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+                  AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
               )
           )
           AND (
@@ -277,6 +307,13 @@ async fn list_circles_handler(
     for (space_uri, circle_id, authority_did, display_name, _created_at, muted, member_count) in
         result_rows
     {
+        if access::verify_member_access(&state, space_uri, &user.did).await?
+            != access::MemberAccessOutcome::Authorized
+        {
+            return Err(AppError::AccessRemoved(
+                "Circle membership changed while listing".into(),
+            ));
+        }
         let circle_tid = Tid::new(SmolStr::new(circle_id))
             .map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
         let uri = AtSpaceUri::new(SmolStr::new(space_uri))

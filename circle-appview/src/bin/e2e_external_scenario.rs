@@ -64,10 +64,10 @@ use catbird_atproto::generated::com_atproto::repo::create_record::{
 use catbird_atproto::generated::com_atproto::repo::strong_ref::StrongRef;
 use catbird_atproto::generated::com_atproto::repo::upload_blob::UploadBlobOutput;
 use catbird_atproto::generated::com_atproto::server::describe_server::DescribeServerOutput;
-use catbird_atproto::generated::com_atproto::simplespace::add_member::AddMember;
 use catbird_atproto::generated::com_atproto::simplespace::create_space::{
-    CreateSpace, CreateSpaceAppAccess, CreateSpacePolicy,
+    CreateSpace, CreateSpaceAppAccess, CreateSpaceReadPolicy, CreateSpaceWritePolicy,
 };
+use catbird_atproto::generated::com_atproto::simplespace::put_member::PutMember;
 use catbird_atproto::generated::com_atproto::simplespace::remove_member::RemoveMember;
 use catbird_atproto::generated::com_atproto::space::apply_writes::{
     ApplyWrites, ApplyWritesOutput, ApplyWritesOutputResultsItem, ApplyWritesWritesItem, Create,
@@ -729,14 +729,14 @@ impl ScenarioRunner {
             }
             if !cap_out.supports_images {
                 return Err(format!(
-                    "supports_images is not true on Nest gateway for {}",
+                    "Image qualification is unavailable (supportsImages=false) on Nest gateway for {}; this full image scenario cannot run",
                     user.name
                 ));
             }
             let rev = cap_out.protocol_revision.as_str();
-            if rev != "89deb9faca20e56fa2a262fe9746ed52bc1095ba" {
+            if rev != "ac0c9f15392f6f0298d71dc52aa88c05036150be" {
                 return Err(format!(
-                    "Space protocol revision mismatch for {}: expected '89deb9faca20e56fa2a262fe9746ed52bc1095ba', got '{rev}'",
+                    "Space protocol revision mismatch for {}: expected 'ac0c9f15392f6f0298d71dc52aa88c05036150be', got '{rev}'",
                     user.name
                 ));
             }
@@ -750,7 +750,7 @@ impl ScenarioRunner {
                 cursor: None,
                 did: Some(Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?),
                 limit: Some(1),
-                r#type: None,
+                space_type: None,
             };
             let ls_resp = user
                 .apply_auth(self.client.get(&list_spaces_url))
@@ -909,7 +909,7 @@ impl ScenarioRunner {
         space: &str,
         prev_rev: Option<&str>,
     ) -> Result<String, String> {
-        // 1. Fetch latest signed commit through Nest using generated GetLatestCommit query input
+        // Fetch and authenticate the current commit through Nest with a fresh request MAC key.
         let get_commit_url = format!(
             "{}/xrpc/com.atproto.space.getLatestCommit",
             self.config.nest_url.trim_end_matches('/')
@@ -919,8 +919,24 @@ impl ScenarioRunner {
             space: AtSpaceUri::new(space.to_string())
                 .map_err(|e| format!("Invalid space URI: {e}"))?,
         };
+        let resolver = circle_appview::auth::DidResolver::new(
+            "https://plc.directory".into(),
+            self.client.clone(),
+        );
+        let doc = resolver
+            .resolve_identity_event(&session.did)
+            .await
+            .map_err(|e| format!("DID resolution failed: {e:?}"))?;
+        let kem =
+            circle_appview::space_mac::kem_key(&doc, &session.did).map_err(|e| e.to_string())?;
+        let request_mac =
+            circle_appview::space_mac::encapsulate(&kem).map_err(|e| e.to_string())?;
         let commit_resp = session
             .apply_auth(self.client.get(&get_commit_url))
+            .header(
+                circle_appview::space_mac::WANT_MAC_HEADER,
+                request_mac.header(),
+            )
             .query(&commit_query)
             .send()
             .await
@@ -932,48 +948,36 @@ impl ScenarioRunner {
                 commit_resp.status()
             ));
         }
-        let commit_output: GetLatestCommitOutput<String> = commit_resp
+        let response_mac = commit_resp
+            .headers()
+            .get_all(circle_appview::space_mac::MAC_HEADER)
+            .iter()
+            .map(|v| v.to_str().map(str::to_owned).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let commit_output: GetLatestCommitOutput = commit_resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse GetLatestCommitOutput: {e}"))?;
         let commit = commit_output.commit;
 
-        if commit.ver != 1 {
-            return Err(format!(
-                "Expected SignedCommit ver == 1, got {}",
-                commit.ver
-            ));
-        }
-        if commit.hash.len() != 32 {
-            return Err(format!(
-                "Expected SignedCommit hash length 32, got {}",
-                commit.hash.len()
-            ));
-        }
-        if commit.ikm.as_ref().map_or(0, |b| b.len()) != 32 {
-            return Err(format!(
-                "Expected SignedCommit ikm length 32, got {:?}",
-                commit.ikm.as_ref().map(|b| b.len())
-            ));
-        }
-        if commit.mac.as_ref().map_or(0, |b| b.len()) != 32 {
-            return Err(format!(
-                "Expected SignedCommit mac length 32, got {:?}",
-                commit.mac.as_ref().map(|b| b.len())
-            ));
-        }
-        if commit.sig.is_empty() {
-            return Err("SignedCommit signature is empty".to_string());
-        }
+        circle_appview::space_mac::verify_commit(
+            &commit,
+            space,
+            &session.did,
+            &request_mac.shared_secret,
+            Some(&response_mac),
+        )
+        .map_err(|e| format!("Commit MAC verification failed: {e}"))?;
         let rev_str = commit.rev.as_str().to_string();
         if rev_str.is_empty() {
-            return Err("SignedCommit revision is empty".to_string());
+            return Err("Commit revision is empty".to_string());
         }
 
-        // Prove that the signed revision advances
+        // Prove that the authenticated revision advances
         if let Some(prev) = prev_rev {
             if rev_str.as_str() <= prev {
-                return Err("Signed revision did not advance".to_string());
+                return Err("Authenticated revision did not advance".to_string());
             }
         }
 
@@ -983,7 +987,7 @@ impl ScenarioRunner {
             .map_err(|e| format!("Failed to connect to Circle AppView database: {e}"))?;
 
         let start = std::time::Instant::now();
-        let expected_hash = commit.hash.as_ref();
+        let expected_hash = commit.data.as_ref();
         loop {
             let row: Option<(String, Vec<u8>)> = sqlx::query_as(
                 "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
@@ -1555,12 +1559,17 @@ impl ScenarioRunner {
                 catbird_atproto::jacquard_common::types::string::RecordKey::any_static(skey)
                     .unwrap(),
             ),
-            policy: CreateSpacePolicy::MemberListPolicy(Box::new(
+            read_policy: CreateSpaceReadPolicy::MemberListPolicy(Box::new(
                 catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
                     extra_data: None,
                 },
             )),
-            r#type: Nsid::new("blue.catbird.circle".into())
+            write_policy: CreateSpaceWritePolicy::MemberListPolicy(Box::new(
+                catbird_atproto::generated::com_atproto::simplespace::MemberListPolicy {
+                    extra_data: None,
+                },
+            )),
+            space_type: Nsid::new("blue.catbird.circle".into())
                 .map_err(|e| format!("Invalid NSID: {e}"))?,
             extra_data: None,
         };
@@ -1601,30 +1610,32 @@ impl ScenarioRunner {
         )
         .await?;
 
-        // Alice adds Bob and Carol via simplespace.addMember
-        let add_member_url = format!(
-            "{}/xrpc/com.atproto.simplespace.addMember",
+        // Alice adds Bob and Carol via simplespace.putMember
+        let put_member_url = format!(
+            "{}/xrpc/com.atproto.simplespace.putMember",
             self.config.nest_url.trim_end_matches('/')
         );
         for user in [&self.config.bob, &self.config.carol] {
-            let add_input = AddMember {
+            let put_input = PutMember {
                 did: Did::new(user.did.clone()).unwrap(),
                 space: space_ref.clone(),
+                read: true,
+                write: true,
                 extra_data: None,
             };
-            let add_resp = self
+            let put_resp = self
                 .config
                 .alice
-                .apply_auth(self.client.post(&add_member_url))
-                .json(&add_input)
+                .apply_auth(self.client.post(&put_member_url))
+                .json(&put_input)
                 .send()
                 .await
-                .map_err(|e| format!("addMember failed for {}: {e}", user.name))?;
-            if !add_resp.status().is_success() {
+                .map_err(|e| format!("putMember failed for {}: {e}", user.name))?;
+            if !put_resp.status().is_success() {
                 return Err(format!(
-                    "addMember for {} returned HTTP {}",
+                    "putMember for {} returned HTTP {}",
                     user.name,
-                    add_resp.status()
+                    put_resp.status()
                 ));
             }
         }
@@ -2406,24 +2417,26 @@ impl ScenarioRunner {
         // Step 11: Alice Adds Dave to Circle via Nest updateMember
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_12_ADD_MEMBER_START");
-        let add_dave_input = AddMember {
+        let put_dave_input = PutMember {
             did: Did::new(self.config.dave.did.clone()).unwrap(),
             space: space_ref.clone(),
+            read: true,
+            write: true,
             extra_data: None,
         };
-        let add_dave_resp = self
+        let put_dave_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&add_member_url))
-            .json(&add_dave_input)
+            .apply_auth(self.client.post(&put_member_url))
+            .json(&put_dave_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call addMember to add Dave: {e}"))?;
+            .map_err(|e| format!("Failed to call putMember to add Dave: {e}"))?;
 
-        if !add_dave_resp.status().is_success() {
+        if !put_dave_resp.status().is_success() {
             return Err(format!(
-                "add Dave returned status {}",
-                add_dave_resp.status()
+                "put Dave returned status {}",
+                put_dave_resp.status()
             ));
         }
 
