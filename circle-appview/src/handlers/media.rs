@@ -12,6 +12,11 @@ pub async fn get_media_handler(
     Query(query): Query<GetMedia>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
+    if !crate::SUPPORTS_IMAGES {
+        return Err(AppError::Forbidden(
+            "Circle images are not available on this protocol profile".into(),
+        ));
+    }
     tracing::debug!("Handling getMedia request");
     crate::media::get_media(
         &state,

@@ -76,7 +76,7 @@ graph LR
 ## 6. Circles (Nest Holds NO Circle Role)
 
 Nest holds **zero Circle role**. Nest is solely a confidential OAuth gateway and generic `/*lexicon` proxy:
-*   Nest **does not** create Circles, track membership, or coordinate Space administration (Space operations are direct between the client and the user's PDS via `com.atproto.simplespace.*` and `com.atproto.space.*`).
+*   Nest **does not** create Circles, track membership, or coordinate Space administration (Space operations are direct between the client and the user's PDS via `com.atproto.space.*` and `com.atproto.memberspace.*`).
 *   Nest **does not** hold Circle projections, access leases, or an outbox.
 *   Nest **does not** mint client attestations for the AppView (the standalone Circle AppView is its own OAuth confidential client and mints its own attestations).
 *   Nest **does not** bridge push notifications for Circles (Circle push is content-free and delivered directly by the AppView).

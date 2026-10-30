@@ -10,7 +10,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
 jacquard-repo = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["crypto-ed25519", "crypto-k256", "crypto-p256"] }
-catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto.git", rev = "f40e8795ff8690092440971a9b5e5496e3f8430f", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
 bytes = { version = "1", features = ["serde"] }
 cid = "0.11"
 multihash = "0.19.3"
@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `pem` is required to accept SEC1 keys ("BEGIN EC PRIVATE KEY"), which is what
 # `openssl ecparam -genkey` produces by default.
-p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "ecdh"] }
 k256 = { version = "0.13", features = ["ecdsa", "jwk"] }
 multibase = "0.9"
 sha2 = "0.10"
@@ -39,6 +39,9 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
+futures-util = "0.3"
+ciborium = "0.2"
 thiserror = "1"
 anyhow = "1"
 

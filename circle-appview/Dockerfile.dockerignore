@@ -1,16 +1,6 @@
 **
-!catbird-atproto/
-!catbird-atproto/**
 !nest/circle-appview/
 !nest/circle-appview/**
-catbird-atproto/target/
-catbird-atproto/target/**
-catbird-atproto/.git/
-catbird-atproto/.git/**
-catbird-atproto/.jj/
-catbird-atproto/.jj/**
-catbird-atproto/.DS_Store
-catbird-atproto/**/.DS_Store
 nest/circle-appview/target/
 nest/circle-appview/target/**
 nest/circle-appview/.git/

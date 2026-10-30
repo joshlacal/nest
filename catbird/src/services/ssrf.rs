@@ -218,6 +218,7 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
 /// - No automatic redirects (`Policy::none()`)
 /// - Strict connection and request timeouts
 /// - Connection pool limits
+/// - Rustls certificate verification with the platform trust store
 pub fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .tls_backend_rustls()
@@ -240,6 +241,7 @@ pub fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
 /// - Automatic decompression disabled (`no_gzip()`, `no_brotli()`, `no_deflate()`)
 /// - Strict connection and request timeouts
 /// - Connection pool limits
+/// - Rustls certificate verification with the platform trust store
 pub fn build_hardened_raw_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .tls_backend_rustls()

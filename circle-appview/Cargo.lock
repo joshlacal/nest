@@ -378,6 +378,7 @@ dependencies = [
 [[package]]
 name = "catbird-atproto"
 version = "0.1.0"
+source = "git+https://github.com/joshlacal/catbird-atproto.git?rev=f40e8795ff8690092440971a9b5e5496e3f8430f#f40e8795ff8690092440971a9b5e5496e3f8430f"
 dependencies = [
  "bytes",
  "jacquard-common",
@@ -506,8 +507,10 @@ dependencies = [
  "bytes",
  "catbird-atproto",
  "chrono",
+ "ciborium",
  "cid",
  "ed25519-dalek",
+ "futures-util",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "iroh-car",
@@ -532,6 +535,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
@@ -1081,6 +1085,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf 0.12.4",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -3972,10 +3977,12 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls",
  "tungstenite",
 ]
@@ -4178,6 +4185,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.9.5",
  "rustls",
  "rustls-pki-types",

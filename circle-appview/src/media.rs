@@ -100,7 +100,17 @@ pub async fn get_media(
         return Err(AppError::NotFound("Not Found".into()));
     }
 
-    // 5. Enforce aggregate concurrent media transfer limit before upstream request
+    // 5. Obtain an active Space credential before taking a media slot, so a slow
+    // or failing exchange never holds one. Credentials last 600 s by default, so
+    // a lapsed one is reacquired here (fresh key, actual exp) through a
+    // still-authorized session, the requesting member's first, rather than
+    // waiting for the next revision sweep. A failed acquisition is not retried
+    // from this path for a minute.
+    let credential = access::ensure_space_credential_for_request(state, space, Some(&user.did))
+        .await
+        .map_err(|_| AppError::NotFound("Not Found".into()))?;
+
+    // 6. Enforce aggregate concurrent media transfer limit before upstream request
     let permit = MEDIA_CONCURRENCY_SEMAPHORE
         .clone()
         .try_acquire_owned()
@@ -117,14 +127,8 @@ pub async fn get_media(
         ));
     }
     let mut byte_guard = MediaByteGuard(MAX_MEDIA_BLOB_BYTES);
-    // 5. Obtain active Space credential from CredentialStore
-    let credential = state
-        .credential_store
-        .get(space)
-        .await
-        .ok_or(AppError::NotFound("Not Found".into()))?;
 
-    // 6. Resolve exact author #atproto_pds endpoint
+    // 7. Resolve exact author #atproto_pds endpoint
     let author_doc = match state.did_resolver.resolve(did).await {
         Ok(doc) => doc,
         Err(_) => return Err(AppError::NotFound("Not Found".into())),
@@ -135,7 +139,8 @@ pub async fn get_media(
         Err(_) => return Err(AppError::NotFound("Not Found".into())),
     };
 
-    // 7. Fetch blob via SpaceClient with active Space credential and DPoP proof
+    // 8. Fetch blob via SpaceClient with the active Space credential, signed for
+    // the blob owner's DID (the repo-read audience)
     let (content_type, bytes) = match state
         .space_client
         .get_blob(
@@ -144,15 +149,24 @@ pub async fn get_media(
             did,
             cid,
             &credential.token,
-            &credential.dpop_key,
+            &credential.signing_key,
         )
         .await
     {
         Ok(res) => res,
-        Err(_) => return Err(AppError::NotFound("Not Found".into())),
+        Err(e) => {
+            crate::access::evict_rejected_credential(
+                &state.credential_store,
+                space,
+                &credential.token,
+                &e,
+            )
+            .await;
+            return Err(AppError::NotFound("Not Found".into()));
+        }
     };
 
-    // 8. Layered enforcement: per-response streaming cap and release unused byte budget
+    // 9. Layered enforcement: per-response streaming cap and release unused byte budget
     if bytes.len() > MAX_MEDIA_BLOB_BYTES {
         return Err(AppError::InvalidRequest(
             "Media blob size exceeds maximum permitted size".into(),

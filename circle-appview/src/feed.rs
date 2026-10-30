@@ -69,7 +69,7 @@ pub fn build_post_view(
 ) -> Result<PostView, AppError> {
     let embed = if let Some(e) = record_json.get("embed") {
         let type_str = e.get("$type").and_then(|t| t.as_str());
-        if type_str == Some("app.bsky.embed.images") {
+        if crate::SUPPORTS_IMAGES && type_str == Some("app.bsky.embed.images") {
             let images_val = e
                 .get("images")
                 .and_then(|i| i.as_array())
@@ -282,13 +282,13 @@ pub async fn get_feed(
             c.display_name AS circle_name,
             c.authority_did AS circle_owner,
             COALESCE(pref.muted, false) AS circle_muted,
-            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri) AS like_count,
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri) AS like_count,
             (
                 SELECT count(*)
                 FROM circle_records rep
                 WHERE rep.parent_uri = r.uri
                   AND rep.space_uri = r.space_uri
-                  AND rep.deleted_at IS NULL
+                  AND rep.deleted_at IS NULL AND rep.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                   AND (
                       rep.root_uri IS NULL
                       OR EXISTS (
@@ -300,7 +300,7 @@ pub async fn get_feed(
                                END
                            ))
                              AND root.space_uri = r.space_uri
-                             AND root.deleted_at IS NULL
+                             AND root.deleted_at IS NULL AND root.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                              AND root.collection = 'app.bsky.feed.post'
                        )
                    )
@@ -315,20 +315,29 @@ pub async fn get_feed(
                                END
                            ))
                              AND p.space_uri = r.space_uri
-                             AND p.deleted_at IS NULL
+                             AND p.deleted_at IS NULL AND p.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                              AND p.collection = 'app.bsky.feed.post'
                        )
                    )
              ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
         FROM circle_records r
-        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.app_access_granted = true
-        JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1
-        JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri AND meta.app_access_granted = true AND meta.access_epoch = c.access_epoch AND meta.last_refreshed_at > now() - INTERVAL '300 seconds'
+        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
+        LEFT JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1 AND m.can_read = true
+        LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
         WHERE r.collection = 'app.bsky.feed.post'
-          AND r.deleted_at IS NULL
+          AND r.deleted_at IS NULL AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
           AND r.parent_uri IS NULL
+          AND (
+              c.authority_did = $1
+              OR (
+                  m.member_did IS NOT NULL
+                  AND meta.app_access_granted = true
+                  AND meta.access_epoch = c.access_epoch
+                  AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
+              )
+          )
           AND ($2::TEXT IS NULL OR r.space_uri = $2)
           AND ($2::TEXT IS NOT NULL OR COALESCE(pref.muted, false) = false)
           AND (
@@ -434,6 +443,20 @@ pub async fn get_feed(
         None
     };
 
+    let spaces: std::collections::HashSet<_> = feed_items
+        .iter()
+        .map(|item| item.circle.uri.as_str())
+        .collect();
+    for space in spaces {
+        access::check_member_access(state, space, user_did).await?;
+    }
+    for item in &feed_items {
+        crate::identity_events::require_active_account(
+            &state.db,
+            item.post.post.author.did.as_str(),
+        )
+        .await?;
+    }
     Ok(GetFeedOutput {
         feed: feed_items,
         cursor: next_cursor,

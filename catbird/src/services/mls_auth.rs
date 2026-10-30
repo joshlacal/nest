@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// All 33 clean-chat procedures defined in blue.catbird.chat.*
+/// All 32 clean-chat procedures defined in blue.catbird.chat.*
 pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.acceptConversation",
     "blue.catbird.chat.acknowledgeWelcome",
@@ -49,7 +49,6 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.getSubscriptionTicket",
     "blue.catbird.chat.prepareBlobUpload",
     "blue.catbird.chat.publishTyping",
-    "blue.catbird.chat.rebindDeviceAuthentication",
     "blue.catbird.chat.rejectWelcome",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.requestLeafRecovery",
