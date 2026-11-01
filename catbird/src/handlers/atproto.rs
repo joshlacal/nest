@@ -31,6 +31,7 @@ use crate::models::{
 };
 use crate::services::{
     AtProtoClient, MlsAuthService, ProxyResponse, ServiceAuthProvider, CIRCLE_ENDPOINTS,
+    INTEL_ENDPOINTS,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1413,6 +1414,151 @@ async fn proxy_circle_request(
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
+const MAX_INTEL_REQUEST_BODY_SIZE: usize = 65_536;
+const MAX_INTEL_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
+
+fn validate_intel_method_and_body(
+    method: &Method,
+    lexicon: &str,
+    body_len: usize,
+) -> AppResult<()> {
+    let is_post_procedure = matches!(
+        lexicon,
+        "blue.catbird.onboarding.getCalibrationSwipes"
+            | "blue.catbird.onboarding.previewTimeline"
+            | "blue.catbird.onboarding.solveBundle"
+    );
+    let expected = if is_post_procedure {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    if method != expected {
+        return Err(AppError::AtprotoResponse {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            error: "MethodNotAllowed".to_string(),
+            message: format!("XRPC method '{lexicon}' requires {expected}"),
+        });
+    }
+    if is_post_procedure {
+        if body_len > MAX_INTEL_REQUEST_BODY_SIZE {
+            return Err(AppError::BadRequest(format!(
+                "Intel request body exceeds {} bytes",
+                MAX_INTEL_REQUEST_BODY_SIZE
+            )));
+        }
+    } else if body_len > 0 {
+        return Err(AppError::BadRequest(
+            "GET request must not carry a body".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_intel_request(
+    state: Arc<AppState>,
+    session: &CatbirdSession,
+    base_url: &str,
+    audience: &str,
+    timeout_ms: u64,
+    dpop_data: &JacquardDpopData,
+    method: reqwest::Method,
+    lexicon: &str,
+    query: Option<&str>,
+    body: Option<bytes::Bytes>,
+    content_type: Option<&str>,
+) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
+    let mut url = format!("{}/xrpc/{lexicon}", base_url.trim_end_matches('/'));
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let token = ServiceAuthProvider::new(state.clone())
+        .token_for_audience_with_dpop(session, audience, lexicon, dpop_data)
+        .await?;
+    let mut request = state
+        .http_client
+        .request(method, &url)
+        .timeout(std::time::Duration::from_millis(timeout_ms.max(500)))
+        .bearer_auth(token);
+    if let Some(content_type) = content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let mut headers = response.headers().clone();
+    let had_content_encoding = headers.remove(reqwest::header::CONTENT_ENCODING).is_some();
+    let content_length = if had_content_encoding {
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        None
+    } else {
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    if content_length.is_some_and(|length| length > MAX_INTEL_RESPONSE_SIZE) {
+        return Err(AppError::ResponseTooLarge(
+            "Intel service response exceeds 2 MiB".into(),
+        ));
+    }
+
+    let mut held_permit = if content_length.is_none()
+        || had_content_encoding
+        || content_length.is_some_and(|length| length > crate::services::STREAM_THRESHOLD)
+    {
+        Some(
+            state
+                .active_stream_semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+        )
+    } else {
+        None
+    };
+
+    let session_id_str = session.id.to_string();
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len() + chunk.len() > MAX_INTEL_RESPONSE_SIZE {
+            return Err(AppError::ResponseTooLarge(
+                "Intel service response exceeds 2 MiB".into(),
+            ));
+        }
+        if held_permit.is_none() && bytes.len() + chunk.len() > crate::services::STREAM_THRESHOLD {
+            held_permit = Some(
+                state
+                    .active_stream_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+            );
+        }
+        state
+            .rate_limit
+            .check_and_record_bytes(&session_id_str, chunk.len() as u64)
+            .await
+            .map_err(|retry_after| AppError::RateLimitExceeded { retry_after })?;
+        bytes.extend_from_slice(&chunk);
+    }
+
+    headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        reqwest::header::HeaderValue::from(bytes.len()),
+    );
+
+    Ok((status, headers, bytes::Bytes::from(bytes)))
+}
+
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
 pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
@@ -1466,6 +1612,61 @@ pub async fn proxy_xrpc(
     } else {
         Some(body_bytes.clone())
     };
+
+    if INTEL_ENDPOINTS.contains(&lexicon.as_str()) {
+        if !state.config.intel.enabled {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "UpstreamUnavailable".to_string(),
+                message: "Catbird intelligence service is disabled".to_string(),
+            });
+        }
+        validate_intel_method_and_body(&method, &lexicon, body_bytes.len())?;
+        tracing::info!(
+            request_id = %request_id,
+            lexicon = %lexicon,
+            user = %session.did,
+            "Routing Intel request directly to standalone Catbird Intel service"
+        );
+        let intel_dpop = dpop_data
+            .as_ref()
+            .map(|extension| &extension.0)
+            .ok_or(AppError::InvalidSession)?;
+        let (status, response_headers, response_body) = proxy_intel_request(
+            state.clone(),
+            &session,
+            &state.config.intel.base_url,
+            &state.config.intel.service_did,
+            state.config.intel.timeout_ms,
+            intel_dpop,
+            method,
+            &lexicon,
+            query_string.as_deref(),
+            body_option,
+            content_type,
+        )
+        .await?;
+
+        metrics::record_proxy_request(&lexicon, status, start.elapsed().as_secs_f64());
+        let mut response = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+        for (name, value) in response_headers.iter() {
+            if matches!(
+                name.as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-disposition"
+                    | "cache-control"
+                    | "etag"
+                    | "last-modified"
+            ) {
+                if let Ok(value) = value.to_str() {
+                    response = response.header(name.as_str(), value);
+                }
+            }
+        }
+        return Ok(response.body(Body::from(response_body)).unwrap());
+    }
 
     if CIRCLE_ENDPOINTS.contains(&lexicon.as_str()) {
         tracing::info!(

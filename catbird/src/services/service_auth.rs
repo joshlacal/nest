@@ -13,6 +13,7 @@ use chrono::Utc;
 use std::sync::Arc;
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
 pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circles";
+pub const INTEL_APPVIEW_SERVICE_REF: &str = "did:web:intel.catbird.blue#catbird_intel";
 pub const CIRCLE_ENDPOINTS: &[&str] = &[
     "blue.catbird.circle.activateCircle",
     "blue.catbird.circle.getFeed",
@@ -22,6 +23,16 @@ pub const CIRCLE_ENDPOINTS: &[&str] = &[
     "blue.catbird.circle.listNotifications",
     "blue.catbird.circle.reportRecord",
     "blue.catbird.circle.updatePreferences",
+];
+pub const INTEL_ENDPOINTS: &[&str] = &[
+    "blue.catbird.intel.listCommunities",
+    "blue.catbird.intel.getCommunity",
+    "blue.catbird.intel.getAuthorModes",
+    "blue.catbird.onboarding.getCatalog",
+    "blue.catbird.onboarding.getSceneCards",
+    "blue.catbird.onboarding.getCalibrationSwipes",
+    "blue.catbird.onboarding.previewTimeline",
+    "blue.catbird.onboarding.solveBundle",
 ];
 
 pub struct ServiceAuthProvider {
@@ -110,6 +121,16 @@ impl ServiceAuthProvider {
             if !CIRCLE_ENDPOINTS.contains(&lexicon) {
                 return Err(AppError::BadRequest(format!(
                     "Unsupported Circle service auth lexicon: {lexicon}"
+                )));
+            }
+            return Ok(());
+        }
+
+        if audience == INTEL_APPVIEW_SERVICE_REF || audience == self.state.config.intel.service_did
+        {
+            if !INTEL_ENDPOINTS.contains(&lexicon) {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported Intel service auth lexicon: {lexicon}"
                 )));
             }
             return Ok(());
