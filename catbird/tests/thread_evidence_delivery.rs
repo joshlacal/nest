@@ -155,6 +155,7 @@ async fn make_test_app_state(
         push: Default::default(),
         chat: Default::default(),
         circle: Default::default(),
+        intel: Default::default(),
     };
     let http_client = reqwest::Client::new();
     config.redis.url = cleanup_auth::disposable_url("REDIS_URL", "redis", 6379);

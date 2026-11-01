@@ -31,6 +31,7 @@ use crate::models::{
 };
 use crate::services::{
     AtProtoClient, MlsAuthService, ProxyResponse, ServiceAuthProvider, CIRCLE_ENDPOINTS,
+    INTEL_ENDPOINTS,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1413,6 +1414,70 @@ async fn proxy_circle_request(
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn proxy_intel_request(
+    state: Arc<AppState>,
+    session: &CatbirdSession,
+    base_url: &str,
+    audience: &str,
+    timeout_ms: u64,
+    dpop_data: &JacquardDpopData,
+    method: reqwest::Method,
+    lexicon: &str,
+    query: Option<&str>,
+    body: Option<bytes::Bytes>,
+    content_type: Option<&str>,
+) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
+    let mut url = format!("{}/xrpc/{lexicon}", base_url.trim_end_matches('/'));
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let token = ServiceAuthProvider::new(state.clone())
+        .token_for_audience_with_dpop(session, audience, lexicon, dpop_data)
+        .await?;
+    let mut request = state
+        .raw_http_client
+        .request(method, &url)
+        .timeout(std::time::Duration::from_millis(timeout_ms.max(500)))
+        .bearer_auth(token);
+    if let Some(content_type) = content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    if headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_CIRCLE_RESPONSE_SIZE)
+    {
+        return Err(AppError::ResponseTooLarge(
+            "Intel service response exceeds 10 MiB".into(),
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len() + chunk.len() > MAX_CIRCLE_RESPONSE_SIZE {
+            return Err(AppError::ResponseTooLarge(
+                "Intel service response exceeds 10 MiB".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok((status, headers, bytes::Bytes::from(bytes)))
+}
+
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
 pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
@@ -1466,6 +1531,60 @@ pub async fn proxy_xrpc(
     } else {
         Some(body_bytes.clone())
     };
+
+    if INTEL_ENDPOINTS.contains(&lexicon.as_str()) {
+        if !state.config.intel.enabled {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "UpstreamUnavailable".to_string(),
+                message: "Catbird intelligence service is disabled".to_string(),
+            });
+        }
+        tracing::info!(
+            request_id = %request_id,
+            lexicon = %lexicon,
+            user = %session.did,
+            "Routing Intel request directly to standalone Catbird Intel service"
+        );
+        let intel_dpop = dpop_data
+            .as_ref()
+            .map(|extension| &extension.0)
+            .ok_or(AppError::InvalidSession)?;
+        let (status, response_headers, response_body) = proxy_intel_request(
+            state.clone(),
+            &session,
+            &state.config.intel.base_url,
+            &state.config.intel.service_did,
+            state.config.intel.timeout_ms,
+            intel_dpop,
+            method,
+            &lexicon,
+            query_string.as_deref(),
+            body_option,
+            content_type,
+        )
+        .await?;
+
+        metrics::record_proxy_request(&lexicon, status, start.elapsed().as_secs_f64());
+        let mut response = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+        for (name, value) in response_headers.iter() {
+            if matches!(
+                name.as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-disposition"
+                    | "cache-control"
+                    | "etag"
+                    | "last-modified"
+            ) {
+                if let Ok(value) = value.to_str() {
+                    response = response.header(name.as_str(), value);
+                }
+            }
+        }
+        return Ok(response.body(Body::from(response_body)).unwrap());
+    }
 
     if CIRCLE_ENDPOINTS.contains(&lexicon.as_str()) {
         tracing::info!(

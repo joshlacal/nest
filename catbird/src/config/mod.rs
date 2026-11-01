@@ -28,6 +28,44 @@ pub struct AppConfig {
     /// Standalone Circle AppView direct-routing configuration.
     #[serde(default)]
     pub circle: CircleConfig,
+    /// Standalone Community Intelligence & Onboarding XRPC service configuration.
+    #[serde(default)]
+    pub intel: IntelConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_intel_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_intel_service_did")]
+    pub service_did: String,
+    #[serde(default = "default_intel_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_intel_base_url() -> String {
+    "http://127.0.0.1:3210".to_string()
+}
+
+fn default_intel_service_did() -> String {
+    "did:web:intel.catbird.blue#catbird_intel".to_string()
+}
+
+fn default_intel_timeout_ms() -> u64 {
+    8000
+}
+
+impl Default for IntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_intel_base_url(),
+            service_did: default_intel_service_did(),
+            timeout_ms: default_intel_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -709,6 +747,27 @@ impl AppConfig {
             if let Ok(ttl) = val.parse::<i64>() {
                 if ttl > 0 {
                     app_config.chat.token_ttl_seconds = ttl;
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("INTEL_ENABLED") {
+            app_config.intel.enabled =
+                matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("INTEL_BASE_URL") {
+            if !val.is_empty() {
+                app_config.intel.base_url = val;
+            }
+        }
+        if let Ok(val) = std::env::var("INTEL_SERVICE_DID") {
+            if !val.is_empty() {
+                app_config.intel.service_did = val;
+            }
+        }
+        if let Ok(val) = std::env::var("INTEL_TIMEOUT_MS") {
+            if let Ok(ms) = val.parse::<u64>() {
+                if ms > 0 {
+                    app_config.intel.timeout_ms = ms;
                 }
             }
         }
