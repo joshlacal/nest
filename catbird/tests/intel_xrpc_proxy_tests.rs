@@ -574,3 +574,170 @@ setInterval(() => {}, 1000);
     assert_eq!(solve_json["summary"]["totalFollows"], 2);
     assert_eq!(solve_json["summary"]["originalsOnlyCount"], 1);
 }
+
+#[tokio::test]
+async fn intel_proxy_decompresses_gzip_upstream_and_updates_content_length() {
+    const GZIPPED_CATALOG: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xab, 0x56, 0x4a, 0x4e, 0x2c,
+        0x49, 0xcc, 0xc9, 0x4f, 0x0f, 0x4b, 0x2d, 0x2a, 0xce, 0xcc, 0xcf, 0x53, 0xb2, 0x52, 0x2a,
+        0x36, 0x34, 0x8f, 0x4f, 0xaf, 0xca, 0x2c, 0x88, 0x2f, 0x49, 0x2d, 0x2e, 0x51, 0xd2, 0x51,
+        0x2a, 0xc9, 0x07, 0x2a, 0x70, 0xce, 0xcf, 0xcd, 0x2d, 0xcd, 0xcb, 0x2c, 0xc9, 0x4c, 0x2d,
+        0x56, 0xb2, 0x32, 0x34, 0x30, 0x34, 0xd3, 0x51, 0x2a, 0x4e, 0x4e, 0xcd, 0x03, 0xf1, 0xa2,
+        0x63, 0x75, 0x94, 0xd2, 0x52, 0x13, 0x4b, 0x4a, 0x8b, 0x52, 0x53, 0x50, 0x94, 0x81, 0x24,
+        0xca, 0x13, 0x8b, 0x72, 0x83, 0x4b, 0x12, 0x8b, 0x4a, 0xd0, 0x64, 0x6a, 0x01, 0x9f, 0x7c,
+        0x84, 0x50, 0x79, 0x00, 0x00, 0x00,
+    ];
+
+    let pds = MockServer::start().await;
+    let intel = MockServer::start().await;
+    let lexicon = "blue.catbird.onboarding.getCatalog";
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": "intel-jwt-gzip-1" })),
+        )
+        .expect(1)
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/blue.catbird.onboarding.getCatalog"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-encoding", "gzip")
+                .set_body_raw(GZIPPED_CATALOG.to_vec(), "application/json"),
+        )
+        .expect(1)
+        .mount(&intel)
+        .await;
+
+    let (state, session, dpop_data) = build_intel_test_fixture(pds.uri(), intel.uri(), true).await;
+    let response = catbird::handlers::atproto::proxy_xrpc(
+        axum::extract::State(state.clone()),
+        axum::Extension(session),
+        None,
+        Some(axum::Extension(dpop_data)),
+        Method::GET,
+        axum::extract::Path(lexicon.to_string()),
+        axum::extract::RawQuery(None),
+        HeaderMap::new(),
+        axum::body::Body::empty(),
+    )
+    .await
+    .expect("gzip intel response decompresses cleanly");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-encoding").is_none());
+    let declared_len: usize = response
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(declared_len, body_bytes.len());
+    assert_eq!(declared_len, 121);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(json["catalogVersion"], "s17_gzip_test");
+    assert_eq!(state.active_stream_semaphore.available_permits(), 64);
+}
+
+#[tokio::test]
+async fn intel_proxy_rejects_wrong_method_and_oversized_body_before_minting_service_auth() {
+    let pds = MockServer::start().await;
+    let intel = MockServer::start().await;
+    let (state, session, dpop_data) = build_intel_test_fixture(pds.uri(), intel.uri(), true).await;
+
+    // 1. POST to GET query lexicon -> 405 MethodNotAllowed, 0 PDS calls
+    let wrong_method = catbird::handlers::atproto::proxy_xrpc(
+        axum::extract::State(state.clone()),
+        axum::Extension(session.clone()),
+        None,
+        Some(axum::Extension(dpop_data.clone())),
+        Method::POST,
+        axum::extract::Path("blue.catbird.onboarding.getCatalog".to_string()),
+        axum::extract::RawQuery(None),
+        HeaderMap::new(),
+        axum::body::Body::empty(),
+    )
+    .await;
+    match wrong_method {
+        Err(AppError::AtprotoResponse { status, error, .. }) => {
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(error, "MethodNotAllowed");
+        }
+        other => panic!("Expected 405 MethodNotAllowed, got {other:?}"),
+    }
+
+    // 2. Oversized >64 KiB POST body on solveBundle -> 400 BadRequest, 0 PDS calls
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let oversized = vec![b' '; 70_000];
+    let too_big = catbird::handlers::atproto::proxy_xrpc(
+        axum::extract::State(state),
+        axum::Extension(session),
+        None,
+        Some(axum::Extension(dpop_data)),
+        Method::POST,
+        axum::extract::Path("blue.catbird.onboarding.solveBundle".to_string()),
+        axum::extract::RawQuery(None),
+        headers,
+        axum::body::Body::from(oversized),
+    )
+    .await;
+    assert!(matches!(too_big, Err(AppError::BadRequest(_))));
+    assert_eq!(pds.received_requests().await.unwrap().len(), 0);
+    assert_eq!(intel.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn intel_proxy_aborts_oversized_upstream_response_and_releases_stream_permit() {
+    let pds = MockServer::start().await;
+    let intel = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": "intel-jwt-oversize-1" })),
+        )
+        .expect(1)
+        .mount(&pds)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/blue.catbird.intel.listCommunities"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![b'a'; 2 * 1024 * 1024 + 1024], "application/json"),
+        )
+        .expect(1)
+        .mount(&intel)
+        .await;
+
+    let (state, session, dpop_data) = build_intel_test_fixture(pds.uri(), intel.uri(), true).await;
+    let res = catbird::handlers::atproto::proxy_xrpc(
+        axum::extract::State(state.clone()),
+        axum::Extension(session),
+        None,
+        Some(axum::Extension(dpop_data)),
+        Method::GET,
+        axum::extract::Path("blue.catbird.intel.listCommunities".to_string()),
+        axum::extract::RawQuery(None),
+        HeaderMap::new(),
+        axum::body::Body::empty(),
+    )
+    .await;
+
+    assert!(matches!(res, Err(AppError::ResponseTooLarge(_))));
+    assert_eq!(state.active_stream_semaphore.available_permits(), 64);
+}

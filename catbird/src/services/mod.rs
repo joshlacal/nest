@@ -25,7 +25,7 @@ mod ssrf;
 
 pub use atproto_client::{
     bounded_byte_stream, bounded_byte_stream_with_accounting, bounded_byte_stream_with_permit,
-    filter_client_headers, AtProtoClient, ProxyResponse, MAX_RESPONSE_SIZE,
+    filter_client_headers, AtProtoClient, ProxyResponse, MAX_RESPONSE_SIZE, STREAM_THRESHOLD,
 };
 pub use crypto::KeyStore;
 pub use dpop_nonce_cache::DpopNonceCache;

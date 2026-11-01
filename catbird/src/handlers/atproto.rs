@@ -1414,6 +1414,47 @@ async fn proxy_circle_request(
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
+const MAX_INTEL_REQUEST_BODY_SIZE: usize = 65_536;
+const MAX_INTEL_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
+
+fn validate_intel_method_and_body(
+    method: &Method,
+    lexicon: &str,
+    body_len: usize,
+) -> AppResult<()> {
+    let is_post_procedure = matches!(
+        lexicon,
+        "blue.catbird.onboarding.getCalibrationSwipes"
+            | "blue.catbird.onboarding.previewTimeline"
+            | "blue.catbird.onboarding.solveBundle"
+    );
+    let expected = if is_post_procedure {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    if method != expected {
+        return Err(AppError::AtprotoResponse {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            error: "MethodNotAllowed".to_string(),
+            message: format!("XRPC method '{lexicon}' requires {expected}"),
+        });
+    }
+    if is_post_procedure {
+        if body_len > MAX_INTEL_REQUEST_BODY_SIZE {
+            return Err(AppError::BadRequest(format!(
+                "Intel request body exceeds {} bytes",
+                MAX_INTEL_REQUEST_BODY_SIZE
+            )));
+        }
+    } else if body_len > 0 {
+        return Err(AppError::BadRequest(
+            "GET request must not carry a body".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_intel_request(
     state: Arc<AppState>,
@@ -1438,7 +1479,7 @@ async fn proxy_intel_request(
         .token_for_audience_with_dpop(session, audience, lexicon, dpop_data)
         .await?;
     let mut request = state
-        .raw_http_client
+        .http_client
         .request(method, &url)
         .timeout(std::time::Duration::from_millis(timeout_ms.max(500)))
         .bearer_auth(token);
@@ -1451,29 +1492,69 @@ async fn proxy_intel_request(
 
     let response = request.send().await?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
-    if headers
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_CIRCLE_RESPONSE_SIZE)
-    {
+    let mut headers = response.headers().clone();
+    let had_content_encoding = headers.remove(reqwest::header::CONTENT_ENCODING).is_some();
+    let content_length = if had_content_encoding {
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        None
+    } else {
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    if content_length.is_some_and(|length| length > MAX_INTEL_RESPONSE_SIZE) {
         return Err(AppError::ResponseTooLarge(
-            "Intel service response exceeds 10 MiB".into(),
+            "Intel service response exceeds 2 MiB".into(),
         ));
     }
 
+    let mut held_permit = if content_length.is_none()
+        || had_content_encoding
+        || content_length.is_some_and(|length| length > crate::services::STREAM_THRESHOLD)
+    {
+        Some(
+            state
+                .active_stream_semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+        )
+    } else {
+        None
+    };
+
+    let session_id_str = session.id.to_string();
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        if bytes.len() + chunk.len() > MAX_CIRCLE_RESPONSE_SIZE {
+        if bytes.len() + chunk.len() > MAX_INTEL_RESPONSE_SIZE {
             return Err(AppError::ResponseTooLarge(
-                "Intel service response exceeds 10 MiB".into(),
+                "Intel service response exceeds 2 MiB".into(),
             ));
         }
+        if held_permit.is_none() && bytes.len() + chunk.len() > crate::services::STREAM_THRESHOLD {
+            held_permit = Some(
+                state
+                    .active_stream_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+            );
+        }
+        state
+            .rate_limit
+            .check_and_record_bytes(&session_id_str, chunk.len() as u64)
+            .await
+            .map_err(|retry_after| AppError::RateLimitExceeded { retry_after })?;
         bytes.extend_from_slice(&chunk);
     }
+
+    headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        reqwest::header::HeaderValue::from(bytes.len()),
+    );
 
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
@@ -1540,6 +1621,7 @@ pub async fn proxy_xrpc(
                 message: "Catbird intelligence service is disabled".to_string(),
             });
         }
+        validate_intel_method_and_body(&method, &lexicon, body_bytes.len())?;
         tracing::info!(
             request_id = %request_id,
             lexicon = %lexicon,
