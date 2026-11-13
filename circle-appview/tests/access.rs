@@ -1010,7 +1010,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                     return;
                 };
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-                if req_str.starts_with("POST /xrpc/com.atproto.space.getSpaceCredential") {
+                if req_str.starts_with("POST /xrpc/com.atproto.space.authorizeSpaceSync") {
                     let body: serde_json::Value = req_str
                         .split_once("\r\n\r\n")
                         .and_then(|(_, body)| serde_json::from_str(body).ok())
@@ -1019,7 +1019,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                     let body_contract = body["space"] == "at://did:plc:auth/space/1"
                         && body["delegationToken"] == "test-delegation-token"
                         && body["clientAttestation"] == "test-attestation"
-                        && body["credentialKid"]
+                        && body["credentialKey"]
                             .as_str()
                             .is_some_and(|kid| kid.starts_with("did:key:"));
                     let no_proof_headers = !lower.contains("\r\nauthorization:")
@@ -1089,23 +1089,26 @@ async fn ssrf_safe_transport_dns_seam_validations() {
         true,
     );
     let target_url = url::Url::parse(&format!(
-        "https://space.example.org:{}/xrpc/com.atproto.space.getSpaceCredential",
+        "https://space.example.org:{}/xrpc/com.atproto.space.authorizeSpaceSync",
         fixture_addr.port()
     ))
     .unwrap();
 
     let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let exchange_request = circle_appview::space_client::SpaceCredentialRequest {
+    let exchange_request = circle_appview::space_client::AuthorizeSpaceSyncRequest {
         space: "at://did:plc:auth/space/1".into(),
-        credential_kid: circle_appview::space_signature::p256_did_key(exchange_key.verifying_key()),
+        credential_key: circle_appview::space_signature::p256_did_key(
+            exchange_key.verifying_key(),
+        ),
         delegation_token: Some("test-delegation-token".into()),
         client_attestation: Some("test-attestation".into()),
+        notify: None,
     };
-    let cred = transport_success
-        .get_space_credential(&target_url, &exchange_request)
+    let output = transport_success
+        .authorize_space_sync(&target_url, &exchange_request)
         .await
         .expect("Space host credential exchange over TLS must succeed");
-    assert_eq!(cred, "test.space.credential.jwt");
+    assert_eq!(output.credential, "test.space.credential.jwt");
 
     // 2. Redirect rejection (Policy::none())
     let redirect_url = url::Url::parse(&format!(
@@ -1114,7 +1117,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     ))
     .unwrap();
     let redirect_res = transport_success
-        .get_space_credential(&redirect_url, &exchange_request)
+        .authorize_space_sync(&redirect_url, &exchange_request)
         .await;
     assert!(
         redirect_res.is_err(),

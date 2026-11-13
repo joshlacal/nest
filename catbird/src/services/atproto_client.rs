@@ -1004,17 +1004,12 @@ mod tests {
             HeaderValue::from_static("untrusted"),
         );
 
-        // Allowlisted Spaces HTTP Message Signature request; the removed legacy
-        // MAC request header remains untrusted.
+        // Allowlisted Spaces HTTP Message Signature request.
         let accept_signature =
             r#"mac=("atproto-space-commit";sf);keyid="did:key:ephemeral";tag="atproto-space-commit""#;
         client_headers.insert(
             HeaderName::from_static("accept-signature"),
             HeaderValue::from_str(accept_signature).unwrap(),
-        );
-        client_headers.insert(
-            HeaderName::from_static("atproto-space-want-mac"),
-            HeaderValue::from_static("legacy"),
         );
         client_headers.insert(
             HeaderName::from_static("accept"),
@@ -1063,7 +1058,6 @@ mod tests {
             out_headers.get("accept-signature").unwrap(),
             accept_signature
         );
-        assert!(!out_headers.contains_key("atproto-space-want-mac"));
         assert_eq!(out_headers.get("accept").unwrap(), "application/json");
         assert_eq!(
             out_headers.get("accept-language").unwrap(),

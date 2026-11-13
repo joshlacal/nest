@@ -3,7 +3,7 @@
 use circle_appview::{
     auth::DidDocument,
     space_client::{
-        validate_space_credential, DefaultSpaceHostTransport, SpaceCredentialRequest,
+        validate_space_credential, AuthorizeSpaceSyncRequest, DefaultSpaceHostTransport,
         SpaceHostTransport,
     },
     space_mac::{encapsulate, kem_key},
@@ -63,24 +63,26 @@ async fn actual_reference_hosts_verify_exchange_commit_ops_and_star() {
             .expect("context schema");
     assert_eq!(
         context.source_revision,
-        "5d88b414a98de1ada22c94c78fa0667a7028163c"
+        "d4def6e9f521896ed8222f576d54923d00b5fbeb"
     );
     let transport = DefaultSpaceHostTransport::with_loopback(true);
     let key = SigningKey::random(&mut OsRng);
     let kid = p256_did_key(key.verifying_key());
-    let request = SpaceCredentialRequest {
+    let request = AuthorizeSpaceSyncRequest {
         space: context.space.clone(),
-        credential_kid: kid.clone(),
+        credential_key: kid.clone(),
         delegation_token: Some(context.delegation_token),
         client_attestation: None,
+        notify: None,
     };
-    let credential = transport
-        .get_space_credential(
-            &endpoint(&context.authority, "getSpaceCredential"),
+    let authorized = transport
+        .authorize_space_sync(
+            &endpoint(&context.authority, "authorizeSpaceSync"),
             &request,
         )
         .await
         .expect("real body-only credential exchange");
+    let credential = authorized.credential;
     validate_space_credential(
         &credential,
         &context.authority.did,
@@ -120,9 +122,8 @@ async fn actual_reference_hosts_verify_exchange_commit_ops_and_star() {
             )
             .await
             .expect("real operations MAC");
-        let ops_commit = ops.commit.expect("complete operations page has commit");
-        assert_eq!(ops_commit.data, latest.data);
-        assert_eq!(ops_commit.rev, latest.rev);
+        assert_eq!(ops.commit.data, latest.data);
+        assert_eq!(ops.commit.rev, latest.rev);
         let bytes = transport
             .get_repo(
                 &endpoint(host, "getRepo"),

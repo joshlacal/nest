@@ -2638,7 +2638,7 @@ mod space_response_header_tests {
         ] {
             assert!(forwards_proxy_response_header(name), "{name}");
         }
-        assert!(!forwards_proxy_response_header("atproto-space-mac"));
+        assert!(!forwards_proxy_response_header("x-untrusted-space-header"));
     }
 }
 

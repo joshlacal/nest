@@ -1,19 +1,20 @@
-//! CIRCLES-04: a space host that answers getSpaceCredential with `SpaceDeleted`
-//! makes the AppView purge every copy of that Circle and tombstone it, at every
-//! credential exchange site (sweep, activation, request-path sync). No other
-//! credential failure purges. A tombstoned Circle answers reads with the declared
-//! `AccessRemoved`, and expired tombstones are purged by a scheduled task.
+//! CIRCLES-04: a space host that answers `authorizeSpaceSync` with
+//! `SpaceDeleted` makes the AppView purge every copy of that Circle and
+//! tombstone it at every credential exchange site. No other credential failure
+//! purges. A tombstoned Circle answers reads with `AccessRemoved`, and expired
+//! tombstones are purged by a scheduled task.
 
 mod support;
 use std::sync::Arc;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use axum::{extract::State, http::StatusCode};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::EncodedPoint;
 use serde_json::json;
+use bytes::Bytes;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -38,7 +39,7 @@ struct Setup {
     mock_transport: Arc<MockSpaceHostTransport>,
 }
 
-fn register_did_doc(resolver: &DidResolver, did: &str, services: Vec<DidService>) {
+fn register_did_doc(resolver: &DidResolver, did: &str, services: Vec<DidService>) -> SigningKey {
     let key = SigningKey::random(&mut OsRng);
     let point = EncodedPoint::from(key.verifying_key());
     resolver.insert_cached(
@@ -61,6 +62,7 @@ fn register_did_doc(resolver: &DidResolver, did: &str, services: Vec<DidService>
             service: services,
         },
     );
+    key
 }
 
 async fn setup(pool: PgPool) -> Setup {
@@ -90,7 +92,7 @@ async fn setup(pool: PgPool) -> Setup {
         config.plc_directory_url.clone(),
         reqwest::Client::builder().no_proxy().build().unwrap(),
     ));
-    register_did_doc(
+    let authority_key = register_did_doc(
         &did_resolver,
         OWNER_DID,
         vec![
@@ -106,7 +108,7 @@ async fn setup(pool: PgPool) -> Setup {
             },
         ],
     );
-    register_did_doc(
+    let _ = register_did_doc(
         &did_resolver,
         BOB_DID,
         vec![DidService {
@@ -117,6 +119,7 @@ async fn setup(pool: PgPool) -> Setup {
     );
 
     let mock_transport = Arc::new(MockSpaceHostTransport::new());
+    mock_transport.set_authority_signing_key(OWNER_DID, authority_key);
     let state = AppState::with_services(
         config,
         pool.clone(),
@@ -241,6 +244,22 @@ fn space_host_error(code: &str) -> Result<String, String> {
     Err(json!({"error": code, "message": "from the space host"}).to_string())
 }
 
+async fn notify_space_deleted(setup: &Setup, token: &str) -> Result<StatusCode, AppError> {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "space": SPACE_URI,
+            "token": token,
+            "update": {
+                "$type": "com.atproto.space.notifySpaceUpdate#spaceDeleted"
+            }
+        }))
+        .unwrap(),
+    );
+    circle_appview::sync::notify_space_update_handler(State(setup.state.clone()), body)
+        .await
+        .map(|response| response.status())
+}
+
 async fn assert_fully_purged(setup: &Setup, pool: &PgPool) {
     for table in PROJECTION_TABLES {
         assert_eq!(count(pool, table).await, 0, "{table} must be purged");
@@ -305,7 +324,7 @@ async fn sweep_purges_circle_when_space_host_reports_space_deleted(pool: PgPool)
 
 #[sqlx::test(migrations = "./migrations")]
 async fn other_credential_failures_never_purge(pool: PgPool) {
-    for code in ["UserNotAuthorized", "AppNotAuthorized", "SpaceNotFound"] {
+    for code in ["AccountNotAuthorized", "AppNotAuthorized", "SpaceNotFound"] {
         // sqlx::test gives one database; reset between cases.
         sqlx::query("DELETE FROM circles")
             .execute(&pool)
@@ -375,6 +394,70 @@ async fn activation_of_a_deleted_space_purges_and_reports_access_removed(pool: P
     assert!(
         matches!(err, AppError::AccessRemoved(_)),
         "expected AccessRemoved, got {err:?}"
+    );
+    assert_fully_purged(&setup, &pool).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn space_deleted_update_reauthorizes_without_purging_a_live_space(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    seed_active_circle(&pool).await;
+    let registration = circle_appview::notify::get_or_create_registration(
+        &pool,
+        SPACE_URI,
+        "http://127.0.0.1:3002",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        notify_space_deleted(&setup, &registration.token)
+            .await
+            .unwrap(),
+        StatusCode::OK
+    );
+    assert!(!tombstoned(&pool).await);
+    assert_eq!(count(&pool, "circle_records").await, 1);
+    assert!(setup.state.credential_store.get(SPACE_URI).await.is_some());
+    assert!(setup
+        .mock_transport
+        .recorded_calls()
+        .iter()
+        .any(|call| call
+            .endpoint_url
+            .ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn space_deleted_update_purges_only_after_declared_space_deleted(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    seed_active_circle(&pool).await;
+    let registration = circle_appview::notify::get_or_create_registration(
+        &pool,
+        SPACE_URI,
+        "http://127.0.0.1:3002",
+    )
+    .await
+    .unwrap();
+
+    setup
+        .mock_transport
+        .set_credential_response(SPACE_URI, space_host_error("RepoDeactivated"));
+    let error = notify_space_deleted(&setup, &registration.token)
+        .await
+        .expect_err("repo suspension is not deletion");
+    assert!(matches!(error, AppError::Forbidden(_)));
+    assert!(!tombstoned(&pool).await);
+    assert_eq!(count(&pool, "circle_records").await, 1);
+
+    setup
+        .mock_transport
+        .set_credential_response(SPACE_URI, space_host_error("SpaceDeleted"));
+    assert_eq!(
+        notify_space_deleted(&setup, &registration.token)
+            .await
+            .unwrap(),
+        StatusCode::OK
     );
     assert_fully_purged(&setup, &pool).await;
 }

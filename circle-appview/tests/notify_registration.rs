@@ -1,47 +1,51 @@
-//! CIRCLES-06: the AppView registers for notifications at each Circle's space
-//! host, persists `expiresAt`, renews an hour before it lapses, unregisters when
-//! it loses access, and acknowledges notifyWrite before syncing.
+//! Nov-12 notification registration, token authentication, and catch-up behavior.
 
 mod support;
+
 use std::sync::Arc;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use chrono::{DateTime, Duration, Utc};
-use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::EncodedPoint;
+use axum::{
+    body::to_bytes, extract::State, http::StatusCode, response::IntoResponse, Json,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use bytes::Bytes;
+use chrono::{Duration, Utc};
+use p256::{ecdsa::SigningKey, elliptic_curve::rand_core::OsRng, EncodedPoint};
+use serde_json::{json, Value};
 use sqlx::PgPool;
 
-use circle_appview::access::{ActiveSpaceCredential, CredentialStore, SpaceLockManager};
-use circle_appview::auth::{
-    DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod,
+use circle_appview::{
+    access::{ActiveSpaceCredential, CredentialStore, SpaceLockManager},
+    auth::{DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod},
+    config::{AppState, Config},
+    db,
+    error::{AppError, AuthReason},
+    notify::{self, ConfirmRegistrationInput, NotifyRegistration},
+    oauth::UserOAuthSession,
+    space_client::{
+        ListWritersOutput, MockSpaceHostTransport, RepoRemoved, RepoWrite, SpaceClient,
+        WriterUpdate,
+    },
+    sync,
 };
-use circle_appview::config::{AppState, Config};
-use circle_appview::notify;
-use circle_appview::space_client::{
-    MockSpaceHostTransport, RecordedNotifyCall, SpaceAppAccess, SpaceClient, SpaceConfig,
-    SpacePolicy,
-};
-use circle_appview::sync::sweep_once;
 
 const OWNER_DID: &str = "did:plc:owner-notify-registration";
+const MEMBER_DID: &str = "did:plc:member-notify-registration";
 const SPACE_URI: &str =
     "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg1";
-const SPACE_HOST: &str = "https://pds.owner.example";
+const SPACE_HOST: &str = "https://space.owner.example";
 
 struct Setup {
     state: AppState,
-    mock_transport: Arc<MockSpaceHostTransport>,
-    owner_key: SigningKey,
+    transport: Arc<MockSpaceHostTransport>,
 }
 
-fn config(service_did: &str) -> Config {
+fn config() -> Config {
     Config {
         host: "127.0.0.1".into(),
         port: 3002,
         database_url: "postgres://localhost/postgres".into(),
-        service_did: service_did.into(),
+        service_did: "did:web:circles.catbird.blue#atproto_circles".into(),
         plc_directory_url: "https://plc.directory".into(),
         identity_relay_url: Some(url::Url::parse("wss://relay.fixture.example.com/").unwrap()),
         public_appview_url: "https://public.api.bsky.app".into(),
@@ -56,20 +60,21 @@ fn config(service_did: &str) -> Config {
     }
 }
 
-async fn setup(pool: PgPool, service_did: &str) -> Setup {
-    support::healthy_identity_fixture(&pool, &[OWNER_DID]).await;
+async fn setup(pool: PgPool) -> Setup {
+    support::healthy_identity_fixture(&pool, &[OWNER_DID, MEMBER_DID]).await;
     std::env::set_var(
         "SESSION_ENCRYPTION_KEY",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     );
-    let config = config(service_did);
-    let did_resolver = Arc::new(DidResolver::new(
+
+    let config = config();
+    let resolver = Arc::new(DidResolver::new(
         config.plc_directory_url.clone(),
         reqwest::Client::builder().no_proxy().build().unwrap(),
     ));
-    let owner_key = SigningKey::random(&mut OsRng);
-    let point = EncodedPoint::from(owner_key.verifying_key());
-    did_resolver.insert_cached(
+    let authority_key = SigningKey::random(&mut OsRng);
+    let point = EncodedPoint::from(authority_key.verifying_key());
+    resolver.insert_cached(
         OWNER_DID.into(),
         DidDocument {
             id: OWNER_DID.into(),
@@ -101,22 +106,41 @@ async fn setup(pool: PgPool, service_did: &str) -> Setup {
         },
     );
 
-    let mock_transport = Arc::new(MockSpaceHostTransport::new());
+    let transport = Arc::new(MockSpaceHostTransport::new());
+    transport.set_authority_signing_key(OWNER_DID, authority_key);
     let credential_store = Arc::new(CredentialStore::new());
     credential_store
         .insert(
             SPACE_URI.into(),
-            credential(Utc::now() + Duration::hours(2)),
+            ActiveSpaceCredential {
+                token: "existing-space-credential".into(),
+                signing_key: SigningKey::random(&mut OsRng),
+                expires_at: Utc::now() + Duration::hours(1),
+            },
         )
         .await;
     let state = AppState::with_services(
         config,
         pool.clone(),
-        did_resolver,
+        resolver,
         credential_store,
-        Arc::new(SpaceClient::with_transport(mock_transport.clone())),
+        Arc::new(SpaceClient::with_transport(transport.clone())),
         Arc::new(SpaceLockManager::new()),
     );
+    state
+        .oauth_service
+        .store_session(UserOAuthSession {
+            user_did: OWNER_DID.into(),
+            access_token: "owner-access-token".into(),
+            refresh_token: None,
+            token_endpoint: "https://pds.owner.example/oauth/token".into(),
+            auth_server_iss: "https://pds.owner.example".into(),
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+            scope: "atproto".into(),
+            dpop_key: SigningKey::random(&mut OsRng),
+        })
+        .await
+        .unwrap();
 
     sqlx::query(
         "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7notifyreg1', $2, 'Notify Circle', now())",
@@ -127,246 +151,298 @@ async fn setup(pool: PgPool, service_did: &str) -> Setup {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO circle_member_cache (space_uri, member_did, can_read, can_write, cached_at) VALUES ($1, $2, true, true, now())",
+        "INSERT INTO circle_member_cache (space_uri, member_did, can_read, can_write, cached_at) VALUES ($1, $2, true, true, now()), ($1, $3, true, true, now())",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .bind(MEMBER_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO circle_member_cache_meta (space_uri, last_refreshed_at, member_count) VALUES ($1, now(), 2)",
+    )
+    .bind(SPACE_URI)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    Setup { state, transport }
+}
+
+async fn registration(pool: &PgPool) -> NotifyRegistration {
+    notify::get_or_create_registration(pool, SPACE_URI, "http://127.0.0.1:3002")
+        .await
+        .unwrap()
+}
+
+async fn send_update(state: &AppState, token: &str, update: Value) -> Result<StatusCode, AppError> {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "space": SPACE_URI,
+            "token": token,
+            "update": update,
+        }))
+        .unwrap(),
+    );
+    sync::notify_space_update_handler(State(state.clone()), body)
+        .await
+        .map(|response| response.status())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    let first = registration(&pool).await;
+    let second = notify::get_or_create_registration(&pool, SPACE_URI, "https://new.example")
+        .await
+        .unwrap();
+    assert_eq!(first.token, second.token, "endpoint changes must not rotate tokens");
+    assert_eq!(second.endpoint, "https://new.example");
+
+    let Json(output) = notify::confirm_registration_handler(
+        State(setup.state.clone()),
+        Json(ConfirmRegistrationInput {
+            space: SPACE_URI.into(),
+            token: first.token.clone(),
+            challenge: "host-challenge".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output, json!({"challenge": "host-challenge"}));
+
+    let mut rejections = Vec::new();
+    for (space, token) in [(SPACE_URI, "wrong-token"), ("at://did:plc:missing/space/x/y", first.token.as_str())] {
+        let error = notify::confirm_registration_handler(
+            State(setup.state.clone()),
+            Json(ConfirmRegistrationInput {
+                space: space.into(),
+                token: token.into(),
+                challenge: "challenge".into(),
+            }),
+        )
+        .await
+        .expect_err("unknown registration or token must be rejected");
+        assert!(matches!(&error, AppError::Unauthorized(AuthReason::InvalidToken)));
+        rejections.push(error.into_response());
+    }
+    assert!(rejections
+        .iter()
+        .all(|response| response.status() == StatusCode::UNAUTHORIZED));
+    let unknown = rejections.pop().unwrap();
+    let wrong = rejections.pop().unwrap();
+    assert_eq!(
+        to_bytes(wrong.into_body(), usize::MAX).await.unwrap(),
+        to_bytes(unknown.into_body(), usize::MAX).await.unwrap(),
+        "unknown spaces and wrong tokens must disclose the same response"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn repo_write_requires_token_and_records_revision_gap(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    let registration = registration(&pool).await;
+    notify::checkpoint(&pool, SPACE_URI, "3l7checkpoint1")
+        .await
+        .unwrap();
+    let update = serde_json::to_value(WriterUpdate::RepoWrite(RepoWrite {
+        repo: MEMBER_DID.into(),
+        repo_rev: "3l7reporev2".into(),
+        data: Bytes::from(vec![7; 32]),
+        space_rev: "3l7spacerev2".into(),
+        prev_space_rev: Some("3l7missedrev".into()),
+    }))
+    .unwrap();
+
+    let error = send_update(&setup.state, "wrong-token", update.clone())
+        .await
+        .expect_err("wrong callback token must fail");
+    assert!(matches!(error, AppError::Unauthorized(AuthReason::InvalidToken)));
+    assert_eq!(
+        send_update(&setup.state, &registration.token, update)
+            .await
+            .unwrap(),
+        StatusCode::OK
+    );
+    sync::wait_for_notify_syncs_idle().await;
+    assert_eq!(
+        notify::catchup_state(&pool, SPACE_URI).await.unwrap(),
+        (Some("3l7checkpoint1".into()), Some("3l7spacerev2".into()))
+    );
+
+    let unsupported = send_update(
+        &setup.state,
+        &registration.token,
+        json!({"$type": "com.atproto.space.notifySpaceUpdate#unknown"}),
+    )
+    .await
+    .expect_err("unknown update type must fail closed");
+    assert!(matches!(unsupported, AppError::InvalidRequest(_)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn repo_removed_drops_writer_state_without_deleting_history(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    let registration = registration(&pool).await;
+    sqlx::query(
+        "INSERT INTO circle_repo_sync_state (space_uri, author_did, last_rev, last_hash, last_synced_at) VALUES ($1, $2, '3l7oldrev', $3, now())",
+    )
+    .bind(SPACE_URI)
+    .bind(MEMBER_DID)
+    .bind(vec![0_u8; 2048])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let record_uri = format!("{SPACE_URI}/{MEMBER_DID}/app.bsky.feed.post/3l7post");
+    sqlx::query(
+        "INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at) VALUES ($1, 'cid', $2, $3, 'app.bsky.feed.post', '3l7post', $4, now())",
+    )
+    .bind(&record_uri)
+    .bind(SPACE_URI)
+    .bind(MEMBER_DID)
+    .bind(json!({"$type": "app.bsky.feed.post", "text": "history"}))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let update = serde_json::to_value(WriterUpdate::RepoRemoved(RepoRemoved {
+        repo: MEMBER_DID.into(),
+        space_rev: "3l7removed1".into(),
+        prev_space_rev: None,
+    }))
+    .unwrap();
+    assert_eq!(
+        send_update(&setup.state, &registration.token, update)
+            .await
+            .unwrap(),
+        StatusCode::OK
+    );
+
+    let member_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2)",
+    )
+    .bind(SPACE_URI)
+    .bind(MEMBER_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let sync_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2)",
+    )
+    .bind(SPACE_URI)
+    .bind(MEMBER_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let record_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_records WHERE uri = $1 AND deleted_at IS NULL)",
+    )
+    .bind(&record_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!member_exists);
+    assert!(!sync_exists);
+    assert!(record_exists, "repoRemoved preserves Space history");
+    assert_eq!(
+        notify::checkpoint_rev(&pool, SPACE_URI).await.unwrap().as_deref(),
+        Some("3l7removed1")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_expired_reauthorizes_and_catches_up_with_list_writers(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    let registration = registration(&pool).await;
+    setup
+        .transport
+        .set_authorize_space_rev(SPACE_URI, Some("3l7expiredrev".into()));
+    setup.transport.set_list_writers_response(
+        SPACE_URI,
+        ListWritersOutput {
+            repos: Vec::new(),
+            cursor: None,
+        },
+    );
+
+    assert_eq!(
+        send_update(
+            &setup.state,
+            &registration.token,
+            json!({
+                "$type": "com.atproto.space.notifySpaceUpdate#registrationExpired",
+                "spaceRev": "3l7expiredrev",
+            }),
+        )
+        .await
+        .unwrap(),
+        StatusCode::OK
+    );
+    sync::wait_for_notify_syncs_idle().await;
+
+    assert!(setup
+        .transport
+        .recorded_calls()
+        .iter()
+        .any(|call| call.endpoint_url.ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
+    assert!(setup
+        .transport
+        .recorded_credential_uses()
+        .iter()
+        .any(|call| call.method == "com.atproto.space.listWriters"));
+    assert_eq!(
+        notify::catchup_state(&pool, SPACE_URI).await.unwrap(),
+        (Some("3l7expiredrev".into()), None)
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn token_migration_replaces_old_registration_rows(pool: PgPool) {
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3l7notifyreg1', $2, 'Notify Circle', now())",
     )
     .bind(SPACE_URI)
     .bind(OWNER_DID)
     .execute(&pool)
     .await
     .unwrap();
-
-    Setup {
-        state,
-        mock_transport,
-        owner_key,
-    }
-}
-
-fn credential(expires_at: DateTime<Utc>) -> ActiveSpaceCredential {
-    ActiveSpaceCredential {
-        token: "space.credential.jwt".into(),
-        signing_key: SigningKey::random(&mut OsRng),
-        expires_at,
-    }
-}
-
-async fn stored_registration(pool: &PgPool) -> Option<(String, String, DateTime<Utc>)> {
-    sqlx::query_as(
-        "SELECT service, space_host_endpoint, expires_at FROM circle_notify_registrations WHERE space_uri = $1",
+    sqlx::query("DROP TABLE circle_notify_registrations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20261112000001")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE circle_notify_registrations (space_uri TEXT PRIMARY KEY REFERENCES circles(space_uri) ON DELETE CASCADE, service TEXT NOT NULL, space_host_endpoint TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, registered_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO circle_notify_registrations (space_uri, service, space_host_endpoint, expires_at) VALUES ($1, 'did:web:old', 'https://old.example', now() + interval '1 hour')",
     )
     .bind(SPACE_URI)
-    .fetch_optional(pool)
+    .execute(&pool)
     .await
-    .unwrap()
-}
+    .unwrap();
 
-fn expected_call(service: &str) -> RecordedNotifyCall {
-    RecordedNotifyCall {
-        endpoint_url: format!("{SPACE_HOST}/xrpc/com.atproto.space.registerNotify"),
-        space_uri: SPACE_URI.into(),
-        service: service.into(),
-    }
-}
+    db::run_migrations(&pool).await.unwrap();
 
-#[sqlx::test(migrations = "./migrations")]
-async fn sweep_registers_at_the_authority_space_host_and_persists_expiry(pool: PgPool) {
-    let setup = setup(pool.clone(), "did:web:circles.catbird.blue#atproto_circles").await;
-    let expires_at = DateTime::from_timestamp(Utc::now().timestamp() + 86_400, 0).unwrap();
-    setup
-        .mock_transport
-        .set_register_notify_response(SPACE_URI, expires_at);
-
-    sweep_once(&setup.state).await.unwrap();
-
-    assert_eq!(
-        setup.mock_transport.recorded_register_notify_calls(),
-        vec![expected_call(
-            "did:web:circles.catbird.blue#atproto_circles"
-        )]
-    );
-    let (service, endpoint, stored_expiry) = stored_registration(&pool).await.unwrap();
-    assert_eq!(service, "did:web:circles.catbird.blue#atproto_circles");
-    assert_eq!(endpoint, SPACE_HOST);
-    assert_eq!(stored_expiry, expires_at);
-
-    // A fresh registration is not re-sent on the next sweep.
-    sweep_once(&setup.state).await.unwrap();
-    assert_eq!(
-        setup.mock_transport.recorded_register_notify_calls().len(),
-        1
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn registration_renews_one_hour_before_expiry(pool: PgPool) {
-    let setup = setup(pool.clone(), "did:web:circles.catbird.blue#atproto_circles").await;
-    let start = Utc::now();
-    let expires_at = DateTime::from_timestamp(start.timestamp() + 86_400, 0).unwrap();
-    setup
-        .mock_transport
-        .set_register_notify_response(SPACE_URI, expires_at);
-    let cred = credential(start + Duration::hours(2));
-
-    let first = notify::ensure_registration_at(&setup.state, SPACE_URI, &cred, start)
-        .await
-        .unwrap();
-    assert_eq!(first, Some(expires_at));
-
-    // 22 h later the registration still has more than an hour left.
-    let later = start + Duration::hours(22);
-    assert_eq!(
-        notify::ensure_registration_at(&setup.state, SPACE_URI, &cred, later)
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        setup.mock_transport.recorded_register_notify_calls().len(),
-        1
-    );
-
-    // Inside the final hour it is renewed and the new expiry persisted.
-    let renewed_expiry = expires_at + Duration::hours(24);
-    setup
-        .mock_transport
-        .set_register_notify_response(SPACE_URI, renewed_expiry);
-    let inside_margin = expires_at - Duration::minutes(59);
-    assert_eq!(
-        notify::ensure_registration_at(&setup.state, SPACE_URI, &cred, inside_margin)
-            .await
-            .unwrap(),
-        Some(renewed_expiry)
-    );
-    assert_eq!(
-        setup.mock_transport.recorded_register_notify_calls().len(),
-        2
-    );
-    assert_eq!(stored_registration(&pool).await.unwrap().2, renewed_expiry);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn registration_service_comes_from_config(pool: PgPool) {
-    let setup = setup(pool.clone(), "did:web:circles.staging.example").await;
-    notify::ensure_registration(&setup.state, SPACE_URI, &credential(Utc::now()))
-        .await
-        .unwrap();
-    assert_eq!(
-        setup.mock_transport.recorded_register_notify_calls(),
-        vec![expected_call(
-            "did:web:circles.staging.example#atproto_circles"
-        )]
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn space_deletion_drops_the_registration(pool: PgPool) {
-    let setup = setup(pool.clone(), "did:web:circles.catbird.blue#atproto_circles").await;
-    notify::ensure_registration(&setup.state, SPACE_URI, &credential(Utc::now()))
-        .await
-        .unwrap();
-    assert!(stored_registration(&pool).await.is_some());
-
-    circle_appview::purge::delete_space(&pool, &setup.state.credential_store, SPACE_URI)
-        .await
-        .unwrap();
-    assert!(stored_registration(&pool).await.is_none());
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn app_access_revocation_unregisters_at_the_space_host(pool: PgPool) {
-    let setup = setup(pool.clone(), "did:web:circles.catbird.blue#atproto_circles").await;
-    notify::ensure_registration(&setup.state, SPACE_URI, &credential(Utc::now()))
-        .await
-        .unwrap();
-    setup.mock_transport.set_space_config(
-        SPACE_URI,
-        SpaceConfig {
-            authority: OWNER_DID.into(),
-            space_type: "blue.catbird.circle".into(),
-            skey: "3l7notifyreg1".into(),
-            app_access: SpaceAppAccess::AllowList(vec!["https://another.app/client".into()]),
-            read_policy: SpacePolicy::MemberList,
-            write_policy: SpacePolicy::MemberList,
-            user_policy: None,
-            name: None,
-            description: None,
-        },
-    );
-
-    circle_appview::access::refresh_member_cache(&setup.state, SPACE_URI)
-        .await
-        .expect_err("an explicit appAccess revocation denies");
-
-    let mut expected = expected_call("did:web:circles.catbird.blue#atproto_circles");
-    expected.endpoint_url = format!("{SPACE_HOST}/xrpc/com.atproto.space.unregisterNotify");
-    assert_eq!(
-        setup.mock_transport.recorded_unregister_notify_calls(),
-        vec![expected]
-    );
-    assert!(stored_registration(&pool).await.is_none());
-}
-
-/// notifyWrite is acknowledged once validated, without running the sync inline:
-/// here the sync itself would fail (no listRepoOps is configured) yet the
-/// receiver still answers 200.
-#[sqlx::test(migrations = "./migrations")]
-async fn notify_write_acknowledges_before_syncing(pool: PgPool) {
-    let setup = setup(pool.clone(), "did:web:circles.catbird.blue#atproto_circles").await;
-    let now = Utc::now().timestamp();
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
-    let claims = URL_SAFE_NO_PAD.encode(
-        serde_json::json!({
-            "iss": OWNER_DID,
-            "aud": "did:web:circles.catbird.blue#atproto_circles",
-            "lxm": "com.atproto.space.notifyWrite",
-            "iat": now,
-            "exp": now + 60,
-            "jti": uuid::Uuid::new_v4().to_string(),
-        })
-        .to_string(),
-    );
-    let signing_input = format!("{header}.{claims}");
-    use p256::ecdsa::signature::Signer;
-    let sig: p256::ecdsa::Signature = setup.owner_key.sign(signing_input.as_bytes());
-    let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
-
-    let body = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[7u8; 32]),
-        repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(OWNER_DID)),
-        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
-            "3l7aaaaaaaaaa",
-        )),
-        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-            String::from("3l7spacerev2a"),
-        )),
-        prev_space_rev: None,
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-            .unwrap(),
-        extra_data: None,
-    };
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-    let resp = circle_appview::sync::notify_write_handler(
-        axum::extract::State(setup.state.clone()),
-        headers,
-        bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'circle_notify_registrations' ORDER BY column_name",
     )
+    .fetch_all(&pool)
     .await
-    .expect("a validated notifyWrite is acknowledged");
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-
-    circle_appview::sync::wait_for_notify_syncs_idle().await;
-    let synced: Option<String> =
-        sqlx::query_scalar("SELECT last_rev FROM circle_repo_sync_state WHERE space_uri = $1")
-            .bind(SPACE_URI)
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-    assert!(
-        synced.is_none(),
-        "the failed background sync must not advance state"
-    );
+    .unwrap();
+    assert!(columns.iter().any(|column| column == "endpoint"));
+    assert!(columns.iter().any(|column| column == "token"));
+    assert!(!columns.iter().any(|column| column == "service"));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM circle_notify_registrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "legacy leases cannot be translated into tokens");
 }

@@ -59,8 +59,9 @@ use catbird_atproto::generated::blue_catbird::circle::list_notifications::{
 };
 use catbird_atproto::generated::blue_catbird::circle::NotificationReason as CircleNotificationReason;
 use catbird_atproto::generated::com_atproto::memberspace::policy::Policy as MemberspacePolicy;
-use catbird_atproto::generated::com_atproto::memberspace::put_member::PutMember;
-use catbird_atproto::generated::com_atproto::memberspace::remove_member::RemoveMember;
+use catbird_atproto::generated::com_atproto::memberspace::put_members::PutMembers;
+use catbird_atproto::generated::com_atproto::memberspace::remove_members::RemoveMembers;
+use catbird_atproto::generated::com_atproto::memberspace::Member;
 use catbird_atproto::generated::com_atproto::repo::create_record::{
     CreateRecord, CreateRecordOutput,
 };
@@ -71,7 +72,7 @@ use catbird_atproto::generated::com_atproto::space::apply_writes::{
     ApplyWrites, ApplyWritesOutput, ApplyWritesOutputResultsItem, ApplyWritesWritesItem, Create,
 };
 use catbird_atproto::generated::com_atproto::space::create_space::{
-    CreateSpace, CreateSpacePolicy,
+    CreateSpace, CreateSpaceOutput, CreateSpacePolicy,
 };
 use catbird_atproto::generated::com_atproto::space::get_latest_commit::{
     GetLatestCommit, GetLatestCommitOutput,
@@ -79,7 +80,9 @@ use catbird_atproto::generated::com_atproto::space::get_latest_commit::{
 use catbird_atproto::generated::com_atproto::space::list_spaces::{ListSpaces, ListSpacesOutput};
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::ident::AtIdentifier;
-use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Nsid};
+use catbird_atproto::jacquard_common::types::string::{
+    AtUri, Cid, Datetime, Did, Nsid, UriValue,
+};
 use catbird_atproto::jacquard_common::types::value::Data;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
@@ -735,10 +738,11 @@ impl ScenarioRunner {
                 ));
             }
             let rev = cap_out.protocol_revision.as_str();
-            if rev != "5d88b414a98de1ada22c94c78fa0667a7028163c" {
+            if rev != circle_appview::CIRCLE_PROTOCOL_REVISION {
                 return Err(format!(
-                    "Space protocol revision mismatch for {}: expected '5d88b414a98de1ada22c94c78fa0667a7028163c', got '{rev}'",
-                    user.name
+                    "Space protocol revision mismatch for {}: expected '{}', got '{rev}'",
+                    user.name,
+                    circle_appview::CIRCLE_PROTOCOL_REVISION,
                 ));
             }
 
@@ -749,7 +753,7 @@ impl ScenarioRunner {
             );
             let ls_query: ListSpaces<String> = ListSpaces {
                 cursor: None,
-                did: Some(Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?),
+                space_did: Some(Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?),
                 limit: Some(1),
                 space_type: None,
             };
@@ -1379,6 +1383,7 @@ impl ScenarioRunner {
             algorithm: Some("reverse-chronological".into()),
             cursor: None,
             limit: Some(100),
+            since: None,
         };
         let timeline_resp = self
             .config
@@ -1549,7 +1554,10 @@ impl ScenarioRunner {
         // A member-list Circle readable only through this AppView's client_id.
         let create_space_input: CreateSpace<String> = CreateSpace {
             policy: CreateSpacePolicy::MemberspacePolicy(Box::new(MemberspacePolicy {
-                allowed_apps: Some(vec![self.config.circle_appview_client_id.clone()]),
+                allowed_apps: Some(vec![UriValue::new(
+                    self.config.circle_appview_client_id.clone(),
+                )
+                .map_err(|e| format!("Invalid AppView client URI: {e}"))?]),
                 public_read: Some(false),
                 public_write: Some(false),
                 publish_members: None,
@@ -1578,13 +1586,12 @@ impl ScenarioRunner {
                 create_resp.status()
             ));
         }
-
-        let space_uri = format!(
-            "at://{}/space/blue.catbird.circle/{}",
-            self.config.alice.did, skey
-        );
-        let space_ref =
-            AtSpaceUri::new(space_uri.clone()).map_err(|e| format!("Invalid AtSpaceUri: {e}"))?;
+        let create_output: CreateSpaceOutput<String> = create_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse createSpace response: {e}"))?;
+        let space_ref = create_output.space;
+        let space_uri = space_ref.as_str().to_owned();
 
         // Alice writes metadata record
         let meta_record = json!({
@@ -1601,30 +1608,34 @@ impl ScenarioRunner {
         )
         .await?;
 
-        // Alice adds Bob and Carol via memberspace.putMember
-        let put_member_url = format!(
-            "{}/xrpc/com.atproto.memberspace.putMember",
+        // Alice adds Bob and Carol via memberspace.putMembers. Use one-element
+        // arrays so this scenario still identifies exactly which member failed.
+        let put_members_url = format!(
+            "{}/xrpc/com.atproto.memberspace.putMembers",
             self.config.nest_url.trim_end_matches('/')
         );
         for user in [&self.config.bob, &self.config.carol] {
-            let put_input = PutMember {
-                did: Did::new(user.did.clone()).unwrap(),
+            let put_input = PutMembers {
+                members: vec![Member {
+                    did: Did::new(user.did.clone()).unwrap(),
+                    read: true,
+                    write: true,
+                    extra_data: None,
+                }],
                 space: space_ref.clone(),
-                read: true,
-                write: true,
                 extra_data: None,
             };
             let put_resp = self
                 .config
                 .alice
-                .apply_auth(self.client.post(&put_member_url))
+                .apply_auth(self.client.post(&put_members_url))
                 .json(&put_input)
                 .send()
                 .await
-                .map_err(|e| format!("putMember failed for {}: {e}", user.name))?;
+                .map_err(|e| format!("putMembers failed for {}: {e}", user.name))?;
             if !put_resp.status().is_success() {
                 return Err(format!(
-                    "putMember for {} returned HTTP {}",
+                    "putMembers for {} returned HTTP {}",
                     user.name,
                     put_resp.status()
                 ));
@@ -2408,21 +2419,24 @@ impl ScenarioRunner {
         // Step 11: Alice Adds Dave to Circle via Nest updateMember
         // -------------------------------------------------------------
         eprintln!("[e2e_scenario] STEP_12_ADD_MEMBER_START");
-        let put_dave_input = PutMember {
-            did: Did::new(self.config.dave.did.clone()).unwrap(),
+        let put_dave_input = PutMembers {
+            members: vec![Member {
+                did: Did::new(self.config.dave.did.clone()).unwrap(),
+                read: true,
+                write: true,
+                extra_data: None,
+            }],
             space: space_ref.clone(),
-            read: true,
-            write: true,
             extra_data: None,
         };
         let put_dave_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&put_member_url))
+            .apply_auth(self.client.post(&put_members_url))
             .json(&put_dave_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call putMember to add Dave: {e}"))?;
+            .map_err(|e| format!("Failed to call putMembers to add Dave: {e}"))?;
 
         if !put_dave_resp.status().is_success() {
             return Err(format!(
@@ -2589,24 +2603,24 @@ impl ScenarioRunner {
         eprintln!("[e2e_scenario] STEP_13_REMOVE_MEMBER_START");
         let pre_bob_remove_snapshot = self.circle_snapshot(&space_ref, &post_uri).await?;
 
-        let remove_member_url = format!(
-            "{}/xrpc/com.atproto.memberspace.removeMember",
+        let remove_members_url = format!(
+            "{}/xrpc/com.atproto.memberspace.removeMembers",
             self.config.nest_url.trim_end_matches('/')
         );
-        let remove_bob_input = RemoveMember {
-            did: Did::new(self.config.bob.did.clone())
-                .map_err(|e| format!("Invalid Bob DID: {e}"))?,
+        let remove_bob_input = RemoveMembers {
+            dids: vec![Did::new(self.config.bob.did.clone())
+                .map_err(|e| format!("Invalid Bob DID: {e}"))?],
             space: space_ref.clone(),
             extra_data: None,
         };
         let remove_bob_resp = self
             .config
             .alice
-            .apply_auth(self.client.post(&remove_member_url))
+            .apply_auth(self.client.post(&remove_members_url))
             .json(&remove_bob_input)
             .send()
             .await
-            .map_err(|e| format!("Failed to call removeMember to remove Bob: {e}"))?;
+            .map_err(|e| format!("Failed to call removeMembers to remove Bob: {e}"))?;
 
         if !remove_bob_resp.status().is_success() {
             return Err(format!(

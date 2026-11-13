@@ -434,7 +434,7 @@ async fn verifies_public_health_and_capabilities_unauthenticated(pool: PgPool) {
     );
     assert_eq!(
         caps.protocol_revision.as_str(),
-        "5d88b414a98de1ada22c94c78fa0667a7028163c"
+        "d4def6e9f521896ed8222f576d54923d00b5fbeb"
     );
     assert!(!caps.supports_images);
 }
