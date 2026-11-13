@@ -1,4 +1,4 @@
--- Nov-12 alpha replaces registerNotify/unregisterNotify with notification data
+-- Nov-12 alpha replaces the legacy registration RPCs with notification data
 -- carried by authorizeSpaceSync. Old registrations cannot be translated because
 -- their hosts know no endpoint token, so discard them and reauthorize cleanly.
 DROP TABLE IF EXISTS circle_notify_registrations;

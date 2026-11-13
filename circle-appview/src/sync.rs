@@ -217,13 +217,13 @@ impl SyncEngine {
             ));
         }
 
-        // Finding 17 & 36: Membership and generation pre-check before lock acquisition, Space credential creation, or network calls
-        let initial_membership: Option<(i64,)> = sqlx::query_as(
+        // Check writer membership before credential creation or repo-host calls.
+        let mut initial_membership: Option<(i64,)> = sqlx::query_as(
             r#"
             SELECT meta.generation
             FROM circle_member_cache m
             JOIN circle_member_cache_meta meta ON meta.space_uri = m.space_uri
-            WHERE m.space_uri = $1 AND m.member_did = $2
+            WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_write = true
             "#,
         )
         .bind(space_uri)
@@ -239,6 +239,31 @@ impl SyncEngine {
         } else {
             crate::identity_events::require_active_account(&self.db, author_did).await?;
             crate::identity_events::require_active_account(&self.db, &authority_did).await?;
+        }
+        // repoRemoved evicts the member cache. A later authenticated repoWrite
+        // is the host's signal that the writer was re-added; refresh the PDS
+        // member list before deciding that the writer is still unauthorized.
+        if initial_membership.is_none()
+            && author_did != authority_did
+            && expected_authority_hash.is_some()
+            && expected_authority_rev.is_some()
+        {
+            if let Some(state) = &self.lifecycle_state {
+                crate::access::refresh_member_cache(state, space_uri).await?;
+                initial_membership = sqlx::query_as(
+                    r#"
+                    SELECT meta.generation
+                    FROM circle_member_cache m
+                    JOIN circle_member_cache_meta meta ON meta.space_uri = m.space_uri
+                    WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_write = true
+                    "#,
+                )
+                .bind(space_uri)
+                .bind(author_did)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(AppError::Database)?;
+            }
         }
         let _initial_generation = match initial_membership {
             Some((gen,)) => Some(gen),
@@ -387,12 +412,46 @@ impl SyncEngine {
                 Ok(page) => page,
                 Err(AppError::NotFound(reason))
                     if reason == "RepoNotFound"
-                        && existing_sync.is_none()
                         && expected_authority_hash.is_none()
                         && expected_authority_rev.is_none() =>
                 {
-                    // A member can join before writing its first record. There
-                    // is no commit or cursor to persist for that empty repo.
+                    // A never-written or garbage-collected empty repo has no
+                    // commit or cursor. Mirror an empty recovery locally.
+                    let mut tx = self.db.begin().await?;
+                    sqlx::query(
+                        "DELETE FROM circle_likes \
+                         WHERE uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL) \
+                            OR post_uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL)",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "DELETE FROM circle_notifications \
+                         WHERE source_uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL) \
+                            OR subject_uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL)",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE circle_records SET deleted_at = now() \
+                         WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
                     return Ok(SyncResult {
                         mode: SyncMode::Incremental,
                         commit_verified: true,

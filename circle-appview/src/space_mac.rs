@@ -390,7 +390,7 @@ mod tests {
             )
             .unwrap(),
             repo: "did:example:alice".to_owned().into(),
-            rev: "3kbcq3p7ad400".to_owned().into(),
+            rev: "3kbcq3p7ad4aa".to_owned().into(),
             data: bytes::Bytes::from_static(&[1; 32]),
             ver: 1,
             extra_data: None,
@@ -538,7 +538,7 @@ mod tests {
         }
 
         let mut changed = commit.clone();
-        changed.rev = "3kbcq3p7ad401".to_owned().into();
+        changed.rev = "3kbcq3p7ad4ab".to_owned().into();
         let headers = signed_headers(&request, &covered, "mac", None);
         assert!(verify_commit(
             &changed,

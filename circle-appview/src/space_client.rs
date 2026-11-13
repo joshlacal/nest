@@ -6,7 +6,7 @@ use p256::elliptic_curve::rand_core::OsRng;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -992,6 +992,7 @@ pub struct MockSpaceHostTransport {
             catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
         >,
     >,
+    list_repo_ops_not_found: Mutex<HashSet<String>>,
     get_repo_responses: Mutex<HashMap<String, Vec<u8>>>,
     latest_commits: Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::Commit>>,
     calls: Mutex<Vec<RecordedSpaceHostCall>>,
@@ -1021,6 +1022,7 @@ impl MockSpaceHostTransport {
             authorize_space_revs: Mutex::new(HashMap::new()),
             list_writers_responses: Mutex::new(HashMap::new()),
             list_repo_ops_responses: Mutex::new(HashMap::new()),
+            list_repo_ops_not_found: Mutex::new(HashSet::new()),
             get_repo_responses: Mutex::new(HashMap::new()),
             latest_commits: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
@@ -1116,6 +1118,13 @@ impl MockSpaceHostTransport {
     ) {
         let mut lock = self.list_repo_ops_responses.lock().unwrap();
         lock.insert(space_and_repo.to_string(), output);
+    }
+
+    pub fn set_list_repo_ops_not_found(&self, space_and_repo: &str) {
+        self.list_repo_ops_not_found
+            .lock()
+            .unwrap()
+            .insert(space_and_repo.to_string());
     }
 
     pub fn set_get_repo_response(&self, space_and_repo: &str, output: Vec<u8>) {
@@ -1329,6 +1338,11 @@ impl SpaceHostTransport for MockSpaceHostTransport {
             return Box::pin(async move { Err(e) });
         }
         let base_key = format!("{space_uri}:{repo_did}");
+        let repo_not_found = self
+            .list_repo_ops_not_found
+            .lock()
+            .unwrap()
+            .contains(&base_key);
         let lock = self.list_repo_ops_responses.lock().unwrap();
         let res = match cursor {
             Some(c) => lock
@@ -1343,6 +1357,9 @@ impl SpaceHostTransport for MockSpaceHostTransport {
             None => base_key,
         };
         Box::pin(async move {
+            if repo_not_found {
+                return Err(AppError::NotFound("RepoNotFound".into()));
+            }
             res.ok_or_else(|| {
                 AppError::NotFound(format!("No mock list_repo_ops configured for {lookup_key}"))
             })
@@ -3206,7 +3223,7 @@ mod tests {
         let star = crate::test_support::fixture_star(&commit, &[]).unwrap();
         let key = p256::ecdsa::SigningKey::random(&mut OsRng);
         for endpoint in ["getLatestCommit", "getRepo", "listRepoOps"] {
-            for mode in ["good", "missing", "wrong", "duplicate", "type", "version"] {
+            for mode in ["good", "missing", "wrong", "duplicate", "keyid", "type", "version"] {
                 let server = MockServer::start().await;
                 let mut auth = credential_headers(&key, "cred", REPO);
                 auth.mac = Some(MacRequest {
@@ -3229,8 +3246,13 @@ mod tests {
                 } else {
                     COMMIT_MAC_PROFILE
                 };
+                let keyid = if mode == "keyid" {
+                    "did:key:zDnaOther"
+                } else {
+                    "did:key:fixture"
+                };
                 let params = format!(
-                    "(\"{COMMIT_MAC_PROFILE}\";sf);keyid=\"did:key:fixture\";tag=\"{tag}\""
+                    "(\"{COMMIT_MAC_PROFILE}\";sf);keyid=\"{keyid}\";tag=\"{tag}\""
                 );
                 let mut mac =
                     Hmac::<Sha256>::new_from_slice(if mode == "wrong" { &[8; 32] } else { &[7; 32] })

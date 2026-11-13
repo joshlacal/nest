@@ -60,12 +60,12 @@ pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), A
     .bind(space)
     .fetch_optional(db)
     .await?;
-    let Some(stored) = stored else {
-        return Err(AppError::Unauthorized(AuthReason::InvalidToken));
-    };
-
-    // Compare fixed-size HMACs using the crate's constant-time verifier. The
-    // token is the key and the space URI separates registrations.
+    // Always perform the same fixed-size MAC verification for an unknown space
+    // as for a wrong token, then return the same error. Registration tokens are
+    // 32 random bytes encoded as 43 base64url characters.
+    const DUMMY_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let known_space = stored.is_some();
+    let stored = stored.as_deref().unwrap_or(DUMMY_TOKEN);
     let mut expected = Hmac::<Sha256>::new_from_slice(stored.as_bytes())
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidToken))?;
     expected.update(space.as_bytes());
@@ -73,10 +73,14 @@ pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), A
     let mut supplied = Hmac::<Sha256>::new_from_slice(token.as_bytes())
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidToken))?;
     supplied.update(space.as_bytes());
-    supplied
-        .verify_slice(&expected)
-        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidToken))
+    let valid = supplied.verify_slice(&expected).is_ok();
+    if known_space && valid {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized(AuthReason::InvalidToken))
+    }
 }
+
 
 pub async fn checkpoint(db: &PgPool, space: &str, space_rev: &str) -> Result<(), AppError> {
     sqlx::query(

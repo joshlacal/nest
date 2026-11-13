@@ -1517,10 +1517,10 @@ mod tests {
             .insert_at("space-a".into(), issued_for("fresh", 600), issued)
             .await;
         assert_eq!(store.get_at("space-a", at(0)).await.unwrap().token, "fresh");
-        assert!(store.get_at("space-a", at(539)).await.is_some());
+        assert!(store.get_at("space-a", at(299)).await.is_some());
         assert!(
-            store.get_at("space-a", at(541)).await.is_none(),
-            "within 60 s of exp"
+            store.get_at("space-a", at(301)).await.is_none(),
+            "within five minutes of exp"
         );
 
         // 55 s credential: the old fixed 60 s margin never served it.
