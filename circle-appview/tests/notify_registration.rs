@@ -292,7 +292,7 @@ async fn repo_write_requires_token_and_records_revision_gap(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn repo_removed_drops_writer_state_without_deleting_history(pool: PgPool) {
+async fn repo_removed_drops_only_writer_state_without_deleting_membership_or_history(pool: PgPool) {
     let setup = setup(pool.clone()).await;
     let registration = registration(&pool).await;
     sqlx::query(
@@ -352,7 +352,7 @@ async fn repo_removed_drops_writer_state_without_deleting_history(pool: PgPool) 
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(!member_exists);
+    assert!(member_exists, "listMembers owns Circle membership");
     assert!(!sync_exists);
     assert!(record_exists, "repoRemoved preserves Space history");
     assert_eq!(

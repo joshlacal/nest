@@ -409,11 +409,7 @@ impl SyncEngine {
 
             let page = match page_res {
                 Ok(page) => page,
-                Err(AppError::NotFound(reason))
-                    if reason == "RepoNotFound"
-                        && expected_authority_hash.is_none()
-                        && expected_authority_rev.is_none() =>
-                {
+                Err(AppError::NotFound(reason)) if reason == "RepoNotFound" => {
                     // A never-written or garbage-collected empty repo has no
                     // commit or cursor. Mirror an empty recovery locally.
                     let mut tx = self.db.begin().await?;
@@ -1627,17 +1623,13 @@ impl SyncEngine {
 
 /// Stop syncing a repo removed from the writer set. Existing records remain as
 /// Space history, matching the service's established member-removal semantics;
-/// deleting sync state makes a later re-add perform a clean full sync.
+/// deleting sync state makes a later write perform a clean full sync. Membership
+/// remains authoritative in the `listMembers` refresh.
 pub async fn apply_repo_removed(
     pool: &sqlx::PgPool,
     space: &str,
     repo: &str,
 ) -> Result<(), AppError> {
-    if extract_authority_did(space)? != repo {
-        crate::purge::remove_member(pool, space, repo)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
     sqlx::query("DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2")
         .bind(space)
         .bind(repo)
@@ -1752,6 +1744,9 @@ pub async fn sweep_once_with_shutdown(
         let mut last_processed: Option<String> = None;
         let mut start_over = false;
         let mut listing_complete = false;
+        // Once an update fails, keep syncing later writers but do not advance
+        // the durable Space checkpoint past the failed update.
+        let mut checkpoint_blocked = false;
 
         loop {
             // Check shutdown between pages
@@ -1800,7 +1795,7 @@ pub async fn sweep_once_with_shutdown(
                 listing_complete = true;
                 break;
             }
-            let mut page_failed = false;
+            let mut credential_rejected = false;
 
             for repo in &repos_output.repos {
                 // Cooperative shutdown check inside repo loop
@@ -1870,12 +1865,14 @@ pub async fn sweep_once_with_shutdown(
                 match applied {
                     Ok(()) => {
                         let space_rev = repo.space_rev();
-                        crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+                        if !checkpoint_blocked {
+                            crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+                        }
                         last_processed = Some(space_rev.to_owned());
                     }
                     Err(e) => {
                         summary.repos_failed += 1;
-                        page_failed = true;
+                        checkpoint_blocked = true;
                         if crate::access::is_credential_rejected(&e) {
                             crate::access::evict_rejected_credential(
                                 &state.credential_store,
@@ -1884,13 +1881,17 @@ pub async fn sweep_once_with_shutdown(
                                 &e,
                             )
                             .await;
+                            credential_rejected = true;
+                            break;
                         }
-                        break;
+                        // In-memory budget resume may pass this entry; durable
+                        // catch-up remains at the last successful checkpoint.
+                        last_processed = Some(repo.space_rev().to_owned());
                     }
                 }
             }
 
-            if page_failed {
+            if credential_rejected {
                 break;
             }
 
@@ -1912,7 +1913,7 @@ pub async fn sweep_once_with_shutdown(
                 break;
             }
         }
-        if listing_complete {
+        if listing_complete && !checkpoint_blocked {
             if let Some(space_rev) = pending_rev.as_deref() {
                 crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
             }

@@ -1317,7 +1317,12 @@ async fn repo_not_found_is_empty_for_never_written_and_collected_repos(pool: PgP
     .unwrap();
 
     SyncEngine::new(&setup.state)
-        .sync_repo(SPACE_URI, OWNER_DID)
+        .sync_repo_with_expected_commit(
+            SPACE_URI,
+            OWNER_DID,
+            Some(&[0xAA; 32]),
+            Some("3l7listedempty"),
+        )
         .await
         .unwrap();
     let active_records: i64 = sqlx::query_scalar(
@@ -4080,8 +4085,10 @@ fn space_rev(i: usize) -> String {
 }
 
 fn writer_entry(i: usize) -> WriterUpdate {
-    WriterUpdate::RepoRemoved(RepoRemoved {
+    WriterUpdate::RepoWrite(RepoWrite {
         repo: format!("did:plc:resume-writer-{i}"),
+        data: bytes::Bytes::copy_from_slice(&[0x22; 32]),
+        repo_rev: "3l7234567a234".into(),
         space_rev: space_rev(i),
         prev_space_rev: None,
     })

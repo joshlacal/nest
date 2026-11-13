@@ -718,11 +718,10 @@ async fn test_sweep_budget_and_shutdown_in_per_page_repo_loop(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_sweep_stops_at_first_failing_ordered_writer_update(pool: PgPool) {
+async fn test_sweep_budget_caps_failing_repos_at_max_repos_per_sweep(pool: PgPool) {
     let setup = setup_test(pool).await;
 
-    // listWriters is ordered by spaceRev. A failed entry must stop the page so
-    // the durable checkpoint cannot skip it and make later updates permanent.
+    // Space with 105 failing repos capped by MAX_REPOS_PER_SWEEP = 100.
     let repos = (0..105)
         .map(|i| writer_update(format!("did:plc:failing-repo-{i}"), 0xAA))
         .collect();
@@ -738,8 +737,11 @@ async fn test_sweep_stops_at_first_failing_ordered_writer_update(pool: PgPool) {
     let summary = circle_appview::sync::sweep_once(&setup.state)
         .await
         .unwrap();
-    assert_eq!(summary.repos_checked, 1);
-    assert_eq!(summary.repos_failed, 1);
+    assert_eq!(
+        summary.repos_checked, 100,
+        "Sweep must halt at MAX_REPOS_PER_SWEEP even when every repo fails"
+    );
+    assert_eq!(summary.repos_failed, 100);
     assert_eq!(summary.repos_synced, 0);
 }
 
