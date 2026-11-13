@@ -802,7 +802,7 @@ pub fn sanitize_url_for_logging(url: &str) -> &str {
 /// - content-type
 /// - atproto-proxy
 /// - atproto-accept-labelers
-/// - atproto-space-want-mac (per-request key share; required for authenticated Space reads)
+/// - accept-signature (per-request HPKE key share; required for authenticated Space reads)
 /// All other headers (e.g. host, forwarded, x-forwarded-*, sec-*, cookie, authorization, dpop, hop-by-hop) are dropped.
 pub fn filter_client_headers(client_headers: &HeaderMap, out_headers: &mut HeaderMap) {
     for (name, value) in client_headers.iter() {
@@ -815,7 +815,7 @@ pub fn filter_client_headers(client_headers: &HeaderMap, out_headers: &mut Heade
                 | "content-type"
                 | "atproto-proxy"
                 | "atproto-accept-labelers"
-                | "atproto-space-want-mac"
+                | "accept-signature"
         ) {
             if name_lower == "content-type" && out_headers.contains_key(CONTENT_TYPE) {
                 continue;
@@ -1004,11 +1004,17 @@ mod tests {
             HeaderValue::from_static("untrusted"),
         );
 
-        // Allowlisted headers:
-        let want_mac = r#"type="atproto-space-repo", ver=1, key_share="did:key:ephemeral""#;
+        // Allowlisted Spaces HTTP Message Signature request; the removed legacy
+        // MAC request header remains untrusted.
+        let accept_signature =
+            r#"mac=("atproto-space-commit";sf);keyid="did:key:ephemeral";tag="atproto-space-commit""#;
+        client_headers.insert(
+            HeaderName::from_static("accept-signature"),
+            HeaderValue::from_str(accept_signature).unwrap(),
+        );
         client_headers.insert(
             HeaderName::from_static("atproto-space-want-mac"),
-            HeaderValue::from_str(want_mac).unwrap(),
+            HeaderValue::from_static("legacy"),
         );
         client_headers.insert(
             HeaderName::from_static("accept"),
@@ -1053,7 +1059,11 @@ mod tests {
         assert!(!out_headers.contains_key("dpop"));
         assert!(!out_headers.contains_key("x-custom-header"));
         assert_eq!(out_headers.get("authorization").unwrap(), "DPoP pds-token");
-        assert_eq!(out_headers.get("atproto-space-want-mac").unwrap(), want_mac);
+        assert_eq!(
+            out_headers.get("accept-signature").unwrap(),
+            accept_signature
+        );
+        assert!(!out_headers.contains_key("atproto-space-want-mac"));
         assert_eq!(out_headers.get("accept").unwrap(), "application/json");
         assert_eq!(
             out_headers.get("accept-language").unwrap(),

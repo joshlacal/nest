@@ -1413,6 +1413,22 @@ async fn proxy_circle_request(
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
+fn forwards_proxy_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-type"
+            | "content-length"
+            | "cache-control"
+            | "etag"
+            | "last-modified"
+            | "atproto-space-commit"
+            | "atproto-space-record"
+            | "signature-input"
+            | "signature"
+            | "vary"
+    )
+}
+
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
 pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
@@ -1658,15 +1674,7 @@ pub async fn proxy_xrpc(
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {
                 let name_str = name.as_str();
-                if matches!(
-                    name_str,
-                    "content-type"
-                        | "content-length"
-                        | "cache-control"
-                        | "etag"
-                        | "last-modified"
-                        | "atproto-space-mac"
-                ) {
+                if forwards_proxy_response_header(name_str) {
                     response = response.header(name, value);
                 }
             }
@@ -1693,15 +1701,7 @@ pub async fn proxy_xrpc(
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {
                 let name_str = name.as_str();
-                if matches!(
-                    name_str,
-                    "content-type"
-                        | "content-length"
-                        | "cache-control"
-                        | "etag"
-                        | "last-modified"
-                        | "atproto-space-mac"
-                ) {
+                if forwards_proxy_response_header(name_str) {
                     response = response.header(name, value);
                 }
             }
@@ -2620,6 +2620,25 @@ mod tests {
             crate::services::redis_crypto::seal_with_aad(&key, session_id.as_bytes(), &aad)
                 .unwrap();
         assert!(v2_sealed.starts_with(crate::services::redis_crypto::V2_PREFIX));
+    }
+}
+
+#[cfg(test)]
+mod space_response_header_tests {
+    use super::forwards_proxy_response_header;
+
+    #[test]
+    fn forwards_http_signature_mac_headers_only() {
+        for name in [
+            "atproto-space-commit",
+            "atproto-space-record",
+            "signature-input",
+            "signature",
+            "vary",
+        ] {
+            assert!(forwards_proxy_response_header(name), "{name}");
+        }
+        assert!(!forwards_proxy_response_header("atproto-space-mac"));
     }
 }
 
