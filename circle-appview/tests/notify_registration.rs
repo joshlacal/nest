@@ -32,6 +32,8 @@ const MEMBER_DID: &str = "did:plc:member-notify-registration";
 const SPACE_URI: &str =
     "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg1";
 const SPACE_HOST: &str = "https://space.owner.example";
+const OTHER_SPACE_URI: &str =
+    "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg2";
 
 struct Setup {
     state: AppState,
@@ -245,6 +247,33 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
         "unknown spaces and wrong tokens must disclose the same response"
     );
 }
+#[sqlx::test(migrations = "./migrations")]
+async fn checkpoint_never_moves_backwards(pool: PgPool) {
+    let _setup = setup(pool.clone()).await;
+    let _registration = registration(&pool).await;
+
+    notify::checkpoint(&pool, SPACE_URI, "3l7spacerev09")
+        .await
+        .unwrap();
+    notify::mark_pending(&pool, SPACE_URI, "3l7spacerev10")
+        .await
+        .unwrap();
+    notify::checkpoint(&pool, SPACE_URI, "3l7spacerev05")
+        .await
+        .unwrap();
+    assert_eq!(
+        notify::catchup_state(&pool, SPACE_URI).await.unwrap(),
+        (Some("3l7spacerev09".into()), Some("3l7spacerev10".into()))
+    );
+
+    notify::checkpoint(&pool, SPACE_URI, "3l7spacerev10")
+        .await
+        .unwrap();
+    assert_eq!(
+        notify::catchup_state(&pool, SPACE_URI).await.unwrap(),
+        (Some("3l7spacerev10".into()), None)
+    );
+}
 
 #[sqlx::test(migrations = "./migrations")]
 async fn repo_write_requires_token_and_records_revision_gap(pool: PgPool) {
@@ -368,6 +397,34 @@ async fn repo_removed_drops_only_writer_state_without_deleting_membership_or_his
 async fn registration_expired_reauthorizes_and_catches_up_with_list_writers(pool: PgPool) {
     let setup = setup(pool.clone()).await;
     let registration = registration(&pool).await;
+    sqlx::query(
+        "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) \
+         VALUES ($1, '3l7notifyreg2', $2, 'Other Notify Circle', now())",
+    )
+    .bind(OTHER_SPACE_URI)
+    .bind(OWNER_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    setup
+        .state
+        .credential_store
+        .insert(
+            OTHER_SPACE_URI.into(),
+            ActiveSpaceCredential {
+                token: "other-space-credential".into(),
+                signing_key: SigningKey::random(&mut OsRng),
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+    setup.transport.set_list_writers_response(
+        OTHER_SPACE_URI,
+        ListWritersOutput {
+            repos: Vec::new(),
+            cursor: None,
+        },
+    );
     setup
         .transport
         .set_authorize_space_rev(SPACE_URI, Some("3l7expiredrev".into()));
@@ -402,6 +459,18 @@ async fn registration_expired_reauthorizes_and_catches_up_with_list_writers(pool
         .recorded_credential_uses()
         .iter()
         .any(|call| call.method == "com.atproto.space.listWriters"));
+    let listed_spaces: Vec<_> = setup
+        .transport
+        .recorded_credential_uses()
+        .into_iter()
+        .filter(|call| call.method == "com.atproto.space.listWriters")
+        .map(|call| call.space_uri)
+        .collect();
+    assert_eq!(
+        listed_spaces,
+        vec![SPACE_URI.to_string()],
+        "notification catch-up must not sweep unrelated Spaces"
+    );
     assert_eq!(
         notify::catchup_state(&pool, SPACE_URI).await.unwrap(),
         (Some("3l7expiredrev".into()), None)

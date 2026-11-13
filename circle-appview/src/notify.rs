@@ -83,8 +83,11 @@ pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), A
 pub async fn checkpoint(db: &PgPool, space: &str, space_rev: &str) -> Result<(), AppError> {
     sqlx::query(
         "UPDATE circle_notify_registrations \
-         SET checkpoint_rev = $2, \
-             pending_rev = CASE WHEN pending_rev <= $2 THEN NULL ELSE pending_rev END, \
+         SET checkpoint_rev = GREATEST(checkpoint_rev, $2), \
+             pending_rev = CASE \
+                 WHEN pending_rev <= GREATEST(checkpoint_rev, $2) THEN NULL \
+                 ELSE pending_rev \
+             END, \
              updated_at = now() \
          WHERE space_uri = $1",
     )

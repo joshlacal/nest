@@ -1638,6 +1638,251 @@ pub async fn apply_repo_removed(
     Ok(())
 }
 
+async fn sweep_space(
+    state: &AppState,
+    space_uri: String,
+    summary: &mut SweepSummary,
+    sweep_start: std::time::Instant,
+    total_bytes_processed: &mut usize,
+    shutdown_rx: &mut Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), AppError> {
+    let sync_engine = SyncEngine::new(state);
+    summary.spaces_checked += 1;
+    let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
+        Ok(c) => c,
+        // ensure_space_credential has already purged and tombstoned the Circle.
+        Err(e) if crate::access::is_space_deleted(&e) => {
+            summary.spaces_purged += 1;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
+            summary.repos_failed += 1;
+            return Ok(());
+        }
+    };
+    let authority_did = match extract_authority_did(&space_uri) {
+        Ok(a) => a,
+        Err(_) => return Ok(()),
+    };
+
+    let authority_doc = match state.did_resolver.resolve(&authority_did).await {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let (service_endpoint, _) = match resolve_space_host_endpoint(&authority_doc, &authority_did) {
+        Ok(ep) => ep,
+        Err(_) => return Ok(()),
+    };
+    // A gap detected by authorizeSpaceSync or notifySpaceUpdate resumes at
+    // the durable per-space revision. Ordinary budget resumes stay in memory.
+    let (checkpoint_rev, pending_rev) = crate::notify::catchup_state(&state.db, &space_uri).await?;
+    let mut cursor = if pending_rev.is_some() {
+        checkpoint_rev
+    } else {
+        state.listing_resume.get(&space_uri)
+    };
+    let mut seen_cursors = HashSet::new();
+    let mut page_count = 0;
+    // The spaceRev of the last entry this pass finished with, and whether
+    // the next listing of this space starts from the beginning.
+    let mut last_processed: Option<String> = None;
+    let mut start_over = false;
+    let mut listing_complete = false;
+    // Once an update fails, keep syncing later writers but do not advance
+    // the durable Space checkpoint past the failed update.
+    let mut checkpoint_blocked = false;
+
+    loop {
+        // Check shutdown between pages
+        if let Some(rx) = shutdown_rx.as_deref_mut() {
+            if *rx.borrow() {
+                break;
+            }
+        }
+
+        if page_count >= MAX_PAGES_PER_SWEEP
+            || summary.repos_checked >= MAX_REPOS_PER_SWEEP
+            || sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS
+            || *total_bytes_processed >= MAX_BYTES_PER_SWEEP
+        {
+            break;
+        }
+        page_count += 1;
+
+        let list_writers_res = state
+            .space_client
+            .list_writers(
+                &service_endpoint,
+                &space_uri,
+                cursor.as_deref(),
+                &cred.token,
+                &cred.signing_key,
+            )
+            .await;
+
+        let repos_output = match list_writers_res {
+            Ok(out) => out,
+            Err(e) => {
+                crate::access::evict_rejected_credential(
+                    &state.credential_store,
+                    &space_uri,
+                    &cred.token,
+                    &e,
+                )
+                .await;
+                break;
+            }
+        };
+        // listWriters pages through writer updates in ascending spaceRev.
+        if repos_output.repos.is_empty() {
+            start_over = true;
+            listing_complete = true;
+            break;
+        }
+        let mut credential_rejected = false;
+
+        for repo in &repos_output.repos {
+            // Cooperative shutdown check inside repo loop
+            if let Some(rx) = shutdown_rx.as_deref_mut() {
+                if *rx.borrow() {
+                    tracing::info!("Cooperative shutdown observed during revision sweep repo loop");
+                    break;
+                }
+            }
+
+            if sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS {
+                tracing::info!("Sweep time budget reached in repo loop");
+                break;
+            }
+            if summary.repos_checked >= MAX_REPOS_PER_SWEEP {
+                tracing::info!("Sweep repo budget reached in repo loop");
+                break;
+            }
+            if *total_bytes_processed >= MAX_BYTES_PER_SWEEP {
+                tracing::info!("Sweep byte budget reached in repo loop");
+                break;
+            }
+
+            summary.repos_checked += 1;
+            let applied = match repo {
+                WriterUpdate::RepoRemoved(update) => {
+                    apply_repo_removed(&state.db, &space_uri, &update.repo).await
+                }
+                WriterUpdate::RepoWrite(update) => {
+                    let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
+                            "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+                        )
+                        .bind(&space_uri)
+                        .bind(&update.repo)
+                        .fetch_optional(&state.db)
+                        .await
+                        .unwrap_or(None);
+                    let needs_sync = match db_sync {
+                        Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
+                            let digest: [u8; 32] = Sha256::digest(&last_hash).into();
+                            last_rev != update.repo_rev || &digest[..] != update.data.as_ref()
+                        }
+                        _ => true,
+                    };
+                    if needs_sync {
+                        let result = sync_engine
+                            .sync_repo_with_expected_commit(
+                                &space_uri,
+                                &update.repo,
+                                Some(update.data.as_ref()),
+                                Some(&update.repo_rev),
+                            )
+                            .await
+                            .map(|_| ());
+                        if result.is_ok() {
+                            summary.repos_synced += 1;
+                        }
+                        *total_bytes_processed = sync_engine.total_bytes_processed();
+                        result
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            match applied {
+                Ok(()) => {
+                    let space_rev = repo.space_rev();
+                    if !checkpoint_blocked {
+                        crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+                    }
+                    last_processed = Some(space_rev.to_owned());
+                }
+                Err(e) => {
+                    summary.repos_failed += 1;
+                    checkpoint_blocked = true;
+                    if crate::access::is_credential_rejected(&e) {
+                        crate::access::evict_rejected_credential(
+                            &state.credential_store,
+                            &space_uri,
+                            &cred.token,
+                            &e,
+                        )
+                        .await;
+                        credential_rejected = true;
+                        break;
+                    }
+                    // In-memory budget resume may pass this entry; durable
+                    // catch-up remains at the last successful checkpoint.
+                    last_processed = Some(repo.space_rev().to_owned());
+                }
+            }
+        }
+
+        if credential_rejected {
+            break;
+        }
+
+        if let Some(next_cursor) = repos_output.cursor {
+            let next_cur_str = next_cursor.to_string();
+            if next_cur_str.len() > MAX_CURSOR_LEN || seen_cursors.contains(&next_cur_str) {
+                // A malformed or repeating listing is not resumed.
+                start_over = true;
+                break;
+            }
+            if seen_cursors.len() >= MAX_PAGES_PER_SWEEP {
+                break;
+            }
+            seen_cursors.insert(next_cur_str.clone());
+            cursor = Some(next_cur_str);
+        } else {
+            start_over = true;
+            listing_complete = true;
+            break;
+        }
+    }
+    if listing_complete && !checkpoint_blocked {
+        if let Some(space_rev) = pending_rev.as_deref() {
+            crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+        }
+    }
+
+    if start_over {
+        state.listing_resume.clear(&space_uri);
+    } else if let Some(space_rev) = last_processed {
+        state.listing_resume.set(&space_uri, space_rev);
+    }
+
+    // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
+    sqlx::query(
+            r#"
+            INSERT INTO circle_sweep_checkpoint (checkpoint_key, last_space_uri, updated_at)
+            VALUES ('revision_sweep', $1, now())
+            ON CONFLICT (checkpoint_key) DO UPDATE SET last_space_uri = EXCLUDED.last_space_uri, updated_at = now()
+            "#,
+        )
+        .bind(&space_uri)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::Database)?;
+    Ok(())
+}
 pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
     sweep_once_with_shutdown(state, None).await
 }
@@ -1646,7 +1891,6 @@ pub async fn sweep_once_with_shutdown(
     state: &AppState,
     mut shutdown_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<SweepSummary, AppError> {
-    let sync_engine = SyncEngine::new(state);
     let mut summary = SweepSummary::default();
     let sweep_start = std::time::Instant::now();
     let mut total_bytes_processed: usize = 0;
@@ -1699,244 +1943,15 @@ pub async fn sweep_once_with_shutdown(
             break;
         }
 
-        summary.spaces_checked += 1;
-        let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
-            Ok(c) => c,
-            // ensure_space_credential has already purged and tombstoned the Circle.
-            Err(e) if crate::access::is_space_deleted(&e) => {
-                summary.spaces_purged += 1;
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
-                summary.repos_failed += 1;
-                continue;
-            }
-        };
-        let authority_did = match extract_authority_did(&space_uri) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-
-        let authority_doc = match state.did_resolver.resolve(&authority_did).await {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-
-        let (service_endpoint, _) =
-            match resolve_space_host_endpoint(&authority_doc, &authority_did) {
-                Ok(ep) => ep,
-                Err(_) => continue,
-            };
-        // A gap detected by authorizeSpaceSync or notifySpaceUpdate resumes at
-        // the durable per-space revision. Ordinary budget resumes stay in memory.
-        let (checkpoint_rev, pending_rev) =
-            crate::notify::catchup_state(&state.db, &space_uri).await?;
-        let mut cursor = if pending_rev.is_some() {
-            checkpoint_rev
-        } else {
-            state.listing_resume.get(&space_uri)
-        };
-        let mut seen_cursors = HashSet::new();
-        let mut page_count = 0;
-        // The spaceRev of the last entry this pass finished with, and whether
-        // the next listing of this space starts from the beginning.
-        let mut last_processed: Option<String> = None;
-        let mut start_over = false;
-        let mut listing_complete = false;
-        // Once an update fails, keep syncing later writers but do not advance
-        // the durable Space checkpoint past the failed update.
-        let mut checkpoint_blocked = false;
-
-        loop {
-            // Check shutdown between pages
-            if let Some(rx) = &mut shutdown_rx {
-                if *rx.borrow() {
-                    break;
-                }
-            }
-
-            if page_count >= MAX_PAGES_PER_SWEEP
-                || summary.repos_checked >= MAX_REPOS_PER_SWEEP
-                || sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS
-                || total_bytes_processed >= MAX_BYTES_PER_SWEEP
-            {
-                break;
-            }
-            page_count += 1;
-
-            let list_writers_res = state
-                .space_client
-                .list_writers(
-                    &service_endpoint,
-                    &space_uri,
-                    cursor.as_deref(),
-                    &cred.token,
-                    &cred.signing_key,
-                )
-                .await;
-
-            let repos_output = match list_writers_res {
-                Ok(out) => out,
-                Err(e) => {
-                    crate::access::evict_rejected_credential(
-                        &state.credential_store,
-                        &space_uri,
-                        &cred.token,
-                        &e,
-                    )
-                    .await;
-                    break;
-                }
-            };
-            // listWriters pages through writer updates in ascending spaceRev.
-            if repos_output.repos.is_empty() {
-                start_over = true;
-                listing_complete = true;
-                break;
-            }
-            let mut credential_rejected = false;
-
-            for repo in &repos_output.repos {
-                // Cooperative shutdown check inside repo loop
-                if let Some(rx) = &mut shutdown_rx {
-                    if *rx.borrow() {
-                        tracing::info!(
-                            "Cooperative shutdown observed during revision sweep repo loop"
-                        );
-                        break;
-                    }
-                }
-
-                if sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS {
-                    tracing::info!("Sweep time budget reached in repo loop");
-                    break;
-                }
-                if summary.repos_checked >= MAX_REPOS_PER_SWEEP {
-                    tracing::info!("Sweep repo budget reached in repo loop");
-                    break;
-                }
-                if total_bytes_processed >= MAX_BYTES_PER_SWEEP {
-                    tracing::info!("Sweep byte budget reached in repo loop");
-                    break;
-                }
-
-                summary.repos_checked += 1;
-                let applied = match repo {
-                    WriterUpdate::RepoRemoved(update) => {
-                        apply_repo_removed(&state.db, &space_uri, &update.repo).await
-                    }
-                    WriterUpdate::RepoWrite(update) => {
-                        let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
-                            "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
-                        )
-                        .bind(&space_uri)
-                        .bind(&update.repo)
-                        .fetch_optional(&state.db)
-                        .await
-                        .unwrap_or(None);
-                        let needs_sync = match db_sync {
-                            Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
-                                let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                                last_rev != update.repo_rev || &digest[..] != update.data.as_ref()
-                            }
-                            _ => true,
-                        };
-                        if needs_sync {
-                            let result = sync_engine
-                                .sync_repo_with_expected_commit(
-                                    &space_uri,
-                                    &update.repo,
-                                    Some(update.data.as_ref()),
-                                    Some(&update.repo_rev),
-                                )
-                                .await
-                                .map(|_| ());
-                            if result.is_ok() {
-                                summary.repos_synced += 1;
-                            }
-                            total_bytes_processed = sync_engine.total_bytes_processed();
-                            result
-                        } else {
-                            Ok(())
-                        }
-                    }
-                };
-                match applied {
-                    Ok(()) => {
-                        let space_rev = repo.space_rev();
-                        if !checkpoint_blocked {
-                            crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
-                        }
-                        last_processed = Some(space_rev.to_owned());
-                    }
-                    Err(e) => {
-                        summary.repos_failed += 1;
-                        checkpoint_blocked = true;
-                        if crate::access::is_credential_rejected(&e) {
-                            crate::access::evict_rejected_credential(
-                                &state.credential_store,
-                                &space_uri,
-                                &cred.token,
-                                &e,
-                            )
-                            .await;
-                            credential_rejected = true;
-                            break;
-                        }
-                        // In-memory budget resume may pass this entry; durable
-                        // catch-up remains at the last successful checkpoint.
-                        last_processed = Some(repo.space_rev().to_owned());
-                    }
-                }
-            }
-
-            if credential_rejected {
-                break;
-            }
-
-            if let Some(next_cursor) = repos_output.cursor {
-                let next_cur_str = next_cursor.to_string();
-                if next_cur_str.len() > MAX_CURSOR_LEN || seen_cursors.contains(&next_cur_str) {
-                    // A malformed or repeating listing is not resumed.
-                    start_over = true;
-                    break;
-                }
-                if seen_cursors.len() >= MAX_PAGES_PER_SWEEP {
-                    break;
-                }
-                seen_cursors.insert(next_cur_str.clone());
-                cursor = Some(next_cur_str);
-            } else {
-                start_over = true;
-                listing_complete = true;
-                break;
-            }
-        }
-        if listing_complete && !checkpoint_blocked {
-            if let Some(space_rev) = pending_rev.as_deref() {
-                crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
-            }
-        }
-
-        if start_over {
-            state.listing_resume.clear(&space_uri);
-        } else if let Some(space_rev) = last_processed {
-            state.listing_resume.set(&space_uri, space_rev);
-        }
-
-        // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
-        sqlx::query(
-            r#"
-            INSERT INTO circle_sweep_checkpoint (checkpoint_key, last_space_uri, updated_at)
-            VALUES ('revision_sweep', $1, now())
-            ON CONFLICT (checkpoint_key) DO UPDATE SET last_space_uri = EXCLUDED.last_space_uri, updated_at = now()
-            "#,
+        sweep_space(
+            state,
+            space_uri,
+            &mut summary,
+            sweep_start,
+            &mut total_bytes_processed,
+            &mut shutdown_rx,
         )
-        .bind(&space_uri)
-        .execute(&state.db)
-        .await
-        .map_err(AppError::Database)?;
+        .await?;
     }
 
     Ok(summary)
@@ -2056,7 +2071,19 @@ fn queue_catchup(state: AppState, space: String, reauthorize: bool) {
                         return;
                     }
                 }
-                if let Err(error) = sweep_once(&state).await {
+                let mut summary = SweepSummary::default();
+                let mut total_bytes_processed = 0;
+                let mut shutdown_rx = None;
+                if let Err(error) = sweep_space(
+                    &state,
+                    space.clone(),
+                    &mut summary,
+                    std::time::Instant::now(),
+                    &mut total_bytes_processed,
+                    &mut shutdown_rx,
+                )
+                .await
+                {
                     tracing::warn!(
                         %error,
                         space = %crate::access::space_fingerprint(&space),
