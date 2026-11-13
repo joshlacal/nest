@@ -1064,6 +1064,13 @@ pub async fn activate_circle(
         ));
     }
 
+    let registration_existed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_notify_registrations WHERE space_uri = $1)",
+    )
+    .bind(space_uri)
+    .fetch_one(&state.db)
+    .await?;
+    let result: Result<CircleSummary, AppError> = async {
     // 3. Acquire a Space credential under the calling user's OAuth session first.
     let cred = ensure_space_credential(state, space_uri, Some(user_did)).await.map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "Failed to acquire space credential during activation");
@@ -1190,15 +1197,31 @@ pub async fn activate_circle(
         catbird_atproto::jacquard_common::types::string::Did::new(SmolStr::new(&authority_did))
             .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
 
-    Ok(CircleSummary {
-        circle_id: circle_tid,
-        uri: space_ref,
-        name: SmolStr::new(&display_name),
-        owner: owner_did,
-        member_count: Some(members.len() as i64),
-        muted: Some(false),
-        extra_data: None,
-    })
+        Ok(CircleSummary {
+            circle_id: circle_tid,
+            uri: space_ref,
+            name: SmolStr::new(&display_name),
+            owner: owner_did,
+            member_count: Some(members.len() as i64),
+            muted: Some(false),
+            extra_data: None,
+        })
+    }
+    .await;
+    if result.is_err() && !registration_existed {
+        sqlx::query(
+            "DELETE FROM circle_notify_registrations r \
+             WHERE r.space_uri = $1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM circles c \
+                   WHERE c.space_uri = r.space_uri AND c.deleted_at IS NULL \
+               )",
+        )
+        .bind(space_uri)
+        .execute(&state.db)
+        .await?;
+    }
+    result
 }
 /// Ensure an active Space credential is available in the CredentialStore for the given space_uri.
 ///
@@ -1216,10 +1239,7 @@ pub async fn ensure_space_credential(
     }
 
     let _lock_guard = state.space_locks.acquire(space_uri).await;
-    let notify_endpoint = state
-        .config
-        .notify_endpoint()
-        .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
+    let notify_endpoint = state.config.notify_endpoint();
 
     ensure_space_credential_from_parts(
         &state.db,
@@ -1229,7 +1249,7 @@ pub async fn ensure_space_credential(
         &state.oauth_service,
         &state.http_client,
         space_uri,
-        Some(&notify_endpoint),
+        Some(notify_endpoint),
         preferred_user_did,
     )
     .await
@@ -1259,10 +1279,7 @@ pub async fn ensure_space_credential_for_request(
     }
 
     let _lock_guard = state.space_locks.acquire(space_uri).await;
-    let notify_endpoint = state
-        .config
-        .notify_endpoint()
-        .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
+    let notify_endpoint = state.config.notify_endpoint();
     // Another request may have acquired, or failed to acquire, while this one waited.
     if state
         .credential_store
@@ -1279,7 +1296,7 @@ pub async fn ensure_space_credential_for_request(
         &state.oauth_service,
         &state.http_client,
         space_uri,
-        Some(&notify_endpoint),
+        Some(notify_endpoint),
         preferred_user_did,
     )
     .await;
@@ -1417,9 +1434,15 @@ pub async fn ensure_space_credential_from_parts(
     // every credential renewal.
     let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
     let notify = match notify_endpoint {
-        Some(endpoint) => {
-            Some(crate::notify::get_or_create_registration(db, space_uri, endpoint).await?)
-        }
+        Some(endpoint) => Some(
+            crate::notify::get_or_create_registration(
+                db,
+                &oauth_service.session_encryption_key,
+                space_uri,
+                endpoint,
+            )
+            .await?,
+        ),
         None => None,
     };
     let exchanged = space_client
@@ -2729,7 +2752,7 @@ mod tests {
 
         // Activation included a stable endpoint and opaque token in
         // authorizeSpaceSync.
-        let registration: Option<(String, String)> = sqlx::query_as(
+        let registration: Option<(String, Vec<u8>)> = sqlx::query_as(
             "SELECT endpoint, token FROM circle_notify_registrations WHERE space_uri = $1",
         )
         .bind(TEST_SPACE_URI)
@@ -2738,7 +2761,13 @@ mod tests {
         .unwrap();
         let (endpoint, token) = registration.expect("activation must configure notifications");
         assert_eq!(endpoint, state.config.appview_base_url);
-        assert!(!token.is_empty());
+        assert!(!crate::oauth::decrypt_secret(
+            &state.oauth_service.session_encryption_key,
+            TEST_SPACE_URI,
+            &token,
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2931,6 +2960,17 @@ mod tests {
                 .unwrap();
 
         assert!(circle_row.is_none(), "NO circles row must exist in DB");
+        let registration_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM circle_notify_registrations WHERE space_uri = $1)",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !registration_exists,
+            "a failed activation must remove its pre-created registration"
+        );
     }
 
     #[test]

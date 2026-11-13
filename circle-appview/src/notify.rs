@@ -12,25 +12,36 @@ use sqlx::PgPool;
 
 use crate::error::{AppError, AuthReason};
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotifyRegistration {
     pub endpoint: String,
     pub token: String,
 }
 
+impl std::fmt::Debug for NotifyRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifyRegistration")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Load the stable token for `space`, creating it on first authorization.
 /// Updating the public endpoint never rotates the token.
 pub async fn get_or_create_registration(
     db: &PgPool,
+    encryption_key: &[u8; 32],
     space: &str,
     endpoint: &str,
 ) -> Result<NotifyRegistration, AppError> {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     let candidate = URL_SAFE_NO_PAD.encode(bytes);
+    let encrypted = crate::oauth::encrypt_secret(encryption_key, space, candidate.as_bytes())?;
 
-    let (endpoint, token): (String, String) = sqlx::query_as(
+    let (endpoint, encrypted_token): (String, Vec<u8>) = sqlx::query_as(
         r#"
         INSERT INTO circle_notify_registrations (space_uri, endpoint, token, updated_at)
         VALUES ($1, $2, $3, now())
@@ -42,19 +53,30 @@ pub async fn get_or_create_registration(
     )
     .bind(space)
     .bind(endpoint)
-    .bind(candidate)
+    .bind(encrypted)
     .fetch_one(db)
     .await?;
+    let token = String::from_utf8(crate::oauth::decrypt_secret(
+        encryption_key,
+        space,
+        &encrypted_token,
+    )?)
+    .map_err(|_| AppError::Internal("Stored notification token is not UTF-8".into()))?;
 
     Ok(NotifyRegistration { endpoint, token })
 }
 
 /// Authenticate a token without a data-dependent plaintext comparison.
-pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), AppError> {
+pub async fn authenticate(
+    db: &PgPool,
+    encryption_key: &[u8; 32],
+    space: &str,
+    token: &str,
+) -> Result<(), AppError> {
     if token.is_empty() || token.len() > 512 {
         return Err(AppError::Unauthorized(AuthReason::InvalidToken));
     }
-    let stored: Option<String> =
+    let stored: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT token FROM circle_notify_registrations WHERE space_uri = $1")
             .bind(space)
             .fetch_optional(db)
@@ -64,7 +86,15 @@ pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), A
     // 32 random bytes encoded as 43 base64url characters.
     const DUMMY_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let known_space = stored.is_some();
-    let stored = stored.as_deref().unwrap_or(DUMMY_TOKEN);
+    let decrypted;
+    let stored = match stored {
+        Some(envelope) => {
+            decrypted = crate::oauth::decrypt_secret(encryption_key, space, &envelope)?;
+            std::str::from_utf8(&decrypted)
+                .map_err(|_| AppError::Internal("Stored notification token is not UTF-8".into()))?
+        }
+        None => DUMMY_TOKEN,
+    };
     let mut expected = Hmac::<Sha256>::new_from_slice(stored.as_bytes())
         .map_err(|_| AppError::Unauthorized(AuthReason::InvalidToken))?;
     expected.update(space.as_bytes());
@@ -151,14 +181,6 @@ pub async fn catchup_state(
     .unwrap_or((None, None)))
 }
 
-pub async fn remove_registration(db: &PgPool, space: &str) -> Result<(), AppError> {
-    sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
-        .bind(space)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmRegistrationInput {
@@ -176,7 +198,13 @@ pub async fn confirm_registration_handler(
             "challenge exceeds 512 characters".into(),
         ));
     }
-    authenticate(&state.db, &input.space, &input.token).await?;
+    authenticate(
+        &state.db,
+        &state.oauth_service.session_encryption_key,
+        &input.space,
+        &input.token,
+    )
+    .await?;
     Ok(axum::Json(serde_json::json!({
         "challenge": input.challenge,
     })))

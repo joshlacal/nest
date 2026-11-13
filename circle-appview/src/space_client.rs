@@ -59,7 +59,7 @@ pub enum SpaceAppAccess {
 }
 
 impl SpaceAppAccess {
-    /// Maps a memberspace policy's `allowedApps` (October 29 Spaces alpha).
+    /// Maps a memberspace policy's `allowedApps` (November 12 Spaces alpha).
     /// Absent means any app may read (`Open`). An array is an allow-list, and an
     /// empty array is an authoritative revocation. Anything else, including an
     /// array with no readable entries, degrades to `Unknown`, which denies
@@ -129,10 +129,10 @@ impl SpacePolicy {
         }
     }
 
-    /// Maps the October 29 policy union onto the read/write/app-access model the
+    /// Maps the November 12 policy union onto the read/write/app-access model the
     /// Circle AppView already enforces. Only a memberspace without public read or
     /// write is supported; managedspace, personalspace and unknown `$type`s are
-    /// refused without purging, as unsupported Oct 22 policies were.
+    /// refused without purging, as older unsupported policies were.
     pub fn parse_policy(policy: &serde_json::Value) -> ParsedSpacePolicy {
         let type_str = policy.get("$type").and_then(serde_json::Value::as_str);
         match type_str {
@@ -179,15 +179,8 @@ pub enum WriterUpdate {
     RepoWrite(RepoWrite),
     #[serde(rename = "com.atproto.space.defs#repoRemoved")]
     RepoRemoved(RepoRemoved),
-}
-
-impl WriterUpdate {
-    pub fn space_rev(&self) -> &str {
-        match self {
-            Self::RepoWrite(update) => &update.space_rev,
-            Self::RepoRemoved(update) => &update.space_rev,
-        }
-    }
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2007,38 +2000,6 @@ impl SpaceClient {
         Err(AppError::Unauthorized(AuthReason::InvalidSpaceMac))
     }
 
-    /// `com.atproto.space.getLatestCommit` on the repo's host; audience is the
-    /// repo owner's DID.
-    pub async fn get_latest_commit(
-        &self,
-        service_endpoint: &str,
-        space_uri: &str,
-        repo_did: &str,
-        space_credential: &str,
-        signing_key: &p256::ecdsa::SigningKey,
-    ) -> Result<catbird_atproto::generated::com_atproto::space::Commit, AppError> {
-        let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.getLatestCommit")?;
-        for retry in 0..2 {
-            let auth = self
-                .mac_auth(signing_key, space_credential, repo_did, retry > 0)
-                .await?;
-            let result = self
-                .transport
-                .get_latest_commit(&xrpc_url, &auth, space_uri, repo_did)
-                .await;
-            if retry == 0
-                && matches!(
-                    &result,
-                    Err(AppError::Unauthorized(AuthReason::InvalidSpaceMac))
-                )
-            {
-                continue;
-            }
-            return result;
-        }
-        Err(AppError::Unauthorized(AuthReason::InvalidSpaceMac))
-    }
-
     /// `com.atproto.space.getBlob` on the repo's host; audience is the repo
     /// owner's DID.
     pub async fn get_blob(
@@ -2286,7 +2247,7 @@ pub fn construct_xrpc_url(service_endpoint: &str, method: &str) -> Result<url::U
 }
 
 pub const UNBOUND_CREDENTIAL_MESSAGE: &str =
-    "Space host issues credentials without an HTTP message signature key binding (cnf.kid); Circles require a space host on the atproto Spaces 2026-10-22 alpha";
+    "Space host issues credentials without an HTTP message signature key binding (cnf.kid); Circles require a space host on the atproto Spaces 2026-11-12 alpha";
 
 /// Lifetime the reference authority gives a space credential, and the mock's.
 pub const DEFAULT_CREDENTIAL_LIFETIME_SECS: i64 = 600;
@@ -2321,7 +2282,7 @@ pub fn validate_space_credential(
 
     // Host compatibility gate, checked before anything else so the declared
     // error surfaces whatever else differs: space credentials must be bound to
-    // the exchange's HTTP signature key (cnf.kid, atproto 2026-10-22 alpha).
+    // the exchange's HTTP signature key (cnf.kid, atproto 2026-11-12 alpha).
     // Bearer credentials (Swan 2026-08-15 / 2026-09-10) and DPoP-bound ones
     // (cnf.jkt: the reference before 2026-10-01, Swan 2026-09-19) are refused.
     let cnf_kid = claims
@@ -2416,19 +2377,6 @@ struct XrpcErrorPayload {
     message: Option<String>,
 }
 
-/// The [`AuthReason`] for an XRPC error code that rejects the space credential
-/// itself. Retrying with that credential cannot succeed: the caller evicts it and
-/// reacquires one only through a still-authorized session.
-pub fn credential_rejection_reason(code: &str) -> Option<AuthReason> {
-    match code {
-        "CredentialRevoked" => Some(AuthReason::CredentialRevoked),
-        "BadSpaceSignature" => Some(AuthReason::BadSpaceSignature),
-        "BadSpaceAudience" => Some(AuthReason::BadSpaceAudience),
-        "InvalidSpaceMac" => Some(AuthReason::InvalidSpaceMac),
-        _ => None,
-    }
-}
-
 /// Map every declared XRPC error, while retaining the credential-specific
 /// reasons callers use to evict a rejected credential.
 async fn credential_use_error(response: reqwest::Response, _op: &str) -> AppError {
@@ -2476,7 +2424,6 @@ pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
         "RepoSuspended" => AppError::Forbidden("RepoSuspended".into()),
         "RepoNotFound" => AppError::NotFound("RepoNotFound".into()),
         "InvalidCursor" => AppError::InvalidRequest("InvalidCursor".into()),
-        "UpstreamFailure" => AppError::Internal("UpstreamFailure".into()),
         "RegistrationNotConfirmed" => AppError::Internal(
             "RegistrationNotConfirmed: check APPVIEW_BASE_URL public reachability".into(),
         ),
@@ -2531,6 +2478,23 @@ pub fn mint_mock_space_credential(
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+
+    #[test]
+    fn list_writers_open_union_accepts_unknown_entries() {
+        let page: ListWritersOutput = serde_json::from_value(json!({
+            "repos": [
+                {"$type": "com.example.future#writerUpdate", "future": true},
+                {
+                    "$type": "com.atproto.space.defs#repoRemoved",
+                    "repo": "did:plc:known",
+                    "spaceRev": "3l7knownrev01"
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(page.repos[0], WriterUpdate::Unknown));
+        assert!(matches!(page.repos[1], WriterUpdate::RepoRemoved(_)));
+    }
 
     #[test]
     fn test_parse_xrpc_error_5xx_with_semantic_code_is_internal() {
@@ -3080,9 +3044,6 @@ mod tests {
         let _ = client
             .list_repo_ops(ep, SPACE, REPO, None, None, "cred", &key)
             .await;
-        let _ = client
-            .get_latest_commit(ep, SPACE, REPO, "cred", &key)
-            .await;
         let _ = client.get_blob(ep, SPACE, REPO, CID, "cred", &key).await;
 
         let audiences: Vec<(&str, Option<String>)> = mock
@@ -3105,7 +3066,6 @@ mod tests {
                 ("com.atproto.space.listWriters", authority),
                 ("com.atproto.space.getRepo", repo.clone()),
                 ("com.atproto.space.listRepoOps", repo.clone()),
-                ("com.atproto.space.getLatestCommit", repo.clone()),
                 ("com.atproto.space.getBlob", repo),
             ]
         );
@@ -3362,7 +3322,7 @@ mod tests {
         mock.reject_credential_uses(Some(AuthReason::InvalidSpaceMac));
         assert!(matches!(
             client
-                .get_latest_commit("https://host.example", SPACE, REPO, "cred", &key)
+                .get_repo("https://host.example", SPACE, REPO, None, "cred", &key,)
                 .await,
             Err(AppError::Unauthorized(AuthReason::InvalidSpaceMac))
         ));

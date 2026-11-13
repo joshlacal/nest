@@ -283,9 +283,7 @@ impl SyncEngine {
         let notify_endpoint = self
             .lifecycle_state
             .as_ref()
-            .map(|state| state.config.notify_endpoint())
-            .transpose()
-            .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
+            .map(|state| state.config.notify_endpoint());
 
         let cred = match self.credential_store.get(space_uri).await {
             Some(c) => c,
@@ -299,7 +297,7 @@ impl SyncEngine {
                         oauth,
                         &self.http_client,
                         space_uri,
-                        notify_endpoint.as_deref(),
+                        notify_endpoint,
                         Some(author_did),
                     )
                     .await?
@@ -1766,20 +1764,20 @@ async fn sweep_space(
                 break;
             }
 
-            summary.repos_checked += 1;
-            let applied = match repo {
-                WriterUpdate::RepoRemoved(update) => {
-                    apply_repo_removed(&state.db, &space_uri, &update.repo).await
-                }
+            let (applied, space_rev) = match repo {
+                WriterUpdate::RepoRemoved(update) => (
+                    apply_repo_removed(&state.db, &space_uri, &update.repo).await,
+                    update.space_rev.as_str(),
+                ),
                 WriterUpdate::RepoWrite(update) => {
                     let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
-                            "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
-                        )
-                        .bind(&space_uri)
-                        .bind(&update.repo)
-                        .fetch_optional(&state.db)
-                        .await
-                        .unwrap_or(None);
+                        "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+                    )
+                    .bind(&space_uri)
+                    .bind(&update.repo)
+                    .fetch_optional(&state.db)
+                    .await
+                    .unwrap_or(None);
                     let needs_sync = match db_sync {
                         Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
                             let digest: [u8; 32] = Sha256::digest(&last_hash).into();
@@ -1787,7 +1785,7 @@ async fn sweep_space(
                         }
                         _ => true,
                     };
-                    if needs_sync {
+                    let applied = if needs_sync {
                         let result = sync_engine
                             .sync_repo_with_expected_commit(
                                 &space_uri,
@@ -1804,12 +1802,14 @@ async fn sweep_space(
                         result
                     } else {
                         Ok(())
-                    }
+                    };
+                    (applied, update.space_rev.as_str())
                 }
+                WriterUpdate::Unknown => continue,
             };
+            summary.repos_checked += 1;
             match applied {
                 Ok(()) => {
-                    let space_rev = repo.space_rev();
                     if !checkpoint_blocked {
                         crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
                     }
@@ -1831,7 +1831,7 @@ async fn sweep_space(
                     }
                     // In-memory budget resume may pass this entry; durable
                     // catch-up remains at the last successful checkpoint.
-                    last_processed = Some(repo.space_rev().to_owned());
+                    last_processed = Some(space_rev.to_owned());
                 }
             }
         }
@@ -2149,7 +2149,13 @@ pub async fn notify_space_update_handler(
 ) -> Result<axum::response::Response, AppError> {
     let input: NotifySpaceUpdateInput = serde_json::from_slice(&body)
         .map_err(|e| AppError::InvalidRequest(format!("Invalid notifySpaceUpdate body: {e}")))?;
-    crate::notify::authenticate(&state.db, &input.space, &input.token).await?;
+    crate::notify::authenticate(
+        &state.db,
+        &state.oauth_service.session_encryption_key,
+        &input.space,
+        &input.token,
+    )
+    .await?;
     let update_type = input
         .update
         .get("$type")

@@ -507,11 +507,16 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
         mock_transport,
     }
 }
-async fn callback_token(pool: &PgPool) -> String {
-    circle_appview::notify::get_or_create_registration(pool, SPACE_URI, "http://127.0.0.1:3002")
-        .await
-        .unwrap()
-        .token
+async fn callback_token(setup: &SyncTestSetup) -> String {
+    circle_appview::notify::get_or_create_registration(
+        &setup.state.db,
+        &setup.state.oauth_service.session_encryption_key,
+        SPACE_URI,
+        "http://127.0.0.1:3002",
+    )
+    .await
+    .unwrap()
+    .token
 }
 
 fn repo_write_update(
@@ -837,7 +842,7 @@ async fn notify_space_update_repo_write_triggers_immediate_sync(pool: PgPool) {
         },
     );
 
-    let token = callback_token(&pool).await;
+    let token = callback_token(&setup).await;
     let update = repo_write_update(OWNER_DID, rev, &lthash.digest(), "3l7spacerev2a", None);
     let app = circle_appview::routes::create_router(setup.state.clone());
     use axum::http::Request;
@@ -1435,7 +1440,7 @@ fn notify_space_update_body_parses_the_nov12_shape() {
 #[sqlx::test(migrations = "./migrations")]
 async fn notify_space_update_wrong_token_and_unknown_space_leak_same_error(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
-    let token = callback_token(&pool).await;
+    let token = callback_token(&setup).await;
     let update = repo_write_update(OWNER_DID, "3l7rev234567a", &[0; 32], "3l7spacerev2a", None);
     let app = circle_appview::routes::create_router(setup.state.clone());
     use axum::body::to_bytes;
@@ -2173,7 +2178,7 @@ async fn notify_space_update_verifies_expected_hash_before_advancing(pool: PgPoo
             extra_data: None,
         },
     );
-    let token = callback_token(&pool).await;
+    let token = callback_token(&setup).await;
 
     let mismatch = circle_appview::sync::notify_space_update_handler(
         axum::extract::State(setup.state.clone()),
@@ -2540,7 +2545,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
 async fn notify_space_update_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
     let app = circle_appview::routes::create_router(setup.state.clone());
-    let token = callback_token(&pool).await;
+    let token = callback_token(&setup).await;
     use axum::http::Request;
     use tower::ServiceExt;
 
@@ -3983,8 +3988,8 @@ fn credential_use_methods(setup: &SyncTestSetup) -> Vec<&'static str> {
 }
 
 /// Persist the stable token that authorizeSpaceSync carries on every renewal.
-async fn register_notify_fresh(_setup: &SyncTestSetup, pool: &PgPool) {
-    let _ = callback_token(pool).await;
+async fn create_notify_registration(setup: &SyncTestSetup) {
+    let _ = callback_token(setup).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -4018,7 +4023,7 @@ async fn rejected_credential_stops_repo_sync_without_get_repo_fallback(pool: PgP
 async fn rejected_credential_stops_the_sweep_and_is_never_retried(pool: PgPool) {
     use circle_appview::error::AuthReason;
     let setup = setup_sync_test(pool.clone()).await;
-    register_notify_fresh(&setup, &pool).await;
+    create_notify_registration(&setup).await;
     setup.mock_transport.set_list_writers_response(
         SPACE_URI,
         ListWritersOutput {
@@ -4101,7 +4106,7 @@ fn writer_entry(i: usize) -> WriterUpdate {
 async fn sweep_resumes_a_budget_cut_listing_from_its_last_processed_space_rev(pool: PgPool) {
     use circle_appview::sync::MAX_REPOS_PER_SWEEP;
     let setup = setup_sync_test(pool.clone()).await;
-    register_notify_fresh(&setup, &pool).await;
+    create_notify_registration(&setup).await;
     let writers = MAX_REPOS_PER_SWEEP + 5;
     assert!(space_rev(0) < space_rev(1) && space_rev(1) < space_rev(writers - 1));
 

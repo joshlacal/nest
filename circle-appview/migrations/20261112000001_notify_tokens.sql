@@ -7,7 +7,7 @@ CREATE TABLE circle_notify_registrations (
     -- Confirmation may arrive during authorizeSpaceSync, before local activation creates circles.
     space_uri TEXT PRIMARY KEY,
     endpoint TEXT NOT NULL,
-    token TEXT NOT NULL CHECK (char_length(token) BETWEEN 1 AND 512),
+    token BYTEA NOT NULL CHECK (octet_length(token) BETWEEN 29 AND 1024),
     checkpoint_rev TEXT,
     pending_rev TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

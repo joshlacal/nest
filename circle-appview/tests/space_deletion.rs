@@ -244,7 +244,7 @@ fn space_host_error(code: &str) -> Result<String, String> {
     Err(json!({"error": code, "message": "from the space host"}).to_string())
 }
 
-async fn notify_space_deleted(setup: &Setup, token: &str) -> Result<StatusCode, AppError> {
+async fn send_space_deleted_update(setup: &Setup, token: &str) -> Result<StatusCode, AppError> {
     let body = Bytes::from(
         serde_json::to_vec(&json!({
             "space": SPACE_URI,
@@ -414,6 +414,7 @@ async fn space_deleted_update_reauthorizes_without_purging_a_live_space(pool: Pg
     seed_active_circle(&pool).await;
     let registration = circle_appview::notify::get_or_create_registration(
         &pool,
+        &setup.state.oauth_service.session_encryption_key,
         SPACE_URI,
         "http://127.0.0.1:3002",
     )
@@ -421,7 +422,7 @@ async fn space_deleted_update_reauthorizes_without_purging_a_live_space(pool: Pg
     .unwrap();
 
     assert_eq!(
-        notify_space_deleted(&setup, &registration.token)
+        send_space_deleted_update(&setup, &registration.token)
             .await
             .unwrap(),
         StatusCode::OK
@@ -440,6 +441,7 @@ async fn space_deleted_update_without_session_purges_only_on_declared_deletion(p
     seed_active_circle(&pool).await;
     let registration = circle_appview::notify::get_or_create_registration(
         &pool,
+        &setup.state.oauth_service.session_encryption_key,
         SPACE_URI,
         "http://127.0.0.1:3002",
     )
@@ -456,7 +458,7 @@ async fn space_deleted_update_without_session_purges_only_on_declared_deletion(p
         setup
             .mock_transport
             .set_credential_response(SPACE_URI, space_host_error(code));
-        notify_space_deleted(&setup, &registration.token)
+        send_space_deleted_update(&setup, &registration.token)
             .await
             .expect_err("an unconfirmed deletion must retain local data");
         assert!(!tombstoned(&pool).await, "{code} must not tombstone");
@@ -467,7 +469,7 @@ async fn space_deleted_update_without_session_purges_only_on_declared_deletion(p
         .mock_transport
         .set_credential_response(SPACE_URI, space_host_error("SpaceDeleted"));
     assert_eq!(
-        notify_space_deleted(&setup, &registration.token)
+        send_space_deleted_update(&setup, &registration.token)
             .await
             .unwrap(),
         StatusCode::OK
@@ -485,6 +487,7 @@ async fn space_deleted_update_purges_only_after_declared_space_deleted(pool: PgP
     seed_active_circle(&pool).await;
     let registration = circle_appview::notify::get_or_create_registration(
         &pool,
+        &setup.state.oauth_service.session_encryption_key,
         SPACE_URI,
         "http://127.0.0.1:3002",
     )
@@ -494,7 +497,7 @@ async fn space_deleted_update_purges_only_after_declared_space_deleted(pool: PgP
     setup
         .mock_transport
         .set_credential_response(SPACE_URI, space_host_error("RepoDeactivated"));
-    let error = notify_space_deleted(&setup, &registration.token)
+    let error = send_space_deleted_update(&setup, &registration.token)
         .await
         .expect_err("repo suspension is not deletion");
     assert!(matches!(error, AppError::Forbidden(_)));
@@ -505,7 +508,7 @@ async fn space_deleted_update_purges_only_after_declared_space_deleted(pool: PgP
         .mock_transport
         .set_credential_response(SPACE_URI, space_host_error("SpaceDeleted"));
     assert_eq!(
-        notify_space_deleted(&setup, &registration.token)
+        send_space_deleted_update(&setup, &registration.token)
             .await
             .unwrap(),
         StatusCode::OK

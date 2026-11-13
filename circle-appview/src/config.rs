@@ -76,9 +76,11 @@ impl Config {
             ));
         }
 
-        let appview_base_url = env::var("APPVIEW_BASE_URL")
-            .or_else(|_| env::var("PUBLIC_URL"))
-            .unwrap_or_else(|_| format!("http://{host}:{port}"));
+        let appview_base_url = validate_appview_base_url(
+            &env::var("APPVIEW_BASE_URL")
+                .or_else(|_| env::var("PUBLIC_URL"))
+                .unwrap_or_else(|_| format!("http://{host}:{port}")),
+        )?;
 
         let oauth_key_id = env::var("OAUTH_KEY_ID")
             .ok()
@@ -134,37 +136,44 @@ impl Config {
     }
 }
 
+fn validate_appview_base_url(raw: &str) -> Result<String, anyhow::Error> {
+    let mut endpoint = url::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("APPVIEW_BASE_URL must be a valid URL: {e}"))?;
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "APPVIEW_BASE_URL must not contain userinfo, a query, or a fragment"
+        ));
+    }
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("APPVIEW_BASE_URL must include a host"))?;
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+    let loopback =
+        host.eq_ignore_ascii_case("localhost") || host_ip.is_some_and(|ip| ip.is_loopback());
+    if host_ip.is_some_and(|ip| crate::auth::is_private_ip(&ip) && !ip.is_loopback()) {
+        return Err(anyhow::anyhow!(
+            "APPVIEW_BASE_URL must use a public host or a loopback development address"
+        ));
+    }
+    if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
+        return Err(anyhow::anyhow!(
+            "APPVIEW_BASE_URL must use HTTPS (HTTP is allowed only for loopback development)"
+        ));
+    }
+    let path = endpoint.path().trim_end_matches('/').to_owned();
+    endpoint.set_path(&path);
+    Ok(endpoint.to_string().trim_end_matches('/').to_owned())
+}
+
 impl Config {
     /// Public base URL registered for `confirmRegistration` and
-    /// `notifySpaceUpdate`. The existing AppView URL is already the service's
-    /// externally reachable base URL, so notification registration does not
-    /// need a second origin setting.
-    pub fn notify_endpoint(&self) -> Result<String, anyhow::Error> {
-        let mut endpoint = url::Url::parse(&self.appview_base_url)
-            .map_err(|e| anyhow::anyhow!("APPVIEW_BASE_URL must be a valid URL: {e}"))?;
-        if !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(anyhow::anyhow!(
-                "APPVIEW_BASE_URL must not contain userinfo, a query, or a fragment"
-            ));
-        }
-        let loopback = endpoint.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
-            return Err(anyhow::anyhow!(
-                "APPVIEW_BASE_URL must use HTTPS (HTTP is allowed only for loopback development)"
-            ));
-        }
-        let path = endpoint.path().trim_end_matches('/').to_owned();
-        endpoint.set_path(&path);
-        Ok(endpoint.to_string().trim_end_matches('/').to_owned())
+    /// `notifySpaceUpdate`. It is normalized and validated during startup.
+    pub fn notify_endpoint(&self) -> &str {
+        &self.appview_base_url
     }
 }
 
@@ -447,7 +456,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::try_load_signing_key;
+    use super::{try_load_signing_key, validate_appview_base_url};
 
     /// `openssl ecparam -genkey -name prime256v1 -noout` emits SEC1, not PKCS#8.
     /// Failing to load it used to fall back to an ephemeral key, which silently
@@ -513,5 +522,29 @@ mod tests {
                                                                                    // 31 bytes in hex (62 hex chars)
         let short_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
         assert!(super::parse_session_encryption_key(short_hex).is_err());
+    }
+
+    #[test]
+    fn validates_appview_base_url_at_startup() {
+        assert_eq!(
+            validate_appview_base_url("https://appview.example/path/").unwrap(),
+            "https://appview.example/path"
+        );
+        assert_eq!(
+            validate_appview_base_url("http://127.0.0.1:3000/").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        for invalid in [
+            "http://appview.example",
+            "https://10.0.0.1",
+            "http://0.0.0.0:3000",
+            "https://user@appview.example",
+            "https://appview.example?query=1",
+        ] {
+            assert!(
+                validate_appview_base_url(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 }

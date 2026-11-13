@@ -170,10 +170,15 @@ async fn setup(pool: PgPool) -> Setup {
     Setup { state, transport }
 }
 
-async fn registration(pool: &PgPool) -> NotifyRegistration {
-    notify::get_or_create_registration(pool, SPACE_URI, "http://127.0.0.1:3002")
-        .await
-        .unwrap()
+async fn registration(setup: &Setup) -> NotifyRegistration {
+    notify::get_or_create_registration(
+        &setup.state.db,
+        &setup.state.oauth_service.session_encryption_key,
+        SPACE_URI,
+        "http://127.0.0.1:3002",
+    )
+    .await
+    .unwrap()
 }
 
 async fn send_update(state: &AppState, token: &str, update: Value) -> Result<StatusCode, AppError> {
@@ -193,15 +198,39 @@ async fn send_update(state: &AppState, token: &str, update: Value) -> Result<Sta
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPool) {
     let setup = setup(pool.clone()).await;
-    let first = registration(&pool).await;
-    let second = notify::get_or_create_registration(&pool, SPACE_URI, "https://new.example")
-        .await
-        .unwrap();
+    let first = registration(&setup).await;
+    let second = notify::get_or_create_registration(
+        &pool,
+        &setup.state.oauth_service.session_encryption_key,
+        SPACE_URI,
+        "https://new.example",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         first.token, second.token,
         "endpoint changes must not rotate tokens"
     );
     assert_eq!(second.endpoint, "https://new.example");
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT token FROM circle_notify_registrations WHERE space_uri = $1")
+            .bind(SPACE_URI)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(stored, first.token.as_bytes());
+    assert_eq!(
+        circle_appview::oauth::decrypt_secret(
+            &setup.state.oauth_service.session_encryption_key,
+            SPACE_URI,
+            &stored,
+        )
+        .unwrap(),
+        first.token.as_bytes(),
+    );
+    let debug = format!("{first:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains(&first.token));
 
     let Json(output) = notify::confirm_registration_handler(
         State(setup.state.clone()),
@@ -249,8 +278,8 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn checkpoint_never_moves_backwards(pool: PgPool) {
-    let _setup = setup(pool.clone()).await;
-    let _registration = registration(&pool).await;
+    let setup = setup(pool.clone()).await;
+    let _registration = registration(&setup).await;
 
     notify::checkpoint(&pool, SPACE_URI, "3l7spacerev09")
         .await
@@ -278,7 +307,7 @@ async fn checkpoint_never_moves_backwards(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn repo_write_requires_token_and_records_revision_gap(pool: PgPool) {
     let setup = setup(pool.clone()).await;
-    let registration = registration(&pool).await;
+    let registration = registration(&setup).await;
     notify::checkpoint(&pool, SPACE_URI, "3l7checkpoint1")
         .await
         .unwrap();
@@ -323,7 +352,7 @@ async fn repo_write_requires_token_and_records_revision_gap(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn repo_removed_drops_only_writer_state_without_deleting_membership_or_history(pool: PgPool) {
     let setup = setup(pool.clone()).await;
-    let registration = registration(&pool).await;
+    let registration = registration(&setup).await;
     sqlx::query(
         "INSERT INTO circle_repo_sync_state (space_uri, author_did, last_rev, last_hash, last_synced_at) VALUES ($1, $2, '3l7oldrev', $3, now())",
     )
@@ -396,7 +425,7 @@ async fn repo_removed_drops_only_writer_state_without_deleting_membership_or_his
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_expired_reauthorizes_and_catches_up_with_list_writers(pool: PgPool) {
     let setup = setup(pool.clone()).await;
-    let registration = registration(&pool).await;
+    let registration = registration(&setup).await;
     sqlx::query(
         "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) \
          VALUES ($1, '3l7notifyreg2', $2, 'Other Notify Circle', now())",
@@ -520,6 +549,13 @@ async fn token_migration_replaces_old_registration_rows(pool: PgPool) {
     assert!(columns.iter().any(|column| column == "endpoint"));
     assert!(columns.iter().any(|column| column == "token"));
     assert!(!columns.iter().any(|column| column == "service"));
+    let token_type: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'circle_notify_registrations' AND column_name = 'token'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(token_type, "bytea");
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM circle_notify_registrations")
         .fetch_one(&pool)
         .await
