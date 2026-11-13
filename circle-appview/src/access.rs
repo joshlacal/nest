@@ -300,7 +300,7 @@ pub struct DelegationTokenClaims {
     pub jti: String,
 }
 
-/// XRPC error a space host returns from getSpaceCredential once the space is
+/// XRPC error a space host returns from authorizeSpaceSync once the space is
 /// deleted. `parse_xrpc_error` maps it to `AppError::AccessRemoved(SPACE_DELETED)`.
 pub const SPACE_DELETED: &str = "SpaceDeleted";
 
@@ -347,11 +347,9 @@ pub fn is_space_deleted(err: &AppError) -> bool {
     matches!(err, AppError::AccessRemoved(code) if code == SPACE_DELETED)
 }
 
-/// A syncer that missed notifySpaceDeleted learns of the deletion at its next
-/// credential exchange and must delete every copy (permissioned-data proposal,
-/// "Space deletion"). Purges projections, the member cache, the credential and
-/// the notify registration, and tombstones the Circle so reads return
-/// `AccessRemoved` until the tombstone expires.
+/// A syncer that missed a `spaceDeleted` notification learns of the deletion at
+/// its next credential exchange. Purge projections, member cache, credential,
+/// and notification registration, then tombstone reads as `AccessRemoved`.
 pub async fn purge_deleted_space(db: &PgPool, credential_store: &CredentialStore, space_uri: &str) {
     match crate::purge::delete_space(db, credential_store, space_uri).await {
         Ok(()) => tracing::info!(
@@ -967,11 +965,10 @@ pub fn space_fingerprint(space_uri: &str) -> String {
 }
 
 /// Activation has already confirmed through the owner's getSpace that the Space
-/// exists. Since the October 29 Spaces alpha, an authority refuses a user its
-/// policy does not authorize with `SpaceNotFound` rather than `UserNotAuthorized`,
-/// and checks `allowedApps` only after the user, so a `SpaceNotFound` from the
-/// credential exchange here is a refusal. It keeps the `Forbidden` answer that
-/// `UserNotAuthorized` and `AppNotAuthorized` produce.
+/// exists. A Nov-12 authority refuses a user its policy does not authorize with
+/// `SpaceNotFound`, and checks `allowedApps` only after the user, so a
+/// `SpaceNotFound` from the credential exchange here is a refusal. It keeps the
+/// `Forbidden` answer that `AccountNotAuthorized` and `AppNotAuthorized` produce.
 fn activation_credential_error(e: AppError) -> AppError {
     match e {
         AppError::NotFound(code) if code == "SpaceNotFound" => AppError::Forbidden(
@@ -1683,6 +1680,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -1743,6 +1741,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -1826,6 +1825,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -1873,6 +1873,7 @@ mod tests {
             &http_client,
             TEST_SPACE_URI,
             None,
+            None,
         )
         .await
         .expect_err("Must fail when no session is held for user/member/authority");
@@ -1913,6 +1914,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             None,
         )
         .await
@@ -1967,6 +1969,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -2326,6 +2329,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -2643,18 +2647,19 @@ mod tests {
 
         assert_eq!(member_rows.len(), 2);
 
-        // Activation registered for notifications at the authority's space host
-        // with the configured service id (CIRCLES-06).
+        // Activation included a stable endpoint and opaque token in
+        // authorizeSpaceSync.
         let registration: Option<(String, String)> = sqlx::query_as(
-            "SELECT service, space_host_endpoint FROM circle_notify_registrations WHERE space_uri = $1",
+            "SELECT endpoint, token FROM circle_notify_registrations WHERE space_uri = $1",
         )
         .bind(TEST_SPACE_URI)
         .fetch_optional(&pool)
         .await
         .unwrap();
-        let (service, endpoint) = registration.expect("activation must register for notifications");
-        assert_eq!(service, state.config.notify_service_identifier());
-        assert_eq!(endpoint, pds_endpoint);
+        let (endpoint, token) =
+            registration.expect("activation must configure notifications");
+        assert_eq!(endpoint, state.config.appview_base_url);
+        assert!(!token.is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2857,8 +2862,8 @@ mod tests {
         }
         // Other refusals keep their existing mapping.
         assert!(matches!(
-            activation_credential_error(AppError::Forbidden("UserNotAuthorized".into())),
-            AppError::Forbidden(msg) if msg == "UserNotAuthorized"
+            activation_credential_error(AppError::Forbidden("AccountNotAuthorized".into())),
+            AppError::Forbidden(msg) if msg == "AccountNotAuthorized"
         ));
         assert!(matches!(
             activation_credential_error(AppError::AccessRemoved("SpaceDeleted".into())),

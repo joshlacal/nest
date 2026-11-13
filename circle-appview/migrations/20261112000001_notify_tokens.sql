@@ -4,7 +4,7 @@
 DROP TABLE IF EXISTS circle_notify_registrations;
 
 CREATE TABLE circle_notify_registrations (
-    space_uri TEXT PRIMARY KEY,
+    space_uri TEXT PRIMARY KEY REFERENCES circles(space_uri) ON DELETE CASCADE,
     endpoint TEXT NOT NULL,
     token TEXT NOT NULL CHECK (char_length(token) BETWEEN 1 AND 512),
     checkpoint_rev TEXT,

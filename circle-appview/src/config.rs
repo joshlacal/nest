@@ -114,16 +114,6 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-        // A leftover signature-policy variable from the retired commit fork is
-        // ignored; current reads always require request-specific response MACs.
-        if let Ok(policy) = env::var("COMMIT_VERIFICATION_POLICY")
-            .or_else(|_| env::var("CIRCLE_COMMIT_VERIFICATION_POLICY"))
-        {
-            tracing::warn!(
-                %policy,
-                "COMMIT_VERIFICATION_POLICY is obsolete and ignored; Spaces response MACs are always required"
-            );
-        }
 
         Ok(Self {
             host,
@@ -273,7 +263,7 @@ pub struct AppState {
     pub credential_store: Arc<CredentialStore>,
     pub space_client: Arc<SpaceClient>,
     pub space_locks: Arc<crate::access::SpaceLockManager>,
-    /// Where the revision sweep resumes budget-cut listRepos listings.
+    /// Where the revision sweep resumes budget-cut listWriters listings.
     pub listing_resume: Arc<crate::sync::ListingResumePoints>,
     pub profile_hydrator: Arc<crate::hydration::ProfileHydrator>,
     pub oauth_service: Arc<OAuthService>,

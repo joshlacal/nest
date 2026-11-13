@@ -43,11 +43,11 @@ pub struct SyncResult {
     pub bytes_processed: usize,
 }
 
-/// Where the revision sweep resumes a space's listRepos listing that its budget
-/// cut short. Held in memory only: after a restart every space is listed from
-/// the beginning.
+/// Where the revision sweep resumes a space's listWriters listing that its
+/// budget cut short. Held in memory only: after a restart every space is listed
+/// from the beginning.
 ///
-/// listRepos ascends by spaceRev, so restarting a cut listing from the
+/// listWriters ascends by spaceRev, so restarting a cut listing from the
 /// beginning would always drop the most recently updated writers (and, in a
 /// space larger than the budget, never reach them). A cut listing resumes after
 /// the spaceRev of the last entry it finished with, which the exclusive cursor
@@ -347,7 +347,6 @@ impl SyncEngine {
         let mut ops_applied = 0;
         let mut records_accepted = 0;
         let mut records_rejected = 0;
-        let mut latest_rev = last_rev.clone().unwrap_or_default();
 
         let mut staged_mutations = Vec::new();
         let mut current_policy = policy.clone();
@@ -385,7 +384,25 @@ impl SyncEngine {
                 .await;
 
             let page = match page_res {
-                Ok(p) => p,
+                Ok(page) => page,
+                Err(AppError::NotFound(reason))
+                    if reason == "RepoNotFound"
+                        && existing_sync.is_none()
+                        && expected_authority_hash.is_none()
+                        && expected_authority_rev.is_none() =>
+                {
+                    // A member can join before writing its first record. There
+                    // is no commit or cursor to persist for that empty repo.
+                    return Ok(SyncResult {
+                        mode: SyncMode::Incremental,
+                        commit_verified: true,
+                        ops_applied: 0,
+                        records_accepted: 0,
+                        records_rejected: 0,
+                        latest_rev: String::new(),
+                        bytes_processed: 0,
+                    });
+                }
                 Err(e) => {
                     // A rejected credential is not retried by falling back to
                     // getRepo with it: evict it and fail this sync.
@@ -410,7 +427,6 @@ impl SyncEngine {
                     break;
                 }
                 ops_applied += 1;
-                latest_rev = op.rev.to_string();
 
                 let collection_str = op.collection.as_str();
                 let rkey_str = op.rkey.0.as_str();
@@ -499,9 +515,9 @@ impl SyncEngine {
                 break;
             }
 
-            if let Some(c) = page.commit {
-                terminal_commit = Some(c);
-            }
+            // Every page's commit has already passed its request-specific MAC.
+            // The no-cursor page is authoritative for the accumulated set hash.
+            terminal_commit = Some(page.commit);
 
             if let Some(next_cur) = page.cursor {
                 let cur_str = next_cur.to_string();
@@ -533,48 +549,27 @@ impl SyncEngine {
                 .await;
         }
 
-        let commit_to_verify = match terminal_commit {
-            Some(c) => Some(c),
-            None => match self
-                .space_client
-                .get_latest_commit(
-                    &repo_service_endpoint,
+        let Some(commit_to_verify) = terminal_commit else {
+            return self
+                .full_recovery(
                     space_uri,
                     author_did,
+                    &repo_service_endpoint,
                     &cred.token,
                     &cred.signing_key,
+                    &policy,
+                    expected_authority_hash,
+                    expected_authority_rev,
                 )
-                .await
-            {
-                Ok(commit) => Some(commit),
-                Err(e) => {
-                    if crate::access::evict_rejected_credential(
-                        &self.credential_store,
-                        space_uri,
-                        &cred.token,
-                        &e,
-                    )
-                    .await
-                    {
-                        return Err(e);
-                    }
-                    None
-                }
-            },
+                .await;
         };
 
-        // The transport verifies each terminal commit MAC using that page's
-        // unique request secret before releasing the page to this accumulator.
-        let commit_verified = if let Some(commit) = &commit_to_verify {
-            latest_rev = commit.rev.to_string();
-            commit.data.as_ref() == lthash.digest().as_slice()
-                && commit.space.as_str() == space_uri
-                && commit.repo.as_str() == author_did
-                && expected_authority_hash.is_none_or(|data| commit.data.as_ref() == data)
-                && expected_authority_rev.is_none_or(|rev| commit.rev.as_str() == rev)
-        } else {
-            false
-        };
+        let latest_rev = commit_to_verify.rev.to_string();
+        let commit_verified = commit_to_verify.data.as_ref() == lthash.digest().as_slice()
+            && commit_to_verify.space.as_str() == space_uri
+            && commit_to_verify.repo.as_str() == author_did
+            && expected_authority_hash.is_none_or(|data| commit_to_verify.data.as_ref() == data)
+            && expected_authority_rev.is_none_or(|rev| commit_to_verify.rev.as_str() == rev);
 
         if !commit_verified {
             return self
@@ -1749,7 +1744,7 @@ pub async fn sweep_once_with_shutdown(
                 listing_complete = true;
                 break;
             }
-            let mut credential_rejected = false;
+            let mut page_failed = false;
 
             for repo in &repos_output.repos {
                 // Cooperative shutdown check inside repo loop
@@ -1825,15 +1820,22 @@ pub async fn sweep_once_with_shutdown(
                     }
                     Err(e) => {
                         summary.repos_failed += 1;
+                        page_failed = true;
                         if crate::access::is_credential_rejected(&e) {
-                            credential_rejected = true;
-                            break;
+                            crate::access::evict_rejected_credential(
+                                &state.credential_store,
+                                &space_uri,
+                                &cred.token,
+                                &e,
+                            )
+                            .await;
                         }
+                        break;
                     }
                 }
             }
 
-            if credential_rejected {
+            if page_failed {
                 break;
             }
 

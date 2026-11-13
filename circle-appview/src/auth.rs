@@ -71,7 +71,7 @@ pub struct VerificationMethod {
     pub controller: String,
     // Absent keys must be omitted, never `null`: @atproto/identity declares
     // publicKeyMultibase as an optional string and rejects the whole DID
-    // document on `null`, which made the AppView unresolvable for registerNotify.
+    // document on `null`, which would make the AppView unresolvable.
     #[serde(
         default,
         rename = "publicKeyJwk",
@@ -973,10 +973,8 @@ pub async fn verify_service_jwt(
 
     let now = Utc::now().timestamp();
 
-    // Tolerate a slightly fast issuer clock: forwarded notifyWrite and
-    // notifySpaceDeleted JWTs from a space host a few seconds ahead were
-    // rejected outright. Upstream service auth does not check iat at all; the
-    // 60 s lifetime and exp checks below still bound the token.
+    // Tolerate a slightly fast service-auth issuer clock. The short lifetime
+    // and expiration checks below still bound the token.
     if iat > now + SERVICE_JWT_IAT_SKEW_SECS {
         return Err(AppError::Unauthorized(AuthReason::FutureIat));
     }
