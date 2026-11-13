@@ -183,6 +183,13 @@ async fn main() -> anyhow::Result<()> {
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::ACCEPT,
+                axum::http::HeaderName::from_static("accept-signature"),
+            ])
+            .expose_headers([
+                axum::http::HeaderName::from_static("atproto-space-commit"),
+                axum::http::HeaderName::from_static("atproto-space-record"),
+                axum::http::HeaderName::from_static("signature-input"),
+                axum::http::HeaderName::from_static("signature"),
             ])
     };
 

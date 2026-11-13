@@ -2161,6 +2161,7 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
 
 #[test]
 fn test_circle_media_base_url_strict_https_origin_validation() {
+    std::env::set_var("APPVIEW_BASE_URL", "http://127.0.0.1:3002");
     let valid_cases = [
         "https://media.catbird.blue",
         "https://media.catbird.blue/",
