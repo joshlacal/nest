@@ -4080,10 +4080,8 @@ fn space_rev(i: usize) -> String {
 }
 
 fn writer_entry(i: usize) -> WriterUpdate {
-    WriterUpdate::RepoWrite(RepoWrite {
+    WriterUpdate::RepoRemoved(RepoRemoved {
         repo: format!("did:plc:resume-writer-{i}"),
-        data: bytes::Bytes::copy_from_slice(&[0x22; 32]),
-        repo_rev: "3l7234567a234".into(),
         space_rev: space_rev(i),
         prev_space_rev: None,
     })
