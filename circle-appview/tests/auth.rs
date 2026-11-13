@@ -3084,7 +3084,7 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
     endpoints.insert(
         "/xrpc/com.atproto.space.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
-            "uri": "at://did:plc:space-auth/space/com.example.space/1",
+            "space": "at://did:plc:space-auth/space/com.example.space/1",
             "policy": {
                 "$type": "com.atproto.memberspace.policy",
                 "publicRead": false,
