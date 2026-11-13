@@ -1347,8 +1347,38 @@ pub async fn ensure_space_credential_from_parts(
         acting_user_did = Some(authority_did.clone());
     }
 
-    let user_did = acting_user_did
-        .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::MissingOAuthSession))?;
+    let user_did = match acting_user_did {
+        Some(user_did) => user_did,
+        None => {
+            let authority_doc =
+                did_resolver
+                    .resolve(&authority_did)
+                    .await
+                    .map_err(|e| match e {
+                        AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+                        other => AppError::Internal(format!(
+                            "Failed to resolve DID document for {authority_did}: {other}"
+                        )),
+                    })?;
+            let (space_host_endpoint, _) =
+                resolve_space_host_endpoint(&authority_doc, &authority_did)?;
+            match space_client
+                .probe_space_status(&space_host_endpoint, space_uri)
+                .await
+            {
+                Err(error) if is_space_deleted(&error) => {
+                    purge_deleted_space(db, credential_store, space_uri).await;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+                Ok(()) => {
+                    return Err(AppError::Unauthorized(
+                        crate::error::AuthReason::MissingOAuthSession,
+                    ))
+                }
+            }
+        }
+    };
 
     // 3. Obtain valid token and DPoP signing key for the chosen user
     let (access_token, dpop_key) = oauth_service
@@ -1877,15 +1907,30 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn test_ensure_space_credential_no_usable_session_fails(pool: PgPool) {
+    async fn test_no_session_probes_host_without_delegation(pool: PgPool) {
         setup_test_key();
         let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_credential_response(
+            TEST_SPACE_URI,
+            Err(serde_json::json!({"error": "AuthRequired"}).to_string()),
+        );
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
         let did_resolver = Arc::new(DidResolver::new(
             "https://plc.directory".into(),
             reqwest::Client::new(),
         ));
+        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &authority_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
@@ -1894,25 +1939,29 @@ mod tests {
             None,
         ));
 
-        let http_client = reqwest::Client::new();
         let err = ensure_space_credential_from_parts(
             &pool,
             &space_client,
             &credential_store,
             &did_resolver,
             &oauth_service,
-            &http_client,
+            &reqwest::Client::new(),
             TEST_SPACE_URI,
             None,
             None,
         )
         .await
-        .expect_err("Must fail when no session is held for user/member/authority");
+        .expect_err("host authorization is still required for a live Space");
 
         assert!(matches!(
             err,
-            AppError::Unauthorized(AuthReason::MissingOAuthSession)
+            AppError::Unauthorized(AuthReason::MissingHeader)
         ));
+        let calls = mock_transport.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].request.delegation_token.is_none());
+        assert!(calls[0].request.client_attestation.is_none());
+        assert!(calls[0].request.notify.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]

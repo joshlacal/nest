@@ -296,6 +296,12 @@ async fn sweep_purges_circle_when_space_host_reports_space_deleted(pool: PgPool)
     let setup = setup(pool.clone()).await;
     seed_active_circle(&pool).await;
     setup
+        .state
+        .oauth_service
+        .remove_session(OWNER_DID)
+        .await
+        .unwrap();
+    setup
         .mock_transport
         .set_credential_response(SPACE_URI, space_host_error("SpaceDeleted"));
 
@@ -304,6 +310,10 @@ async fn sweep_purges_circle_when_space_host_reports_space_deleted(pool: PgPool)
     assert_eq!(summary.spaces_purged, 1);
     assert_eq!(summary.repos_failed, 0);
     assert_fully_purged(&setup, &pool).await;
+    let probe = setup.mock_transport.recorded_calls().pop().unwrap();
+    assert!(probe.request.delegation_token.is_none());
+    assert!(probe.request.client_attestation.is_none());
+    assert!(probe.request.notify.is_none());
 
     // Reads of the purged Circle surface the declared AccessRemoved (not
     // Forbidden or NotFound), which makes the device purge its caches.
@@ -422,6 +432,51 @@ async fn space_deleted_update_reauthorizes_without_purging_a_live_space(pool: Pg
     assert!(setup.mock_transport.recorded_calls().iter().any(|call| call
         .endpoint_url
         .ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn space_deleted_update_without_session_purges_only_on_declared_deletion(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    seed_active_circle(&pool).await;
+    let registration = circle_appview::notify::get_or_create_registration(
+        &pool,
+        SPACE_URI,
+        "http://127.0.0.1:3002",
+    )
+    .await
+    .unwrap();
+    setup
+        .state
+        .oauth_service
+        .remove_session(OWNER_DID)
+        .await
+        .unwrap();
+
+    for code in ["SpaceNotFound", "AuthRequired"] {
+        setup
+            .mock_transport
+            .set_credential_response(SPACE_URI, space_host_error(code));
+        notify_space_deleted(&setup, &registration.token)
+            .await
+            .expect_err("an unconfirmed deletion must retain local data");
+        assert!(!tombstoned(&pool).await, "{code} must not tombstone");
+        assert_eq!(count(&pool, "circle_records").await, 1, "{code}");
+    }
+
+    setup
+        .mock_transport
+        .set_credential_response(SPACE_URI, space_host_error("SpaceDeleted"));
+    assert_eq!(
+        notify_space_deleted(&setup, &registration.token)
+            .await
+            .unwrap(),
+        StatusCode::OK
+    );
+    let probe = setup.mock_transport.recorded_calls().pop().unwrap();
+    assert!(probe.request.delegation_token.is_none());
+    assert!(probe.request.client_attestation.is_none());
+    assert!(probe.request.notify.is_none());
+    assert_fully_purged(&setup, &pool).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]

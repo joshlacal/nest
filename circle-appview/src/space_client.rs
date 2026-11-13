@@ -1836,6 +1836,30 @@ impl SpaceClient {
         })
     }
 
+    /// Probe `authorizeSpaceSync` without user authorization. The Nov-12 host
+    /// checks `SpaceDeleted` before delegation, so callers can confirm deletion
+    /// after every local OAuth session has gone away.
+    pub async fn probe_space_status(
+        &self,
+        service_endpoint: &str,
+        space_uri: &str,
+    ) -> Result<(), AppError> {
+        let xrpc_url =
+            construct_xrpc_url(service_endpoint, "com.atproto.space.authorizeSpaceSync")?;
+        let ephemeral_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let request = AuthorizeSpaceSyncRequest {
+            space: space_uri.into(),
+            credential_key: p256_did_key(ephemeral_key.verifying_key()),
+            delegation_token: None,
+            client_attestation: None,
+            notify: None,
+        };
+        self.transport
+            .authorize_space_sync(&xrpc_url, &request)
+            .await
+            .map(|_| ())
+    }
+
     /// Best-effort `com.atproto.server.describeServer` on a space host, reduced to
     /// the fields that identify its implementation profile, for operator logs.
     pub async fn describe_space_host(&self, service_endpoint: &str) -> Option<serde_json::Value> {
