@@ -181,8 +181,10 @@ where
     tracing::info!("Listening on {}", addr);
     let identity_task = identity_events::spawn(state.clone());
 
-    let (sweep_handle, sweep_shutdown_tx) =
-        sync::spawn_revision_sweep_task(state.clone(), std::time::Duration::from_secs(300));
+    let (sweep_handle, sweep_shutdown_tx) = sync::spawn_revision_sweep_task(
+        state.clone(),
+        std::time::Duration::from_secs(sync::REGISTRATION_REAUTH_INTERVAL_SECS),
+    );
     let (jti_handle, jti_shutdown_tx) =
         spawn_jti_cleanup_task(pool.clone(), std::time::Duration::from_secs(60));
     let (rejections_handle, rejections_shutdown_tx) =

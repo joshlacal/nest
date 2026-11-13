@@ -25,6 +25,7 @@ pub const MAX_PAGES_PER_REPO_SYNC: usize = 50;
 pub const MAX_OPS_PER_REPO_SYNC: usize = 5_000;
 pub const MAX_BYTES_PER_REPO_SYNC: usize = 10 * 1024 * 1024;
 pub const MAX_TIME_PER_REPO_SYNC_SECS: u64 = 30;
+pub const REGISTRATION_REAUTH_INTERVAL_SECS: u64 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -1957,6 +1958,37 @@ pub async fn sweep_once_with_shutdown(
     Ok(summary)
 }
 
+async fn reauthorize_active_spaces_at(
+    state: &AppState,
+    now: chrono::DateTime<chrono::Utc>,
+    period: std::time::Duration,
+) -> Result<(), AppError> {
+    let spaces: Vec<String> = sqlx::query_scalar(
+        "SELECT space_uri FROM circles \
+         WHERE deleted_at IS NULL AND app_access_granted = true \
+         ORDER BY space_uri",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let renewal_horizon = chrono::Duration::from_std(period.saturating_mul(2))
+        .map_err(|_| AppError::Internal("Registration renewal period is too large".into()))?;
+
+    for space in spaces {
+        state
+            .credential_store
+            .remove_expiring_within_at(&space, now, renewal_horizon)
+            .await;
+        if let Err(error) = crate::access::ensure_space_credential(state, &space, None).await {
+            tracing::warn!(
+                %error,
+                space = %crate::access::space_fingerprint(&space),
+                "scheduled notification reauthorization failed; next pass will retry"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Spawn and retain a production revision sweep task on a repeating interval.
 /// Runs `sweep_once` on each tick, emits only content-free aggregate logs/errors,
 /// and terminates gracefully when shutdown is signaled.
@@ -1982,6 +2014,18 @@ pub fn spawn_revision_sweep_task(
                     }
                 }
                 _ = interval.tick() => {
+                    if let Err(error) = reauthorize_active_spaces_at(
+                        &state,
+                        chrono::Utc::now(),
+                        interval_duration,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "Scheduled notification reauthorization pass failed"
+                        );
+                    }
                     match sweep_once_with_shutdown(&state, Some(&mut shutdown_rx)).await {
                         Ok(summary) => {
                             tracing::info!(

@@ -24,10 +24,9 @@ pub struct ActiveSpaceCredential {
     pub expires_at: DateTime<Utc>,
 }
 
-/// A credential is renewed five minutes early so the existing five-minute
-/// revision sweep reauthorizes notification delivery before the registration
-/// expires with its credential. Shorter-lived credentials use half their
-/// lifetime instead.
+/// Request paths stop serving a credential within its normal renewal margin.
+/// The scheduler separately renews every active Space before two scheduler
+/// periods remain, keeping notification registration comfortably ahead of exp.
 pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
 
 /// The renewal margin for a credential with `lifetime` left when it is stored:
@@ -112,6 +111,23 @@ impl CredentialStore {
     pub async fn remove(&self, space: &str) {
         let mut lock = self.values.write().await;
         lock.remove(space);
+    }
+    pub(crate) async fn remove_expiring_within_at(
+        &self,
+        space: &str,
+        now: DateTime<Utc>,
+        within: chrono::Duration,
+    ) -> bool {
+        let mut lock = self.values.write().await;
+        if lock
+            .get(space)
+            .is_some_and(|stored| stored.cred.expires_at < now + within)
+        {
+            lock.remove(space);
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove the credential for `space` only if it is still `token`, so a
@@ -1537,6 +1553,23 @@ mod tests {
             )
             .await;
         assert_eq!(store.get("space-c").await.unwrap().token, "fresh");
+
+        store
+            .insert_at("space-d".into(), issued_for("scheduled", 600), issued)
+            .await;
+        let two_periods = chrono::Duration::seconds(480);
+        assert!(
+            !store
+                .remove_expiring_within_at("space-d", issued, two_periods)
+                .await,
+            "exactly 600 seconds remain"
+        );
+        assert!(
+            store
+                .remove_expiring_within_at("space-d", at(121), two_periods)
+                .await,
+            "fewer than two 240-second periods remain"
+        );
     }
 
     #[tokio::test]
