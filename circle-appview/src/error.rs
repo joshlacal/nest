@@ -55,6 +55,7 @@ pub enum AuthReason {
     /// A host refused the request's `Atproto-Space-Audience` (`BadSpaceAudience`).
     BadSpaceAudience,
     InvalidSpaceMac,
+    InvalidToken,
 }
 
 impl std::fmt::Display for AuthReason {
@@ -100,6 +101,7 @@ impl std::fmt::Display for AuthReason {
             Self::BadSpaceSignature => "bad_space_signature",
             Self::BadSpaceAudience => "bad_space_audience",
             Self::InvalidSpaceMac => "invalid_space_mac",
+            Self::InvalidToken => "invalid_token",
         };
         write!(f, "{s}")
     }

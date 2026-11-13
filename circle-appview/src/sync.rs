@@ -11,7 +11,7 @@ use crate::auth::DidResolver;
 use crate::commit::{compute_dagcbor_cid, LtHash, LTHASH_SIZE};
 use crate::config::AppState;
 use crate::error::AppError;
-use crate::space_client::SpaceClient;
+use crate::space_client::{SpaceClient, WriterUpdate};
 use crate::validator::{
     validate_record, InvalidRecord, RecordCandidate, ValidatedRecord, ValidationPolicy,
 };
@@ -254,6 +254,13 @@ impl SyncEngine {
         };
 
         let _lock_guard = self.space_locks.acquire(space_uri).await;
+        let notify_endpoint = self
+            .lifecycle_state
+            .as_ref()
+            .map(|state| state.config.notify_endpoint())
+            .transpose()
+            .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
+
 
         let cred = match self.credential_store.get(space_uri).await {
             Some(c) => c,
@@ -267,6 +274,7 @@ impl SyncEngine {
                         oauth,
                         &self.http_client,
                         space_uri,
+                        notify_endpoint.as_deref(),
                         Some(author_did),
                     )
                     .await?
@@ -1564,6 +1572,29 @@ impl SyncEngine {
     }
 }
 
+/// Stop syncing a repo removed from the writer set. Existing records remain as
+/// Space history, matching the service's established member-removal semantics;
+/// deleting sync state makes a later re-add perform a clean full sync.
+pub async fn apply_repo_removed(
+    pool: &sqlx::PgPool,
+    space: &str,
+    repo: &str,
+) -> Result<(), AppError> {
+    if extract_authority_did(space)? != repo {
+        crate::purge::remove_member(pool, space, repo)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    sqlx::query(
+        "DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(space)
+    .bind(repo)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
     sweep_once_with_shutdown(state, None).await
 }
@@ -1639,19 +1670,6 @@ pub async fn sweep_once_with_shutdown(
                 continue;
             }
         };
-        if let Err(e) = crate::notify::ensure_registration(state, &space_uri, &cred).await {
-            tracing::warn!(
-                error = %e,
-                space = %crate::access::space_fingerprint(&space_uri),
-                "registerNotify failed during sweep; retried next sweep"
-            );
-            // The host rejected the credential and it was evicted: do not list
-            // with it. The next sweep acquires a replacement.
-            if crate::access::is_credential_rejected(&e) {
-                summary.repos_failed += 1;
-                continue;
-            }
-        }
         let authority_did = match extract_authority_did(&space_uri) {
             Ok(a) => a,
             Err(_) => continue,
@@ -1667,14 +1685,22 @@ pub async fn sweep_once_with_shutdown(
                 Ok(ep) => ep,
                 Err(_) => continue,
             };
-        // Resume a listing an earlier pass's budget cut short (ListingResumePoints).
-        let mut cursor: Option<String> = state.listing_resume.get(&space_uri);
+        // A gap detected by authorizeSpaceSync or notifySpaceUpdate resumes at
+        // the durable per-space revision. Ordinary budget resumes stay in memory.
+        let (checkpoint_rev, pending_rev) =
+            crate::notify::catchup_state(&state.db, &space_uri).await?;
+        let mut cursor = if pending_rev.is_some() {
+            checkpoint_rev
+        } else {
+            state.listing_resume.get(&space_uri)
+        };
         let mut seen_cursors = HashSet::new();
         let mut page_count = 0;
         // The spaceRev of the last entry this pass finished with, and whether
         // the next listing of this space starts from the beginning.
         let mut last_processed: Option<String> = None;
         let mut start_over = false;
+        let mut listing_complete = false;
 
         loop {
             // Check shutdown between pages
@@ -1693,9 +1719,9 @@ pub async fn sweep_once_with_shutdown(
             }
             page_count += 1;
 
-            let list_repos_res = state
+            let list_writers_res = state
                 .space_client
-                .list_repos(
+                .list_writers(
                     &service_endpoint,
                     &space_uri,
                     cursor.as_deref(),
@@ -1704,7 +1730,7 @@ pub async fn sweep_once_with_shutdown(
                 )
                 .await;
 
-            let repos_output = match list_repos_res {
+            let repos_output = match list_writers_res {
                 Ok(out) => out,
                 Err(e) => {
                     crate::access::evict_rejected_credential(
@@ -1717,10 +1743,10 @@ pub async fn sweep_once_with_shutdown(
                     break;
                 }
             };
-            // listRepos pages through writers in ascending spaceRev order and
-            // ends with an empty page, which omits the cursor.
+            // listWriters pages through writer updates in ascending spaceRev.
             if repos_output.repos.is_empty() {
                 start_over = true;
+                listing_complete = true;
                 break;
             }
             let mut credential_rejected = false;
@@ -1750,53 +1776,61 @@ pub async fn sweep_once_with_shutdown(
                 }
 
                 summary.repos_checked += 1;
-                let repo_did = repo.did.as_str();
-
-                let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
-                    "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
-                )
-                .bind(&space_uri)
-                .bind(repo_did)
-                .fetch_optional(&state.db)
-                .await
-                .unwrap_or(None);
-
-                // A repo can reappear when it advances during pagination; the
-                // comparison against stored state makes repeats a no-op.
-                let needs_sync = match db_sync {
-                    Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
-                        let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                        last_rev != repo.repo_rev.as_str() || &digest[..] != repo.data.as_ref()
+                let applied = match repo {
+                    WriterUpdate::RepoRemoved(update) => {
+                        apply_repo_removed(&state.db, &space_uri, &update.repo).await
                     }
-                    _ => true,
-                };
-
-                if needs_sync {
-                    match sync_engine
-                        .sync_repo_with_expected_commit(
-                            &space_uri,
-                            repo_did,
-                            Some(repo.data.as_ref()),
-                            Some(repo.repo_rev.as_str()),
+                    WriterUpdate::RepoWrite(update) => {
+                        let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
+                            "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
                         )
+                        .bind(&space_uri)
+                        .bind(&update.repo)
+                        .fetch_optional(&state.db)
                         .await
-                    {
-                        Ok(_res) => {
-                            summary.repos_synced += 1;
-                        }
-                        Err(e) => {
-                            summary.repos_failed += 1;
-                            // The credential was evicted; stop using it for this
-                            // space. A resumed listing retries this repo.
-                            if crate::access::is_credential_rejected(&e) {
-                                credential_rejected = true;
-                                break;
+                        .unwrap_or(None);
+                        let needs_sync = match db_sync {
+                            Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
+                                let digest: [u8; 32] = Sha256::digest(&last_hash).into();
+                                last_rev != update.repo_rev
+                                    || &digest[..] != update.data.as_ref()
                             }
+                            _ => true,
+                        };
+                        if needs_sync {
+                            let result = sync_engine
+                                .sync_repo_with_expected_commit(
+                                    &space_uri,
+                                    &update.repo,
+                                    Some(update.data.as_ref()),
+                                    Some(&update.repo_rev),
+                                )
+                                .await
+                                .map(|_| ());
+                            if result.is_ok() {
+                                summary.repos_synced += 1;
+                            }
+                            total_bytes_processed = sync_engine.total_bytes_processed();
+                            result
+                        } else {
+                            Ok(())
                         }
                     }
-                    total_bytes_processed = sync_engine.total_bytes_processed();
+                };
+                match applied {
+                    Ok(()) => {
+                        let space_rev = repo.space_rev();
+                        crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+                        last_processed = Some(space_rev.to_owned());
+                    }
+                    Err(e) => {
+                        summary.repos_failed += 1;
+                        if crate::access::is_credential_rejected(&e) {
+                            credential_rejected = true;
+                            break;
+                        }
+                    }
                 }
-                last_processed = Some(repo.space_rev.to_string());
             }
 
             if credential_rejected {
@@ -1817,9 +1851,16 @@ pub async fn sweep_once_with_shutdown(
                 cursor = Some(next_cur_str);
             } else {
                 start_over = true;
+                listing_complete = true;
                 break;
             }
         }
+        if listing_complete {
+            if let Some(space_rev) = pending_rev.as_deref() {
+                crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+            }
+        }
+
 
         if start_over {
             state.listing_resume.clear(&space_uri);
@@ -1891,182 +1932,206 @@ pub fn spawn_revision_sweep_task(
     (handle, shutdown_tx)
 }
 
-/// Upper bound on notifyWrite-triggered syncs running at once.
+/// Upper bound on notification-triggered work running at once.
 pub const MAX_CONCURRENT_NOTIFY_SYNCS: usize = 32;
 
 static NOTIFY_SYNC_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NOTIFY_SYNCS)));
 
-/// Wait until no notifyWrite-triggered sync is running in this process.
 pub async fn wait_for_notify_syncs_idle() {
     while NOTIFY_SYNC_PERMITS.available_permits() < MAX_CONCURRENT_NOTIFY_SYNCS {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
-/// Receives com.atproto.space.notifyWrite. Upstream fan-out is best-effort and
-/// does not wait on the receiver, so this validates the caller and the Circle,
-/// queues the sync in the background and acknowledges at once. When the queue is
-/// full the notification is dropped and the revision sweep repairs it.
-pub async fn notify_write_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: bytes::Bytes,
-) -> Result<axum::response::Response, AppError> {
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::MissingHeader,
-        ))?;
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .or_else(|| auth_header.strip_prefix("bearer "))
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::InvalidHeader,
-        ))?;
-    // A forwarded notification is signed by the space authority and addressed
-    // to the service identifier this AppView registered with registerNotify.
-    let user = crate::auth::verify_service_jwt(
-        &state,
-        token,
-        &state.config.notify_service_identifier(),
-        Some("com.atproto.space.notifyWrite"),
-    )
-    .await?;
+#[derive(serde::Deserialize)]
+struct NotifySpaceUpdateInput {
+    space: String,
+    token: String,
+    update: serde_json::Value,
+}
 
-    // { space, repo, repoRev, data, spaceRev, prevSpaceRev? }
-    let input: catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite =
-        serde_json::from_slice(&body)
-            .map_err(|e| AppError::InvalidRequest(format!("Invalid notifyWrite body: {e}")))?;
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrationExpired {
+    space_rev: String,
+}
 
-    if input.data.len() != 32 {
-        return Err(AppError::InvalidRequest(
-            "Data must be exactly 32 bytes".into(),
-        ));
-    }
-    if input.repo_rev.as_str().is_empty() {
-        return Err(AppError::InvalidRequest("repoRev cannot be empty".into()));
-    }
-
-    // Only the space host forwards to syncers; a repo host notifies the space
-    // host, never this AppView.
-    let authority = extract_authority_did(input.space.as_str())?;
-    if user.did != authority {
-        return Err(AppError::Forbidden(
-            "notifyWrite issuer is not the space authority".into(),
-        ));
-    }
-    // Space revisions are not checkpointed here: the revision sweep re-lists
-    // every space (resuming a listing its budget cut short), so a prevSpaceRev
-    // gap is repaired by a later pass.
-    tracing::debug!(
-        space = %crate::access::space_fingerprint(input.space.as_str()),
-        space_rev = ?input.space_rev.as_ref().map(|r| r.as_str()),
-        prev_space_rev = ?input.prev_space_rev.as_ref().map(|r| r.as_str()),
-        "notifyWrite received"
-    );
-
-    // Finding 17 & 36: Verify caller and repo author are active members before work
-    let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true)",
-    )
-    .bind(input.space.as_str())
-    .bind(input.repo.as_str())
-    .fetch_one(&state.db)
-    .await
-    .map_err(AppError::Database)?;
-
-    if !is_member && input.repo.as_str() != authority {
-        return Err(AppError::Forbidden(
-            "Repo author is not an active member of this Space under its allowedApps".into(),
-        ));
-    }
-
-    let circle_active: Option<bool> = sqlx::query_scalar(
+async fn active_space(state: &AppState, space: &str) -> Result<(), AppError> {
+    let active: Option<bool> = sqlx::query_scalar(
         "SELECT app_access_granted FROM circles WHERE space_uri = $1 AND deleted_at IS NULL",
     )
-    .bind(input.space.as_str())
+    .bind(space)
     .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::Database)?;
-    if circle_active != Some(true) {
-        return Err(AppError::Forbidden(
+    .await?;
+    if active == Some(true) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
             "Space is deleted or allowedApps revoked".into(),
-        ));
+        ))
     }
+}
 
+fn has_revision_gap(previous: Option<&str>, checkpoint: Option<&str>) -> bool {
+    match (previous, checkpoint) {
+        (None, None) => false,
+        (Some(previous), Some(checkpoint)) => previous != checkpoint,
+        _ => true,
+    }
+}
+
+fn queue_catchup(state: AppState, space: String, reauthorize: bool) {
     match NOTIFY_SYNC_PERMITS.clone().try_acquire_owned() {
         Ok(permit) => {
-            let space = input.space.as_str().to_string();
-            let repo = input.repo.as_str().to_string();
-            let rev = input.repo_rev.as_str().to_string();
-            let hash = input.data.to_vec();
             tokio::spawn(async move {
                 let _permit = permit;
-                let res = SyncEngine::new(&state)
-                    .sync_repo_with_expected_commit(&space, &repo, Some(&hash), Some(&rev))
-                    .await;
-                if let Err(e) = res {
+                if reauthorize {
+                    state.credential_store.remove(&space).await;
+                    if let Err(error) =
+                        crate::access::ensure_space_credential(&state, &space, None).await
+                    {
+                        tracing::warn!(
+                            %error,
+                            space = %crate::access::space_fingerprint(&space),
+                            "notification reauthorization failed; revision sweep will retry"
+                        );
+                        return;
+                    }
+                }
+                if let Err(error) = sweep_once(&state).await {
                     tracing::warn!(
-                        error = %e,
+                        %error,
                         space = %crate::access::space_fingerprint(&space),
-                        "notifyWrite sync failed; the revision sweep will retry"
+                        "notification catch-up failed; revision sweep will retry"
                     );
                 }
             });
         }
         Err(_) => tracing::warn!(
-            space = %crate::access::space_fingerprint(input.space.as_str()),
-            "notifyWrite sync queue full; the revision sweep will catch up"
+            space = %crate::access::space_fingerprint(&space),
+            "notification queue full; durable revision gap left for sweep"
         ),
     }
-
-    use axum::response::IntoResponse;
-    Ok(axum::http::StatusCode::OK.into_response())
 }
 
-#[derive(serde::Deserialize)]
-pub struct NotifySpaceDeletedPayload {
-    pub space: String,
-}
-
-pub async fn notify_space_deleted_handler(
+pub async fn notify_space_update_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-    headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, AppError> {
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::MissingHeader,
-        ))?;
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .or_else(|| auth_header.strip_prefix("bearer "))
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::InvalidHeader,
-        ))?;
-    let user = crate::auth::verify_service_jwt(
-        &state,
-        token,
-        &state.config.notify_service_identifier(),
-        Some("com.atproto.space.notifySpaceDeleted"),
-    )
-    .await?;
+    let input: NotifySpaceUpdateInput = serde_json::from_slice(&body).map_err(|e| {
+        AppError::InvalidRequest(format!("Invalid notifySpaceUpdate body: {e}"))
+    })?;
+    crate::notify::authenticate(&state.db, &input.space, &input.token).await?;
+    let update_type = input
+        .update
+        .get("$type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::InvalidRequest("update.$type is required".into()))?;
 
-    let input: NotifySpaceDeletedPayload = serde_json::from_slice(&body)
-        .map_err(|e| AppError::InvalidRequest(format!("Invalid notifySpaceDeleted body: {e}")))?;
-
-    let authority = crate::access::extract_authority_did(&input.space)?;
-    if user.did != authority {
-        return Err(AppError::Unauthorized(crate::error::AuthReason::IdMismatch));
+    match update_type {
+        "com.atproto.space.defs#repoWrite" => {
+            active_space(&state, &input.space).await?;
+            let update: crate::space_client::RepoWrite =
+                serde_json::from_value(input.update).map_err(|e| {
+                    AppError::InvalidRequest(format!("Invalid repoWrite update: {e}"))
+                })?;
+            if update.data.len() != 32 || update.repo_rev.is_empty() {
+                return Err(AppError::InvalidRequest(
+                    "repoWrite data must be 32 bytes and repoRev must be non-empty".into(),
+                ));
+            }
+            let authority = extract_authority_did(&input.space)?;
+            let is_writer: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true)",
+            )
+            .bind(&input.space)
+            .bind(&update.repo)
+            .fetch_one(&state.db)
+            .await?;
+            if !is_writer && update.repo != authority {
+                return Err(AppError::Forbidden(
+                    "Repo author is not an active writer in this Space".into(),
+                ));
+            }
+            let checkpoint = crate::notify::checkpoint_rev(&state.db, &input.space).await?;
+            if has_revision_gap(update.prev_space_rev.as_deref(), checkpoint.as_deref()) {
+                crate::notify::mark_pending(&state.db, &input.space, &update.space_rev).await?;
+                queue_catchup(state, input.space, false);
+            } else {
+                match NOTIFY_SYNC_PERMITS.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        let space = input.space;
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if SyncEngine::new(&state)
+                                .sync_repo_with_expected_commit(
+                                    &space,
+                                    &update.repo,
+                                    Some(update.data.as_ref()),
+                                    Some(&update.repo_rev),
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                let _ = crate::notify::checkpoint(
+                                    &state.db,
+                                    &space,
+                                    &update.space_rev,
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        crate::notify::mark_pending(
+                            &state.db,
+                            &input.space,
+                            &update.space_rev,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        "com.atproto.space.defs#repoRemoved" => {
+            active_space(&state, &input.space).await?;
+            let update: crate::space_client::RepoRemoved =
+                serde_json::from_value(input.update).map_err(|e| {
+                    AppError::InvalidRequest(format!("Invalid repoRemoved update: {e}"))
+                })?;
+            let checkpoint = crate::notify::checkpoint_rev(&state.db, &input.space).await?;
+            if has_revision_gap(update.prev_space_rev.as_deref(), checkpoint.as_deref()) {
+                crate::notify::mark_pending(&state.db, &input.space, &update.space_rev).await?;
+                queue_catchup(state, input.space, false);
+            } else {
+                apply_repo_removed(&state.db, &input.space, &update.repo).await?;
+                crate::notify::checkpoint(&state.db, &input.space, &update.space_rev).await?;
+            }
+        }
+        "com.atproto.space.notifySpaceUpdate#spaceDeleted" => {
+            state.credential_store.remove(&input.space).await;
+            match crate::access::ensure_space_credential(&state, &input.space, None).await {
+                Err(error) if crate::access::is_space_deleted(&error) => {}
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        "com.atproto.space.notifySpaceUpdate#registrationExpired" => {
+            active_space(&state, &input.space).await?;
+            let update: RegistrationExpired =
+                serde_json::from_value(input.update).map_err(|e| {
+                    AppError::InvalidRequest(format!("Invalid registrationExpired update: {e}"))
+                })?;
+            crate::notify::mark_pending(&state.db, &input.space, &update.space_rev).await?;
+            queue_catchup(state, input.space, true);
+        }
+        other => {
+            return Err(AppError::InvalidRequest(format!(
+                "Unsupported notifySpaceUpdate update type: {other}"
+            )))
+        }
     }
-
-    crate::purge::delete_space(&state.db, &state.credential_store, &input.space)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     use axum::response::IntoResponse;
     Ok(axum::http::StatusCode::OK.into_response())

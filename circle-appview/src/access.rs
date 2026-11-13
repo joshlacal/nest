@@ -24,17 +24,14 @@ pub struct ActiveSpaceCredential {
     pub expires_at: DateTime<Utc>,
 }
 
-/// A cached credential is handed out only while it has at least this long left,
-/// so a request (or a sweep's run of requests, bounded at 30 s) never starts on
-/// a credential about to expire. Sized for the 600 s credentials authorities
-/// issue by default, with room for clock skew. Shorter-lived credentials use a
-/// proportionally smaller margin (see [`renewal_margin`]).
-pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
+/// A credential is renewed five minutes early so the existing five-minute
+/// revision sweep reauthorizes notification delivery before the registration
+/// expires with its credential. Shorter-lived credentials use half their
+/// lifetime instead.
+pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
 
 /// The renewal margin for a credential with `lifetime` left when it is stored:
 /// [`CREDENTIAL_RENEWAL_MARGIN`], or half the lifetime when that is shorter.
-/// Issuers may choose any lifetime up to 3600 s, so a credential of a minute or
-/// less is still served for the first half of its life instead of never.
 pub fn renewal_margin(lifetime: chrono::Duration) -> chrono::Duration {
     std::cmp::min(CREDENTIAL_RENEWAL_MARGIN, lifetime / 2)
 }
@@ -752,8 +749,6 @@ pub async fn refresh_member_cache(
         .is_explicit_revocation(expected_client_id)
     {
         tracing::warn!(space_uri = %space_uri, "Space allowedApps explicitly omits client_id, revoking");
-        // Unregister while the space credential is still cached; revocation drops it.
-        crate::notify::unregister(state, space_uri).await;
         let mut revoke_res =
             crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await;
         if revoke_res.is_err() {
@@ -1164,11 +1159,6 @@ pub async fn activate_circle(
     // so notification triggers correctly detect active members.
     let members = refresh_member_cache(state, space_uri).await?;
 
-    // 6b. Register for notifyWrite / notifySpaceDeleted at the space host. Best
-    // effort: the revision sweep retries a failed registration.
-    if let Err(e) = crate::notify::ensure_registration(state, space_uri, &cred).await {
-        tracing::warn!(error = %e, space = %space_fingerprint(space_uri), "registerNotify failed during activation");
-    }
 
     // 7. Sync the repo so children (circle_records, etc.) have their FK parent and notifications are generated.
     let sync_engine = crate::sync::SyncEngine::new(state);
@@ -1214,6 +1204,10 @@ pub async fn ensure_space_credential(
     }
 
     let _lock_guard = state.space_locks.acquire(space_uri).await;
+    let notify_endpoint = state
+        .config
+        .notify_endpoint()
+        .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
 
     ensure_space_credential_from_parts(
         &state.db,
@@ -1223,6 +1217,7 @@ pub async fn ensure_space_credential(
         &state.oauth_service,
         &state.http_client,
         space_uri,
+        Some(&notify_endpoint),
         preferred_user_did,
     )
     .await
@@ -1252,6 +1247,10 @@ pub async fn ensure_space_credential_for_request(
     }
 
     let _lock_guard = state.space_locks.acquire(space_uri).await;
+    let notify_endpoint = state
+        .config
+        .notify_endpoint()
+        .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
     // Another request may have acquired, or failed to acquire, while this one waited.
     if state
         .credential_store
@@ -1268,6 +1267,7 @@ pub async fn ensure_space_credential_for_request(
         &state.oauth_service,
         &state.http_client,
         space_uri,
+        Some(&notify_endpoint),
         preferred_user_did,
     )
     .await;
@@ -1289,6 +1289,7 @@ pub async fn ensure_space_credential_from_parts(
     oauth_service: &crate::oauth::OAuthService,
     http_client: &reqwest::Client,
     space_uri: &str,
+    notify_endpoint: Option<&str>,
     preferred_user_did: Option<&str>,
 ) -> Result<ActiveSpaceCredential, AppError> {
     // 1. Return early if credential store already holds an active, unexpired credential
@@ -1369,20 +1370,28 @@ pub async fn ensure_space_credential_from_parts(
     let (space_host_endpoint, space_host_service) =
         resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
-    // 7. Step 2: Sign client attestation and exchange for Space credential
+    // 7. Sign the client attestation and authorize sync. Notification
+    // registration is part of this exchange and reuses the persisted token on
+    // every credential renewal.
     let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
-
+    let notify = match notify_endpoint {
+        Some(endpoint) => Some(
+            crate::notify::get_or_create_registration(db, space_uri, endpoint).await?,
+        ),
+        None => None,
+    };
     let exchanged = space_client
-        .exchange_credential(
+        .authorize_space_sync(
             &space_host_endpoint,
             space_uri,
             &delegation_token,
             &client_attestation,
+            notify,
             &authority_did,
             &authority_doc,
         )
         .await;
-    let (credential_jwt, ephemeral_signing_key, expires_at) = match exchanged {
+    let exchanged = match exchanged {
         Ok(exchanged) => exchanged,
         Err(e) if is_space_deleted(&e) => {
             purge_deleted_space(db, credential_store, space_uri).await;
@@ -1403,11 +1412,13 @@ pub async fn ensure_space_credential_from_parts(
         }
         Err(e) => return Err(e),
     };
+    crate::notify::note_authorized_revision(db, space_uri, exchanged.space_rev.as_deref()).await?;
+
 
     let cred = ActiveSpaceCredential {
-        token: credential_jwt,
-        signing_key: ephemeral_signing_key,
-        expires_at,
+        token: exchanged.credential,
+        signing_key: exchanged.signing_key,
+        expires_at: exchanged.expires_at,
     };
 
     // 8. Store in CredentialStore

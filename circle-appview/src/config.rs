@@ -146,15 +146,33 @@ impl Config {
 }
 
 impl Config {
-    /// Service identifier passed to `com.atproto.space.registerNotify`: this
-    /// AppView's DID plus the `#atproto_circles` service entry that space hosts
-    /// resolve to deliver notifyWrite and notifySpaceDeleted.
-    pub fn notify_service_identifier(&self) -> String {
-        if self.service_did.contains('#') {
-            self.service_did.clone()
-        } else {
-            format!("{}#atproto_circles", self.service_did)
+    /// Public base URL registered for `confirmRegistration` and
+    /// `notifySpaceUpdate`. The existing AppView URL is already the service's
+    /// externally reachable base URL, so notification registration does not
+    /// need a second origin setting.
+    pub fn notify_endpoint(&self) -> Result<String, anyhow::Error> {
+        let mut endpoint = url::Url::parse(&self.appview_base_url)
+            .map_err(|e| anyhow::anyhow!("APPVIEW_BASE_URL must be a valid URL: {e}"))?;
+        if !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "APPVIEW_BASE_URL must not contain userinfo, a query, or a fragment"
+            ));
         }
+        let loopback = endpoint
+            .host_str()
+            .is_some_and(|host| host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
+            return Err(anyhow::anyhow!(
+                "APPVIEW_BASE_URL must use HTTPS (HTTP is allowed only for loopback development)"
+            ));
+        }
+        let path = endpoint.path().trim_end_matches('/').to_owned();
+        endpoint.set_path(&path);
+        Ok(endpoint.to_string().trim_end_matches('/').to_owned())
     }
 }
 
