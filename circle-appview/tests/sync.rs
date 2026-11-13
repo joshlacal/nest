@@ -26,8 +26,8 @@ use circle_appview::commit::{compute_dagcbor_cid, LtHash as RepoLtHash, RepoReco
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
 use circle_appview::space_client::{
-    ListWritersOutput, MockSpaceHostTransport, RepoRemoved, RepoWrite, SpaceAppAccess,
-    SpaceClient, SpaceConfig, SpacePolicy, WriterUpdate,
+    ListWritersOutput, MockSpaceHostTransport, RepoRemoved, RepoWrite, SpaceAppAccess, SpaceClient,
+    SpaceConfig, SpacePolicy, WriterUpdate,
 };
 
 #[derive(Clone)]
@@ -508,14 +508,10 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
     }
 }
 async fn callback_token(pool: &PgPool) -> String {
-    circle_appview::notify::get_or_create_registration(
-        pool,
-        SPACE_URI,
-        "http://127.0.0.1:3002",
-    )
-    .await
-    .unwrap()
-    .token
+    circle_appview::notify::get_or_create_registration(pool, SPACE_URI, "http://127.0.0.1:3002")
+        .await
+        .unwrap()
+        .token
 }
 
 fn repo_write_update(
@@ -545,7 +541,6 @@ fn notify_body(token: &str, update: serde_json::Value) -> bytes::Bytes {
         .unwrap(),
     )
 }
-
 
 // ---------------------------------------------------------------------------------------
 // Step 4: Incremental Sync and Hash Mismatch Recovery Tests
@@ -809,7 +804,6 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
 // Step 5: Notify Write and Sweep Revision Tests
 // ---------------------------------------------------------------------------------------
 
-
 #[sqlx::test(migrations = "./migrations")]
 async fn notify_space_update_repo_write_triggers_immediate_sync(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
@@ -844,13 +838,7 @@ async fn notify_space_update_repo_write_triggers_immediate_sync(pool: PgPool) {
     );
 
     let token = callback_token(&pool).await;
-    let update = repo_write_update(
-        OWNER_DID,
-        rev,
-        &lthash.digest(),
-        "3l7spacerev2a",
-        None,
-    );
+    let update = repo_write_update(OWNER_DID, rev, &lthash.digest(), "3l7spacerev2a", None);
     let app = circle_appview::routes::create_router(setup.state.clone());
     use axum::http::Request;
     use tower::ServiceExt;
@@ -968,7 +956,6 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-
 #[test]
 fn dagcbor_cid_computation_and_mismatch_rejection() {
     let post_val = json!({
@@ -1075,7 +1062,6 @@ fn dagcbor_cid_with_nested_links_and_raw_bytes() {
         blob_cid_str
     );
 }
-
 
 #[test]
 fn author_pds_resolution_requires_exact_atproto_pds_id_and_type() {
@@ -1418,13 +1404,7 @@ async fn star_roundtrip_and_tampered_record_rejection(pool: PgPool) {
 fn notify_space_update_body_parses_the_nov12_shape() {
     use catbird_atproto::generated::com_atproto::space::notify_space_update::NotifySpaceUpdate;
 
-    let update = repo_write_update(
-        OWNER_DID,
-        "3l7rev234567a",
-        &[9; 32],
-        "3l7spacerev2a",
-        None,
-    );
+    let update = repo_write_update(OWNER_DID, "3l7rev234567a", &[9; 32], "3l7spacerev2a", None);
     let wire = json!({
         "space": SPACE_URI,
         "token": "opaque-registration-token",
@@ -1432,10 +1412,7 @@ fn notify_space_update_body_parses_the_nov12_shape() {
     });
     let parsed: NotifySpaceUpdate<String> = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(parsed.token, "opaque-registration-token");
-    assert_eq!(
-        wire["update"]["$type"],
-        "com.atproto.space.defs#repoWrite"
-    );
+    assert_eq!(wire["update"]["$type"], "com.atproto.space.defs#repoWrite");
     assert_eq!(wire["update"]["repoRev"], "3l7rev234567a");
     assert_eq!(wire["update"]["spaceRev"], "3l7spacerev2a");
     assert!(wire.get("repoRev").is_none());
@@ -1454,13 +1431,7 @@ fn notify_space_update_body_parses_the_nov12_shape() {
 async fn notify_space_update_wrong_token_and_unknown_space_leak_same_error(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
     let token = callback_token(&pool).await;
-    let update = repo_write_update(
-        OWNER_DID,
-        "3l7rev234567a",
-        &[0; 32],
-        "3l7spacerev2a",
-        None,
-    );
+    let update = repo_write_update(OWNER_DID, "3l7rev234567a", &[0; 32], "3l7spacerev2a", None);
     let app = circle_appview::routes::create_router(setup.state.clone());
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -2031,7 +2002,10 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     );
 
     let summary = sweep_once(&setup.state).await.unwrap();
-    assert_eq!(summary.repos_checked, 2, "the repeated repo is listed twice");
+    assert_eq!(
+        summary.repos_checked, 2,
+        "the repeated repo is listed twice"
+    );
     assert_eq!(
         summary.repos_synced, 1,
         "the repeat matches stored state and is not re-synced"
@@ -2106,9 +2080,11 @@ async fn list_writers_repo_removed_then_repo_write_readds_writer(pool: PgPool) {
             authority: OWNER_DID.into(),
             space_type: "blue.catbird.circle".into(),
             skey: "3l7syncaaaaaa".into(),
-            app_access: SpaceAppAccess::AllowList(vec![
-                setup.state.oauth_service.client_id.clone(),
-            ]),
+            app_access: SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
             read_policy: SpacePolicy::MemberList,
             write_policy: SpacePolicy::MemberList,
             user_policy: None,
@@ -2198,17 +2174,14 @@ async fn notify_space_update_verifies_expected_hash_before_advancing(pool: PgPoo
         axum::extract::State(setup.state.clone()),
         notify_body(
             &token,
-            repo_write_update(
-                OWNER_DID,
-                rev,
-                &[0x99; 32],
-                "3l7spacerev2a",
-                None,
-            ),
+            repo_write_update(OWNER_DID, rev, &[0x99; 32], "3l7spacerev2a", None),
         ),
     )
     .await;
-    assert!(mismatch.is_ok(), "a valid update is acknowledged before syncing");
+    assert!(
+        mismatch.is_ok(),
+        "a valid update is acknowledged before syncing"
+    );
     circle_appview::sync::wait_for_notify_syncs_idle().await;
     let indexed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM circle_records WHERE space_uri = $1 AND author_did = $2",
@@ -2233,13 +2206,7 @@ async fn notify_space_update_verifies_expected_hash_before_advancing(pool: PgPoo
         axum::extract::State(setup.state.clone()),
         notify_body(
             &token,
-            repo_write_update(
-                OWNER_DID,
-                rev,
-                &lthash.digest(),
-                "3l7spacerev2a",
-                None,
-            ),
+            repo_write_update(OWNER_DID, rev, &lthash.digest(), "3l7spacerev2a", None),
         ),
     )
     .await;
@@ -2591,13 +2558,7 @@ async fn notify_space_update_requires_32_byte_hash_and_non_empty_rev(pool: PgPoo
     let body_with_repo_rev = |repo_rev: &str| {
         notify_body(
             &token,
-            repo_write_update(
-                DAVE_DID,
-                repo_rev,
-                &[0x22; 32],
-                "3l7spacerev2a",
-                None,
-            ),
+            repo_write_update(DAVE_DID, repo_rev, &[0x22; 32], "3l7spacerev2a", None),
         )
     };
     let valid = circle_appview::sync::notify_space_update_handler(

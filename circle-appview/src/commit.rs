@@ -57,8 +57,9 @@ pub fn json_to_ipld(
 ) -> Result<jacquard_common::types::value::Data<jacquard_common::SmolStr>, PermissionedError> {
     reject_json_floats(value)?;
     let data: jacquard_common::types::value::Data<jacquard_common::SmolStr> =
-        serde_json::from_value(value.clone())
-            .map_err(|e| PermissionedError::Serialization(format!("Invalid IPLD/JSON format: {e}")))?;
+        serde_json::from_value(value.clone()).map_err(|e| {
+            PermissionedError::Serialization(format!("Invalid IPLD/JSON format: {e}"))
+        })?;
 
     fn reject_ipld_floats(
         value: &jacquard_common::types::value::Data<jacquard_common::SmolStr>,

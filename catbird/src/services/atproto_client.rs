@@ -1005,8 +1005,7 @@ mod tests {
         );
 
         // Allowlisted Spaces HTTP Message Signature request.
-        let accept_signature =
-            r#"mac=("atproto-space-commit";sf);keyid="did:key:ephemeral";tag="atproto-space-commit""#;
+        let accept_signature = r#"mac=("atproto-space-commit";sf);keyid="did:key:ephemeral";tag="atproto-space-commit""#;
         client_headers.insert(
             HeaderName::from_static("accept-signature"),
             HeaderValue::from_str(accept_signature).unwrap(),

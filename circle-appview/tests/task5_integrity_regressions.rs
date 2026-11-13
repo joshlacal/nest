@@ -431,7 +431,6 @@ async fn test_linearizable_activation_cannot_resurrect_purged_circle(pool: PgPoo
     );
 }
 
-
 #[sqlx::test(migrations = "./migrations")]
 async fn test_missing_operation_value_fails_atomically_without_advancing_sync_state(pool: PgPool) {
     let setup = setup_test(pool).await;

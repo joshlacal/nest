@@ -4,9 +4,7 @@ mod support;
 
 use std::sync::Arc;
 
-use axum::{
-    body::to_bytes, extract::State, http::StatusCode, response::IntoResponse, Json,
-};
+use axum::{body::to_bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use chrono::{Duration, Utc};
@@ -197,7 +195,10 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
     let second = notify::get_or_create_registration(&pool, SPACE_URI, "https://new.example")
         .await
         .unwrap();
-    assert_eq!(first.token, second.token, "endpoint changes must not rotate tokens");
+    assert_eq!(
+        first.token, second.token,
+        "endpoint changes must not rotate tokens"
+    );
     assert_eq!(second.endpoint, "https://new.example");
 
     let Json(output) = notify::confirm_registration_handler(
@@ -213,7 +214,10 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
     assert_eq!(output, json!({"challenge": "host-challenge"}));
 
     let mut rejections = Vec::new();
-    for (space, token) in [(SPACE_URI, "wrong-token"), ("at://did:plc:missing/space/x/y", first.token.as_str())] {
+    for (space, token) in [
+        (SPACE_URI, "wrong-token"),
+        ("at://did:plc:missing/space/x/y", first.token.as_str()),
+    ] {
         let error = notify::confirm_registration_handler(
             State(setup.state.clone()),
             Json(ConfirmRegistrationInput {
@@ -224,7 +228,10 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
         )
         .await
         .expect_err("unknown registration or token must be rejected");
-        assert!(matches!(&error, AppError::Unauthorized(AuthReason::InvalidToken)));
+        assert!(matches!(
+            &error,
+            AppError::Unauthorized(AuthReason::InvalidToken)
+        ));
         rejections.push(error.into_response());
     }
     assert!(rejections
@@ -258,7 +265,10 @@ async fn repo_write_requires_token_and_records_revision_gap(pool: PgPool) {
     let error = send_update(&setup.state, "wrong-token", update.clone())
         .await
         .expect_err("wrong callback token must fail");
-    assert!(matches!(error, AppError::Unauthorized(AuthReason::InvalidToken)));
+    assert!(matches!(
+        error,
+        AppError::Unauthorized(AuthReason::InvalidToken)
+    ));
     assert_eq!(
         send_update(&setup.state, &registration.token, update)
             .await
@@ -346,7 +356,10 @@ async fn repo_removed_drops_writer_state_without_deleting_history(pool: PgPool) 
     assert!(!sync_exists);
     assert!(record_exists, "repoRemoved preserves Space history");
     assert_eq!(
-        notify::checkpoint_rev(&pool, SPACE_URI).await.unwrap().as_deref(),
+        notify::checkpoint_rev(&pool, SPACE_URI)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("3l7removed1")
     );
 }
@@ -381,11 +394,9 @@ async fn registration_expired_reauthorizes_and_catches_up_with_list_writers(pool
     );
     sync::wait_for_notify_syncs_idle().await;
 
-    assert!(setup
-        .transport
-        .recorded_calls()
-        .iter()
-        .any(|call| call.endpoint_url.ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
+    assert!(setup.transport.recorded_calls().iter().any(|call| call
+        .endpoint_url
+        .ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
     assert!(setup
         .transport
         .recorded_credential_uses()

@@ -114,7 +114,6 @@ impl Config {
         })?;
         let _ = parse_session_encryption_key(&session_encryption_key_raw)?;
 
-
         Ok(Self {
             host,
             port,
@@ -152,9 +151,12 @@ impl Config {
                 "APPVIEW_BASE_URL must not contain userinfo, a query, or a fragment"
             ));
         }
-        let loopback = endpoint
-            .host_str()
-            .is_some_and(|host| host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+        let loopback = endpoint.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
         if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
             return Err(anyhow::anyhow!(
                 "APPVIEW_BASE_URL must use HTTPS (HTTP is allowed only for loopback development)"

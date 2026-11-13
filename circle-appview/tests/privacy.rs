@@ -2627,7 +2627,6 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
     );
 }
 
-
 #[sqlx::test(migrations = "./migrations")]
 async fn get_space_transport_or_auth_error_does_not_purge_circle_data(pool: PgPool) {
     use circle_appview::access::refresh_member_cache;

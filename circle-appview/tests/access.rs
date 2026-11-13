@@ -1097,9 +1097,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
     let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let exchange_request = circle_appview::space_client::AuthorizeSpaceSyncRequest {
         space: "at://did:plc:auth/space/1".into(),
-        credential_key: circle_appview::space_signature::p256_did_key(
-            exchange_key.verifying_key(),
-        ),
+        credential_key: circle_appview::space_signature::p256_did_key(exchange_key.verifying_key()),
         delegation_token: Some("test-delegation-token".into()),
         client_attestation: Some("test-attestation".into()),
         notify: None,

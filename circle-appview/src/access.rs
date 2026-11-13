@@ -1156,7 +1156,6 @@ pub async fn activate_circle(
     // so notification triggers correctly detect active members.
     let members = refresh_member_cache(state, space_uri).await?;
 
-
     // 7. Sync the repo so children (circle_records, etc.) have their FK parent and notifications are generated.
     let sync_engine = crate::sync::SyncEngine::new(state);
     if let Err(e) = sync_engine.sync_repo(space_uri, &authority_did).await {
@@ -1372,9 +1371,9 @@ pub async fn ensure_space_credential_from_parts(
     // every credential renewal.
     let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
     let notify = match notify_endpoint {
-        Some(endpoint) => Some(
-            crate::notify::get_or_create_registration(db, space_uri, endpoint).await?,
-        ),
+        Some(endpoint) => {
+            Some(crate::notify::get_or_create_registration(db, space_uri, endpoint).await?)
+        }
         None => None,
     };
     let exchanged = space_client
@@ -1410,7 +1409,6 @@ pub async fn ensure_space_credential_from_parts(
         Err(e) => return Err(e),
     };
     crate::notify::note_authorized_revision(db, space_uri, exchanged.space_rev.as_deref()).await?;
-
 
     let cred = ActiveSpaceCredential {
         token: exchanged.credential,
@@ -2656,8 +2654,7 @@ mod tests {
         .fetch_optional(&pool)
         .await
         .unwrap();
-        let (endpoint, token) =
-            registration.expect("activation must configure notifications");
+        let (endpoint, token) = registration.expect("activation must configure notifications");
         assert_eq!(endpoint, state.config.appview_base_url);
         assert!(!token.is_empty());
     }

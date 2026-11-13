@@ -286,7 +286,6 @@ impl SyncEngine {
             .transpose()
             .map_err(|e| AppError::Internal(format!("Invalid notification endpoint: {e}")))?;
 
-
         let cred = match self.credential_store.get(space_uri).await {
             Some(c) => c,
             None => {
@@ -1639,13 +1638,11 @@ pub async fn apply_repo_removed(
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
-    sqlx::query(
-        "DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
-    )
-    .bind(space)
-    .bind(repo)
-    .execute(pool)
-    .await?;
+    sqlx::query("DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2")
+        .bind(space)
+        .bind(repo)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -1846,8 +1843,7 @@ pub async fn sweep_once_with_shutdown(
                         let needs_sync = match db_sync {
                             Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
                                 let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                                last_rev != update.repo_rev
-                                    || &digest[..] != update.data.as_ref()
+                                last_rev != update.repo_rev || &digest[..] != update.data.as_ref()
                             }
                             _ => true,
                         };
@@ -1921,7 +1917,6 @@ pub async fn sweep_once_with_shutdown(
                 crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
             }
         }
-
 
         if start_over {
             state.listing_resume.clear(&space_uri);
@@ -2080,9 +2075,8 @@ pub async fn notify_space_update_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, AppError> {
-    let input: NotifySpaceUpdateInput = serde_json::from_slice(&body).map_err(|e| {
-        AppError::InvalidRequest(format!("Invalid notifySpaceUpdate body: {e}"))
-    })?;
+    let input: NotifySpaceUpdateInput = serde_json::from_slice(&body)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid notifySpaceUpdate body: {e}")))?;
     crate::notify::authenticate(&state.db, &input.space, &input.token).await?;
     let update_type = input
         .update
@@ -2093,10 +2087,8 @@ pub async fn notify_space_update_handler(
     match update_type {
         "com.atproto.space.defs#repoWrite" => {
             active_space(&state, &input.space).await?;
-            let update: crate::space_client::RepoWrite =
-                serde_json::from_value(input.update).map_err(|e| {
-                    AppError::InvalidRequest(format!("Invalid repoWrite update: {e}"))
-                })?;
+            let update: crate::space_client::RepoWrite = serde_json::from_value(input.update)
+                .map_err(|e| AppError::InvalidRequest(format!("Invalid repoWrite update: {e}")))?;
             if update.data.len() != 32 || update.repo_rev.is_empty() {
                 return Err(AppError::InvalidRequest(
                     "repoWrite data must be 32 bytes and repoRev must be non-empty".into(),
@@ -2135,30 +2127,23 @@ pub async fn notify_space_update_handler(
                                 .await
                                 .is_ok()
                             {
-                                let _ = crate::notify::checkpoint(
-                                    &state.db,
-                                    &space,
-                                    &update.space_rev,
-                                )
-                                .await;
+                                let _ =
+                                    crate::notify::checkpoint(&state.db, &space, &update.space_rev)
+                                        .await;
                             }
                         });
                     }
                     Err(_) => {
-                        crate::notify::mark_pending(
-                            &state.db,
-                            &input.space,
-                            &update.space_rev,
-                        )
-                        .await?;
+                        crate::notify::mark_pending(&state.db, &input.space, &update.space_rev)
+                            .await?;
                     }
                 }
             }
         }
         "com.atproto.space.defs#repoRemoved" => {
             active_space(&state, &input.space).await?;
-            let update: crate::space_client::RepoRemoved =
-                serde_json::from_value(input.update).map_err(|e| {
+            let update: crate::space_client::RepoRemoved = serde_json::from_value(input.update)
+                .map_err(|e| {
                     AppError::InvalidRequest(format!("Invalid repoRemoved update: {e}"))
                 })?;
             let checkpoint = crate::notify::checkpoint_rev(&state.db, &input.space).await?;

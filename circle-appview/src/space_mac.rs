@@ -152,13 +152,7 @@ pub fn derive_secret(
         &mut exporter_secret,
     )?;
     let mut shared_secret = [0; 32];
-    labeled_expand(
-        SUITE_ID,
-        &exporter_secret,
-        b"sec",
-        &[],
-        &mut shared_secret,
-    )?;
+    labeled_expand(SUITE_ID, &exporter_secret, b"sec", &[], &mut shared_secret)?;
     Ok(shared_secret)
 }
 
@@ -189,9 +183,7 @@ fn labeled_expand(
         [] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label], output),
         [a] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a], output),
         [a, b] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a, b], output),
-        [a, b, c] => {
-            hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a, b, c], output)
-        }
+        [a, b, c] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a, b, c], output),
         _ => return Err(invalid_mac()),
     };
     result.map_err(|_| invalid_mac())
@@ -305,7 +297,8 @@ fn verify_mac(
     let covered_value = combined_header(headers, profile)?;
     let fields = parse_dictionary(&covered_value)?;
     let canonical = fields.serialize().ok_or_else(invalid_mac)?;
-    let mut hmac = Hmac::<Sha256>::new_from_slice(&request.shared_secret).map_err(|_| invalid_mac())?;
+    let mut hmac =
+        Hmac::<Sha256>::new_from_slice(&request.shared_secret).map_err(|_| invalid_mac())?;
     hmac.update(b"\"");
     hmac.update(profile.as_bytes());
     hmac.update(b"\";sf: ");
@@ -333,9 +326,12 @@ pub fn verify_commit(
     }
     let fields = verify_mac(request, headers)?;
     let matches = matches!(bare_item(&fields, "ver"), Some(BareItem::Integer(value)) if i64::from(*value) == commit.ver)
-        && string_item(bare_item(&fields, "repo").ok_or_else(invalid_mac)?) == Some(commit.repo.as_str())
-        && string_item(bare_item(&fields, "space").ok_or_else(invalid_mac)?) == Some(commit.space.as_str())
-        && string_item(bare_item(&fields, "rev").ok_or_else(invalid_mac)?) == Some(commit.rev.as_str())
+        && string_item(bare_item(&fields, "repo").ok_or_else(invalid_mac)?)
+            == Some(commit.repo.as_str())
+        && string_item(bare_item(&fields, "space").ok_or_else(invalid_mac)?)
+            == Some(commit.space.as_str())
+        && string_item(bare_item(&fields, "rev").ok_or_else(invalid_mac)?)
+            == Some(commit.rev.as_str())
         && matches!(bare_item(&fields, "data"), Some(BareItem::ByteSequence(value)) if value.as_slice() == commit.data.as_ref());
     if matches {
         Ok(())
@@ -411,7 +407,9 @@ mod tests {
         let params = params.unwrap_or(&default_params);
         let canonical = parse_dictionary(covered).unwrap().serialize().unwrap();
         let mut hmac = Hmac::<Sha256>::new_from_slice(&request.shared_secret).unwrap();
-        hmac.update(format!("\"{profile}\";sf: {canonical}\n\"@signature-params\": {params}").as_bytes());
+        hmac.update(
+            format!("\"{profile}\";sf: {canonical}\n\"@signature-params\": {params}").as_bytes(),
+        );
         let signature = STANDARD.encode(hmac.finalize().into_bytes());
         let mut headers = HeaderMap::new();
         headers.insert(profile, HeaderValue::from_str(covered).unwrap());

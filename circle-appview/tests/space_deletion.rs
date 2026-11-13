@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use bytes::Bytes;
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::EncodedPoint;
 use serde_json::json;
-use bytes::Bytes;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -419,13 +419,9 @@ async fn space_deleted_update_reauthorizes_without_purging_a_live_space(pool: Pg
     assert!(!tombstoned(&pool).await);
     assert_eq!(count(&pool, "circle_records").await, 1);
     assert!(setup.state.credential_store.get(SPACE_URI).await.is_some());
-    assert!(setup
-        .mock_transport
-        .recorded_calls()
-        .iter()
-        .any(|call| call
-            .endpoint_url
-            .ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
+    assert!(setup.mock_transport.recorded_calls().iter().any(|call| call
+        .endpoint_url
+        .ends_with("/xrpc/com.atproto.space.authorizeSpaceSync")));
 }
 
 #[sqlx::test(migrations = "./migrations")]

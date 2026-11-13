@@ -80,9 +80,7 @@ use catbird_atproto::generated::com_atproto::space::get_latest_commit::{
 use catbird_atproto::generated::com_atproto::space::list_spaces::{ListSpaces, ListSpacesOutput};
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::ident::AtIdentifier;
-use catbird_atproto::jacquard_common::types::string::{
-    AtUri, Cid, Datetime, Did, Nsid, UriValue,
-};
+use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Nsid, UriValue};
 use catbird_atproto::jacquard_common::types::value::Data;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
@@ -753,7 +751,9 @@ impl ScenarioRunner {
             );
             let ls_query: ListSpaces<String> = ListSpaces {
                 cursor: None,
-                space_did: Some(Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?),
+                space_did: Some(
+                    Did::new(user.did.clone()).map_err(|e| format!("Invalid DID: {e}"))?,
+                ),
                 limit: Some(1),
                 space_type: None,
             };

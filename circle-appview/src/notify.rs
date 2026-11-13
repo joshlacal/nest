@@ -54,12 +54,11 @@ pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), A
     if token.is_empty() || token.len() > 512 {
         return Err(AppError::Unauthorized(AuthReason::InvalidToken));
     }
-    let stored: Option<String> = sqlx::query_scalar(
-        "SELECT token FROM circle_notify_registrations WHERE space_uri = $1",
-    )
-    .bind(space)
-    .fetch_optional(db)
-    .await?;
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT token FROM circle_notify_registrations WHERE space_uri = $1")
+            .bind(space)
+            .fetch_optional(db)
+            .await?;
     // Always perform the same fixed-size MAC verification for an unknown space
     // as for a wrong token, then return the same error. Registration tokens are
     // 32 random bytes encoded as 43 base64url characters.
@@ -80,7 +79,6 @@ pub async fn authenticate(db: &PgPool, space: &str, token: &str) -> Result<(), A
         Err(AppError::Unauthorized(AuthReason::InvalidToken))
     }
 }
-
 
 pub async fn checkpoint(db: &PgPool, space: &str, space_rev: &str) -> Result<(), AppError> {
     sqlx::query(
@@ -137,7 +135,6 @@ pub async fn mark_pending(db: &PgPool, space: &str, space_rev: &str) -> Result<(
     Ok(())
 }
 
-
 pub async fn catchup_state(
     db: &PgPool,
     space: &str,
@@ -150,7 +147,6 @@ pub async fn catchup_state(
     .await?
     .unwrap_or((None, None)))
 }
-
 
 pub async fn remove_registration(db: &PgPool, space: &str) -> Result<(), AppError> {
     sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")

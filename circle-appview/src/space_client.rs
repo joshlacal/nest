@@ -51,7 +51,6 @@ pub struct AuthorizedSpaceSync {
     pub space_rev: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SpaceAppAccess {
     Open,
@@ -665,8 +664,10 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 MAX_SPACE_CREDENTIAL_BYTES,
             )
             .await?;
-            let body: AuthorizeSpaceSyncOutput = serde_json::from_slice(&body_bytes)
-                .map_err(|e| AppError::Internal(format!("Invalid authorizeSpaceSync response: {e}")))?;
+            let body: AuthorizeSpaceSyncOutput =
+                serde_json::from_slice(&body_bytes).map_err(|e| {
+                    AppError::Internal(format!("Invalid authorizeSpaceSync response: {e}"))
+                })?;
             if body.credential.is_empty() {
                 return Err(AppError::Internal(
                     "Empty credential in authorizeSpaceSync response".into(),
@@ -971,7 +972,6 @@ pub struct RecordedCredentialUse {
     pub auth: SpaceAuthHeaders,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct RecordedDelegationTokenCall {
     pub endpoint_url: String,
@@ -1100,11 +1100,7 @@ impl MockSpaceHostTransport {
         lock.clone()
     }
 
-    pub fn set_list_writers_response(
-        &self,
-        space: &str,
-        output: ListWritersOutput,
-    ) {
+    pub fn set_list_writers_response(&self, space: &str, output: ListWritersOutput) {
         self.list_writers_responses
             .lock()
             .unwrap()
@@ -1145,7 +1141,6 @@ impl MockSpaceHostTransport {
         let mut lock = self.blob_responses.lock().unwrap();
         lock.insert(key.to_string(), (content_type, data));
     }
-
 
     pub fn recorded_calls(&self) -> Vec<RecordedSpaceHostCall> {
         let lock = self.calls.lock().unwrap();
@@ -1254,9 +1249,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         Box::pin(async move {
             let credential = match res {
                 Some(Ok(credential)) => credential,
-                Some(Err(e)) => {
-                    return Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e))
-                }
+                Some(Err(e)) => return Err(parse_xrpc_error(reqwest::StatusCode::BAD_REQUEST, &e)),
                 None => {
                     let key = authority_key.ok_or_else(|| {
                         AppError::NotFound(format!("No mock response for {space_uri}"))
@@ -1266,8 +1259,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
                         &authority_did,
                         space_uri,
                         request.credential_key.as_str(),
-                        Utc::now()
-                            + chrono::Duration::seconds(DEFAULT_CREDENTIAL_LIFETIME_SECS),
+                        Utc::now() + chrono::Duration::seconds(DEFAULT_CREDENTIAL_LIFETIME_SECS),
                     )
                 }
             };
@@ -1294,14 +1286,12 @@ impl SpaceHostTransport for MockSpaceHostTransport {
             .push(cursor.map(str::to_string));
         let lock = self.list_writers_responses.lock().unwrap();
         let res = match cursor {
-            Some(c) => Some(
-                lock.get(&format!("{space_uri}:{c}"))
-                    .cloned()
-                    .unwrap_or(ListWritersOutput {
-                        cursor: None,
-                        repos: Vec::new(),
-                    }),
-            ),
+            Some(c) => lock.get(&format!("{space_uri}:{c}")).cloned().or_else(|| {
+                lock.contains_key(space_uri).then_some(ListWritersOutput {
+                    cursor: None,
+                    repos: Vec::new(),
+                })
+            }),
             None => lock.get(space_uri).cloned(),
         };
         let lookup_key = match cursor {
@@ -1871,7 +1861,6 @@ impl SpaceClient {
         Some(serde_json::Value::Object(profile))
     }
 
-
     /// `com.atproto.space.listWriters` on the space host; audience is the
     /// authority's bare DID. `cursor` is an exclusive spaceRev checkpoint.
     pub async fn list_writers(
@@ -2428,7 +2417,6 @@ async fn credential_use_error(response: reqwest::Response, _op: &str) -> AppErro
     .unwrap_or_default();
     parse_xrpc_error(status, &String::from_utf8_lossy(&body))
 }
-
 
 pub fn parse_xrpc_error(status: reqwest::StatusCode, body: &str) -> AppError {
     if status.is_server_error() {
@@ -3223,7 +3211,15 @@ mod tests {
         let star = crate::test_support::fixture_star(&commit, &[]).unwrap();
         let key = p256::ecdsa::SigningKey::random(&mut OsRng);
         for endpoint in ["getLatestCommit", "getRepo", "listRepoOps"] {
-            for mode in ["good", "missing", "wrong", "duplicate", "keyid", "type", "version"] {
+            for mode in [
+                "good",
+                "missing",
+                "wrong",
+                "duplicate",
+                "keyid",
+                "type",
+                "version",
+            ] {
                 let server = MockServer::start().await;
                 let mut auth = credential_headers(&key, "cred", REPO);
                 auth.mac = Some(MacRequest {
@@ -3251,12 +3247,14 @@ mod tests {
                 } else {
                     "did:key:fixture"
                 };
-                let params = format!(
-                    "(\"{COMMIT_MAC_PROFILE}\";sf);keyid=\"{keyid}\";tag=\"{tag}\""
-                );
-                let mut mac =
-                    Hmac::<Sha256>::new_from_slice(if mode == "wrong" { &[8; 32] } else { &[7; 32] })
-                        .unwrap();
+                let params =
+                    format!("(\"{COMMIT_MAC_PROFILE}\";sf);keyid=\"{keyid}\";tag=\"{tag}\"");
+                let mut mac = Hmac::<Sha256>::new_from_slice(if mode == "wrong" {
+                    &[8; 32]
+                } else {
+                    &[7; 32]
+                })
+                .unwrap();
                 mac.update(
                     format!(
                         "\"{COMMIT_MAC_PROFILE}\";sf: {covered}\n\"@signature-params\": {params}"
