@@ -2380,7 +2380,7 @@ mod tests {
                     let req_str = String::from_utf8_lossy(&buf[..n]);
                     if req_str.starts_with("GET /xrpc/com.atproto.space.getSpace") {
                         let body = serde_json::json!({
-                            "uri": TEST_SPACE_URI,
+                            "space": TEST_SPACE_URI,
                             "policy": {
                                 "$type": "com.atproto.memberspace.policy",
                                 "publicRead": false,
