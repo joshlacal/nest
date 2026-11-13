@@ -42,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
 futures-util = "0.3"
 ciborium = "0.2"
+sfv = "=0.16.1"
 thiserror = "1"
 anyhow = "1"
 

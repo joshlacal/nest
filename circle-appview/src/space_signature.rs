@@ -60,7 +60,7 @@ impl SpaceAuthHeaders {
         let mac_header = self.mac.as_ref().map(crate::space_mac::MacRequest::header);
         if let Some(value) = &mac_header {
             fields.push((
-                HeaderName::from_static(crate::space_mac::WANT_MAC_HEADER),
+                HeaderName::from_static(crate::space_mac::ACCEPT_SIGNATURE_HEADER),
                 value.as_str(),
             ));
         }

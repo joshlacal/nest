@@ -930,12 +930,15 @@ impl ScenarioRunner {
             .map_err(|e| format!("DID resolution failed: {e:?}"))?;
         let kem =
             circle_appview::space_mac::kem_key(&doc, &session.did).map_err(|e| e.to_string())?;
-        let request_mac =
-            circle_appview::space_mac::encapsulate(&kem).map_err(|e| e.to_string())?;
+        let request_mac = circle_appview::space_mac::encapsulate(
+            &kem,
+            circle_appview::space_mac::MacProfile::Commit,
+        )
+        .map_err(|e| e.to_string())?;
         let commit_resp = session
             .apply_auth(self.client.get(&get_commit_url))
             .header(
-                circle_appview::space_mac::WANT_MAC_HEADER,
+                circle_appview::space_mac::ACCEPT_SIGNATURE_HEADER,
                 request_mac.header(),
             )
             .query(&commit_query)
@@ -949,13 +952,7 @@ impl ScenarioRunner {
                 commit_resp.status()
             ));
         }
-        let response_mac = commit_resp
-            .headers()
-            .get_all(circle_appview::space_mac::MAC_HEADER)
-            .iter()
-            .map(|v| v.to_str().map(str::to_owned).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
+        let response_headers = commit_resp.headers().clone();
         let commit_output: GetLatestCommitOutput = commit_resp
             .json()
             .await
@@ -966,8 +963,8 @@ impl ScenarioRunner {
             &commit,
             space,
             &session.did,
-            &request_mac.shared_secret,
-            Some(&response_mac),
+            &request_mac,
+            &response_headers,
         )
         .map_err(|e| format!("Commit MAC verification failed: {e}"))?;
         let rev_str = commit.rev.as_str().to_string();

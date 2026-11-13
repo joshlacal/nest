@@ -94,7 +94,10 @@ async fn actual_reference_hosts_verify_exchange_commit_ops_and_star() {
         let kem = kem_key(&host.document, &host.did).expect("real PLC KEM key");
         let auth = || {
             let mut headers = credential_headers(&key, &credential, &host.did);
-            headers.mac = Some(encapsulate(&kem).expect("fresh DHKEM request"));
+            headers.mac = Some(
+                encapsulate(&kem, circle_appview::space_mac::MacProfile::Commit)
+                    .expect("fresh HPKE-export request"),
+            );
             headers
         };
         let latest = transport
