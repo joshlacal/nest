@@ -42,12 +42,14 @@ pub fn fixture_star(commit: &Commit, records: &[RepoRecord]) -> anyhow::Result<V
     let mut records: Vec<_> = records.iter().collect();
     records.sort_by_key(|r| format!("{}/{}", r.collection, r.rkey));
     for r in records {
+        out.push(0x01);
         frame(&mut out, format!("{}/{}", r.collection, r.rkey).as_bytes());
         frame(
             &mut out,
             &serde_ipld_dagcbor::to_vec(&json_to_ipld(&r.value)?)?,
         );
     }
+    out.push(0x00);
     Ok(out)
 }
 pub fn frame(out: &mut Vec<u8>, bytes: &[u8]) {
