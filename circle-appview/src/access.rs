@@ -24,17 +24,13 @@ pub struct ActiveSpaceCredential {
     pub expires_at: DateTime<Utc>,
 }
 
-/// A cached credential is handed out only while it has at least this long left,
-/// so a request (or a sweep's run of requests, bounded at 30 s) never starts on
-/// a credential about to expire. Sized for the 600 s credentials authorities
-/// issue by default, with room for clock skew. Shorter-lived credentials use a
-/// proportionally smaller margin (see [`renewal_margin`]).
-pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
+/// Request paths stop serving a credential within its normal renewal margin.
+/// The scheduler separately renews every active Space before two scheduler
+/// periods remain, keeping notification registration comfortably ahead of exp.
+pub const CREDENTIAL_RENEWAL_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
 
 /// The renewal margin for a credential with `lifetime` left when it is stored:
 /// [`CREDENTIAL_RENEWAL_MARGIN`], or half the lifetime when that is shorter.
-/// Issuers may choose any lifetime up to 3600 s, so a credential of a minute or
-/// less is still served for the first half of its life instead of never.
 pub fn renewal_margin(lifetime: chrono::Duration) -> chrono::Duration {
     std::cmp::min(CREDENTIAL_RENEWAL_MARGIN, lifetime / 2)
 }
@@ -115,6 +111,23 @@ impl CredentialStore {
     pub async fn remove(&self, space: &str) {
         let mut lock = self.values.write().await;
         lock.remove(space);
+    }
+    pub(crate) async fn remove_expiring_within_at(
+        &self,
+        space: &str,
+        now: DateTime<Utc>,
+        within: chrono::Duration,
+    ) -> bool {
+        let mut lock = self.values.write().await;
+        if lock
+            .get(space)
+            .is_some_and(|stored| stored.cred.expires_at < now + within)
+        {
+            lock.remove(space);
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove the credential for `space` only if it is still `token`, so a
@@ -303,7 +316,7 @@ pub struct DelegationTokenClaims {
     pub jti: String,
 }
 
-/// XRPC error a space host returns from getSpaceCredential once the space is
+/// XRPC error a space host returns from authorizeSpaceSync once the space is
 /// deleted. `parse_xrpc_error` maps it to `AppError::AccessRemoved(SPACE_DELETED)`.
 pub const SPACE_DELETED: &str = "SpaceDeleted";
 
@@ -350,11 +363,9 @@ pub fn is_space_deleted(err: &AppError) -> bool {
     matches!(err, AppError::AccessRemoved(code) if code == SPACE_DELETED)
 }
 
-/// A syncer that missed notifySpaceDeleted learns of the deletion at its next
-/// credential exchange and must delete every copy (permissioned-data proposal,
-/// "Space deletion"). Purges projections, the member cache, the credential and
-/// the notify registration, and tombstones the Circle so reads return
-/// `AccessRemoved` until the tombstone expires.
+/// A syncer that missed a `spaceDeleted` notification learns of the deletion at
+/// its next credential exchange. Purge projections, member cache, credential,
+/// and notification registration, then tombstone reads as `AccessRemoved`.
 pub async fn purge_deleted_space(db: &PgPool, credential_store: &CredentialStore, space_uri: &str) {
     match crate::purge::delete_space(db, credential_store, space_uri).await {
         Ok(()) => tracing::info!(
@@ -752,8 +763,6 @@ pub async fn refresh_member_cache(
         .is_explicit_revocation(expected_client_id)
     {
         tracing::warn!(space_uri = %space_uri, "Space allowedApps explicitly omits client_id, revoking");
-        // Unregister while the space credential is still cached; revocation drops it.
-        crate::notify::unregister(state, space_uri).await;
         let mut revoke_res =
             crate::purge::revoke_app_access(&state.db, &state.credential_store, space_uri).await;
         if revoke_res.is_err() {
@@ -972,11 +981,10 @@ pub fn space_fingerprint(space_uri: &str) -> String {
 }
 
 /// Activation has already confirmed through the owner's getSpace that the Space
-/// exists. Since the October 29 Spaces alpha, an authority refuses a user its
-/// policy does not authorize with `SpaceNotFound` rather than `UserNotAuthorized`,
-/// and checks `allowedApps` only after the user, so a `SpaceNotFound` from the
-/// credential exchange here is a refusal. It keeps the `Forbidden` answer that
-/// `UserNotAuthorized` and `AppNotAuthorized` produce.
+/// exists. A Nov-12 authority refuses a user its policy does not authorize with
+/// `SpaceNotFound`, and checks `allowedApps` only after the user, so a
+/// `SpaceNotFound` from the credential exchange here is a refusal. It keeps the
+/// `Forbidden` answer that `AccountNotAuthorized` and `AppNotAuthorized` produce.
 fn activation_credential_error(e: AppError) -> AppError {
     match e {
         AppError::NotFound(code) if code == "SpaceNotFound" => AppError::Forbidden(
@@ -1056,6 +1064,13 @@ pub async fn activate_circle(
         ));
     }
 
+    let registration_existed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM circle_notify_registrations WHERE space_uri = $1)",
+    )
+    .bind(space_uri)
+    .fetch_one(&state.db)
+    .await?;
+    let result: Result<CircleSummary, AppError> = async {
     // 3. Acquire a Space credential under the calling user's OAuth session first.
     let cred = ensure_space_credential(state, space_uri, Some(user_did)).await.map_err(|e| {
         tracing::warn!(error = %e, space_uri = %space_uri, "Failed to acquire space credential during activation");
@@ -1164,12 +1179,6 @@ pub async fn activate_circle(
     // so notification triggers correctly detect active members.
     let members = refresh_member_cache(state, space_uri).await?;
 
-    // 6b. Register for notifyWrite / notifySpaceDeleted at the space host. Best
-    // effort: the revision sweep retries a failed registration.
-    if let Err(e) = crate::notify::ensure_registration(state, space_uri, &cred).await {
-        tracing::warn!(error = %e, space = %space_fingerprint(space_uri), "registerNotify failed during activation");
-    }
-
     // 7. Sync the repo so children (circle_records, etc.) have their FK parent and notifications are generated.
     let sync_engine = crate::sync::SyncEngine::new(state);
     if let Err(e) = sync_engine.sync_repo(space_uri, &authority_did).await {
@@ -1188,15 +1197,31 @@ pub async fn activate_circle(
         catbird_atproto::jacquard_common::types::string::Did::new(SmolStr::new(&authority_did))
             .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
 
-    Ok(CircleSummary {
-        circle_id: circle_tid,
-        uri: space_ref,
-        name: SmolStr::new(&display_name),
-        owner: owner_did,
-        member_count: Some(members.len() as i64),
-        muted: Some(false),
-        extra_data: None,
-    })
+        Ok(CircleSummary {
+            circle_id: circle_tid,
+            uri: space_ref,
+            name: SmolStr::new(&display_name),
+            owner: owner_did,
+            member_count: Some(members.len() as i64),
+            muted: Some(false),
+            extra_data: None,
+        })
+    }
+    .await;
+    if result.is_err() && !registration_existed {
+        sqlx::query(
+            "DELETE FROM circle_notify_registrations r \
+             WHERE r.space_uri = $1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM circles c \
+                   WHERE c.space_uri = r.space_uri AND c.deleted_at IS NULL \
+               )",
+        )
+        .bind(space_uri)
+        .execute(&state.db)
+        .await?;
+    }
+    result
 }
 /// Ensure an active Space credential is available in the CredentialStore for the given space_uri.
 ///
@@ -1214,6 +1239,7 @@ pub async fn ensure_space_credential(
     }
 
     let _lock_guard = state.space_locks.acquire(space_uri).await;
+    let notify_endpoint = state.config.notify_endpoint();
 
     ensure_space_credential_from_parts(
         &state.db,
@@ -1223,6 +1249,7 @@ pub async fn ensure_space_credential(
         &state.oauth_service,
         &state.http_client,
         space_uri,
+        Some(notify_endpoint),
         preferred_user_did,
     )
     .await
@@ -1252,6 +1279,7 @@ pub async fn ensure_space_credential_for_request(
     }
 
     let _lock_guard = state.space_locks.acquire(space_uri).await;
+    let notify_endpoint = state.config.notify_endpoint();
     // Another request may have acquired, or failed to acquire, while this one waited.
     if state
         .credential_store
@@ -1268,6 +1296,7 @@ pub async fn ensure_space_credential_for_request(
         &state.oauth_service,
         &state.http_client,
         space_uri,
+        Some(notify_endpoint),
         preferred_user_did,
     )
     .await;
@@ -1289,6 +1318,7 @@ pub async fn ensure_space_credential_from_parts(
     oauth_service: &crate::oauth::OAuthService,
     http_client: &reqwest::Client,
     space_uri: &str,
+    notify_endpoint: Option<&str>,
     preferred_user_did: Option<&str>,
 ) -> Result<ActiveSpaceCredential, AppError> {
     // 1. Return early if credential store already holds an active, unexpired credential
@@ -1334,8 +1364,38 @@ pub async fn ensure_space_credential_from_parts(
         acting_user_did = Some(authority_did.clone());
     }
 
-    let user_did = acting_user_did
-        .ok_or_else(|| AppError::Unauthorized(crate::error::AuthReason::MissingOAuthSession))?;
+    let user_did = match acting_user_did {
+        Some(user_did) => user_did,
+        None => {
+            let authority_doc =
+                did_resolver
+                    .resolve(&authority_did)
+                    .await
+                    .map_err(|e| match e {
+                        AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
+                        other => AppError::Internal(format!(
+                            "Failed to resolve DID document for {authority_did}: {other}"
+                        )),
+                    })?;
+            let (space_host_endpoint, _) =
+                resolve_space_host_endpoint(&authority_doc, &authority_did)?;
+            match space_client
+                .probe_space_status(&space_host_endpoint, space_uri)
+                .await
+            {
+                Err(error) if is_space_deleted(&error) => {
+                    purge_deleted_space(db, credential_store, space_uri).await;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+                Ok(()) => {
+                    return Err(AppError::Unauthorized(
+                        crate::error::AuthReason::MissingOAuthSession,
+                    ))
+                }
+            }
+        }
+    };
 
     // 3. Obtain valid token and DPoP signing key for the chosen user
     let (access_token, dpop_key) = oauth_service
@@ -1369,20 +1429,34 @@ pub async fn ensure_space_credential_from_parts(
     let (space_host_endpoint, space_host_service) =
         resolve_space_host_endpoint(&authority_doc, &authority_did)?;
 
-    // 7. Step 2: Sign client attestation and exchange for Space credential
+    // 7. Sign the client attestation and authorize sync. Notification
+    // registration is part of this exchange and reuses the persisted token on
+    // every credential renewal.
     let client_attestation = oauth_service.sign_client_attestation(&space_host_service)?;
-
+    let notify = match notify_endpoint {
+        Some(endpoint) => Some(
+            crate::notify::get_or_create_registration(
+                db,
+                &oauth_service.session_encryption_key,
+                space_uri,
+                endpoint,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let exchanged = space_client
-        .exchange_credential(
+        .authorize_space_sync(
             &space_host_endpoint,
             space_uri,
             &delegation_token,
             &client_attestation,
+            notify,
             &authority_did,
             &authority_doc,
         )
         .await;
-    let (credential_jwt, ephemeral_signing_key, expires_at) = match exchanged {
+    let exchanged = match exchanged {
         Ok(exchanged) => exchanged,
         Err(e) if is_space_deleted(&e) => {
             purge_deleted_space(db, credential_store, space_uri).await;
@@ -1403,11 +1477,12 @@ pub async fn ensure_space_credential_from_parts(
         }
         Err(e) => return Err(e),
     };
+    crate::notify::note_authorized_revision(db, space_uri, exchanged.space_rev.as_deref()).await?;
 
     let cred = ActiveSpaceCredential {
-        token: credential_jwt,
-        signing_key: ephemeral_signing_key,
-        expires_at,
+        token: exchanged.credential,
+        signing_key: exchanged.signing_key,
+        expires_at: exchanged.expires_at,
     };
 
     // 8. Store in CredentialStore
@@ -1509,10 +1584,10 @@ mod tests {
             .insert_at("space-a".into(), issued_for("fresh", 600), issued)
             .await;
         assert_eq!(store.get_at("space-a", at(0)).await.unwrap().token, "fresh");
-        assert!(store.get_at("space-a", at(539)).await.is_some());
+        assert!(store.get_at("space-a", at(299)).await.is_some());
         assert!(
-            store.get_at("space-a", at(541)).await.is_none(),
-            "within 60 s of exp"
+            store.get_at("space-a", at(301)).await.is_none(),
+            "within five minutes of exp"
         );
 
         // 55 s credential: the old fixed 60 s margin never served it.
@@ -1531,6 +1606,23 @@ mod tests {
             )
             .await;
         assert_eq!(store.get("space-c").await.unwrap().token, "fresh");
+
+        store
+            .insert_at("space-d".into(), issued_for("scheduled", 600), issued)
+            .await;
+        let two_periods = chrono::Duration::seconds(480);
+        assert!(
+            !store
+                .remove_expiring_within_at("space-d", issued, two_periods)
+                .await,
+            "exactly 600 seconds remain"
+        );
+        assert!(
+            store
+                .remove_expiring_within_at("space-d", at(121), two_periods)
+                .await,
+            "fewer than two 240-second periods remain"
+        );
     }
 
     #[tokio::test]
@@ -1672,6 +1764,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -1732,6 +1825,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -1815,6 +1909,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -1835,15 +1930,30 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn test_ensure_space_credential_no_usable_session_fails(pool: PgPool) {
+    async fn test_no_session_probes_host_without_delegation(pool: PgPool) {
         setup_test_key();
         let mock_transport = Arc::new(MockSpaceHostTransport::new());
+        mock_transport.set_credential_response(
+            TEST_SPACE_URI,
+            Err(serde_json::json!({"error": "AuthRequired"}).to_string()),
+        );
         let space_client = Arc::new(SpaceClient::with_transport(mock_transport.clone()));
         let credential_store = Arc::new(CredentialStore::new());
         let did_resolver = Arc::new(DidResolver::new(
             "https://plc.directory".into(),
             reqwest::Client::new(),
         ));
+        let authority_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        register_test_did_doc(
+            &did_resolver,
+            TEST_AUTHORITY_DID,
+            &authority_key,
+            vec![DidService {
+                id: "#atproto_pds".into(),
+                r#type: "AtprotoPersonalDataServer".into(),
+                service_endpoint: TEST_SPACE_HOST.into(),
+            }],
+        );
         let oauth_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
@@ -1852,24 +1962,29 @@ mod tests {
             None,
         ));
 
-        let http_client = reqwest::Client::new();
         let err = ensure_space_credential_from_parts(
             &pool,
             &space_client,
             &credential_store,
             &did_resolver,
             &oauth_service,
-            &http_client,
+            &reqwest::Client::new(),
             TEST_SPACE_URI,
+            None,
             None,
         )
         .await
-        .expect_err("Must fail when no session is held for user/member/authority");
+        .expect_err("host authorization is still required for a live Space");
 
         assert!(matches!(
             err,
-            AppError::Unauthorized(AuthReason::MissingOAuthSession)
+            AppError::Unauthorized(AuthReason::MissingHeader)
         ));
+        let calls = mock_transport.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].request.delegation_token.is_none());
+        assert!(calls[0].request.client_attestation.is_none());
+        assert!(calls[0].request.notify.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1902,6 +2017,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             None,
         )
         .await
@@ -1956,6 +2072,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -2315,6 +2432,7 @@ mod tests {
             &oauth_service,
             &http_client,
             TEST_SPACE_URI,
+            None,
             Some(TEST_USER_DID),
         )
         .await
@@ -2365,7 +2483,7 @@ mod tests {
                     let req_str = String::from_utf8_lossy(&buf[..n]);
                     if req_str.starts_with("GET /xrpc/com.atproto.space.getSpace") {
                         let body = serde_json::json!({
-                            "uri": TEST_SPACE_URI,
+                            "space": TEST_SPACE_URI,
                             "policy": {
                                 "$type": "com.atproto.memberspace.policy",
                                 "publicRead": false,
@@ -2632,18 +2750,24 @@ mod tests {
 
         assert_eq!(member_rows.len(), 2);
 
-        // Activation registered for notifications at the authority's space host
-        // with the configured service id (CIRCLES-06).
-        let registration: Option<(String, String)> = sqlx::query_as(
-            "SELECT service, space_host_endpoint FROM circle_notify_registrations WHERE space_uri = $1",
+        // Activation included a stable endpoint and opaque token in
+        // authorizeSpaceSync.
+        let registration: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT endpoint, token FROM circle_notify_registrations WHERE space_uri = $1",
         )
         .bind(TEST_SPACE_URI)
         .fetch_optional(&pool)
         .await
         .unwrap();
-        let (service, endpoint) = registration.expect("activation must register for notifications");
-        assert_eq!(service, state.config.notify_service_identifier());
-        assert_eq!(endpoint, pds_endpoint);
+        let (endpoint, token) = registration.expect("activation must configure notifications");
+        assert_eq!(endpoint, state.config.appview_base_url);
+        assert!(!crate::oauth::decrypt_secret(
+            &state.oauth_service.session_encryption_key,
+            TEST_SPACE_URI,
+            &token,
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2836,6 +2960,17 @@ mod tests {
                 .unwrap();
 
         assert!(circle_row.is_none(), "NO circles row must exist in DB");
+        let registration_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM circle_notify_registrations WHERE space_uri = $1)",
+        )
+        .bind(TEST_SPACE_URI)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !registration_exists,
+            "a failed activation must remove its pre-created registration"
+        );
     }
 
     #[test]
@@ -2846,8 +2981,8 @@ mod tests {
         }
         // Other refusals keep their existing mapping.
         assert!(matches!(
-            activation_credential_error(AppError::Forbidden("UserNotAuthorized".into())),
-            AppError::Forbidden(msg) if msg == "UserNotAuthorized"
+            activation_credential_error(AppError::Forbidden("AccountNotAuthorized".into())),
+            AppError::Forbidden(msg) if msg == "AccountNotAuthorized"
         ));
         assert!(matches!(
             activation_credential_error(AppError::AccessRemoved("SpaceDeleted".into())),

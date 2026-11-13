@@ -53,12 +53,12 @@ pub fn create_router(state: AppState) -> Router {
             get(get_capabilities),
         )
         .route(
-            "/xrpc/com.atproto.space.notifyWrite",
-            post(crate::sync::notify_write_handler),
+            "/xrpc/com.atproto.space.confirmRegistration",
+            post(crate::notify::confirm_registration_handler),
         )
         .route(
-            "/xrpc/com.atproto.space.notifySpaceDeleted",
-            post(crate::sync::notify_space_deleted_handler),
+            "/xrpc/com.atproto.space.notifySpaceUpdate",
+            post(crate::sync::notify_space_update_handler),
         );
 
     // Authenticated XRPC endpoints

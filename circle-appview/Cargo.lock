@@ -378,7 +378,7 @@ dependencies = [
 [[package]]
 name = "catbird-atproto"
 version = "0.1.0"
-source = "git+https://github.com/joshlacal/catbird-atproto.git?rev=f40e8795ff8690092440971a9b5e5496e3f8430f#f40e8795ff8690092440971a9b5e5496e3f8430f"
+source = "git+https://github.com/joshlacal/catbird-atproto.git?rev=3939ba0027e281a2c63541f1ee56d627830c21b0#3939ba0027e281a2c63541f1ee56d627830c21b0"
 dependencies = [
  "bytes",
  "jacquard-common",
@@ -530,6 +530,7 @@ dependencies = [
  "serde_bytes",
  "serde_ipld_dagcbor 0.6.4",
  "serde_json",
+ "sfv",
  "sha2 0.10.9",
  "sqlx",
  "thiserror 1.0.69",
@@ -3372,6 +3373,17 @@ checksum = "a84f14a19e9a014bb9f4512488d9829a68e04ecabffb0f9904cd1ace94598177"
 dependencies = [
  "base16ct",
  "serde",
+]
+
+[[package]]
+name = "sfv"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ad2f82c45c83ee1bf0628f2d677a4fd6b08d755c25fad27a9f5600fb2e470b2"
+dependencies = [
+ "base64 0.23.1",
+ "indexmap",
+ "ref-cast",
 ]
 
 [[package]]

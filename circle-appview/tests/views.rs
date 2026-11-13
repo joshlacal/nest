@@ -1906,6 +1906,7 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
                             indexed_at: None,
                             joined_via_starter_pack: None,
                             labels: None,
+                            links: None,
                             pinned_post: None,
                             posts_count: None,
                             pronouns: Some(SmolStr::new("she/her")),
@@ -1935,6 +1936,7 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
                             indexed_at: None,
                             joined_via_starter_pack: None,
                             labels: None,
+                            links: None,
                             pinned_post: None,
                             posts_count: None,
                             pronouns: None,
@@ -2107,6 +2109,7 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
                         follows_count: None,
                         indexed_at: None,
                         joined_via_starter_pack: None,
+                        links: None,
                         labels: None,
                         pinned_post: None,
                         posts_count: None,
@@ -2158,6 +2161,7 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
 
 #[test]
 fn test_circle_media_base_url_strict_https_origin_validation() {
+    std::env::set_var("APPVIEW_BASE_URL", "http://127.0.0.1:3002");
     let valid_cases = [
         "https://media.catbird.blue",
         "https://media.catbird.blue/",

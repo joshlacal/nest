@@ -29,7 +29,7 @@ use std::future::Future;
 
 /// Media remains disabled until private blob serving is qualified on supported hosts.
 pub const SUPPORTS_IMAGES: bool = false;
-pub const CIRCLE_PROTOCOL_REVISION: &str = "5d88b414a98de1ada22c94c78fa0667a7028163c";
+pub const CIRCLE_PROTOCOL_REVISION: &str = "d4def6e9f521896ed8222f576d54923d00b5fbeb";
 
 pub use auth::{
     authenticate, AuthenticatedUser, DidDocument, DidResolver, PublicKeyJwk, VerificationMethod,
@@ -181,8 +181,10 @@ where
     tracing::info!("Listening on {}", addr);
     let identity_task = identity_events::spawn(state.clone());
 
-    let (sweep_handle, sweep_shutdown_tx) =
-        sync::spawn_revision_sweep_task(state.clone(), std::time::Duration::from_secs(300));
+    let (sweep_handle, sweep_shutdown_tx) = sync::spawn_revision_sweep_task(
+        state.clone(),
+        std::time::Duration::from_secs(sync::REGISTRATION_REAUTH_INTERVAL_SECS),
+    );
     let (jti_handle, jti_shutdown_tx) =
         spawn_jti_cleanup_task(pool.clone(), std::time::Duration::from_secs(60));
     let (rejections_handle, rejections_shutdown_tx) =

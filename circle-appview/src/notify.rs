@@ -1,174 +1,211 @@
-//! Notification registration at a Circle's space host (CIRCLES-06).
+//! Nov-12 Spaces notification registration state.
 //!
-//! Upstream space hosts forward notifyWrite and notifySpaceDeleted only to
-//! services registered with `com.atproto.space.registerNotify` on the
-//! authority's space host. A registration lasts 24 h, so it is renewed once it
-//! is within [`RENEW_MARGIN`] of `expiresAt`.
+//! A stable, per-space opaque token is included in every `authorizeSpaceSync`
+//! request. Space hosts authenticate `confirmRegistration` and
+//! `notifySpaceUpdate` by echoing that token in the JSON body.
 
-use chrono::{DateTime, Utc};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use sha2::Sha256;
+use sqlx::PgPool;
 
-use crate::access::{
-    extract_authority_did, resolve_space_host_endpoint, space_fingerprint, ActiveSpaceCredential,
-};
-use crate::config::AppState;
 use crate::error::{AppError, AuthReason};
 
-/// Renew a registration this long before the space host's `expiresAt`.
-pub const RENEW_MARGIN: chrono::Duration = chrono::Duration::hours(1);
-
-/// Register, or renew, this AppView's notify registration for `space_uri`.
-/// Returns the new `expiresAt`, or `None` when the stored registration is still
-/// fresh and no request was sent.
-pub async fn ensure_registration(
-    state: &AppState,
-    space_uri: &str,
-    cred: &ActiveSpaceCredential,
-) -> Result<Option<DateTime<Utc>>, AppError> {
-    ensure_registration_at(state, space_uri, cred, Utc::now()).await
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyRegistration {
+    pub endpoint: String,
+    pub token: String,
 }
 
-/// [`ensure_registration`] with an explicit clock, for renewal tests.
-pub async fn ensure_registration_at(
-    state: &AppState,
-    space_uri: &str,
-    cred: &ActiveSpaceCredential,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>, AppError> {
-    let service = state.config.notify_service_identifier();
-    let existing: Option<(String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT service, expires_at FROM circle_notify_registrations WHERE space_uri = $1",
-    )
-    .bind(space_uri)
-    .fetch_optional(&state.db)
-    .await?;
-    if let Some((registered_service, expires_at)) = existing {
-        if registered_service == service && expires_at - RENEW_MARGIN > now {
-            return Ok(None);
-        }
+impl std::fmt::Debug for NotifyRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifyRegistration")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"[REDACTED]")
+            .finish()
     }
+}
 
-    // The alpha accepts registrations only on the authority's own space host.
-    let authority_did = extract_authority_did(space_uri)?;
-    let authority_doc = state
-        .did_resolver
-        .resolve(&authority_did)
-        .await
-        .map_err(|e| match e {
-            AuthReason::SsrfBlocked => AppError::Unauthorized(AuthReason::SsrfBlocked),
-            other => AppError::Internal(format!(
-                "Failed to resolve DID document for {authority_did}: {other}"
-            )),
-        })?;
-    let (space_host_endpoint, _) = resolve_space_host_endpoint(&authority_doc, &authority_did)?;
+/// Load the stable token for `space`, creating it on first authorization.
+/// Updating the public endpoint never rotates the token.
+pub async fn get_or_create_registration(
+    db: &PgPool,
+    encryption_key: &[u8; 32],
+    space: &str,
+    endpoint: &str,
+) -> Result<NotifyRegistration, AppError> {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let candidate = URL_SAFE_NO_PAD.encode(bytes);
+    let encrypted = crate::oauth::encrypt_secret(encryption_key, space, candidate.as_bytes())?;
 
-    let expires_at = match state
-        .space_client
-        .register_notify(
-            &space_host_endpoint,
-            space_uri,
-            &cred.token,
-            &cred.signing_key,
-            &service,
-        )
-        .await
-    {
-        Ok(expires_at) => expires_at,
-        Err(e) => {
-            crate::access::evict_rejected_credential(
-                &state.credential_store,
-                space_uri,
-                &cred.token,
-                &e,
-            )
-            .await;
-            return Err(e);
-        }
-    };
-
-    sqlx::query(
+    let (endpoint, encrypted_token): (String, Vec<u8>) = sqlx::query_as(
         r#"
-        INSERT INTO circle_notify_registrations (space_uri, service, space_host_endpoint, expires_at, registered_at)
-        VALUES ($1, $2, $3, $4, now())
+        INSERT INTO circle_notify_registrations (space_uri, endpoint, token, updated_at)
+        VALUES ($1, $2, $3, now())
         ON CONFLICT (space_uri) DO UPDATE
-        SET service = EXCLUDED.service,
-            space_host_endpoint = EXCLUDED.space_host_endpoint,
-            expires_at = EXCLUDED.expires_at,
-            registered_at = now()
+        SET endpoint = EXCLUDED.endpoint,
+            updated_at = now()
+        RETURNING endpoint, token
         "#,
     )
-    .bind(space_uri)
-    .bind(&service)
-    .bind(&space_host_endpoint)
-    .bind(expires_at)
-    .execute(&state.db)
+    .bind(space)
+    .bind(endpoint)
+    .bind(encrypted)
+    .fetch_one(db)
     .await?;
+    let token = String::from_utf8(crate::oauth::decrypt_secret(
+        encryption_key,
+        space,
+        &encrypted_token,
+    )?)
+    .map_err(|_| AppError::Internal("Stored notification token is not UTF-8".into()))?;
 
-    tracing::info!(
-        space = %space_fingerprint(space_uri),
-        %expires_at,
-        "Registered for space notifications"
-    );
-    Ok(Some(expires_at))
+    Ok(NotifyRegistration { endpoint, token })
 }
 
-/// Best-effort `com.atproto.space.unregisterNotify` when this AppView loses
-/// access to a space, then forget the registration. A failure only means the
-/// host keeps sending notifications the receiver now rejects until the 24 h
-/// registration lapses.
-pub async fn unregister(state: &AppState, space_uri: &str) {
-    let registration: Option<(String, String)> = match sqlx::query_as(
-        "SELECT service, space_host_endpoint FROM circle_notify_registrations WHERE space_uri = $1",
+/// Authenticate a token without a data-dependent plaintext comparison.
+pub async fn authenticate(
+    db: &PgPool,
+    encryption_key: &[u8; 32],
+    space: &str,
+    token: &str,
+) -> Result<(), AppError> {
+    if token.is_empty() || token.len() > 512 {
+        return Err(AppError::Unauthorized(AuthReason::InvalidToken));
+    }
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT token FROM circle_notify_registrations WHERE space_uri = $1")
+            .bind(space)
+            .fetch_optional(db)
+            .await?;
+    // Always perform the same fixed-size MAC verification for an unknown space
+    // as for a wrong token, then return the same error. Registration tokens are
+    // 32 random bytes encoded as 43 base64url characters.
+    const DUMMY_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let known_space = stored.is_some();
+    let decrypted;
+    let stored = match stored {
+        Some(envelope) => {
+            decrypted = crate::oauth::decrypt_secret(encryption_key, space, &envelope)?;
+            std::str::from_utf8(&decrypted)
+                .map_err(|_| AppError::Internal("Stored notification token is not UTF-8".into()))?
+        }
+        None => DUMMY_TOKEN,
+    };
+    let mut expected = Hmac::<Sha256>::new_from_slice(stored.as_bytes())
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidToken))?;
+    expected.update(space.as_bytes());
+    let expected = expected.finalize().into_bytes();
+    let mut supplied = Hmac::<Sha256>::new_from_slice(token.as_bytes())
+        .map_err(|_| AppError::Unauthorized(AuthReason::InvalidToken))?;
+    supplied.update(space.as_bytes());
+    let valid = supplied.verify_slice(&expected).is_ok();
+    if known_space && valid {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized(AuthReason::InvalidToken))
+    }
+}
+
+pub async fn checkpoint(db: &PgPool, space: &str, space_rev: &str) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE circle_notify_registrations \
+         SET checkpoint_rev = GREATEST(checkpoint_rev, $2), \
+             pending_rev = CASE \
+                 WHEN pending_rev <= GREATEST(checkpoint_rev, $2) THEN NULL \
+                 ELSE pending_rev \
+             END, \
+             updated_at = now() \
+         WHERE space_uri = $1",
     )
-    .bind(space_uri)
-    .fetch_optional(&state.db)
-    .await
-    {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to read notify registration");
-            return;
-        }
-    };
-    let Some((service, endpoint)) = registration else {
-        return;
-    };
+    .bind(space)
+    .bind(space_rev)
+    .execute(db)
+    .await?;
+    Ok(())
+}
 
-    if let Some(cred) = state.credential_store.get(space_uri).await {
-        let call = state.space_client.unregister_notify(
-            &endpoint,
-            space_uri,
-            &cred.token,
-            &cred.signing_key,
-            &service,
-        );
-        match tokio::time::timeout(std::time::Duration::from_secs(5), call).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                crate::access::evict_rejected_credential(
-                    &state.credential_store,
-                    space_uri,
-                    &cred.token,
-                    &e,
-                )
-                .await;
-                tracing::warn!(
-                    error = %e,
-                    space = %space_fingerprint(space_uri),
-                    "unregisterNotify failed"
-                )
-            }
-            Err(_) => tracing::warn!(
-                space = %space_fingerprint(space_uri),
-                "unregisterNotify timed out"
-            ),
-        }
-    }
+pub async fn checkpoint_rev(db: &PgPool, space: &str) -> Result<Option<String>, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT checkpoint_rev FROM circle_notify_registrations WHERE space_uri = $1",
+    )
+    .bind(space)
+    .fetch_optional(db)
+    .await?
+    .flatten())
+}
+pub async fn note_authorized_revision(
+    db: &PgPool,
+    space: &str,
+    space_rev: Option<&str>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE circle_notify_registrations \
+         SET pending_rev = CASE \
+                 WHEN $2::text IS DISTINCT FROM checkpoint_rev THEN $2 \
+                 ELSE NULL \
+             END, \
+             updated_at = now() \
+         WHERE space_uri = $1",
+    )
+    .bind(space)
+    .bind(space_rev)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+pub async fn mark_pending(db: &PgPool, space: &str, space_rev: &str) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE circle_notify_registrations SET pending_rev = $2, updated_at = now() WHERE space_uri = $1",
+    )
+    .bind(space)
+    .bind(space_rev)
+    .execute(db)
+    .await?;
+    Ok(())
+}
 
-    if let Err(e) = sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
-        .bind(space_uri)
-        .execute(&state.db)
-        .await
-    {
-        tracing::warn!(error = %e, "Failed to delete notify registration");
+pub async fn catchup_state(
+    db: &PgPool,
+    space: &str,
+) -> Result<(Option<String>, Option<String>), AppError> {
+    Ok(sqlx::query_as(
+        "SELECT checkpoint_rev, pending_rev FROM circle_notify_registrations WHERE space_uri = $1",
+    )
+    .bind(space)
+    .fetch_optional(db)
+    .await?
+    .unwrap_or((None, None)))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmRegistrationInput {
+    pub space: String,
+    pub token: String,
+    pub challenge: String,
+}
+
+pub async fn confirm_registration_handler(
+    axum::extract::State(state): axum::extract::State<crate::config::AppState>,
+    axum::Json(input): axum::Json<ConfirmRegistrationInput>,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    if input.challenge.len() > 512 {
+        return Err(AppError::InvalidRequest(
+            "challenge exceeds 512 characters".into(),
+        ));
     }
+    authenticate(
+        &state.db,
+        &state.oauth_service.session_encryption_key,
+        &input.space,
+        &input.token,
+    )
+    .await?;
+    Ok(axum::Json(serde_json::json!({
+        "challenge": input.challenge,
+    })))
 }

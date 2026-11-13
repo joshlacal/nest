@@ -404,6 +404,8 @@ pub async fn get_feed(
             reason: None,
             feed_context: None,
             req_id: None,
+            op_thread_post_index: None,
+            op_thread_post_count: None,
             extra_data: None,
         };
 
