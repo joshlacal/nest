@@ -91,7 +91,7 @@ fn classify_auth_error(error: AppError) -> AppError {
     }
 }
 
-/// Extract session ID from request (cookie or Authorization header).
+/// Extract session ID from request headers (cookie or Authorization header).
 ///
 /// Authorization rules:
 /// - If `Authorization` header is present:
@@ -101,8 +101,10 @@ fn classify_auth_error(error: AppError) -> AppError {
 /// - If `Authorization` header is absent:
 ///   - Fall back to checking the `catbird_session` cookie.
 ///   - If cookie is missing or empty, returns an `AuthenticationRequired` (401) error.
-fn extract_session_id(req: &Request<Body>) -> Result<String, AppError> {
-    if let Some(auth_header) = req.headers().get(AUTH_HEADER_NAME) {
+pub fn extract_session_id_from_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<String, AppError> {
+    if let Some(auth_header) = headers.get(AUTH_HEADER_NAME) {
         let auth_str = auth_header
             .to_str()
             .map_err(|_| classify_auth_error(AppError::InvalidSession))?;
@@ -117,8 +119,7 @@ fn extract_session_id(req: &Request<Body>) -> Result<String, AppError> {
     }
 
     // Fall back to cookie only when Authorization header is absent
-    let cookies = req
-        .headers()
+    let cookies = headers
         .get_all("cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -142,6 +143,30 @@ fn extract_session_id(req: &Request<Body>) -> Result<String, AppError> {
     ))
 }
 
+fn extract_session_id(req: &Request<Body>) -> Result<String, AppError> {
+    extract_session_id_from_headers(req.headers())
+}
+
+/// Authenticate a Catbird session directly from request headers (UUIDv4 Bearer or cookie).
+pub async fn authenticate_session_headers(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(CatbirdSession, JacquardDpopData), AppError> {
+    let session_id = extract_session_id_from_headers(headers)?;
+
+    // Strict rejection of non-UUID session IDs — never fabricate or proceed with malformed identity
+    if uuid::Uuid::parse_str(&session_id).is_err() {
+        return Err(classify_auth_error(AppError::InvalidSession));
+    }
+    let auth_store = state.auth_store.as_ref().ok_or_else(|| {
+        classify_auth_error(AppError::Internal("Auth store not configured".into()))
+    })?;
+
+    resolve_session_via_jacquard(state, auth_store, &session_id)
+        .await
+        .map_err(classify_auth_error)
+}
+
 /// Authentication middleware
 ///
 /// This middleware:
@@ -153,19 +178,7 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let session_id = extract_session_id(&req)?;
-
-    // Strict rejection of non-UUID session IDs — never fabricate or proceed with malformed identity
-    if uuid::Uuid::parse_str(&session_id).is_err() {
-        return Err(classify_auth_error(AppError::InvalidSession));
-    }
-    let auth_store = state.auth_store.as_ref().ok_or_else(|| {
-        classify_auth_error(AppError::Internal("Auth store not configured".into()))
-    })?;
-
-    let (session, dpop_data) = resolve_session_via_jacquard(&state, auth_store, &session_id)
-        .await
-        .map_err(classify_auth_error)?;
+    let (session, dpop_data) = authenticate_session_headers(&state, req.headers()).await?;
 
     req.extensions_mut().insert(session);
     req.extensions_mut().insert(dpop_data);

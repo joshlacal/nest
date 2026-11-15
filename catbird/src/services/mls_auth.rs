@@ -26,21 +26,20 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Every clean-chat procedure the delivery service serves under blue.catbird.chat.*,
-/// including the encrypted direct-request procedures.
+/// Every clean-chat procedure the delivery service serves under `blue.catbird.chat.*`
+/// (`D-01` + `Wave-1b`: exact 36 live RPCs from `blue.catbird.chat.authFull`).
 pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.acceptConversation",
+    "blue.catbird.chat.acknowledgeEntries",
     "blue.catbird.chat.acknowledgeWelcome",
     "blue.catbird.chat.activateReset",
+    "blue.catbird.chat.approveDevice",
     "blue.catbird.chat.cancelDirectRequestPreparation",
     "blue.catbird.chat.cancelLeafRecovery",
     "blue.catbird.chat.cancelLeave",
     "blue.catbird.chat.closeConversation",
     "blue.catbird.chat.createConversation",
-    "blue.catbird.chat.deleteBlob",
     "blue.catbird.chat.enrollDevice",
-    "blue.catbird.chat.getBlob",
-    "blue.catbird.chat.getBlobUsage",
     "blue.catbird.chat.getConversationState",
     "blue.catbird.chat.getConversations",
     "blue.catbird.chat.getDeviceKey",
@@ -51,12 +50,14 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.getOwnDevices",
     "blue.catbird.chat.getPendingWelcomes",
     "blue.catbird.chat.getSubscriptionTicket",
-    "blue.catbird.chat.prepareBlobUpload",
     "blue.catbird.chat.prepareDirectRequest",
     "blue.catbird.chat.publishDirectRequest",
     "blue.catbird.chat.publishDirectRequestKeys",
     "blue.catbird.chat.publishTyping",
+    "blue.catbird.chat.registerPushGateway",
     "blue.catbird.chat.rejectWelcome",
+    "blue.catbird.chat.relaySpaceCredential",
+    "blue.catbird.chat.relaySpaceRead",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.requestLeafRecovery",
     "blue.catbird.chat.requestLeave",
@@ -64,9 +65,6 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.revokeDevice",
     "blue.catbird.chat.sendMessage",
     "blue.catbird.chat.submitTransition",
-    "blue.catbird.chat.subscribeEvents",
-    "blue.catbird.chat.uploadBlob",
-    "blue.catbird.chat.updatePushToken",
 ];
 
 /// Exact proxy body limit per procedure. The direct-request procedures mirror

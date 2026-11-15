@@ -776,6 +776,22 @@ struct WakeJwtClaims {
     body_sha256: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RegisterServiceJwtClaims {
+    iss: String,
+    aud: String,
+    #[serde(default)]
+    lxm: Option<String>,
+    #[serde(default)]
+    iat: Option<i64>,
+    exp: i64,
+    #[serde(default)]
+    jti: Option<String>,
+}
+
+const REGISTER_SERVICE_JWT_MAX_LIFETIME_SECS: i64 = 300;
+const MAX_JTI_CACHE_ENTRIES: usize = 65_536;
+
 pub struct PushGatewayService {
     db_pool: PgPool,
     config: PushGatewayConfig,
@@ -892,8 +908,20 @@ impl PushGatewayService {
         session_id: &str,
         req: &RegisterKey,
     ) -> AppResult<RegisterKeyOutput> {
+        self.register_key_with_optional_session(account_did, Some(session_id), req)
+            .await
+    }
+
+    /// Issue a fresh 256-bit CSPRNG `push_key` for either a Nest session (`session_id = Some(..)`)
+    /// or an external PDS `ServiceJWT` caller (`session_id = None`, `D-09`).
+    pub async fn register_key_with_optional_session(
+        &self,
+        account_did: &str,
+        session_id: Option<&str>,
+        req: &RegisterKey,
+    ) -> AppResult<RegisterKeyOutput> {
         let session_fingerprint =
-            crate::services::push::registry::normalize_or_hash_session_fingerprint(session_id);
+            session_id.map(crate::services::push::registry::normalize_or_hash_session_fingerprint);
         if req.extra_data.as_ref().is_some_and(|m| !m.is_empty()) {
             return Err(AppError::BadRequest(
                 "InvalidRequest: unexpected extra fields in registerKey".into(),
@@ -1029,6 +1057,164 @@ impl PushGatewayService {
         Ok(res.rows_affected())
     }
 
+    /// Authenticate an ATProto PDS `ServiceJWT` (`com.atproto.server.getServiceAuth`) for
+    /// `POST /xrpc/blue.catbird.push.registerKey` (`D-09`).
+    ///
+    /// Verifies ES256 / ES256K signature against `iss`'s `#atproto` DID document key, enforces
+    /// `lxm == "blue.catbird.push.registerKey"` and `aud` matching this gateway's service DID,
+    /// and prevents `jti` replay within the token lifetime window.
+    pub async fn authenticate_register_service_jwt(
+        &self,
+        auth_header: Option<&str>,
+        extra_allowed_audiences: &[&str],
+    ) -> AppResult<String> {
+        let unauthorized = |msg: &'static str| AppError::AtprotoResponse {
+            status: StatusCode::UNAUTHORIZED,
+            error: "InvalidToken".to_string(),
+            message: msg.to_string(),
+        };
+
+        let Some(raw_auth) = auth_header else {
+            return Err(unauthorized("Missing Authorization Bearer token"));
+        };
+        let jwt = raw_auth
+            .strip_prefix("Bearer ")
+            .or_else(|| raw_auth.strip_prefix("bearer "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= MAX_DELIVER_JWT_BYTES)
+            .ok_or_else(|| unauthorized("Malformed Authorization Bearer header"))?;
+
+        let mut parts = jwt.split('.');
+        let (Some(hdr_b64), Some(claims_b64), Some(sig_b64), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(unauthorized("Malformed compact ServiceJWT"));
+        };
+
+        let hdr_bytes = BASE64URL
+            .decode(hdr_b64)
+            .map_err(|_| unauthorized("Invalid ServiceJWT header base64url"))?;
+        let header: WakeJwtHeader = serde_json::from_slice(&hdr_bytes)
+            .map_err(|_| unauthorized("Invalid ServiceJWT header JSON"))?;
+        if header.jwk.is_some() || header.crit.is_some() {
+            return Err(unauthorized("Unsupported ServiceJWT header extensions"));
+        }
+        if !matches!(header.alg.as_str(), "ES256" | "ES256K") {
+            return Err(unauthorized("Unsupported ServiceJWT signing algorithm"));
+        }
+        if let Some(typ) = header.typ.as_deref() {
+            if !matches!(typ, "JWT" | "jwt" | "at+jwt") {
+                return Err(unauthorized("Invalid ServiceJWT typ"));
+            }
+        }
+
+        let claims_bytes = BASE64URL
+            .decode(claims_b64)
+            .map_err(|_| unauthorized("Invalid ServiceJWT claims base64url"))?;
+        let claims: RegisterServiceJwtClaims = serde_json::from_slice(&claims_bytes)
+            .map_err(|_| unauthorized("Invalid ServiceJWT claims JSON"))?;
+
+        let caller_did = claims.iss.trim();
+        if caller_did.contains('#')
+            || jacquard_common::types::did::Did::new(caller_did).is_err()
+            || !(caller_did.starts_with("did:plc:") || caller_did.starts_with("did:web:"))
+        {
+            return Err(unauthorized("Invalid ServiceJWT issuer DID"));
+        }
+
+        if claims.lxm.as_deref() != Some("blue.catbird.push.registerKey") {
+            return Err(unauthorized(
+                "ServiceJWT lxm must equal blue.catbird.push.registerKey",
+            ));
+        }
+
+        let aud_bare = match claims.aud.trim().split_once('#') {
+            Some((did_part, "atproto_push" | "atproto_gateway")) => did_part,
+            Some(_) => return Err(unauthorized("Invalid ServiceJWT audience fragment")),
+            None => claims.aud.trim(),
+        };
+        let default_gw_did = Url::parse(&self.config.gateway_url).ok().and_then(|u| {
+            u.host_str()
+                .map(|h| format!("did:web:{}", h.to_ascii_lowercase()))
+        });
+        let aud_matches = default_gw_did.as_deref() == Some(aud_bare)
+            || extra_allowed_audiences.iter().any(|allowed| {
+                let allowed_bare = allowed.split_once('#').map_or(*allowed, |(d, _)| d);
+                !allowed_bare.is_empty() && allowed_bare == aud_bare
+            });
+        if !aud_matches {
+            return Err(unauthorized("ServiceJWT aud does not match gateway DID"));
+        }
+
+        let now = Utc::now().timestamp();
+        if claims.exp < now - 5 || claims.exp > now + REGISTER_SERVICE_JWT_MAX_LIFETIME_SECS {
+            return Err(unauthorized(
+                "ServiceJWT exp expired or exceeds 300s window",
+            ));
+        }
+        if let Some(iat) = claims.iat {
+            if iat > now + JWT_MAX_SKEW_SECS
+                || claims.exp < iat
+                || claims.exp > iat + REGISTER_SERVICE_JWT_MAX_LIFETIME_SECS
+            {
+                return Err(unauthorized("ServiceJWT iat outside allowed window"));
+            }
+        }
+        let jti = claims
+            .jti
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or_else(|| unauthorized("ServiceJWT missing valid jti"))?
+            .to_string();
+
+        let sig_bytes = BASE64URL
+            .decode(sig_b64)
+            .map_err(|_| unauthorized("Invalid ServiceJWT signature base64url"))?;
+        let signing_input = format!("{hdr_b64}.{claims_b64}");
+
+        let vk = self
+            .resolver
+            .resolve_ds_atproto_key(caller_did, false)
+            .await
+            .map_err(|_| unauthorized("Unable to resolve caller #atproto key"))?;
+
+        let verified = if vk.verify_raw(&header.alg, signing_input.as_bytes(), &sig_bytes) {
+            true
+        } else if let Ok(refreshed_vk) =
+            self.resolver.resolve_ds_atproto_key(caller_did, true).await
+        {
+            refreshed_vk.verify_raw(&header.alg, signing_input.as_bytes(), &sig_bytes)
+        } else {
+            false
+        };
+        if !verified {
+            return Err(unauthorized("ServiceJWT signature verification failed"));
+        }
+
+        if self.jti_replay_cache.len() > 4096 {
+            self.jti_replay_cache.retain(|_, exp_at| *exp_at > now);
+        }
+        if self.jti_replay_cache.len() >= MAX_JTI_CACHE_ENTRIES {
+            return Err(AppError::RateLimitExceeded { retry_after: 5 });
+        }
+        let replay_key = (format!("register:{caller_did}"), jti);
+        let expiry_deadline = claims.exp.max(now) + JWT_MAX_SKEW_SECS;
+        match self.jti_replay_cache.entry(replay_key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                if *occ.get() > now {
+                    return Err(unauthorized("Replayed ServiceJWT jti"));
+                }
+                occ.insert(expiry_deadline);
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                vac.insert(expiry_deadline);
+            }
+        }
+
+        Ok(caller_did.to_string())
+    }
+
     async fn authenticate_ds_jwt(
         &self,
         auth_header: Option<&str>,
@@ -1159,6 +1345,12 @@ impl PushGatewayService {
         // Prune expired jti entries opportunistically and atomically check/insert (iss, jti).
         if self.jti_replay_cache.len() > 4096 {
             self.jti_replay_cache.retain(|_, exp_at| *exp_at > now);
+        }
+        if self.jti_replay_cache.len() >= MAX_JTI_CACHE_ENTRIES {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "error": "RateLimitExceeded", "message": "Replay cache saturated" }),
+            ));
         }
         let replay_key = (caller_ds_did.to_string(), claims.jti);
         let expiry_deadline = now + JTI_CACHE_TTL_SECS;

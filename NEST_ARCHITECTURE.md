@@ -30,7 +30,7 @@ This document details the architecture of the **Confidential** path.
 ## 3. Technology Stack
 
 *   **Language:** Rust (Axum, Tokio).
-*   **AT Protocol:** Atrium (`atrium-oauth`, `atrium-api`).
+*   **AT Protocol:** Jacquard (`jacquard-oauth`, `jacquard-common`, `jacquard-identity`).
 *   **Storage:** Redis (Session Store).
 
 ## 4. Architecture Components
@@ -67,6 +67,14 @@ graph LR
     *   Nest performs Token Exchange (Private Key JWT).
     *   Nest creates Session (Redis).
     *   Nest redirects to iOS (`catbird://...`) with Session Cookie/Token.
+
+### C. Chat Proxy and MLS Push Gateway
+
+*   **Chat:** `blue.catbird.chat.*` requests go to the MLS delivery service with a PDS-issued service-auth token per request (`lxm` allowlist `CHAT_ENDPOINTS`, per-procedure body limits). Legacy `blue.catbird.mlsChat.*` is not intercepted.
+*   **D2 Push Gateway:** devices register native tokens through `blue.catbird.push.registerKey`; the delivery service wakes them through `blue.catbird.push.deliver` with metadata-only payloads (`wakeKind` includes `directRequest`), and Nest writes the only display text.
+*   **Scope upgrades:** `/auth/upgrade` → `/auth/upgrade/exchange` → `/auth/upgrade/commit` grants allowlisted scopes, including the explicit Labyrinth Space scopes that replace the retired `manage=`-only and `authority=*`-only forms.
+
+Exact routing, limits, wake semantics and scope strings: [AGENTS.md](AGENTS.md).
 
 ## 5. Security
 

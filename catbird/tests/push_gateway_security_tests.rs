@@ -180,6 +180,7 @@ struct TestGatewayEnv {
     schema: String,
     gateway: Arc<PushGatewayService>,
     spy_transport: SpyGatewayTransport,
+    alice_atproto_sk: P256SigningKey,
     catbird_ds_sk: P256SigningKey,
     self_hosted_ds_sk: P256SigningKey,
     evil_ds_sk: P256SigningKey,
@@ -227,10 +228,12 @@ impl TestGatewayEnv {
         .await
         .expect("apply push_gateway_keys session migration");
 
+        let alice_atproto_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let catbird_ds_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let self_hosted_ds_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let evil_ds_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
 
+        let alice_atproto_sk = P256SigningKey::from(&alice_atproto_secret);
         let catbird_ds_sk = P256SigningKey::from(&catbird_ds_secret);
         let self_hosted_ds_sk = P256SigningKey::from(&self_hosted_ds_secret);
         let evil_ds_sk = P256SigningKey::from(&evil_ds_secret);
@@ -247,6 +250,11 @@ impl TestGatewayEnv {
                 ),
             ],
             [
+                (
+                    "did:plc:alicecatbird000000000001",
+                    SpaceSigningKey::from_p256_secret(&alice_atproto_secret, "#atproto")
+                        .verifying_key(),
+                ),
                 (
                     "did:web:chat.catbird.blue",
                     SpaceSigningKey::from_p256_secret(&catbird_ds_secret, "#atproto")
@@ -286,6 +294,7 @@ impl TestGatewayEnv {
             schema,
             gateway,
             spy_transport,
+            alice_atproto_sk,
             catbird_ds_sk,
             self_hosted_ds_sk,
             evil_ds_sk,
@@ -1169,6 +1178,207 @@ async fn revoked_keys_stop_waking_and_revocation_is_scoped_to_the_session() {
     assert_eq!(wake(&env, &ipad_key).await, StatusCode::ACCEPTED);
     assert_eq!(wake(&env, &phone_key_2).await, StatusCode::ACCEPTED);
     assert_eq!(env.spy_transport.sent_calls().len(), 3);
+
+    env.teardown().await;
+}
+
+fn sign_pds_service_jwt(
+    signing_key: &P256SigningKey,
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+    jti: &str,
+    iat: i64,
+    exp: i64,
+) -> String {
+    let header = json!({
+        "alg": "ES256",
+        "typ": "JWT",
+    });
+    let claims = json!({
+        "iss": iss,
+        "aud": aud,
+        "lxm": lxm,
+        "iat": iat,
+        "exp": exp,
+        "jti": jti,
+    });
+    let hdr_b64 = BASE64URL.encode(serde_json::to_vec(&header).unwrap());
+    let claims_b64 = BASE64URL.encode(serde_json::to_vec(&claims).unwrap());
+    let signing_input = format!("{hdr_b64}.{claims_b64}");
+    let sig: P256Signature = signing_key.sign(signing_input.as_bytes());
+    let norm = sig.normalize_s().unwrap_or(sig);
+    let sig_b64 = BASE64URL.encode(norm.to_bytes());
+    format!("{signing_input}.{sig_b64}")
+}
+
+#[tokio::test]
+async fn service_jwt_register_key_accepts_valid_token_and_rejects_forgery_and_replay() {
+    let env = TestGatewayEnv::setup().await;
+    let alice_did = "did:plc:alicecatbird000000000001";
+    let device_id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    let req_body = serde_json::to_vec(&json!({
+        "appId": "social.external.chat",
+        "deviceId": device_id,
+        "nativeToken": "c3".repeat(32),
+        "platform": "apns",
+    }))
+    .unwrap();
+
+    let valid_jti = Uuid::new_v4().to_string();
+    let valid_jwt = sign_pds_service_jwt(
+        &env.alice_atproto_sk,
+        alice_did,
+        "did:web:api.catbird.blue#atproto_push",
+        "blue.catbird.push.registerKey",
+        &valid_jti,
+        now,
+        now + 60,
+    );
+
+    let resp = env
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/blue.catbird.push.registerKey")
+                .header("authorization", format!("Bearer {valid_jwt}"))
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp_json: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap())
+        .expect("parse registerKey output");
+    let push_key = resp_json["pushKey"].as_str().expect("pushKey string");
+    assert_eq!(resp_json["appId"], "social.external.chat");
+
+    // Verify auth_session_fingerprint is NULL for external ServiceJWT registrations.
+    let push_key_sha256: [u8; 32] = Sha256::digest(push_key.as_bytes()).into();
+    let row = sqlx::query(
+        "SELECT auth_session_fingerprint FROM push_gateway_keys WHERE push_key_sha256 = $1",
+    )
+    .bind(push_key_sha256.as_slice())
+    .fetch_one(&env.pool)
+    .await
+    .expect("registered row must exist");
+    let session_fp: Option<String> = row.get("auth_session_fingerprint");
+    assert!(
+        session_fp.is_none(),
+        "ServiceJWT registration must leave auth_session_fingerprint NULL"
+    );
+
+    // Confirm a wake from Alice's bound mls-ds delivers cleanly for this external appId.
+    let wake_body = serde_json::to_vec(&json!({
+        "pushKey": push_key,
+        "appId": "social.external.chat",
+        "payload": {
+            "wakeKind": "applicationMessage",
+            "conversationId": Uuid::new_v4().to_string(),
+            "generation": 0,
+            "seq": 1,
+            "epoch": 1
+        }
+    }))
+    .unwrap();
+    let wake_jwt = sign_ds_wake_jwt(
+        &env.catbird_ds_sk,
+        "did:web:chat.catbird.blue",
+        "https://api.catbird.blue/xrpc/blue.catbird.push.deliver",
+        &Uuid::new_v4().to_string(),
+        now,
+        now + 30,
+        &wake_body,
+    );
+    let wake_resp = env
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/blue.catbird.push.deliver")
+                .header("authorization", format!("Bearer {wake_jwt}"))
+                .header("content-type", "application/json")
+                .body(Body::from(wake_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wake_resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(env.spy_transport.sent_calls().len(), 1);
+
+    // Replaying the exact same ServiceJWT (`jti`) must fail with 401.
+    let replay_resp = env
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/blue.catbird.push.registerKey")
+                .header("authorization", format!("Bearer {valid_jwt}"))
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong lxm, wrong aud, expired exp, and forged signature must all fail with 401.
+    for bad_jwt in [
+        sign_pds_service_jwt(
+            &env.alice_atproto_sk,
+            alice_did,
+            "did:web:api.catbird.blue",
+            "blue.catbird.push.deliver",
+            &Uuid::new_v4().to_string(),
+            now,
+            now + 60,
+        ),
+        sign_pds_service_jwt(
+            &env.alice_atproto_sk,
+            alice_did,
+            "did:web:evil.example",
+            "blue.catbird.push.registerKey",
+            &Uuid::new_v4().to_string(),
+            now,
+            now + 60,
+        ),
+        sign_pds_service_jwt(
+            &env.alice_atproto_sk,
+            alice_did,
+            "did:web:api.catbird.blue",
+            "blue.catbird.push.registerKey",
+            &Uuid::new_v4().to_string(),
+            now - 120,
+            now - 30,
+        ),
+        sign_pds_service_jwt(
+            &env.evil_ds_sk,
+            alice_did,
+            "did:web:api.catbird.blue",
+            "blue.catbird.push.registerKey",
+            &Uuid::new_v4().to_string(),
+            now,
+            now + 60,
+        ),
+    ] {
+        let r = env
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/xrpc/blue.catbird.push.registerKey")
+                    .header("authorization", format!("Bearer {bad_jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
 
     env.teardown().await;
 }

@@ -61,9 +61,10 @@ const REQUIRED_CLEAN_SLATE_SCOPES: &[&str] = &[
     "atproto",
     "blob:*/*",
     "repo:blue.catbird.labyrinth.mailboxKeys",
-    "repo:blue.catbird.chat.device",
-    "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
-    "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
+    "repo:blue.catbird.chat.device?action=create",
+    "repo:blue.catbird.chat.deviceRevocation?action=create",
+    "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
+    "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
 ];
 
 const RETIRED_LABYRINTH_SPACE_SCOPES: &[&str] = &[
@@ -175,7 +176,10 @@ async fn well_known_oauth_client_metadata_and_allowlist_contain_all_labyrinth_an
         );
     }
 
-    for retired in RETIRED_LABYRINTH_SPACE_SCOPES {
+    for retired in RETIRED_LABYRINTH_SPACE_SCOPES.iter().chain([
+        &"repo:blue.catbird.chat.device",
+        &"repo:blue.catbird.chat.deviceRevocation",
+    ]) {
         assert!(
             !tokens.contains(retired),
             "oauth-client-metadata must not declare retired scope '{retired}'"
@@ -344,7 +348,10 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
             "PAR wire scope must contain exact raw token '{expected}'; got: {wire_scope}"
         );
     }
-    for retired in RETIRED_LABYRINTH_SPACE_SCOPES {
+    for retired in RETIRED_LABYRINTH_SPACE_SCOPES.iter().chain([
+        &"repo:blue.catbird.chat.device",
+        &"repo:blue.catbird.chat.deviceRevocation",
+    ]) {
         assert!(
             !wire_tokens.contains(retired),
             "PAR wire scope must not request retired scope '{retired}'; got: {wire_scope}"
@@ -414,8 +421,12 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         .await
         .expect("start_upgrade_flow");
 
+    let mailbox_idx = raw_requested
+        .iter()
+        .position(|s| s.starts_with("space:blue.catbird.labyrinth.mailbox?"))
+        .expect("mailbox space scope index");
     let mut swan_grants = raw_requested.clone();
-    swan_grants[4] = swan_grants[4].replacen(
+    swan_grants[mailbox_idx] = swan_grants[mailbox_idx].replacen(
         "&collection=",
         &format!("&authority={user_did}&collection="),
         1,
@@ -453,18 +464,22 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         .await
         .expect("resolved self-authority grant remains registered");
     assert!(
-        resolved_start.requested_scopes.contains(&raw_requested[4]),
+        resolved_start
+            .requested_scopes
+            .contains(&raw_requested[mailbox_idx]),
         "PAR must retain the registration's wire-exact mailbox scope"
     );
     assert!(
-        !resolved_start.requested_scopes.contains(&swan_grants[4]),
+        !resolved_start
+            .requested_scopes
+            .contains(&swan_grants[mailbox_idx]),
         "resolved grant spelling must not replace the registered PAR spelling"
     );
 
     // A session holding only the retired Labyrinth scopes is missing the new ones: an upgrade
     // whose grants stay at the retired scopes must be rejected, never accepted as equivalent.
     let old_scope_session_id = Uuid::new_v4().to_string();
-    let old_scopes: Vec<String> = REQUIRED_CLEAN_SLATE_SCOPES[..4]
+    let old_scopes: Vec<String> = REQUIRED_CLEAN_SLATE_SCOPES[..mailbox_idx]
         .iter()
         .chain(RETIRED_LABYRINTH_SPACE_SCOPES)
         .map(|s| (*s).to_string())
@@ -481,7 +496,7 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
             user_did,
             &old_scopes,
             &raw_requested,
-            &raw_requested[4..],
+            &raw_requested[mailbox_idx..],
             browser_nonce,
         )
         .await
@@ -545,7 +560,7 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         .await
         .expect_err("retired Labyrinth grants must not satisfy the new scopes");
     assert!(
-        matches!(&err, UpgradeError::ScopeDowngrade(msg) if msg.contains(REQUIRED_CLEAN_SLATE_SCOPES[4])),
+        matches!(&err, UpgradeError::ScopeDowngrade(msg) if msg.contains(REQUIRED_CLEAN_SLATE_SCOPES[mailbox_idx])),
         "expected missing mailbox scope downgrade, got: {err}"
     );
 

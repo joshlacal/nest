@@ -51,11 +51,13 @@ redirect_uri = "http://localhost:3000/auth/callback"
 #   "account:email?action=manage",
 #   "account:status?action=manage",
 #   "space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update",
+#   "space:blue.catbird.circle.encrypted?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update",
 #   "blob:*/*",
 #   "repo:blue.catbird.labyrinth.mailboxKeys",
-#   "repo:blue.catbird.chat.device",
-#   "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
-#   "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
+#   "repo:blue.catbird.chat.device?action=create",
+#   "repo:blue.catbird.chat.deviceRevocation?action=create",
+#   "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
+#   "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
 # ]
 
 # Legacy compatibility alias (backward-compatible initial input when initial_scopes is absent; does not inherit optional max scopes)

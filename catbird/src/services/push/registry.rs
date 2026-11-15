@@ -1119,6 +1119,24 @@ impl PushRegistry {
                 .execute(&mut *tx)
                 .await?;
         }
+        let has_gateway_keys: bool =
+            sqlx::query_scalar("SELECT to_regclass('push_gateway_keys') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if has_gateway_keys {
+            let normalized_leaving_fp = normalize_or_hash_session_fingerprint(leaving_fp);
+            sqlx::query(
+                "UPDATE push_gateway_keys \
+                 SET revoked_at = NOW(), updated_at = NOW() \
+                 WHERE account_did = $1 \
+                   AND auth_session_fingerprint = $2 \
+                   AND revoked_at IS NULL",
+            )
+            .bind(did)
+            .bind(&normalized_leaving_fp)
+            .execute(&mut *tx)
+            .await?;
+        }
         let devices_deactivated =
             sqlx::query("DELETE FROM user_devices WHERE did=$1 AND id=ANY($2)")
                 .bind(did)

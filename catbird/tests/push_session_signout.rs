@@ -798,3 +798,69 @@ async fn interrupted_upgrade_transfer_cannot_claim_candidate_device_cleanup_comp
         .unwrap()
         .is_some());
 }
+
+#[tokio::test]
+#[ignore = "requires explicit disposable Postgres and Redis"]
+async fn cleanup_retired_session_revokes_leaving_session_wake_keys_and_preserves_other_sessions() {
+    let db = TestDb::new().await;
+    let store = cleanup_auth::store().await;
+    let registry = PushRegistry::with_config(
+        db.pool.clone(),
+        &PushConfig {
+            service_did: Some("did:web:push.catbird.blue".to_string()),
+            ..PushConfig::default()
+        },
+    )
+    .with_auth_store(store.clone());
+
+    let (phone, phone_device) =
+        sign_in_with_device(&store, &registry, "ab".repeat(32).as_str()).await;
+    let (ipad, ipad_device) =
+        sign_in_with_device(&store, &registry, "cd".repeat(32).as_str()).await;
+
+    let phone_key = insert_wake_key(&db.pool, &phone).await;
+    let ipad_key = insert_wake_key(&db.pool, &ipad).await;
+
+    // External PDS ServiceJWT wake key row (`auth_session_fingerprint IS NULL`) must also stay live.
+    let service_jwt_key = Uuid::new_v4().as_bytes().repeat(2);
+    sqlx::query(
+        "INSERT INTO push_gateway_keys (push_key_sha256, account_did, device_id, app_id, platform, \
+         encrypted_native_token, allowed_mls_service_did, auth_session_fingerprint) \
+         VALUES ($1, $2, $3, 'social.external', 'apns', '\\x00'::bytea, 'did:web:chat.catbird.blue', NULL)",
+    )
+    .bind(&service_jwt_key)
+    .bind(DID)
+    .bind(Uuid::new_v4().to_string())
+    .execute(&db.pool)
+    .await
+    .expect("insert ServiceJWT wake key");
+
+    let phone_fp = session_fingerprint(&phone.id.to_string());
+    let outcome = registry
+        .cleanup_retired_session(DID, &phone_fp)
+        .await
+        .expect("cleanup_retired_session");
+    assert_eq!(outcome.devices_deactivated, 1);
+
+    let phone_device_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_devices WHERE id = $1)")
+            .bind(phone_device)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(!phone_device_exists);
+    assert!(is_active(&db.pool, ipad_device).await);
+
+    assert!(
+        wake_key_is_revoked(&db.pool, &phone_key).await,
+        "cleanup_retired_session must revoke the leaving session's MLS wake key"
+    );
+    assert!(
+        !wake_key_is_revoked(&db.pool, &ipad_key).await,
+        "cleanup_retired_session must leave other active sessions' MLS wake keys live"
+    );
+    assert!(
+        !wake_key_is_revoked(&db.pool, &service_jwt_key).await,
+        "cleanup_retired_session must leave sessionless ServiceJWT wake keys live"
+    );
+}

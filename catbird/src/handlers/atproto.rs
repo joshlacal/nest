@@ -1576,6 +1576,39 @@ async fn validate_client_service_auth_request(
                 Err(refuse())
             };
         }
+        if lxm_val == "blue.catbird.push.registerKey" {
+            let aud_bare = match aud.split_once('#') {
+                Some((did_part, "atproto_push" | "atproto_gateway")) => did_part,
+                Some(_) => return Err(refuse()),
+                None => aud.as_str(),
+            };
+            let base_did = url::Url::parse(&state.config.server.base_url)
+                .ok()
+                .and_then(|u| {
+                    u.host_str()
+                        .map(|h| format!("did:web:{}", h.to_ascii_lowercase()))
+                });
+            let push_did = state
+                .config
+                .push
+                .service_did
+                .as_deref()
+                .map(|d| d.split_once('#').map_or(d, |(b, _)| b));
+            let gw_did = state
+                .config
+                .mls
+                .gateway_did
+                .as_deref()
+                .map(|d| d.split_once('#').map_or(d, |(b, _)| b));
+            return if base_did.as_deref() == Some(aud_bare)
+                || push_did == Some(aud_bare)
+                || gw_did == Some(aud_bare)
+            {
+                Ok(())
+            } else {
+                Err(refuse())
+            };
+        }
     }
 
     // MLS / Labyrinth / Space audience check (bare DID or `<did>#atproto_mls`).
@@ -1637,6 +1670,107 @@ fn validate_proxy_lexicon(lexicon: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Repo write XRPC methods gated by the `Y-6` / `B4` create-only device/key transparency rule.
+const CREATE_ONLY_GUARDED_REPO_NSIDS: &[&str] = &[
+    "com.atproto.repo.deleteRecord",
+    "com.atproto.repo.putRecord",
+    "com.atproto.repo.applyWrites",
+];
+
+fn is_create_only_chat_transparency_collection(collection: &str) -> bool {
+    collection.eq_ignore_ascii_case("blue.catbird.chat.device")
+        || collection.eq_ignore_ascii_case("blue.catbird.chat.deviceRevocation")
+}
+
+/// Enforce `Y-6` / `B4` create-only immutability on public device/key records proxied through Nest:
+/// - `blue.catbird.chat.device` and `blue.catbird.chat.deviceRevocation`: strictly create-only
+///   (`createRecord` and `applyWrites#create` are permitted; `deleteRecord`, `putRecord`, and
+///   `applyWrites` update/delete/untyped operations are forbidden with `403 Forbidden`).
+/// - `blue.catbird.labyrinth.mailboxKeys`: `deleteRecord` is forbidden on all rkeys;
+///   `putRecord` / `applyWrites#update` is permitted ONLY for the mutable `self` pointer
+///   (immutable 12-digit `<epochNumber>` snapshots are strictly create-only).
+fn validate_create_only_repo_mutation(lexicon: &str, body_bytes: &[u8]) -> AppResult<()> {
+    if !CREATE_ONLY_GUARDED_REPO_NSIDS.contains(&lexicon) {
+        return Ok(());
+    }
+    let forbid = |msg: &str| AppError::AtprotoResponse {
+        status: StatusCode::FORBIDDEN,
+        error: "Forbidden".to_string(),
+        message: msg.to_string(),
+    };
+    let parsed: serde_json::Value = serde_json::from_slice(body_bytes)
+        .map_err(|_| AppError::BadRequest("Malformed JSON body for repo mutation".into()))?;
+
+    match lexicon {
+        "com.atproto.repo.deleteRecord" => {
+            let collection = parsed
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if is_create_only_chat_transparency_collection(collection)
+                || collection.eq_ignore_ascii_case("blue.catbird.labyrinth.mailboxKeys")
+            {
+                return Err(forbid(
+                    "Deleting device, deviceRevocation, or mailbox key transparency records is forbidden",
+                ));
+            }
+        }
+        "com.atproto.repo.putRecord" => {
+            let collection = parsed
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let rkey = parsed.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
+            if is_create_only_chat_transparency_collection(collection) {
+                return Err(forbid(
+                    "Overwriting blue.catbird.chat.device or blue.catbird.chat.deviceRevocation records is forbidden; use createRecord",
+                ));
+            }
+            if collection.eq_ignore_ascii_case("blue.catbird.labyrinth.mailboxKeys")
+                && rkey != "self"
+            {
+                return Err(forbid(
+                    "Overwriting immutable blue.catbird.labyrinth.mailboxKeys epoch snapshots is forbidden",
+                ));
+            }
+        }
+        "com.atproto.repo.applyWrites" => {
+            let Some(writes) = parsed.get("writes").and_then(|v| v.as_array()) else {
+                return Err(AppError::BadRequest(
+                    "applyWrites body must include a 'writes' array".into(),
+                ));
+            };
+            for op in writes {
+                let op_type = op.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+                let collection = op
+                    .get("collection")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let rkey = op.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
+                let is_exact_create = op_type == "com.atproto.repo.applyWrites#create";
+                let is_exact_update = op_type == "com.atproto.repo.applyWrites#update";
+                if is_create_only_chat_transparency_collection(collection) && !is_exact_create {
+                    return Err(forbid(
+                        "Mutating or deleting blue.catbird.chat.device or blue.catbird.chat.deviceRevocation via applyWrites is forbidden",
+                    ));
+                }
+                if collection.eq_ignore_ascii_case("blue.catbird.labyrinth.mailboxKeys")
+                    && !(is_exact_create || (is_exact_update && rkey == "self"))
+                {
+                    return Err(forbid(
+                        "Mutating or deleting immutable blue.catbird.labyrinth.mailboxKeys records via applyWrites is forbidden",
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Moderation mutations the gateway acts on after proxying them
 /// (see `apply_moderation_mutation`).
 const MODERATION_MUTATION_NSIDS: &[&str] = &[
@@ -1675,6 +1809,7 @@ fn is_non_canonical_policy_nsid(lexicon: &str) -> bool {
         .chain(CIRCLE_ENDPOINTS)
         .chain(crate::services::CHAT_ENDPOINTS)
         .chain(MODERATION_MUTATION_NSIDS)
+        .chain(CREATE_ONLY_GUARDED_REPO_NSIDS)
         .any(|policy| lexicon != *policy && lexicon.eq_ignore_ascii_case(policy))
 }
 
@@ -1837,7 +1972,6 @@ pub async fn proxy_xrpc(
         tracing::debug!(
             request_id = %request_id,
             lexicon = %lexicon,
-            user = %session.did,
             "Routing MLS request directly to MLS service"
         );
 
@@ -1895,6 +2029,7 @@ pub async fn proxy_xrpc(
     }
 
     let path = format!("/xrpc/{}", lexicon);
+    validate_create_only_repo_mutation(&lexicon, &body_bytes)?;
 
     // Default: proxy through PDS
     tracing::info!(
@@ -3131,7 +3266,8 @@ mod proxy_lexicon_case_tests {
         let routed = CIRCLE_ENDPOINTS
             .iter()
             .chain(crate::services::CHAT_ENDPOINTS)
-            .chain(MODERATION_MUTATION_NSIDS);
+            .chain(MODERATION_MUTATION_NSIDS)
+            .chain(CREATE_ONLY_GUARDED_REPO_NSIDS);
         for canonical in routed {
             assert!(
                 validate_proxy_lexicon(canonical).is_ok(),
@@ -3164,5 +3300,144 @@ mod proxy_lexicon_case_tests {
         ] {
             assert!(validate_proxy_lexicon(ok).is_ok(), "{ok} must stay allowed");
         }
+    }
+}
+
+#[cfg(test)]
+mod create_only_repo_mutation_tests {
+    use super::validate_create_only_repo_mutation;
+    use crate::error::AppError;
+    use axum::http::StatusCode;
+
+    fn assert_forbidden<T: std::fmt::Debug>(res: Result<T, AppError>) {
+        match res {
+            Err(AppError::AtprotoResponse { status, .. }) => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+            other => panic!("expected 403 Forbidden AtprotoResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permits_create_record_on_chat_device_and_device_revocation() {
+        for collection in [
+            "blue.catbird.chat.device",
+            "blue.catbird.chat.deviceRevocation",
+        ] {
+            let body = format!(
+                r#"{{"repo":"did:plc:alice","collection":"{collection}","rkey":"3kxyz","record":{{}}}}"#
+            );
+            assert!(validate_create_only_repo_mutation(
+                "com.atproto.repo.createRecord",
+                body.as_bytes(),
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn forbids_delete_record_on_chat_device_device_revocation_and_mailbox_keys() {
+        for collection in [
+            "blue.catbird.chat.device",
+            "blue.catbird.chat.deviceRevocation",
+            "blue.catbird.chat.devicerevocation",
+        ] {
+            let body =
+                format!(r#"{{"repo":"did:plc:alice","collection":"{collection}","rkey":"3kxyz"}}"#);
+            assert_forbidden(validate_create_only_repo_mutation(
+                "com.atproto.repo.deleteRecord",
+                body.as_bytes(),
+            ));
+        }
+        assert_forbidden(validate_create_only_repo_mutation(
+            "com.atproto.repo.deleteRecord",
+            br#"{"repo":"did:plc:alice","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"self"}"#,
+        ));
+        assert_forbidden(validate_create_only_repo_mutation(
+            "com.atproto.repo.deleteRecord",
+            br#"{"repo":"did:plc:alice","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"000000000001"}"#,
+        ));
+        assert!(validate_create_only_repo_mutation(
+            "com.atproto.repo.deleteRecord",
+            br#"{"repo":"did:plc:alice","collection":"app.bsky.feed.post","rkey":"3kxyz"}"#,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn forbids_put_record_on_chat_device_device_revocation_and_immutable_mailbox_epochs() {
+        for collection in [
+            "blue.catbird.chat.device",
+            "blue.catbird.chat.deviceRevocation",
+            "BLUE.CATBIRD.CHAT.DEVICEREVOCATION",
+        ] {
+            let body = format!(
+                r#"{{"repo":"did:plc:alice","collection":"{collection}","rkey":"3kxyz","record":{{}}}}"#
+            );
+            assert_forbidden(validate_create_only_repo_mutation(
+                "com.atproto.repo.putRecord",
+                body.as_bytes(),
+            ));
+        }
+        assert_forbidden(validate_create_only_repo_mutation(
+            "com.atproto.repo.putRecord",
+            br#"{"repo":"did:plc:alice","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"000000000001","record":{}}"#,
+        ));
+        assert!(validate_create_only_repo_mutation(
+            "com.atproto.repo.putRecord",
+            br#"{"repo":"did:plc:alice","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"self","record":{}}"#,
+        )
+        .is_ok());
+        assert_forbidden(validate_create_only_repo_mutation(
+            "com.atproto.repo.putRecord",
+            br#"{"repo":"did:plc:alice","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"self ","record":{}}"#,
+        ));
+    }
+
+    #[test]
+    fn enforces_create_only_rules_inside_apply_writes_batches_for_device_and_revocation() {
+        assert!(validate_create_only_repo_mutation(
+            "com.atproto.repo.applyWrites",
+            br#"{"repo":"did:plc:alice","writes":[{"$type":"com.atproto.repo.applyWrites#create","collection":"blue.catbird.chat.device","rkey":"3kdev1","value":{}},{"$type":"com.atproto.repo.applyWrites#create","collection":"blue.catbird.chat.deviceRevocation","rkey":"3krev1","value":{}},{"$type":"com.atproto.repo.applyWrites#create","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"000000000001","value":{}},{"$type":"com.atproto.repo.applyWrites#update","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"self","value":{}}]}"#,
+        )
+        .is_ok());
+
+        for collection in [
+            "blue.catbird.chat.device",
+            "blue.catbird.chat.deviceRevocation",
+        ] {
+            for bad_type in [
+                "com.atproto.repo.applyWrites#update",
+                "com.atproto.repo.applyWrites#delete",
+                "com.atproto.repo.applyWrites#Update",
+                "com.atproto.repo.applyWrites#Create",
+            ] {
+                let body = format!(
+                    r#"{{"repo":"did:plc:alice","writes":[{{"$type":"{bad_type}","collection":"{collection}","rkey":"3k1","value":{{}}}}]}}"#
+                );
+                assert_forbidden(validate_create_only_repo_mutation(
+                    "com.atproto.repo.applyWrites",
+                    body.as_bytes(),
+                ));
+            }
+            let untyped = format!(
+                r#"{{"repo":"did:plc:alice","writes":[{{"collection":"{collection}","rkey":"3k1","value":{{}}}}]}}"#
+            );
+            assert_forbidden(validate_create_only_repo_mutation(
+                "com.atproto.repo.applyWrites",
+                untyped.as_bytes(),
+            ));
+        }
+
+        assert!(validate_create_only_repo_mutation(
+            "com.atproto.repo.applyWrites",
+            br#"{"repo":"did:plc:alice"}"#,
+        )
+        .is_err());
+
+        assert_forbidden(validate_create_only_repo_mutation(
+            "com.atproto.repo.applyWrites",
+            br#"{"repo":"did:plc:alice","writes":[{"$type":"com.atproto.repo.applyWrites#delete","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"000000000001"}]}"#,
+        ));
     }
 }

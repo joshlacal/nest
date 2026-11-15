@@ -645,9 +645,11 @@ mod tests {
                 "account:email?action=manage",
                 "account:status?action=manage",
                 crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE,
+                crate::models::oauth_upgrade::CIRCLE_ENCRYPTED_SPACE_SCOPE,
                 crate::models::oauth_upgrade::BLOB_ALL_SCOPE,
                 crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE,
                 crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE,
+                crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE,
                 crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE,
                 crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE,
             ]

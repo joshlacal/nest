@@ -20,22 +20,29 @@ pub const MAX_SCOPE_LEN: usize = 512;
 /// first creates or writes to a Circle.
 pub const CIRCLE_SPACE_SCOPE: &str = "space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update";
 
+/// Encrypted Circle Space scope (`blue.catbird.circle.encrypted`), in jacquard-normalized form.
+pub const CIRCLE_ENCRYPTED_SPACE_SCOPE: &str = "space:blue.catbird.circle.encrypted?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update";
+
 /// Wildcard blob upload/fetch scope required for encrypted media & Space avatars.
 pub const BLOB_ALL_SCOPE: &str = "blob:*/*";
 
 /// Repository write/read scope for Labyrinth `mailboxKeys` records.
 pub const LABYRINTH_MAILBOX_KEYS_REPO_SCOPE: &str = "repo:blue.catbird.labyrinth.mailboxKeys";
 
-/// Repository write/read scope for MLS `device` key-material records (`blue.catbird.chat.device`).
-pub const MLS_CHAT_DEVICE_REPO_SCOPE: &str = "repo:blue.catbird.chat.device";
+/// Create-only repository scope for MLS `device` key-material records (`blue.catbird.chat.device`).
+pub const MLS_CHAT_DEVICE_REPO_SCOPE: &str = "repo:blue.catbird.chat.device?action=create";
+
+/// Create-only repository scope for signed MLS `deviceRevocation` tombstones (`blue.catbird.chat.deviceRevocation`, `B4`).
+pub const MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE: &str =
+    "repo:blue.catbird.chat.deviceRevocation?action=create";
 
 /// Labyrinth personal mailbox Space scope: record read/create/update/delete on the exact
 /// mailbox collections plus Space create/delete management (self authority).
-pub const LABYRINTH_MAILBOX_SPACE_SCOPE: &str = "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete";
+pub const LABYRINTH_MAILBOX_SPACE_SCOPE: &str = "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete";
 
 /// Labyrinth conversation Space scope: record read/create/update/delete on the exact
 /// conversation collections across any Space authority (`authority=*`).
-pub const LABYRINTH_CONVERSATION_SPACE_SCOPE: &str = "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek";
+pub const LABYRINTH_CONVERSATION_SPACE_SCOPE: &str = "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek";
 
 /// Minimum length of browser nonce
 pub const MIN_BROWSER_NONCE_LEN: usize = 16;
@@ -55,9 +62,11 @@ pub const ALLOWLISTED_UPGRADE_SCOPES: &[&str] = &[
     "account:email?action=manage",
     "account:status?action=manage",
     CIRCLE_SPACE_SCOPE,
+    CIRCLE_ENCRYPTED_SPACE_SCOPE,
     BLOB_ALL_SCOPE,
     LABYRINTH_MAILBOX_KEYS_REPO_SCOPE,
     MLS_CHAT_DEVICE_REPO_SCOPE,
+    MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE,
     LABYRINTH_MAILBOX_SPACE_SCOPE,
     LABYRINTH_CONVERSATION_SPACE_SCOPE,
 ];
@@ -327,9 +336,32 @@ mod tests {
         assert!(!over_512.is_structurally_valid());
 
         let arbitrary_531 = UpgradeStartRequest {
-            additional_scopes: vec!["s".repeat(531)],
-            browser_nonce: nonce,
+            additional_scopes: vec!["s".repeat(LABYRINTH_MAILBOX_SPACE_SCOPE.len())],
+            browser_nonce: nonce.clone(),
         };
         assert!(!arbitrary_531.is_structurally_valid());
+
+        let allowlisted_mailbox = UpgradeStartRequest {
+            additional_scopes: vec![
+                LABYRINTH_MAILBOX_SPACE_SCOPE.to_string(),
+                CIRCLE_ENCRYPTED_SPACE_SCOPE.to_string(),
+                MLS_CHAT_DEVICE_REPO_SCOPE.to_string(),
+                MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE.to_string(),
+            ],
+            browser_nonce: nonce.clone(),
+        };
+        assert!(allowlisted_mailbox.is_structurally_valid());
+        assert!(allowlisted_mailbox.has_only_allowlisted_scopes());
+
+        for bare_retired in [
+            "repo:blue.catbird.chat.device",
+            "repo:blue.catbird.chat.deviceRevocation",
+        ] {
+            let bare_req = UpgradeStartRequest {
+                additional_scopes: vec![bare_retired.to_string()],
+                browser_nonce: nonce.clone(),
+            };
+            assert!(!bare_req.has_only_allowlisted_scopes(), "{bare_retired}");
+        }
     }
 }

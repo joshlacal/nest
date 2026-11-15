@@ -92,12 +92,31 @@ mod tests {
         assert_eq!(proof_claims.ath, calculate_ath(token));
         assert_eq!(proof_claims.iat, now);
 
-        // 3. Verify the complete procedure registry, including push registration
+        // 3. Verify the complete 36-procedure `blue.catbird.chat.authFull` registry,
+        //    including Wave-1b device approval, push gateway registration, Space relays,
         //    and the delivery service's encrypted direct-request procedures.
-        assert_eq!(CHAT_ENDPOINTS.len(), 38);
-        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.updatePushToken"));
+        assert_eq!(CHAT_ENDPOINTS.len(), 36);
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.acknowledgeEntries"));
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.approveDevice"));
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.registerPushGateway"));
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.relaySpaceCredential"));
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.relaySpaceRead"));
         assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.publishDirectRequest"));
         assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.getEntries"));
+        for retired in [
+            "blue.catbird.chat.deleteBlob",
+            "blue.catbird.chat.getBlob",
+            "blue.catbird.chat.getBlobUsage",
+            "blue.catbird.chat.prepareBlobUpload",
+            "blue.catbird.chat.uploadBlob",
+            "blue.catbird.chat.updatePushToken",
+            "blue.catbird.chat.subscribeEvents",
+        ] {
+            assert!(
+                !CHAT_ENDPOINTS.contains(&retired),
+                "retired or WS-only chat NSID must not be in CHAT_ENDPOINTS: {retired}"
+            );
+        }
     }
 
     /// Test ADR-014 is_allowed_redirect validation and origin matching

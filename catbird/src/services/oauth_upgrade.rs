@@ -39,9 +39,11 @@ pub const ALLOWED_UPGRADE_SCOPES: &[&str] = &[
     "account:email?action=manage",
     "account:status?action=manage",
     crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE,
+    crate::models::oauth_upgrade::CIRCLE_ENCRYPTED_SPACE_SCOPE,
     crate::models::oauth_upgrade::BLOB_ALL_SCOPE,
     crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE,
     crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE,
+    crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE,
     crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE,
     crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE,
 ];
@@ -50,17 +52,33 @@ fn known_space_lexicon_collections(space_nsid: &str) -> Option<&'static [&'stati
     match space_nsid {
         "blue.catbird.labyrinth.mailbox" => Some(&[
             "blue.catbird.labyrinth.attachmentManifest",
+            "blue.catbird.labyrinth.circleOwnerState",
             "blue.catbird.labyrinth.device",
             "blue.catbird.labyrinth.epoch",
             "blue.catbird.labyrinth.epochMember",
             "blue.catbird.labyrinth.otcSession",
             "blue.catbird.labyrinth.ownerBatch",
+            "blue.catbird.labyrinth.readState",
             "blue.catbird.labyrinth.virtualDevice",
         ]),
         "blue.catbird.labyrinth.conversation" => Some(&[
             "blue.catbird.labyrinth.attachmentManifest",
+            "blue.catbird.labyrinth.authorRedaction",
             "blue.catbird.labyrinth.batch",
             "blue.catbird.labyrinth.mek",
+        ]),
+        "blue.catbird.circle" => Some(&[
+            "app.bsky.feed.like",
+            "app.bsky.feed.post",
+            "app.bsky.graph.listitem",
+            "blue.catbird.circle.metadata",
+            "blue.catbird.circle.report",
+        ]),
+        "blue.catbird.circle.encrypted" => Some(&[
+            "app.bsky.feed.like",
+            "blue.catbird.circle.key",
+            "blue.catbird.circle.metadata",
+            "blue.catbird.circle.post",
         ]),
         _ => None,
     }

@@ -114,16 +114,28 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 )),
         );
 
-    // Server-to-server mls-ds DID-JWT authenticated Push Gateway delivery route (outside session auth_middleware)
-    let public_xrpc_routes = Router::new().route(
-        "/blue.catbird.push.deliver",
-        post(crate::handlers::push_gateway::deliver)
-            .layer(DefaultBodyLimit::max(16 * 1024))
-            .layer(middleware::from_fn_with_state(
-                rate_limit_state.clone(),
-                push_deliver_ip_rate_limit,
-            )),
-    );
+    // Push Gateway routes with handler-managed auth (outside session-only auth_middleware):
+    // - `/blue.catbird.push.deliver`: server-to-server `mls-ds` `#atproto` DID-JWT
+    // - `/blue.catbird.push.registerKey`: dual Nest session OR PDS `ServiceJWT` (`D-09`)
+    let public_xrpc_routes = Router::new()
+        .route(
+            "/blue.catbird.push.deliver",
+            post(crate::handlers::push_gateway::deliver)
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    push_deliver_ip_rate_limit,
+                )),
+        )
+        .route(
+            "/blue.catbird.push.registerKey",
+            post(crate::handlers::push_gateway::register_key)
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_state.clone(),
+                    ip_rate_limit,
+                )),
+        );
 
     // XRPC proxy routes - protected with auth and session-based rate limiting
     let xrpc_routes = Router::new()
@@ -162,10 +174,6 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/blue.catbird.bskychat.updateMuteStatus",
             post(crate::handlers::chat_poll::update_mute_status),
-        )
-        .route(
-            "/blue.catbird.push.registerKey",
-            post(crate::handlers::push_gateway::register_key),
         )
         .route(
             "/:lexicon",
