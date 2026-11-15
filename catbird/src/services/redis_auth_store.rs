@@ -7,9 +7,7 @@ use hmac::{Hmac, Mac};
 use jacquard_common::session::SessionStoreError;
 use jacquard_common::types::did::Did;
 
-use super::redis_crypto::{
-    open_strict, open_v2_with_metadata, seal_v2_with_metadata, EnvelopeMetadata,
-};
+use super::redis_crypto::{open_v2_with_metadata, seal_v2_with_metadata, EnvelopeMetadata};
 use jacquard_oauth::authstore::ClientAuthStore;
 use jacquard_oauth::session::{AuthRequestData, ClientSessionData};
 use redis::AsyncCommands;
@@ -331,6 +329,61 @@ fn validate_auth_req_identity(
     Ok(info)
 }
 
+pub const DEFAULT_OAUTH_PROFILE: &str = "catbird";
+pub const CATMOS_OAUTH_PROFILE: &str = "catmos";
+
+pub fn default_oauth_profile() -> String {
+    DEFAULT_OAUTH_PROFILE.to_string()
+}
+
+#[derive(serde::Deserialize)]
+struct SessionProfileEnvelope {
+    #[serde(default = "default_oauth_profile")]
+    oauth_profile: String,
+}
+
+pub(crate) fn extract_oauth_profile_from_session_json(json: &str) -> String {
+    serde_json::from_str::<SessionProfileEnvelope>(json)
+        .map(|env| {
+            let trimmed = env.oauth_profile.trim();
+            if trimmed.is_empty() {
+                default_oauth_profile()
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .unwrap_or_else(|_| default_oauth_profile())
+}
+
+pub(crate) fn serialize_session_with_oauth_profile(
+    session: &ClientSessionData,
+    oauth_profile: &str,
+) -> Result<String, serde_json::Error> {
+    let mut val = serde_json::to_value(session)?;
+    if let Some(obj) = val.as_object_mut() {
+        let profile = if oauth_profile.trim().is_empty() {
+            DEFAULT_OAUTH_PROFILE
+        } else {
+            oauth_profile.trim()
+        };
+        obj.insert(
+            "oauth_profile".to_string(),
+            serde_json::Value::String(profile.to_string()),
+        );
+    }
+    serde_json::to_string(&val)
+}
+
+pub(crate) fn deserialize_client_session_data(
+    json: &str,
+) -> Result<ClientSessionData, serde_json::Error> {
+    let mut val: serde_json::Value = serde_json::from_str(json)?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("oauth_profile");
+    }
+    serde_json::from_value(val)
+}
+
 /// Redis-backed auth store for Jacquard OAuth.
 ///
 /// Key schema:
@@ -345,6 +398,7 @@ pub struct RedisAuthStore {
     session_ttl: u64,
     encryption_key: [u8; 32],
     reconcile_cursor: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    oauth_profile: String,
 }
 
 impl RedisAuthStore {
@@ -388,6 +442,7 @@ impl RedisAuthStore {
             session_ttl,
             encryption_key,
             reconcile_cursor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            oauth_profile: default_oauth_profile(),
         })
     }
 
@@ -405,7 +460,31 @@ impl RedisAuthStore {
             session_ttl,
             encryption_key,
             reconcile_cursor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            oauth_profile: default_oauth_profile(),
         })
+    }
+
+    /// Return a clone of this store bound to a specific OAuth client profile (e.g. `"catmos"`),
+    /// sharing the same Redis connection, encryption key, prefix, and reconcile cursor.
+    pub fn with_oauth_profile(&self, profile: impl Into<String>) -> Self {
+        let profile_str = profile.into();
+        let normalized = if profile_str.trim().is_empty() {
+            default_oauth_profile()
+        } else {
+            profile_str.trim().to_string()
+        };
+        Self {
+            redis: self.redis.clone(),
+            key_prefix: self.key_prefix.clone(),
+            session_ttl: self.session_ttl,
+            encryption_key: self.encryption_key,
+            reconcile_cursor: self.reconcile_cursor.clone(),
+            oauth_profile: normalized,
+        }
+    }
+
+    pub fn oauth_profile(&self) -> &str {
+        &self.oauth_profile
     }
 
     pub fn fingerprint_id(key: &[u8; 32], id: &str) -> String {
@@ -459,7 +538,7 @@ impl RedisAuthStore {
         if metadata.did.as_deref().is_some_and(|stored| stored != did) {
             return Err(other_err("local session DID mismatch"));
         }
-        let session = serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+        let session = deserialize_client_session_data(&json).map_err(SessionStoreError::Serde)?;
         validate_session_identity(session, &parsed_did, session_id).map(Some)
     }
 
@@ -627,6 +706,44 @@ impl RedisAuthStore {
         Ok(changed == 1)
     }
 
+    /// Look up the persisted OAuth client profile (`"catbird"` or `"catmos"`) for an active session.
+    /// Legacy sessions without the `oauth_profile` field default cleanly to `"catbird"`.
+    pub async fn lookup_session_oauth_profile(
+        &self,
+        did: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionStoreError> {
+        let hashed_session_key = self.session_key(did, session_id);
+        let hashed_retired_key = self.retired_key(session_id);
+        let mut conn = self.redis.clone();
+
+        let is_retired: bool = conn.exists(&hashed_retired_key).await.map_err(redis_err)?;
+        if is_retired {
+            return Ok(None);
+        }
+
+        let data: Option<String> = conn.get(&hashed_session_key).await.map_err(redis_err)?;
+        let Some(encrypted) = data else {
+            return Ok(None);
+        };
+
+        let (json, metadata, _) = open_v2_with_metadata(
+            &self.encryption_key,
+            &encrypted,
+            "session",
+            &hashed_session_key,
+        )
+        .map_err(|e| other_err(&format!("Session decryption failed: {e}")))?;
+
+        if let Some(meta_did) = metadata.did {
+            if meta_did != did {
+                return Err(other_err("Session DID mismatch with envelope metadata"));
+            }
+        }
+
+        Ok(Some(extract_oauth_profile_from_session_json(&json)))
+    }
+
     /// Repair/slide indexes only through an authenticated, locally live grant read.
     pub async fn write_session_index(
         &self,
@@ -661,7 +778,7 @@ impl RedisAuthStore {
             open_v2_with_metadata(&self.encryption_key, encrypted, "session", key)
                 .map_err(|_| other_err("Session envelope authentication failed"))?;
         let session: ClientSessionData =
-            serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+            deserialize_client_session_data(&json).map_err(SessionStoreError::Serde)?;
         if session.account_did.as_str() != did
             || session.token_set.sub.as_str() != did
             || metadata.did.as_deref().is_some_and(|value| value != did)
@@ -882,30 +999,28 @@ impl RedisAuthStore {
                             if let Ok(alt_session) =
                                 self.decode_bound_session(&alt_session_k, did, &alt_enc)
                             {
+                                let alt_computed =
+                                    crate::services::push::registry::session_fingerprint(
+                                        alt_session.session_id.as_str(),
+                                    );
+                                if alt_computed == expected_fp
+                                    || alt_session.session_id.as_str() == expected_fingerprint
                                 {
-                                    let alt_computed =
-                                        crate::services::push::registry::session_fingerprint(
-                                            alt_session.session_id.as_str(),
-                                        );
-                                    if alt_computed == expected_fp
-                                        || alt_session.session_id.as_str() == expected_fingerprint
-                                    {
-                                        let install_script =
-                                            redis::Script::new(LUA_INSTALL_FP_INDEX_SCRIPT);
-                                        let verdict: Result<i32, _> = install_script
-                                            .key(&fp_index_key)
-                                            .key(&did_index_key)
-                                            .key(&alt_session_k)
-                                            .key(&alt_retired_k)
-                                            .key(self.account_erasure_key(did))
-                                            .arg(&alt_fp)
-                                            .arg(ttl.max(1))
-                                            .arg(&alt_enc)
-                                            .invoke_async(&mut conn)
-                                            .await;
-                                        if let Ok(0) = verdict {
-                                            return Ok(Some(alt_session));
-                                        }
+                                    let install_script =
+                                        redis::Script::new(LUA_INSTALL_FP_INDEX_SCRIPT);
+                                    let verdict: Result<i32, _> = install_script
+                                        .key(&fp_index_key)
+                                        .key(&did_index_key)
+                                        .key(&alt_session_k)
+                                        .key(&alt_retired_k)
+                                        .key(self.account_erasure_key(did))
+                                        .arg(&alt_fp)
+                                        .arg(ttl.max(1))
+                                        .arg(&alt_enc)
+                                        .invoke_async(&mut conn)
+                                        .await;
+                                    if let Ok(0) = verdict {
+                                        return Ok(Some(alt_session));
                                     }
                                 }
                             }
@@ -1244,7 +1359,7 @@ impl ClientAuthStore for RedisAuthStore {
             )
             .map_err(|e| other_err(&format!("Session decryption failed: {e}")))?;
             let session: ClientSessionData =
-                serde_json::from_str(&json).map_err(SessionStoreError::Serde)?;
+                deserialize_client_session_data(&json).map_err(SessionStoreError::Serde)?;
             let session = validate_session_identity(session, did, session_id)?;
 
             if let Some(meta_did) = metadata.did {
@@ -1290,7 +1405,8 @@ impl ClientAuthStore for RedisAuthStore {
         let did_idx_key = self.did_index_key(session.account_did.as_str());
         let hmac_fp = self.fingerprint(&session.session_id);
 
-        let json = serde_json::to_string(&session).map_err(SessionStoreError::Serde)?;
+        let json = serialize_session_with_oauth_profile(&session, &self.oauth_profile)
+            .map_err(SessionStoreError::Serde)?;
         let meta = EnvelopeMetadata::new(
             "session",
             &hashed_session,
@@ -3466,5 +3582,129 @@ mod tests {
         assert!(resolved_legacy2.is_some());
         assert_eq!(sim.direct_lookups.get(), 3);
         assert_eq!(sim.scan_iterations.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_b5_session_resolution_and_reconcile_reject_transplanted_v2_envelopes() {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str()).unwrap();
+        let redis_mgr = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("local Redis must be reachable");
+
+        let prefix = format!("catbird:v2:test_b5_{}:", uuid::Uuid::new_v4().simple());
+        let key = TEST_KEY;
+        let did = "did:plc:z72i7hdynmk6r22z27h6tvur";
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let hmac_fp = fingerprint_id(&key, session_id);
+        let sha256_fp = crate::services::push::registry::session_fingerprint(session_id);
+
+        let store = RedisAuthStore::from_key(redis_mgr.clone(), prefix.clone(), 3600, key)
+            .expect("store creation");
+        let mut conn = redis_mgr.clone();
+
+        let sess_key = format!("{prefix}session:{did}_{hmac_fp}");
+        let fp_index_key = store.session_fp_index_key(&sha256_fp);
+        let did_index_key = store.did_index_key(did);
+
+        let session = make_test_session_data(did, session_id);
+        let json = serde_json::to_string(&session).unwrap();
+
+        // 1. Transplanted wrong-record_class v2 envelope MUST be rejected on direct lookup, self-heal scan, and reconciliation
+        let wrong_class_meta =
+            EnvelopeMetadata::new("oauth_upgrade_flow", &sess_key, Some(did), None);
+        let wrong_class_enc = seal_v2_with_metadata(&key, &json, &wrong_class_meta).unwrap();
+
+        let _: () = redis::cmd("SETEX")
+            .arg(&sess_key)
+            .arg(3600)
+            .arg(&wrong_class_enc)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SETEX")
+            .arg(&fp_index_key)
+            .arg(3600)
+            .arg(&hmac_fp)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let direct_wrong_class = store
+            .resolve_session_for_did_with_fingerprint(did, &sha256_fp)
+            .await;
+        assert!(
+            direct_wrong_class.is_err(),
+            "Direct session lookup must reject transplanted wrong-record_class v2 envelope"
+        );
+
+        // Remove fp_index_key so self-heal SCAN path runs against wrong_class_enc
+        let _: () = redis::cmd("DEL")
+            .arg(&fp_index_key)
+            .arg(&did_index_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let scan_wrong_class = store
+            .resolve_session_for_did_with_fingerprint(did, &sha256_fp)
+            .await
+            .unwrap();
+        assert!(
+            scan_wrong_class.is_none(),
+            "Self-heal SCAN must reject transplanted wrong-record_class v2 envelope"
+        );
+
+        let outcome = store.reconcile_legacy_sessions().await.unwrap();
+        assert_eq!(
+            outcome.failed, 1,
+            "Reconcile must count transplanted wrong-record_class v2 envelope as failed"
+        );
+
+        // 2. Transplanted wrong-redis_key v2 envelope MUST also be rejected
+        let other_sess_key = format!("{prefix}session:did:plc:other_otherhmac");
+        let wrong_key_meta = EnvelopeMetadata::new("session", &other_sess_key, Some(did), None);
+        let wrong_key_enc = seal_v2_with_metadata(&key, &json, &wrong_key_meta).unwrap();
+        let _: () = redis::cmd("SETEX")
+            .arg(&sess_key)
+            .arg(3600)
+            .arg(&wrong_key_enc)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let scan_wrong_key = store
+            .resolve_session_for_did_with_fingerprint(did, &sha256_fp)
+            .await
+            .unwrap();
+        assert!(
+            scan_wrong_key.is_none(),
+            "Self-heal SCAN must reject transplanted wrong-redis_key v2 envelope"
+        );
+
+        // 3. Authentic v2 envelope bound to ("session", sess_key, did) succeeds
+        let valid_meta = EnvelopeMetadata::new("session", &sess_key, Some(did), None);
+        let valid_enc = seal_v2_with_metadata(&key, &json, &valid_meta).unwrap();
+        let _: () = redis::cmd("SETEX")
+            .arg(&sess_key)
+            .arg(3600)
+            .arg(&valid_enc)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let recovered = store
+            .resolve_session_for_did_with_fingerprint(did, &sha256_fp)
+            .await
+            .unwrap()
+            .expect("valid bound v2 session envelope must resolve");
+        assert_eq!(recovered.session_id, session_id);
+
+        // Cleanup
+        let _: () = redis::cmd("DEL")
+            .arg(&sess_key)
+            .arg(&fp_index_key)
+            .arg(&did_index_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 }

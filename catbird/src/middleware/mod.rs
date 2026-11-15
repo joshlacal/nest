@@ -8,7 +8,7 @@ mod request_id;
 
 pub use auth::{auth_middleware, JacquardDpopData, SESSION_COOKIE_NAME};
 pub use rate_limit::{
-    ip_rate_limit, session_rate_limit, ByteRateLimitConfig, ByteRateLimiter, RateLimitConfig,
-    RateLimitState, RateLimiter,
+    ip_rate_limit, push_deliver_ip_rate_limit, session_rate_limit, ByteRateLimitConfig,
+    ByteRateLimiter, RateLimitConfig, RateLimitState, RateLimiter, PUSH_DELIVER_IP_LIMIT,
 };
 pub use request_id::{request_id_middleware, RequestId};

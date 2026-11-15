@@ -580,15 +580,20 @@ pub fn default_initial_scopes() -> Vec<String> {
     ]
 }
 
-/// Default optional progressive scopes (identity, account management, and
-/// Circle Spaces). App-password management and account deletion are excluded
-/// by design.
+/// Default optional progressive scopes (identity, account management,
+/// Circle Spaces, and MLS Clean-Slate Labyrinth/device/blob scopes).
+/// App-password management and account deletion are excluded by design.
 pub fn default_optional_scopes() -> Vec<String> {
     vec![
         "identity:handle".to_string(),
         "account:email?action=manage".to_string(),
         "account:status?action=manage".to_string(),
         crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE.to_string(),
+        crate::models::oauth_upgrade::BLOB_ALL_SCOPE.to_string(),
+        crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE.to_string(),
+        crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE.to_string(),
+        crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE.to_string(),
+        crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE.to_string(),
     ]
 }
 
@@ -612,6 +617,18 @@ pub fn default_max_scopes() -> Vec<String> {
 }
 
 impl AppConfig {
+    pub(crate) fn env_source(prefix: &str) -> config::Environment {
+        config::Environment::with_prefix(prefix)
+            .separator("__")
+            .with_list_parse_key("server.allowed_origins")
+            .with_list_parse_key("server.trusted_proxies")
+            .with_list_parse_key("oauth.scopes")
+            .with_list_parse_key("oauth.initial_scopes")
+            .with_list_parse_key("oauth.max_scopes")
+            .list_separator(",")
+            .try_parsing(true)
+    }
+
     /// Load configuration from environment and config files
     pub fn load() -> Result<Self, config::ConfigError> {
         dotenvy::dotenv().ok();
@@ -627,15 +644,7 @@ impl AppConfig {
             .add_source(config::File::with_name("config/default").required(false))
             .add_source(config::File::with_name("config/local").required(false))
             // Override with environment variables (CATBIRD_ prefix)
-            .add_source(
-                config::Environment::with_prefix("CATBIRD")
-                    .separator("__")
-                    .with_list_parse_key("oauth.scopes")
-                    .with_list_parse_key("oauth.initial_scopes")
-                    .with_list_parse_key("oauth.max_scopes")
-                    .list_separator(",")
-                    .try_parsing(true),
-            )
+            .add_source(Self::env_source("CATBIRD"))
             .build()?;
 
         let mut app_config: AppConfig = config.try_deserialize()?;
@@ -922,10 +931,12 @@ impl AppState {
             if let Ok(catmos_client_id) = std::env::var("CATMOS_OAUTH_CLIENT_ID") {
                 let catmos_redirect = std::env::var("CATMOS_OAUTH_REDIRECT_URI")
                     .unwrap_or_else(|_| format!("{}/auth/callback", state.config.server.base_url));
+                let catmos_store = auth_store
+                    .with_oauth_profile(crate::services::redis_auth_store::CATMOS_OAUTH_PROFILE);
                 match Self::build_jacquard_client(
                     &state,
                     key_store,
-                    auth_store,
+                    &catmos_store,
                     &catmos_client_id,
                     &catmos_redirect,
                     &state.catmos_oauth_scopes,
@@ -961,8 +972,17 @@ impl AppState {
             .auth_store
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Push requires the local session write guard"))?;
+        let gateway = Arc::new(
+            crate::services::push::gateway::PushGatewayService::new_postgres(
+                pool.clone(),
+                &self.config.push,
+                &self.config.server.base_url,
+                self.raw_http_client.clone(),
+            )?,
+        );
         let services = crate::services::push::PushServices::new(pool, self.config.push.clone())?
-            .with_auth_store(store);
+            .with_auth_store(store)
+            .with_gateway(gateway);
         self.push = Some(Arc::new(services));
         tracing::info!("Push services initialized successfully");
         Ok(())
@@ -988,6 +1008,25 @@ impl AppState {
     pub fn is_session_index_ready(&self) -> bool {
         self.session_index_ready
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Select the `JacquardOAuthClient` owning a session profile (`"catbird"` vs `"catmos"`).
+    pub fn oauth_client_for_profile(&self, profile: &str) -> Option<&Arc<JacquardOAuthClient>> {
+        match profile.trim() {
+            "catmos" | "catmos-web" => self.catmos_jacquard_client.as_ref(),
+            _ => self.jacquard_client.as_ref(),
+        }
+    }
+
+    /// Look up the persisted OAuth profile for `(did, session_id)`, defaulting legacy
+    /// sessions without profile metadata to `"catbird"`.
+    pub async fn session_oauth_profile(&self, did: &str, session_id: &str) -> String {
+        if let Some(store) = self.auth_store.as_ref() {
+            if let Ok(Some(profile)) = store.lookup_session_oauth_profile(did, session_id).await {
+                return profile;
+            }
+        }
+        crate::services::redis_auth_store::DEFAULT_OAUTH_PROFILE.to_string()
     }
 
     pub async fn wait_for_session_index_readiness(&self) {
@@ -1343,6 +1382,12 @@ mod tests {
                 "transition:chat.bsky".to_string(),
             ]
         );
+        let expected_conv_normalized = jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(
+            crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE,
+        )
+        .unwrap()
+        .to_string_normalized()
+        .to_string();
         assert_eq!(
             config.normalized_max_scopes().unwrap(),
             vec![
@@ -1353,6 +1398,11 @@ mod tests {
                 "account:email?action=manage".to_string(),
                 "account:status?action=manage".to_string(),
                 crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE.to_string(),
+                crate::models::oauth_upgrade::BLOB_ALL_SCOPE.to_string(),
+                crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE.to_string(),
+                crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE.to_string(),
+                crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE.to_string(),
+                expected_conv_normalized,
             ]
         );
 
@@ -1363,6 +1413,9 @@ mod tests {
             .unwrap());
         assert!(config
             .is_scope_allowed(crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE)
+            .unwrap());
+        assert!(config
+            .is_scope_allowed(crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE)
             .unwrap());
     }
 
@@ -1418,6 +1471,11 @@ mod tests {
                 "account:email?action=manage".to_string(),
                 "account:status?action=manage".to_string(),
                 crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE.to_string(),
+                crate::models::oauth_upgrade::BLOB_ALL_SCOPE.to_string(),
+                crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE.to_string(),
+                crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE.to_string(),
+                crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE.to_string(),
+                crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE.to_string(),
             ]
         );
         assert_eq!(config.scopes, config.max_scopes);
@@ -2060,5 +2118,45 @@ mod tests {
             assert!(res.is_ok(), "Waiter must not be parked due to lost wakeup");
             assert!(res.unwrap().unwrap(), "Waiter must observe readiness");
         }
+    }
+
+    #[test]
+    fn test_b4_env_comma_separated_allowed_origins_and_trusted_proxies() {
+        std::env::set_var(
+            "CATBIRD_B4_UNIT__SERVER__ALLOWED_ORIGINS",
+            "https://catbird.blue,https://app.catbird.blue",
+        );
+        std::env::set_var(
+            "CATBIRD_B4_UNIT__SERVER__TRUSTED_PROXIES",
+            "10.0.0.0/8,172.16.0.0/12",
+        );
+        let cfg = config::Config::builder()
+            .set_default("server.host", "0.0.0.0")
+            .unwrap()
+            .set_default("server.port", 8080)
+            .unwrap()
+            .set_default("server.base_url", "https://api.catbird.blue")
+            .unwrap()
+            .add_source(AppConfig::env_source("CATBIRD_B4_UNIT"))
+            .build()
+            .expect("build config with CATBIRD_B4_UNIT env");
+
+        std::env::remove_var("CATBIRD_B4_UNIT__SERVER__ALLOWED_ORIGINS");
+        std::env::remove_var("CATBIRD_B4_UNIT__SERVER__TRUSTED_PROXIES");
+
+        let server: ServerConfig = cfg.get("server").expect(
+            "deserialize comma-separated server.allowed_origins and server.trusted_proxies",
+        );
+        assert_eq!(
+            server.allowed_origins,
+            vec![
+                "https://catbird.blue".to_string(),
+                "https://app.catbird.blue".to_string()
+            ]
+        );
+        assert_eq!(
+            server.trusted_proxies,
+            vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()]
+        );
     }
 }

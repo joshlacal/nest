@@ -1,0 +1,14 @@
+# Non-shipping transitive dependency advisories verified against the production dependency graph (`cargo tree -e normal`).
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2: pulled exclusively via dev-dependency testcontainers 0.18.0 -> reqwest 0.12.28 (no 0.25.x fix exists).
+    # The production resolver is hickory-proto 0.26.3, which carries the fixes for these four and for RUSTSEC-2026-0488.
+    # If the production copy ever drops below 0.26.2 these ignores would hide it: check `cargo tree -e normal -i hickory-proto` before touching that pin.
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0490",
+    "RUSTSEC-2026-0491",
+    # libsqlite3-sys 0.30.1: in Cargo.lock only, through sqlx's SQLite driver, which nest never enables (PostgreSQL only).
+    # `cargo tree --target all -e all -i libsqlite3-sys` is empty.
+    "RUSTSEC-2026-0459",
+]

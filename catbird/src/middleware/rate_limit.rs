@@ -455,6 +455,58 @@ pub async fn ip_rate_limit(
     }
 }
 
+/// Pre-authentication ceiling for `blue.catbird.push.deliver`, per source IP.
+///
+/// The caller is a delivery service, not a person signing in: one service
+/// sends every wake for its users from a handful of addresses. The gateway
+/// already limits each verified service to 600 wakes a minute and each push
+/// key to 30, so this ceiling only bounds the work an unverified caller can
+/// cause (token parsing and DID resolution). It is set to twice the verified
+/// budget so the per-service bucket, not this one, is what a legitimate
+/// service runs into.
+pub const PUSH_DELIVER_IP_LIMIT: RateLimitConfig = RateLimitConfig {
+    max_requests: 1200,
+    window: Duration::from_secs(60),
+};
+
+/// Per-IP rate limiting for `blue.catbird.push.deliver`.
+///
+/// Counted under its own `deliver:` keys so that wake traffic and sign-in
+/// traffic from the same address can never exhaust each other's budget. The
+/// refusal uses the XRPC `RateLimited` error the gateway returns for its own
+/// per-service and per-key limits.
+pub async fn push_deliver_ip_rate_limit(
+    State(rate_limit): State<Arc<RateLimitState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let key = match extract_client_ip(&req, &rate_limit.trusted_proxies) {
+        Some(ip) => format!("deliver:{}", ip),
+        None => "deliver:unknown".to_string(),
+    };
+
+    match rate_limit
+        .ip_limiter
+        .check(&key, &PUSH_DELIVER_IP_LIMIT)
+        .await
+    {
+        Ok(_) => next.run(req).await,
+        Err(retry_after) => {
+            tracing::warn!(key = %key, retry_after = retry_after, "Push deliver rate limit exceeded");
+            metrics::record_rate_limit_exceeded("push_deliver");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", retry_after.to_string())],
+                Json(json!({
+                    "error": "RateLimited",
+                    "message": "Push delivery rate limit exceeded",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +627,96 @@ mod tests {
 
         let ip = extract_client_ip(&req, &[]);
         assert!(ip.is_none());
+    }
+
+    mod push_deliver {
+        use super::*;
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tower::ServiceExt;
+
+        const DS_ADDR: &str = "203.0.113.7:443";
+
+        /// One limiter state shared by a sign-in route and the deliver route,
+        /// mounted the way `routes::atproto::create_router` mounts them.
+        fn app(state: Arc<RateLimitState>) -> Router {
+            Router::new()
+                .route(
+                    "/auth/login",
+                    post(|| async { "login" })
+                        .layer(from_fn_with_state(state.clone(), ip_rate_limit)),
+                )
+                .route(
+                    "/xrpc/blue.catbird.push.deliver",
+                    post(|| async { "wake" })
+                        .layer(from_fn_with_state(state, push_deliver_ip_rate_limit)),
+                )
+        }
+
+        async fn post_from(app: &Router, path: &str, addr: &str) -> Response {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(addr.parse::<SocketAddr>().unwrap()));
+            app.clone().oneshot(req).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_delivery_service_is_not_held_to_the_sign_in_limit() {
+            let state = Arc::new(RateLimitState::default());
+            let sign_in_limit = state.ip_config.max_requests;
+            let app = app(state);
+
+            // Ten times the sign-in limit, all from the one address a
+            // delivery service sends from.
+            for n in 0..sign_in_limit * 10 {
+                let resp = post_from(&app, "/xrpc/blue.catbird.push.deliver", DS_ADDR).await;
+                assert_eq!(resp.status(), StatusCode::OK, "wake {n} was refused");
+            }
+        }
+
+        #[tokio::test]
+        async fn wakes_and_sign_ins_from_one_address_do_not_share_a_budget() {
+            let state = Arc::new(RateLimitState::default());
+            let sign_in_limit = state.ip_config.max_requests;
+            let app = app(state);
+
+            // Wake traffic does not spend the sign-in budget...
+            for _ in 0..sign_in_limit * 3 {
+                post_from(&app, "/xrpc/blue.catbird.push.deliver", DS_ADDR).await;
+            }
+            for n in 0..sign_in_limit {
+                let resp = post_from(&app, "/auth/login", DS_ADDR).await;
+                assert_eq!(resp.status(), StatusCode::OK, "sign-in {n} was refused");
+            }
+            let resp = post_from(&app, "/auth/login", DS_ADDR).await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+            // ...and an exhausted sign-in budget does not block wakes.
+            let resp = post_from(&app, "/xrpc/blue.catbird.push.deliver", DS_ADDR).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn the_deliver_ceiling_is_per_address_and_answers_with_rate_limited() {
+            let app = app(Arc::new(RateLimitState::default()));
+
+            for n in 0..PUSH_DELIVER_IP_LIMIT.max_requests {
+                let resp = post_from(&app, "/xrpc/blue.catbird.push.deliver", DS_ADDR).await;
+                assert_eq!(resp.status(), StatusCode::OK, "wake {n} was refused");
+            }
+            let resp = post_from(&app, "/xrpc/blue.catbird.push.deliver", DS_ADDR).await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(resp.headers().contains_key("retry-after"));
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "RateLimited");
+
+            // Another address still has its own budget.
+            let resp = post_from(&app, "/xrpc/blue.catbird.push.deliver", "198.51.100.9:443").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 }

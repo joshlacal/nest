@@ -1,10 +1,13 @@
 pub mod apns;
 pub mod decision;
+pub mod gateway;
 pub mod lock;
 pub mod moderation_verdict;
 pub mod preferences;
 pub mod queue;
 pub mod registry;
+#[cfg(test)]
+mod request_events;
 pub mod session_devices;
 pub mod subscriptions;
 pub mod thread_evidence;
@@ -166,6 +169,7 @@ pub struct PushServices {
     pub queue: PushQueue,
     pub decision: PushDecisionEngine,
     pub apns: Option<Arc<dyn ApnsSender>>,
+    pub gateway: Arc<gateway::PushGatewayService>,
 }
 
 impl PushServices {
@@ -177,6 +181,15 @@ impl PushServices {
 
         let apns = ApnsDelivery::new(&config.apns)?.map(|d| Arc::new(d) as Arc<dyn ApnsSender>);
         let registry = PushRegistry::with_config(db_pool.clone(), &config);
+        let default_base_url = std::env::var("CATBIRD_GATEWAY_BASE_URL")
+            .unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        let raw_http_client = crate::services::build_hardened_raw_http_client()?;
+        let gateway = Arc::new(gateway::PushGatewayService::new_postgres(
+            db_pool.clone(),
+            &config,
+            &default_base_url,
+            raw_http_client,
+        )?);
 
         Ok(Self {
             registry,
@@ -187,6 +200,7 @@ impl PushServices {
             queue: PushQueue::new(db_pool),
             decision: PushDecisionEngine::new(),
             apns,
+            gateway,
             config,
         })
     }
@@ -199,6 +213,11 @@ impl PushServices {
 
     pub fn with_apns_sender(mut self, sender: Arc<dyn ApnsSender>) -> Self {
         self.apns = Some(sender);
+        self
+    }
+
+    pub fn with_gateway(mut self, gateway: Arc<gateway::PushGatewayService>) -> Self {
+        self.gateway = gateway;
         self
     }
     pub async fn verify_pre_send_fence(
@@ -1162,10 +1181,6 @@ pub(crate) async fn resolve_background_session(
         .auth_store
         .as_ref()
         .ok_or_else(|| anyhow!("Auth store not configured"))?;
-    let jacquard_client = state
-        .jacquard_client
-        .as_ref()
-        .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
 
     // Resolve current active session from Redis for this DID and verify its fingerprint
     let session_data = auth_store
@@ -1173,6 +1188,12 @@ pub(crate) async fn resolve_background_session(
         .await
         .map_err(|err| anyhow!("Redis session resolution failed: {err}"))?
         .ok_or_else(|| anyhow!("Session resolution index miss for DID {account_did}: no active Redis session index matching fingerprint (retryable)"))?;
+    let profile = state
+        .session_oauth_profile(account_did, session_data.session_id.as_str())
+        .await;
+    let jacquard_client = state
+        .oauth_client_for_profile(&profile)
+        .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
     let did = Did::new(account_did)
         .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
     let session_data = jacquard_client

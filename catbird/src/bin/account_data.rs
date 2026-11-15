@@ -86,6 +86,7 @@ enum Command {
 /// `push_accounts`; it is deleted explicitly so the count is exact.
 const OWNED_TABLES: &[(&str, &str)] = &[
     ("push_preferences", "account_did"),
+    ("push_gateway_keys", "account_did"),
     ("user_devices", "did"),
     ("activity_subscriptions", "subscriber_did"),
     ("thread_mutes", "user_did"),

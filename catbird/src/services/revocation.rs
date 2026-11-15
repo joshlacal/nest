@@ -75,6 +75,7 @@ pub async fn revoke_upstream(
     .await
     {
         Ok(()) => RevokeOutcome::Revoked,
+        Err(e) if e.to_string() == "http status: 200 OK" => RevokeOutcome::Revoked,
         Err(e) => RevokeOutcome::Failed(format!("revocation request: {e}")),
     }
 }

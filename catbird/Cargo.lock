@@ -189,6 +189,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -244,6 +250,40 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "atproto-spaces"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "catbird-atproto",
+ "ciborium",
+ "cid",
+ "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
+ "http 1.5.0",
+ "ipld-core",
+ "jacquard-common",
+ "k256",
+ "multibase",
+ "multihash",
+ "p256",
+ "rand 0.8.8",
+ "serde",
+ "serde_bytes",
+ "serde_ipld_dagcbor 0.6.4",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 1.0.69",
+ "url",
+ "uuid",
+ "web-time",
+]
 
 [[package]]
 name = "auto-future"
@@ -468,6 +508,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -633,6 +686,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "atproto-spaces",
  "axum",
  "axum-extra",
  "axum-test",
@@ -655,6 +709,7 @@ dependencies = [
  "jacquard-identity",
  "jacquard-oauth",
  "jose-jwk",
+ "k256",
  "lazy_static",
  "multibase",
  "p256",
@@ -690,7 +745,6 @@ dependencies = [
 [[package]]
 name = "catbird-atproto"
 version = "0.1.0"
-source = "git+https://github.com/joshlacal/catbird-atproto.git?rev=d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad#d6638bb5237e3d7bf9f6ac34d958fa2d61da2aad"
 dependencies = [
  "bytes",
  "jacquard-common",
@@ -702,6 +756,15 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "cbor4ii"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b544cf8c89359205f4f990d0e6f3828db42df85b5dac95d09157a250eb0749c4"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -961,6 +1024,12 @@ name = "const-str"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f421161cb492475f1661ddc9815a745a1c894592070661180fdec3d4872e9c3"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -1588,6 +1657,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -2188,9 +2258,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -2198,7 +2268,7 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "hickory-proto 0.26.1",
+ "hickory-proto 0.26.3",
  "idna",
  "ipnet",
  "jni",
@@ -2237,9 +2307,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -2278,14 +2348,14 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
+checksum = "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
 dependencies = [
  "cfg-if",
  "futures-util",
  "hickory-net",
- "hickory-proto 0.26.1",
+ "hickory-proto 0.26.3",
  "ipconfig",
  "ipnet",
  "jni",
@@ -2459,7 +2529,7 @@ dependencies = [
  "http 1.5.0",
  "hyper",
  "hyper-util",
- "rustls 0.23.43",
+ "rustls 0.23.46",
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
@@ -2498,7 +2568,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2778,7 +2848,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_html_form",
- "serde_ipld_dagcbor",
+ "serde_ipld_dagcbor 0.7.0",
  "serde_json",
  "signature",
  "smol_str",
@@ -2809,7 +2879,7 @@ source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a
 dependencies = [
  "bon",
  "bytes",
- "hickory-resolver 0.26.1",
+ "hickory-resolver 0.26.3",
  "http 1.5.0",
  "jacquard-common",
  "jacquard-lexicon",
@@ -2841,7 +2911,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
- "serde_ipld_dagcbor",
+ "serde_ipld_dagcbor 0.7.0",
  "serde_json",
  "serde_path_to_error",
  "serde_repr",
@@ -3064,7 +3134,9 @@ dependencies = [
  "cfg-if",
  "ecdsa",
  "elliptic-curve",
+ "once_cell",
  "sha2 0.10.9",
+ "signature",
 ]
 
 [[package]]
@@ -4017,8 +4089,8 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.43",
- "socket2 0.6.5",
+ "rustls 0.23.46",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4027,9 +4099,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4039,7 +4111,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.43",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.20",
@@ -4057,7 +4129,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4354,7 +4426,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.43",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -4514,9 +4586,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -4582,7 +4654,7 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.43",
+ "rustls 0.23.46",
  "rustls-native-certs 0.8.4",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.16",
@@ -4805,11 +4877,23 @@ dependencies = [
 
 [[package]]
 name = "serde_ipld_dagcbor"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46182f4f08349a02b45c998ba3215d3f9de826246ba02bb9dddfe9a2a2100778"
+dependencies = [
+ "cbor4ii 0.2.14",
+ "ipld-core",
+ "scopeguard",
+ "serde",
+]
+
+[[package]]
+name = "serde_ipld_dagcbor"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2918680761336241e07049131fdc59f63c5691a8aaf592a167c0706b473c5fe5"
 dependencies = [
- "cbor4ii",
+ "cbor4ii 1.2.2",
  "ipld-core",
  "scopeguard",
  "serde",
@@ -5138,7 +5222,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
- "rustls 0.23.43",
+ "rustls 0.23.46",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5431,7 +5515,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5653,7 +5737,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.43",
+ "rustls 0.23.46",
  "tokio",
 ]
 
@@ -6273,7 +6357,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

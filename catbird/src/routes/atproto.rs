@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use crate::config::AppState;
 use crate::handlers::{atproto, oauth_upgrade, push};
-use crate::middleware::{auth_middleware, ip_rate_limit, session_rate_limit};
+use crate::middleware::{
+    auth_middleware, ip_rate_limit, push_deliver_ip_rate_limit, session_rate_limit,
+};
 
 /// Create the ATProto router
 ///
@@ -112,6 +114,17 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 )),
         );
 
+    // Server-to-server mls-ds DID-JWT authenticated Push Gateway delivery route (outside session auth_middleware)
+    let public_xrpc_routes = Router::new().route(
+        "/blue.catbird.push.deliver",
+        post(crate::handlers::push_gateway::deliver)
+            .layer(DefaultBodyLimit::max(16 * 1024))
+            .layer(middleware::from_fn_with_state(
+                rate_limit_state.clone(),
+                push_deliver_ip_rate_limit,
+            )),
+    );
+
     // XRPC proxy routes - protected with auth and session-based rate limiting
     let xrpc_routes = Router::new()
         .route(
@@ -151,7 +164,11 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(crate::handlers::chat_poll::update_mute_status),
         )
         .route(
-            "/*lexicon",
+            "/blue.catbird.push.registerKey",
+            post(crate::handlers::push_gateway::register_key),
+        )
+        .route(
+            "/:lexicon",
             get(atproto::proxy_xrpc).post(atproto::proxy_xrpc),
         )
         .layer(DefaultBodyLimit::max(11 * 1024 * 1024)) // 11 MB for blob uploads (10 MB + overhead)
@@ -172,7 +189,7 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
     Router::new()
         .nest("/auth", auth_routes)
-        .nest("/xrpc", xrpc_routes)
+        .nest("/xrpc", public_xrpc_routes.merge(xrpc_routes))
         .nest("/.well-known", wellknown_routes)
 }
 

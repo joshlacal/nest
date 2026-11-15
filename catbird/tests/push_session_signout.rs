@@ -226,6 +226,115 @@ async fn signing_out_one_session_keeps_other_devices_and_user_data() {
     );
 }
 
+/// Inserts an MLS wake key row owned by `session`, as `registerKey` would.
+async fn insert_wake_key(pool: &Pool<Postgres>, session: &CatbirdSession) -> Vec<u8> {
+    let key_hash = Uuid::new_v4().as_bytes().repeat(2);
+    sqlx::query(
+        "INSERT INTO push_gateway_keys (push_key_sha256, account_did, device_id, app_id, platform, \
+         encrypted_native_token, allowed_mls_service_did, auth_session_fingerprint) \
+         VALUES ($1, $2, $3, 'blue.catbird', 'apns', '\\x00'::bytea, 'did:web:chat.catbird.blue', $4)",
+    )
+    .bind(&key_hash)
+    .bind(DID)
+    .bind(Uuid::new_v4().to_string())
+    .bind(session_fingerprint(&session.id.to_string()))
+    .execute(pool)
+    .await
+    .expect("insert wake key");
+    key_hash
+}
+
+async fn wake_key_is_revoked(pool: &Pool<Postgres>, key_hash: &[u8]) -> bool {
+    sqlx::query_scalar(
+        "SELECT revoked_at IS NOT NULL FROM push_gateway_keys WHERE push_key_sha256 = $1",
+    )
+    .bind(key_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires explicit disposable Postgres and Redis"]
+async fn signing_out_a_session_revokes_only_its_wake_keys() {
+    let db = TestDb::new().await;
+    let store = cleanup_auth::store().await;
+    let registry = PushRegistry::with_config(
+        db.pool.clone(),
+        &PushConfig {
+            service_did: Some("did:web:push.catbird.blue".to_string()),
+            ..PushConfig::default()
+        },
+    )
+    .with_auth_store(store.clone());
+
+    let (phone, _) = sign_in_with_device(&store, &registry, "aa".repeat(32).as_str()).await;
+    let (ipad, _) = sign_in_with_device(&store, &registry, "bb".repeat(32).as_str()).await;
+    let phone_key = insert_wake_key(&db.pool, &phone).await;
+    let ipad_key = insert_wake_key(&db.pool, &ipad).await;
+
+    session_devices::sign_out_session(Some(&store), &registry, DID, &phone.id.to_string())
+        .await
+        .unwrap();
+
+    assert!(
+        wake_key_is_revoked(&db.pool, &phone_key).await,
+        "the signed-out session's wake key must be revoked"
+    );
+    assert!(
+        !wake_key_is_revoked(&db.pool, &ipad_key).await,
+        "another session's wake key must stay live"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires explicit disposable Postgres and Redis"]
+async fn wake_keys_follow_an_upgraded_session_and_are_revoked_with_it() {
+    let db = TestDb::new().await;
+    let store = cleanup_auth::store().await;
+    let registry = PushRegistry::with_config(
+        db.pool.clone(),
+        &PushConfig {
+            service_did: Some("did:web:push.catbird.blue".to_string()),
+            ..PushConfig::default()
+        },
+    )
+    .with_auth_store(store.clone());
+
+    let (old, _) = sign_in_with_device(&store, &registry, "aa".repeat(32).as_str()).await;
+    let key = insert_wake_key(&db.pool, &old).await;
+
+    // A scope upgrade replaces the session with a new bearer.
+    let upgraded = catbird_session();
+    cleanup_auth::seed(&store, &upgraded).await;
+    registry
+        .replace_account_session(DID, &old.id.to_string(), &upgraded.id.to_string())
+        .await
+        .expect("upgrade transfer");
+
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT auth_session_fingerprint FROM push_gateway_keys WHERE push_key_sha256 = $1",
+    )
+    .bind(&key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.as_deref(),
+        Some(session_fingerprint(&upgraded.id.to_string()).as_str()),
+        "the wake key must move to the upgraded session"
+    );
+    assert!(!wake_key_is_revoked(&db.pool, &key).await);
+
+    session_devices::sign_out_session(Some(&store), &registry, DID, &upgraded.id.to_string())
+        .await
+        .unwrap();
+    assert!(
+        wake_key_is_revoked(&db.pool, &key).await,
+        "signing out the upgraded session must revoke the key it inherited"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires local Postgres and Redis"]
 async fn re_registered_device_belongs_to_the_newer_session() {

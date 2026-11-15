@@ -279,7 +279,10 @@ pub async fn continue_cleanup<S: CleanupStore, E: CleanupEffects>(
                     {
                         UpstreamStatus::Pending
                     }
-                    RevokeOutcome::Failed(_) => UpstreamStatus::Unconfirmed,
+                    RevokeOutcome::Failed(reason) => {
+                        tracing::warn!(reason = %reason, "Logout upstream revocation unconfirmed");
+                        UpstreamStatus::Unconfirmed
+                    }
                 }
             } else {
                 UpstreamStatus::Unconfirmed
@@ -513,7 +516,8 @@ impl CleanupStore for RedisCleanupStore<'_> {
             open_v2_with_metadata(self.store.enc_key(), &snapshot, "session", &session_key)
                 .map_err(|_| CleanupError::Unauthorized)?;
         let grant: ClientSessionData =
-            serde_json::from_str(&json).map_err(|_| CleanupError::Unauthorized)?;
+            crate::services::redis_auth_store::deserialize_client_session_data(&json)
+                .map_err(|_| CleanupError::Unauthorized)?;
         if grant.account_did.as_str() != did
             || grant.session_id.as_str() != request.bearer
             || metadata.did.as_deref().is_some_and(|value| value != did)
@@ -722,6 +726,7 @@ where
 struct NestCleanupEffects<'a> {
     state: &'a crate::config::AppState,
     retention: CredentialRetention,
+    oauth_profile: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -978,7 +983,7 @@ impl CleanupEffects for NestCleanupEffects<'_> {
         if fence.ok().flatten().as_deref() != Some(&receipt_id.to_string()) {
             return RevokeOutcome::Failed("exclusive final-session fence not confirmed".into());
         }
-        let Some(client) = self.state.jacquard_client.as_deref() else {
+        let Some(client) = self.state.oauth_client_for_profile(&self.oauth_profile) else {
             return RevokeOutcome::Failed("OAuth client unavailable".into());
         };
         // Evict the cached object after local retirement. It cannot refresh an
@@ -1045,7 +1050,8 @@ impl RedisCleanupStore<'_> {
                     open_v2_with_metadata(self.store.enc_key(), &value, "session", &key)
                         .map_err(|_| CleanupError::InventoryIncomplete)?;
                 let grant: ClientSessionData =
-                    serde_json::from_str(&json).map_err(|_| CleanupError::InventoryIncomplete)?;
+                    crate::services::redis_auth_store::deserialize_client_session_data(&json)
+                        .map_err(|_| CleanupError::InventoryIncomplete)?;
                 if grant.account_did.as_str() != did
                     || grant.token_set.sub.as_str() != did
                     || self.store.fingerprint(grant.session_id.as_str()) != suffix
@@ -1154,10 +1160,19 @@ pub async fn run_runtime_cleanup(
     let claim = claim_attempt(store, &store.fingerprint(&request.bearer)).await?;
     let backend = RedisCleanupStore { store };
     let result = async {
+        let oauth_profile = match store.lookup_did_for_session(&request.bearer).await {
+            Ok(Some(did)) => store
+                .lookup_session_oauth_profile(&did, &request.bearer)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        }
+        .unwrap_or_else(crate::services::redis_auth_store::default_oauth_profile);
         let attempt = backend
             .begin_or_resume(request, chrono::Utc::now().timestamp())
             .await?;
-        if let Some(client) = state.jacquard_client.as_deref() {
+        if let Some(client) = state.oauth_client_for_profile(&oauth_profile) {
             let did = jacquard_common::types::did::Did::new(attempt.journal.target.did.as_str())
                 .map_err(|_| CleanupError::ReceiptConflict)?;
             client
@@ -1171,6 +1186,7 @@ pub async fn run_runtime_cleanup(
             &NestCleanupEffects {
                 state,
                 retention: runtime_credential_retention(),
+                oauth_profile,
             },
             attempt,
             chrono::Utc::now().timestamp(),
@@ -1263,6 +1279,8 @@ pub async fn retry_cleanup_pass(state: &crate::config::AppState) -> Result<usize
                         &NestCleanupEffects {
                             state,
                             retention: policy,
+                            oauth_profile: crate::services::redis_auth_store::default_oauth_profile(
+                            ),
                         },
                         attempt,
                         chrono::Utc::now().timestamp(),

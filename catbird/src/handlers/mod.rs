@@ -5,3 +5,4 @@ pub mod chat_poll;
 mod mls_proxy_response;
 pub mod oauth_upgrade;
 pub mod push;
+pub mod push_gateway;

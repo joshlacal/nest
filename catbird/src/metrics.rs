@@ -4,7 +4,7 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    self, CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+    self, CounterVec, Gauge, HistogramOpts, HistogramVec, IntCounter, Opts, Registry, TextEncoder,
 };
 
 lazy_static! {
@@ -64,6 +64,27 @@ lazy_static! {
         "catbird_chat_poll_enabled",
         "Whether chat polling subsystem is active and release gate is open (0 = disabled, 1 = enabled)"
     ).unwrap();
+
+    // Authenticated Push Gateway (D2) Metrics
+    pub static ref PUSH_GATEWAY_DELIVERIES_TOTAL: IntCounter = IntCounter::new(
+        "catbird_push_gateway_deliveries_total",
+        "Total authenticated mls-ds push wakes dispatched by Nest Push Gateway"
+    ).unwrap();
+
+    pub static ref PUSH_GATEWAY_SPOOFED_CALLER_TOTAL: IntCounter = IntCounter::new(
+        "catbird_push_gateway_spoofed_caller_total",
+        "Total push wakes dropped silently due to caller_ds_did or app_id mismatch"
+    ).unwrap();
+
+    pub static ref PUSH_GATEWAY_UNKNOWN_KEY_TOTAL: IntCounter = IntCounter::new(
+        "catbird_push_gateway_unknown_key_total",
+        "Total push wakes targeting unknown push_key hashes"
+    ).unwrap();
+
+    pub static ref PUSH_GATEWAY_RATE_LIMITED_TOTAL: IntCounter = IntCounter::new(
+        "catbird_push_gateway_rate_limited_total",
+        "Total push wakes dropped by per-key or per-DS token buckets"
+    ).unwrap();
 }
 
 /// Register all metrics with the registry
@@ -92,6 +113,18 @@ pub fn register_metrics() {
         .unwrap();
     REGISTRY
         .register(Box::new(CHAT_POLL_ENABLED_GAUGE.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PUSH_GATEWAY_DELIVERIES_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PUSH_GATEWAY_SPOOFED_CALLER_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PUSH_GATEWAY_UNKNOWN_KEY_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PUSH_GATEWAY_RATE_LIMITED_TOTAL.clone()))
         .unwrap();
 }
 

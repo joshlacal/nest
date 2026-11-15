@@ -92,9 +92,12 @@ mod tests {
         assert_eq!(proof_claims.ath, calculate_ath(token));
         assert_eq!(proof_claims.iat, now);
 
-        // 3. Verify the complete procedure registry, including push registration.
-        assert_eq!(CHAT_ENDPOINTS.len(), 32);
+        // 3. Verify the complete procedure registry, including push registration
+        //    and the delivery service's encrypted direct-request procedures.
+        assert_eq!(CHAT_ENDPOINTS.len(), 38);
         assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.updatePushToken"));
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.publishDirectRequest"));
+        assert!(CHAT_ENDPOINTS.contains(&"blue.catbird.chat.getEntries"));
     }
 
     /// Test ADR-014 is_allowed_redirect validation and origin matching
@@ -973,6 +976,922 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["feed"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_b1_xrpc_path_traversal_and_wildcard_segments_rejected_before_pds() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Method, Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use catbird::config::{AppConfig, AppState};
+        use catbird::models::CatbirdSession;
+        use catbird::services::DpopNonceCache;
+        use chrono::Utc;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+        use uuid::Uuid;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+        // Zero requests may ever reach the upstream PDS
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(0)
+            .mount(&pds)
+            .await;
+
+        let config = AppConfig::load().unwrap();
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client: http_client.clone(),
+            raw_http_client: http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".into(),
+            handle: "alice.test".into(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        // 1. Direct handler defense-in-depth: decoded traversal, multi-segment, percent-encoded, invalid NSID
+        for bad_lexicon in [
+            "../oauth/revoke",
+            "..%2foauth%2frevoke",
+            "foo/bar",
+            "not_an_nsid",
+            "com.atproto.repo.getRecord?foo=bar",
+            "com.atproto.repo.getRecord#frag",
+        ] {
+            let res = catbird::handlers::atproto::proxy_xrpc(
+                axum::extract::State(state.clone()),
+                axum::Extension(session.clone()),
+                None,
+                Some(axum::Extension(dpop_data.clone())),
+                Method::GET,
+                axum::extract::Path(bad_lexicon.to_string()),
+                axum::extract::RawQuery(None),
+                HeaderMap::new(),
+                Body::empty(),
+            )
+            .await;
+            let err_resp = res.expect_err(&format!("bad lexicon '{bad_lexicon}' must fail"));
+            let http_resp = axum::response::IntoResponse::into_response(err_resp);
+            assert_eq!(
+                http_resp.status(),
+                StatusCode::BAD_REQUEST,
+                "bad lexicon '{bad_lexicon}' must return 400 Bad Request"
+            );
+        }
+
+        // 2. Full router check: /xrpc/foo/bar and /xrpc/..%2foauth%2frevoke must not reach PDS
+        // Wrap create_router's /xrpc route shape via create_router (unauthenticated requests on /xrpc/foo/bar
+        // shouldn't even match a wildcard route, and with injected session extension on the route pattern
+        // /xrpc/..%2foauth%2frevoke returns 400).
+        let unauth_router =
+            catbird::routes::atproto::create_router(state.clone()).with_state(state.clone());
+        let multi_seg_resp = unauth_router
+            .oneshot(
+                Request::builder()
+                    .uri("/xrpc/foo/bar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            multi_seg_resp.status(),
+            StatusCode::NOT_FOUND,
+            "/xrpc/foo/bar must not match single-segment /:lexicon route"
+        );
+
+        let authed_xrpc_router = Router::new()
+            .route(
+                "/xrpc/:lexicon",
+                get(catbird::handlers::atproto::proxy_xrpc)
+                    .post(catbird::handlers::atproto::proxy_xrpc),
+            )
+            .layer(axum::Extension(dpop_data))
+            .layer(axum::Extension(session))
+            .with_state(state);
+
+        let encoded_traversal_resp = authed_xrpc_router
+            .oneshot(
+                Request::builder()
+                    .uri("/xrpc/..%2foauth%2frevoke")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded_traversal_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_b1_xrpc_blocked_sensitive_server_nsids_rejected_before_pds() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Method, StatusCode};
+        use catbird::config::{AppConfig, AppState};
+        use catbird::models::CatbirdSession;
+        use catbird::services::DpopNonceCache;
+        use chrono::Utc;
+        use std::sync::Arc;
+        use uuid::Uuid;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "forged-token"})),
+            )
+            .expect(0)
+            .mount(&pds)
+            .await;
+
+        let config = AppConfig::load().unwrap();
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client: http_client.clone(),
+            raw_http_client: http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".into(),
+            handle: "alice.test".into(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        for (blocked_nsid, method, raw_query) in [
+            (
+                "com.atproto.server.getServiceAuth",
+                Method::GET,
+                Some("aud=did:web:evil.example".to_string()),
+            ),
+            ("com.atproto.server.createSession", Method::POST, None),
+            ("com.atproto.server.refreshSession", Method::POST, None),
+            ("com.atproto.server.deleteSession", Method::POST, None),
+            ("com.atproto.server.createAppPassword", Method::POST, None),
+            ("com.atproto.server.revokeAppPassword", Method::POST, None),
+        ] {
+            let res = catbird::handlers::atproto::proxy_xrpc(
+                axum::extract::State(state.clone()),
+                axum::Extension(session.clone()),
+                None,
+                Some(axum::Extension(dpop_data.clone())),
+                method,
+                axum::extract::Path(blocked_nsid.to_string()),
+                axum::extract::RawQuery(raw_query),
+                HeaderMap::new(),
+                Body::empty(),
+            )
+            .await;
+            let err_resp = res.expect_err(&format!("blocked NSID '{blocked_nsid}' must fail"));
+            let http_resp = axum::response::IntoResponse::into_response(err_resp);
+            assert_eq!(
+                http_resp.status(),
+                StatusCode::BAD_REQUEST,
+                "blocked NSID '{blocked_nsid}' must return 400 Bad Request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_b1_invalid_or_untrusted_atproto_proxy_rejected_before_pds() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+        use catbird::config::{AppConfig, AppState};
+        use catbird::models::CatbirdSession;
+        use catbird::services::DpopNonceCache;
+        use chrono::Utc;
+        use std::sync::Arc;
+        use uuid::Uuid;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(0)
+            .mount(&pds)
+            .await;
+
+        let config = AppConfig::load().unwrap();
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client: http_client.clone(),
+            raw_http_client: http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".into(),
+            handle: "alice.test".into(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        for bad_proxy in [
+            "did:web:evil.example#svc",
+            "did:plc:bad#bsky_appview",
+            "did:web:api.bsky.app",
+            "did:web:localhost#bsky_appview",
+            "did:web:evil.example/path#bsky_appview",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("atproto-proxy", HeaderValue::from_str(bad_proxy).unwrap());
+            let res = catbird::handlers::atproto::proxy_xrpc(
+                axum::extract::State(state.clone()),
+                axum::Extension(session.clone()),
+                None,
+                Some(axum::Extension(dpop_data.clone())),
+                Method::GET,
+                axum::extract::Path("app.bsky.feed.getTimeline".to_string()),
+                axum::extract::RawQuery(None),
+                headers,
+                Body::empty(),
+            )
+            .await;
+            let err_resp = res.expect_err(&format!("bad atproto-proxy '{bad_proxy}' must fail"));
+            let http_resp = axum::response::IntoResponse::into_response(err_resp);
+            assert_eq!(
+                http_resp.status(),
+                StatusCode::BAD_REQUEST,
+                "bad atproto-proxy '{bad_proxy}' must return 400 Bad Request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_b3_gzipped_json_expanding_over_1mib_preserves_exact_framing_and_enforces_semaphore(
+    ) {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+        use catbird::config::{AppConfig, AppState};
+        use catbird::models::CatbirdSession;
+        use catbird::services::DpopNonceCache;
+        use chrono::Utc;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use std::sync::Arc;
+        use uuid::Uuid;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+
+        let plain_json = serde_json::to_vec(&serde_json::json!({
+            "feed": [],
+            "padding": "a".repeat(1_300_000)
+        }))
+        .unwrap();
+        assert!(plain_json.len() > 1_048_576);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&plain_json).unwrap();
+        let gzipped_bytes = encoder.finish().unwrap();
+        assert!(
+            gzipped_bytes.len() < 16 * 1024,
+            "compressed payload should be tiny (<16 KiB)"
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getTimeline"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(gzipped_bytes.clone()),
+            )
+            .mount(&pds)
+            .await;
+
+        let config = AppConfig::load().unwrap();
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
+        let raw_http_client = catbird::services::build_hardened_raw_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config.clone()),
+            http_client: http_client.clone(),
+            raw_http_client: raw_http_client.clone(),
+            redis: redis.clone(),
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".into(),
+            handle: "alice.test".into(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        // 1. Client sends Accept-Encoding: gzip, deflate, br -> framing must STILL be exact
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, deflate, br"),
+        );
+
+        let resp = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(state.clone()),
+            axum::Extension(session.clone()),
+            None,
+            Some(axum::Extension(dpop_data.clone())),
+            Method::GET,
+            axum::extract::Path("app.bsky.feed.getTimeline".to_string()),
+            axum::extract::RawQuery(None),
+            req_headers.clone(),
+            Body::empty(),
+        )
+        .await
+        .expect("gzipped JSON response within 10 MiB limit must succeed");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !resp.headers().contains_key("content-encoding"),
+            "decompressed proxy response must never carry stale content-encoding"
+        );
+        let advertised_len: usize = resp
+            .headers()
+            .get("content-length")
+            .expect("buffered response must advertise exact content-length")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 20 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            advertised_len,
+            body_bytes.len(),
+            "Content-Length header must exactly match buffered body length"
+        );
+        assert_eq!(
+            body_bytes.as_ref(),
+            plain_json.as_slice(),
+            "decompressed body must match original JSON"
+        );
+
+        // 2. With 0 permits in active_stream_semaphore, expanding >1 MiB gzipped response must fail closed
+        let zero_sem_state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client,
+            raw_http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(0)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let exhausted_err = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(zero_sem_state),
+            axum::Extension(session),
+            None,
+            Some(axum::Extension(dpop_data)),
+            Method::GET,
+            axum::extract::Path("app.bsky.feed.getTimeline".to_string()),
+            axum::extract::RawQuery(None),
+            req_headers,
+            Body::empty(),
+        )
+        .await
+        .expect_err("gzipped >1 MiB response must fail closed when semaphore is exhausted");
+
+        let exhausted_resp = axum::response::IntoResponse::into_response(exhausted_err);
+        assert_eq!(exhausted_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_b3_gzipped_decompression_bomb_enforces_max_response_bytes_and_stream_framing() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+        use catbird::config::{AppConfig, AppState};
+        use catbird::error::AppError;
+        use catbird::models::CatbirdSession;
+        use catbird::services::DpopNonceCache;
+        use chrono::Utc;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use std::sync::Arc;
+        use uuid::Uuid;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+
+        // 51 MiB JSON compressed to <256 KiB (exceeds 50 MiB MAX_RESPONSE_SIZE after decompression)
+        let mut bomb_json = Vec::with_capacity(51 * 1024 * 1024 + 32);
+        bomb_json.extend_from_slice(br#"{"bomb":""#);
+        bomb_json.resize(bomb_json.len() + 51 * 1024 * 1024, b'z');
+        bomb_json.extend_from_slice(br#""}"#);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&bomb_json).unwrap();
+        let compressed_bomb = encoder.finish().unwrap();
+        assert!(compressed_bomb.len() < 256 * 1024);
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(compressed_bomb),
+            )
+            .mount(&pds)
+            .await;
+
+        // Non-JSON blob compressed with gzip -> streamed response must omit content-length & content-encoding
+        let raw_blob = vec![0x42u8; 300_000];
+        let mut blob_enc = GzEncoder::new(Vec::new(), Compression::fast());
+        blob_enc.write_all(&raw_blob).unwrap();
+        let compressed_blob = blob_enc.finish().unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.sync.getBlob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(compressed_blob),
+            )
+            .mount(&pds)
+            .await;
+
+        let config = AppConfig::load().unwrap();
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
+        let raw_http_client = catbird::services::build_hardened_raw_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client,
+            raw_http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rate_limit: Arc::new(catbird::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".into(),
+            handle: "alice.test".into(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("accept-encoding", HeaderValue::from_static("gzip"));
+
+        let bomb_err = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(state.clone()),
+            axum::Extension(session.clone()),
+            None,
+            Some(axum::Extension(dpop_data.clone())),
+            Method::GET,
+            axum::extract::Path("app.bsky.feed.getAuthorFeed".to_string()),
+            axum::extract::RawQuery(None),
+            req_headers.clone(),
+            Body::empty(),
+        )
+        .await
+        .expect_err("11 MiB gzipped decompression bomb must be rejected");
+        assert!(
+            matches!(bomb_err, AppError::ResponseTooLarge(_)),
+            "Expected ResponseTooLarge on decompression bomb, got: {bomb_err:?}"
+        );
+
+        let stream_resp = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(state),
+            axum::Extension(session),
+            None,
+            Some(axum::Extension(dpop_data)),
+            Method::GET,
+            axum::extract::Path("com.atproto.sync.getBlob".to_string()),
+            axum::extract::RawQuery(None),
+            req_headers,
+            Body::empty(),
+        )
+        .await
+        .expect("300 KiB gzipped blob stream must succeed");
+        assert_eq!(stream_resp.status(), StatusCode::OK);
+        assert!(
+            !stream_resp.headers().contains_key("content-encoding"),
+            "streamed response must omit content-encoding"
+        );
+        assert!(
+            !stream_resp.headers().contains_key("content-length"),
+            "streamed response must omit content-length so framing is never corrupted"
+        );
+        let streamed_bytes = axum::body::to_bytes(stream_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(streamed_bytes.as_ref(), raw_blob.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_b3_circle_and_mls_proxies_enforce_semaphore_and_byte_rate_limit_over_1mib() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Method, StatusCode};
+        use catbird::config::{AppConfig, AppState};
+        use catbird::middleware::{ByteRateLimitConfig, RateLimitConfig, RateLimitState};
+        use catbird::models::CatbirdSession;
+        use catbird::services::{DpopNonceCache, MlsAuthService, CIRCLE_ENDPOINTS};
+        use chrono::Utc;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use uuid::Uuid;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+        let mls_srv = MockServer::start().await;
+        let circle_srv = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.server.getServiceAuth"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "token": "mock-svc-jwt" })),
+            )
+            .mount(&pds)
+            .await;
+
+        let large_body = serde_json::to_vec(&serde_json::json!({
+            "data": "x".repeat(1_200_000)
+        }))
+        .unwrap();
+        assert!(large_body.len() > 1_048_576);
+
+        let circle_lexicon = CIRCLE_ENDPOINTS[0];
+        Mock::given(method("GET"))
+            .and(path(format!("/xrpc/{circle_lexicon}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(large_body.clone()),
+            )
+            .mount(&circle_srv)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/blue.catbird.chat.getConversations"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(large_body.clone()),
+            )
+            .mount(&mls_srv)
+            .await;
+
+        let mut config = AppConfig::load().unwrap();
+        config.circle.base_url = circle_srv.uri();
+        config.mls.service_url = Some(mls_srv.uri());
+
+        let http_client = catbird::services::build_hardened_http_client().unwrap();
+        let raw_http_client = catbird::services::build_hardened_raw_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".into(),
+            handle: "alice.test".into(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".into(),
+            refresh_token: "mock-refresh".into(),
+            scopes: vec!["atproto".into()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".into()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = catbird::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        // 1. With 0 permits in active_stream_semaphore, >1 MiB responses on BOTH Circle & MLS must fail closed
+        let zero_sem_state = Arc::new(AppState {
+            config: Arc::new(config.clone()),
+            http_client: http_client.clone(),
+            raw_http_client: raw_http_client.clone(),
+            redis: redis.clone(),
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(0)),
+            rate_limit: Arc::new(RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let circle_err = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(zero_sem_state.clone()),
+            axum::Extension(session.clone()),
+            None,
+            Some(axum::Extension(dpop_data.clone())),
+            Method::GET,
+            axum::extract::Path(circle_lexicon.to_string()),
+            axum::extract::RawQuery(None),
+            HeaderMap::new(),
+            Body::empty(),
+        )
+        .await
+        .expect_err("Circle >1 MiB response must acquire active_stream_semaphore");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(circle_err).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let mls_service_zero = MlsAuthService::new(zero_sem_state);
+        let mls_err = mls_service_zero
+            .proxy_clean_chat_request(
+                &session,
+                reqwest::Method::GET,
+                "blue.catbird.chat.getConversations",
+                None,
+                None,
+                None,
+                None,
+                Some(&dpop_data),
+            )
+            .await
+            .expect_err("MLS >1 MiB response must acquire active_stream_semaphore");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(mls_err).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // 2. With 1 permit and a 2.0 MiB session byte budget, first 1.2 MiB call succeeds and second 1.2 MiB call hits byte rate limit
+        let tight_rl = Arc::new(RateLimitState {
+            session_limiter: Arc::new(catbird::middleware::RateLimiter::new()),
+            ip_limiter: Arc::new(catbird::middleware::RateLimiter::new()),
+            session_byte_limiter: Arc::new(catbird::middleware::ByteRateLimiter::new()),
+            global_byte_limiter: Arc::new(catbird::middleware::ByteRateLimiter::new()),
+            session_config: RateLimitConfig::default(),
+            ip_config: RateLimitConfig::default(),
+            session_byte_config: ByteRateLimitConfig {
+                max_bytes: 2_000_000,
+                window: Duration::from_secs(60),
+            },
+            global_byte_config: ByteRateLimitConfig::default(),
+            trusted_proxies: vec![],
+        });
+
+        let metered_state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client,
+            raw_http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            rate_limit: tight_rl,
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let first_ok = catbird::handlers::atproto::proxy_xrpc(
+            axum::extract::State(metered_state.clone()),
+            axum::Extension(session.clone()),
+            None,
+            Some(axum::Extension(dpop_data.clone())),
+            Method::GET,
+            axum::extract::Path(circle_lexicon.to_string()),
+            axum::extract::RawQuery(None),
+            HeaderMap::new(),
+            Body::empty(),
+        )
+        .await
+        .expect("first 1.2 MiB Circle response within 2.0 MiB budget must succeed");
+        assert_eq!(first_ok.status(), StatusCode::OK);
+
+        let mls_service_metered = MlsAuthService::new(metered_state);
+        let second_over_budget = mls_service_metered
+            .proxy_clean_chat_request(
+                &session,
+                reqwest::Method::GET,
+                "blue.catbird.chat.getConversations",
+                None,
+                None,
+                None,
+                None,
+                Some(&dpop_data),
+            )
+            .await
+            .expect_err("second 1.2 MiB response (2.4 MiB cumulative) must exceed 2.0 MiB session byte budget");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(second_over_budget).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[tokio::test]

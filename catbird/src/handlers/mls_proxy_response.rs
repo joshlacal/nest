@@ -16,14 +16,11 @@ pub(super) fn build_response(
         Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
     for (name, value) in response_headers.iter() {
         let name_str = name.as_str();
-        if matches!(
+        if name_str == "content-length" {
+            response = response.header(name_str, response_body.len().to_string());
+        } else if matches!(
             name_str,
-            "content-type"
-                | "content-length"
-                | "cache-control"
-                | "etag"
-                | "last-modified"
-                | "retry-after"
+            "content-type" | "cache-control" | "etag" | "last-modified" | "retry-after"
         ) {
             if let Ok(v) = reqwest::header::HeaderValue::to_str(value) {
                 response = response.header(name_str, v);

@@ -206,14 +206,12 @@ pub async fn login(
 
     let jacquard_client = if is_catmos {
         state
-            .catmos_jacquard_client
-            .as_ref()
-            .or(state.jacquard_client.as_ref())
+            .oauth_client_for_profile("catmos")
+            .or_else(|| state.oauth_client_for_profile("catbird"))
             .ok_or_else(|| AppError::Internal("No OAuthClient available for catmos-web".into()))?
     } else {
         state
-            .jacquard_client
-            .as_ref()
+            .oauth_client_for_profile("catbird")
             .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
     };
 
@@ -565,16 +563,14 @@ pub async fn oauth_callback(
 
     let jacquard_client = if is_catmos {
         state
-            .catmos_jacquard_client
-            .as_ref()
-            .or(state.jacquard_client.as_ref())
+            .oauth_client_for_profile("catmos")
+            .or_else(|| state.oauth_client_for_profile("catbird"))
             .ok_or_else(|| {
                 AppError::Internal("No OAuthClient available for catmos-web callback".into())
             })?
     } else {
         state
-            .jacquard_client
-            .as_ref()
+            .oauth_client_for_profile("catbird")
             .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
     };
 
@@ -819,9 +815,11 @@ async fn handle_upgrade_callback(
         ));
     };
 
+    let flow_profile = upgrade_service
+        .peek_flow_oauth_profile(&callback.state)
+        .await;
     let jacquard_client = state
-        .jacquard_client
-        .as_ref()
+        .oauth_client_for_profile(&flow_profile)
         .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
 
     use jacquard_oauth::types::CallbackParams;
@@ -1386,18 +1384,39 @@ async fn proxy_circle_request(
 
     let response = request.send().await?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
-    if headers
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_CIRCLE_RESPONSE_SIZE)
-    {
+    let mut headers = response.headers().clone();
+    let had_content_encoding = headers.remove(reqwest::header::CONTENT_ENCODING).is_some();
+    let content_length = if had_content_encoding {
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        None
+    } else {
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    if content_length.is_some_and(|length| length > MAX_CIRCLE_RESPONSE_SIZE) {
         return Err(AppError::ResponseTooLarge(
             "Circle AppView response exceeds 10 MiB".into(),
         ));
     }
 
+    let mut held_permit = if content_length.is_none()
+        || had_content_encoding
+        || content_length.is_some_and(|length| length > crate::services::STREAM_THRESHOLD)
+    {
+        Some(
+            state
+                .active_stream_semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+        )
+    } else {
+        None
+    };
+
+    let session_id_str = session.id.to_string();
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -1407,10 +1426,271 @@ async fn proxy_circle_request(
                 "Circle AppView response exceeds 10 MiB".into(),
             ));
         }
+        if held_permit.is_none() && bytes.len() + chunk.len() > crate::services::STREAM_THRESHOLD {
+            held_permit = Some(
+                state
+                    .active_stream_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+            );
+        }
+        state
+            .rate_limit
+            .check_and_record_bytes(&session_id_str, chunk.len() as u64)
+            .await
+            .map_err(|retry_after| AppError::RateLimitExceeded { retry_after })?;
         bytes.extend_from_slice(&chunk);
     }
 
+    headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        reqwest::header::HeaderValue::from(bytes.len()),
+    );
+
     Ok((status, headers, bytes::Bytes::from(bytes)))
+}
+
+/// Sensitive PDS session and credential-management XRPC methods that must never
+/// be proxied directly through the confidential OAuth gateway (B-1, 2026-10-31 review).
+const BLOCKED_PROXY_XRPC_NSIDS: &[&str] = &[
+    "com.atproto.server.createSession",
+    "com.atproto.server.refreshSession",
+    "com.atproto.server.deleteSession",
+    "com.atproto.server.createAppPassword",
+    "com.atproto.server.revokeAppPassword",
+];
+
+const SERVICE_AUTH_NSID: &str = "com.atproto.server.getServiceAuth";
+const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
+const VIDEO_SERVICE_AUTH_LXMS: &[&str] = &[
+    "app.bsky.video.getUploadLimits",
+    "app.bsky.video.uploadVideo",
+    "app.bsky.video.getJobStatus",
+];
+const PDS_UPLOAD_BLOB_LXM: &str = "com.atproto.repo.uploadBlob";
+
+fn session_pds_did_web(pds_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(pds_url).ok()?;
+    if parsed.port().is_some() {
+        return None;
+    }
+    Some(format!(
+        "did:web:{}",
+        parsed.host_str()?.to_ascii_lowercase()
+    ))
+}
+
+/// Allows `getServiceAuth` only as `GET` with exactly one `aud` and one `lxm`
+/// (plus optional `exp`) from the video-upload set: video methods for
+/// `did:web:video.bsky.app`, `com.atproto.repo.uploadBlob` for the session's
+/// own PDS.
+fn is_allowed_mls_service_auth_lxm(lxm: Option<&str>) -> bool {
+    match lxm {
+        None => true,
+        Some(nsid) => {
+            !nsid.is_empty()
+                && !nsid.contains('*')
+                && !nsid.contains(char::is_whitespace)
+                && jacquard_common::types::nsid::Nsid::new(nsid).is_ok()
+                && (nsid.starts_with("blue.catbird.chat.")
+                    || nsid.starts_with("blue.catbird.mlsChat.")
+                    || nsid.starts_with("blue.catbird.labyrinth.")
+                    || nsid.starts_with("com.atproto.space."))
+        }
+    }
+}
+
+async fn resolve_user_declared_mls_did(state: &AppState, user_did: &str) -> Option<String> {
+    if let Some(push) = state.push.as_ref() {
+        return push
+            .gateway
+            .resolver()
+            .resolve_user_mls_service_did(user_did)
+            .await
+            .ok();
+    }
+    let plc_url =
+        std::env::var("PLC_DIRECTORY_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
+    let fallback = crate::services::push::gateway::HttpMlsDsIdentityResolver::new(
+        state.raw_http_client.clone(),
+        plc_url,
+    );
+    use crate::services::push::gateway::MlsDsIdentityResolver as _;
+    fallback.resolve_user_mls_service_did(user_did).await.ok()
+}
+
+/// Allows `getServiceAuth` as `GET` for:
+/// 1. Video upload (`VIDEO_SERVICE_AUTH_LXMS` -> `did:web:video.bsky.app`, `com.atproto.repo.uploadBlob` -> session PDS)
+/// 2. MLS / Labyrinth / Space calls targeting either the configured Catbird `mls-ds` DID
+///    or the user's DID-document `#atproto_mls` service DID (`Spec §6.7, §8.2`).
+async fn validate_client_service_auth_request(
+    state: &AppState,
+    session: &CatbirdSession,
+    method: &Method,
+    raw_query: Option<&str>,
+) -> AppResult<()> {
+    let refuse = || {
+        AppError::BadRequest(format!(
+            "XRPC method '{SERVICE_AUTH_NSID}' rejected for unauthorized audience or lexicon"
+        ))
+    };
+    if method != Method::GET {
+        return Err(refuse());
+    }
+    let (mut aud, mut lxm, mut exp) = (None, None, None);
+    for (key, value) in url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        let slot = match key.as_ref() {
+            "aud" => &mut aud,
+            "lxm" => &mut lxm,
+            "exp" => &mut exp,
+            _ => return Err(refuse()),
+        };
+        if slot.replace(value.into_owned()).is_some() {
+            return Err(refuse());
+        }
+    }
+    if exp.as_deref().is_some_and(|v| v.parse::<i64>().is_err()) {
+        return Err(refuse());
+    }
+    let Some(aud) = aud else {
+        return Err(refuse());
+    };
+    if aud.is_empty() || aud != aud.trim() || aud.contains('*') || aud.contains(char::is_whitespace)
+    {
+        return Err(refuse());
+    }
+
+    if let Some(ref lxm_val) = lxm {
+        if VIDEO_SERVICE_AUTH_LXMS.contains(&lxm_val.as_str()) {
+            return if aud == VIDEO_SERVICE_DID {
+                Ok(())
+            } else {
+                Err(refuse())
+            };
+        }
+        if lxm_val == PDS_UPLOAD_BLOB_LXM {
+            return if session_pds_did_web(&session.pds_url).is_some_and(|pds_did| pds_did == aud) {
+                Ok(())
+            } else {
+                Err(refuse())
+            };
+        }
+    }
+
+    // MLS / Labyrinth / Space audience check (bare DID or `<did>#atproto_mls`).
+    let aud_bare = match aud.split_once('#') {
+        Some((did_part, "atproto_mls")) => did_part,
+        Some(_) => return Err(refuse()),
+        None => aud.as_str(),
+    };
+    if !is_allowed_mls_service_auth_lxm(lxm.as_deref()) {
+        return Err(refuse());
+    }
+
+    let cfg_mls_bare = state
+        .config
+        .mls
+        .service_did
+        .split_once('#')
+        .map_or(state.config.mls.service_did.as_str(), |(d, _)| d);
+    if (!cfg_mls_bare.is_empty() && aud_bare == cfg_mls_bare)
+        || aud_bare == "did:web:chat.catbird.blue"
+    {
+        return Ok(());
+    }
+
+    if let Some(user_mls_did) = resolve_user_declared_mls_did(state, &session.did).await {
+        if aud_bare == user_mls_did {
+            return Ok(());
+        }
+    }
+
+    Err(refuse())
+}
+
+fn validate_proxy_lexicon(lexicon: &str) -> AppResult<()> {
+    if lexicon.is_empty()
+        || lexicon.len() > 317
+        || lexicon.contains('/')
+        || lexicon.contains('\\')
+        || lexicon.contains("..")
+        || lexicon.contains('%')
+        || lexicon.contains('?')
+        || lexicon.contains('#')
+        || lexicon.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(AppError::BadRequest("Invalid XRPC lexicon NSID".into()));
+    }
+    if jacquard_common::types::nsid::Nsid::new(lexicon).is_err() {
+        return Err(AppError::BadRequest("Invalid XRPC lexicon NSID".into()));
+    }
+    if is_non_canonical_policy_nsid(lexicon) {
+        return Err(AppError::BadRequest("Invalid XRPC lexicon NSID".into()));
+    }
+    if BLOCKED_PROXY_XRPC_NSIDS.contains(&lexicon) {
+        return Err(AppError::BadRequest(format!(
+            "XRPC method '{}' is not permitted via gateway proxy",
+            lexicon
+        )));
+    }
+    Ok(())
+}
+
+/// Moderation mutations the gateway acts on after proxying them
+/// (see `apply_moderation_mutation`).
+const MODERATION_MUTATION_NSIDS: &[&str] = &[
+    "app.bsky.graph.muteThread",
+    "app.bsky.graph.unmuteThread",
+    "app.bsky.graph.muteActor",
+    "app.bsky.graph.unmuteActor",
+    "app.bsky.graph.muteActorList",
+    "app.bsky.graph.unmuteActorList",
+];
+
+/// True when `lexicon` is a letter-case variant of a method name the gateway
+/// applies policy to.
+///
+/// Every policy decision in this file compares the method name byte for byte,
+/// but upstream servers do not: the reference PDS mounts XRPC methods on a
+/// case-insensitive router, so `com.atproto.server.getserviceauth` reaches the
+/// same handler as `com.atproto.server.getServiceAuth`. A variant spelling
+/// would therefore skip the gateway's check and still be served upstream.
+///
+/// Two rules close that:
+/// - the authority (every segment but the last) must already be lowercase,
+///   which is its normalized form, so no prefix-based route can be dodged;
+/// - a name that matches a gated, refused or specially routed method in
+///   everything but case is refused.
+fn is_non_canonical_policy_nsid(lexicon: &str) -> bool {
+    let authority = lexicon
+        .rsplit_once('.')
+        .map_or("", |(authority, _)| authority);
+    if authority.bytes().any(|b| b.is_ascii_uppercase()) {
+        return true;
+    }
+    BLOCKED_PROXY_XRPC_NSIDS
+        .iter()
+        .chain(std::iter::once(&SERVICE_AUTH_NSID))
+        .chain(CIRCLE_ENDPOINTS)
+        .chain(crate::services::CHAT_ENDPOINTS)
+        .chain(MODERATION_MUTATION_NSIDS)
+        .any(|policy| lexicon != *policy && lexicon.eq_ignore_ascii_case(policy))
+}
+
+fn forwards_proxy_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-type"
+            | "cache-control"
+            | "etag"
+            | "last-modified"
+            | "atproto-space-commit"
+            | "atproto-space-record"
+            | "signature-input"
+            | "signature"
+            | "vary"
+    )
 }
 
 /// Proxy XRPC requests to the user's PDS (or directly to MLS service for MLS lexicons)
@@ -1426,6 +1706,29 @@ pub async fn proxy_xrpc(
     body: Body,
 ) -> AppResult<Response> {
     let start = std::time::Instant::now();
+
+    let policy_check = match validate_proxy_lexicon(&lexicon) {
+        Ok(()) if lexicon == SERVICE_AUTH_NSID => {
+            validate_client_service_auth_request(&state, &session, &method, raw_query.as_deref())
+                .await
+        }
+        other => other,
+    };
+    if let Err(err) = policy_check {
+        tracing::warn!(
+            lexicon_len = lexicon.len(),
+            service_auth = lexicon == SERVICE_AUTH_NSID,
+            "[BFF-REJECT] XRPC lexicon refused by gateway policy"
+        );
+        return Err(err);
+    }
+    {
+        let mut extra_service_ids = Vec::new();
+        if let Some((_, frag)) = state.config.circle.service_did.split_once('#') {
+            extra_service_ids.push(frag);
+        }
+        crate::services::validate_atproto_proxy_headers(&headers, &extra_service_ids)?;
+    }
 
     // Extract request ID: prefer middleware-set value, fall back to client header
     let request_id = req_extensions
@@ -1444,9 +1747,24 @@ pub async fn proxy_xrpc(
 
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
 
-    let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to read body: {}", e)))?;
+    // Bounded before minting any service auth: an oversized body is refused
+    // here and never reaches the delivery service or the PDS.
+    let limit = crate::services::proxy_body_limit(&lexicon);
+    let mut body_stream = body.into_data_stream();
+    let mut buffered = Vec::new();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk =
+            chunk.map_err(|e| AppError::BadRequest(format!("Failed to read body: {}", e)))?;
+        if chunk.len() > limit - buffered.len() {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                error: "RequestTooLarge".to_string(),
+                message: format!("Request body exceeds {limit} bytes"),
+            });
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    let body_bytes = bytes::Bytes::from(buffered);
 
     // Log request receipt with body shape
     let body_shape = json_shape(&body_bytes);
@@ -1529,15 +1847,6 @@ pub async fn proxy_xrpc(
             .or_else(|| headers.get("x-device-id"))
             .and_then(|v| v.to_str().ok());
 
-        let session_dpop_key = dpop_data.as_ref().and_then(|ext| {
-            match jose_jwk::crypto::Key::try_from(&ext.0.dpop_key).ok()? {
-                jose_jwk::crypto::Key::P256(jose_jwk::crypto::Kind::Secret(sk)) => {
-                    Some(p256::ecdsa::SigningKey::from(sk))
-                }
-                _ => None,
-            }
-        });
-
         let (status, response_headers, response_body) =
             if MlsAuthService::is_clean_chat_lexicon(&lexicon) {
                 mls_service
@@ -1549,7 +1858,7 @@ pub async fn proxy_xrpc(
                         body_option,
                         content_type,
                         device_id_header,
-                        session_dpop_key.as_ref(),
+                        dpop_data.as_ref().map(|ext| &ext.0),
                     )
                     .await?
             } else {
@@ -1655,18 +1964,11 @@ pub async fn proxy_xrpc(
             }
 
             let mut response = Response::builder()
-                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                .header(axum::http::header::CONTENT_LENGTH, response_body.len());
             for (name, value) in resp_headers.iter() {
                 let name_str = name.as_str();
-                if matches!(
-                    name_str,
-                    "content-type"
-                        | "content-length"
-                        | "cache-control"
-                        | "etag"
-                        | "last-modified"
-                        | "atproto-space-mac"
-                ) {
+                if forwards_proxy_response_header(name_str) {
                     response = response.header(name, value);
                 }
             }
@@ -1693,15 +1995,7 @@ pub async fn proxy_xrpc(
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (name, value) in resp_headers.iter() {
                 let name_str = name.as_str();
-                if matches!(
-                    name_str,
-                    "content-type"
-                        | "content-length"
-                        | "cache-control"
-                        | "etag"
-                        | "last-modified"
-                        | "atproto-space-mac"
-                ) {
+                if forwards_proxy_response_header(name_str) {
                     response = response.header(name, value);
                 }
             }
@@ -2621,6 +2915,130 @@ mod tests {
                 .unwrap();
         assert!(v2_sealed.starts_with(crate::services::redis_crypto::V2_PREFIX));
     }
+
+    #[tokio::test]
+    async fn test_b4_logout_revoke_retry_never_stores_plaintext_session_id() {
+        use axum::http::HeaderValue;
+        use jacquard_common::IntoStatic;
+        use jacquard_oauth::authstore::ClientAuthStore;
+        use uuid::Uuid;
+
+        let mut config = crate::config::AppConfig::test_default();
+        config.server.base_url = "https://catbird.test".to_string();
+        config.oauth.scopes = vec!["atproto".to_string()];
+
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("local Redis must be reachable");
+
+        let prefix = format!("catbird:v2:test_b4_{}:", Uuid::new_v4().simple());
+        let key = [0x55u8; 32];
+        let auth_store = Arc::new(
+            crate::services::redis_auth_store::RedisAuthStore::from_key(
+                redis.clone(),
+                prefix.clone(),
+                3600,
+                key,
+            )
+            .unwrap(),
+        );
+        let signing_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let key_store = crate::services::KeyStore::from_key("catbird-b4-key", signing_key);
+        let scopes = vec![
+            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse("atproto")
+                .unwrap()
+                .into_static(),
+        ];
+
+        let state_proto = crate::config::AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            raw_http_client: crate::services::build_hardened_raw_http_client().unwrap(),
+            redis: redis.clone(),
+            push_db: None,
+            key_store: Some(Arc::new(key_store.clone())),
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: Some(auth_store.clone()),
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: Some(key),
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        };
+        let jacquard_client = crate::config::AppState::build_jacquard_client(
+            &state_proto,
+            &key_store,
+            &auth_store,
+            "https://catbird.test/client-metadata.json",
+            "https://catbird.test/auth/callback",
+            &scopes,
+        )
+        .unwrap();
+        let state = Arc::new(crate::config::AppState {
+            jacquard_client: Some(Arc::new(jacquard_client)),
+            ..state_proto
+        });
+
+        let did = "did:plc:z72i7hdynmk6r22z27h6tvur";
+        let session_id = Uuid::new_v4();
+        let session_id_str = session_id.to_string();
+        auth_store
+            .upsert_session(crate::services::revocation::tests::session(
+                did,
+                &session_id_str,
+            ))
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {session_id_str}")).unwrap(),
+        );
+        let (_, _, Json(resp)) = logout(State(state), headers, CookieJar::new())
+            .await
+            .expect("logout must retire local session even when remote revocation fails");
+        assert_eq!(resp["cleanup"]["session_retired"], true);
+
+        let mut conn = redis.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{prefix}*"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(!keys.is_empty(), "cleanup state must exist in Redis");
+        for k in &keys {
+            assert!(
+                !k.contains(&session_id_str),
+                "Redis key {k} must NEVER contain plaintext session_id"
+            );
+            let val: Option<String> = redis::cmd("GET")
+                .arg(k)
+                .query_async(&mut conn)
+                .await
+                .ok()
+                .flatten();
+            if let Some(v) = val {
+                assert!(
+                    !v.contains(&session_id_str),
+                    "Redis value at {k} must NEVER contain plaintext session_id"
+                );
+            }
+            let _: () = redis::cmd("DEL")
+                .arg(k)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2647,5 +3065,104 @@ mod query_logging_tests {
         let long = format!("{}=v", "n".repeat(500));
         assert_eq!(query_param_names(&long)[0].len(), 64);
         assert!(query_param_names("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod space_response_header_tests {
+    use super::forwards_proxy_response_header;
+
+    #[test]
+    fn forwards_http_signature_mac_headers_only() {
+        for name in [
+            "atproto-space-commit",
+            "atproto-space-record",
+            "signature-input",
+            "signature",
+            "vary",
+        ] {
+            assert!(forwards_proxy_response_header(name), "{name}");
+        }
+        assert!(!forwards_proxy_response_header("x-untrusted-space-header"));
+    }
+}
+
+#[cfg(test)]
+mod proxy_lexicon_case_tests {
+    use super::*;
+
+    fn refused(lexicon: &str) -> bool {
+        validate_proxy_lexicon(lexicon).is_err()
+    }
+
+    #[test]
+    fn case_variants_of_the_service_auth_method_are_refused() {
+        for variant in [
+            "com.atproto.server.getserviceauth",
+            "com.atproto.server.GetServiceAuth",
+            "com.atproto.server.GETSERVICEAUTH",
+            "com.atproto.server.getServiceauth",
+            "COM.atproto.server.getServiceAuth",
+            "com.ATPROTO.server.getServiceAuth",
+            "com.atproto.Server.getServiceAuth",
+        ] {
+            assert!(refused(variant), "{variant} must be refused");
+        }
+        // The canonical spelling still reaches the dedicated service-auth gate.
+        assert!(validate_proxy_lexicon(SERVICE_AUTH_NSID).is_ok());
+    }
+
+    #[test]
+    fn case_variants_of_blocked_methods_are_refused() {
+        for blocked in BLOCKED_PROXY_XRPC_NSIDS {
+            assert!(refused(blocked), "{blocked} must be refused");
+            assert!(
+                refused(&blocked.to_ascii_lowercase()),
+                "lowercase {blocked} must be refused"
+            );
+            let (authority, name) = blocked.rsplit_once('.').unwrap();
+            let upper_name = format!("{authority}.{}", name.to_ascii_uppercase());
+            assert!(refused(&upper_name), "{upper_name} must be refused");
+        }
+    }
+
+    #[test]
+    fn case_variants_of_routed_and_hooked_methods_are_refused() {
+        let routed = CIRCLE_ENDPOINTS
+            .iter()
+            .chain(crate::services::CHAT_ENDPOINTS)
+            .chain(MODERATION_MUTATION_NSIDS);
+        for canonical in routed {
+            assert!(
+                validate_proxy_lexicon(canonical).is_ok(),
+                "{canonical} must stay allowed"
+            );
+            let lower = canonical.to_ascii_lowercase();
+            if lower != *canonical {
+                assert!(refused(&lower), "{lower} must be refused");
+            }
+        }
+    }
+
+    #[test]
+    fn uppercase_authority_is_refused_for_any_method() {
+        assert!(refused("Blue.catbird.chat.getConvo"));
+        assert!(refused("blue.Catbird.chat.somethingNew"));
+        assert!(refused("App.bsky.feed.getTimeline"));
+    }
+
+    #[test]
+    fn ordinary_methods_keep_their_camel_case_names() {
+        for ok in [
+            "app.bsky.feed.getTimeline",
+            "app.bsky.actor.getProfile",
+            "com.atproto.repo.createRecord",
+            "com.atproto.repo.uploadBlob",
+            "com.atproto.sync.getBlob",
+            "chat.bsky.convo.getLog",
+            "blue.catbird.chat.defs",
+        ] {
+            assert!(validate_proxy_lexicon(ok).is_ok(), "{ok} must stay allowed");
+        }
     }
 }

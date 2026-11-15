@@ -821,7 +821,8 @@ async fn persist_host_nonce(
 ) {
     use jacquard_common::types::did::Did;
 
-    let Some(jacquard_client) = state.jacquard_client.as_ref() else {
+    let profile = state.session_oauth_profile(account_did, session_id).await;
+    let Some(jacquard_client) = state.oauth_client_for_profile(&profile) else {
         return;
     };
 

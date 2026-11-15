@@ -358,6 +358,16 @@ impl PushRegistry {
         .bind(&new_fp)
         .execute(&mut *tx)
         .await?;
+        // Wake keys follow the same proven ownership, so signing the upgraded
+        // session out later still revokes them.
+        sqlx::query(
+            "UPDATE push_gateway_keys SET auth_session_fingerprint=$3,updated_at=NOW() WHERE account_did=$1 AND auth_session_fingerprint=$2",
+        )
+        .bind(did)
+        .bind(&old_fp)
+        .bind(&new_fp)
+        .execute(&mut *tx)
+        .await?;
         // Also include already-migrated rows: a receipt retry must repair links
         // after an earlier SQL commit whose Redis response was unavailable.
         let owned_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
@@ -957,6 +967,20 @@ impl PushRegistry {
             .await?
             .rows_affected()
         };
+
+        // The MLS wake keys this session registered stop with it: a delivery
+        // service must not be able to wake a signed-out device.
+        sqlx::query(
+            r#"
+            UPDATE push_gateway_keys
+            SET revoked_at = NOW(), updated_at = NOW()
+            WHERE account_did = $1 AND auth_session_fingerprint = $2 AND revoked_at IS NULL
+            "#,
+        )
+        .bind(did)
+        .bind(&session_fp)
+        .execute(&mut *tx)
+        .await?;
 
         let is_push_session: bool = sqlx::query_scalar(
             r#"

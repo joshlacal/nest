@@ -160,6 +160,17 @@ impl AtProtoClient {
         jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
         max_bytes: usize,
     ) -> AppResult<ProxyResponse> {
+        if let Some(ch) = client_headers {
+            let mut extra_service_ids = Vec::new();
+            if let Some((_, frag)) = self.state.config.mls.service_did.split_once('#') {
+                extra_service_ids.push(frag);
+            }
+            if let Some((_, frag)) = self.state.config.circle.service_did.split_once('#') {
+                extra_service_ids.push(frag);
+            }
+            validate_atproto_proxy_headers(ch, &extra_service_ids)?;
+        }
+
         // SSRF protection & endpoint origin binding: validate PDS URL and target URL
         validate_pds_url(&session.pds_url)?;
         let pds_parsed = url::Url::parse(&session.pds_url)
@@ -219,6 +230,9 @@ impl AtProtoClient {
         if let Some(ch) = client_headers {
             filter_client_headers(ch, &mut headers);
         }
+        // Let reqwest manage Accept-Encoding so compressed upstream bodies are always
+        // decompressed and metered against decompressed byte limits inside Nest.
+        headers.remove(reqwest::header::ACCEPT_ENCODING);
 
         let mut request = self
             .state
@@ -251,14 +265,22 @@ impl AtProtoClient {
         };
 
         let status = response.status().as_u16();
-        let response_headers = response.headers().clone();
+        let mut response_headers = response.headers().clone();
 
         self.record_nonce_from_headers(origin.as_deref(), &response_headers);
 
-        let content_length = response_headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
+        let had_content_encoding = response_headers
+            .remove(reqwest::header::CONTENT_ENCODING)
+            .is_some();
+        let content_length = if had_content_encoding {
+            response_headers.remove(reqwest::header::CONTENT_LENGTH);
+            None
+        } else {
+            response_headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+        };
 
         // Check if we got a DPoP nonce error (401 with use_dpop_nonce)
         if status == 401 {
@@ -268,7 +290,7 @@ impl AtProtoClient {
                     "Cumulative response size exceeded maximum allowed limit of {max_bytes} bytes"
                 )));
             }
-            let permit = if content_length.is_none() {
+            let permit = if content_length.is_none() || had_content_encoding {
                 Some(self.state.active_stream_semaphore.clone().try_acquire_owned().map_err(|_| {
                     tracing::warn!(
                         request_id = %request_id,
@@ -354,6 +376,10 @@ impl AtProtoClient {
             }
 
             let initial_bytes = error_body.len();
+            response_headers.insert(
+                reqwest::header::CONTENT_LENGTH,
+                HeaderValue::from(initial_bytes),
+            );
             return Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
@@ -418,6 +444,7 @@ impl AtProtoClient {
                 }
             };
 
+            response_headers.remove(reqwest::header::CONTENT_LENGTH);
             Ok(ProxyResponse::Streaming {
                 status,
                 headers: response_headers,
@@ -429,7 +456,7 @@ impl AtProtoClient {
                 bytes_transferred: 0,
             })
         } else {
-            let permit = if content_length.is_none() {
+            let permit = if content_length.is_none() || had_content_encoding {
                 Some(self.state.active_stream_semaphore.clone().try_acquire_owned().map_err(|_| {
                     tracing::warn!(
                         request_id = %request_id,
@@ -462,6 +489,7 @@ impl AtProtoClient {
             );
 
             let body_len = body.len();
+            response_headers.insert(reqwest::header::CONTENT_LENGTH, HeaderValue::from(body_len));
             Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
@@ -506,6 +534,7 @@ impl AtProtoClient {
         if let Some(ch) = client_headers {
             filter_client_headers(ch, &mut headers);
         }
+        headers.remove(reqwest::header::ACCEPT_ENCODING);
 
         let body_size = body.as_ref().map(|b| b.len()).unwrap_or(0);
         let safe_url = sanitize_url_for_logging(url);
@@ -547,15 +576,23 @@ impl AtProtoClient {
         };
 
         let status = response.status().as_u16();
-        let response_headers = response.headers().clone();
+        let mut response_headers = response.headers().clone();
 
         self.record_nonce_from_headers(origin, &response_headers);
 
-        // Check Content-Length for size limits
-        let content_length = response_headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
+        let had_content_encoding = response_headers
+            .remove(reqwest::header::CONTENT_ENCODING)
+            .is_some();
+        // Check Content-Length for size limits (ignoring upstream Content-Length if Content-Encoding was present)
+        let content_length = if had_content_encoding {
+            response_headers.remove(reqwest::header::CONTENT_LENGTH);
+            None
+        } else {
+            response_headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+        };
 
         // Reject responses that are too large
         if let Some(len) = content_length {
@@ -614,6 +651,7 @@ impl AtProtoClient {
                 }
             };
 
+            response_headers.remove(reqwest::header::CONTENT_LENGTH);
             Ok(ProxyResponse::Streaming {
                 status,
                 headers: response_headers,
@@ -625,8 +663,8 @@ impl AtProtoClient {
                 bytes_transferred: 0,
             })
         } else {
-            // Buffer small JSON responses. If content_length is unknown (None), acquire semaphore permit before buffering.
-            let permit = if content_length.is_none() {
+            // Buffer small JSON responses. If content_length is unknown (None) or was encoded, acquire semaphore permit before buffering.
+            let permit = if content_length.is_none() || had_content_encoding {
                 Some(self.state.active_stream_semaphore.clone().try_acquire_owned().map_err(|_| {
                     tracing::warn!(
                         request_id = %request_id,
@@ -669,6 +707,7 @@ impl AtProtoClient {
             }
 
             let body_len = body.len();
+            response_headers.insert(reqwest::header::CONTENT_LENGTH, HeaderValue::from(body_len));
             Ok(ProxyResponse::Buffered {
                 status,
                 headers: response_headers,
@@ -690,7 +729,7 @@ impl AtProtoClient {
         session_id: Option<&str>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> AppResult<bytes::Bytes> {
-        let _permit = permit;
+        let mut held_permit = permit;
         let mut stream = response.bytes_stream();
         let mut body = Vec::new();
 
@@ -708,6 +747,21 @@ impl AtProtoClient {
                     "Response exceeded maximum size of {} bytes while reading",
                     max_size
                 )));
+            }
+            if held_permit.is_none() && body.len() + chunk.len() > STREAM_THRESHOLD {
+                held_permit = Some(
+                    self.state
+                        .active_stream_semaphore
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                "[BFF-UPSTREAM-ERR] Active stream concurrency limit reached while reading response > 1 MiB (64 max)"
+                            );
+                            AppError::RateLimitExceeded { retry_after: 5 }
+                        })?,
+                );
             }
             if let Some(sess_id) = session_id {
                 self.state
@@ -795,14 +849,191 @@ pub fn sanitize_url_for_logging(url: &str) -> &str {
 }
 
 /// Filter client headers before forwarding to upstream PDS using a strict positive allowlist.
+/// Safe service IDs allowed on client-supplied `atproto-proxy` headers (`<did>#<service_id>`).
+pub const ALLOWED_ATPROTO_PROXY_SERVICE_IDS: &[&str] = &[
+    "bsky_appview",
+    "bsky_chat",
+    "bsky_fg",
+    "bsky_notif",
+    "atproto_labeler",
+    "atproto_circles",
+    "atproto_notif",
+];
+
+fn is_valid_did_web_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 {
+        return false;
+    }
+    if !domain.contains('.')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+    {
+        return false;
+    }
+    if domain.parse::<std::net::Ipv4Addr>().is_ok() {
+        return false;
+    }
+    let lower = domain.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return false;
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return false;
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validates a client-supplied `atproto-proxy` header value against `<valid-did>#<allowed-service-id>`.
+pub fn is_valid_atproto_proxy_header_with_extra(value: &str, extra_service_ids: &[&str]) -> bool {
+    if value.is_empty() || value.len() > 320 || !value.bytes().all(|b| b.is_ascii_graphic()) {
+        return false;
+    }
+    let Some((did_part, service_id)) = value.split_once('#') else {
+        return false;
+    };
+    if service_id.is_empty()
+        || service_id.len() > 64
+        || !service_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return false;
+    }
+    let service_allowed = ALLOWED_ATPROTO_PROXY_SERVICE_IDS.contains(&service_id)
+        || extra_service_ids.contains(&service_id);
+    if !service_allowed {
+        return false;
+    }
+
+    if let Some(plc_id) = did_part.strip_prefix("did:plc:") {
+        plc_id.len() == 24
+            && plc_id
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+    } else if let Some(web_rest) = did_part.strip_prefix("did:web:") {
+        let mut parts = web_rest.split(':');
+        if !is_valid_did_web_domain(parts.next().unwrap_or_default()) {
+            return false;
+        }
+        parts.all(|segment| {
+            !segment.is_empty()
+                && segment.len() <= 63
+                && !segment.contains("..")
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+    } else {
+        false
+    }
+}
+
+/// Validates a client-supplied `atproto-proxy` header value against the default service-ID allowlist.
+pub fn is_valid_atproto_proxy_header(value: &str) -> bool {
+    is_valid_atproto_proxy_header_with_extra(value, &[])
+}
+
+/// Normalizes one raw `atproto-proxy` header value, collapsing identical comma-joined duplicates.
+pub fn normalize_atproto_proxy_value_with_extra(
+    raw: &str,
+    extra_service_ids: &[&str],
+) -> Option<String> {
+    if raw.is_empty() || raw.len() > 1024 {
+        return None;
+    }
+    let mut chosen: Option<&str> = None;
+    for part in raw.split(',') {
+        let part = part.trim();
+        if !is_valid_atproto_proxy_header_with_extra(part, extra_service_ids) {
+            return None;
+        }
+        match chosen {
+            None => chosen = Some(part),
+            Some(prev) if prev == part => {}
+            Some(_) => return None,
+        }
+    }
+    chosen.map(str::to_owned)
+}
+
+/// Validates all `atproto-proxy` headers on an incoming client `HeaderMap`, returning the
+/// single normalized target when present.
+pub fn validated_atproto_proxy_with_extra(
+    headers: &HeaderMap,
+    extra_service_ids: &[&str],
+) -> AppResult<Option<String>> {
+    let mut chosen: Option<String> = None;
+    for value in headers.get_all("atproto-proxy") {
+        let val_str = value
+            .to_str()
+            .map_err(|_| AppError::BadRequest("Invalid atproto-proxy header encoding".into()))?;
+        if val_str.split(',').any(|part| {
+            part.trim()
+                .split_once('#')
+                .is_some_and(|(_, frag)| frag == "atproto_mls")
+        }) {
+            return Err(AppError::AtprotoResponse {
+                status: axum::http::StatusCode::FORBIDDEN,
+                error: "Forbidden".into(),
+                message: "atproto_mls proxy target is retired; connect directly to home mls-ds"
+                    .into(),
+            });
+        }
+        let normalized = normalize_atproto_proxy_value_with_extra(val_str, extra_service_ids)
+            .ok_or_else(|| {
+                AppError::BadRequest("Invalid or untrusted atproto-proxy header".into())
+            })?;
+        match &chosen {
+            None => chosen = Some(normalized),
+            Some(prev) if *prev == normalized => {}
+            Some(_) => {
+                return Err(AppError::BadRequest(
+                    "Conflicting atproto-proxy headers".into(),
+                ));
+            }
+        }
+    }
+    Ok(chosen)
+}
+
+pub fn validated_atproto_proxy(headers: &HeaderMap) -> AppResult<Option<String>> {
+    validated_atproto_proxy_with_extra(headers, &[])
+}
+
+/// Validates all `atproto-proxy` headers on an incoming client `HeaderMap`.
+pub fn validate_atproto_proxy_headers(
+    headers: &HeaderMap,
+    extra_service_ids: &[&str],
+) -> AppResult<()> {
+    validated_atproto_proxy_with_extra(headers, extra_service_ids).map(|_| ())
+}
+
 /// Allows documented AT Protocol and application headers:
 /// - accept
 /// - accept-encoding
 /// - accept-language
 /// - content-type
-/// - atproto-proxy
+/// - atproto-proxy (normalized to one allowlisted target)
 /// - atproto-accept-labelers
-/// - atproto-space-want-mac (per-request key share; required for authenticated Space reads)
+/// - accept-signature (per-request HPKE key share; required for authenticated Space reads)
+/// - atproto-space-credential (signed capability delegation; required for cross-PDS Space reads/writes)
 /// All other headers (e.g. host, forwarded, x-forwarded-*, sec-*, cookie, authorization, dpop, hop-by-hop) are dropped.
 pub fn filter_client_headers(client_headers: &HeaderMap, out_headers: &mut HeaderMap) {
     for (name, value) in client_headers.iter() {
@@ -813,14 +1044,22 @@ pub fn filter_client_headers(client_headers: &HeaderMap, out_headers: &mut Heade
                 | "accept-encoding"
                 | "accept-language"
                 | "content-type"
-                | "atproto-proxy"
                 | "atproto-accept-labelers"
-                | "atproto-space-want-mac"
+                | "accept-signature"
+                | "atproto-space-credential"
         ) {
             if name_lower == "content-type" && out_headers.contains_key(CONTENT_TYPE) {
                 continue;
             }
             out_headers.insert(name.clone(), value.clone());
+        }
+    }
+    if let Ok(Some(target)) = validated_atproto_proxy(client_headers) {
+        if let Ok(value) = HeaderValue::from_str(&target) {
+            out_headers.insert(
+                reqwest::header::HeaderName::from_static("atproto-proxy"),
+                value,
+            );
         }
     }
 }
@@ -1004,11 +1243,16 @@ mod tests {
             HeaderValue::from_static("untrusted"),
         );
 
-        // Allowlisted headers:
-        let want_mac = r#"type="atproto-space-repo", ver=1, key_share="did:key:ephemeral""#;
+        // Allowlisted Spaces HTTP Message Signature request.
+        let accept_signature = r#"mac=("atproto-space-commit";sf);keyid="did:key:ephemeral";tag="atproto-space-commit""#;
+        let space_cred = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0cHJvdG8tc3BhY2UtY3JlZCsganMifQ.eyJzdWIiOiJkaWQ6cGxjOmFsaWNlIn0.c2ln";
         client_headers.insert(
-            HeaderName::from_static("atproto-space-want-mac"),
-            HeaderValue::from_str(want_mac).unwrap(),
+            HeaderName::from_static("accept-signature"),
+            HeaderValue::from_str(accept_signature).unwrap(),
+        );
+        client_headers.insert(
+            HeaderName::from_static("atproto-space-credential"),
+            HeaderValue::from_str(space_cred).unwrap(),
         );
         client_headers.insert(
             HeaderName::from_static("accept"),
@@ -1053,7 +1297,14 @@ mod tests {
         assert!(!out_headers.contains_key("dpop"));
         assert!(!out_headers.contains_key("x-custom-header"));
         assert_eq!(out_headers.get("authorization").unwrap(), "DPoP pds-token");
-        assert_eq!(out_headers.get("atproto-space-want-mac").unwrap(), want_mac);
+        assert_eq!(
+            out_headers.get("accept-signature").unwrap(),
+            accept_signature
+        );
+        assert_eq!(
+            out_headers.get("atproto-space-credential").unwrap(),
+            space_cred
+        );
         assert_eq!(out_headers.get("accept").unwrap(), "application/json");
         assert_eq!(
             out_headers.get("accept-language").unwrap(),
@@ -1072,6 +1323,56 @@ mod tests {
             "did:plc:ar7c404540u662fuut8jh7tr;redact"
         );
         assert_eq!(out_headers.get("content-type").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn test_filter_client_headers_drops_invalid_or_untrusted_atproto_proxy() {
+        let invalid_values = [
+            "did:web:evil.example#svc",
+            "did:web:api.bsky.app",
+            "did:plc:short#bsky_appview",
+            "did:plc:INVALIDUPPERCASE23456723#bsky_appview",
+            "did:web:localhost#bsky_appview",
+            "did:web:evil.example/../../etc#bsky_appview",
+            "did:web:api.bsky.app#bsky_appview#extra",
+        ];
+
+        for bad in invalid_values {
+            let mut client_headers = HeaderMap::new();
+            client_headers.insert(
+                HeaderName::from_static("atproto-proxy"),
+                HeaderValue::from_str(bad).unwrap(),
+            );
+            let mut out_headers = HeaderMap::new();
+            filter_client_headers(&client_headers, &mut out_headers);
+            assert!(
+                !out_headers.contains_key("atproto-proxy"),
+                "Invalid/untrusted atproto-proxy header '{}' must be dropped",
+                bad
+            );
+        }
+
+        let valid_values = [
+            "did:web:api.bsky.app#bsky_appview",
+            "did:web:api.bsky.chat#bsky_chat",
+            "did:plc:z72i7hdynmk6r22z27h6tvur#atproto_labeler",
+            "did:web:circles.catbird.blue#atproto_circles",
+        ];
+        for good in valid_values {
+            let mut client_headers = HeaderMap::new();
+            client_headers.insert(
+                HeaderName::from_static("atproto-proxy"),
+                HeaderValue::from_str(good).unwrap(),
+            );
+            let mut out_headers = HeaderMap::new();
+            filter_client_headers(&client_headers, &mut out_headers);
+            assert_eq!(
+                out_headers.get("atproto-proxy").unwrap(),
+                good,
+                "Valid allowlisted atproto-proxy header '{}' must pass",
+                good
+            );
+        }
     }
 
     #[tokio::test]

@@ -80,6 +80,11 @@ pub async fn unregister_push(
         .deactivate_registration(&session, &input)
         .await
         .map_err(internal_error)?;
+    // The same device's MLS wake key goes with its push token.
+    push.gateway
+        .revoke_keys_for_session_app(&session.did, &session.id.to_string(), &input.app_id)
+        .await
+        .map_err(internal_error)?;
     if let Some(push_db) = state.push_db.as_ref() {
         let scheduler =
             crate::services::chat_poll::scheduler::ChatPollScheduler::new(push_db.clone());

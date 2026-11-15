@@ -772,6 +772,7 @@ async fn test_upgrade_callback_denial_leaves_old_session_valid() {
             &old_session_id,
             did_str,
             &scope_names(&["atproto", "transition:generic"]),
+            &state.config.oauth.max_scopes,
             &scope_names(&["identity:handle"]),
             BROWSER_NONCE,
         )
@@ -1140,6 +1141,7 @@ async fn test_upgrade_exchange_wrong_nonce_origin_or_bearer_cannot_burn_exchange
             &old_session_id,
             did_str,
             &scope_names(&["atproto", "transition:generic"]),
+            &state.config.oauth.max_scopes,
             &scope_names(&["identity:handle"]),
             BROWSER_NONCE,
         )
@@ -1263,6 +1265,7 @@ async fn test_staged_candidate_gets_401_on_auth_session_and_xrpc() {
             &old_session_id,
             did_str,
             &scope_names(&["atproto"]),
+            &state.config.oauth.max_scopes,
             &scope_names(&["identity:handle"]),
             BROWSER_NONCE,
         )
@@ -1342,6 +1345,7 @@ async fn test_upgrade_commit_idempotent_and_lifecycle() {
             &old_session_id,
             did_str,
             &scope_names(&["atproto", "transition:generic"]),
+            &state.config.oauth.max_scopes,
             &scope_names(&["identity:handle"]),
             BROWSER_NONCE,
         )
@@ -1477,6 +1481,7 @@ async fn test_concurrent_candidate_loses_without_winner_id() {
                 &old_session_id,
                 did_str,
                 &scope_names(&["atproto"]),
+                &state.config.oauth.max_scopes,
                 &scope_names(&[additional_scope]),
                 nonce,
             )
@@ -1657,4 +1662,377 @@ async fn test_upgrade_limiter_runs_before_auth_for_stable_client_ip() {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|seconds| seconds > 0));
+}
+
+fn extract_oauth_request_client_id(req: &WiremockRequest) -> Option<String> {
+    let params: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&req.body)
+        .into_owned()
+        .collect();
+    if let Some(cid) = params.get("client_id") {
+        if !cid.is_empty() {
+            return Some(cid.clone());
+        }
+    }
+    let assertion = params.get("client_assertion")?;
+    let payload_b64 = assertion.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let json: Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("sub")
+        .or_else(|| json.get("iss"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+#[tokio::test]
+async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgrade_and_logout() {
+    let mock = MockServer::start().await;
+    let did = FIXED_TEST_DID;
+    let provider_url = mock.uri();
+    let catmos_client_id_str = "https://catmos.catbird.blue/client-metadata.json";
+
+    // Mount DID doc + OAuth metadata WITH revocation_endpoint
+    let supported_scopes = [
+        "atproto",
+        "transition:generic",
+        "transition:chat.bsky",
+        "identity:handle",
+        "account:email",
+        "account:status",
+    ];
+    Mock::given(method("GET"))
+        .and(path(format!("/{did}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": did,
+            "alsoKnownAs": [format!("at://{}.bsky.social", did.replace(':', "."))],
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": provider_url
+            }]
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": provider_url,
+            "authorization_servers": [provider_url],
+            "scopes_supported": supported_scopes
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": provider_url,
+            "authorization_endpoint": format!("{provider_url}/oauth/authorize"),
+            "token_endpoint": format!("{provider_url}/oauth/token"),
+            "revocation_endpoint": format!("{provider_url}/oauth/revoke"),
+            "pushed_authorization_request_endpoint": format!("{provider_url}/oauth/par"),
+            "require_pushed_authorization_requests": true,
+            "dpop_signing_alg_values_supported": ["ES256"],
+            "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
+            "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+            "authorization_response_iss_parameter_supported": true,
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": supported_scopes,
+            "protected_resources": [provider_url]
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/par"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_uri": "urn:ietf:params:oauth:request_uri:catmos-par-1",
+            "expires_in": 300
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "refreshed-catmos-access-token",
+            "refresh_token": "refreshed-catmos-refresh-token",
+            "token_type": "DPoP",
+            "expires_in": 3600,
+            "sub": did,
+            "scope": "atproto transition:generic identity:handle"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let (base_state, _old_server, _upgrade_service, _redis) =
+        setup_test_server_with_resolver(Some(build_mock_resolver(&mock))).await;
+
+    let base_store = base_state
+        .auth_store
+        .as_ref()
+        .expect("auth_store")
+        .as_ref()
+        .clone();
+    let catmos_store = base_store.with_oauth_profile("catmos");
+
+    let keyset = base_state
+        .key_store
+        .as_ref()
+        .and_then(|ks| ks.to_jacquard_keyset().ok());
+    let catmos_cid = jacquard_common::deps::fluent_uri::Uri::parse(catmos_client_id_str)
+        .unwrap()
+        .to_owned();
+    let catmos_redirect =
+        jacquard_common::deps::fluent_uri::Uri::parse("https://api.catbird.blue/auth/callback")
+            .unwrap()
+            .to_owned();
+    let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
+        "https://api.catbird.blue/.well-known/jwks.json",
+    )
+    .unwrap()
+    .to_owned();
+    let catmos_scopes_vec = vec![
+        Scope::Atproto,
+        Scope::Transition(TransitionScope::Generic),
+        Scope::Identity(IdentityScope::Handle),
+    ];
+    let catmos_scopes =
+        Scopes::from_scopes(catmos_scopes_vec.iter().cloned().map(|s| s.convert())).unwrap();
+    let catmos_md =
+        AtprotoClientMetadata::new(vec![catmos_redirect], catmos_cid, Some(catmos_scopes))
+            .with_jwks_uri(jwks_uri);
+    let catmos_client = JacquardOAuthClient::new_from_resolver(
+        catmos_store.clone(),
+        build_mock_resolver(&mock),
+        ClientData::new(keyset, catmos_md),
+    );
+
+    let mut state_clone: AppState = (*base_state).clone();
+    state_clone.catmos_jacquard_client = Some(Arc::new(catmos_client));
+    state_clone.catmos_oauth_scopes = catmos_scopes_vec;
+    let state = Arc::new(state_clone);
+    let app = create_router(state.clone()).with_state(state.clone());
+    let server = TestServer::new(app).expect("create TestServer");
+
+    // 1. Verify oauth_client_for_profile helper + legacy session default ("catbird")
+    assert!(Arc::ptr_eq(
+        state
+            .oauth_client_for_profile("catmos")
+            .expect("catmos client"),
+        state.catmos_jacquard_client.as_ref().unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        state
+            .oauth_client_for_profile("catbird")
+            .expect("catbird client"),
+        state.jacquard_client.as_ref().unwrap()
+    ));
+
+    let legacy_session_id = Uuid::new_v4().to_string();
+    let legacy_data = create_test_session_data_with_pds(
+        &legacy_session_id,
+        did,
+        vec![Scope::Atproto],
+        &provider_url,
+    );
+    // Write raw ClientSessionData JSON WITHOUT oauth_profile field to verify #[serde(default)] backwards compatibility
+    let legacy_session_key = base_store.session_key(did, &legacy_session_id);
+    let legacy_json = serde_json::to_string(&legacy_data).unwrap();
+    assert!(!legacy_json.contains("oauth_profile"));
+    let legacy_meta =
+        catbird::services::EnvelopeMetadata::new("session", &legacy_session_key, Some(did), None);
+    let legacy_sealed =
+        catbird::services::seal_v2_with_metadata(&TEST_ENCRYPTION_KEY, &legacy_json, &legacy_meta)
+            .unwrap();
+    {
+        let mut conn = state.redis.clone();
+        redis::cmd("SET")
+            .arg(&legacy_session_key)
+            .arg(&legacy_sealed)
+            .arg("EX")
+            .arg(3600)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        state.session_oauth_profile(did, &legacy_session_id).await,
+        "catbird",
+        "Legacy sessions without oauth_profile field must default to 'catbird'"
+    );
+
+    // 2. Seed an expired catmos session so auth_middleware refreshes it via catmos_jacquard_client
+    let catmos_session_id = Uuid::new_v4().to_string();
+    let mut catmos_session_data = create_test_session_data_with_pds(
+        &catmos_session_id,
+        did,
+        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        &provider_url,
+    );
+    catmos_session_data.authserver_token_endpoint = format!("{provider_url}/oauth/token").into();
+    catmos_session_data.authserver_revocation_endpoint =
+        Some(format!("{provider_url}/oauth/revoke").into());
+    catmos_session_data.token_set.expires_at = Some(
+        jacquard_common::types::string::Datetime::try_from(
+            (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
+        )
+        .unwrap(),
+    );
+    catmos_store
+        .upsert_session(catmos_session_data)
+        .await
+        .expect("seed catmos session");
+    assert_eq!(
+        state.session_oauth_profile(did, &catmos_session_id).await,
+        "catmos"
+    );
+
+    let bearer = format!("Bearer {catmos_session_id}");
+    let session_resp = server
+        .get("/auth/session")
+        .add_header(AUTHORIZATION, &bearer)
+        .await;
+    assert_status(
+        &session_resp,
+        StatusCode::OK,
+        "catmos /auth/session refresh",
+    );
+
+    let reqs_after_refresh = mock.received_requests().await.unwrap();
+    let refresh_req = reqs_after_refresh
+        .iter()
+        .find(|r| r.url.path() == "/oauth/token")
+        .expect("auth_middleware should refresh expired catmos token at /oauth/token");
+    assert_eq!(
+        extract_oauth_request_client_id(refresh_req).as_deref(),
+        Some(catmos_client_id_str),
+        "Token refresh in auth_middleware MUST use catmos OAuth client"
+    );
+
+    // 3. Upgrade start MUST use catmos OAuth client for PAR
+    let _id_guard = EnvVarGuard::set("CATBIRD_TEST_OAUTH_IDENTIFIER", did);
+    let upgrade_resp = server
+        .post("/auth/upgrade")
+        .add_header(AUTHORIZATION, &bearer)
+        .json(&json!({
+            "additional_scopes": ["identity:handle"],
+            "browser_nonce": BROWSER_NONCE
+        }))
+        .await;
+    assert_status(&upgrade_resp, StatusCode::OK, "catmos /auth/upgrade start");
+
+    let reqs_after_par = mock.received_requests().await.unwrap();
+    let par_req = reqs_after_par
+        .iter()
+        .rfind(|r| r.url.path() == "/oauth/par")
+        .expect("upgrade_start should send PAR");
+    assert_eq!(
+        extract_oauth_request_client_id(par_req).as_deref(),
+        Some(catmos_client_id_str),
+        "upgrade_start PAR MUST use catmos OAuth client"
+    );
+    let par_form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(&par_req.body)
+            .into_owned()
+            .collect();
+    let par_scopes = par_form
+        .get("scope")
+        .expect("upgrade PAR carries an explicit scope set");
+    assert!(
+        par_scopes
+            .split_whitespace()
+            .any(|scope| scope == "transition:generic"),
+        "Catmos registered grants must survive an unrelated upgrade: {par_scopes}"
+    );
+
+    // 4. Logout MUST use catmos OAuth client for remote PDS token revocation.
+    // Under main's logout_cleanup coordinator, upstream revocation executes only
+    // when retiring the final active session for an account and requires push_db
+    // for SQL inventory fencing.
+    let logout_did = "did:plc:catmoslogoutuser";
+    Mock::given(method("GET"))
+        .and(path(format!("/{logout_did}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": logout_did,
+            "alsoKnownAs": ["at://catmoslogout.bsky.social"],
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": provider_url
+            }]
+        })))
+        .mount(&mock)
+        .await;
+
+    let admin_db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
+    let admin_pool = sqlx::PgPool::connect(&admin_db_url)
+        .await
+        .expect("connect local postgres for B-2 logout test");
+    let temp_db_name = format!("test_b2_logout_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{temp_db_name}\""))
+        .execute(&admin_pool)
+        .await
+        .expect("create temp db for B-2 logout test");
+    let mut temp_db_url = url::Url::parse(&admin_db_url).expect("parse DATABASE_URL");
+    temp_db_url.set_path(&temp_db_name);
+    let temp_pool = sqlx::PgPool::connect(temp_db_url.as_str())
+        .await
+        .expect("connect temp db for B-2 logout test");
+    sqlx::migrate!("./migrations")
+        .run(&temp_pool)
+        .await
+        .expect("run migrations on temp db for B-2 logout test");
+
+    let mut logout_state_clone: AppState = (*state).clone();
+    logout_state_clone.push_db = Some(temp_pool.clone());
+    let logout_state = Arc::new(logout_state_clone);
+    let logout_app = create_router(logout_state.clone()).with_state(logout_state.clone());
+    let logout_server = TestServer::new(logout_app).expect("create logout TestServer");
+
+    let catmos_logout_id = Uuid::new_v4().to_string();
+    let mut logout_data = create_test_session_data_with_pds(
+        &catmos_logout_id,
+        logout_did,
+        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        &provider_url,
+    );
+    logout_data.authserver_token_endpoint = format!("{provider_url}/oauth/token").into();
+    logout_data.authserver_revocation_endpoint =
+        Some(format!("{provider_url}/oauth/revoke").into());
+    catmos_store
+        .upsert_session(logout_data)
+        .await
+        .expect("seed catmos logout session");
+
+    let logout_resp = logout_server
+        .post("/auth/logout")
+        .add_header(AUTHORIZATION, format!("Bearer {catmos_logout_id}"))
+        .await;
+    assert_status(&logout_resp, StatusCode::OK, "catmos /auth/logout");
+
+    temp_pool.close().await;
+    let _ = sqlx::query(&format!("DROP DATABASE \"{temp_db_name}\" WITH (FORCE)"))
+        .execute(&admin_pool)
+        .await;
+    admin_pool.close().await;
+
+    let reqs_after_logout = mock.received_requests().await.unwrap();
+    let revoke_req = reqs_after_logout
+        .iter()
+        .rfind(|r| r.url.path() == "/oauth/revoke")
+        .expect("logout should call /oauth/revoke on PDS");
+    assert_eq!(
+        extract_oauth_request_client_id(revoke_req).as_deref(),
+        Some(catmos_client_id_str),
+        "logout remote PDS revocation MUST use catmos OAuth client"
+    );
 }

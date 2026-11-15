@@ -109,14 +109,21 @@ Key settings:
 - `GET /live` - Liveness probe
 
 ### Authentication
-- `POST /auth/login` - Initiate OAuth login
+- `GET|POST /auth/login` - Initiate OAuth login
 - `GET /auth/callback` - OAuth callback handler
+- `POST /auth/exchange` - Consume an exchange code and return the session ID (ADR-014)
+- `POST /auth/upgrade`, `POST /auth/upgrade/exchange`, `POST /auth/upgrade/commit` - Progressive scope upgrade (allowlisted scopes only, including the explicit Labyrinth Space scopes; see [AGENTS.md](../AGENTS.md))
 - `POST /auth/logout` - Logout and revoke tokens
 - `GET /auth/session` - Get current session info
 
 ### XRPC Proxy
 - `GET /xrpc/*` - Proxy GET requests to PDS
 - `POST /xrpc/*` - Proxy POST requests to PDS
+- `blue.catbird.chat.*` (except `.defs`) goes to the delivery service (`CATBIRD__MLS__SERVICE_URL`) with a PDS-issued service-auth token whose `lxm` must be in `CHAT_ENDPOINTS`; bodies are capped per procedure (`proxy_body_limit`)
+
+### MLS Push Gateway (D2)
+- `POST /xrpc/blue.catbird.push.registerKey` - Register a native APNs/FCM token (session auth); returns an opaque `pushKey`
+- `POST /xrpc/blue.catbird.push.deliver` - Delivery-service wake (DS `#atproto` DID-JWT, no session); unknown keys get a uniform `202`
 
 ### OAuth Metadata
 - `GET /.well-known/oauth-client-metadata` - OAuth client metadata

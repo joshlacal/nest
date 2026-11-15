@@ -117,6 +117,25 @@ pub async fn start_auth_with_scopes(
     state_token: &str,
     redirect_uri: Option<jacquard_common::deps::fluent_uri::Uri<String>>,
 ) -> Result<String> {
+    start_auth_with_raw_scopes(client, identifier, scopes, &[], state_token, redirect_uri).await
+}
+
+/// Push an authorization request preserving wire-exact `raw_scopes` when non-empty.
+///
+/// Why this matters for ATProto Spaces (`atproto#5187` / `Swan`):
+/// `jacquard_oauth`'s `to_string_normalized()` re-serializes `space:` scopes and
+/// injects default `action=` params into bare-collection ones, which `Swan` rejects at
+/// PAR with `invalid_scope` (`writeActionWithoutCollection`). Preserving the validated
+/// raw scope tokens keeps the wire request byte-exact (e.g. the Labyrinth
+/// `space:blue.catbird.labyrinth.*` scopes with explicit `action=` + `collection=`).
+pub async fn start_auth_with_raw_scopes(
+    client: &JacquardOAuthClient,
+    identifier: &str,
+    scopes: &[Scope],
+    raw_scopes: &[String],
+    state_token: &str,
+    redirect_uri: Option<jacquard_common::deps::fluent_uri::Uri<String>>,
+) -> Result<String> {
     // An empty set would let the authorization server apply its own defaults,
     // which is how a request ends up broader than intended.
     if scopes.is_empty() {
@@ -136,8 +155,18 @@ pub async fn start_auth_with_scopes(
         config.redirect_uris = vec![redirect_uri];
     }
 
-    let client_metadata = atproto_client_metadata(&config, &client_data.keyset)
+    let mut client_metadata = atproto_client_metadata(&config, &client_data.keyset)
         .map_err(|e| anyhow!("failed to derive client metadata: {e:?}"))?;
+    if !raw_scopes.is_empty() {
+        let joined: Vec<&str> = raw_scopes
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !joined.is_empty() {
+            client_metadata.scope = Some(joined.join(" ").to_smolstr());
+        }
+    }
 
     let (server_metadata, identity) = client
         .client

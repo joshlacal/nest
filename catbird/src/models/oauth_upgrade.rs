@@ -10,8 +10,8 @@ use uuid::Uuid;
 pub const MAX_ADDITIONAL_SCOPES: usize = 16;
 
 /// Maximum length of an individual scope string.
-/// 256 accommodates parameterized `space:` scopes (the Circle scope is ~150 chars).
-pub const MAX_SCOPE_LEN: usize = 256;
+/// 512 accommodates parameterized `space:` scopes (the Labyrinth mailbox scope is ~440 chars).
+pub const MAX_SCOPE_LEN: usize = 512;
 
 /// Circle Space scope, in jacquard-normalized form (params sorted, defaults omitted).
 /// Grants record read_self/create/update/delete on any collection in
@@ -19,6 +19,23 @@ pub const MAX_SCOPE_LEN: usize = 256;
 /// create/update/delete management. Requested just-in-time when the user
 /// first creates or writes to a Circle.
 pub const CIRCLE_SPACE_SCOPE: &str = "space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update";
+
+/// Wildcard blob upload/fetch scope required for encrypted media & Space avatars.
+pub const BLOB_ALL_SCOPE: &str = "blob:*/*";
+
+/// Repository write/read scope for Labyrinth `mailboxKeys` records.
+pub const LABYRINTH_MAILBOX_KEYS_REPO_SCOPE: &str = "repo:blue.catbird.labyrinth.mailboxKeys";
+
+/// Repository write/read scope for MLS `device` key-material records (`blue.catbird.chat.device`).
+pub const MLS_CHAT_DEVICE_REPO_SCOPE: &str = "repo:blue.catbird.chat.device";
+
+/// Labyrinth personal mailbox Space scope: record read/create/update/delete on the exact
+/// mailbox collections plus Space create/delete management (self authority).
+pub const LABYRINTH_MAILBOX_SPACE_SCOPE: &str = "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete";
+
+/// Labyrinth conversation Space scope: record read/create/update/delete on the exact
+/// conversation collections across any Space authority (`authority=*`).
+pub const LABYRINTH_CONVERSATION_SPACE_SCOPE: &str = "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek";
 
 /// Minimum length of browser nonce
 pub const MIN_BROWSER_NONCE_LEN: usize = 16;
@@ -38,6 +55,11 @@ pub const ALLOWLISTED_UPGRADE_SCOPES: &[&str] = &[
     "account:email?action=manage",
     "account:status?action=manage",
     CIRCLE_SPACE_SCOPE,
+    BLOB_ALL_SCOPE,
+    LABYRINTH_MAILBOX_KEYS_REPO_SCOPE,
+    MLS_CHAT_DEVICE_REPO_SCOPE,
+    LABYRINTH_MAILBOX_SPACE_SCOPE,
+    LABYRINTH_CONVERSATION_SPACE_SCOPE,
 ];
 
 /// Request payload for initiating progressive OAuth upgrade (`POST /auth/upgrade`).
@@ -180,6 +202,31 @@ mod tests {
         };
         assert!(req.is_structurally_valid());
         assert!(!req.has_only_allowlisted_scopes());
+    }
+
+    #[test]
+    fn upgrade_start_request_accepts_exact_labyrinth_space_scopes_only() {
+        let nonce = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF".to_string();
+        let req = UpgradeStartRequest {
+            additional_scopes: vec![
+                LABYRINTH_MAILBOX_SPACE_SCOPE.to_string(),
+                LABYRINTH_CONVERSATION_SPACE_SCOPE.to_string(),
+            ],
+            browser_nonce: nonce.clone(),
+        };
+        assert!(req.is_structurally_valid());
+        assert!(req.has_only_allowlisted_scopes());
+
+        for retired in [
+            "space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete",
+            "space:blue.catbird.labyrinth.conversation?authority=*",
+        ] {
+            let req = UpgradeStartRequest {
+                additional_scopes: vec![retired.to_string()],
+                browser_nonce: nonce.clone(),
+            };
+            assert!(!req.has_only_allowlisted_scopes(), "{retired}");
+        }
     }
 
     #[test]

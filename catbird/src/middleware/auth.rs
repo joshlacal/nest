@@ -162,14 +162,10 @@ pub async fn auth_middleware(
     let auth_store = state.auth_store.as_ref().ok_or_else(|| {
         classify_auth_error(AppError::Internal("Auth store not configured".into()))
     })?;
-    let jacquard_client = state.jacquard_client.as_ref().ok_or_else(|| {
-        classify_auth_error(AppError::Internal("Jacquard client not configured".into()))
-    })?;
 
-    let (session, dpop_data) =
-        resolve_session_via_jacquard(auth_store, jacquard_client, &session_id)
-            .await
-            .map_err(classify_auth_error)?;
+    let (session, dpop_data) = resolve_session_via_jacquard(&state, auth_store, &session_id)
+        .await
+        .map_err(classify_auth_error)?;
 
     req.extensions_mut().insert(session);
     req.extensions_mut().insert(dpop_data);
@@ -182,8 +178,8 @@ pub async fn auth_middleware(
 /// then call SessionRegistry.get() which handles token refresh atomically
 /// using in-process DashMap mutex (no Redis distributed locks needed).
 async fn resolve_session_via_jacquard(
+    state: &AppState,
     auth_store: &crate::services::RedisAuthStore,
-    jacquard_client: &crate::config::JacquardOAuthClient,
     session_id: &str,
 ) -> Result<(CatbirdSession, JacquardDpopData), AppError> {
     use jacquard_common::types::did::Did;
@@ -199,6 +195,19 @@ async fn resolve_session_via_jacquard(
         .ok_or(AppError::InvalidSession)?;
 
     let did = Did::new(did_str.as_str()).map_err(|_| AppError::InvalidSession)?;
+
+    // Step 1b: Resolve which OAuth client profile owns this session so token refresh
+    // uses the matching confidential client metadata (`catbird` vs `catmos`).
+    let oauth_profile = auth_store
+        .lookup_session_oauth_profile(&did_str, session_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(crate::services::redis_auth_store::default_oauth_profile);
+    let jacquard_client = state
+        .oauth_client_for_profile(&oauth_profile)
+        .ok_or_else(|| AppError::Internal("Jacquard client not configured".into()))?;
+
     // Step 2: Get session from registry (auto_refresh=true triggers token refresh if needed)
     let session_data = jacquard_client
         .registry

@@ -39,7 +39,96 @@ pub const ALLOWED_UPGRADE_SCOPES: &[&str] = &[
     "account:email?action=manage",
     "account:status?action=manage",
     crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE,
+    crate::models::oauth_upgrade::BLOB_ALL_SCOPE,
+    crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE,
+    crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE,
+    crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE,
+    crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE,
 ];
+
+fn known_space_lexicon_collections(space_nsid: &str) -> Option<&'static [&'static str]> {
+    match space_nsid {
+        "blue.catbird.labyrinth.mailbox" => Some(&[
+            "blue.catbird.labyrinth.attachmentManifest",
+            "blue.catbird.labyrinth.device",
+            "blue.catbird.labyrinth.epoch",
+            "blue.catbird.labyrinth.epochMember",
+            "blue.catbird.labyrinth.otcSession",
+            "blue.catbird.labyrinth.ownerBatch",
+            "blue.catbird.labyrinth.virtualDevice",
+        ]),
+        "blue.catbird.labyrinth.conversation" => Some(&[
+            "blue.catbird.labyrinth.attachmentManifest",
+            "blue.catbird.labyrinth.batch",
+            "blue.catbird.labyrinth.mek",
+        ]),
+        _ => None,
+    }
+}
+
+/// Recognizes when an ATProto OAuth AS (`Swan` / `atproto#5187`) expands a bare-collection
+/// `space:<nsid>` request into explicit `recordCollections` (`expandSpaceCollections`) and/or
+/// resolves `authority=self` to `authority=<account_did>` (`resolveSpaceSelfAuthority`).
+fn space_scope_matches_lexicon_expansion(
+    requested: &Scope,
+    granted: &Scope,
+    account_did: &str,
+) -> bool {
+    use jacquard_oauth::scopes::{SpaceAuthority, SpaceCollection, SpaceType};
+
+    let (Scope::Space(req_sp), Scope::Space(grant_sp)) = (requested, granted) else {
+        return false;
+    };
+    let (SpaceType::Nsid(req_nsid), SpaceType::Nsid(grant_nsid)) =
+        (&req_sp.space_type, &grant_sp.space_type)
+    else {
+        return false;
+    };
+    if req_nsid.as_str() != grant_nsid.as_str() {
+        return false;
+    }
+    if req_sp.skey != grant_sp.skey || req_sp.manage != grant_sp.manage {
+        return false;
+    }
+
+    let authority_ok = match (&req_sp.authority, &grant_sp.authority) {
+        (a, b) if a == b => true,
+        (SpaceAuthority::Self_, SpaceAuthority::Did(did)) => did.as_str() == account_did,
+        _ => false,
+    };
+    if !authority_ok {
+        return false;
+    }
+
+    // Actions must match (either identical, or bare manage-only request expanded with empty/matching actions).
+    if req_sp.actions != grant_sp.actions {
+        return false;
+    }
+
+    if req_sp.collections == grant_sp.collections {
+        return true;
+    }
+    if !req_sp.collections.is_empty() || grant_sp.collections.is_empty() {
+        return false;
+    }
+
+    let Some(expected_cols) = known_space_lexicon_collections(req_nsid.as_str()) else {
+        return false;
+    };
+    if grant_sp.collections.len() != expected_cols.len() {
+        return false;
+    }
+    grant_sp.collections.iter().all(|c| match c {
+        SpaceCollection::Nsid(n) => expected_cols.contains(&n.as_str()),
+        SpaceCollection::All => false,
+    })
+}
+
+fn registered_scope_covers_grant(registered: &Scope, granted: &Scope, account_did: &str) -> bool {
+    registered == granted
+        || (registered.grants(granted) && granted.grants(registered))
+        || space_scope_matches_lexicon_expansion(registered, granted, account_did)
+}
 
 /// TTL for pending upgrade flow state (10 minutes)
 pub const UPGRADE_FLOW_TTL_SECONDS: u64 = 600;
@@ -316,6 +405,8 @@ pub struct UpgradeFlowState {
     pub browser_nonce: String,
     pub created_at: u64,
     pub expected_old_session_blob: String,
+    #[serde(default = "crate::services::redis_auth_store::default_oauth_profile")]
+    pub oauth_profile: String,
 }
 
 /// Inactive candidate session staged in Redis prior to commit.
@@ -329,6 +420,8 @@ pub struct StagedCandidateSession {
     pub session_data_json: String,
     pub created_at: u64,
     pub expected_old_session_blob: String,
+    #[serde(default = "crate::services::redis_auth_store::default_oauth_profile")]
+    pub oauth_profile: String,
 }
 
 /// Exchange state stored under a composite key (old_session_id:code:browser_nonce).
@@ -350,6 +443,8 @@ pub struct UpgradeReceipt {
     pub did: String,
     pub granted_scopes: Vec<String>,
     pub committed_at: u64,
+    #[serde(default = "crate::services::redis_auth_store::default_oauth_profile")]
+    pub oauth_profile: String,
 }
 
 /// Result returned from initiating an upgrade flow.
@@ -358,6 +453,8 @@ pub struct UpgradeStartResult {
     pub state: String,
     pub requested_scopes: Vec<String>,
     pub callback_url: String,
+    #[serde(default = "crate::services::redis_auth_store::default_oauth_profile")]
+    pub oauth_profile: String,
 }
 
 /// Result returned from processing the server-side OAuth callback.
@@ -560,13 +657,15 @@ impl OAuthUpgradeService {
 
     /// Start a progressive OAuth upgrade flow.
     ///
-    /// Validates inputs, rejects current scopes missing `atproto`, rejects duplicate pending
-    /// upgrades if a live flow exists, and persists encrypted flow state.
+    /// Current grants retired from the current client registration are not
+    /// carried into PAR. They are removed by the replacement session at commit;
+    /// unrelated grants still declared in `registered_max_scopes` are retained.
     pub async fn start_upgrade_flow(
         &self,
         old_session_id: &str,
         old_did: &str,
         current_scopes: &[String],
+        registered_max_scopes: &[String],
         additional_scopes: &[String],
         browser_nonce: &str,
     ) -> Result<UpgradeStartResult, UpgradeError> {
@@ -576,43 +675,77 @@ impl OAuthUpgradeService {
 
         validate_additional_scopes(additional_scopes)?;
 
-        // Validate UUID structure
         if Uuid::parse_str(old_session_id).is_err() {
             return Err(UpgradeError::InvalidSessionId);
         }
-
-        // Validate current scopes: must be non-empty, parseable, and must explicitly contain atproto
         if current_scopes.is_empty() {
             return Err(UpgradeError::ScopeDowngrade(
                 "current scopes empty: must contain atproto".into(),
             ));
         }
 
-        let mut has_atproto = false;
-        for s in current_scopes {
-            let parsed = Scope::<smol_str::SmolStr>::parse(s).map_err(|_| {
-                UpgradeError::DisallowedScope(format!("invalid current scope: {s}"))
-            })?;
-            if matches!(parsed, Scope::Atproto) {
-                has_atproto = true;
-            }
-        }
-        if !has_atproto {
+        let parsed_current = current_scopes
+            .iter()
+            .map(|scope| {
+                Scope::<smol_str::SmolStr>::parse(scope).map_err(|_| {
+                    UpgradeError::DisallowedScope(format!("invalid current scope: {scope}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !parsed_current
+            .iter()
+            .any(|scope| matches!(scope, Scope::Atproto))
+        {
             return Err(UpgradeError::ScopeDowngrade(
                 "current scopes missing required atproto scope".into(),
             ));
         }
 
-        // Build combined requested scopes preserving base scopes without duplicate entries
+        let registered = registered_max_scopes
+            .iter()
+            .map(|raw| {
+                Scope::<smol_str::SmolStr>::parse(raw)
+                    .map(|parsed| (raw.trim().to_string(), parsed))
+                    .map_err(|_| {
+                        UpgradeError::DisallowedScope(format!(
+                            "invalid registered maximum scope: {raw}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !registered
+            .iter()
+            .any(|(_, scope)| matches!(scope, Scope::Atproto))
+        {
+            return Err(UpgradeError::ScopeDowngrade(
+                "registered maximum scopes missing required atproto scope".into(),
+            ));
+        }
+
+        let registered_spelling = |grant: &Scope<smol_str::SmolStr>| {
+            registered
+                .iter()
+                .find(|(_, requested)| registered_scope_covers_grant(requested, grant, old_did))
+                .map(|(raw, _)| raw.clone())
+        };
         let mut requested_scopes = Vec::new();
-        for s in current_scopes {
-            if !requested_scopes.contains(s) {
-                requested_scopes.push(s.clone());
+        for parsed in parsed_current {
+            if let Some(registered) = registered_spelling(&parsed) {
+                if !requested_scopes.contains(&registered) {
+                    requested_scopes.push(registered);
+                }
             }
         }
-        for s in additional_scopes {
-            if !requested_scopes.contains(s) {
-                requested_scopes.push(s.clone());
+        for scope in additional_scopes {
+            let parsed = Scope::<smol_str::SmolStr>::parse(scope)
+                .map_err(|_| UpgradeError::DisallowedScope(scope.clone()))?;
+            let registered = registered_spelling(&parsed).ok_or_else(|| {
+                UpgradeError::DisallowedScope(format!(
+                    "scope is absent from current client registration: {scope}"
+                ))
+            })?;
+            if !requested_scopes.contains(&registered) {
+                requested_scopes.push(registered);
             }
         }
 
@@ -628,6 +761,15 @@ impl OAuthUpgradeService {
             return Err(UpgradeError::OldSessionInactive);
         }
 
+        let oauth_profile =
+            open_v2_with_metadata(self.enc_key(), &old_sess_str, "session", &old_session_k)
+                .map(|(old_json, _, _)| {
+                    crate::services::redis_auth_store::extract_oauth_profile_from_session_json(
+                        &old_json,
+                    )
+                })
+                .unwrap_or_else(|_| crate::services::redis_auth_store::default_oauth_profile());
+
         // Generate cryptographically random OAuth state for the upgrade flow
         let state = format!("upg_{}", Uuid::new_v4().simple());
         let flow_state = UpgradeFlowState {
@@ -638,6 +780,7 @@ impl OAuthUpgradeService {
             browser_nonce: browser_nonce.to_string(),
             created_at: current_timestamp_secs(),
             expected_old_session_blob: old_sess_str,
+            oauth_profile: oauth_profile.clone(),
         };
 
         let json = serde_json::to_string(&flow_state)?;
@@ -685,7 +828,25 @@ impl OAuthUpgradeService {
             state,
             requested_scopes,
             callback_url: self.callback_url.clone(),
+            oauth_profile,
         })
+    }
+
+    /// Read the OAuth client profile bound to a pending upgrade flow without consuming it.
+    pub async fn peek_flow_oauth_profile(&self, state: &str) -> String {
+        let mut conn = self.redis.clone();
+        let flow_k = self.flow_key(state);
+        let Ok(Some(encrypted)) = conn.get::<_, Option<String>>(&flow_k).await else {
+            return crate::services::redis_auth_store::default_oauth_profile();
+        };
+        let Ok((json, _, _)) =
+            open_v2_with_metadata(self.enc_key(), &encrypted, "upgrade_flow", &flow_k)
+        else {
+            return crate::services::redis_auth_store::default_oauth_profile();
+        };
+        serde_json::from_str::<UpgradeFlowState>(&json)
+            .map(|f| f.oauth_profile)
+            .unwrap_or_else(|_| crate::services::redis_auth_store::default_oauth_profile())
     }
 
     /// Clean up a cancelled or denied upgrade flow without touching the active session.
@@ -818,9 +979,14 @@ impl OAuthUpgradeService {
             ));
         }
 
-        // Exact/semantic scope verification: every requested scope must be covered by granted scopes
+        // Exact/semantic scope verification: every requested scope must be covered by granted scopes,
+        // including Swan / atproto#5187 `expandSpaceCollections` + `resolveSpaceSelfAuthority` expansions.
         for req in &parsed_requested {
-            let covered = parsed_granted.iter().any(|g| g == req || g.grants(req));
+            let covered = parsed_granted.iter().any(|g| {
+                g == req
+                    || g.grants(req)
+                    || space_scope_matches_lexicon_expansion(req, g, &flow.old_did)
+            });
             if !covered {
                 return Err(UpgradeError::ScopeDowngrade(format!(
                     "requested scope '{}' not granted",
@@ -831,9 +997,11 @@ impl OAuthUpgradeService {
 
         // No unexpected grant beyond target: every granted scope must be covered by requested scopes
         for grant in &parsed_granted {
-            let allowed = parsed_requested
-                .iter()
-                .any(|r| r == grant || r.grants(grant));
+            let allowed = parsed_requested.iter().any(|r| {
+                r == grant
+                    || r.grants(grant)
+                    || space_scope_matches_lexicon_expansion(r, grant, &flow.old_did)
+            });
             if !allowed {
                 return Err(UpgradeError::ScopeDowngrade(format!(
                     "unexpected scope '{}' granted beyond requested target",
@@ -883,9 +1051,14 @@ impl OAuthUpgradeService {
             did: flow.old_did.clone(),
             flow_state: self.fingerprint(&flow.state),
             granted_scopes: granted_scopes.clone(),
-            session_data_json: serde_json::to_string(&session_data)?,
+            session_data_json:
+                crate::services::redis_auth_store::serialize_session_with_oauth_profile(
+                    &session_data,
+                    &flow.oauth_profile,
+                )?,
             created_at: current_timestamp_secs(),
             expected_old_session_blob: flow.expected_old_session_blob,
+            oauth_profile: flow.oauth_profile,
         };
         let staged_json = serde_json::to_string(&staged_candidate)?;
         let cand_key = self.candidate_key(&candidate_session_id);
@@ -1047,6 +1220,7 @@ impl OAuthUpgradeService {
             did: candidate.did.clone(),
             granted_scopes: candidate.granted_scopes.clone(),
             committed_at: current_timestamp_secs(),
+            oauth_profile: candidate.oauth_profile.clone(),
         };
         let receipt_json = serde_json::to_string(&receipt)?;
         let receipt_k = self.receipt_key(candidate_session_id);
@@ -2199,6 +2373,7 @@ mod tests {
             session_data_json: "{}".to_string(),
             created_at: 1700000000,
             expected_old_session_blob: "sealed_old_blob".to_string(),
+            oauth_profile: "catbird".to_string(),
         };
 
         assert_eq!(staged.flow_state, fp_state);
@@ -2228,6 +2403,7 @@ mod tests {
             browser_nonce: "test_nonce".to_string(),
             created_at: 1700000000,
             expected_old_session_blob: "old_blob".to_string(),
+            oauth_profile: "catbird".to_string(),
         };
         let flow_json = serde_json::to_string(&flow_state).unwrap();
         let sealed = seal_v2_with_metadata(&TEST_KEY, &flow_json, &meta).unwrap();
@@ -2348,6 +2524,7 @@ mod disposable_fence_tests {
                 session_data_json: serde_json::to_string(&grant(candidate)).unwrap(),
                 created_at: current_timestamp_secs(),
                 expected_old_session_blob: "synthetic-old-session-cas".into(),
+                oauth_profile: crate::services::redis_auth_store::default_oauth_profile(),
             };
             let candidate_key = self.service.candidate_key(candidate);
             let sealed = seal_v2_with_metadata(

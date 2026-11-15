@@ -176,8 +176,9 @@ fn candidate_children_and_all_local_state_are_included_but_shared_state_is_not()
     let plan =
         prepare(authorization(), captured(), discovery()).unwrap_or_else(|e| panic!("{e:?}"));
     let tables: Vec<_> = plan.sql_operations().iter().map(|o| o.table).collect();
-    assert_eq!(tables.len(), 22);
+    assert_eq!(tables.len(), 23);
     for table in [
+        "push_gateway_keys",
         "push_device_deliveries",
         "push_event_receipts",
         "chat_mute_sync_generations",

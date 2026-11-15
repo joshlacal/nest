@@ -16,6 +16,7 @@ pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atpro
 pub const CIRCLE_ENDPOINTS: &[&str] = &[
     "blue.catbird.circle.activateCircle",
     "blue.catbird.circle.getFeed",
+    "blue.catbird.circle.getKeys",
     "blue.catbird.circle.getMedia",
     "blue.catbird.circle.getPostThread",
     "blue.catbird.circle.listCircles",
@@ -53,6 +54,18 @@ impl ServiceAuthProvider {
     ) -> AppResult<String> {
         self.validate_audience_and_lexicon(audience, lexicon)?;
         self.fetch_service_auth_from_pds(session, audience, lexicon, None)
+            .await
+    }
+
+    /// Mint a PDS service-auth token for `MLS_APPVIEW_SERVICE_REF` using the DPoP key
+    /// already authenticated by gateway middleware.
+    pub async fn token_for_with_dpop(
+        &self,
+        session: &CatbirdSession,
+        lexicon: &str,
+        dpop_data: &JacquardDpopData,
+    ) -> AppResult<String> {
+        self.token_for_audience_with_dpop(session, MLS_APPVIEW_SERVICE_REF, lexicon, dpop_data)
             .await
     }
 
@@ -138,7 +151,7 @@ impl ServiceAuthProvider {
         );
         let dpop_data = match dpop_data {
             Some(dpop_data) => dpop_data.clone(),
-            None => self.resolve_dpop_data(session).await,
+            None => self.resolve_dpop_data(session).await?,
         };
 
         let response = client
@@ -200,30 +213,28 @@ impl ServiceAuthProvider {
         Ok(token)
     }
 
-    async fn resolve_dpop_data(&self, session: &CatbirdSession) -> JacquardDpopData {
-        if let Some(jacquard_client) = &self.state.jacquard_client {
-            if let Ok(did) = jacquard_common::types::did::Did::new(session.did.as_str()) {
-                if let Ok(session_data) = jacquard_client
-                    .registry
-                    .get(&did, &session.id.to_string(), true)
-                    .await
-                {
-                    return JacquardDpopData {
-                        dpop_key: session_data.dpop_data.dpop_key.clone(),
-                        dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
-                    };
-                }
-            }
-        }
+    async fn resolve_dpop_data(&self, session: &CatbirdSession) -> AppResult<JacquardDpopData> {
+        let session_id_str = session.id.to_string();
+        let profile = self
+            .state
+            .session_oauth_profile(&session.did, &session_id_str)
+            .await;
+        let jacquard_client = self
+            .state
+            .oauth_client_for_profile(&profile)
+            .ok_or(AppError::InvalidSession)?;
+        let did = jacquard_common::types::did::Did::new(session.did.as_str())
+            .map_err(|_| AppError::InvalidSession)?;
+        let session_data = jacquard_client
+            .registry
+            .get(&did, &session_id_str, true)
+            .await
+            .map_err(|_| AppError::InvalidSession)?;
 
-        // Ephemeral DPoP key fallback for testing or sessions without registry entries
-        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
-        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
-        let dpop_key = jose_jwk::Key::from(&crypto_key);
-        JacquardDpopData {
-            dpop_key,
-            dpop_host_nonce: String::new(),
-        }
+        Ok(JacquardDpopData {
+            dpop_key: session_data.dpop_data.dpop_key.clone(),
+            dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
+        })
     }
 }
 
@@ -402,14 +413,26 @@ mod tests {
     fn jti_of(token: &str) -> String {
         decode_claim(token, "jti")
     }
+
+    fn test_dpop_data() -> JacquardDpopData {
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn requests_a_pds_token_audienced_to_the_mls_appview_and_bound_to_one_nsid() {
         let pds = MockPds::new().await;
         let provider = ServiceAuthProvider::new(test_state().await);
         let session = test_session("did:plc:alice-req", &pds.uri());
+        let dpop = test_dpop_data();
 
         let _ = provider
-            .token_for(&session, "blue.catbird.chat.getConversations")
+            .token_for_with_dpop(&session, "blue.catbird.chat.getConversations", &dpop)
             .await
             .expect("token minted");
 
@@ -438,17 +461,56 @@ mod tests {
         let pds = MockPds::new().await;
         let provider = ServiceAuthProvider::new(test_state().await);
         let session = test_session("did:plc:alice-circle", &pds.uri());
+        let dpop = test_dpop_data();
         let circle_service = "did:web:circles.catbird.blue#atproto_circles";
         let circle_lxm = "blue.catbird.circle.listCircles";
 
         let _ = provider
-            .token_for_audience(&session, circle_service, circle_lxm)
+            .token_for_audience_with_dpop(&session, circle_service, circle_lxm, &dpop)
             .await
             .expect("Circle service-auth token minted");
 
         let call = pds.single_call().await;
         assert_eq!(call.query("aud"), Some(circle_service));
         assert_eq!(call.query("lxm"), Some(circle_lxm));
+    }
+
+    /// Pins the Circle AppView endpoints the gateway will mint tokens for and proxy. Every
+    /// authenticated `blue.catbird.circle.*` route the AppView serves must be here.
+    #[test]
+    fn circle_endpoint_list_is_pinned() {
+        assert_eq!(
+            CIRCLE_ENDPOINTS,
+            &[
+                "blue.catbird.circle.activateCircle",
+                "blue.catbird.circle.getFeed",
+                "blue.catbird.circle.getKeys",
+                "blue.catbird.circle.getMedia",
+                "blue.catbird.circle.getPostThread",
+                "blue.catbird.circle.listCircles",
+                "blue.catbird.circle.listNotifications",
+                "blue.catbird.circle.reportRecord",
+                "blue.catbird.circle.updatePreferences",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mints_a_circle_token_for_get_keys() {
+        let pds = MockPds::new().await;
+        let provider = ServiceAuthProvider::new(test_state().await);
+        let session = test_session("did:plc:alice-getkeys", &pds.uri());
+        let lxm = "blue.catbird.circle.getKeys";
+        provider
+            .token_for_audience_with_dpop(
+                &session,
+                CIRCLE_APPVIEW_SERVICE_REF,
+                lxm,
+                &test_dpop_data(),
+            )
+            .await
+            .expect("getKeys is a routed Circle endpoint");
+        assert_eq!(pds.single_call().await.query("lxm"), Some(lxm));
     }
 
     /// Regression test for the production defect found 2026-08-22. Tokens were
@@ -462,13 +524,14 @@ mod tests {
         let pds = MockPds::new().await;
         let provider = ServiceAuthProvider::new(test_state().await);
         let session = test_session("did:plc:alice-single-use", &pds.uri());
+        let dpop = test_dpop_data();
 
         let first = provider
-            .token_for(&session, "blue.catbird.chat.getConversations")
+            .token_for_with_dpop(&session, "blue.catbird.chat.getConversations", &dpop)
             .await
             .unwrap();
         let second = provider
-            .token_for(&session, "blue.catbird.chat.getConversations")
+            .token_for_with_dpop(&session, "blue.catbird.chat.getConversations", &dpop)
             .await
             .unwrap();
 
@@ -494,22 +557,108 @@ mod tests {
         let provider = ServiceAuthProvider::new(test_state().await);
         let alice = test_session("did:plc:alice-share", &pds.uri());
         let bob = test_session("did:plc:bob-share", &pds.uri());
+        let alice_dpop = test_dpop_data();
+        let bob_dpop = test_dpop_data();
 
         provider
-            .token_for(&alice, "blue.catbird.chat.getConversations")
+            .token_for_with_dpop(&alice, "blue.catbird.chat.getConversations", &alice_dpop)
             .await
             .unwrap();
         provider
-            .token_for(&alice, "blue.catbird.chat.enrollDevice")
+            .token_for_with_dpop(&alice, "blue.catbird.chat.enrollDevice", &alice_dpop)
             .await
             .unwrap();
         provider
-            .token_for(&bob, "blue.catbird.chat.getConversations")
+            .token_for_with_dpop(&bob, "blue.catbird.chat.getConversations", &bob_dpop)
             .await
             .unwrap();
 
         // lxm is single-endpoint by mls-ds contract and tokens are per-account:
         // three distinct cache keys, three distinct PDS calls.
         assert_eq!(pds.call_count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn proxy_clean_chat_request_passes_preloaded_dpop_without_registry() {
+        let pds = MockPds::new().await;
+        let chat_ds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/blue.catbird.chat.getConversations"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "convos": [] })),
+            )
+            .expect(1)
+            .mount(&chat_ds)
+            .await;
+
+        let mut config = AppConfig::load().unwrap();
+        config.chat.enabled = true;
+        config.chat.ds_internal_url = chat_ds.uri();
+        let http_client = crate::services::build_hardened_http_client().unwrap();
+        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            http_client: http_client.clone(),
+            raw_http_client: http_client,
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let mls = crate::services::MlsAuthService::new(state);
+        let session = test_session("did:plc:alice-chat", &pds.uri());
+        let dpop = test_dpop_data();
+
+        let (status, _, _) = mls
+            .proxy_clean_chat_request(
+                &session,
+                reqwest::Method::GET,
+                "blue.catbird.chat.getConversations",
+                None,
+                None,
+                None,
+                Some("device-valid-1"),
+                Some(&dpop),
+            )
+            .await
+            .expect("preloaded dpop_data must succeed without registry");
+        assert_eq!(status, 200);
+        assert_eq!(pds.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_dpop_data_fails_closed_instead_of_random_key() {
+        let pds = MockPds::new().await;
+        let provider = ServiceAuthProvider::new(test_state().await);
+        let session = test_session("did:plc:alice-missing-dpop", &pds.uri());
+
+        let err = provider
+            .token_for(&session, "blue.catbird.chat.getConversations")
+            .await
+            .expect_err("missing session DPoP material must fail closed");
+        assert!(
+            matches!(err, AppError::InvalidSession),
+            "expected AppError::InvalidSession, got: {err:?}"
+        );
+        assert_eq!(
+            pds.call_count().await,
+            0,
+            "must never call PDS with an unbound random DPoP key"
+        );
     }
 }

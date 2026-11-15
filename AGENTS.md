@@ -47,9 +47,14 @@ Catbird iOS --[Session Cookie]--> Nest Gateway --[DPoP + Access Token]--> User P
 5. Nest optionally enriches response (content injection)
 6. Returns modified JSON to iOS
 
-### MLS proxy path (nest is NOT MLS-free)
+### Chat proxy path (nest is NOT MLS-free)
 
-MLS implementation and storage live in **mls-ds**, but nest retains an **active MLS proxy**. MLS lexicons (`blue.catbird.mlsChat.*`) are intercepted in `handlers/atproto.rs` and routed through `MlsAuthService` (`services/mls_auth.rs`) to local mls-ds at `http://127.0.0.1:3001`, with a minted service-auth JWT (`aud=did:web:chat.catbird.blue`, `gateway_did=did:web:api.catbird.blue`). Do not assume "MLS moved to mls-ds" means nest no longer touches MLS — it is on the hot request path.
+MLS implementation and storage live in **mls-ds**, but nest is on the hot chat request path. `handlers/atproto.rs::proxy_xrpc` sends every `blue.catbird.chat.*` NSID except `blue.catbird.chat.defs` through `MlsAuthService::proxy_clean_chat_request` (`services/mls_auth.rs`) to `CATBIRD__MLS__SERVICE_URL` whenever chat routing is enabled (`mls.service_url` set, `chat.enabled`, or `CHAT_ENABLED=1`). Each request carries a fresh PDS-issued user service-auth token (`aud` = `CATBIRD__MLS__SERVICE_DID`, default `did:web:mlschat.catbird.blue`; `lxm` = the NSID) and an `x-catbird-chat-device-id` header.
+
+- `CHAT_ENDPOINTS` (38 NSIDs, count pinned in `tests/integration_tests.rs`) is the `lxm` allowlist. `services/service_auth.rs` refuses to mint a token for a chat NSID that is not listed, so a procedure missing from the list fails for every client. The list includes the encrypted direct-request procedures (`prepareDirectRequest`, `publishDirectRequest`, `publishDirectRequestKeys`, `cancelDirectRequestPreparation`, `getDirectRequestOutcome`) and `getDeviceKey`.
+- Method names are matched byte for byte, so `validate_proxy_lexicon` refuses any name with an uppercase letter in its authority and any letter-case variant of a gated, blocked or specially routed method (`is_non_canonical_policy_nsid`). The reference PDS matches method names case-insensitively; without this a variant such as `com.atproto.server.getserviceauth` would skip the gateway's check and still be served upstream.
+- `proxy_body_limit` bounds the request body before any token is minted: 16 MiB for `publishDirectRequest` and `publishDirectRequestKeys`, 64 KiB for `prepareDirectRequest` and `cancelDirectRequestPreparation`, 10 MiB for everything else. A larger body gets `413 RequestTooLarge` and never reaches the DS or the PDS.
+- Legacy `blue.catbird.mlsChat.*` is no longer intercepted (`MlsAuthService::is_mls_lexicon` matches clean-chat only); it goes through the generic PDS proxy like any other NSID.
 
 ### Push notifications (nest owns ALL push — social + chat)
 
@@ -70,10 +75,20 @@ Since July 2026, nest is the single push-notification owner for Catbird
   accounts and enqueues chat push (`poller.rs`, `scheduler.rs`,
   `rate_budget.rs` per-PDS budgets, `mute_sync.rs`). Dormant in prod as of
   Jul 2026 (Bsky chat parity program).
+- **`services/push/gateway.rs` — D2 MLS Push Gateway** (handlers in `handlers/push_gateway.rs`).
+  - `POST /xrpc/blue.catbird.push.registerKey` (session auth) stores the device's encrypted native APNs/FCM token and returns an opaque 256-bit `pushKey` bound to the account DID, device ID, app ID and the account's `#atproto_mls` service DID. The device then registers that key with its DS through `blue.catbird.chat.registerPushGateway`.
+  - `POST /xrpc/blue.catbird.push.deliver` sits outside session auth. The DS signs a `#atproto` DID-JWT (ES256 or ES256K) bound to `htm`, `htu` (path `/xrpc/blue.catbird.push.deliver`), `iat`/`exp` (±60 s skew, ≤60 s lifetime), a single-use `jti` and the body SHA-256. Bodies are capped at 16 KiB.
+  - The payload is wake metadata only: `wakeKind` (`applicationMessage`, `controlTransition`, `directRequest` or `welcome`), `conversationId`, `generation`, `seq`, `epoch`, and an optional `ciphertext` of at most 2,200 bytes. Any other field, including `aps`, `title` or `body`, is `400 InvalidRequest`. Nest writes the only display text: APNs gets `aps.alert.body = "New message"` with `mutable-content: 1` plus a `catbird` object (`recipientAccountHash`, the wake fields, `fetchRequired`); FCM gets a high-priority data-only message whose `data.catbird` is that object as a JSON string.
+  - Unknown, revoked or wrong-DS `pushKey`s all get the same `202 {"accepted": true}` (constant-time comparison). `410 PushTokenGone` is returned only when the calling DS is the key's bound service and the provider reported the native token unregistered. Per-DS and per-key token buckets drop floods before any provider call.
+  - `deliver` has its own pre-authentication limit, `PUSH_DELIVER_IP_LIMIT` (1,200 requests a minute per source IP, `middleware/rate_limit.rs`), counted separately from the sign-in limiter. Over it the caller gets `429 RateLimited`. The caller's DID document is read with a 256 KiB cap enforced while streaming, because it is fetched before the signature is verified.
+  - Each key records the fingerprint of the session that registered it (`push_gateway_keys.auth_session_fingerprint`). The key is revoked when that session signs out or calls `unregisterPush` for the same app, follows the session through a scope upgrade, and is deleted with the account in account erasure. There is no `unregisterKey` method.
+  - FCM delivery needs `CATBIRD_FCM_PROJECT_ID` and `CATBIRD_FCM_BEARER_TOKEN`. WebPush is not configured.
+  - **Direct-request wakes:** the DS worker wakes a recipient's devices (`wakeKind=directRequest`) for a published encrypted direct request. A provider failure is redelivered by the DS's durable retry, a lost gateway ACK is retried with an identical wake (same collapse ID and envelope), a request answered before the wake is never woken, and a device that re-registered with an FCM token is woken only through FCM. The paired qualification tests are in `services/push/request_events/` (`#[cfg(test)]`, `#[ignore]`): `paired_harness::live_ds_worker_to_nest` (t16) and `c32_paired_harness::live_ds_worker_to_nest_c32` (C32). `mls-ds/e2e-tests` starts them as a second process with `CATBIRD_REQUEST_PUSH_PAIRED_DIR` (a `/tmp/<prefix>*` directory) and `CATBIRD_REQUEST_PUSH_TEST_DB`; they do not run standalone.
 
 Client-facing endpoints in `handlers/push.rs`: `register_push`,
 `unregister_push`, `get_preferences`, `put_preferences_v2`,
-`list_activity_subscriptions`, `put_activity_subscription`.
+`list_activity_subscriptions`, `put_activity_subscription`. MLS wake keys are
+registered through `blue.catbird.push.registerKey` (above).
 
 
 ### Circles (nest holds NO Circle role)
@@ -91,8 +106,10 @@ nest/catbird/src/
 ├── bin/
 │   └── session_migrate.rs # One-off session-store migration tool
 ├── handlers/
-│   ├── atproto.rs       # XRPC proxy handler
+│   ├── atproto.rs       # XRPC proxy handler (chat routing + body limits)
 │   ├── push.rs          # Push registration + preferences endpoints
+│   ├── push_gateway.rs  # D2 MLS push gateway: registerKey, deliver
+│   ├── oauth_upgrade.rs # Progressive scope upgrade endpoints
 │   ├── chat_poll.rs     # Chat-poll enrollment endpoints
 │   └── mod.rs
 ├── middleware/
@@ -104,9 +121,11 @@ nest/catbird/src/
 └── services/
     ├── atproto_client.rs  # Upstream PDS client
     ├── crypto.rs          # DPoP key management
-    ├── mls_auth.rs        # MLS proxy: mints service-auth JWT, forwards MLS lexicons to mls-ds (live hot path)
-    ├── oauth.rs           # OAuth flow (PAR, token exchange)
-    ├── push/              # APNS push pipeline (see Push notifications above)
+    ├── mls_auth.rs        # Chat proxy: CHAT_ENDPOINTS, proxy_body_limit, forwards blue.catbird.chat.* to mls-ds (live hot path)
+    ├── service_auth.rs    # PDS service-auth minting; per-audience lxm allowlists
+    ├── oauth_authorize.rs # PAR with byte-exact raw scopes
+    ├── oauth_upgrade.rs   # Progressive scope upgrade (allowlisted scopes only)
+    ├── push/              # APNS pipeline + D2 gateway (see Push notifications above)
     ├── chat_poll/         # chat.bsky poller (see Push notifications above)
     ├── redis_auth_store.rs # Session/auth persistence in Redis/Valkey
     ├── redis_crypto.rs    # Encryption for Redis-stored secrets
@@ -116,7 +135,7 @@ nest/catbird/src/
 ## Key Dependencies
 
 - **axum** 0.7 - Web framework
-- **atrium-api / atrium-oauth** - AT Protocol SDK (git dependency)
+- **jacquard-oauth / jacquard-common / jacquard-identity** - AT Protocol OAuth, XRPC and identity (git dependency, pinned rev)
 - **redis** 0.25 - Session storage
 - **p256 / jsonwebtoken** - DPoP and JWT signing
 - **tower-http** - CORS, tracing, request IDs
@@ -127,6 +146,16 @@ nest/catbird/src/
 1. **Login**: iOS requests login URL -> Nest generates PAR -> redirects to PDS
 2. **Callback**: PDS redirects to Nest -> token exchange (Private Key JWT) -> creates Redis session -> redirects to iOS with session cookie
 3. **Requests**: Cookie validated -> access token retrieved from Redis -> refreshed if expired -> DPoP-signed request to PDS
+4. **Scope upgrade** (`services/oauth_upgrade.rs`): `POST /auth/upgrade` (session + browser nonce) -> PDS consent -> fixed callback `https://catbird.blue/oauth/permission-callback` -> `POST /auth/upgrade/exchange` -> `POST /auth/upgrade/commit`. Commit activates the candidate session atomically; the old session stays live until then. Only `ALLOWED_UPGRADE_SCOPES` can be requested.
+
+### Labyrinth Space scopes
+
+Labyrinth history backup needs two Space scopes, in these exact explicit forms (`models/oauth_upgrade.rs`; `MAX_SCOPE_LEN` is 512):
+
+- `LABYRINTH_MAILBOX_SPACE_SCOPE`: `space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete`
+- `LABYRINTH_CONVERSATION_SPACE_SCOPE`: `space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek`
+
+`oauth_authorize::start_auth_with_raw_scopes` sends them byte-exact at PAR, because jacquard's normalization rewrites `space:` scopes and Swan rejects the result with `invalid_scope`. The retired forms `space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete` and `space:blue.catbird.labyrinth.conversation?authority=*` are no longer allowlisted. Clients (Rust `catbird_mls::REQUIRED_LABYRINTH_OAUTH_SCOPES`, CatbirdMLSCore `MLSAppGroupStorage.requiredSpacesScopes`, Android `MlsSdkManager.REQUIRED_SPACES_OAUTH_SCOPES`, catmos `src/lib/labyrinth-ui.ts` `REQUIRED_LABYRINTH_OAUTH_SCOPES`) report a session that holds only the retired forms as missing both scopes, so the user must re-authorize; a Nest session does that through the upgrade flow above. Both scopes are part of `default_max_scopes()` and the commented `CATBIRD__OAUTH__MAX_SCOPES` example in `catbird/.env.example` and `catbird/config/default.toml`.
 
 ## Deployment
 

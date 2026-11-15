@@ -97,6 +97,7 @@ pub const SQL_TABLES: &[SqlTableSpec] = &[
     table!("user_blocks", "user_did", "text", false),
     table!("user_mutes", "user_did", "text", false),
     table!("moderation_list_subscriptions", "user_did", "text", false),
+    table!("push_gateway_keys", "account_did", "text", true),
     table!("user_devices", "did", "text", true),
     table!("push_event_receipts", "recipient_did", "text", true),
     table!("push_accounts", "account_did", "text", true),

@@ -263,13 +263,26 @@ pub async fn upgrade_start(
     })?;
 
     let upgrade_service = get_upgrade_service(&state)?;
+    let session_id = session.id.to_string();
+    let oauth_profile = state.session_oauth_profile(&session.did, &session_id).await;
+    let registered_max_scopes: Vec<String> =
+        if matches!(oauth_profile.trim(), "catmos" | "catmos-web") {
+            state
+                .catmos_oauth_scopes
+                .iter()
+                .map(|scope| scope.to_string_normalized().to_string())
+                .collect()
+        } else {
+            state.config.oauth.max_scopes.clone()
+        };
 
     // 6. Start flow in service
     let start_result = upgrade_service
         .start_upgrade_flow(
-            &session.id.to_string(),
+            &session_id,
             &session.did,
             &session.granted_scopes,
+            &registered_max_scopes,
             &payload.additional_scopes,
             &payload.browser_nonce,
         )
@@ -287,25 +300,33 @@ pub async fn upgrade_start(
             AppError::Internal("OAuth upgrade operation failed".into())
         })?;
 
-    let jacquard_client = state.jacquard_client.as_ref().ok_or_else(|| {
-        tracing::error!(
-            category = "jacquard",
-            "Jacquard OAuthClient not initialized"
-        );
-        AppError::Internal("OAuth upgrade operation failed".into())
-    })?;
+    let jacquard_client = state
+        .oauth_client_for_profile(&start_result.oauth_profile)
+        .ok_or_else(|| {
+            tracing::error!(
+                category = "jacquard",
+                oauth_profile = %start_result.oauth_profile,
+                "Jacquard OAuthClient not initialized for session profile"
+            );
+            AppError::Internal("OAuth upgrade operation failed".into())
+        })?;
 
-    let redirect_url =
-        jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.redirect_uri.as_str())
-            .map_err(|e| {
-                tracing::error!(
-                    category = "url_parse",
-                    error = %e,
-                    "Invalid OAuth redirect URI configured in state.config.oauth.redirect_uri"
-                );
-                AppError::Internal("OAuth upgrade operation failed".into())
-            })?
-            .to_owned();
+    let redirect_override = if start_result.oauth_profile == "catmos" {
+        None
+    } else {
+        Some(
+            jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.redirect_uri.as_str())
+                .map_err(|e| {
+                    tracing::error!(
+                        category = "url_parse",
+                        error = %e,
+                        "Invalid OAuth redirect URI configured in state.config.oauth.redirect_uri"
+                    );
+                    AppError::Internal("OAuth upgrade operation failed".into())
+                })?
+                .to_owned(),
+        )
+    };
 
     let flow_state = start_result.state.clone();
     let auth_identifier = resolve_oauth_identifier(&session.pds_url);
@@ -314,12 +335,13 @@ pub async fn upgrade_start(
     // and the PAR's scope comes from the client metadata rather than from
     // `AuthorizeOptions`, so the request is built per call. See
     // `services::oauth_authorize`.
-    let auth_url = match crate::services::oauth_authorize::start_auth_with_scopes(
+    let auth_url = match crate::services::oauth_authorize::start_auth_with_raw_scopes(
         jacquard_client,
         &auth_identifier,
         &parsed_scopes,
+        &start_result.requested_scopes,
         &flow_state,
-        Some(redirect_url),
+        redirect_override,
     )
     .await
     {
@@ -510,7 +532,7 @@ pub async fn upgrade_commit(
         );
 
         // Compensation 1: Revoke candidate session at Auth server (remote)
-        if let Some(jacquard_client) = &state.jacquard_client {
+        if let Some(jacquard_client) = state.oauth_client_for_profile(&receipt.oauth_profile) {
             let revoked = match jacquard_client
                 .restore(&parsed_did, &receipt.candidate_session_id)
                 .await
@@ -623,6 +645,11 @@ mod tests {
                 "account:email?action=manage",
                 "account:status?action=manage",
                 crate::models::oauth_upgrade::CIRCLE_SPACE_SCOPE,
+                crate::models::oauth_upgrade::BLOB_ALL_SCOPE,
+                crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE,
+                crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE,
+                crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE,
+                crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE,
             ]
         );
     }

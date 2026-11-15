@@ -42,7 +42,7 @@ redirect_uri = "http://localhost:3000/auth/callback"
 # Declared maximum scopes in client metadata (union of initial + optional progressive scopes).
 # Progressive requests request explicit subsets during authorization/upgrade.
 # Note: App-password management and account deletion scopes are excluded by design.
-# Defaults to union(initial_scopes, ["identity:handle", "account:email?action=manage", "account:status?action=manage"])
+# Defaults to union(initial_scopes, default_optional_scopes()):
 # max_scopes = [
 #   "atproto",
 #   "transition:generic",
@@ -50,6 +50,12 @@ redirect_uri = "http://localhost:3000/auth/callback"
 #   "identity:handle",
 #   "account:email?action=manage",
 #   "account:status?action=manage",
+#   "space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update",
+#   "blob:*/*",
+#   "repo:blue.catbird.labyrinth.mailboxKeys",
+#   "repo:blue.catbird.chat.device",
+#   "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
+#   "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
 # ]
 
 # Legacy compatibility alias (backward-compatible initial input when initial_scopes is absent; does not inherit optional max scopes)

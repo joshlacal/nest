@@ -25,15 +25,18 @@ mod ssrf;
 
 pub use atproto_client::{
     bounded_byte_stream, bounded_byte_stream_with_accounting, bounded_byte_stream_with_permit,
-    filter_client_headers, AtProtoClient, ProxyResponse, MAX_RESPONSE_SIZE,
+    filter_client_headers, is_valid_atproto_proxy_header, is_valid_atproto_proxy_header_with_extra,
+    validate_atproto_proxy_headers, validated_atproto_proxy, validated_atproto_proxy_with_extra,
+    AtProtoClient, ProxyResponse, ALLOWED_ATPROTO_PROXY_SERVICE_IDS, MAX_RESPONSE_SIZE,
+    STREAM_THRESHOLD,
 };
 pub use crypto::KeyStore;
 pub use dpop_nonce_cache::DpopNonceCache;
 pub use mls_auth::{
     calculate_ath, calculate_rfc7638_jkt, generate_dpop_proof, p256_jwk_thumbprint,
-    p256_verifying_key_thumbprint, parse_p256_signing_key, public_p256_jwk_from_signing_key,
-    public_p256_jwk_from_verifying_key, verify_dpop_proof, DpopProofClaims, DpopProofHeader,
-    MlsAuthService, PublicP256Jwk, CHAT_ENDPOINTS,
+    p256_verifying_key_thumbprint, parse_p256_signing_key, proxy_body_limit,
+    public_p256_jwk_from_signing_key, public_p256_jwk_from_verifying_key, verify_dpop_proof,
+    DpopProofClaims, DpopProofHeader, MlsAuthService, PublicP256Jwk, CHAT_ENDPOINTS,
 };
 pub use oauth_upgrade::{
     is_allowed_upgrade_scope, is_valid_browser_nonce, validate_additional_scopes,

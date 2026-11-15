@@ -2,7 +2,7 @@
 //!
 //! Handles service auth tokens for Gateway → Delivery Service communication.
 //! Supports both:
-//! - Clean-chat (`blue.catbird.chat.*`, all 32 endpoints): PDS-issued user service auth tokens (Bearer)
+//! - Clean-chat (`blue.catbird.chat.*`, every delivery-service procedure): PDS-issued user service auth tokens (Bearer)
 //!   and direct Delivery Service routing.
 //! - Legacy MLS (`blue.catbird.mlsChat.*`): Gateway-issued ES256 service tokens (Bearer)
 //!   and direct Delivery Service routing.
@@ -26,11 +26,13 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// All 32 clean-chat procedures defined in blue.catbird.chat.*
+/// Every clean-chat procedure the delivery service serves under blue.catbird.chat.*,
+/// including the encrypted direct-request procedures.
 pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.acceptConversation",
     "blue.catbird.chat.acknowledgeWelcome",
     "blue.catbird.chat.activateReset",
+    "blue.catbird.chat.cancelDirectRequestPreparation",
     "blue.catbird.chat.cancelLeafRecovery",
     "blue.catbird.chat.cancelLeave",
     "blue.catbird.chat.closeConversation",
@@ -41,13 +43,18 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.getBlobUsage",
     "blue.catbird.chat.getConversationState",
     "blue.catbird.chat.getConversations",
+    "blue.catbird.chat.getDeviceKey",
     "blue.catbird.chat.getDevices",
+    "blue.catbird.chat.getDirectRequestOutcome",
     "blue.catbird.chat.getEntries",
     "blue.catbird.chat.getLeafRecoveryInbox",
     "blue.catbird.chat.getOwnDevices",
     "blue.catbird.chat.getPendingWelcomes",
     "blue.catbird.chat.getSubscriptionTicket",
     "blue.catbird.chat.prepareBlobUpload",
+    "blue.catbird.chat.prepareDirectRequest",
+    "blue.catbird.chat.publishDirectRequest",
+    "blue.catbird.chat.publishDirectRequestKeys",
     "blue.catbird.chat.publishTyping",
     "blue.catbird.chat.rejectWelcome",
     "blue.catbird.chat.replenishKeyPackages",
@@ -61,6 +68,20 @@ pub const CHAT_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.uploadBlob",
     "blue.catbird.chat.updatePushToken",
 ];
+
+/// Exact proxy body limit per procedure. The direct-request procedures mirror
+/// the delivery service's route limits (a 16 MiB signed publication bundle, a
+/// 64 KiB signed prepare/cancel); every other procedure keeps 10 MiB.
+pub fn proxy_body_limit(lexicon: &str) -> usize {
+    match lexicon {
+        "blue.catbird.chat.publishDirectRequest" | "blue.catbird.chat.publishDirectRequestKeys" => {
+            16 * 1024 * 1024
+        }
+        "blue.catbird.chat.prepareDirectRequest"
+        | "blue.catbird.chat.cancelDirectRequestPreparation" => 64 * 1024,
+        _ => 10 * 1024 * 1024,
+    }
+}
 
 /// Public EC P-256 JWK embedded in DPoP proof headers (deny_unknown_fields)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,7 +360,7 @@ impl MlsAuthService {
         false
     }
 
-    /// Check if a lexicon belongs to clean-chat (`blue.catbird.chat.*`, 32 endpoints)
+    /// Check if a lexicon belongs to clean-chat (`blue.catbird.chat.*`)
     pub fn is_clean_chat_lexicon(lexicon: &str) -> bool {
         let prefix = "blue.catbird.chat";
         lexicon.len() > prefix.len()
@@ -553,39 +574,9 @@ impl MlsAuthService {
             .await
             .map_err(|e| AppError::Internal(format!("MLS request failed: {}", e)))?;
 
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-
-        let content_length = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
-
-        if let Some(len) = content_length {
-            if len > MAX_RESPONSE_SIZE {
-                return Err(AppError::ResponseTooLarge(format!(
-                    "MLS response size {} bytes exceeds maximum allowed {} bytes",
-                    len, MAX_RESPONSE_SIZE
-                )));
-            }
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut body_vec = Vec::new();
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| AppError::Internal(format!("Failed to read MLS response: {}", e)))?;
-            if body_vec.len() + chunk.len() > MAX_RESPONSE_SIZE {
-                return Err(AppError::ResponseTooLarge(format!(
-                    "MLS response exceeded maximum size of {} bytes while reading",
-                    MAX_RESPONSE_SIZE
-                )));
-            }
-            body_vec.extend_from_slice(&chunk);
-        }
-
-        let body = bytes::Bytes::from(body_vec);
+        let (status, headers, body) = self
+            .read_bounded_mls_response(session, response, "MLS")
+            .await?;
 
         tracing::debug!(
             lexicon = %lexicon,
@@ -595,6 +586,90 @@ impl MlsAuthService {
         );
 
         Ok((status, headers, body))
+    }
+
+    async fn read_bounded_mls_response(
+        &self,
+        session: &CatbirdSession,
+        response: reqwest::Response,
+        label: &str,
+    ) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
+        let status = response.status().as_u16();
+        let mut headers = response.headers().clone();
+
+        let had_content_encoding = headers.remove(reqwest::header::CONTENT_ENCODING).is_some();
+        let content_length = if had_content_encoding {
+            headers.remove(reqwest::header::CONTENT_LENGTH);
+            None
+        } else {
+            headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+        };
+
+        if let Some(len) = content_length {
+            if len > MAX_RESPONSE_SIZE {
+                return Err(AppError::ResponseTooLarge(format!(
+                    "{label} response size {len} bytes exceeds maximum allowed {MAX_RESPONSE_SIZE} bytes"
+                )));
+            }
+        }
+
+        let mut held_permit = if content_length.is_none()
+            || had_content_encoding
+            || content_length.is_some_and(|l| l > super::atproto_client::STREAM_THRESHOLD)
+        {
+            Some(
+                self.state
+                    .active_stream_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+            )
+        } else {
+            None
+        };
+
+        let session_id_str = session.id.to_string();
+        let mut stream = response.bytes_stream();
+        let mut body_vec = Vec::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result
+                .map_err(|e| AppError::Internal(format!("Failed to read {label} response: {e}")))?;
+            if body_vec.len() + chunk.len() > MAX_RESPONSE_SIZE {
+                return Err(AppError::ResponseTooLarge(format!(
+                    "{label} response exceeded maximum size of {MAX_RESPONSE_SIZE} bytes while reading"
+                )));
+            }
+            if held_permit.is_none()
+                && body_vec.len() + chunk.len() > super::atproto_client::STREAM_THRESHOLD
+            {
+                held_permit = Some(
+                    self.state
+                        .active_stream_semaphore
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+                );
+            }
+            self.state
+                .rate_limit
+                .check_and_record_bytes(&session_id_str, chunk.len() as u64)
+                .await
+                .map_err(|retry_after| AppError::RateLimitExceeded { retry_after })?;
+            body_vec.extend_from_slice(&chunk);
+        }
+
+        if had_content_encoding || headers.contains_key(reqwest::header::CONTENT_LENGTH) {
+            headers.insert(
+                reqwest::header::CONTENT_LENGTH,
+                reqwest::header::HeaderValue::from(body_vec.len()),
+            );
+        }
+
+        Ok((status, headers, bytes::Bytes::from(body_vec)))
     }
 
     /// Make a clean-chat authenticated request (Authorization: Bearer <token>)
@@ -608,7 +683,7 @@ impl MlsAuthService {
         body: Option<bytes::Bytes>,
         content_type: Option<&str>,
         device_id_override: Option<&str>,
-        _dpop_key_override: Option<&SigningKey>,
+        dpop_data: Option<&crate::middleware::JacquardDpopData>,
     ) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
         let service_url = self
             .service_url()
@@ -630,24 +705,9 @@ impl MlsAuthService {
         // 2. Request body (actorDeviceId / deviceId / recipientDeviceId)
         // 3. Database lookup for session.did in chat.devices (active device)
         // 4. Fallback UUIDv4
-        let device_id = if let Some(id) = device_id_override {
-            id.to_string()
-        } else if let Some(id) = body.as_ref().and_then(|b| {
-            serde_json::from_slice::<serde_json::Value>(b)
-                .ok()
-                .and_then(|v| {
-                    let inner = v
-                        .get("signedRequest")
-                        .and_then(|sr| sr.get("body"))
-                        .unwrap_or_else(|| v.get("body").unwrap_or(&v));
-                    inner
-                        .get("actorDeviceId")
-                        .or_else(|| inner.get("deviceId"))
-                        .or_else(|| inner.get("recipientDeviceId"))
-                        .and_then(|d| d.as_str())
-                        .map(|s| s.to_string())
-                })
-        }) {
+        let device_id = if let Some(id) =
+            extract_chat_device_id(device_id_override, body.as_deref())?
+        {
             id
         } else if let Some(ref pool) = self.state.push_db {
             let row: Option<(Uuid,)> = sqlx::query_as(
@@ -664,10 +724,13 @@ impl MlsAuthService {
             Uuid::new_v4().hyphenated().to_string()
         };
 
-        // Obtain PDS-issued user service auth token
-        let token = super::service_auth::ServiceAuthProvider::new(self.state.clone())
-            .token_for(session, lexicon)
-            .await?;
+        // Obtain PDS-issued user service auth token using preloaded gateway DPoP key material when available
+        let provider = super::service_auth::ServiceAuthProvider::new(self.state.clone());
+        let token = if let Some(dpop) = dpop_data {
+            provider.token_for_with_dpop(session, lexicon, dpop).await?
+        } else {
+            provider.token_for(session, lexicon).await?
+        };
 
         let mut request = self
             .state
@@ -689,39 +752,9 @@ impl MlsAuthService {
             .await
             .map_err(|e| AppError::Internal(format!("Chat request failed: {}", e)))?;
 
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-
-        let content_length = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
-
-        if let Some(len) = content_length {
-            if len > MAX_RESPONSE_SIZE {
-                return Err(AppError::ResponseTooLarge(format!(
-                    "Chat response size {} bytes exceeds maximum allowed {} bytes",
-                    len, MAX_RESPONSE_SIZE
-                )));
-            }
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut body_vec = Vec::new();
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| AppError::Internal(format!("Failed to read chat response: {}", e)))?;
-            if body_vec.len() + chunk.len() > MAX_RESPONSE_SIZE {
-                return Err(AppError::ResponseTooLarge(format!(
-                    "Chat response exceeded maximum size of {} bytes while reading",
-                    MAX_RESPONSE_SIZE
-                )));
-            }
-            body_vec.extend_from_slice(&chunk);
-        }
-
-        let body = bytes::Bytes::from(body_vec);
+        let (status, headers, body) = self
+            .read_bounded_mls_response(session, response, "Chat")
+            .await?;
 
         probe_bytes_encoding(lexicon, status, &body);
 
@@ -734,6 +767,46 @@ impl MlsAuthService {
 
         Ok((status, headers, body))
     }
+}
+
+/// Validate a client-supplied chat device identifier (`1..=128` ASCII `[A-Za-z0-9._:-]`).
+pub fn validate_chat_device_id(id: &str) -> AppResult<&str> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(AppError::BadRequest("Invalid chat device ID".into()));
+    }
+    Ok(id)
+}
+
+/// Extract and validate `x-catbird-chat-device-id` from client header override or JSON body.
+pub fn extract_chat_device_id(
+    device_id_override: Option<&str>,
+    body: Option<&[u8]>,
+) -> AppResult<Option<String>> {
+    if let Some(id) = device_id_override {
+        return Ok(Some(validate_chat_device_id(id)?.to_string()));
+    }
+    if let Some(raw_body) = body {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw_body) {
+            let inner = v
+                .get("signedRequest")
+                .and_then(|sr| sr.get("body"))
+                .unwrap_or_else(|| v.get("body").unwrap_or(&v));
+            if let Some(id) = inner
+                .get("actorDeviceId")
+                .or_else(|| inner.get("deviceId"))
+                .or_else(|| inner.get("recipientDeviceId"))
+                .and_then(|d| d.as_str())
+            {
+                return Ok(Some(validate_chat_device_id(id)?.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// TEMPORARY diagnostic (2026-08-22). The iOS client cannot decode
@@ -826,6 +899,32 @@ fn probe_bytes_encoding(lexicon: &str, status: u16, body: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_request_procedures_are_proxied_with_their_delivery_service_limits() {
+        for nsid in [
+            "blue.catbird.chat.prepareDirectRequest",
+            "blue.catbird.chat.publishDirectRequest",
+            "blue.catbird.chat.publishDirectRequestKeys",
+            "blue.catbird.chat.cancelDirectRequestPreparation",
+            "blue.catbird.chat.getDirectRequestOutcome",
+            "blue.catbird.chat.getDeviceKey",
+        ] {
+            assert!(CHAT_ENDPOINTS.contains(&nsid), "{nsid} must be proxied");
+        }
+        assert_eq!(
+            proxy_body_limit("blue.catbird.chat.publishDirectRequest"),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            proxy_body_limit("blue.catbird.chat.prepareDirectRequest"),
+            64 * 1024
+        );
+        assert_eq!(
+            proxy_body_limit("blue.catbird.chat.sendMessage"),
+            10 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn test_is_mls_lexicon_recognition() {
@@ -965,5 +1064,127 @@ mod tests {
         let url_safe_sec1 = URL_SAFE_NO_PAD.encode(sec1_bytes);
         let parsed_url_safe = parse_p256_signing_key(&url_safe_sec1).unwrap();
         assert_eq!(parsed_url_safe.to_bytes(), key.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_b5_validate_and_extract_chat_device_id_rejects_malformed_ids() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pds = MockServer::start().await;
+        let mls_srv = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&pds)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mls_srv)
+            .await;
+
+        let mut config = crate::config::AppConfig::test_default();
+        config.mls.service_url = Some(mls_srv.uri());
+
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.as_str()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+
+        let state = Arc::new(crate::config::AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            raw_http_client: crate::services::build_hardened_raw_http_client().unwrap(),
+            redis,
+            push_db: None,
+            key_store: None,
+            jacquard_client: None,
+            catmos_jacquard_client: None,
+            catmos_oauth_scopes: vec![],
+            trusted_proxies: vec![],
+            auth_store: None,
+            push: None,
+            dpop_nonce_cache: Arc::new(crate::services::DpopNonceCache::new()),
+            session_encryption_key: None,
+            active_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rate_limit: Arc::new(crate::middleware::RateLimitState::default()),
+            session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_index_readiness: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let session = CatbirdSession {
+            id: Uuid::new_v4(),
+            did: "did:plc:z72i7hdynmk6r22z27h6tvur".to_string(),
+            handle: "alice.test".to_string(),
+            pds_url: pds.uri(),
+            access_token: "mock-token".to_string(),
+            refresh_token: "mock-refresh".to_string(),
+            scopes: vec!["atproto".to_string()],
+            access_token_expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            granted_scopes: vec!["atproto".to_string()],
+        };
+
+        let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+        let crypto_key = jose_jwk::crypto::Key::from(secret_key);
+        let dpop_key = jose_jwk::Key::from(&crypto_key);
+        let dpop_data = crate::middleware::JacquardDpopData {
+            dpop_key,
+            dpop_host_nonce: String::new(),
+        };
+
+        let svc = MlsAuthService::new(state);
+        let overlong = "a".repeat(129);
+        for bad_id in [
+            "",
+            overlong.as_str(),
+            "device id with spaces",
+            "dev\r\nx-injected:1",
+            "../traversal",
+            "dev;drop",
+        ] {
+            let err = svc
+                .proxy_clean_chat_request(
+                    &session,
+                    reqwest::Method::GET,
+                    "blue.catbird.chat.getConversations",
+                    None,
+                    None,
+                    None,
+                    Some(bad_id),
+                    Some(&dpop_data),
+                )
+                .await
+                .expect_err(&format!("invalid header device_id '{bad_id}' must fail"));
+            assert!(
+                matches!(err, AppError::BadRequest(_)),
+                "Expected BadRequest for invalid header device_id '{bad_id}', got: {err:?}"
+            );
+
+            let body = bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "actorDeviceId": bad_id })).unwrap(),
+            );
+            let body_err = svc
+                .proxy_clean_chat_request(
+                    &session,
+                    reqwest::Method::POST,
+                    "blue.catbird.chat.sendMessage",
+                    None,
+                    Some(body),
+                    Some("application/json"),
+                    None,
+                    Some(&dpop_data),
+                )
+                .await
+                .expect_err(&format!("invalid body actorDeviceId '{bad_id}' must fail"));
+            assert!(
+                matches!(body_err, AppError::BadRequest(_)),
+                "Expected BadRequest for invalid body actorDeviceId '{bad_id}', got: {body_err:?}"
+            );
+        }
     }
 }
