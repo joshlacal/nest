@@ -189,6 +189,9 @@ pub struct PushConfig {
     /// Defaults to true; set false only as an emergency rollback to legacy raw writes.
     #[serde(default = "default_phase2_writers")]
     pub phase2_writers: bool,
+    /// Chat push wake payload format (`"sealed"` default for Sealed Wake v2; `"clear"` only for legacy v1 rollback).
+    #[serde(default = "default_push_wake_envelope")]
+    pub wake_envelope: String,
 }
 
 impl PushConfig {
@@ -225,8 +228,13 @@ impl Default for PushConfig {
             apns: Default::default(),
             chat_poll_enabled: false,
             phase2_writers: default_phase2_writers(),
+            wake_envelope: default_push_wake_envelope(),
         }
     }
+}
+
+fn default_push_wake_envelope() -> String {
+    "sealed".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

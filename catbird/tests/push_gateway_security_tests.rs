@@ -268,6 +268,7 @@ impl TestGatewayEnv {
         let gw_cfg = PushGatewayConfig {
             gateway_url: "https://api.catbird.blue/xrpc/blue.catbird.push.deliver".to_string(),
             token_encryption_key: [0x5Au8; 32],
+            wake_envelope: catbird::services::push::gateway::WakeEnvelopeMode::ClearV1,
             per_key_burst: 10,
             per_key_per_minute: 30,
             per_ds_burst: 200,

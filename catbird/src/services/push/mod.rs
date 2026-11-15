@@ -13,6 +13,7 @@ pub mod subscriptions;
 pub mod thread_evidence;
 pub mod thread_mutes;
 pub mod types;
+pub mod wake_envelope;
 use std::collections::HashSet;
 use std::sync::Arc;
 

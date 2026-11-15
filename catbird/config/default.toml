@@ -60,3 +60,7 @@ redirect_uri = "http://localhost:3000/auth/callback"
 
 # Legacy compatibility alias (backward-compatible initial input when initial_scopes is absent; does not inherit optional max scopes)
 # scopes = ["atproto", "transition:generic", "transition:chat.bsky"]
+
+[push]
+# Chat wake payload mode handed to APNs/FCM ("sealed" = constant-size Sealed Wake v2; "clear" = legacy v1 rollback).
+wake_envelope = "sealed"

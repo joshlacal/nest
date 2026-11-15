@@ -210,6 +210,7 @@ impl Paired {
             PushGatewayConfig {
                 gateway_url: CANONICAL_GATEWAY_URL.into(),
                 token_encryption_key: token_key,
+                wake_envelope: crate::services::push::gateway::WakeEnvelopeMode::ClearV1,
                 per_key_burst: 10,
                 per_key_per_minute: 30,
                 per_ds_burst: 200,

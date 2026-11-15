@@ -44,6 +44,7 @@ use subtle::ConstantTimeEq;
 use url::Url;
 use uuid::Uuid;
 
+use super::wake_envelope;
 use crate::{
     config::{ApnsConfig, PushConfig},
     error::{AppError, AppResult},
@@ -561,10 +562,143 @@ impl PushGatewayTransport for LivePushGatewayTransport {
     }
 }
 
+/// Shape of the chat wake payload handed to the push provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WakeEnvelopeMode {
+    /// Version 1: conversation id, generation, seq, epoch, wake kind and an
+    /// unsalted hash of the account DID in clear. Retained only for explicit
+    /// emergency rollback (`CATBIRD_PUSH_WAKE_ENVELOPE=clear`).
+    ClearV1,
+    /// Version 2 (default): one opaque constant-size blob (`wake_envelope`).
+    /// The provider sees no conversation, account or size information.
+    #[default]
+    SealedV2,
+}
+
+impl WakeEnvelopeMode {
+    /// Parse `CATBIRD_PUSH_WAKE_ENVELOPE`. Unset, empty, `"sealed"`, `"2"`, or
+    /// unrecognized values default to [`Self::SealedV2`]; only explicit `"clear"`
+    /// or `"1"` selects [`Self::ClearV1`].
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("clear") || v == "1" => Self::ClearV1,
+            _ => Self::SealedV2,
+        }
+    }
+}
+
+/// Decode a configured encryption key (`CATBIRD_PUSH_GATEWAY_TOKEN_KEY` or
+/// `SESSION_ENCRYPTION_KEY`) into exact 32 non-zero bytes, accepting standard
+/// base64, URL-safe base64 (padded or unpadded), or 64-character hex.
+pub fn decode_exact_32_byte_key(raw: &str) -> Result<[u8; 32]> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("encryption key must not be empty"));
+    }
+
+    let decoded = if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut out = Vec::with_capacity(32);
+        for chunk in trimmed.as_bytes().chunks_exact(2) {
+            let s = std::str::from_utf8(chunk).map_err(|_| anyhow!("invalid hex key"))?;
+            let byte = u8::from_str_radix(s, 16).map_err(|_| anyhow!("invalid hex key"))?;
+            out.push(byte);
+        }
+        out
+    } else {
+        BASE64URL
+            .decode(trimmed)
+            .or_else(|_| BASE64_STD.decode(trimmed))
+            .or_else(|_| {
+                base64::engine::general_purpose::URL_SAFE
+                    .decode(trimmed)
+                    .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
+            })
+            .map_err(|_| anyhow!("key must be valid base64, base64url, or 64-char hex"))?
+    };
+
+    if decoded.len() != 32 {
+        return Err(anyhow!(
+            "key decoded to {} bytes; expected exactly 32 bytes",
+            decoded.len()
+        ));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded);
+    if key == [0u8; 32] {
+        return Err(anyhow!("all-zero 32-byte encryption key is forbidden"));
+    }
+    Ok(key)
+}
+
+/// Resolve the 256-bit AES-GCM key protecting stored native device push tokens.
+///
+/// - If `CATBIRD_PUSH_GATEWAY_TOKEN_KEY` is non-empty, it MUST decode to 32 non-zero bytes.
+/// - Otherwise, if `SESSION_ENCRYPTION_KEY` is non-empty, it MUST decode to 32 non-zero bytes
+///   and is domain-separated via SHA-256 (`catbird-push-gateway-token-key-v1:`).
+/// - If neither variable is set:
+///   - Release builds (`allow_debug_ephemeral == false` / `#[cfg(not(debug_assertions))]`)
+///     refuse startup with `Err(...)`.
+///   - Debug/test builds (`allow_debug_ephemeral == true` / `#[cfg(debug_assertions)]`)
+///     generate 32 random CSPRNG bytes via `OsRng` (never a deterministic fallback).
+pub fn resolve_gateway_token_encryption_key(
+    gateway_token_key_env: Option<&str>,
+    session_encryption_key_env: Option<&str>,
+    allow_debug_ephemeral: bool,
+) -> Result<[u8; 32]> {
+    if let Some(raw_gw) = gateway_token_key_env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return decode_exact_32_byte_key(raw_gw)
+            .context("Invalid CATBIRD_PUSH_GATEWAY_TOKEN_KEY (must decode to 32 non-zero bytes)");
+    }
+
+    if let Some(raw_sess) = session_encryption_key_env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let sess_bytes = decode_exact_32_byte_key(raw_sess)
+            .context("Invalid SESSION_ENCRYPTION_KEY (must decode to 32 non-zero bytes)")?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"catbird-push-gateway-token-key-v1:");
+        hasher.update(sess_bytes);
+        let mut derived = [0u8; 32];
+        derived.copy_from_slice(&hasher.finalize());
+        return Ok(derived);
+    }
+
+    if !allow_debug_ephemeral {
+        return Err(anyhow!(
+            "Push gateway startup refused: CATBIRD_PUSH_GATEWAY_TOKEN_KEY or SESSION_ENCRYPTION_KEY (32-byte key) must be configured in release builds"
+        ));
+    }
+
+    let mut ephemeral = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut ephemeral);
+    Ok(ephemeral)
+}
+
+pub fn resolve_gateway_token_encryption_key_from_env() -> Result<[u8; 32]> {
+    let gw_env = std::env::var("CATBIRD_PUSH_GATEWAY_TOKEN_KEY").ok();
+    let sess_env = std::env::var("SESSION_ENCRYPTION_KEY").ok();
+    #[cfg(not(debug_assertions))]
+    let allow_debug_ephemeral = false;
+    #[cfg(debug_assertions)]
+    let allow_debug_ephemeral = true;
+
+    resolve_gateway_token_encryption_key(
+        gw_env.as_deref(),
+        sess_env.as_deref(),
+        allow_debug_ephemeral,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct PushGatewayConfig {
     pub gateway_url: String,
     pub token_encryption_key: [u8; 32],
+    pub wake_envelope: WakeEnvelopeMode,
     pub per_key_burst: u32,
     pub per_key_per_minute: u32,
     pub per_ds_burst: u32,
@@ -572,47 +706,26 @@ pub struct PushGatewayConfig {
 }
 
 impl PushGatewayConfig {
-    pub fn from_push_and_server_config(push: &PushConfig, base_url: &str) -> Self {
-        let mut token_encryption_key = [0u8; 32];
-        if let Ok(hex_or_b64) = std::env::var("CATBIRD_PUSH_GATEWAY_TOKEN_KEY") {
-            let trimmed = hex_or_b64.trim();
-            if let Ok(decoded) = BASE64URL
-                .decode(trimmed)
-                .or_else(|_| BASE64_STD.decode(trimmed))
-            {
-                if decoded.len() == 32 {
-                    token_encryption_key.copy_from_slice(&decoded);
-                }
-            }
-            if token_encryption_key == [0u8; 32] {
-                let digest = Sha256::digest(trimmed.as_bytes());
-                token_encryption_key.copy_from_slice(&digest);
-            }
-        } else if let Ok(sess_key) = std::env::var("SESSION_ENCRYPTION_KEY") {
-            let mut hasher = Sha256::new();
-            hasher.update(b"catbird-push-gateway-token-key-v1:");
-            hasher.update(sess_key.as_bytes());
-            token_encryption_key.copy_from_slice(&hasher.finalize());
-        } else {
-            // Ephemeral process key fallback for local dev/tests when env key is unset.
-            let mut hasher = Sha256::new();
-            hasher.update(b"catbird-push-gateway-default-dev-key:");
-            hasher.update(push.service_did.as_deref().unwrap_or("nest").as_bytes());
-            token_encryption_key.copy_from_slice(&hasher.finalize());
-        }
+    pub fn from_push_and_server_config(push: &PushConfig, base_url: &str) -> Result<Self> {
+        let token_encryption_key = resolve_gateway_token_encryption_key_from_env()?;
+        let raw_wake_mode = std::env::var("CATBIRD_PUSH_WAKE_ENVELOPE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| push.wake_envelope.clone());
 
         let gateway_url = format!(
             "{}/xrpc/blue.catbird.push.deliver",
             base_url.trim_end_matches('/')
         );
-        Self {
+        Ok(Self {
             gateway_url,
             token_encryption_key,
+            wake_envelope: WakeEnvelopeMode::from_env_value(Some(raw_wake_mode.as_str())),
             per_key_burst: 10,
             per_key_per_minute: 30,
             per_ds_burst: 200,
             per_ds_per_minute: 600,
-        }
+        })
     }
 }
 
@@ -707,7 +820,7 @@ impl PushGatewayService {
             &push_config.apns,
             raw_http_client,
         )?);
-        let config = PushGatewayConfig::from_push_and_server_config(push_config, base_url);
+        let config = PushGatewayConfig::from_push_and_server_config(push_config, base_url)?;
         Ok(Self::new(db_pool, config, resolver, transport))
     }
 
@@ -1304,69 +1417,31 @@ impl PushGatewayService {
             );
         };
 
-        let convo_id = req.payload.conversation_id.as_str();
-        let mut collapse_hasher = Sha256::new();
-        collapse_hasher.update(req.push_key.as_bytes());
-        collapse_hasher.update(convo_id.as_bytes());
-        let collapse_id = hex_encode(&collapse_hasher.finalize())[..32].to_string();
-
-        let recipient_account_hash = hex_encode(&Sha256::digest(account_did.as_bytes()));
-        let mut catbird_obj = serde_json::Map::new();
-        catbird_obj.insert(
-            "recipientAccountHash".to_string(),
-            Value::String(recipient_account_hash),
-        );
-        catbird_obj.insert(
-            "wakeKind".to_string(),
-            Value::String(req.payload.wake_kind.as_str().to_string()),
-        );
-        catbird_obj.insert(
-            "conversationId".to_string(),
-            Value::String(convo_id.to_string()),
-        );
-        catbird_obj.insert("generation".to_string(), json!(req.payload.generation));
-        catbird_obj.insert("seq".to_string(), json!(req.payload.seq));
-        catbird_obj.insert("epoch".to_string(), json!(req.payload.epoch));
-        catbird_obj.insert(
-            "fetchRequired".to_string(),
-            Value::Bool(req.payload.ciphertext.is_none()),
-        );
-        if let Some(ct) = req.payload.ciphertext.as_ref() {
-            catbird_obj.insert(
-                "ciphertext".to_string(),
-                Value::String(BASE64_STD.encode(ct)),
-            );
-        }
-        let catbird_val = Value::Object(catbird_obj);
-
-        // Nest exclusively constructs APNs `aps` and FCM data-only envelopes (zero mls-ds display strings).
-        let apns_envelope = json!({
-            "aps": {
-                "alert": { "body": "New message" },
-                "mutable-content": 1
+        let dispatched = match build_wake_dispatch(
+            self.config.wake_envelope,
+            WakeDispatchInput {
+                platform,
+                app_id: row_app_id,
+                native_token,
+                account_did: &account_did,
+                push_key: req.push_key.as_str(),
+                wake_kind: req.payload.wake_kind.as_str(),
+                conversation_id: req.payload.conversation_id.as_str(),
+                generation: req.payload.generation,
+                seq: req.payload.seq,
+                epoch: req.payload.epoch,
+                ciphertext: req.payload.ciphertext.as_deref(),
+                utc_day: &Utc::now().format("%Y-%m-%d").to_string(),
             },
-            "catbird": catbird_val,
-        });
-        let fcm_envelope = json!({
-            "message": {
-                "token": native_token,
-                "android": {
-                    "priority": "high",
-                    "collapse_key": collapse_id,
-                },
-                "data": {
-                    "catbird": serde_json::to_string(&apns_envelope["catbird"]).unwrap_or_default(),
-                }
+        ) {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to build chat wake envelope");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": "InternalServerError", "message": "Wake envelope construction failed" }),
+                );
             }
-        });
-
-        let dispatched = DispatchedGatewayPush {
-            platform,
-            app_id: row_app_id,
-            native_token,
-            collapse_id,
-            apns_envelope,
-            fcm_envelope,
         };
 
         match self.transport.send(dispatched).await {
@@ -1465,5 +1540,381 @@ mod did_document_body_tests {
             .expect("a document exactly at the cap is allowed");
 
         assert_eq!(body.len(), MAX_DID_DOCUMENT_BYTES);
+    }
+}
+
+/// Everything needed to build the provider-facing envelopes for one chat wake.
+pub struct WakeDispatchInput<'a> {
+    pub platform: GatewayPlatform,
+    pub app_id: String,
+    pub native_token: String,
+    pub account_did: &'a str,
+    pub push_key: &'a str,
+    pub wake_kind: &'a str,
+    pub conversation_id: &'a str,
+    pub generation: i64,
+    pub seq: i64,
+    pub epoch: i64,
+    pub ciphertext: Option<&'a [u8]>,
+    /// `YYYY-MM-DD` in UTC; only the sealed form uses it (daily collapse-id rotation).
+    pub utc_day: &'a str,
+}
+
+/// Build the APNs and FCM envelopes for one chat wake.
+///
+/// Nest alone constructs the APNs `aps` block and the FCM data-only message; the
+/// delivery service supplies no display strings. In [`WakeEnvelopeMode::SealedV2`]
+/// the `catbird` object is the opaque constant-size blob from [`wake_envelope`], and
+/// the collapse id is derived from the push key so it rotates daily. In
+/// [`WakeEnvelopeMode::ClearV1`] both are the original clear forms.
+pub fn build_wake_dispatch(
+    mode: WakeEnvelopeMode,
+    input: WakeDispatchInput<'_>,
+) -> Result<DispatchedGatewayPush> {
+    let (catbird_val, collapse_id) = match mode {
+        WakeEnvelopeMode::SealedV2 => {
+            let keys = wake_envelope::WakeKeys::derive(input.push_key);
+            let header = wake_envelope::WakeHeader {
+                wake_kind: input.wake_kind.to_string(),
+                conversation_id: input.conversation_id.to_string(),
+                generation: input.generation,
+                seq: input.seq,
+                epoch: input.epoch,
+                fetch_required: input.ciphertext.is_none(),
+            };
+            (
+                wake_envelope::seal(&keys, &input.app_id, &header, input.ciphertext)?,
+                keys.collapse_id(input.conversation_id, input.utc_day),
+            )
+        }
+        WakeEnvelopeMode::ClearV1 => {
+            let mut collapse_hasher = Sha256::new();
+            collapse_hasher.update(input.push_key.as_bytes());
+            collapse_hasher.update(input.conversation_id.as_bytes());
+            let collapse_id = hex_encode(&collapse_hasher.finalize())[..32].to_string();
+
+            let mut catbird_obj = serde_json::Map::new();
+            catbird_obj.insert(
+                "recipientAccountHash".to_string(),
+                Value::String(hex_encode(&Sha256::digest(input.account_did.as_bytes()))),
+            );
+            catbird_obj.insert(
+                "wakeKind".to_string(),
+                Value::String(input.wake_kind.to_string()),
+            );
+            catbird_obj.insert(
+                "conversationId".to_string(),
+                Value::String(input.conversation_id.to_string()),
+            );
+            catbird_obj.insert("generation".to_string(), json!(input.generation));
+            catbird_obj.insert("seq".to_string(), json!(input.seq));
+            catbird_obj.insert("epoch".to_string(), json!(input.epoch));
+            catbird_obj.insert(
+                "fetchRequired".to_string(),
+                Value::Bool(input.ciphertext.is_none()),
+            );
+            if let Some(ct) = input.ciphertext {
+                catbird_obj.insert(
+                    "ciphertext".to_string(),
+                    Value::String(BASE64_STD.encode(ct)),
+                );
+            }
+            (Value::Object(catbird_obj), collapse_id)
+        }
+    };
+
+    let apns_envelope = json!({
+        "aps": {
+            "alert": { "body": "New message" },
+            "mutable-content": 1
+        },
+        "catbird": catbird_val,
+    });
+    let fcm_envelope = json!({
+        "message": {
+            "token": input.native_token,
+            "android": {
+                "priority": "high",
+                "collapse_key": collapse_id,
+            },
+            "data": {
+                "catbird": serde_json::to_string(&apns_envelope["catbird"])?,
+            }
+        }
+    });
+
+    Ok(DispatchedGatewayPush {
+        platform: input.platform,
+        app_id: input.app_id,
+        native_token: input.native_token,
+        collapse_id,
+        apns_envelope,
+        fcm_envelope,
+    })
+}
+
+#[cfg(test)]
+mod gateway_key_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn release_mode_refuses_startup_when_gateway_and_session_keys_are_unset() {
+        assert!(resolve_gateway_token_encryption_key(None, None, false).is_err());
+        assert!(resolve_gateway_token_encryption_key(Some(""), Some("   "), false).is_err());
+    }
+
+    #[test]
+    fn debug_mode_generates_fresh_csprng_key_when_unset() {
+        let k1 = resolve_gateway_token_encryption_key(None, None, true)
+            .expect("debug mode generates CSPRNG key");
+        let k2 = resolve_gateway_token_encryption_key(None, None, true)
+            .expect("debug mode generates CSPRNG key");
+        assert_ne!(k1, [0u8; 32]);
+        assert_ne!(k2, [0u8; 32]);
+        assert_ne!(
+            k1, k2,
+            "ephemeral debug keys must come from OsRng, never a deterministic seed"
+        );
+    }
+
+    #[test]
+    fn malformed_or_short_or_zero_keys_are_always_rejected() {
+        for allow_debug in [false, true] {
+            assert!(
+                resolve_gateway_token_encryption_key(Some("not-32-bytes"), None, allow_debug)
+                    .is_err()
+            );
+            assert!(
+                resolve_gateway_token_encryption_key(None, Some("short"), allow_debug).is_err()
+            );
+            let zero_b64 = BASE64_STD.encode([0u8; 32]);
+            assert!(
+                resolve_gateway_token_encryption_key(Some(&zero_b64), None, allow_debug).is_err()
+            );
+            assert!(
+                resolve_gateway_token_encryption_key(None, Some(&zero_b64), allow_debug).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_valid_32_byte_gateway_or_session_keys_with_domain_separation() {
+        let raw_gw = [0x42u8; 32];
+        let gw_b64 = BASE64_STD.encode(raw_gw);
+        let resolved_gw = resolve_gateway_token_encryption_key(Some(&gw_b64), None, false).unwrap();
+        assert_eq!(resolved_gw, raw_gw);
+
+        let raw_sess = [0x7Au8; 32];
+        let sess_hex = hex_encode(&raw_sess);
+        let resolved_from_sess =
+            resolve_gateway_token_encryption_key(None, Some(&sess_hex), false).unwrap();
+        assert_ne!(resolved_from_sess, raw_sess);
+        let mut expected_hasher = Sha256::new();
+        expected_hasher.update(b"catbird-push-gateway-token-key-v1:");
+        expected_hasher.update(raw_sess);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(&expected_hasher.finalize());
+        assert_eq!(resolved_from_sess, expected);
+    }
+}
+
+#[cfg(test)]
+mod wake_dispatch_tests {
+    use super::*;
+
+    const PUSH_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    const CONVO: &str = "3f0e6f0a-6f0b-4c5e-9d55-0a4e4f6c2b11";
+    const DID: &str = "did:plc:alicecatbird000000000001";
+
+    fn input<'a>(
+        platform: GatewayPlatform,
+        ciphertext: Option<&'a [u8]>,
+        utc_day: &'a str,
+    ) -> WakeDispatchInput<'a> {
+        WakeDispatchInput {
+            platform,
+            app_id: "blue.catbird".into(),
+            native_token: "native-token-0123456789".into(),
+            account_did: DID,
+            push_key: PUSH_KEY,
+            wake_kind: "applicationMessage",
+            conversation_id: CONVO,
+            generation: 0,
+            seq: 7,
+            epoch: 3,
+            ciphertext,
+            utc_day,
+        }
+    }
+
+    #[test]
+    fn envelope_mode_defaults_to_sealed_v2_and_requires_explicit_clear_rollback() {
+        assert_eq!(WakeEnvelopeMode::default(), WakeEnvelopeMode::SealedV2);
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(None),
+            WakeEnvelopeMode::SealedV2
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some("")),
+            WakeEnvelopeMode::SealedV2
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some(" Sealed ")),
+            WakeEnvelopeMode::SealedV2
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some("2")),
+            WakeEnvelopeMode::SealedV2
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some("unrecognized")),
+            WakeEnvelopeMode::SealedV2
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some("clear")),
+            WakeEnvelopeMode::ClearV1
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some(" CLEAR ")),
+            WakeEnvelopeMode::ClearV1
+        );
+        assert_eq!(
+            WakeEnvelopeMode::from_env_value(Some("1")),
+            WakeEnvelopeMode::ClearV1
+        );
+    }
+
+    #[test]
+    fn clear_mode_is_byte_for_byte_the_version_one_payload() {
+        let ct = [0xAB_u8; 16];
+        let push = build_wake_dispatch(
+            WakeEnvelopeMode::ClearV1,
+            input(GatewayPlatform::Apns, Some(&ct), "2026-11-09"),
+        )
+        .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(PUSH_KEY.as_bytes());
+        hasher.update(CONVO.as_bytes());
+        assert_eq!(push.collapse_id, hex_encode(&hasher.finalize())[..32]);
+        assert_eq!(
+            push.apns_envelope["catbird"],
+            json!({
+                "recipientAccountHash": hex_encode(&Sha256::digest(DID.as_bytes())),
+                "wakeKind": "applicationMessage",
+                "conversationId": CONVO,
+                "generation": 0,
+                "seq": 7,
+                "epoch": 3,
+                "fetchRequired": false,
+                "ciphertext": BASE64_STD.encode(ct),
+            })
+        );
+    }
+
+    #[test]
+    fn sealed_mode_shows_the_provider_nothing_and_opens_to_the_same_wake() {
+        let ct = [0xAB_u8; 300];
+        for platform in [GatewayPlatform::Apns, GatewayPlatform::Fcm] {
+            let push = build_wake_dispatch(
+                WakeEnvelopeMode::SealedV2,
+                input(platform, Some(&ct), "2026-11-09"),
+            )
+            .unwrap();
+
+            let visible = format!(
+                "{}{}{}",
+                push.apns_envelope, push.fcm_envelope, push.collapse_id
+            );
+            let did_hash = hex_encode(&Sha256::digest(DID.as_bytes()));
+            for needle in [
+                CONVO,
+                DID,
+                did_hash.as_str(),
+                PUSH_KEY,
+                "applicationMessage",
+            ] {
+                assert!(!visible.contains(needle), "provider can read {needle}");
+            }
+            assert_eq!(
+                push.apns_envelope["aps"],
+                json!({ "alert": { "body": "New message" }, "mutable-content": 1 })
+            );
+
+            let keys = wake_envelope::WakeKeys::derive(PUSH_KEY);
+            let fcm_catbird: Value = serde_json::from_str(
+                push.fcm_envelope["message"]["data"]["catbird"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fcm_catbird, push.apns_envelope["catbird"]);
+            let opened = wake_envelope::open(&keys, "blue.catbird", &fcm_catbird).unwrap();
+            assert_eq!(opened.header.conversation_id, CONVO);
+            assert_eq!(opened.header.wake_kind, "applicationMessage");
+            assert_eq!(
+                (
+                    opened.header.generation,
+                    opened.header.seq,
+                    opened.header.epoch
+                ),
+                (0, 7, 3)
+            );
+            assert!(!opened.header.fetch_required);
+            assert_eq!(opened.ciphertext.as_deref(), Some(&ct[..]));
+            assert_eq!(push.collapse_id, keys.collapse_id(CONVO, "2026-11-09"));
+            assert_eq!(
+                push.fcm_envelope["message"]["android"]["collapse_key"],
+                push.collapse_id
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_wakes_are_one_size_on_both_providers_and_within_their_limits() {
+        let big = [1_u8; MAX_INLINE_CIPHERTEXT_BYTES];
+        let mut apns = std::collections::BTreeSet::new();
+        let mut fcm = std::collections::BTreeSet::new();
+        for ciphertext in [None, Some(&big[..1]), Some(&big[..])] {
+            let push = build_wake_dispatch(
+                WakeEnvelopeMode::SealedV2,
+                input(GatewayPlatform::Apns, ciphertext, "2026-11-09"),
+            )
+            .unwrap();
+            apns.insert(serde_json::to_vec(&push.apns_envelope).unwrap().len());
+            fcm.insert(
+                serde_json::to_vec(&push.fcm_envelope["message"]["data"])
+                    .unwrap()
+                    .len(),
+            );
+        }
+        assert_eq!(apns.len(), 1, "APNs sizes differ: {apns:?}");
+        assert_eq!(fcm.len(), 1, "FCM sizes differ: {fcm:?}");
+        assert!(*apns.first().unwrap() <= 4096, "{apns:?}");
+        assert!(*fcm.first().unwrap() <= 4096, "{fcm:?}");
+    }
+
+    #[test]
+    fn sealed_collapse_id_rotates_with_the_utc_day() {
+        let today = build_wake_dispatch(
+            WakeEnvelopeMode::SealedV2,
+            input(GatewayPlatform::Apns, None, "2026-11-09"),
+        )
+        .unwrap();
+        let again = build_wake_dispatch(
+            WakeEnvelopeMode::SealedV2,
+            input(GatewayPlatform::Apns, None, "2026-11-09"),
+        )
+        .unwrap();
+        let tomorrow = build_wake_dispatch(
+            WakeEnvelopeMode::SealedV2,
+            input(GatewayPlatform::Apns, None, "2026-11-10"),
+        )
+        .unwrap();
+        assert_eq!(today.collapse_id, again.collapse_id);
+        assert_ne!(today.collapse_id, tomorrow.collapse_id);
+        assert_ne!(
+            today.apns_envelope["catbird"]["sealed"],
+            again.apns_envelope["catbird"]["sealed"]
+        );
     }
 }

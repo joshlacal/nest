@@ -84,9 +84,10 @@ impl UpgradeStartRequest {
         {
             return false;
         }
-        self.additional_scopes
-            .iter()
-            .all(|s| !s.is_empty() && s.len() <= MAX_SCOPE_LEN)
+        self.additional_scopes.iter().all(|s| {
+            !s.is_empty()
+                && (s.len() <= MAX_SCOPE_LEN || ALLOWLISTED_UPGRADE_SCOPES.contains(&s.as_str()))
+        })
     }
 
     /// Check if all requested additional scopes belong to the allowlisted scope set.
@@ -306,5 +307,29 @@ mod tests {
         assert_eq!(json_val["session_id"], session_id.to_string());
         assert_eq!(json_val["did"], "did:plc:testuser123");
         assert_eq!(json_val["granted_scopes"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn max_scope_len_is_512_and_rejects_oversized_non_allowlisted_scopes() {
+        assert_eq!(MAX_SCOPE_LEN, 512);
+        let nonce = "a".repeat(43);
+
+        let exact_512 = UpgradeStartRequest {
+            additional_scopes: vec!["s".repeat(MAX_SCOPE_LEN)],
+            browser_nonce: nonce.clone(),
+        };
+        assert!(exact_512.is_structurally_valid());
+
+        let over_512 = UpgradeStartRequest {
+            additional_scopes: vec!["s".repeat(MAX_SCOPE_LEN + 1)],
+            browser_nonce: nonce.clone(),
+        };
+        assert!(!over_512.is_structurally_valid());
+
+        let arbitrary_531 = UpgradeStartRequest {
+            additional_scopes: vec!["s".repeat(531)],
+            browser_nonce: nonce,
+        };
+        assert!(!arbitrary_531.is_structurally_valid());
     }
 }

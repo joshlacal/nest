@@ -698,7 +698,8 @@ async fn get_service_auth_permits_user_declared_atproto_mls_did_and_rejects_arbi
         plc_mock.uri(),
     ));
     let gw_config =
-        PushGatewayConfig::from_push_and_server_config(&config.push, "https://api.catbird.blue");
+        PushGatewayConfig::from_push_and_server_config(&config.push, "https://api.catbird.blue")
+            .expect("push gateway config");
     let live_transport = Arc::new(
         catbird::services::push::gateway::LivePushGatewayTransport::from_config(
             &config.push.apns,
