@@ -22,6 +22,7 @@ pub async fn get_post_thread_handler(
         query.space.as_str(),
         query.depth,
         query.parent_height,
+        query.include_encrypted.unwrap_or(false),
     )
     .await?;
     Ok(Json(output))

@@ -841,6 +841,10 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
     // Insert active accepted record referencing blob_cid
+    let mock_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00]; // PNG header + bytes
+    let blob_cid_owned = compute_raw_blob_cid(&mock_bytes);
+    let blob_cid = blob_cid_owned.as_str();
+
     sqlx::query(
         r#"
         INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
@@ -860,7 +864,7 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
                     "alt": "test image",
                     "image": {
                         "$type": "blob",
-                        "ref": { "$link": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku" },
+                        "ref": { "$link": blob_cid },
                         "mimeType": "image/png",
                         "size": 10
                     }
@@ -895,8 +899,6 @@ async fn media_streaming_enforces_20mib_cap_and_no_cache(pool: PgPool) {
         .await;
 
     // Set up mock transport response for blob
-    let blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
-    let mock_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00]; // PNG header + bytes
     setup.mock_transport.set_blob_response(
         &format!("{SPACE_1}:{ALICE_DID}:{blob_cid}"),
         Some("image/png".to_string()),
@@ -998,7 +1000,9 @@ async fn media_does_not_rerun_a_refused_credential_exchange_per_request(pool: Pg
     grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
     grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
 
-    let blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let mock_png_short = vec![0x89, 0x50, 0x4E, 0x47];
+    let blob_cid_owned = compute_raw_blob_cid(&mock_png_short);
+    let blob_cid = blob_cid_owned.as_str();
     sqlx::query(
         r#"
         INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
@@ -1023,7 +1027,7 @@ async fn media_does_not_rerun_a_refused_credential_exchange_per_request(pool: Pg
     setup.mock_transport.set_blob_response(
         &format!("{SPACE_1}:{ALICE_DID}:{blob_cid}"),
         Some("image/png".to_string()),
-        vec![0x89, 0x50, 0x4E, 0x47],
+        mock_png_short,
     );
     // No credential is cached and the authority refuses the exchange.
     setup.mock_transport.set_credential_response(
@@ -1891,7 +1895,9 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
         .await;
 
     // Insert post referencing valid CIDv1
-    let authorized_blob_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let mock_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let authorized_blob_cid_owned = compute_raw_blob_cid(&mock_bytes);
+    let authorized_blob_cid = authorized_blob_cid_owned.as_str();
     sqlx::query(
         r#"
         INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
@@ -1924,7 +1930,6 @@ async fn local_active_record_cid_authorization_before_media_request_with_uniform
     .unwrap();
 
     // Set mock response for authorized blob
-    let mock_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     setup.mock_transport.set_blob_response(
         &format!("{SPACE_1}:{ALICE_DID}:{authorized_blob_cid}"),
         Some("image/png".to_string()),
@@ -2625,86 +2630,6 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
         active_created_at, regranted_created_at,
         "Activating an active Circle must keep its created_at"
     );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn notify_write_authorizes_membership_and_app_access_before_lock(pool: PgPool) {
-    use circle_appview::purge::revoke_app_access;
-
-    let setup = setup_privacy_test(pool.clone()).await;
-
-    sqlx::query(
-        r#"
-        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, app_access_granted)
-        VALUES ($1, '3l7notify', $2, 'Notify Auth Space', now(), true)
-        "#,
-    )
-    .bind(SPACE_1)
-    .bind(ALICE_DID)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
-
-    let app = create_router(setup.state.clone());
-
-    // Mint service token for notifyWrite
-    let alice_jwt = mint_jwt(ALICE_DID, "com.atproto.space.notifyWrite", &setup.alice_key);
-    let dave_jwt = mint_jwt(DAVE_DID, "com.atproto.space.notifyWrite", &setup.dave_key);
-
-    let notify_dave = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
-        repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(DAVE_DID)),
-        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
-            "3l7aaaaaaaaaa",
-        )),
-        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-            String::from("3l7spacerev2a"),
-        )),
-        prev_space_rev: None,
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
-            .unwrap(),
-        extra_data: None,
-    };
-    let req = Request::builder()
-        .method("POST")
-        .uri("/xrpc/com.atproto.space.notifyWrite")
-        .header(header::AUTHORIZATION, format!("Bearer {dave_jwt}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&notify_dave).unwrap()))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // 2. Revoked appAccess rejects notifyWrite
-    revoke_app_access(&pool, &setup.state.credential_store, SPACE_1)
-        .await
-        .unwrap();
-
-    let notify_alice = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0u8; 32]),
-        repo: catbird_atproto::jacquard_common::types::string::Did::from(String::from(ALICE_DID)),
-        repo_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
-            "3l7aaaaaaaaaa",
-        )),
-        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-            String::from("3l7spacerev2a"),
-        )),
-        prev_space_rev: None,
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_1)
-            .unwrap(),
-        extra_data: None,
-    };
-    let req = Request::builder()
-        .method("POST")
-        .uri("/xrpc/com.atproto.space.notifyWrite")
-        .header(header::AUTHORIZATION, format!("Bearer {alice_jwt}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&notify_alice).unwrap()))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_ne!(resp.status(), StatusCode::OK);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -4055,7 +3980,7 @@ async fn membership_expiring_during_profile_hydration_cannot_return_a_private_po
         reqwest::Client::new(),
     ));
     let request = tokio::spawn(async move {
-        circle_appview::feed::get_feed(&state, BOB_DID, Some(SPACE_1), Some(20), None).await
+        circle_appview::feed::get_feed(&state, BOB_DID, Some(SPACE_1), Some(20), None, false).await
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while profile_host.received_requests().await.unwrap().is_empty() {
@@ -4074,4 +3999,215 @@ async fn membership_expiring_during_profile_hydration_cannot_return_a_private_po
         matches!(result, Err(circle_appview::AppError::AccessRemoved(_))),
         "expired in-flight authorization cannot publish the previously fetched post: {result:?}"
     );
+}
+
+fn compute_raw_blob_cid(data: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(data);
+    let mut cid_bytes = Vec::with_capacity(4 + 32);
+    cid_bytes.push(0x01); // CIDv1
+    cid_bytes.push(0x55); // raw binary multicodec
+    cid_bytes.push(0x12); // sha2-256
+    cid_bytes.push(0x20); // 32-byte digest
+    cid_bytes.extend_from_slice(&digest);
+    multibase::encode(multibase::Base::Base32Lower, &cid_bytes)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn b6_media_rejects_tampered_blob_cid_and_enforces_safe_mime_nosniff_and_csp(pool: PgPool) {
+    let setup = setup_privacy_test(pool.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at)
+        VALUES ($1, '3l7b6media', $2, 'B6 Media Space', now())
+        "#,
+    )
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    grant_active_member(&pool, SPACE_1, ALICE_DID, Duration::hours(1)).await;
+    grant_active_member(&pool, SPACE_1, BOB_DID, Duration::hours(1)).await;
+
+    setup
+        .state
+        .credential_store
+        .insert(
+            SPACE_1.to_string(),
+            ActiveSpaceCredential {
+                token: "space-cred-b6".into(),
+                signing_key: p256::ecdsa::SigningKey::random(&mut OsRng),
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        )
+        .await;
+
+    let expected_png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02];
+    let tampered_cid = compute_raw_blob_cid(b"expected-authentic-blob-bytes");
+    let html_bytes = b"<html><body><script>alert(1)</script></body></html>".to_vec();
+    let html_cid = compute_raw_blob_cid(&html_bytes);
+    let svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>".to_vec();
+    let svg_cid = compute_raw_blob_cid(&svg_bytes);
+    let valid_png_cid = compute_raw_blob_cid(&expected_png_bytes);
+
+    sqlx::query(
+        r#"
+        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at)
+        VALUES ($1, 'bafyrecb6', $2, $3, 'app.bsky.feed.post', '3l7b6post', $4, now())
+        "#,
+    )
+    .bind(format!("{SPACE_1}/app.bsky.feed.post/3l7b6post"))
+    .bind(SPACE_1)
+    .bind(ALICE_DID)
+    .bind(json!({
+        "$type": "app.bsky.feed.post",
+        "text": "Post with b6 test blobs",
+        "embed": {
+            "$type": "app.bsky.embed.images",
+            "images": [
+                { "alt": "tampered", "image": { "$type": "blob", "ref": { "$link": tampered_cid }, "mimeType": "image/png", "size": 10 } },
+                { "alt": "html", "image": { "$type": "blob", "ref": { "$link": html_cid }, "mimeType": "text/html", "size": html_bytes.len() } },
+                { "alt": "svg", "image": { "$type": "blob", "ref": { "$link": svg_cid }, "mimeType": "image/svg+xml", "size": svg_bytes.len() } },
+                { "alt": "png", "image": { "$type": "blob", "ref": { "$link": valid_png_cid }, "mimeType": "image/png", "size": expected_png_bytes.len() } }
+            ]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Upstream PDS returns bytes whose SHA-256 digest does NOT match `tampered_cid`
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{tampered_cid}"),
+        Some("image/png".to_string()),
+        b"tampered-substituted-blob-bytes".to_vec(),
+    );
+    // 2. Upstream PDS returns matching CID bytes with dangerous `text/html` and `image/svg+xml` MIME types
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{html_cid}"),
+        Some("text/html; charset=utf-8".to_string()),
+        html_bytes.clone(),
+    );
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{svg_cid}"),
+        Some("image/svg+xml".to_string()),
+        svg_bytes.clone(),
+    );
+    // 3. Upstream PDS returns matching CID bytes with safe `image/png` MIME type
+    setup.mock_transport.set_blob_response(
+        &format!("{SPACE_1}:{ALICE_DID}:{valid_png_cid}"),
+        Some("image/png".to_string()),
+        expected_png_bytes.clone(),
+    );
+
+    let app = media_core_fixture_router(setup.state.clone());
+
+    let fetch = |cid: &str| {
+        let bob_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
+        let req = Request::builder()
+            .uri(format!(
+                "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid={}",
+                url_encode(SPACE_1),
+                url_encode(ALICE_DID),
+                url_encode(cid),
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {bob_jwt}"))
+            .body(Body::empty())
+            .unwrap();
+        let router = app.clone();
+        async move { router.oneshot(req).await.unwrap() }
+    };
+
+    // Case 1: Tampered blob bytes MUST fail closed with 404 Not Found
+    let tampered_resp = fetch(&tampered_cid).await;
+    assert_eq!(
+        tampered_resp.status(),
+        StatusCode::NOT_FOUND,
+        "Tampered blob whose SHA-256 does not match requested CID must be rejected"
+    );
+
+    // Case 2a: `text/html` MUST be rewritten to `application/octet-stream` + `attachment` + `nosniff` + `CSP`
+    let html_resp = fetch(&html_cid).await;
+    assert_eq!(html_resp.status(), StatusCode::OK);
+    assert_eq!(
+        html_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        html_resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap(),
+        "attachment"
+    );
+    assert_eq!(
+        html_resp
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        html_resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "default-src 'none'; sandbox"
+    );
+
+    // Case 2b: `image/svg+xml` MUST also fall back to `application/octet-stream` + `attachment`
+    let svg_resp = fetch(&svg_cid).await;
+    assert_eq!(svg_resp.status(), StatusCode::OK);
+    assert_eq!(
+        svg_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        svg_resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+        "attachment"
+    );
+    assert_eq!(
+        svg_resp
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        svg_resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "default-src 'none'; sandbox"
+    );
+
+    // Case 3: Safe `image/png` preserves `image/png` and still emits `nosniff` and `CSP`
+    let png_resp = fetch(&valid_png_cid).await;
+    assert_eq!(png_resp.status(), StatusCode::OK);
+    assert_eq!(
+        png_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    assert_eq!(
+        png_resp
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        png_resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "default-src 'none'; sandbox"
+    );
+    assert_eq!(
+        png_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store, private"
+    );
+    let body = to_bytes(png_resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(body.as_ref(), expected_png_bytes.as_slice());
 }

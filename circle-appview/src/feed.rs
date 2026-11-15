@@ -4,12 +4,16 @@ use crate::error::AppError;
 use crate::hydration::ProfileHydrator;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
 use catbird_atproto::generated::app_bsky::embed::images::{View as ImagesView, ViewImage};
 use catbird_atproto::generated::app_bsky::feed::{
     FeedViewPost, PostView, PostViewEmbed, ViewerState,
 };
 use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, FeedItem};
+use catbird_atproto::generated::blue_catbird::circle::post::Post as EncryptedPostRecord;
+use catbird_atproto::generated::blue_catbird::circle::{
+    CircleSummary, EncryptedPostView, FeedItem, FeedItemPost,
+};
 use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Tid, UriValue};
@@ -37,8 +41,25 @@ pub fn decode_cursor(cursor_str: &str) -> Result<FeedCursor, AppError> {
     Ok(cursor)
 }
 
+/// Collection of encrypted Circle post envelopes.
+pub const ENCRYPTED_POST_COLLECTION: &str = "blue.catbird.circle.post";
+
+/// The Circle's current key version for a `CircleSummary`: `None` for a plaintext
+/// Space or an encrypted Space without indexed key records.
+pub async fn summary_key_version(
+    pool: &sqlx::PgPool,
+    space_uri: &str,
+) -> Result<Option<i64>, AppError> {
+    Ok(crate::sync::latest_key_version(pool, space_uri)
+        .await?
+        .map(|(version, _)| version))
+}
+
 pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
-    if let Some(col_idx) = uri.rfind("/app.bsky.") {
+    let col_idx = uri
+        .rfind("/app.bsky.")
+        .or_else(|| uri.rfind(&format!("/{ENCRYPTED_POST_COLLECTION}/")));
+    if let Some(col_idx) = col_idx {
         let prefix = &uri[..col_idx];
         let last_segment = prefix.rsplit('/').next().unwrap_or("");
         let did = if last_segment.starts_with("did:") {
@@ -146,29 +167,12 @@ pub fn build_post_view(
         None
     };
 
-    let viewer = viewer_like_uri.map(|like_uri| {
-        let std_like_uri = normalize_uri_to_standard_aturi(like_uri);
-        ViewerState {
-            like: AtUri::new(SmolStr::new(std_like_uri)).ok(),
-            repost: None,
-            bookmarked: None,
-            embedding_disabled: None,
-            known_likers: None,
-            pinned: None,
-            reply_disabled: None,
-            thread_muted: None,
-            extra_data: None,
-        }
-    });
+    let viewer = viewer_state(viewer_like_uri);
 
     let record_data: Data = serde_json::from_value(record_json.clone())
         .map_err(|e| AppError::Internal(format!("Invalid record data: {e}")))?;
 
-    let std_uri = normalize_uri_to_standard_aturi(uri);
-    let aturi = AtUri::new(SmolStr::new(std_uri))
-        .map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
-    let cid_val = Cid::new(cid.as_bytes())
-        .map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
+    let (aturi, cid_val) = post_identity(uri, cid)?;
 
     Ok(PostView {
         uri: aturi,
@@ -190,6 +194,69 @@ pub fn build_post_view(
     })
 }
 
+/// The viewer state for a post: only the viewer's own like is tracked.
+fn viewer_state(viewer_like_uri: Option<&str>) -> Option<ViewerState> {
+    viewer_like_uri.map(|like_uri| {
+        let std_like_uri = normalize_uri_to_standard_aturi(like_uri);
+        ViewerState {
+            like: AtUri::new(SmolStr::new(std_like_uri)).ok(),
+            repost: None,
+            bookmarked: None,
+            embedding_disabled: None,
+            known_likers: None,
+            pinned: None,
+            reply_disabled: None,
+            thread_muted: None,
+            extra_data: None,
+        }
+    })
+}
+
+/// The served URI (standard `at://did/collection/rkey` form) and CID of a post row.
+fn post_identity(uri: &str, cid: &str) -> Result<(AtUri, Cid), AppError> {
+    let std_uri = normalize_uri_to_standard_aturi(uri);
+    let aturi = AtUri::new(SmolStr::new(std_uri))
+        .map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
+    let cid_val = Cid::new(cid.as_bytes())
+        .map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
+    Ok((aturi, cid_val))
+}
+
+/// View of a `blue.catbird.circle.post` envelope. The record is passed through as
+/// stored (plaintext header plus ciphertext); counts and viewer state are computed
+/// exactly as for `build_post_view`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_encrypted_post_view(
+    uri: &str,
+    cid: &str,
+    author_did: &str,
+    record_json: &serde_json::Value,
+    indexed_at: DateTime<Utc>,
+    like_count: i64,
+    reply_count: i64,
+    viewer_like_uri: Option<&str>,
+    author_profile: ProfileViewBasic,
+) -> Result<EncryptedPostView, AppError> {
+    let record: EncryptedPostRecord =
+        crate::validator::from_value_borrowed(record_json).map_err(|e| {
+            AppError::Internal(format!(
+                "Invalid encrypted post record from {author_did}: {e}"
+            ))
+        })?;
+    let (aturi, cid_val) = post_identity(uri, cid)?;
+    Ok(EncryptedPostView {
+        uri: aturi,
+        cid: cid_val,
+        author: author_profile,
+        record,
+        indexed_at: Datetime::new(indexed_at.into()),
+        like_count: Some(like_count),
+        reply_count: Some(reply_count),
+        viewer: viewer_state(viewer_like_uri),
+        extra_data: None,
+    })
+}
+
 #[allow(clippy::type_complexity)]
 pub async fn get_feed(
     state: &AppState,
@@ -197,6 +264,7 @@ pub async fn get_feed(
     space_filter: Option<&str>,
     limit: Option<i64>,
     cursor_str: Option<&str>,
+    include_encrypted: bool,
 ) -> Result<GetFeedOutput, AppError> {
     let limit = limit.unwrap_or(50).clamp(1, 100) as usize;
 
@@ -263,6 +331,7 @@ pub async fn get_feed(
         String,           // author_did
         serde_json::Value,// record_json
         DateTime<Utc>,    // indexed_at
+        String,           // collection
         String,           // circle_name
         String,           // circle_owner
         bool,             // circle_muted
@@ -279,6 +348,7 @@ pub async fn get_feed(
             r.author_did,
             r.record_json,
             r.indexed_at,
+            r.collection,
             c.display_name AS circle_name,
             c.authority_did AS circle_owner,
             COALESCE(pref.muted, false) AS circle_muted,
@@ -288,7 +358,7 @@ pub async fn get_feed(
                 FROM circle_records rep
                 WHERE rep.parent_uri = r.uri
                   AND rep.space_uri = r.space_uri
-                  AND rep.deleted_at IS NULL AND rep.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+                  AND rep.deleted_at IS NULL AND NOT rep.stale_key AND rep.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
                   AND (
                       rep.root_uri IS NULL
                       OR EXISTS (
@@ -300,8 +370,8 @@ pub async fn get_feed(
                                END
                            ))
                              AND root.space_uri = r.space_uri
-                             AND root.deleted_at IS NULL AND root.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
-                             AND root.collection = 'app.bsky.feed.post'
+                             AND root.deleted_at IS NULL AND NOT root.stale_key AND root.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+                             AND root.collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')
                        )
                    )
                    AND (
@@ -315,8 +385,8 @@ pub async fn get_feed(
                                END
                            ))
                              AND p.space_uri = r.space_uri
-                             AND p.deleted_at IS NULL AND p.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
-                             AND p.collection = 'app.bsky.feed.post'
+                             AND p.deleted_at IS NULL AND NOT p.stale_key AND p.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+                             AND p.collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')
                        )
                    )
              ) AS reply_count,
@@ -326,8 +396,8 @@ pub async fn get_feed(
         LEFT JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1 AND m.can_read = true
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
-        WHERE r.collection = 'app.bsky.feed.post'
-          AND r.deleted_at IS NULL AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+        WHERE r.collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')
+          AND r.deleted_at IS NULL AND NOT r.stale_key AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
           AND r.parent_uri IS NULL
           AND (
               c.authority_did = $1
@@ -340,6 +410,7 @@ pub async fn get_feed(
           )
           AND ($2::TEXT IS NULL OR r.space_uri = $2)
           AND ($2::TEXT IS NOT NULL OR COALESCE(pref.muted, false) = false)
+          AND ($6::BOOLEAN OR r.collection <> 'blue.catbird.circle.post')
           AND (
               $3::TIMESTAMPTZ IS NULL
               OR (r.indexed_at, r.uri) < ($3, $4)
@@ -353,6 +424,7 @@ pub async fn get_feed(
     .bind(cursor_indexed_at)
     .bind(cursor_uri)
     .bind(fetch_limit)
+    .bind(include_encrypted)
     .fetch_all(&state.db)
     .await?;
 
@@ -363,6 +435,8 @@ pub async fn get_feed(
     let profiles_map = state.profile_hydrator.get_profiles(&author_dids).await;
 
     let mut feed_items = Vec::with_capacity(page_rows.len());
+    let mut key_versions: std::collections::HashMap<&str, Option<i64>> =
+        std::collections::HashMap::new();
 
     for row in page_rows {
         let uri = &row.0;
@@ -372,39 +446,55 @@ pub async fn get_feed(
         let author_did = &row.4;
         let record_json = &row.5;
         let indexed_at = row.6;
-        let circle_name = &row.7;
-        let circle_owner = &row.8;
-        let circle_muted = row.9;
-        let like_count = row.10;
-        let reply_count = row.11;
-        let viewer_like_uri = row.12.as_deref();
+        let collection = &row.7;
+        let circle_name = &row.8;
+        let circle_owner = &row.9;
+        let circle_muted = row.10;
+        let like_count = row.11;
+        let reply_count = row.12;
+        let viewer_like_uri = row.13.as_deref();
 
         let author_profile = profiles_map
             .get(author_did)
             .cloned()
             .unwrap_or_else(|| ProfileHydrator::unavailable_profile(author_did));
 
-        let post_view = build_post_view(
-            uri,
-            cid,
-            author_did,
-            record_json,
-            indexed_at,
-            like_count,
-            reply_count,
-            viewer_like_uri,
-            space_uri,
-            author_profile,
-            &state.config.circle_media_base_url,
-        )?;
-
-        let feed_view_post = FeedViewPost {
-            post: post_view,
-            reply: None,
-            reason: None,
-            feed_context: None,
-            req_id: None,
-            extra_data: None,
+        let post = if collection == ENCRYPTED_POST_COLLECTION {
+            FeedItemPost::EncryptedPostView(Box::new(build_encrypted_post_view(
+                uri,
+                cid,
+                author_did,
+                record_json,
+                indexed_at,
+                like_count,
+                reply_count,
+                viewer_like_uri,
+                author_profile,
+            )?))
+        } else {
+            let post_view = build_post_view(
+                uri,
+                cid,
+                author_did,
+                record_json,
+                indexed_at,
+                like_count,
+                reply_count,
+                viewer_like_uri,
+                space_uri,
+                author_profile,
+                &state.config.circle_media_base_url,
+            )?;
+            FeedItemPost::FeedViewPost(Box::new(FeedViewPost {
+                post: post_view,
+                reply: None,
+                reason: None,
+                feed_context: None,
+                req_id: None,
+                op_thread_post_index: None,
+                op_thread_post_count: None,
+                extra_data: None,
+            }))
         };
 
         let circle_tid = Tid::new(SmolStr::new(circle_id))
@@ -414,6 +504,14 @@ pub async fn get_feed(
         let circle_owner_did = Did::new(SmolStr::new(circle_owner)).map_err(|e| {
             AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}"))
         })?;
+        let latest_key_version = match key_versions.get(space_uri.as_str()) {
+            Some(version) => *version,
+            None => {
+                let version = summary_key_version(&state.db, space_uri).await?;
+                key_versions.insert(space_uri.as_str(), version);
+                version
+            }
+        };
 
         let circle_summary = CircleSummary {
             circle_id: circle_tid,
@@ -422,11 +520,12 @@ pub async fn get_feed(
             owner: circle_owner_did,
             member_count: None,
             muted: Some(circle_muted),
+            latest_key_version,
             extra_data: None,
         };
 
         feed_items.push(FeedItem {
-            post: feed_view_post,
+            post,
             circle: circle_summary,
             extra_data: None,
         });
@@ -451,11 +550,14 @@ pub async fn get_feed(
         access::check_member_access(state, space, user_did).await?;
     }
     for item in &feed_items {
-        crate::identity_events::require_active_account(
-            &state.db,
-            item.post.post.author.did.as_str(),
-        )
-        .await?;
+        let author_did = match &item.post {
+            FeedItemPost::FeedViewPost(view) => view.post.author.did.as_str(),
+            FeedItemPost::EncryptedPostView(view) => view.author.did.as_str(),
+            FeedItemPost::Unknown(_) => {
+                return Err(AppError::Internal("feed item without a post view".into()))
+            }
+        };
+        crate::identity_events::require_active_account(&state.db, author_did).await?;
     }
     Ok(GetFeedOutput {
         feed: feed_items,

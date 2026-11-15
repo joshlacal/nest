@@ -11,7 +11,7 @@ use crate::auth::DidResolver;
 use crate::commit::{compute_dagcbor_cid, LtHash, LTHASH_SIZE};
 use crate::config::AppState;
 use crate::error::AppError;
-use crate::space_client::SpaceClient;
+use crate::space_client::{SpaceClient, WriterUpdate};
 use crate::validator::{
     validate_record, InvalidRecord, RecordCandidate, ValidatedRecord, ValidationPolicy,
 };
@@ -25,6 +25,7 @@ pub const MAX_PAGES_PER_REPO_SYNC: usize = 50;
 pub const MAX_OPS_PER_REPO_SYNC: usize = 5_000;
 pub const MAX_BYTES_PER_REPO_SYNC: usize = 10 * 1024 * 1024;
 pub const MAX_TIME_PER_REPO_SYNC_SECS: u64 = 30;
+pub const REGISTRATION_REAUTH_INTERVAL_SECS: u64 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -43,11 +44,11 @@ pub struct SyncResult {
     pub bytes_processed: usize,
 }
 
-/// Where the revision sweep resumes a space's listRepos listing that its budget
-/// cut short. Held in memory only: after a restart every space is listed from
-/// the beginning.
+/// Where the revision sweep resumes a space's listWriters listing that its
+/// budget cut short. Held in memory only: after a restart every space is listed
+/// from the beginning.
 ///
-/// listRepos ascends by spaceRev, so restarting a cut listing from the
+/// listWriters ascends by spaceRev, so restarting a cut listing from the
 /// beginning would always drop the most recently updated writers (and, in a
 /// space larger than the budget, never reach them). A cut listing resumes after
 /// the spaceRev of the last entry it finished with, which the exclusive cursor
@@ -112,6 +113,11 @@ enum StagedMutation {
         valid: ValidatedRecord,
         cid: String,
     },
+    /// A validated `blue.catbird.circle.key` record; indexed into `circle_keys` only.
+    UpsertKey {
+        valid: ValidatedRecord,
+        cid: String,
+    },
     DeleteRecord {
         uri: String,
     },
@@ -120,6 +126,104 @@ enum StagedMutation {
         reason: InvalidRecord,
         rev: String,
     },
+}
+
+const KEY_COLLECTION: &str = "blue.catbird.circle.key";
+const ENVELOPE_COLLECTION: &str = "blue.catbird.circle.post";
+
+/// Upsert of a validated record into `circle_records`.
+///
+/// `stale_key` (D13): an envelope at key version N ($11) is stale iff it is first indexed
+/// more than 600 s after key N+1 was first indexed. The comparison is against the
+/// superseding key N+1 only, so later rotations neither open nor close grace for N. A NULL
+/// key version (plaintext records) is never stale. Re-ingesting an unchanged CID (a re-sync
+/// or a full recovery) keeps the row's first-seen `indexed_at` and its `stale_key`; only a
+/// real content change re-judges the record as first seen now. Returns the row's
+/// `stale_key`, so a stale envelope reply creates no notification (or push).
+const UPSERT_CIRCLE_RECORD_SQL: &str = r#"
+    INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at, parent_uri, root_uri, key_version, stale_key)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, COALESCE((
+        SELECT k.indexed_at < now() - INTERVAL '600 seconds'
+        FROM circle_keys k WHERE k.space_uri = $3 AND k.key_version = $11 + 1
+    ), false))
+    ON CONFLICT (uri) DO UPDATE SET
+        cid = EXCLUDED.cid,
+        record_json = EXCLUDED.record_json,
+        indexed_at = CASE WHEN circle_records.cid = EXCLUDED.cid
+            THEN circle_records.indexed_at ELSE now() END,
+        parent_uri = EXCLUDED.parent_uri,
+        root_uri = EXCLUDED.root_uri,
+        key_version = EXCLUDED.key_version,
+        stale_key = CASE WHEN circle_records.cid = EXCLUDED.cid
+            THEN circle_records.stale_key ELSE EXCLUDED.stale_key END,
+        deleted_at = NULL
+    RETURNING stale_key
+"#;
+
+/// Stage a validated record and fold it into the in-batch policy: a key record raises
+/// the policy's latest key version (so its first envelopes in the same batch validate),
+/// and a post or envelope becomes a known reply target.
+fn stage_validated(
+    policy: &mut ValidationPolicy,
+    valid: ValidatedRecord,
+    cid: String,
+) -> StagedMutation {
+    match valid.collection.as_str() {
+        KEY_COLLECTION => {
+            if let Some(kv) = valid.key_version {
+                policy.latest_key_version = Some(
+                    policy
+                        .latest_key_version
+                        .map_or(kv, |latest| latest.max(kv)),
+                );
+            }
+            StagedMutation::UpsertKey { valid, cid }
+        }
+        "app.bsky.feed.post" | ENVELOPE_COLLECTION => {
+            policy.add_post(valid.uri.clone(), cid.clone());
+            StagedMutation::UpsertRecord { valid, cid }
+        }
+        _ => StagedMutation::UpsertRecord { valid, cid },
+    }
+}
+
+/// Index a validated key record. A rewrite of an existing version by the owner is
+/// legitimate (D8 rule 2) and replaces the stored row; `indexed_at` is the version's
+/// first-seen time and is immutable, because D13 grace is measured from it and owners
+/// re-wrap the current version weekly (a rewrite must not reopen grace for N-1 envelopes).
+/// `created_at` follows the record only when the CID changes.
+async fn upsert_key(
+    conn: &mut sqlx::PgConnection,
+    space_uri: &str,
+    valid: &ValidatedRecord,
+    cid: &str,
+) -> Result<(), AppError> {
+    let key_version = valid.key_version.ok_or_else(|| {
+        AppError::Internal("validated key record is missing its key version".into())
+    })?;
+    sqlx::query(
+        r#"
+        INSERT INTO circle_keys (space_uri, key_version, uri, cid, owner_did, record_json, created_at, indexed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+        ON CONFLICT (space_uri, key_version) DO UPDATE SET
+            uri = EXCLUDED.uri,
+            cid = EXCLUDED.cid,
+            record_json = EXCLUDED.record_json,
+            created_at = CASE WHEN circle_keys.cid = EXCLUDED.cid
+                THEN circle_keys.created_at ELSE EXCLUDED.created_at END,
+            indexed_at = circle_keys.indexed_at
+        "#,
+    )
+    .bind(space_uri)
+    .bind(key_version)
+    .bind(&valid.uri)
+    .bind(cid)
+    .bind(&valid.author_did)
+    .bind(&valid.record_json)
+    .bind(valid.created_at)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 impl SyncEngine {
@@ -203,27 +307,30 @@ impl SyncEngine {
         expected_authority_hash: Option<&[u8]>,
         expected_authority_rev: Option<&str>,
     ) -> Result<SyncResult, AppError> {
-        let circle_active: Option<(bool,)> = sqlx::query_as(
-            "SELECT app_access_granted FROM circles WHERE space_uri = $1 AND deleted_at IS NULL",
+        let circle_active: Option<(bool, String, String)> = sqlx::query_as(
+            "SELECT app_access_granted, space_type, circle_id FROM circles WHERE space_uri = $1 AND deleted_at IS NULL",
         )
         .bind(space_uri)
         .fetch_optional(&self.db)
         .await
         .map_err(AppError::Database)?;
 
-        if !circle_active.is_some_and(|(granted,)| granted) {
-            return Err(AppError::Forbidden(
-                "Space is deleted or allowedApps revoked".into(),
-            ));
-        }
+        let (space_type, circle_id) = match circle_active {
+            Some((true, space_type, circle_id)) => (space_type, circle_id),
+            _ => {
+                return Err(AppError::Forbidden(
+                    "Space is deleted or allowedApps revoked".into(),
+                ));
+            }
+        };
 
-        // Finding 17 & 36: Membership and generation pre-check before lock acquisition, Space credential creation, or network calls
-        let initial_membership: Option<(i64,)> = sqlx::query_as(
+        // Check writer membership before credential creation or repo-host calls.
+        let mut initial_membership: Option<(i64,)> = sqlx::query_as(
             r#"
             SELECT meta.generation
             FROM circle_member_cache m
             JOIN circle_member_cache_meta meta ON meta.space_uri = m.space_uri
-            WHERE m.space_uri = $1 AND m.member_did = $2
+            WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_write = true
             "#,
         )
         .bind(space_uri)
@@ -240,6 +347,31 @@ impl SyncEngine {
             crate::identity_events::require_active_account(&self.db, author_did).await?;
             crate::identity_events::require_active_account(&self.db, &authority_did).await?;
         }
+        // repoRemoved evicts the member cache. A later authenticated repoWrite
+        // is the host's signal that the writer was re-added; refresh the PDS
+        // member list before deciding that the writer is still unauthorized.
+        if initial_membership.is_none()
+            && author_did != authority_did
+            && expected_authority_hash.is_some()
+            && expected_authority_rev.is_some()
+        {
+            if let Some(state) = &self.lifecycle_state {
+                crate::access::refresh_member_cache(state, space_uri).await?;
+                initial_membership = sqlx::query_as(
+                    r#"
+                    SELECT meta.generation
+                    FROM circle_member_cache m
+                    JOIN circle_member_cache_meta meta ON meta.space_uri = m.space_uri
+                    WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_write = true
+                    "#,
+                )
+                .bind(space_uri)
+                .bind(author_did)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(AppError::Database)?;
+            }
+        }
         let _initial_generation = match initial_membership {
             Some((gen,)) => Some(gen),
             None => {
@@ -254,6 +386,10 @@ impl SyncEngine {
         };
 
         let _lock_guard = self.space_locks.acquire(space_uri).await;
+        let notify_endpoint = self
+            .lifecycle_state
+            .as_ref()
+            .map(|state| state.config.notify_endpoint());
 
         let cred = match self.credential_store.get(space_uri).await {
             Some(c) => c,
@@ -267,6 +403,7 @@ impl SyncEngine {
                         oauth,
                         &self.http_client,
                         space_uri,
+                        notify_endpoint,
                         Some(author_did),
                     )
                     .await?
@@ -308,15 +445,19 @@ impl SyncEngine {
             active_member_rows.into_iter().map(|(m,)| m).collect();
 
         let known_post_rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND collection = 'app.bsky.feed.post' AND deleted_at IS NULL",
+            "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post') AND deleted_at IS NULL",
         )
         .bind(space_uri)
         .fetch_all(&self.db)
         .await?;
 
+        let latest_key = latest_key_version(&self.db, space_uri).await?;
         let policy = ValidationPolicy::new(&authority_did, active_members_set)
             .with_space_uri(space_uri)
-            .with_known_posts(known_post_rows);
+            .with_known_posts(known_post_rows)
+            .with_space_type(space_type)
+            .with_circle_id(circle_id)
+            .with_latest_key_version(latest_key.map(|(version, _)| version));
 
         // Load previous sync state
         let existing_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
@@ -339,7 +480,6 @@ impl SyncEngine {
         let mut ops_applied = 0;
         let mut records_accepted = 0;
         let mut records_rejected = 0;
-        let mut latest_rev = last_rev.clone().unwrap_or_default();
 
         let mut staged_mutations = Vec::new();
         let mut current_policy = policy.clone();
@@ -377,7 +517,55 @@ impl SyncEngine {
                 .await;
 
             let page = match page_res {
-                Ok(p) => p,
+                Ok(page) => page,
+                Err(AppError::NotFound(reason)) if reason == "RepoNotFound" => {
+                    // A never-written or garbage-collected empty repo has no
+                    // commit or cursor. Mirror an empty recovery locally.
+                    let mut tx = self.db.begin().await?;
+                    sqlx::query(
+                        "DELETE FROM circle_likes \
+                         WHERE uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL) \
+                            OR post_uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL)",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "DELETE FROM circle_notifications \
+                         WHERE source_uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL) \
+                            OR subject_uri IN (SELECT uri FROM circle_records WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL)",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE circle_records SET deleted_at = now() \
+                         WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+                    )
+                    .bind(space_uri)
+                    .bind(author_did)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(SyncResult {
+                        mode: SyncMode::Incremental,
+                        commit_verified: true,
+                        ops_applied: 0,
+                        records_accepted: 0,
+                        records_rejected: 0,
+                        latest_rev: String::new(),
+                        bytes_processed: 0,
+                    });
+                }
                 Err(e) => {
                     // A rejected credential is not retried by falling back to
                     // getRepo with it: evict it and fail this sync.
@@ -402,7 +590,6 @@ impl SyncEngine {
                     break;
                 }
                 ops_applied += 1;
-                latest_rev = op.rev.to_string();
 
                 let collection_str = op.collection.as_str();
                 let rkey_str = op.rkey.0.as_str();
@@ -460,13 +647,11 @@ impl SyncEngine {
                     match validate_record(&candidate, &current_policy) {
                         Ok(valid) => {
                             records_accepted += 1;
-                            if valid.collection == "app.bsky.feed.post" {
-                                current_policy.add_post(valid.uri.clone(), cid_str.to_string());
-                            }
-                            staged_mutations.push(StagedMutation::UpsertRecord {
+                            staged_mutations.push(stage_validated(
+                                &mut current_policy,
                                 valid,
-                                cid: cid_str.to_string(),
-                            });
+                                cid_str.to_string(),
+                            ));
                         }
                         Err(invalid) => {
                             records_rejected += 1;
@@ -491,9 +676,9 @@ impl SyncEngine {
                 break;
             }
 
-            if let Some(c) = page.commit {
-                terminal_commit = Some(c);
-            }
+            // Every page's commit has already passed its request-specific MAC.
+            // The no-cursor page is authoritative for the accumulated set hash.
+            terminal_commit = Some(page.commit);
 
             if let Some(next_cur) = page.cursor {
                 let cur_str = next_cur.to_string();
@@ -525,48 +710,27 @@ impl SyncEngine {
                 .await;
         }
 
-        let commit_to_verify = match terminal_commit {
-            Some(c) => Some(c),
-            None => match self
-                .space_client
-                .get_latest_commit(
-                    &repo_service_endpoint,
+        let Some(commit_to_verify) = terminal_commit else {
+            return self
+                .full_recovery(
                     space_uri,
                     author_did,
+                    &repo_service_endpoint,
                     &cred.token,
                     &cred.signing_key,
+                    &policy,
+                    expected_authority_hash,
+                    expected_authority_rev,
                 )
-                .await
-            {
-                Ok(commit) => Some(commit),
-                Err(e) => {
-                    if crate::access::evict_rejected_credential(
-                        &self.credential_store,
-                        space_uri,
-                        &cred.token,
-                        &e,
-                    )
-                    .await
-                    {
-                        return Err(e);
-                    }
-                    None
-                }
-            },
+                .await;
         };
 
-        // The transport verifies each terminal commit MAC using that page's
-        // unique request secret before releasing the page to this accumulator.
-        let commit_verified = if let Some(commit) = &commit_to_verify {
-            latest_rev = commit.rev.to_string();
-            commit.data.as_ref() == lthash.digest().as_slice()
-                && commit.space.as_str() == space_uri
-                && commit.repo.as_str() == author_did
-                && expected_authority_hash.is_none_or(|data| commit.data.as_ref() == data)
-                && expected_authority_rev.is_none_or(|rev| commit.rev.as_str() == rev)
-        } else {
-            false
-        };
+        let latest_rev = commit_to_verify.rev.to_string();
+        let commit_verified = commit_to_verify.data.as_ref() == lthash.digest().as_slice()
+            && commit_to_verify.space.as_str() == space_uri
+            && commit_to_verify.repo.as_str() == author_did
+            && expected_authority_hash.is_none_or(|data| commit_to_verify.data.as_ref() == data)
+            && expected_authority_rev.is_none_or(|rev| commit_to_verify.rev.as_str() == rev);
 
         if !commit_verified {
             return self
@@ -598,31 +762,20 @@ impl SyncEngine {
                     .await?
                     .map(|(c,)| c);
 
-                    sqlx::query(
-                        r#"
-                        INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at, parent_uri, root_uri)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)
-                        ON CONFLICT (uri) DO UPDATE SET
-                            cid = EXCLUDED.cid,
-                            record_json = EXCLUDED.record_json,
-                            indexed_at = now(),
-                            parent_uri = EXCLUDED.parent_uri,
-                            root_uri = EXCLUDED.root_uri,
-                            deleted_at = NULL
-                        "#,
-                    )
-                    .bind(&valid.uri)
-                    .bind(&cid)
-                    .bind(space_uri)
-                    .bind(&valid.author_did)
-                    .bind(&valid.collection)
-                    .bind(&valid.rkey)
-                    .bind(&valid.record_json)
-                    .bind(valid.created_at)
-                    .bind(&valid.parent_uri)
-                    .bind(&valid.root_uri)
-                    .execute(&mut *tx)
-                    .await?;
+                    let stale: bool = sqlx::query_scalar(UPSERT_CIRCLE_RECORD_SQL)
+                        .bind(&valid.uri)
+                        .bind(&cid)
+                        .bind(space_uri)
+                        .bind(&valid.author_did)
+                        .bind(&valid.collection)
+                        .bind(&valid.rkey)
+                        .bind(&valid.record_json)
+                        .bind(valid.created_at)
+                        .bind(&valid.parent_uri)
+                        .bind(&valid.root_uri)
+                        .bind(valid.key_version)
+                        .fetch_one(&mut *tx)
+                        .await?;
 
                     if let Some(post_uri) = &valid.post_uri {
                         sqlx::query(
@@ -736,7 +889,7 @@ impl SyncEngine {
                                 .execute(&mut *tx)
                                 .await?;
                         }
-                    } else if let Some(parent_uri) = &valid.parent_uri {
+                    } else if let (Some(parent_uri), false) = (&valid.parent_uri, stale) {
                         // Create notification for reply
                         let parent_author: Option<(String,)> =
                             sqlx::query_as("SELECT author_did FROM circle_records WHERE uri = $1 AND deleted_at IS NULL")
@@ -836,9 +989,19 @@ impl SyncEngine {
                             .await?;
                     }
                 }
+                StagedMutation::UpsertKey { valid, cid } => {
+                    upsert_key(&mut tx, space_uri, &valid, &cid).await?;
+                }
                 StagedMutation::DeleteRecord { uri } => {
                     sqlx::query("UPDATE circle_records SET deleted_at = now() WHERE uri = $1")
                         .bind(&uri)
+                        .execute(&mut *tx)
+                        .await?;
+                    // A deleted key record leaves circle_keys; latest_key_version is
+                    // always computed from the remaining rows.
+                    sqlx::query("DELETE FROM circle_keys WHERE uri = $1 AND space_uri = $2")
+                        .bind(&uri)
+                        .bind(space_uri)
                         .execute(&mut *tx)
                         .await?;
                     sqlx::query("DELETE FROM circle_likes WHERE uri = $1")
@@ -1097,12 +1260,13 @@ impl SyncEngine {
 
         let mut pending_records = records;
         let mut staged_valid_records = Vec::new();
+        let mut staged_keys: Vec<(ValidatedRecord, String)> = Vec::new();
         let mut staged_rejections = Vec::new();
         let mut current_policy = policy.clone();
 
         // Exact query of other authors' active posts directly from DB (no substring matching)
         let other_authors_posts: Vec<(String, String)> = sqlx::query_as(
-            "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did != $2 AND collection = 'app.bsky.feed.post' AND deleted_at IS NULL",
+            "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did != $2 AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post') AND deleted_at IS NULL",
         )
         .bind(space_uri)
         .bind(author_did)
@@ -1136,17 +1300,31 @@ impl SyncEngine {
                 match validate_record(&candidate, &current_policy) {
                     Ok(valid) => {
                         records_accepted += 1;
-                        if valid.collection == "app.bsky.feed.post" {
-                            current_policy.add_post(valid.uri.clone(), cid_str.clone());
+                        match stage_validated(&mut current_policy, valid, cid_str) {
+                            StagedMutation::UpsertKey { valid, cid } => {
+                                staged_keys.push((valid, cid))
+                            }
+                            StagedMutation::UpsertRecord { valid, cid } => {
+                                staged_valid_records.push((valid, cid))
+                            }
+                            StagedMutation::DeleteRecord { .. }
+                            | StagedMutation::Rejection { .. } => {
+                                unreachable!("stage_validated only stages upserts")
+                            }
                         }
-                        staged_valid_records.push((valid, cid_str));
                         progress = true;
                     }
-                    Err(InvalidRecord::CrossSpaceReference) => {
+                    // Retried on the next pass: the parent, the key record an envelope
+                    // needs, or the key version before this one may be later in this repo.
+                    Err(
+                        deferred @ (InvalidRecord::CrossSpaceReference
+                        | InvalidRecord::KeyVersionAheadOfKeys { .. }
+                        | InvalidRecord::KeyVersionNotMonotone { .. }),
+                    ) => {
                         remaining.push((
                             (collection_str, rkey_str, cid_str, value_json),
                             uri,
-                            InvalidRecord::CrossSpaceReference,
+                            deferred,
                         ));
                     }
                     Err(invalid) => {
@@ -1170,6 +1348,20 @@ impl SyncEngine {
         let mut recovered_uris: HashSet<String> = HashSet::new();
         let mut tx = self.db.begin().await?;
         let mut new_notification_recipients: HashSet<String> = HashSet::new();
+        // Keys first, so envelopes see the newest key when their staleness is computed.
+        for (valid, cid) in &staged_keys {
+            upsert_key(&mut tx, space_uri, valid, cid).await?;
+        }
+        // Key records the owner no longer holds (deleted, or now invalid) leave circle_keys.
+        let kept_key_uris: Vec<String> = staged_keys.iter().map(|(v, _)| v.uri.clone()).collect();
+        sqlx::query(
+            "DELETE FROM circle_keys WHERE space_uri = $1 AND owner_did = $2 AND NOT (uri = ANY($3))",
+        )
+        .bind(space_uri)
+        .bind(author_did)
+        .bind(&kept_key_uris)
+        .execute(&mut *tx)
+        .await?;
         for (valid, cid_str) in staged_valid_records {
             recovered_uris.insert(valid.uri.clone());
 
@@ -1181,31 +1373,20 @@ impl SyncEngine {
             .await?
             .map(|(c,)| c);
 
-            sqlx::query(
-                r#"
-                INSERT INTO circle_records (uri, cid, space_uri, author_did, collection, rkey, record_json, indexed_at, created_at, parent_uri, root_uri)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)
-                ON CONFLICT (uri) DO UPDATE SET
-                    cid = EXCLUDED.cid,
-                    record_json = EXCLUDED.record_json,
-                    indexed_at = now(),
-                    parent_uri = EXCLUDED.parent_uri,
-                    root_uri = EXCLUDED.root_uri,
-                    deleted_at = NULL
-                "#,
-            )
-            .bind(&valid.uri)
-            .bind(&cid_str)
-            .bind(space_uri)
-            .bind(&valid.author_did)
-            .bind(&valid.collection)
-            .bind(&valid.rkey)
-            .bind(&valid.record_json)
-            .bind(valid.created_at)
-            .bind(&valid.parent_uri)
-            .bind(&valid.root_uri)
-            .execute(&mut *tx)
-            .await?;
+            let stale: bool = sqlx::query_scalar(UPSERT_CIRCLE_RECORD_SQL)
+                .bind(&valid.uri)
+                .bind(&cid_str)
+                .bind(space_uri)
+                .bind(&valid.author_did)
+                .bind(&valid.collection)
+                .bind(&valid.rkey)
+                .bind(&valid.record_json)
+                .bind(valid.created_at)
+                .bind(&valid.parent_uri)
+                .bind(&valid.root_uri)
+                .bind(valid.key_version)
+                .fetch_one(&mut *tx)
+                .await?;
 
             if let Some(post_uri) = &valid.post_uri {
                 sqlx::query(
@@ -1295,7 +1476,7 @@ impl SyncEngine {
                         .execute(&mut *tx)
                         .await?;
                 }
-            } else if let Some(parent_uri) = &valid.parent_uri {
+            } else if let (Some(parent_uri), false) = (&valid.parent_uri, stale) {
                 let parent_author: Option<(String,)> = sqlx::query_as(
                     "SELECT author_did FROM circle_records WHERE uri = $1 AND deleted_at IS NULL",
                 )
@@ -1564,6 +1745,285 @@ impl SyncEngine {
     }
 }
 
+/// Stop syncing a repo removed from the writer set. Existing records remain as
+/// Space history, matching the service's established member-removal semantics;
+/// deleting sync state makes a later write perform a clean full sync. Membership
+/// remains authoritative in the `listMembers` refresh.
+pub async fn apply_repo_removed(
+    pool: &sqlx::PgPool,
+    space: &str,
+    repo: &str,
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2")
+        .bind(space)
+        .bind(repo)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn sweep_space(
+    state: &AppState,
+    space_uri: String,
+    summary: &mut SweepSummary,
+    sweep_start: std::time::Instant,
+    total_bytes_processed: &mut usize,
+    shutdown_rx: &mut Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), AppError> {
+    let sync_engine = SyncEngine::new(state);
+    summary.spaces_checked += 1;
+    let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
+        Ok(c) => c,
+        // ensure_space_credential has already purged and tombstoned the Circle.
+        Err(e) if crate::access::is_space_deleted(&e) => {
+            summary.spaces_purged += 1;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
+            summary.repos_failed += 1;
+            return Ok(());
+        }
+    };
+    let authority_did = match extract_authority_did(&space_uri) {
+        Ok(a) => a,
+        Err(_) => return Ok(()),
+    };
+
+    let authority_doc = match state.did_resolver.resolve(&authority_did).await {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let (service_endpoint, _) = match resolve_space_host_endpoint(&authority_doc, &authority_did) {
+        Ok(ep) => ep,
+        Err(_) => return Ok(()),
+    };
+    // A gap detected by authorizeSpaceSync or notifySpaceUpdate resumes at
+    // the durable per-space revision. Ordinary budget resumes stay in memory.
+    let (checkpoint_rev, pending_rev) = crate::notify::catchup_state(&state.db, &space_uri).await?;
+    let mut cursor = if pending_rev.is_some() {
+        checkpoint_rev
+    } else {
+        state.listing_resume.get(&space_uri)
+    };
+    let mut seen_cursors = HashSet::new();
+    let mut page_count = 0;
+    // The spaceRev of the last entry this pass finished with, and whether
+    // the next listing of this space starts from the beginning.
+    let mut last_processed: Option<String> = None;
+    let mut start_over = false;
+    let mut listing_complete = false;
+    // Once an update fails, keep syncing later writers but do not advance
+    // the durable Space checkpoint past the failed update.
+    let mut checkpoint_blocked = false;
+
+    loop {
+        // Check shutdown between pages
+        if let Some(rx) = shutdown_rx.as_deref_mut() {
+            if *rx.borrow() {
+                break;
+            }
+        }
+
+        if page_count >= MAX_PAGES_PER_SWEEP
+            || summary.repos_checked >= MAX_REPOS_PER_SWEEP
+            || sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS
+            || *total_bytes_processed >= MAX_BYTES_PER_SWEEP
+        {
+            break;
+        }
+        page_count += 1;
+
+        let list_writers_res = state
+            .space_client
+            .list_writers(
+                &service_endpoint,
+                &space_uri,
+                cursor.as_deref(),
+                &cred.token,
+                &cred.signing_key,
+            )
+            .await;
+
+        let repos_output = match list_writers_res {
+            Ok(out) => out,
+            Err(e) => {
+                crate::access::evict_rejected_credential(
+                    &state.credential_store,
+                    &space_uri,
+                    &cred.token,
+                    &e,
+                )
+                .await;
+                break;
+            }
+        };
+        // listWriters pages through writer updates in ascending spaceRev.
+        if repos_output.repos.is_empty() {
+            start_over = true;
+            listing_complete = true;
+            break;
+        }
+        let mut credential_rejected = false;
+
+        for repo in &repos_output.repos {
+            // Cooperative shutdown check inside repo loop
+            if let Some(rx) = shutdown_rx.as_deref_mut() {
+                if *rx.borrow() {
+                    tracing::info!("Cooperative shutdown observed during revision sweep repo loop");
+                    break;
+                }
+            }
+
+            if sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS {
+                tracing::info!("Sweep time budget reached in repo loop");
+                break;
+            }
+            if summary.repos_checked >= MAX_REPOS_PER_SWEEP {
+                tracing::info!("Sweep repo budget reached in repo loop");
+                break;
+            }
+            if *total_bytes_processed >= MAX_BYTES_PER_SWEEP {
+                tracing::info!("Sweep byte budget reached in repo loop");
+                break;
+            }
+
+            let (applied, space_rev) = match repo {
+                WriterUpdate::RepoRemoved(update) => (
+                    apply_repo_removed(&state.db, &space_uri, &update.repo).await,
+                    update.space_rev.as_str(),
+                ),
+                WriterUpdate::RepoWrite(update) => {
+                    let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
+                        "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
+                    )
+                    .bind(&space_uri)
+                    .bind(&update.repo)
+                    .fetch_optional(&state.db)
+                    .await
+                    .unwrap_or(None);
+                    let needs_sync = match db_sync {
+                        Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
+                            let digest: [u8; 32] = Sha256::digest(&last_hash).into();
+                            last_rev != update.repo_rev || &digest[..] != update.data.as_ref()
+                        }
+                        _ => true,
+                    };
+                    let applied = if needs_sync {
+                        let result = sync_engine
+                            .sync_repo_with_expected_commit(
+                                &space_uri,
+                                &update.repo,
+                                Some(update.data.as_ref()),
+                                Some(&update.repo_rev),
+                            )
+                            .await
+                            .map(|_| ());
+                        if result.is_ok() {
+                            summary.repos_synced += 1;
+                        }
+                        *total_bytes_processed = sync_engine.total_bytes_processed();
+                        result
+                    } else {
+                        Ok(())
+                    };
+                    (applied, update.space_rev.as_str())
+                }
+                WriterUpdate::Unknown => continue,
+            };
+            summary.repos_checked += 1;
+            match applied {
+                Ok(()) => {
+                    if !checkpoint_blocked {
+                        crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+                    }
+                    last_processed = Some(space_rev.to_owned());
+                }
+                Err(e) => {
+                    summary.repos_failed += 1;
+                    checkpoint_blocked = true;
+                    if crate::access::is_credential_rejected(&e) {
+                        crate::access::evict_rejected_credential(
+                            &state.credential_store,
+                            &space_uri,
+                            &cred.token,
+                            &e,
+                        )
+                        .await;
+                        credential_rejected = true;
+                        break;
+                    }
+                    // In-memory budget resume may pass this entry; durable
+                    // catch-up remains at the last successful checkpoint.
+                    last_processed = Some(space_rev.to_owned());
+                }
+            }
+        }
+
+        if credential_rejected {
+            break;
+        }
+
+        if let Some(next_cursor) = repos_output.cursor {
+            let next_cur_str = next_cursor.to_string();
+            if next_cur_str.len() > MAX_CURSOR_LEN || seen_cursors.contains(&next_cur_str) {
+                // A malformed or repeating listing is not resumed.
+                start_over = true;
+                break;
+            }
+            if seen_cursors.len() >= MAX_PAGES_PER_SWEEP {
+                break;
+            }
+            seen_cursors.insert(next_cur_str.clone());
+            cursor = Some(next_cur_str);
+        } else {
+            start_over = true;
+            listing_complete = true;
+            break;
+        }
+    }
+    if listing_complete && !checkpoint_blocked {
+        if let Some(space_rev) = pending_rev.as_deref() {
+            crate::notify::checkpoint(&state.db, &space_uri, space_rev).await?;
+        }
+    }
+
+    if start_over {
+        state.listing_resume.clear(&space_uri);
+    } else if let Some(space_rev) = last_processed {
+        state.listing_resume.set(&space_uri, space_rev);
+    }
+
+    // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
+    sqlx::query(
+            r#"
+            INSERT INTO circle_sweep_checkpoint (checkpoint_key, last_space_uri, updated_at)
+            VALUES ('revision_sweep', $1, now())
+            ON CONFLICT (checkpoint_key) DO UPDATE SET last_space_uri = EXCLUDED.last_space_uri, updated_at = now()
+            "#,
+        )
+        .bind(&space_uri)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::Database)?;
+    Ok(())
+}
+
+/// The highest stored `blue.catbird.circle.key` version for a Space, with the time
+/// that key row was (last) indexed.
+pub async fn latest_key_version(
+    pool: &sqlx::PgPool,
+    space_uri: &str,
+) -> Result<Option<(i64, chrono::DateTime<chrono::Utc>)>, AppError> {
+    Ok(sqlx::query_as(
+        "SELECT key_version, indexed_at FROM circle_keys WHERE space_uri = $1 ORDER BY key_version DESC LIMIT 1",
+    )
+    .bind(space_uri)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn sweep_once(state: &AppState) -> Result<SweepSummary, AppError> {
     sweep_once_with_shutdown(state, None).await
 }
@@ -1572,7 +2032,6 @@ pub async fn sweep_once_with_shutdown(
     state: &AppState,
     mut shutdown_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<SweepSummary, AppError> {
-    let sync_engine = SyncEngine::new(state);
     let mut summary = SweepSummary::default();
     let sweep_start = std::time::Instant::now();
     let mut total_bytes_processed: usize = 0;
@@ -1625,223 +2084,49 @@ pub async fn sweep_once_with_shutdown(
             break;
         }
 
-        summary.spaces_checked += 1;
-        let cred = match crate::access::ensure_space_credential(state, &space_uri, None).await {
-            Ok(c) => c,
-            // ensure_space_credential has already purged and tombstoned the Circle.
-            Err(e) if crate::access::is_space_deleted(&e) => {
-                summary.spaces_purged += 1;
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, space_uri = %space_uri, "Failed to ensure space credential for sweep");
-                summary.repos_failed += 1;
-                continue;
-            }
-        };
-        if let Err(e) = crate::notify::ensure_registration(state, &space_uri, &cred).await {
-            tracing::warn!(
-                error = %e,
-                space = %crate::access::space_fingerprint(&space_uri),
-                "registerNotify failed during sweep; retried next sweep"
-            );
-            // The host rejected the credential and it was evicted: do not list
-            // with it. The next sweep acquires a replacement.
-            if crate::access::is_credential_rejected(&e) {
-                summary.repos_failed += 1;
-                continue;
-            }
-        }
-        let authority_did = match extract_authority_did(&space_uri) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-
-        let authority_doc = match state.did_resolver.resolve(&authority_did).await {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-
-        let (service_endpoint, _) =
-            match resolve_space_host_endpoint(&authority_doc, &authority_did) {
-                Ok(ep) => ep,
-                Err(_) => continue,
-            };
-        // Resume a listing an earlier pass's budget cut short (ListingResumePoints).
-        let mut cursor: Option<String> = state.listing_resume.get(&space_uri);
-        let mut seen_cursors = HashSet::new();
-        let mut page_count = 0;
-        // The spaceRev of the last entry this pass finished with, and whether
-        // the next listing of this space starts from the beginning.
-        let mut last_processed: Option<String> = None;
-        let mut start_over = false;
-
-        loop {
-            // Check shutdown between pages
-            if let Some(rx) = &mut shutdown_rx {
-                if *rx.borrow() {
-                    break;
-                }
-            }
-
-            if page_count >= MAX_PAGES_PER_SWEEP
-                || summary.repos_checked >= MAX_REPOS_PER_SWEEP
-                || sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS
-                || total_bytes_processed >= MAX_BYTES_PER_SWEEP
-            {
-                break;
-            }
-            page_count += 1;
-
-            let list_repos_res = state
-                .space_client
-                .list_repos(
-                    &service_endpoint,
-                    &space_uri,
-                    cursor.as_deref(),
-                    &cred.token,
-                    &cred.signing_key,
-                )
-                .await;
-
-            let repos_output = match list_repos_res {
-                Ok(out) => out,
-                Err(e) => {
-                    crate::access::evict_rejected_credential(
-                        &state.credential_store,
-                        &space_uri,
-                        &cred.token,
-                        &e,
-                    )
-                    .await;
-                    break;
-                }
-            };
-            // listRepos pages through writers in ascending spaceRev order and
-            // ends with an empty page, which omits the cursor.
-            if repos_output.repos.is_empty() {
-                start_over = true;
-                break;
-            }
-            let mut credential_rejected = false;
-
-            for repo in &repos_output.repos {
-                // Cooperative shutdown check inside repo loop
-                if let Some(rx) = &mut shutdown_rx {
-                    if *rx.borrow() {
-                        tracing::info!(
-                            "Cooperative shutdown observed during revision sweep repo loop"
-                        );
-                        break;
-                    }
-                }
-
-                if sweep_start.elapsed().as_secs() >= MAX_TIME_PER_SWEEP_SECS {
-                    tracing::info!("Sweep time budget reached in repo loop");
-                    break;
-                }
-                if summary.repos_checked >= MAX_REPOS_PER_SWEEP {
-                    tracing::info!("Sweep repo budget reached in repo loop");
-                    break;
-                }
-                if total_bytes_processed >= MAX_BYTES_PER_SWEEP {
-                    tracing::info!("Sweep byte budget reached in repo loop");
-                    break;
-                }
-
-                summary.repos_checked += 1;
-                let repo_did = repo.did.as_str();
-
-                let db_sync: Option<(String, Vec<u8>)> = sqlx::query_as(
-                    "SELECT last_rev, last_hash FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
-                )
-                .bind(&space_uri)
-                .bind(repo_did)
-                .fetch_optional(&state.db)
-                .await
-                .unwrap_or(None);
-
-                // A repo can reappear when it advances during pagination; the
-                // comparison against stored state makes repeats a no-op.
-                let needs_sync = match db_sync {
-                    Some((last_rev, last_hash)) if last_hash.len() == LTHASH_SIZE => {
-                        let digest: [u8; 32] = Sha256::digest(&last_hash).into();
-                        last_rev != repo.repo_rev.as_str() || &digest[..] != repo.data.as_ref()
-                    }
-                    _ => true,
-                };
-
-                if needs_sync {
-                    match sync_engine
-                        .sync_repo_with_expected_commit(
-                            &space_uri,
-                            repo_did,
-                            Some(repo.data.as_ref()),
-                            Some(repo.repo_rev.as_str()),
-                        )
-                        .await
-                    {
-                        Ok(_res) => {
-                            summary.repos_synced += 1;
-                        }
-                        Err(e) => {
-                            summary.repos_failed += 1;
-                            // The credential was evicted; stop using it for this
-                            // space. A resumed listing retries this repo.
-                            if crate::access::is_credential_rejected(&e) {
-                                credential_rejected = true;
-                                break;
-                            }
-                        }
-                    }
-                    total_bytes_processed = sync_engine.total_bytes_processed();
-                }
-                last_processed = Some(repo.space_rev.to_string());
-            }
-
-            if credential_rejected {
-                break;
-            }
-
-            if let Some(next_cursor) = repos_output.cursor {
-                let next_cur_str = next_cursor.to_string();
-                if next_cur_str.len() > MAX_CURSOR_LEN || seen_cursors.contains(&next_cur_str) {
-                    // A malformed or repeating listing is not resumed.
-                    start_over = true;
-                    break;
-                }
-                if seen_cursors.len() >= MAX_PAGES_PER_SWEEP {
-                    break;
-                }
-                seen_cursors.insert(next_cur_str.clone());
-                cursor = Some(next_cur_str);
-            } else {
-                start_over = true;
-                break;
-            }
-        }
-
-        if start_over {
-            state.listing_resume.clear(&space_uri);
-        } else if let Some(space_rev) = last_processed {
-            state.listing_resume.set(&space_uri, space_rev);
-        }
-
-        // Persist checkpoint after space is processed so an interrupted space resumes rather than skips
-        sqlx::query(
-            r#"
-            INSERT INTO circle_sweep_checkpoint (checkpoint_key, last_space_uri, updated_at)
-            VALUES ('revision_sweep', $1, now())
-            ON CONFLICT (checkpoint_key) DO UPDATE SET last_space_uri = EXCLUDED.last_space_uri, updated_at = now()
-            "#,
+        sweep_space(
+            state,
+            space_uri,
+            &mut summary,
+            sweep_start,
+            &mut total_bytes_processed,
+            &mut shutdown_rx,
         )
-        .bind(&space_uri)
-        .execute(&state.db)
-        .await
-        .map_err(AppError::Database)?;
+        .await?;
     }
 
     Ok(summary)
+}
+
+async fn reauthorize_active_spaces_at(
+    state: &AppState,
+    now: chrono::DateTime<chrono::Utc>,
+    period: std::time::Duration,
+) -> Result<(), AppError> {
+    let spaces: Vec<String> = sqlx::query_scalar(
+        "SELECT space_uri FROM circles \
+         WHERE deleted_at IS NULL AND app_access_granted = true \
+         ORDER BY space_uri",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let renewal_horizon = chrono::Duration::from_std(period.saturating_mul(2))
+        .map_err(|_| AppError::Internal("Registration renewal period is too large".into()))?;
+
+    for space in spaces {
+        state
+            .credential_store
+            .remove_expiring_within_at(&space, now, renewal_horizon)
+            .await;
+        if let Err(error) = crate::access::ensure_space_credential(state, &space, None).await {
+            tracing::warn!(
+                %error,
+                space = %crate::access::space_fingerprint(&space),
+                "scheduled notification reauthorization failed; next pass will retry"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Spawn and retain a production revision sweep task on a repeating interval.
@@ -1869,6 +2154,18 @@ pub fn spawn_revision_sweep_task(
                     }
                 }
                 _ = interval.tick() => {
+                    if let Err(error) = reauthorize_active_spaces_at(
+                        &state,
+                        chrono::Utc::now(),
+                        interval_duration,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "Scheduled notification reauthorization pass failed"
+                        );
+                    }
                     match sweep_once_with_shutdown(&state, Some(&mut shutdown_rx)).await {
                         Ok(summary) => {
                             tracing::info!(
@@ -1891,182 +2188,214 @@ pub fn spawn_revision_sweep_task(
     (handle, shutdown_tx)
 }
 
-/// Upper bound on notifyWrite-triggered syncs running at once.
+/// Upper bound on notification-triggered work running at once.
 pub const MAX_CONCURRENT_NOTIFY_SYNCS: usize = 32;
 
 static NOTIFY_SYNC_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NOTIFY_SYNCS)));
 
-/// Wait until no notifyWrite-triggered sync is running in this process.
 pub async fn wait_for_notify_syncs_idle() {
     while NOTIFY_SYNC_PERMITS.available_permits() < MAX_CONCURRENT_NOTIFY_SYNCS {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
-/// Receives com.atproto.space.notifyWrite. Upstream fan-out is best-effort and
-/// does not wait on the receiver, so this validates the caller and the Circle,
-/// queues the sync in the background and acknowledges at once. When the queue is
-/// full the notification is dropped and the revision sweep repairs it.
-pub async fn notify_write_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: bytes::Bytes,
-) -> Result<axum::response::Response, AppError> {
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::MissingHeader,
-        ))?;
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .or_else(|| auth_header.strip_prefix("bearer "))
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::InvalidHeader,
-        ))?;
-    // A forwarded notification is signed by the space authority and addressed
-    // to the service identifier this AppView registered with registerNotify.
-    let user = crate::auth::verify_service_jwt(
-        &state,
-        token,
-        &state.config.notify_service_identifier(),
-        Some("com.atproto.space.notifyWrite"),
-    )
-    .await?;
+#[derive(serde::Deserialize)]
+struct NotifySpaceUpdateInput {
+    space: String,
+    token: String,
+    update: serde_json::Value,
+}
 
-    // { space, repo, repoRev, data, spaceRev, prevSpaceRev? }
-    let input: catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite =
-        serde_json::from_slice(&body)
-            .map_err(|e| AppError::InvalidRequest(format!("Invalid notifyWrite body: {e}")))?;
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrationExpired {
+    space_rev: String,
+}
 
-    if input.data.len() != 32 {
-        return Err(AppError::InvalidRequest(
-            "Data must be exactly 32 bytes".into(),
-        ));
-    }
-    if input.repo_rev.as_str().is_empty() {
-        return Err(AppError::InvalidRequest("repoRev cannot be empty".into()));
-    }
-
-    // Only the space host forwards to syncers; a repo host notifies the space
-    // host, never this AppView.
-    let authority = extract_authority_did(input.space.as_str())?;
-    if user.did != authority {
-        return Err(AppError::Forbidden(
-            "notifyWrite issuer is not the space authority".into(),
-        ));
-    }
-    // Space revisions are not checkpointed here: the revision sweep re-lists
-    // every space (resuming a listing its budget cut short), so a prevSpaceRev
-    // gap is repaired by a later pass.
-    tracing::debug!(
-        space = %crate::access::space_fingerprint(input.space.as_str()),
-        space_rev = ?input.space_rev.as_ref().map(|r| r.as_str()),
-        prev_space_rev = ?input.prev_space_rev.as_ref().map(|r| r.as_str()),
-        "notifyWrite received"
-    );
-
-    // Finding 17 & 36: Verify caller and repo author are active members before work
-    let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true)",
-    )
-    .bind(input.space.as_str())
-    .bind(input.repo.as_str())
-    .fetch_one(&state.db)
-    .await
-    .map_err(AppError::Database)?;
-
-    if !is_member && input.repo.as_str() != authority {
-        return Err(AppError::Forbidden(
-            "Repo author is not an active member of this Space under its allowedApps".into(),
-        ));
-    }
-
-    let circle_active: Option<bool> = sqlx::query_scalar(
+async fn active_space(state: &AppState, space: &str) -> Result<(), AppError> {
+    let active: Option<bool> = sqlx::query_scalar(
         "SELECT app_access_granted FROM circles WHERE space_uri = $1 AND deleted_at IS NULL",
     )
-    .bind(input.space.as_str())
+    .bind(space)
     .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::Database)?;
-    if circle_active != Some(true) {
-        return Err(AppError::Forbidden(
+    .await?;
+    if active == Some(true) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
             "Space is deleted or allowedApps revoked".into(),
-        ));
+        ))
     }
+}
 
+fn has_revision_gap(previous: Option<&str>, checkpoint: Option<&str>) -> bool {
+    match (previous, checkpoint) {
+        (None, None) => false,
+        (Some(previous), Some(checkpoint)) => previous != checkpoint,
+        _ => true,
+    }
+}
+
+fn queue_catchup(state: AppState, space: String, reauthorize: bool) {
     match NOTIFY_SYNC_PERMITS.clone().try_acquire_owned() {
         Ok(permit) => {
-            let space = input.space.as_str().to_string();
-            let repo = input.repo.as_str().to_string();
-            let rev = input.repo_rev.as_str().to_string();
-            let hash = input.data.to_vec();
             tokio::spawn(async move {
                 let _permit = permit;
-                let res = SyncEngine::new(&state)
-                    .sync_repo_with_expected_commit(&space, &repo, Some(&hash), Some(&rev))
-                    .await;
-                if let Err(e) = res {
+                if reauthorize {
+                    state.credential_store.remove(&space).await;
+                    if let Err(error) =
+                        crate::access::ensure_space_credential(&state, &space, None).await
+                    {
+                        tracing::warn!(
+                            %error,
+                            space = %crate::access::space_fingerprint(&space),
+                            "notification reauthorization failed; revision sweep will retry"
+                        );
+                        return;
+                    }
+                }
+                let mut summary = SweepSummary::default();
+                let mut total_bytes_processed = 0;
+                let mut shutdown_rx = None;
+                if let Err(error) = sweep_space(
+                    &state,
+                    space.clone(),
+                    &mut summary,
+                    std::time::Instant::now(),
+                    &mut total_bytes_processed,
+                    &mut shutdown_rx,
+                )
+                .await
+                {
                     tracing::warn!(
-                        error = %e,
+                        %error,
                         space = %crate::access::space_fingerprint(&space),
-                        "notifyWrite sync failed; the revision sweep will retry"
+                        "notification catch-up failed; revision sweep will retry"
                     );
                 }
             });
         }
         Err(_) => tracing::warn!(
-            space = %crate::access::space_fingerprint(input.space.as_str()),
-            "notifyWrite sync queue full; the revision sweep will catch up"
+            space = %crate::access::space_fingerprint(&space),
+            "notification queue full; durable revision gap left for sweep"
         ),
     }
-
-    use axum::response::IntoResponse;
-    Ok(axum::http::StatusCode::OK.into_response())
 }
 
-#[derive(serde::Deserialize)]
-pub struct NotifySpaceDeletedPayload {
-    pub space: String,
-}
-
-pub async fn notify_space_deleted_handler(
+pub async fn notify_space_update_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-    headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, AppError> {
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::MissingHeader,
-        ))?;
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .or_else(|| auth_header.strip_prefix("bearer "))
-        .ok_or(AppError::Unauthorized(
-            crate::error::AuthReason::InvalidHeader,
-        ))?;
-    let user = crate::auth::verify_service_jwt(
-        &state,
-        token,
-        &state.config.notify_service_identifier(),
-        Some("com.atproto.space.notifySpaceDeleted"),
+    let input: NotifySpaceUpdateInput = serde_json::from_slice(&body)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid notifySpaceUpdate body: {e}")))?;
+    crate::notify::authenticate(
+        &state.db,
+        &state.oauth_service.session_encryption_key,
+        &input.space,
+        &input.token,
     )
     .await?;
+    let update_type = input
+        .update
+        .get("$type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::InvalidRequest("update.$type is required".into()))?;
 
-    let input: NotifySpaceDeletedPayload = serde_json::from_slice(&body)
-        .map_err(|e| AppError::InvalidRequest(format!("Invalid notifySpaceDeleted body: {e}")))?;
-
-    let authority = crate::access::extract_authority_did(&input.space)?;
-    if user.did != authority {
-        return Err(AppError::Unauthorized(crate::error::AuthReason::IdMismatch));
+    match update_type {
+        "com.atproto.space.defs#repoWrite" => {
+            active_space(&state, &input.space).await?;
+            let update: crate::space_client::RepoWrite = serde_json::from_value(input.update)
+                .map_err(|e| AppError::InvalidRequest(format!("Invalid repoWrite update: {e}")))?;
+            if update.data.len() != 32 || update.repo_rev.is_empty() {
+                return Err(AppError::InvalidRequest(
+                    "repoWrite data must be 32 bytes and repoRev must be non-empty".into(),
+                ));
+            }
+            let authority = extract_authority_did(&input.space)?;
+            let is_writer: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM circle_member_cache WHERE space_uri = $1 AND member_did = $2 AND can_write = true)",
+            )
+            .bind(&input.space)
+            .bind(&update.repo)
+            .fetch_one(&state.db)
+            .await?;
+            if !is_writer && update.repo != authority {
+                return Err(AppError::Forbidden(
+                    "Repo author is not an active writer in this Space".into(),
+                ));
+            }
+            let checkpoint = crate::notify::checkpoint_rev(&state.db, &input.space).await?;
+            if has_revision_gap(update.prev_space_rev.as_deref(), checkpoint.as_deref()) {
+                crate::notify::mark_pending(&state.db, &input.space, &update.space_rev).await?;
+                queue_catchup(state, input.space, false);
+            } else {
+                match NOTIFY_SYNC_PERMITS.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        let space = input.space;
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if SyncEngine::new(&state)
+                                .sync_repo_with_expected_commit(
+                                    &space,
+                                    &update.repo,
+                                    Some(update.data.as_ref()),
+                                    Some(&update.repo_rev),
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                let _ =
+                                    crate::notify::checkpoint(&state.db, &space, &update.space_rev)
+                                        .await;
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        crate::notify::mark_pending(&state.db, &input.space, &update.space_rev)
+                            .await?;
+                    }
+                }
+            }
+        }
+        "com.atproto.space.defs#repoRemoved" => {
+            active_space(&state, &input.space).await?;
+            let update: crate::space_client::RepoRemoved = serde_json::from_value(input.update)
+                .map_err(|e| {
+                    AppError::InvalidRequest(format!("Invalid repoRemoved update: {e}"))
+                })?;
+            let checkpoint = crate::notify::checkpoint_rev(&state.db, &input.space).await?;
+            if has_revision_gap(update.prev_space_rev.as_deref(), checkpoint.as_deref()) {
+                crate::notify::mark_pending(&state.db, &input.space, &update.space_rev).await?;
+                queue_catchup(state, input.space, false);
+            } else {
+                apply_repo_removed(&state.db, &input.space, &update.repo).await?;
+                crate::notify::checkpoint(&state.db, &input.space, &update.space_rev).await?;
+            }
+        }
+        "com.atproto.space.notifySpaceUpdate#spaceDeleted" => {
+            state.credential_store.remove(&input.space).await;
+            match crate::access::ensure_space_credential(&state, &input.space, None).await {
+                Err(error) if crate::access::is_space_deleted(&error) => {}
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        "com.atproto.space.notifySpaceUpdate#registrationExpired" => {
+            active_space(&state, &input.space).await?;
+            let update: RegistrationExpired =
+                serde_json::from_value(input.update).map_err(|e| {
+                    AppError::InvalidRequest(format!("Invalid registrationExpired update: {e}"))
+                })?;
+            crate::notify::mark_pending(&state.db, &input.space, &update.space_rev).await?;
+            queue_catchup(state, input.space, true);
+        }
+        other => {
+            return Err(AppError::InvalidRequest(format!(
+                "Unsupported notifySpaceUpdate update type: {other}"
+            )))
+        }
     }
-
-    crate::purge::delete_space(&state.db, &state.credential_store, &input.space)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     use axum::response::IntoResponse;
     Ok(axum::http::StatusCode::OK.into_response())

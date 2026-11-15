@@ -1,19 +1,19 @@
-//! atproto Spaces HTTP message signatures (RFC 9421), October 22, 2026 alpha.
+//! atproto Spaces HTTP message signatures (RFC 9421), November 12, 2026 alpha.
 //!
-//! These replace the Spaces DPoP binding (atproto#5569). Ordinary AT Protocol
-//! OAuth DPoP in [`crate::oauth`] is a separate mechanism and is unchanged.
+//! Ordinary AT Protocol OAuth DPoP in [`crate::oauth`] is a separate mechanism
+//! and is unchanged.
 //!
 //! A credential client holds one fresh P-256 key per space credential:
 //!
-//! - The body-only exchange sends `credentialKid`; the authority binds the
-//!   issued credential to that key as `cnf.kid`. No HTTP signature is sent.
-//!   See [`crate::space_client::SpaceCredentialRequest`].
+//! - `authorizeSpaceSync` sends `credentialKey`; the authority binds the issued
+//!   credential to that key as `cnf.kid`. No HTTP signature is sent.
+//!   See [`crate::space_client::AuthorizeSpaceSyncRequest`].
 //! - Every use of the credential signs `authorization` and
 //!   `atproto-space-audience`, in that order, with the same key. The audience is
 //!   the repo owner's DID for repo reads and the space authority's bare DID for
 //!   space-host operations.
 //!
-//! Mirrors `packages/space/src/http-signature.ts` at atproto 5d88b414a98de1ada22c94c78fa0667a7028163c.
+//! Mirrors `packages/space/src/http-signature.ts` at atproto d4def6e9.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -21,7 +21,7 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 
 /// The signature label in `Signature-Input` and `Signature`.
-pub const SIGNATURE_LABEL: &str = "atproto-space-credential";
+pub const SIGNATURE_LABEL: &str = "sig";
 /// Header naming the DID a space credential is being presented to.
 pub const AUDIENCE_HEADER: &str = "atproto-space-audience";
 /// Authorization scheme for a space credential.
@@ -60,7 +60,7 @@ impl SpaceAuthHeaders {
         let mac_header = self.mac.as_ref().map(crate::space_mac::MacRequest::header);
         if let Some(value) = &mac_header {
             fields.push((
-                HeaderName::from_static(crate::space_mac::WANT_MAC_HEADER),
+                HeaderName::from_static(crate::space_mac::ACCEPT_SIGNATURE_HEADER),
                 value.as_str(),
             ));
         }
@@ -176,7 +176,7 @@ mod tests {
     fn signature_bytes(headers: &SpaceAuthHeaders) -> Vec<u8> {
         let encoded = headers
             .signature
-            .strip_prefix("atproto-space-credential=:")
+            .strip_prefix("sig=:")
             .and_then(|s| s.strip_suffix(':'))
             .expect("byte-sequence signature field");
         STANDARD.decode(encoded).expect("standard base64")
@@ -185,7 +185,7 @@ mod tests {
     fn params(headers: &SpaceAuthHeaders) -> &str {
         headers
             .signature_input
-            .strip_prefix("atproto-space-credential=")
+            .strip_prefix("sig=")
             .expect("labelled signature input")
     }
 
@@ -227,9 +227,9 @@ mod tests {
         assert_eq!(headers.audience.as_deref(), Some("did:plc:repoowner"));
         assert_eq!(
             headers.signature_input,
-            r#"atproto-space-credential=("authorization" "atproto-space-audience");tag="atproto-space-credential""#
+            r#"sig=("authorization" "atproto-space-audience");tag="atproto-space-credential""#
         );
-        assert!(headers.signature.starts_with("atproto-space-credential=:"));
+        assert!(headers.signature.starts_with("sig=:"));
         assert!(headers.signature.ends_with(':'));
         assert_eq!(
             headers.key_id(),
@@ -292,7 +292,7 @@ mod tests {
                     .get("https://host.example/xrpc/com.atproto.space.getRepo")
                     .header(reqwest::header::AUTHORIZATION, "Bearer stale")
                     .header(AUDIENCE_HEADER, "did:plc:stale")
-                    .header("signature", "atproto-space-credential=:c3RhbGU=:"),
+                    .header("signature", "stale=:c3RhbGU=:"),
             )
             .build()
             .unwrap();

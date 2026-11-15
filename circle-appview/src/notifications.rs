@@ -92,6 +92,9 @@ pub async fn list_notifications(
         LEFT JOIN circle_preferences pref ON pref.space_uri = n.space_uri AND pref.member_did = $1
         WHERE n.recipient_did = $1 AND n.actor_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
           AND COALESCE(pref.muted, false) = false
+          AND NOT EXISTS (
+              SELECT 1 FROM circle_records sr WHERE sr.uri = n.subject_uri AND sr.stale_key
+          )
           AND (
               $2::TIMESTAMPTZ IS NULL
               OR (n.created_at, n.id) < ($2, $3)
@@ -181,6 +184,7 @@ pub async fn list_notifications(
             owner: circle_owner_did,
             member_count: None,
             muted: Some(circle_muted),
+            latest_key_version: None,
             extra_data: None,
         };
 

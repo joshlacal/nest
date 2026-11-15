@@ -63,6 +63,7 @@ fn test_activate_circle_output_contract() {
         name: SmolStr::new("Test Circle"),
         owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
         member_count: Some(5),
+        latest_key_version: None,
         muted: Some(false),
         extra_data: None,
     };
@@ -94,6 +95,7 @@ fn test_circle_summary_contract() {
         name: SmolStr::new("Alice's Inner Circle"),
         owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
         member_count: Some(42),
+        latest_key_version: None,
         muted: Some(true),
         extra_data: None,
     };
@@ -158,8 +160,9 @@ fn test_notification_reason_open_union() {
 fn test_get_capabilities_output_contract() {
     let output = GetCapabilitiesOutput {
         enabled: true,
-        protocol_revision: SmolStr::new("5d88b414a98de1ada22c94c78fa0667a7028163c"),
+        protocol_revision: SmolStr::new("d4def6e9f521896ed8222f576d54923d00b5fbeb"),
         supports_images: false,
+        supports_encrypted_posts: None,
         extra_data: None,
     };
 
@@ -167,7 +170,7 @@ fn test_get_capabilities_output_contract() {
     assert_eq!(serialized["enabled"], true);
     assert_eq!(
         serialized["protocolRevision"],
-        "5d88b414a98de1ada22c94c78fa0667a7028163c"
+        "d4def6e9f521896ed8222f576d54923d00b5fbeb"
     );
     assert_eq!(serialized["supportsImages"], false);
 }
@@ -180,6 +183,7 @@ fn test_get_feed_query_and_output_contract() {
     .unwrap();
     let query = GetFeed {
         cursor: Some(SmolStr::new("cursor123")),
+        include_encrypted: None,
         limit: Some(25),
         space: Some(space_uri),
     };
@@ -263,6 +267,7 @@ fn test_get_media_and_post_thread_contract() {
 
     let thread_query = GetPostThread {
         depth: Some(10),
+        include_encrypted: None,
         parent_height: Some(80),
         space: space_uri,
         uri: aturi,
@@ -288,6 +293,8 @@ fn test_moderation_and_preferences_contract() {
         reason: ReportRecordReason::Abuse,
         space: space_uri.clone(),
         uri: aturi,
+        disclosed_media: None,
+        disclosed_post_key: None,
         extra_data: None,
     };
     let report_ser = serde_json::to_value(&report).unwrap();

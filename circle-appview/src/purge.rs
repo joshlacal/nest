@@ -152,6 +152,10 @@ pub async fn revoke_app_access(
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query("DELETE FROM circle_space_notify_tokens WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
@@ -304,6 +308,28 @@ pub async fn purge_circle_projected_data(pool: &PgPool, space: &str) -> Result<(
         }
     }
 
+    // Key records (wrapped content keys)
+    loop {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM circle_keys
+            WHERE ctid IN (
+                SELECT ctid FROM circle_keys
+                WHERE space_uri = $1
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(space)
+        .bind(BATCH_SIZE)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if deleted < BATCH_SIZE as u64 {
+            break;
+        }
+    }
+
     // Rejections
     loop {
         let deleted = sqlx::query(
@@ -370,6 +396,10 @@ pub async fn delete_space(
         .bind(space)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM circle_keys WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM circle_repo_sync_state WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
@@ -391,6 +421,10 @@ pub async fn delete_space(
         .execute(&mut *tx)
         .await?;
     // The space is gone at the host, so its registration is gone with it.
+    sqlx::query("DELETE FROM circle_space_notify_tokens WHERE space_uri = $1")
+        .bind(space)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM circle_notify_registrations WHERE space_uri = $1")
         .bind(space)
         .execute(&mut *tx)
@@ -502,6 +536,7 @@ pub async fn purge_deleted_author(pool: &PgPool, author: &str) -> Result<(), Pur
         ("circle_reports", "reporter_did=$1"),
         ("circle_preferences", "member_did=$1"),
         ("circle_repo_sync_state", "author_did=$1"),
+        ("circle_keys", "owner_did=$1"),
         ("circle_member_cache", "member_did=$1"),
         ("circle_former_members", "member_did=$1"),
         ("oauth_sessions", "user_did=$1"),

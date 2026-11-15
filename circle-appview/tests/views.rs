@@ -35,10 +35,12 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use support::plain;
 use tower::ServiceExt;
 
 use circle_appview::validator::{policy, validate_record, RecordCandidate, ValidationPolicy};
 use sha2::{Digest, Sha256};
+
 const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const ALICE_DID: &str = "did:plc:alice-circle-owner";
 const BOB_DID: &str = "did:plc:bob-circle-member";
@@ -390,7 +392,7 @@ async fn feed_excludes_spaces_without_active_lease(pool: PgPool) {
     );
     assert_eq!(feed_output.feed[0].circle.uri.as_str(), SPACE_1);
     assert_eq!(
-        feed_output.feed[0].post.post.uri.as_str(),
+        plain(&feed_output.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post1")
     );
 }
@@ -576,11 +578,11 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let page1: GetFeedOutput = serde_json::from_slice(&body1).unwrap();
     assert_eq!(page1.feed.len(), 2);
     assert_eq!(
-        page1.feed[0].post.post.uri.as_str(),
+        plain(&page1.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post5")
     );
     assert_eq!(
-        page1.feed[1].post.post.uri.as_str(),
+        plain(&page1.feed[1]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post4")
     );
     assert!(page1.cursor.is_some());
@@ -604,11 +606,11 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let page2: GetFeedOutput = serde_json::from_slice(&body2).unwrap();
     assert_eq!(page2.feed.len(), 2);
     assert_eq!(
-        page2.feed[0].post.post.uri.as_str(),
+        plain(&page2.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post3")
     );
     assert_eq!(
-        page2.feed[1].post.post.uri.as_str(),
+        plain(&page2.feed[1]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post2")
     );
     assert!(page2.cursor.is_some());
@@ -632,7 +634,7 @@ async fn feed_stable_opaque_cursor_pagination(pool: PgPool) {
     let page3: GetFeedOutput = serde_json::from_slice(&body3).unwrap();
     assert_eq!(page3.feed.len(), 1);
     assert_eq!(
-        page3.feed[0].post.post.uri.as_str(),
+        plain(&page3.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7post1")
     );
     assert!(page3.cursor.is_none(), "Last page must have no next cursor");
@@ -842,7 +844,7 @@ async fn feed_returns_top_level_posts_only_and_omits_replies(pool: PgPool) {
 
     assert_eq!(feed.feed.len(), 1, "Feed must contain only top-level posts");
     assert_eq!(
-        feed.feed[0].post.post.uri.as_str(),
+        plain(&feed.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7root")
     );
 }
@@ -926,7 +928,7 @@ async fn owner_omitted_from_explicit_list_sees_own_actual_post_in_unified_and_di
         "Owner must see own post in direct feed"
     );
     assert_eq!(
-        feed_alice_direct.feed[0].post.post.uri.as_str(),
+        plain(&feed_alice_direct.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7ownerpost")
     );
     assert_eq!(feed_alice_direct.feed[0].circle.owner.as_str(), ALICE_DID);
@@ -954,7 +956,7 @@ async fn owner_omitted_from_explicit_list_sees_own_actual_post_in_unified_and_di
         "Owner must see own post in unified feed"
     );
     assert_eq!(
-        feed_alice_unified.feed[0].post.post.uri.as_str(),
+        plain(&feed_alice_unified.feed[0]).post.uri.as_str(),
         format!("at://{ALICE_DID}/app.bsky.feed.post/3l7ownerpost")
     );
 
@@ -1265,7 +1267,7 @@ async fn feed_and_thread_space_local_counts_and_viewer_likes_isolate_cross_space
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let feed: GetFeedOutput = serde_json::from_slice(&body).unwrap();
 
-    let post = &feed.feed[0].post.post;
+    let post = &plain(&feed.feed[0]).post;
     assert_eq!(
         post.reply_count,
         Some(1),
@@ -1375,7 +1377,7 @@ async fn feed_view_omits_rendered_images_while_blob_support_is_disabled(pool: Pg
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let feed: GetFeedOutput = serde_json::from_slice(&body).unwrap();
 
-    let post = &feed.feed[0].post.post;
+    let post = &plain(&feed.feed[0]).post;
     assert!(
         post.embed.is_none(),
         "Unqualified private images must not produce media URLs"
@@ -1906,6 +1908,7 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
                             indexed_at: None,
                             joined_via_starter_pack: None,
                             labels: None,
+                            links: None,
                             pinned_post: None,
                             posts_count: None,
                             pronouns: Some(SmolStr::new("she/her")),
@@ -1935,6 +1938,7 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
                             indexed_at: None,
                             joined_via_starter_pack: None,
                             labels: None,
+                            links: None,
                             pinned_post: None,
                             posts_count: None,
                             pronouns: None,
@@ -2107,6 +2111,7 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
                         follows_count: None,
                         indexed_at: None,
                         joined_via_starter_pack: None,
+                        links: None,
                         labels: None,
                         pinned_post: None,
                         posts_count: None,
@@ -2158,6 +2163,7 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
 
 #[test]
 fn test_circle_media_base_url_strict_https_origin_validation() {
+    std::env::set_var("APPVIEW_BASE_URL", "http://127.0.0.1:3002");
     let valid_cases = [
         "https://media.catbird.blue",
         "https://media.catbird.blue/",
@@ -2675,6 +2681,7 @@ async fn thread_view_unions_replies_under_both_parent_uri_spellings(pool: PgPool
         SPACE_1,
         Some(10),
         None,
+        false,
     )
     .await;
     if let Err(e) = &direct_res {

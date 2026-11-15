@@ -7,6 +7,7 @@ use axum::{
     http::{header, HeaderValue},
     response::Response,
 };
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -14,6 +15,28 @@ use tokio::sync::Semaphore;
 pub const MAX_CONCURRENT_MEDIA_TRANSFERS: usize = 16;
 pub const MAX_MEDIA_BLOB_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 pub const MAX_AGGREGATE_MEDIA_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+const ALLOWED_MEDIA_MIME_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/avif",
+];
+
+fn sanitize_media_content_type(raw: Option<&str>) -> (&'static str, bool) {
+    if let Some(ct) = raw {
+        if !ct.bytes().any(|b| b.is_ascii_control()) {
+            let media_type = ct.split(';').next().unwrap_or("").trim();
+            for &allowed in ALLOWED_MEDIA_MIME_TYPES {
+                if media_type.eq_ignore_ascii_case(allowed) {
+                    return (allowed, false);
+                }
+            }
+        }
+    }
+    ("application/octet-stream", true)
+}
 
 static MEDIA_CONCURRENCY_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_MEDIA_TRANSFERS)));
@@ -70,8 +93,13 @@ pub async fn get_media(
     access::check_member_access(state, space, did).await?;
 
     // 3. Validate CID syntax strictly (fail-closed before database or network)
-    let _parsed_cid =
-        cid::Cid::try_from(cid).map_err(|_| AppError::NotFound("Not Found".into()))?;
+    let parsed_cid = cid::Cid::try_from(cid).map_err(|_| AppError::NotFound("Not Found".into()))?;
+    if parsed_cid.version() != cid::Version::V1
+        || parsed_cid.hash().code() != 0x12
+        || parsed_cid.hash().digest().len() != 32
+    {
+        return Err(AppError::NotFound("Not Found".into()));
+    }
 
     // 4. Local active-accepted-record CID authorization before any Space media request.
     // Must match either exact record CID or an exact blob reference in record_json.
@@ -82,6 +110,7 @@ pub async fn get_media(
         WHERE space_uri = $1
           AND author_did = $2
           AND deleted_at IS NULL
+          AND NOT stale_key
           AND (
             cid = $3
             OR jsonb_path_exists(record_json, '$.**."$link" ? (@ == $cid)', jsonb_build_object('cid', $3))
@@ -99,6 +128,16 @@ pub async fn get_media(
     if record_exists.is_none() {
         return Err(AppError::NotFound("Not Found".into()));
     }
+
+    // Blobs of an encrypted Circle are ciphertext: never let an upstream media type
+    // make a client treat them as renderable content.
+    let space_type: Option<String> =
+        sqlx::query_scalar("SELECT space_type FROM circles WHERE space_uri = $1")
+            .bind(space)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::Database)?;
+    let encrypted_space = space_type.as_deref() == Some(crate::validator::ENCRYPTED_SPACE_TYPE);
 
     // 5. Obtain an active Space credential before taking a media slot, so a slow
     // or failing exchange never holds one. Credentials last 600 s by default, so
@@ -173,20 +212,25 @@ pub async fn get_media(
         ));
     }
 
+    // 10. Verify SHA-256 multihash of fetched bytes matches the requested CID before serving
+    let actual_digest = Sha256::digest(&bytes);
+    if &actual_digest[..] != parsed_cid.hash().digest() {
+        return Err(AppError::NotFound("Not Found".into()));
+    }
+
     let byte_len = bytes.len();
     let unused = MAX_MEDIA_BLOB_BYTES.saturating_sub(byte_len);
     if unused > 0 {
         ACTIVE_MEDIA_BYTES.fetch_sub(unused, Ordering::SeqCst);
         byte_guard.0 = byte_len;
     }
-    let content_type_str = content_type
-        .as_deref()
-        .unwrap_or("application/octet-stream");
 
-    // Validate content type does not contain control characters
-    let header_val = HeaderValue::from_str(content_type_str).map_err(|_| {
-        AppError::InvalidRequest("Invalid Content-Type header from upstream".into())
-    })?;
+    let (safe_content_type, force_attachment) = if encrypted_space {
+        ("application/octet-stream", true)
+    } else {
+        sanitize_media_content_type(content_type.as_deref())
+    };
+    let header_val = HeaderValue::from_static(safe_content_type);
 
     let stream = GuardedMediaStream {
         data: Some(bytes::Bytes::from(bytes)),
@@ -194,10 +238,20 @@ pub async fn get_media(
         _byte_guard: byte_guard,
     };
 
-    let response = Response::builder()
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, header_val)
         .header(header::CONTENT_LENGTH, byte_len)
         .header(header::CACHE_CONTROL, "no-store, private")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; sandbox",
+        );
+    if force_attachment {
+        builder = builder.header(header::CONTENT_DISPOSITION, "attachment");
+    }
+
+    let response = builder
         .body(Body::from_stream(stream))
         .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")))?;
 

@@ -14,6 +14,7 @@
 
 mod support;
 use std::sync::Arc;
+use support::plain;
 
 use axum::{
     body::{to_bytes, Body},
@@ -958,8 +959,7 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
     // Carol's feed has viewer.like populated on Alice's post
     let carol_target_post = &carol_feed[0];
     assert!(
-        carol_target_post
-            .post
+        plain(carol_target_post)
             .post
             .uri
             .as_str()
@@ -967,8 +967,7 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
         "Alice's post must be in Carol's feed"
     );
     assert!(
-        carol_target_post
-            .post
+        plain(carol_target_post)
             .post
             .viewer
             .as_ref()
@@ -977,8 +976,8 @@ async fn three_user_circle_is_private_and_revocable(pool: PgPool) {
         "Carol must have viewer.like set on Alice's post"
     );
     // Alice's post shows like_count = 1 and reply_count = 1
-    assert_eq!(carol_target_post.post.post.like_count, Some(1));
-    assert_eq!(carol_target_post.post.post.reply_count, Some(1));
+    assert_eq!(plain(carol_target_post).post.like_count, Some(1));
+    assert_eq!(plain(carol_target_post).post.reply_count, Some(1));
     // Dave (unauthorized stranger) is denied access
     assert_eq!(
         env.dave.feed_status(&env, &circle).await,

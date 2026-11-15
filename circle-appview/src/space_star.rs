@@ -1,4 +1,4 @@
-//! Strict STAR-lite v1 repository replacement. No records escape before full digest validation.
+//! Strict DASL STAR repository replacement. No records escape before full digest validation.
 use crate::{
     commit::{create_cid_bytes_from_data, json_to_ipld, LtHash},
     error::AppError,
@@ -7,6 +7,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 pub const MAX_STAR_BYTES: usize = 50 * 1024 * 1024;
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
+pub const MAX_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 pub const MAX_RECORDS: usize = 10_000;
 pub const MAGIC: &[u8] = &[0x2a, 0x6c, 0x01, 0x00];
@@ -57,6 +59,22 @@ fn frame<'a>(input: &mut &'a [u8], max: usize) -> Result<&'a [u8], AppError> {
     *input = rest;
     Ok(value)
 }
+fn pair<'a>(input: &mut &'a [u8]) -> Result<Option<(&'a [u8], &'a [u8])>, AppError> {
+    let (&control, rest) = input
+        .split_first()
+        .ok_or_else(|| invalid("unexpected end of archive"))?;
+    *input = rest;
+    match control {
+        0x00 if input.is_empty() => Ok(None),
+        0x00 => Err(invalid("unexpected bytes after end of archive")),
+        0x01 => {
+            let key = frame(input, MAX_KEY_BYTES)?;
+            let value = frame(input, MAX_RECORD_BYTES)?;
+            Ok(Some((key, value)))
+        }
+        _ => Err(invalid("invalid control byte")),
+    }
+}
 fn canonical(
     bytes: &[u8],
 ) -> Result<jacquard_common::types::value::Data<jacquard_common::SmolStr>, AppError> {
@@ -78,7 +96,7 @@ pub fn read_commit(bytes: &[u8], space: &str, repo: &str) -> Result<Commit, AppE
     let mut input = bytes
         .strip_prefix(MAGIC)
         .ok_or_else(|| invalid("wrong magic"))?;
-    let metadata = frame(&mut input, 64 * 1024)?;
+    let metadata = frame(&mut input, MAX_METADATA_BYTES)?;
     canonical(metadata)?;
     let meta: Meta =
         serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid metadata"))?;
@@ -92,6 +110,7 @@ pub fn read_commit(bytes: &[u8], space: &str, repo: &str) -> Result<Commit, AppE
     }
     let commit: Commit =
         serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid commit"))?;
+    while pair(&mut input)?.is_some() {}
     Ok(commit)
 }
 
@@ -102,7 +121,7 @@ pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnap
     let mut input = bytes
         .strip_prefix(MAGIC)
         .ok_or_else(|| invalid("wrong magic"))?;
-    let metadata = frame(&mut input, 64 * 1024)?;
+    let metadata = frame(&mut input, MAX_METADATA_BYTES)?;
     canonical(metadata)?;
     let meta: Meta =
         serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid metadata"))?;
@@ -119,11 +138,10 @@ pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnap
     let mut records = Vec::new();
     let mut last: Option<Vec<u8>> = None;
     let mut lthash = LtHash::default();
-    while !input.is_empty() {
+    while let Some((path_bytes, record_bytes)) = pair(&mut input)? {
         if records.len() >= MAX_RECORDS {
             return Err(invalid("too many records"));
         }
-        let path_bytes = frame(&mut input, 1024)?;
         if last
             .as_ref()
             .is_some_and(|last| last.as_slice() >= path_bytes)
@@ -143,7 +161,6 @@ pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnap
         {
             return Err(invalid("invalid collection or rkey"));
         }
-        let record_bytes = frame(&mut input, MAX_RECORD_BYTES)?;
         let value = canonical(record_bytes)?;
         let json = serde_json::to_value(value).map_err(|_| invalid("invalid record JSON"))?;
         json_to_ipld(&json).map_err(|_| invalid("invalid record value"))?;
@@ -196,9 +213,11 @@ mod tests {
         let mut bytes = MAGIC.to_vec();
         append_frame(&mut bytes, &serde_ipld_dagcbor::to_vec(&meta).unwrap());
         for (path, value) in pairs {
+            bytes.push(0x01);
             append_frame(&mut bytes, path.as_bytes());
             append_frame(&mut bytes, value);
         }
+        bytes.push(0x00);
         bytes
     }
     fn parse(bytes: &[u8]) -> Result<RepoSnapshot, AppError> {
@@ -231,6 +250,7 @@ mod tests {
         }
         let mut bytes = archive(&[("app.bsky.feed.post/a", &value)]);
         bytes.pop();
+
         assert!(parse(&bytes).is_err());
         let mut bytes = archive(&[]);
         bytes.push(0x80);
@@ -240,6 +260,23 @@ mod tests {
         let end = bytes.len() - 1;
         bytes[end] ^= 1;
         assert!(parse(&bytes).is_err());
+    }
+    #[test]
+    fn rejects_missing_end_bad_control_and_trailing_bytes() {
+        let complete = archive(&[]);
+        assert_eq!(complete.last(), Some(&0x00));
+
+        let mut missing_end = complete.clone();
+        missing_end.pop();
+        assert!(parse(&missing_end).is_err());
+
+        let mut bad_control = complete.clone();
+        *bad_control.last_mut().unwrap() = 0x02;
+        assert!(parse(&bad_control).is_err());
+
+        let mut trailing = complete;
+        trailing.push(0xff);
+        assert!(parse(&trailing).is_err());
     }
     #[test]
     fn rejects_noncanonical_or_forbidden_records_even_with_matching_digest() {
@@ -278,10 +315,14 @@ mod tests {
             &mut invalid_version,
             &serde_ipld_dagcbor::to_vec(&meta).unwrap(),
         );
+        invalid_version.push(0x00);
         assert!(parse(&invalid_version).is_err());
         let mut invalid_path = bytes;
+        invalid_path.pop();
+        invalid_path.push(0x01);
         append_frame(&mut invalid_path, &[0xff]);
         append_frame(&mut invalid_path, &[0xa0]);
+        invalid_path.push(0x00);
         assert!(parse(&invalid_path).is_err());
     }
 
@@ -289,5 +330,12 @@ mod tests {
     fn rejects_oversized_record() {
         let value = vec![0; MAX_RECORD_BYTES + 1];
         assert!(parse(&archive(&[("app.bsky.feed.post/a", &value)])).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_key() {
+        let key = "a".repeat(MAX_KEY_BYTES + 1);
+        let value = serde_ipld_dagcbor::to_vec(&serde_json::json!({})).unwrap();
+        assert!(parse(&archive(&[(key.as_str(), value.as_slice())])).is_err());
     }
 }

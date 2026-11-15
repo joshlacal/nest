@@ -53,12 +53,12 @@ pub fn create_router(state: AppState) -> Router {
             get(get_capabilities),
         )
         .route(
-            "/xrpc/com.atproto.space.notifyWrite",
-            post(crate::sync::notify_write_handler),
+            "/xrpc/com.atproto.space.confirmRegistration",
+            post(crate::notify::confirm_registration_handler),
         )
         .route(
-            "/xrpc/com.atproto.space.notifySpaceDeleted",
-            post(crate::sync::notify_space_deleted_handler),
+            "/xrpc/com.atproto.space.notifySpaceUpdate",
+            post(crate::sync::notify_space_update_handler),
         );
 
     // Authenticated XRPC endpoints
@@ -70,6 +70,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/xrpc/blue.catbird.circle.getPostThread",
             get(crate::handlers::thread::get_post_thread_handler),
+        )
+        .route(
+            "/xrpc/blue.catbird.circle.getKeys",
+            get(crate::handlers::keys::get_keys_handler),
         )
         .route(
             "/xrpc/blue.catbird.circle.listCircles",
@@ -184,6 +188,7 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<GetCapabilities
         enabled: lifecycle_ready(&state).await,
         protocol_revision: CIRCLE_PROTOCOL_REVISION.into(),
         supports_images: crate::SUPPORTS_IMAGES,
+        supports_encrypted_posts: Some(true),
         extra_data: None,
     })
 }
@@ -328,6 +333,7 @@ async fn list_circles_handler(
             name: SmolStr::new(display_name),
             owner,
             uri,
+            latest_key_version: crate::feed::summary_key_version(&state.db, space_uri).await?,
             extra_data: None,
         });
     }

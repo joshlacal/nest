@@ -1,5 +1,6 @@
 //! Local current-wire fixtures; injected transport tests do not qualify host interoperability.
 #![allow(dead_code)]
+pub mod encrypted;
 use circle_appview::{
     commit::{json_to_ipld, RepoRecord},
     space_mac::Commit,
@@ -42,12 +43,14 @@ pub fn fixture_star(commit: &Commit, records: &[RepoRecord]) -> anyhow::Result<V
     let mut records: Vec<_> = records.iter().collect();
     records.sort_by_key(|r| format!("{}/{}", r.collection, r.rkey));
     for r in records {
+        out.push(0x01);
         frame(&mut out, format!("{}/{}", r.collection, r.rkey).as_bytes());
         frame(
             &mut out,
             &serde_ipld_dagcbor::to_vec(&json_to_ipld(&r.value)?)?,
         );
     }
+    out.push(0x00);
     Ok(out)
 }
 pub fn frame(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -70,5 +73,17 @@ pub async fn healthy_identity_fixture(pool: &sqlx::PgPool, dids: &[&str]) {
     for did in dids {
         sqlx::query("INSERT INTO circle_account_status(did,active,pds_url,source_seq,relay_url) VALUES($1,true,'https://pds.fixture.example.com',1,'wss://relay.fixture.example.com/') ON CONFLICT(did) DO NOTHING")
             .bind(did).execute(pool).await.unwrap();
+    }
+}
+
+/// The plaintext arm of a feed item; the plaintext view suites index only plaintext posts.
+pub fn plain(
+    item: &catbird_atproto::generated::blue_catbird::circle::FeedItem,
+) -> &catbird_atproto::generated::app_bsky::feed::FeedViewPost {
+    match &item.post {
+        catbird_atproto::generated::blue_catbird::circle::FeedItemPost::FeedViewPost(v) => v,
+        _ => {
+            panic!("expected a plaintext feedViewPost")
+        }
     }
 }

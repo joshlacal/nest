@@ -40,12 +40,14 @@ use crate::error::{AppError, AuthReason};
 
 /// TTL for pending OAuth authorization states (10 minutes).
 pub const PENDING_STATE_TTL_SECS: i64 = 600;
+/// Maximum number of concurrent pending OAuth authorization states retained in memory.
+pub const MAX_PENDING_OAUTH_STATES: usize = 10_000;
 
 /// The bare `atproto` scope is MANDATORY in every atproto OAuth authorization
 /// request; a PDS rejects the request with `invalid_request` / `Missing "atproto"
 /// scope` without it. The permissioned-data scope alone is not sufficient, which
 /// a live authorization against spaces-alpha.host.bsky.network proved.
-pub const CIRCLE_SCOPE: &str = "atproto space:blue.catbird.circle?authority=*&action=read";
+pub const CIRCLE_SCOPE: &str = "atproto space:blue.catbird.circle?authority=*&action=read space:blue.catbird.circle.encrypted?authority=*&action=read";
 pub const CALLBACK_DEEP_LINK: &str = "blue.catbird://oauth/circle-appview";
 pub const MAX_OAUTH_METADATA_BYTES: usize = 256 * 1024; // 256 KiB
 pub const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1024; // 256 KiB
@@ -640,6 +642,17 @@ impl OAuthService {
             lock.retain(|_, v| {
                 v.created_at + chrono::Duration::seconds(PENDING_STATE_TTL_SECS) > now
             });
+            while lock.len() >= MAX_PENDING_OAUTH_STATES && !lock.contains_key(&state) {
+                if let Some(evict_key) = lock
+                    .iter()
+                    .min_by_key(|(_, v)| (v.in_flight, v.created_at))
+                    .map(|(k, _)| k.clone())
+                {
+                    lock.remove(&evict_key);
+                } else {
+                    break;
+                }
+            }
             lock.insert(
                 state.clone(),
                 PendingOAuthState {
@@ -1950,6 +1963,10 @@ mod tests {
                 .any(|s| s.starts_with("space:blue.catbird.circle?")),
             "CIRCLE_SCOPE must still request the Circle permissioned-data scope, got {CIRCLE_SCOPE:?}"
         );
+        assert!(
+            scopes.contains(&"space:blue.catbird.circle.encrypted?authority=*&action=read"),
+            "CIRCLE_SCOPE must request read on the encrypted Circle space type, got {CIRCLE_SCOPE:?}"
+        );
     }
 
     const TEST_ENC_KEY_HEX: &str =
@@ -2913,5 +2930,94 @@ mod tests {
             0,
             "No PAR requests should be sent when not advertised"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn b6_pending_oauth_states_enforces_max_cap_and_evicts_expired_or_oldest(pool: PgPool) {
+        setup_test_encryption_key();
+        let mock_server = MockServer::start().await;
+        let service = OAuthService::with_transport(
+            pool,
+            "http://127.0.0.1:3002".to_string(),
+            p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
+            None,
+            Arc::new(DefaultSpaceHostTransport::with_loopback(true)),
+        );
+        let http_client = reqwest::Client::new();
+        let user_did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": mock_server.uri(),
+                "authorization_endpoint": format!("{}/oauth/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oauth/token", mock_server.uri()),
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let did_resolver = DidResolver::new("https://plc.directory".into(), http_client.clone());
+        did_resolver.insert_cached(
+            user_did.into(),
+            crate::auth::DidDocument {
+                id: user_did.into(),
+                verification_method: vec![],
+                service: vec![crate::auth::DidService {
+                    id: "#atproto_pds".into(),
+                    r#type: "AtprotoPersonalDataServer".into(),
+                    service_endpoint: mock_server.uri(),
+                }],
+            },
+        );
+
+        // Pre-seed 10_000 active pending states: `state-0` is in-flight, `state-1..=state-5` are oldest idle.
+        let shared_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let base_time = Utc::now() - chrono::Duration::seconds(300);
+        {
+            let mut lock = service.pending_states.write();
+            for i in 0..10_000usize {
+                let key = format!("state-{i}");
+                lock.insert(
+                    key.clone(),
+                    PendingOAuthState {
+                        state: key,
+                        code_verifier: "verifier".into(),
+                        user_did: user_did.into(),
+                        pds_endpoint: mock_server.uri(),
+                        token_endpoint: format!("{}/oauth/token", mock_server.uri()),
+                        auth_server_iss: Some(mock_server.uri()),
+                        created_at: base_time + chrono::Duration::milliseconds(i as i64),
+                        in_flight: i == 0,
+                        dpop_key: shared_dpop_key.clone(),
+                    },
+                );
+            }
+        }
+
+        for _ in 0..5 {
+            service
+                .start_flow(user_did, &did_resolver, &http_client)
+                .await
+                .expect("start_flow must succeed while enforcing pending_states cap");
+        }
+
+        let lock = service.pending_states.read();
+        assert_eq!(
+            lock.len(),
+            10_000,
+            "pending_states must be strictly capped at 10_000 entries, got {}",
+            lock.len()
+        );
+        assert!(
+            lock.contains_key("state-0"),
+            "Active in-flight OAuth state should be preserved over idle states when evicting"
+        );
+        for evicted_idx in 1..=5 {
+            let key = format!("state-{evicted_idx}");
+            assert!(
+                !lock.contains_key(&key),
+                "Oldest idle pending state `{key}` should have been evicted at capacity"
+            );
+        }
     }
 }

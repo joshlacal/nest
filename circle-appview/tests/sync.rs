@@ -13,7 +13,6 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use catbird_atproto::jacquard_common::types::cid::Cid;
-use catbird_atproto::jacquard_common::types::did::Did;
 use catbird_atproto::jacquard_common::types::nsid::Nsid;
 use catbird_atproto::jacquard_common::types::recordkey::RecordKey;
 use catbird_atproto::jacquard_common::types::string::Rkey;
@@ -21,16 +20,15 @@ use catbird_atproto::jacquard_common::types::tid::Tid;
 
 use circle_appview::access::{ActiveSpaceCredential, CredentialStore, SpaceLockManager};
 use circle_appview::auth::{
-    DidDocument, DidResolver, DidService, ParsedVerifyingKey, PublicKeyJwk, VerificationMethod,
+    DidDocument, DidResolver, DidService, PublicKeyJwk, VerificationMethod,
 };
-use circle_appview::commit::{
-    compute_commit_context, compute_commit_mac, compute_dagcbor_cid, decode_repo_car,
-    derive_commit_mac_key, mint_repo_car, mint_signed_commit, verify_commit, CommitContext,
-    LtHash as RepoLtHash, RepoRecord,
-};
+use circle_appview::commit::{compute_dagcbor_cid, LtHash as RepoLtHash, RepoRecord};
 use circle_appview::config::{AppState, Config};
 use circle_appview::error::AppError;
-use circle_appview::space_client::{MockSpaceHostTransport, SpaceClient};
+use circle_appview::space_client::{
+    ListWritersOutput, MockSpaceHostTransport, RepoRemoved, RepoWrite, SpaceAppAccess, SpaceClient,
+    SpaceConfig, SpacePolicy, WriterUpdate,
+};
 
 #[derive(Clone)]
 struct TestLtHash {
@@ -299,7 +297,7 @@ fn rejects_nonmember_top_level_cross_space_and_quote() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Step 2 & 3: LtHash and Signed Commit Verification Tests
+// Step 2: LtHash accumulator tests
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -330,45 +328,6 @@ fn lthash_additive_homomorphic_properties() {
     assert_eq!(h1.as_bytes(), LtHash::new().as_bytes());
 }
 
-#[test]
-fn commit_verification_succeeds_and_fails_on_tampering() {
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let parsed_vk = ParsedVerifyingKey::P256(*verifying_key);
-
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7test111111", "bafytestcid1");
-
-    let rev = "3l7aaaaaaaaaa";
-    let signed_commit = mint_signed_commit(space(), owner(), rev, lthash.as_bytes(), &signing_key);
-
-    let context = CommitContext {
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(space())
-            .unwrap(),
-        author: catbird_atproto::jacquard_common::types::did::Did::new_owned(owner()).unwrap(),
-        rev: catbird_atproto::jacquard_common::types::tid::Tid::new(rev).unwrap(),
-    };
-
-    // 1. Valid commit verification succeeds
-    assert!(verify_commit(&signed_commit, &context, &parsed_vk).is_ok());
-
-    // 2. Tampered MAC -> fails
-    let mut tampered_mac_commit = signed_commit.clone();
-    tampered_mac_commit.mac =
-        catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]);
-    assert!(verify_commit(&tampered_mac_commit, &context, &parsed_vk).is_err());
-
-    // 3. Tampered Signature -> fails
-    let mut tampered_sig_commit = signed_commit.clone();
-    tampered_sig_commit.sig =
-        catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[1u8; 64]);
-    assert!(verify_commit(&tampered_sig_commit, &context, &parsed_vk).is_err());
-
-    // 4. Version Mismatch -> fails
-    let mut bad_ver_commit = signed_commit.clone();
-    bad_ver_commit.ver = 2;
-    assert!(verify_commit(&bad_ver_commit, &context, &parsed_vk).is_err());
-}
 // ---------------------------------------------------------------------------------------
 // Test Infrastructure for End-to-End Sync Engine Tests
 // ---------------------------------------------------------------------------------------
@@ -376,7 +335,6 @@ fn commit_verification_succeeds_and_fails_on_tampering() {
 struct SyncTestSetup {
     state: AppState,
     mock_transport: Arc<MockSpaceHostTransport>,
-    owner_signing_key: SigningKey,
 }
 
 fn register_did_doc(
@@ -547,8 +505,46 @@ async fn setup_sync_test(pool: PgPool) -> SyncTestSetup {
     SyncTestSetup {
         state,
         mock_transport,
-        owner_signing_key: owner_key,
     }
+}
+async fn callback_token(setup: &SyncTestSetup) -> String {
+    circle_appview::notify::get_or_create_registration(
+        &setup.state.db,
+        &setup.state.oauth_service.session_encryption_key,
+        SPACE_URI,
+        "http://127.0.0.1:3002",
+    )
+    .await
+    .unwrap()
+    .token
+}
+
+fn repo_write_update(
+    repo: &str,
+    repo_rev: &str,
+    data: &[u8],
+    space_rev: &str,
+    prev_space_rev: Option<&str>,
+) -> serde_json::Value {
+    serde_json::to_value(WriterUpdate::RepoWrite(RepoWrite {
+        repo: repo.into(),
+        repo_rev: repo_rev.into(),
+        data: bytes::Bytes::copy_from_slice(data),
+        space_rev: space_rev.into(),
+        prev_space_rev: prev_space_rev.map(str::to_owned),
+    }))
+    .unwrap()
+}
+
+fn notify_body(token: &str, update: serde_json::Value) -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&json!({
+            "space": SPACE_URI,
+            "token": token,
+            "update": update,
+        }))
+        .unwrap(),
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -584,7 +580,7 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
 
     let list_ops_output =
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -672,7 +668,7 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(bad_commit),
+            commit: bad_commit,
             cursor: None,
             ops: vec![inc_op_entry],
             extra_data: None,
@@ -770,7 +766,7 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![invalid_op],
             extra_data: None,
@@ -813,54 +809,20 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
 // Step 5: Notify Write and Sweep Revision Tests
 // ---------------------------------------------------------------------------------------
 
-fn mint_service_jwt(
-    issuer_did: &str,
-    aud_did: &str,
-    lxm: &str,
-    signing_key: &SigningKey,
-) -> String {
-    use p256::ecdsa::signature::Signer;
-    let now = Utc::now().timestamp();
-    let header_json = json!({
-        "typ": "JWT",
-        "alg": "ES256"
-    });
-    let claims_json = json!({
-        "iss": issuer_did,
-        "aud": aud_did,
-        "exp": now + 30,
-        "iat": now,
-        "jti": uuid::Uuid::new_v4().to_string(),
-        "lxm": lxm
-    });
-
-    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_json).unwrap());
-    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_json).unwrap());
-    let signing_input = format!("{header_b64}.{claims_b64}");
-
-    let sig: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
-    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-    format!("{signing_input}.{sig_b64}")
-}
-
 #[sqlx::test(migrations = "./migrations")]
-async fn notify_write_triggers_immediate_sync(pool: PgPool) {
+async fn notify_space_update_repo_write_triggers_immediate_sync(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
     let post_val = json!({
         "$type": "app.bsky.feed.post",
-        "text": "Post synced via notify_write notification",
+        "text": "Post synced via notifySpaceUpdate",
         "createdAt": "2026-08-24T12:00:00.000Z"
     });
     let post_cid = compute_dagcbor_cid(&post_val).unwrap();
-
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7notifypost", &post_cid);
-
     let rev = "3l7aaaaaaaaaa";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
-
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
@@ -870,65 +832,35 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
-
-    let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
-        &key,
+        &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
         },
     );
 
-    let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            &lthash.digest(),
-        ),
-        repo: Did::from(String::from(OWNER_DID)),
-        repo_rev: Tid::from(String::from(rev)),
-        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-            String::from("3l7spacerev2a"),
-        )),
-        prev_space_rev: None,
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-            .unwrap(),
-        extra_data: None,
-    };
-
-    let token = mint_service_jwt(
-        OWNER_DID,
-        &setup.state.config.notify_service_identifier(),
-        "com.atproto.space.notifyWrite",
-        &setup.owner_signing_key,
-    );
-
+    let token = callback_token(&setup).await;
+    let update = repo_write_update(OWNER_DID, rev, &lthash.digest(), "3l7spacerev2a", None);
     let app = circle_appview::routes::create_router(setup.state.clone());
     use axum::http::Request;
     use tower::ServiceExt;
-
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .uri("/xrpc/com.atproto.space.notifySpaceUpdate")
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {token}"))
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&notify_input).unwrap(),
-                ))
+                .body(axum::body::Body::from(notify_body(&token, update)))
                 .unwrap(),
         )
         .await
         .unwrap();
-
     assert_eq!(response.status(), StatusCode::OK);
 
-    // notifyWrite acknowledges first and syncs in the background (CIRCLES-06).
     circle_appview::sync::wait_for_notify_syncs_idle().await;
-
-    // Record was indexed with permissioned URI without waiting for the sweep.
     let record: (String, String) = sqlx::query_as(
         "SELECT uri, cid FROM circle_records WHERE space_uri = $1 AND author_did = $2",
     )
@@ -937,7 +869,6 @@ async fn notify_write_triggers_immediate_sync(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-
     assert_eq!(
         record.0,
         format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7notifypost")
@@ -975,31 +906,26 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
         },
     );
 
-    // Space host returns listRepos with updated revision and 32-byte SHA256 digest
-    let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-        did: Did::from(String::from(OWNER_DID)),
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            &lthash.digest(),
-        ),
-        repo_rev: Tid::from(String::from(rev)),
-        space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
-            "3l7spacerev2a",
-        )),
-        extra_data: None,
-    };
-    setup.mock_transport.set_list_repos_response(
+    // Space host returns listWriters with the latest writer revision and set hash.
+    let repo_item = WriterUpdate::RepoWrite(RepoWrite {
+        repo: OWNER_DID.into(),
+        repo_rev: rev.into(),
+        data: bytes::Bytes::copy_from_slice(&lthash.digest()),
+        space_rev: "3l7spacerev2a".into(),
+        prev_space_rev: None,
+    });
+    setup.mock_transport.set_list_writers_response(
         SPACE_URI,
-        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+        ListWritersOutput {
             cursor: None,
             repos: vec![repo_item],
-            extra_data: None,
         },
     );
 
@@ -1033,54 +959,6 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[test]
-fn crypto_vectors_for_lthash_context_and_hkdf_expand() {
-    // 1. Exact Context Encoding with raw protocol tag + uint16be length prefixes
-    let ikm = [0x42u8; 32];
-    let ctx = compute_commit_context(
-        "at://did:plc:alice/space/blue.catbird.circle/1",
-        "did:plc:alice",
-        "3l7revaaaaaaa",
-        &ikm,
-    )
-    .expect("valid commit context");
-
-    // Check raw protocol tag (no len prefix) and uint16be fields
-    let tag = b"atproto-space-v1";
-    assert_eq!(&ctx[0..tag.len()], tag);
-    assert_eq!(ctx.len(), 128);
-    assert_eq!(
-        to_hex(&ctx),
-        "617470726f746f2d73706163652d7631002e61743a2f2f6469643a706c633a616c6963652f73706163652f626c75652e636174626972642e636972636c652f31000d6469643a706c633a616c696365000d336c377265766161616161616100204242424242424242424242424242424242424242424242424242424242424242"
-    );
-
-    // 2. Exact HKDF-Expand from 32-byte IKM directly (PRK = ikm)
-    let mac_key = derive_commit_mac_key(&ikm, &ctx).expect("HKDF expand must succeed");
-    assert_eq!(mac_key.len(), 32);
-    assert_eq!(
-        to_hex(&mac_key),
-        "79a1578c6bac70083d9b6d4a1dc31c6cd60e0ae8d00c8f59ba22d4870075662a"
-    );
-
-    let lthash_digest = [0x55u8; 32];
-    let mac = compute_commit_mac(&mac_key, &lthash_digest).expect("HMAC must succeed");
-    assert_eq!(mac.len(), 32);
-    assert_eq!(
-        to_hex(&mac),
-        "0b99383cb6dedfb157b960b29169303a7bae9e3968bfd6e277d5b98e34202f57"
-    );
-    // 3. LtHash item formatting: direct BLAKE3 XOF over exact {collection}/{rkey}/{cid}
-    let mut h1 = LtHash::new();
-    h1.add("app.bsky.feed.post", "3l7post1", "bafyreih327owner1");
-    assert_ne!(h1.as_bytes(), &[0u8; 2048]);
-    assert_eq!(h1.as_bytes().len(), 2048);
-    assert_eq!(h1.digest().len(), 32);
-    assert_eq!(
-        to_hex(&h1.digest()),
-        "ded1c592c7a508e343df92cdbffa74120f51a1af508d8a21ca657238fe0e9a3d"
-    );
 }
 
 #[test]
@@ -1191,60 +1069,6 @@ fn dagcbor_cid_with_nested_links_and_raw_bytes() {
 }
 
 #[test]
-fn drisl_canonical_shortest_key_first_and_reorder_rejection() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-
-    let rec_z = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "z".to_string(),
-        cid: "bafyreiz11111111111111111111111111111111111111111111111".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "z",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-    let rec_aa = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "aa".to_string(),
-        cid: "bafyreiaa1111111111111111111111111111111111111111111111".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "aa",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let rec_z_cid = compute_dagcbor_cid(&rec_z.value).unwrap();
-    let rec_aa_cid = compute_dagcbor_cid(&rec_aa.value).unwrap();
-    let rec_z = RepoRecord {
-        cid: rec_z_cid,
-        ..rec_z
-    };
-    let rec_aa = RepoRecord {
-        cid: rec_aa_cid,
-        ..rec_aa
-    };
-
-    let mut lthash = LtHash::new();
-    lthash.add(&rec_z.collection, &rec_z.rkey, &rec_z.cid);
-    lthash.add(&rec_aa.collection, &rec_aa.rkey, &rec_aa.cid);
-
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7rev234567a",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let car_bytes = mint_repo_car(&commit, &[rec_aa.clone(), rec_z.clone()]).unwrap();
-    let decoded = decode_repo_car(&car_bytes).unwrap();
-    assert_eq!(decoded.records.len(), 2);
-    assert_eq!(decoded.records[0].rkey, "z");
-    assert_eq!(decoded.records[1].rkey, "aa");
-}
-
-#[test]
 fn author_pds_resolution_requires_exact_atproto_pds_id_and_type() {
     use circle_appview::access::resolve_pds_endpoint;
     use circle_appview::auth::{DidDocument, DidService};
@@ -1343,7 +1167,7 @@ fn strong_references_require_and_verify_matching_cid() {
     );
 }
 #[sqlx::test(migrations = "./migrations")]
-async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPool) {
+async fn multi_page_cursor_pagination_empty_terminal_and_same_batch_reply(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
 
     let owner_post_val = json!({
@@ -1389,7 +1213,7 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
         extra_data: None,
     };
 
-    // Page 2: reply with terminal commit
+    // Page 2: reply on another full page. A full page still carries a cursor.
     let op_page2 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(reply_cid.clone())),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
@@ -1404,7 +1228,7 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
     setup.mock_transport.set_list_repo_ops_response(
         &key_initial,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: None,
+            commit: commit.clone(),
             cursor: Some("page2".into()),
             ops: vec![op_page1],
             extra_data: None,
@@ -1415,9 +1239,22 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
     setup.mock_transport.set_list_repo_ops_response(
         &key_page2,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
-            cursor: None,
+            commit: commit.clone(),
+            cursor: Some("page3".into()),
             ops: vec![op_page2],
+            extra_data: None,
+        },
+    );
+
+    // Page 3: an empty cursorless page is the terminal page whose commit is
+    // authoritative for the running set hash.
+    let key_page3 = format!("{SPACE_URI}:{OWNER_DID}:page3");
+    setup.mock_transport.set_list_repo_ops_response(
+        &key_page3,
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit,
+            cursor: None,
+            ops: vec![],
             extra_data: None,
         },
     );
@@ -1429,6 +1266,90 @@ async fn multi_page_cursor_pagination_and_same_batch_reply_resolution(pool: PgPo
     assert_eq!(result.mode, SyncMode::Incremental);
     assert!(result.commit_verified);
     assert_eq!(result.records_accepted, 2);
+    assert_eq!(
+        setup
+            .mock_transport
+            .recorded_credential_uses()
+            .iter()
+            .filter(|call| call.method == "com.atproto.space.listRepoOps")
+            .count(),
+        3,
+        "every page, including the empty terminal page, must be fetched"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn repo_not_found_is_empty_for_never_written_and_collected_repos(pool: PgPool) {
+    let setup = setup_sync_test(pool).await;
+    setup
+        .mock_transport
+        .set_list_repo_ops_not_found(&format!("{SPACE_URI}:{OWNER_DID}"));
+
+    let result = SyncEngine::new(&setup.state)
+        .sync_repo(SPACE_URI, OWNER_DID)
+        .await
+        .unwrap();
+
+    assert_eq!(result.mode, SyncMode::Incremental);
+    assert!(result.commit_verified);
+    assert_eq!(result.ops_applied, 0);
+    assert_eq!(result.records_accepted, 0);
+    assert_eq!(result.latest_rev, "");
+
+    sqlx::query(
+        "INSERT INTO circle_repo_sync_state \
+         (space_uri, author_did, last_rev, last_hash, last_synced_at) \
+         VALUES ($1, $2, '3l7emptygcaaa', $3, now())",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .bind(vec![1_u8; 2048])
+    .execute(&setup.state.db)
+    .await
+    .unwrap();
+    let record_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7emptypost1");
+    sqlx::query(
+        "INSERT INTO circle_records \
+         (uri, cid, space_uri, author_did, collection, rkey, record_json, created_at) \
+         VALUES ($1, 'bafyreicollected', $2, $3, 'app.bsky.feed.post', '3l7emptypost1', $4, now())",
+    )
+    .bind(&record_uri)
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .bind(json!({"$type": "app.bsky.feed.post", "text": "cleared"}))
+    .execute(&setup.state.db)
+    .await
+    .unwrap();
+
+    SyncEngine::new(&setup.state)
+        .sync_repo_with_expected_commit(
+            SPACE_URI,
+            OWNER_DID,
+            Some(&[0xAA; 32]),
+            Some("3l7listedempty"),
+        )
+        .await
+        .unwrap();
+    let active_records: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM circle_records \
+         WHERE space_uri = $1 AND author_did = $2 AND deleted_at IS NULL",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .fetch_one(&setup.state.db)
+    .await
+    .unwrap();
+    let sync_states: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM circle_repo_sync_state \
+         WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(OWNER_DID)
+    .fetch_one(&setup.state.db)
+    .await
+    .unwrap();
+    assert_eq!(active_records, 0);
+    assert_eq!(sync_states, 0);
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn star_roundtrip_and_tampered_record_rejection(pool: PgPool) {
@@ -1487,122 +1408,84 @@ async fn star_roundtrip_and_tampered_record_rejection(pool: PgPool) {
         circle_appview::space_star::parse_repo_star(&tampered_car, SPACE_URI, OWNER_DID).is_err()
     );
 }
-/// The forwarded notifyWrite body is {space, repo, repoRev, hash, spaceRev,
-/// prevSpaceRev?}: prevSpaceRev is omitted on a space's first update, and the
-/// pre-Oct-1 `rev` field no longer parses.
+/// `notifySpaceUpdate` carries the registration token and a fully tagged update.
+/// The repo revision and space sequencing fields live inside `repoWrite`.
 #[test]
-fn notify_write_body_parses_the_oct22_shape() {
-    use catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite;
+fn notify_space_update_body_parses_the_nov12_shape() {
+    use catbird_atproto::generated::com_atproto::space::notify_space_update::NotifySpaceUpdate;
 
-    let first = NotifyWrite {
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[9u8; 32]),
-        repo: Did::from(String::from(OWNER_DID)),
-        repo_rev: Tid::from(String::from("3l7rev234567a")),
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-            .unwrap(),
-        space_rev: Some(Tid::from(String::from("3l7spacerev2a"))),
-        prev_space_rev: None,
-        extra_data: None,
-    };
-    let wire = serde_json::to_value(&first).unwrap();
-    let keys: std::collections::BTreeSet<_> = wire.as_object().unwrap().keys().cloned().collect();
-    assert_eq!(
-        keys,
-        ["data", "repo", "repoRev", "space", "spaceRev"]
-            .into_iter()
-            .map(String::from)
-            .collect()
-    );
-    let parse = |v: &serde_json::Value| {
-        serde_json::from_slice::<NotifyWrite>(&serde_json::to_vec(v).unwrap())
-    };
-    let parsed = parse(&wire).unwrap();
-    assert_eq!(parsed.repo_rev.as_str(), "3l7rev234567a");
-    assert_eq!(
-        parsed.space_rev.as_ref().map(|r| r.as_str()),
-        Some("3l7spacerev2a")
-    );
-    assert!(parsed.prev_space_rev.is_none());
+    let update = repo_write_update(OWNER_DID, "3l7rev234567a", &[9; 32], "3l7spacerev2a", None);
+    let wire = json!({
+        "space": SPACE_URI,
+        "token": "opaque-registration-token",
+        "update": update,
+    });
+    let parsed: NotifySpaceUpdate<String> = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(parsed.token, "opaque-registration-token");
+    assert_eq!(wire["update"]["$type"], "com.atproto.space.defs#repoWrite");
+    assert_eq!(wire["update"]["repoRev"], "3l7rev234567a");
+    assert_eq!(wire["update"]["spaceRev"], "3l7spacerev2a");
+    assert!(wire.get("repoRev").is_none());
+    assert!(wire.get("spaceRev").is_none());
 
-    let mut next = wire.clone();
-    next["prevSpaceRev"] = serde_json::json!("3l7spacerev2a");
-    next["spaceRev"] = serde_json::json!("3l7spacerev2b");
-    let parsed = parse(&next).unwrap();
-    assert_eq!(
-        parsed.prev_space_rev.as_ref().map(|r| r.as_str()),
-        Some("3l7spacerev2a")
-    );
-
-    let mut legacy = wire;
-    let rev = legacy.as_object_mut().unwrap().remove("repoRev").unwrap();
-    legacy["rev"] = rev;
-    assert!(parse(&legacy).is_err());
+    let legacy = json!({
+        "space": SPACE_URI,
+        "repo": OWNER_DID,
+        "repoRev": "3l7rev234567a",
+        "data": vec![9; 32],
+    });
+    assert!(serde_json::from_value::<NotifySpaceUpdate<String>>(legacy).is_err());
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn notify_write_service_auth_rejection_and_issuer_binding(pool: PgPool) {
+async fn notify_space_update_wrong_token_and_unknown_space_leak_same_error(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
+    let token = callback_token(&setup).await;
+    let update = repo_write_update(OWNER_DID, "3l7rev234567a", &[0; 32], "3l7spacerev2a", None);
     let app = circle_appview::routes::create_router(setup.state.clone());
+    use axum::body::to_bytes;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let notify_input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::from_static(&[0u8; 32]),
-        repo: Did::from(String::from(OWNER_DID)),
-        repo_rev: Tid::from(String::from("3l7rev234567a")),
-        space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-            String::from("3l7spacerev2a"),
-        )),
-        prev_space_rev: None,
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-            .unwrap(),
-        extra_data: None,
-    };
-
-    // 1. Unauthenticated request -> 401 Unauthorized
-    let resp1 = app
+    let wrong = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .uri("/xrpc/com.atproto.space.notifySpaceUpdate")
                 .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&notify_input).unwrap(),
-                ))
+                .body(axum::body::Body::from(notify_body(
+                    "wrong-token",
+                    update.clone(),
+                )))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
-
-    // 2. Unauthorized caller DID -> 403 Forbidden
-    let attacker_key = SigningKey::random(&mut OsRng);
-    let attacker_did = "did:plc:attacker-evil-99";
-    register_did_doc(&setup.state.did_resolver, attacker_did, &attacker_key, None);
-
-    let attacker_token = mint_service_jwt(
-        attacker_did,
-        &setup.state.config.notify_service_identifier(),
-        "com.atproto.space.notifyWrite",
-        &attacker_key,
-    );
-
-    let resp2 = app
+    let unknown = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/xrpc/com.atproto.space.notifyWrite")
+                .uri("/xrpc/com.atproto.space.notifySpaceUpdate")
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {attacker_token}"))
                 .body(axum::body::Body::from(
-                    serde_json::to_vec(&notify_input).unwrap(),
+                    serde_json::to_vec(&json!({
+                        "space": "at://did:plc:unknown/space/blue.catbird.circle/missing",
+                        "token": token,
+                        "update": update,
+                    }))
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        to_bytes(wrong.into_body(), usize::MAX).await.unwrap(),
+        to_bytes(unknown.into_body(), usize::MAX).await.unwrap(),
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1719,7 +1602,7 @@ async fn federated_repo_sync_routes_to_member_pds_endpoint(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(bob_commit),
+            commit: bob_commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -1813,7 +1696,7 @@ async fn ordered_operations_preserve_delete_then_recreate_on_same_path(pool: PgP
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_create_1, op_delete, op_create_2],
             extra_data: None,
@@ -1885,7 +1768,7 @@ async fn strong_reference_validation_rejects_without_fail_open_and_ignores_non_p
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -2010,11 +1893,11 @@ async fn ssrf_policy_enforced_across_all_repo_transport_methods() {
         OWNER_DID,
     );
 
-    // 1. list_repos to 127.0.0.1 -> blocked
+    // 1. list_writers to 127.0.0.1 -> blocked
     let loopback_url =
-        url::Url::parse("https://127.0.0.1/xrpc/com.atproto.space.listRepos").unwrap();
+        url::Url::parse("https://127.0.0.1/xrpc/com.atproto.space.listWriters").unwrap();
     let res1 = transport
-        .list_repos(&loopback_url, &auth, SPACE_URI, None)
+        .list_writers(&loopback_url, &auth, SPACE_URI, None)
         .await;
     assert!(matches!(
         res1,
@@ -2085,46 +1968,48 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
         },
     );
 
-    // listRepos (Oct-1 alpha): entries ascend by spaceRev, a nonempty page's
-    // cursor is its last entry's spaceRev (an exclusive checkpoint), and the
-    // listing ends with an empty page that omits the cursor. OWNER_DID advances
-    // while the sweep paginates, so it reappears on page 2.
+    // listWriters ascends by spaceRev. A full page has a cursor, and an empty
+    // cursor-less page terminates the listing.
     let space_rev_1 = "3l7spacerev2a";
     let space_rev_2 = "3l7spacerev2b";
-    let entry =
-        |space_rev: &str| catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-            did: Did::from(String::from(OWNER_DID)),
-            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                &lthash.digest(),
-            ),
-            repo_rev: Tid::from(String::from(rev)),
-            space_rev: Tid::from(String::from(space_rev)),
-            extra_data: None,
-        };
-    setup.mock_transport.set_list_repos_response(
+    let entry = |space_rev: &str| {
+        WriterUpdate::RepoWrite(RepoWrite {
+            repo: OWNER_DID.into(),
+            data: bytes::Bytes::copy_from_slice(&lthash.digest()),
+            repo_rev: rev.into(),
+            space_rev: space_rev.into(),
+            prev_space_rev: None,
+        })
+    };
+    setup.mock_transport.set_list_writers_response(
         SPACE_URI,
-        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+        ListWritersOutput {
             cursor: Some(space_rev_1.into()),
             repos: vec![entry(space_rev_1)],
-            extra_data: None,
         },
     );
-    setup.mock_transport.set_list_repos_response(
+    setup.mock_transport.set_list_writers_response(
         &format!("{SPACE_URI}:{space_rev_1}"),
-        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+        ListWritersOutput {
             cursor: Some(space_rev_2.into()),
             repos: vec![entry(space_rev_2)],
-            extra_data: None,
         },
     );
-    // Past space_rev_2 the mock answers the empty, cursor-less final page.
+
+    setup.mock_transport.set_list_writers_response(
+        &format!("{SPACE_URI}:{space_rev_2}"),
+        ListWritersOutput {
+            cursor: None,
+            repos: vec![],
+        },
+    );
 
     let summary = sweep_once(&setup.state).await.unwrap();
     assert_eq!(
@@ -2137,7 +2022,7 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     );
     assert_eq!(summary.repos_failed, 0);
     assert_eq!(
-        setup.mock_transport.recorded_list_repos_cursors(),
+        setup.mock_transport.recorded_list_writers_cursors(),
         vec![
             None,
             Some(space_rev_1.to_string()),
@@ -2145,18 +2030,16 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
         ],
         "each returned cursor is passed back unchanged until an empty page"
     );
-
-    // listRepos is a space-host operation: signed for the authority's bare DID.
     let list_uses: Vec<_> = setup
         .mock_transport
         .recorded_credential_uses()
         .into_iter()
-        .filter(|u| u.method == "com.atproto.space.listRepos")
+        .filter(|use_| use_.method == "com.atproto.space.listWriters")
         .collect();
     assert_eq!(list_uses.len(), 3);
-    for u in &list_uses {
-        assert_eq!(u.auth.audience.as_deref(), Some(OWNER_DID));
-        assert!(u
+    for use_ in &list_uses {
+        assert_eq!(use_.auth.audience.as_deref(), Some(OWNER_DID));
+        assert!(use_
             .auth
             .authorization
             .starts_with("Atproto-Space-Credential "));
@@ -2164,21 +2047,119 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(pool: PgPool) {
+async fn list_writers_repo_removed_then_repo_write_readds_writer(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
+    sqlx::query(
+        "INSERT INTO circle_repo_sync_state \
+         (space_uri, author_did, last_rev, last_hash, last_synced_at) \
+         VALUES ($1, $2, '3l7oldrevaaaa', $3, now())",
+    )
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .bind(vec![0_u8; 2048])
+    .execute(&pool)
+    .await
+    .unwrap();
+    setup.mock_transport.set_list_writers_response(
+        SPACE_URI,
+        ListWritersOutput {
+            cursor: None,
+            repos: vec![WriterUpdate::RepoRemoved(RepoRemoved {
+                repo: BOB_DID.into(),
+                space_rev: "3l7removedaaa".into(),
+                prev_space_rev: None,
+            })],
+        },
+    );
 
+    let removed = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(removed.repos_checked, 1);
+    assert!(!sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM circle_repo_sync_state \
+         WHERE space_uri = $1 AND author_did = $2)",
+    )
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap());
+
+    setup.mock_transport.set_space_config(
+        SPACE_URI,
+        SpaceConfig {
+            authority: OWNER_DID.into(),
+            space_type: "blue.catbird.circle".into(),
+            skey: "3l7syncaaaaaa".into(),
+            app_access: SpaceAppAccess::AllowList(vec![setup
+                .state
+                .oauth_service
+                .client_id
+                .clone()]),
+            read_policy: SpacePolicy::MemberList,
+            write_policy: SpacePolicy::MemberList,
+            user_policy: None,
+            name: Some("Test Circle".into()),
+            description: None,
+        },
+    );
+    setup
+        .mock_transport
+        .set_space_members(SPACE_URI, vec![OWNER_DID.into(), BOB_DID.into()]);
+
+    let state = [0_u8; 2048];
+    let repo_rev = "3l7readdaaaaa";
+    let commit = fixture_commit(SPACE_URI, BOB_DID, repo_rev, &state);
+    setup.mock_transport.set_list_repo_ops_response(
+        &format!("{SPACE_URI}:{BOB_DID}"),
+        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+            commit: commit.clone(),
+            cursor: None,
+            ops: vec![],
+            extra_data: None,
+        },
+    );
+    setup.mock_transport.set_list_writers_response(
+        SPACE_URI,
+        ListWritersOutput {
+            cursor: None,
+            repos: vec![WriterUpdate::RepoWrite(RepoWrite {
+                repo: BOB_DID.into(),
+                repo_rev: repo_rev.into(),
+                data: commit.data,
+                space_rev: "3l7readdedaaa".into(),
+                prev_space_rev: Some("3l7removedaaa".into()),
+            })],
+        },
+    );
+
+    let readded = sweep_once(&setup.state).await.unwrap();
+    assert_eq!(readded.repos_synced, 1);
+    assert_eq!(readded.repos_failed, 0);
+    let synced_rev: String = sqlx::query_scalar(
+        "SELECT last_rev FROM circle_repo_sync_state \
+         WHERE space_uri = $1 AND author_did = $2",
+    )
+    .bind(SPACE_URI)
+    .bind(BOB_DID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(synced_rev, repo_rev);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn notify_space_update_verifies_expected_hash_before_advancing(pool: PgPool) {
+    let setup = setup_sync_test(pool.clone()).await;
     let post_val = json!({
         "$type": "app.bsky.feed.post",
-        "text": "Post for notifyWrite hash check",
+        "text": "Post for notifySpaceUpdate hash check",
         "createdAt": "2026-08-24T12:00:00.000Z"
     });
     let post_cid = compute_dagcbor_cid(&post_val).unwrap();
-
     let mut lthash = LtHash::new();
     lthash.add("app.bsky.feed.post", "3l7postnotify1", &post_cid);
     let rev = "3l7notifysync";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
-
     let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
         cid: Some(Cid::from(post_cid.clone())),
         collection: Nsid::from(String::from("app.bsky.feed.post")),
@@ -2188,59 +2169,28 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
-
-    let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
-        &key,
+        &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
         },
     );
+    let token = callback_token(&setup).await;
 
-    let token = mint_service_jwt(
-        OWNER_DID,
-        &setup.state.config.notify_service_identifier(),
-        "com.atproto.space.notifyWrite",
-        &setup.owner_signing_key,
-    );
-
-    // 1. Mismatched notify hash -> Rejected
-    let wrong_hash = [0x99u8; 32];
-    let notify_input_mismatched =
-        catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                &wrong_hash,
-            ),
-            repo: Did::from(String::from(OWNER_DID)),
-            repo_rev: Tid::from(String::from(rev)),
-            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-                String::from("3l7spacerev2a"),
-            )),
-            prev_space_rev: None,
-            space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-                .unwrap(),
-            extra_data: None,
-        };
-
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-    let res_mismatch = circle_appview::sync::notify_write_handler(
+    let mismatch = circle_appview::sync::notify_space_update_handler(
         axum::extract::State(setup.state.clone()),
-        headers.clone(),
-        bytes::Bytes::from(serde_json::to_vec(&notify_input_mismatched).unwrap()),
+        notify_body(
+            &token,
+            repo_write_update(OWNER_DID, rev, &[0x99; 32], "3l7spacerev2a", None),
+        ),
     )
     .await;
-    // notifyWrite acknowledges once validated and syncs in the background
-    // (CIRCLES-06), so the mismatch is caught by the sync, not the response.
     assert!(
-        res_mismatch.is_ok(),
-        "A validated notifyWrite is acknowledged before syncing"
+        mismatch.is_ok(),
+        "a valid update is acknowledged before syncing"
     );
     circle_appview::sync::wait_for_notify_syncs_idle().await;
     let indexed: i64 = sqlx::query_scalar(
@@ -2251,7 +2201,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(indexed, 0, "Mismatched notify hash must not be synced");
+    assert_eq!(indexed, 0);
     let synced: Option<String> = sqlx::query_scalar(
         "SELECT last_rev FROM circle_repo_sync_state WHERE space_uri = $1 AND author_did = $2",
     )
@@ -2260,46 +2210,17 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     .fetch_optional(&pool)
     .await
     .unwrap();
-    assert!(
-        synced.is_none(),
-        "Mismatched notify hash must not advance sync state"
-    );
+    assert!(synced.is_none());
 
-    // 2. Correct notify hash -> Accepted
-    let notify_input_correct =
-        catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                &lthash.digest(),
-            ),
-            repo: Did::from(String::from(OWNER_DID)),
-            repo_rev: Tid::from(String::from(rev)),
-            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-                String::from("3l7spacerev2a"),
-            )),
-            prev_space_rev: None,
-            space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-                .unwrap(),
-            extra_data: None,
-        };
-
-    let token2 = mint_service_jwt(
-        OWNER_DID,
-        &setup.state.config.notify_service_identifier(),
-        "com.atproto.space.notifyWrite",
-        &setup.owner_signing_key,
-    );
-    let mut headers2 = axum::http::HeaderMap::new();
-    headers2.insert(
-        axum::http::header::AUTHORIZATION,
-        format!("Bearer {token2}").parse().unwrap(),
-    );
-    let res_correct = circle_appview::sync::notify_write_handler(
+    let correct = circle_appview::sync::notify_space_update_handler(
         axum::extract::State(setup.state.clone()),
-        headers2,
-        bytes::Bytes::from(serde_json::to_vec(&notify_input_correct).unwrap()),
+        notify_body(
+            &token,
+            repo_write_update(OWNER_DID, rev, &lthash.digest(), "3l7spacerev2a", None),
+        ),
     )
     .await;
-    assert!(res_correct.is_ok(), "Matching notify hash must succeed");
+    assert!(correct.is_ok());
     circle_appview::sync::wait_for_notify_syncs_idle().await;
     let indexed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM circle_records WHERE space_uri = $1 AND author_did = $2",
@@ -2309,7 +2230,7 @@ async fn notify_write_verifies_against_expected_hash_and_rejects_mismatched_car(
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(indexed, 1, "Matching notify hash must be synced");
+    assert_eq!(indexed, 1);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -2333,7 +2254,7 @@ async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgP
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit1),
+            commit: commit1,
             cursor: None,
             ops: vec![
                 catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
@@ -2409,7 +2330,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_a1),
+            commit: commit_a1,
             cursor: None,
             ops: vec![
                 catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
@@ -2443,7 +2364,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_b1),
+            commit: commit_b1,
             cursor: None,
             ops: vec![
                 catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
@@ -2485,7 +2406,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_b2),
+            commit: commit_b2,
             cursor: None,
             ops: vec![
                 catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
@@ -2523,7 +2444,7 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit_a2),
+            commit: commit_a2,
             cursor: None,
             ops: vec![
                 catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
@@ -2574,7 +2495,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: None,
+            commit: commit.clone(),
             cursor: Some("cursor_A".into()),
             ops: vec![],
             extra_data: None,
@@ -2583,7 +2504,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{key}:cursor_A"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: None,
+            commit: commit.clone(),
             cursor: Some("cursor_B".into()),
             ops: vec![],
             extra_data: None,
@@ -2592,7 +2513,7 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{key}:cursor_B"),
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: None,
+            commit: commit.clone(),
             cursor: Some("cursor_A".into()), // Cycle!
             ops: vec![],
             extra_data: None,
@@ -2620,768 +2541,65 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
 // ---------------------------------------------------------------------------------------
 // Step 7: Round 4 Adversarial Unit and Integration Tests
 // ---------------------------------------------------------------------------------------
-
-#[test]
-fn strict_car_rejects_noncanonical_signed_commit_dagcbor() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let rec = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "3l7post1".to_string(),
-        cid: "bafyreih327testcid1".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Valid post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    let decoded = decode_repo_car(&valid_car).unwrap();
-
-    // Build a SignedCommit block with non-canonical key order in DAG-CBOR
-    // Canonical keys (length 3 sorted, then length 4): ikm, mac, rev, sig, ver, hash
-    // Encode map with reversed key order: hash, ver, sig, rev, mac, ikm
-    let mut noncanonical_commit_cbor = Vec::new();
-    noncanonical_commit_cbor.push(0xa6);
-    noncanonical_commit_cbor.extend_from_slice(&[
-        0x64,
-        b'h',
-        b'a',
-        b's',
-        b'h',
-        0x58,
-        commit.hash.len() as u8,
-    ]);
-    noncanonical_commit_cbor.extend_from_slice(commit.hash.as_ref());
-    noncanonical_commit_cbor.extend_from_slice(&[0x63, b'v', b'e', b'r', 0x01]);
-    noncanonical_commit_cbor.extend_from_slice(&[
-        0x63,
-        b's',
-        b'i',
-        b'g',
-        0x58,
-        commit.sig.len() as u8,
-    ]);
-    noncanonical_commit_cbor.extend_from_slice(commit.sig.as_ref());
-    noncanonical_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
-    noncanonical_commit_cbor.extend_from_slice(commit.rev.as_bytes());
-    noncanonical_commit_cbor.extend_from_slice(&[
-        0x63,
-        b'm',
-        b'a',
-        b'c',
-        0x58,
-        commit.mac.len() as u8,
-    ]);
-    noncanonical_commit_cbor.extend_from_slice(commit.mac.as_ref());
-    noncanonical_commit_cbor.extend_from_slice(&[
-        0x63,
-        b'i',
-        b'k',
-        b'm',
-        0x58,
-        commit.ikm.len() as u8,
-    ]);
-    noncanonical_commit_cbor.extend_from_slice(commit.ikm.as_ref());
-
-    let (nc_cid_bytes, nc_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&noncanonical_commit_cbor);
-    let nc_cid: cid::Cid = nc_cid_str.parse().unwrap();
-    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
-
-    let header = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![nc_cid, drisl_cid],
-    };
-    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
-
-    let mut tampered_car = Vec::new();
-    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
-    tampered_car.extend_from_slice(&header_cbor);
-
-    circle_appview::commit::encode_varint(
-        (nc_cid_bytes.len() + noncanonical_commit_cbor.len()) as u64,
-        &mut tampered_car,
-    );
-    tampered_car.extend_from_slice(&nc_cid_bytes);
-    tampered_car.extend_from_slice(&noncanonical_commit_cbor);
-
-    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
-    let (b1_len, b1_vlen) =
-        circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
-    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
-    tampered_car.extend_from_slice(&valid_car[remaining_offset..]);
-
-    let res = decode_repo_car(&tampered_car);
-    assert!(
-        res.is_err(),
-        "Non-canonical SignedCommit block encoding must be rejected"
-    );
-    let err_msg = res.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("Non-canonical DAG-CBOR SignedCommit") || err_msg.contains("strict IPLD")
-    );
-}
-
-#[test]
-fn strict_car_rejects_signed_commit_with_extra_data_float() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let rec = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "3l7post1".to_string(),
-        cid: "bafyreih327testcid1".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Valid post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    let decoded = decode_repo_car(&valid_car).unwrap();
-
-    // Encode SignedCommit with keys in canonical DAG-CBOR order (3-byte keys, then 4-byte key 'hash', then 11-byte key 'extra_float' containing CBOR float 0xfa 0x42 0x2a 0x00 0x00)
-    let mut float_commit_cbor = Vec::new();
-    float_commit_cbor.push(0xa7); // 7 entries
-    float_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
-    float_commit_cbor.extend_from_slice(commit.ikm.as_ref());
-    float_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
-    float_commit_cbor.extend_from_slice(commit.mac.as_ref());
-    float_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
-    float_commit_cbor.extend_from_slice(commit.rev.as_bytes());
-    float_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);
-    float_commit_cbor.extend_from_slice(commit.sig.as_ref());
-    float_commit_cbor.extend_from_slice(&[0x63, b'v', b'e', b'r', 0x01]);
-    float_commit_cbor.extend_from_slice(&[
-        0x64,
-        b'h',
-        b'a',
-        b's',
-        b'h',
-        0x58,
-        commit.hash.len() as u8,
-    ]);
-    float_commit_cbor.extend_from_slice(commit.hash.as_ref());
-    float_commit_cbor.extend_from_slice(&[
-        0x6b, b'e', b'x', b't', b'r', b'a', b'_', b'f', b'l', b'o', b'a', b't', 0xfa, 0x42, 0x2a,
-        0x00, 0x00,
-    ]);
-    let (float_cid_bytes, float_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&float_commit_cbor);
-    let float_cid: cid::Cid = float_cid_str.parse().unwrap();
-    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
-
-    let header = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![float_cid, drisl_cid],
-    };
-    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
-
-    let mut tampered_car = Vec::new();
-    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
-    tampered_car.extend_from_slice(&header_cbor);
-
-    circle_appview::commit::encode_varint(
-        (float_cid_bytes.len() + float_commit_cbor.len()) as u64,
-        &mut tampered_car,
-    );
-    tampered_car.extend_from_slice(&float_cid_bytes);
-    tampered_car.extend_from_slice(&float_commit_cbor);
-
-    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
-    let (b1_len, b1_vlen) =
-        circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
-    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
-    tampered_car.extend_from_slice(&valid_car[remaining_offset..]);
-
-    let res = decode_repo_car(&tampered_car);
-    assert!(
-        res.is_err(),
-        "SignedCommit containing float must be rejected by strict IPLD decoding"
-    );
-    assert!(res
-        .unwrap_err()
-        .to_string()
-        .contains("Floating point numbers are forbidden"));
-}
-#[test]
-fn strict_car_rejects_signed_commit_with_unknown_extra_data() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let rec = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "3l7post1".to_string(),
-        cid: "bafyreih327testcid1".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Valid post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    let decoded = decode_repo_car(&valid_car).unwrap();
-
-    // Canonical SignedCommit CBOR with canonical extra string field: extra_field: "value"
-    let mut extra_commit_cbor = Vec::new();
-    extra_commit_cbor.push(0xa7); // 7 entries
-    extra_commit_cbor.extend_from_slice(&[0x63, b'i', b'k', b'm', 0x58, commit.ikm.len() as u8]);
-    extra_commit_cbor.extend_from_slice(commit.ikm.as_ref());
-    extra_commit_cbor.extend_from_slice(&[0x63, b'm', b'a', b'c', 0x58, commit.mac.len() as u8]);
-    extra_commit_cbor.extend_from_slice(commit.mac.as_ref());
-    extra_commit_cbor.extend_from_slice(&[0x63, b'r', b'e', b'v', 0x6d]);
-    extra_commit_cbor.extend_from_slice(commit.rev.as_bytes());
-    extra_commit_cbor.extend_from_slice(&[0x63, b's', b'i', b'g', 0x58, commit.sig.len() as u8]);
-    extra_commit_cbor.extend_from_slice(commit.sig.as_ref());
-    extra_commit_cbor.extend_from_slice(&[0x63, b'v', b'e', b'r', 0x01]);
-    extra_commit_cbor.extend_from_slice(&[
-        0x64,
-        b'h',
-        b'a',
-        b's',
-        b'h',
-        0x58,
-        commit.hash.len() as u8,
-    ]);
-    extra_commit_cbor.extend_from_slice(commit.hash.as_ref());
-    // 11-byte key 'extra_field', 5-byte string 'value' (0x65, b'v', b'a', b'l', b'u', b'e')
-    extra_commit_cbor.extend_from_slice(&[
-        0x6b, b'e', b'x', b't', b'r', b'a', b'_', b'f', b'i', b'e', b'l', b'd', 0x65, b'v', b'a',
-        b'l', b'u', b'e',
-    ]);
-
-    let (extra_cid_bytes, extra_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&extra_commit_cbor);
-    let extra_cid: cid::Cid = extra_cid_str.parse().unwrap();
-    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
-
-    let header = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![extra_cid, drisl_cid],
-    };
-    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
-    let mut tampered_car = Vec::new();
-    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
-    tampered_car.extend_from_slice(&header_cbor);
-
-    circle_appview::commit::encode_varint(
-        (extra_cid_bytes.len() + extra_commit_cbor.len()) as u64,
-        &mut tampered_car,
-    );
-    tampered_car.extend_from_slice(&extra_cid_bytes);
-    tampered_car.extend_from_slice(&extra_commit_cbor);
-
-    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
-    let (b1_len, b1_vlen) =
-        circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
-    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
-    tampered_car.extend_from_slice(&valid_car[remaining_offset..]);
-
-    let res = decode_repo_car(&tampered_car);
-    assert!(
-        res.is_err(),
-        "SignedCommit containing unknown extra_data must be rejected"
-    );
-    assert!(res
-        .unwrap_err()
-        .to_string()
-        .contains("SignedCommit contains unknown fields"));
-}
-
-#[test]
-fn strict_car_rejects_cidv0_and_unblessed_cidv1_codecs() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let rec = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "3l7post1".to_string(),
-        cid: "bafyreih327testcid1".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Valid post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    let decoded = decode_repo_car(&valid_car).unwrap();
-    let commit_cbor = serde_ipld_dagcbor::to_vec(&commit).unwrap();
-    use sha2::Digest;
-    let commit_digest = sha2::Sha256::digest(&commit_cbor);
-
-    // 1. CAR with CIDv0 root (starts with 0x12, 0x20...) in block 1
-    let cidv0_mh = multihash::Multihash::wrap(0x12, &commit_digest).unwrap();
-    let cidv0_cid = cid::Cid::new_v0(cidv0_mh).unwrap();
-    let cidv0_bytes = cidv0_cid.to_bytes();
-    let drisl_cid: cid::Cid = decoded.data_root_cid.parse().unwrap();
-
-    let header_v0 = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![cidv0_cid, drisl_cid],
-    };
-    let header_v0_cbor = serde_ipld_dagcbor::to_vec(&header_v0).unwrap();
-    let mut car_v0 = Vec::new();
-    circle_appview::commit::encode_varint(header_v0_cbor.len() as u64, &mut car_v0);
-    car_v0.extend_from_slice(&header_v0_cbor);
-    circle_appview::commit::encode_varint(
-        (cidv0_bytes.len() + commit_cbor.len()) as u64,
-        &mut car_v0,
-    );
-    car_v0.extend_from_slice(&cidv0_bytes);
-    car_v0.extend_from_slice(&commit_cbor);
-
-    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
-    let (b1_len, b1_vlen) =
-        circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
-    let remaining_offset = h_vlen + h_len as usize + b1_vlen + b1_len as usize;
-    car_v0.extend_from_slice(&valid_car[remaining_offset..]);
-
-    let res_v0 = decode_repo_car(&car_v0);
-    assert!(
-        res_v0.is_err(),
-        "CIDv0 root and block in CAR must be rejected"
-    );
-
-    // 2. CAR with unblessed CIDv1 codec (0x55 raw binary instead of 0x71 dag-cbor)
-    let unblessed_mh = multihash::Multihash::wrap(0x12, &commit_digest).unwrap();
-    let unblessed_cid = cid::Cid::new_v1(0x55, unblessed_mh);
-    let unblessed_cidv1 = unblessed_cid.to_bytes();
-
-    let header_unblessed = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![unblessed_cid, drisl_cid],
-    };
-    let header_unblessed_cbor = serde_ipld_dagcbor::to_vec(&header_unblessed).unwrap();
-    let mut car_unblessed = Vec::new();
-    car_unblessed.extend_from_slice(&header_unblessed_cbor);
-    circle_appview::commit::encode_varint(
-        (unblessed_cidv1.len() + commit_cbor.len()) as u64,
-        &mut car_unblessed,
-    );
-    car_unblessed.extend_from_slice(&unblessed_cidv1);
-    car_unblessed.extend_from_slice(&commit_cbor);
-    car_unblessed.extend_from_slice(&valid_car[remaining_offset..]);
-
-    let res_unblessed = decode_repo_car(&car_unblessed);
-    assert!(
-        res_unblessed.is_err(),
-        "Unblessed CIDv1 codec 0x55 must be rejected"
-    );
-}
-
-#[test]
-fn strict_car_rejects_non_minimal_and_overflowing_varints() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let rec = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "3l7post1".to_string(),
-        cid: "bafyreih327testcid1".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Valid post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
-
-    // 1. Re-encode header varint with non-minimal overlong encoding
-    let mut non_minimal_car = Vec::new();
-    let val = h_len;
-    non_minimal_car.push(((val & 0x7f) as u8) | 0x80);
-    non_minimal_car.push((val >> 7) as u8); // extra byte
-    non_minimal_car.extend_from_slice(&valid_car[h_vlen..]);
-
-    let res_non_minimal = decode_repo_car(&non_minimal_car);
-    assert!(
-        res_non_minimal.is_err(),
-        "Non-minimal varint encoding must be rejected"
-    );
-    assert!(res_non_minimal
-        .unwrap_err()
-        .to_string()
-        .contains("Non-minimal varint"));
-
-    // 2. 10-byte varint where 10th byte exceeds max u64 (> 0x01)
-    let mut overflow_car = Vec::new();
-    overflow_car.extend_from_slice(&[0xff; 9]);
-    overflow_car.push(0x02);
-    overflow_car.extend_from_slice(&valid_car[h_vlen..]);
-
-    let res_overflow = decode_repo_car(&overflow_car);
-    assert!(
-        res_overflow.is_err(),
-        "10th varint byte exceeding max u64 must be rejected"
-    );
-    assert!(res_overflow
-        .unwrap_err()
-        .to_string()
-        .contains("10th varint byte exceeds maximum u64"));
-
-    // 3. 10-byte varint where 10th byte has continuation bit set (0x80)
-    let mut cont_car = Vec::new();
-    cont_car.extend_from_slice(&[0xff; 9]);
-    cont_car.push(0x80);
-    cont_car.extend_from_slice(&valid_car[h_vlen..]);
-
-    let res_cont = decode_repo_car(&cont_car);
-    assert!(
-        res_cont.is_err(),
-        "10th varint byte with continuation bit set must be rejected"
-    );
-    assert!(res_cont
-        .unwrap_err()
-        .to_string()
-        .contains("continuation bit"));
-}
-
-#[test]
-fn strict_car_rejects_duplicate_map_keys_in_ipld_and_drisl() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", "bafyreih327testcid1");
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let rec = RepoRecord {
-        collection: "app.bsky.feed.post".to_string(),
-        rkey: "3l7post1".to_string(),
-        cid: "bafyreih327testcid1".to_string(),
-        value: json!({
-            "$type": "app.bsky.feed.post",
-            "text": "Valid post",
-            "createdAt": "2026-08-24T12:00:00.000Z"
-        }),
-    };
-
-    let valid_car = mint_repo_car(&commit, &[rec]).unwrap();
-    let decoded = decode_repo_car(&valid_car).unwrap();
-
-    // Construct DRISL map block with duplicate map key
-    let (_dummy_cid_bytes, dummy_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(b"dummy data");
-    let dummy_cid: cid::Cid = dummy_cid_str.parse().unwrap();
-    let link: circle_appview::commit::CidLink<jacquard_common::SmolStr> =
-        circle_appview::commit::CidLink::ipld(dummy_cid);
-    let link_cbor = serde_ipld_dagcbor::to_vec(&link).unwrap();
-    let mut dup_drisl_cbor = Vec::new();
-    dup_drisl_cbor.push(0xa2); // 2 map entries
-    let key = "app.bsky.feed.post/3l7post1";
-    dup_drisl_cbor.push(0x78);
-    dup_drisl_cbor.push(key.len() as u8);
-    dup_drisl_cbor.extend_from_slice(key.as_bytes());
-    dup_drisl_cbor.extend_from_slice(&link_cbor);
-
-    dup_drisl_cbor.push(0x78);
-    dup_drisl_cbor.push(key.len() as u8);
-    dup_drisl_cbor.extend_from_slice(key.as_bytes());
-    dup_drisl_cbor.extend_from_slice(&link_cbor);
-
-    let (dup_drisl_cid_bytes, dup_drisl_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&dup_drisl_cbor);
-    let dup_drisl_cid: cid::Cid = dup_drisl_cid_str.parse().unwrap();
-    let commit_cid: cid::Cid = decoded.commit_cid.parse().unwrap();
-
-    let header = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![commit_cid, dup_drisl_cid],
-    };
-    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
-
-    let mut tampered_car = Vec::new();
-    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut tampered_car);
-    tampered_car.extend_from_slice(&header_cbor);
-
-    let (h_len, h_vlen) = circle_appview::commit::decode_varint(&valid_car).unwrap();
-    let (b1_len, b1_vlen) =
-        circle_appview::commit::decode_varint(&valid_car[h_vlen + h_len as usize..]).unwrap();
-    let b1_start = h_vlen + h_len as usize;
-    let b1_end = b1_start + b1_vlen + b1_len as usize;
-    tampered_car.extend_from_slice(&valid_car[b1_start..b1_end]);
-
-    circle_appview::commit::encode_varint(
-        (dup_drisl_cid_bytes.len() + dup_drisl_cbor.len()) as u64,
-        &mut tampered_car,
-    );
-    tampered_car.extend_from_slice(&dup_drisl_cid_bytes);
-    tampered_car.extend_from_slice(&dup_drisl_cbor);
-
-    let res = decode_repo_car(&tampered_car);
-    assert!(
-        res.is_err(),
-        "Duplicate map keys in DRISL block must be rejected"
-    );
-    assert!(res.unwrap_err().to_string().contains("Duplicate map key"));
-}
-#[test]
-fn strict_car_rejects_duplicate_map_keys_in_record_block() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-
-    // Construct a record with duplicate map keys in CBOR
-    // Canonically 3 entries (with duplicate 'text' key):
-    // 1. "text" (4) -> 0x64, b't', b'e', b'x', b't', 0x65, "hello" (5)
-    // 2. "text" (4) -> 0x64, b't', b'e', b'x', b't', 0x69, "duplicate" (9)
-    // 3. "$type" (5) -> 0x65, b'$', b't', b'y', b'p', b'e', 0x72, "app.bsky.feed.post" (18)
-    let type_key = "$type";
-    let type_val = "app.bsky.feed.post";
-    let text_key = "text";
-    let text_val1 = "hello";
-    let text_val2 = "duplicate";
-
-    let mut dup_rec_cbor = Vec::new();
-    dup_rec_cbor.push(0xa3); // 3 entries (with duplicate 'text' key)
-    dup_rec_cbor.push(0x60 + text_key.len() as u8);
-    dup_rec_cbor.extend_from_slice(text_key.as_bytes());
-    dup_rec_cbor.push(0x60 + text_val1.len() as u8);
-    dup_rec_cbor.extend_from_slice(text_val1.as_bytes());
-
-    dup_rec_cbor.push(0x60 + text_key.len() as u8);
-    dup_rec_cbor.extend_from_slice(text_key.as_bytes());
-    dup_rec_cbor.push(0x60 + text_val2.len() as u8);
-    dup_rec_cbor.extend_from_slice(text_val2.as_bytes());
-
-    dup_rec_cbor.push(0x60 + type_key.len() as u8);
-    dup_rec_cbor.extend_from_slice(type_key.as_bytes());
-    dup_rec_cbor.push(0x72); // 18 bytes
-    dup_rec_cbor.extend_from_slice(type_val.as_bytes());
-
-    let (dup_rec_cid_bytes, dup_rec_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&dup_rec_cbor);
-    let dup_rec_cid_obj: cid::Cid = dup_rec_cid_str.parse().unwrap();
-    let dup_rec_cid_link: circle_appview::commit::CidLink<jacquard_common::SmolStr> =
-        circle_appview::commit::CidLink::ipld(dup_rec_cid_obj);
-    let mut lthash = LtHash::new();
-    lthash.add("app.bsky.feed.post", "3l7post1", &dup_rec_cid_str);
-    let commit = mint_signed_commit(
-        SPACE_URI,
-        OWNER_DID,
-        "3l7aaaaaaaaaa",
-        lthash.as_bytes(),
-        &signing_key,
-    );
-    let commit_cbor = serde_ipld_dagcbor::to_vec(&commit).unwrap();
-    let (commit_cid_bytes, commit_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&commit_cbor);
-    let commit_cid: cid::Cid = commit_cid_str.parse().unwrap();
-
-    // Construct valid DRISL map pointing to dup_rec_cid_link
-    let mut drisl_map = std::collections::BTreeMap::new();
-    drisl_map.insert(
-        jacquard_common::SmolStr::new("app.bsky.feed.post/3l7post1"),
-        dup_rec_cid_link,
-    );
-    let drisl_cbor = serde_ipld_dagcbor::to_vec(&drisl_map).unwrap();
-    let (drisl_cid_bytes, drisl_cid_str) =
-        circle_appview::commit::create_cid_bytes_from_data(&drisl_cbor);
-    let drisl_cid: cid::Cid = drisl_cid_str.parse().unwrap();
-
-    let header = circle_appview::commit::CarHeader {
-        version: 1,
-        roots: vec![commit_cid, drisl_cid],
-    };
-    let header_cbor = serde_ipld_dagcbor::to_vec(&header).unwrap();
-
-    let mut car = Vec::new();
-    // Header
-    circle_appview::commit::encode_varint(header_cbor.len() as u64, &mut car);
-    car.extend_from_slice(&header_cbor);
-    // Commit block
-    circle_appview::commit::encode_varint(
-        (commit_cid_bytes.len() + commit_cbor.len()) as u64,
-        &mut car,
-    );
-    car.extend_from_slice(&commit_cid_bytes);
-    car.extend_from_slice(&commit_cbor);
-    // DRISL block
-    circle_appview::commit::encode_varint(
-        (drisl_cid_bytes.len() + drisl_cbor.len()) as u64,
-        &mut car,
-    );
-    car.extend_from_slice(&drisl_cid_bytes);
-    car.extend_from_slice(&drisl_cbor);
-    // Record block with duplicate keys
-    circle_appview::commit::encode_varint(
-        (dup_rec_cid_bytes.len() + dup_rec_cbor.len()) as u64,
-        &mut car,
-    );
-    car.extend_from_slice(&dup_rec_cid_bytes);
-    car.extend_from_slice(&dup_rec_cbor);
-
-    let res = decode_repo_car(&car);
-    assert!(
-        res.is_err(),
-        "Duplicate map keys in record block must be rejected"
-    );
-    let err_str = res.unwrap_err().to_string();
-    assert!(
-        err_str.contains("Failed to decode record CBOR") || err_str.contains("Duplicate map key")
-    );
-}
-
 #[sqlx::test(migrations = "./migrations")]
-async fn notify_write_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
+async fn notify_space_update_requires_32_byte_hash_and_non_empty_rev(pool: PgPool) {
     let setup = setup_sync_test(pool.clone()).await;
     let app = circle_appview::routes::create_router(setup.state.clone());
+    let token = callback_token(&setup).await;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let token = mint_service_jwt(
-        OWNER_DID,
-        &setup.state.config.notify_service_identifier(),
-        "com.atproto.space.notifyWrite",
-        &setup.owner_signing_key,
-    );
-
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-
-    let short_hash_input =
-        catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                &[0x11u8; 16],
-            ),
-            repo: Did::from(String::from(OWNER_DID)),
-            repo_rev: Tid::from(String::from("3l7234567a234")),
-            space_rev: Some(catbird_atproto::jacquard_common::types::string::Tid::from(
-                String::from("3l7spacerev2a"),
-            )),
-            prev_space_rev: None,
-            space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-                .unwrap(),
-            extra_data: None,
-        };
-    let res = circle_appview::sync::notify_write_handler(
+    let short = circle_appview::sync::notify_space_update_handler(
         axum::extract::State(setup.state.clone()),
-        headers,
-        bytes::Bytes::from(serde_json::to_vec(&short_hash_input).unwrap()),
+        notify_body(
+            &token,
+            repo_write_update(
+                OWNER_DID,
+                "3l7234567a234",
+                &[0x11; 16],
+                "3l7spacerev2a",
+                None,
+            ),
+        ),
     )
     .await;
-    assert!(
-        matches!(res, Err(AppError::InvalidRequest(_))),
-        "Non-32-byte hash must return InvalidRequest"
-    );
+    assert!(matches!(short, Err(AppError::InvalidRequest(_))));
 
-    // 2. Empty repoRev. Each request carries a fresh service JWT: a jti is
-    // single-use, so reusing `token` would be refused (401) before the body is
-    // read.
-    let fresh_headers = || {
-        let token = mint_service_jwt(
-            OWNER_DID,
-            &setup.state.config.notify_service_identifier(),
-            "com.atproto.space.notifyWrite",
-            &setup.owner_signing_key,
-        );
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        headers
-    };
-    // An Oct-1 body (32-byte hash) from a repo that is not a Circle member, with
-    // repoRev replaced.
     let body_with_repo_rev = |repo_rev: &str| {
-        let input = catbird_atproto::generated::com_atproto::space::notify_write::NotifyWrite {
-            data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                &[0x22u8; 32],
-            ),
-            repo: Did::from(String::from(DAVE_DID)),
-            repo_rev: Tid::from(String::from("3l7234567a234")),
-            space_rev: Some(Tid::from(String::from("3l7spacerev2a"))),
-            prev_space_rev: None,
-            space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(SPACE_URI)
-                .unwrap(),
-            extra_data: None,
-        };
-        let mut body = serde_json::to_value(&input).unwrap();
-        body["repoRev"] = json!(repo_rev);
-        body.to_string()
+        notify_body(
+            &token,
+            repo_write_update(DAVE_DID, repo_rev, &[0x22; 32], "3l7spacerev2a", None),
+        )
     };
-
-    // Positive control: with a nonempty repoRev the body parses and the handler
-    // gets as far as the membership check.
-    let res = circle_appview::sync::notify_write_handler(
+    let valid = circle_appview::sync::notify_space_update_handler(
         axum::extract::State(setup.state.clone()),
-        fresh_headers(),
-        bytes::Bytes::from(body_with_repo_rev("3l7234567a234")),
+        body_with_repo_rev("3l7234567a234"),
     )
     .await;
-    assert!(matches!(res, Err(AppError::Forbidden(_))), "{res:?}");
+    assert!(matches!(valid, Err(AppError::Forbidden(_))), "{valid:?}");
 
-    let res = circle_appview::sync::notify_write_handler(
+    let empty = circle_appview::sync::notify_space_update_handler(
         axum::extract::State(setup.state.clone()),
-        fresh_headers(),
-        bytes::Bytes::from(body_with_repo_rev("")),
+        body_with_repo_rev(""),
     )
     .await;
-    // repoRev is a TID, so the generated type refuses "" while the body is
-    // parsed; the handler's own empty check is a backstop.
     assert!(
-        matches!(&res, Err(AppError::InvalidRequest(_))),
-        "Empty repoRev must return InvalidRequest: {res:?}"
+        matches!(&empty, Err(AppError::InvalidRequest(_))),
+        "Empty repoRev must return InvalidRequest: {empty:?}"
     );
 
-    // The same body over the router is a client error, not an auth failure.
-    let mut request = Request::builder()
-        .method("POST")
-        .uri("/xrpc/com.atproto.space.notifyWrite")
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(body_with_repo_rev("")))
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.space.notifySpaceUpdate")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body_with_repo_rev("")))
+                .unwrap(),
+        )
+        .await
         .unwrap();
-    request.headers_mut().extend(fresh_headers());
-    let res = app.oneshot(request).await.unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "Empty repoRev");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -3415,7 +2633,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit.clone()),
+            commit: commit.clone(),
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
@@ -3653,7 +2871,7 @@ async fn staged_rejection_removes_uri_from_policy_preventing_stale_deps(pool: Pg
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit2),
+            commit: commit2,
             cursor: None,
             ops: vec![op1, op2],
             extra_data: None,
@@ -4583,36 +3801,31 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
     setup.mock_transport.set_list_repo_ops_response(
         &key,
         catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit: Some(commit),
+            commit,
             cursor: None,
             ops: vec![op_entry],
             extra_data: None,
         },
     );
 
-    let repo_item = catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-        did: Did::from(String::from(OWNER_DID)),
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            &lthash.digest(),
-        ),
-        repo_rev: Tid::from(String::from(rev)),
-        space_rev: catbird_atproto::jacquard_common::types::string::Tid::from(String::from(
-            "3l7spacerev2a",
-        )),
-        extra_data: None,
-    };
-    setup.mock_transport.set_list_repos_response(
+    let repo_item = WriterUpdate::RepoWrite(RepoWrite {
+        repo: OWNER_DID.into(),
+        data: bytes::Bytes::copy_from_slice(&lthash.digest()),
+        repo_rev: rev.into(),
+        space_rev: "3l7spacerev2a".into(),
+        prev_space_rev: None,
+    });
+    setup.mock_transport.set_list_writers_response(
         SPACE_URI,
-        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+        ListWritersOutput {
             cursor: None,
             repos: vec![repo_item],
-            extra_data: None,
         },
     );
 
     let expected_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7sweepsch1");
 
-    // Verify record is NOT yet in the database (simulating dropped notifyWrite)
+    // Verify the record is absent before listWriters catch-up.
     let before: Option<(String,)> = sqlx::query_as("SELECT uri FROM circle_records WHERE uri = $1")
         .bind(&expected_uri)
         .fetch_optional(&pool)
@@ -4774,16 +3987,9 @@ fn credential_use_methods(setup: &SyncTestSetup) -> Vec<&'static str> {
         .collect()
 }
 
-/// A fresh registerNotify registration, so a sweep goes straight to listRepos.
-async fn register_notify_fresh(setup: &SyncTestSetup, pool: &PgPool) {
-    sqlx::query(
-        "INSERT INTO circle_notify_registrations (space_uri, service, space_host_endpoint, expires_at) VALUES ($1, $2, 'https://space.catbird.blue', now() + interval '24 hours')",
-    )
-    .bind(SPACE_URI)
-    .bind(setup.state.config.notify_service_identifier())
-    .execute(pool)
-    .await
-    .unwrap();
+/// Persist the stable token that authorizeSpaceSync carries on every renewal.
+async fn create_notify_registration(setup: &SyncTestSetup) {
+    let _ = callback_token(setup).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -4817,23 +4023,18 @@ async fn rejected_credential_stops_repo_sync_without_get_repo_fallback(pool: PgP
 async fn rejected_credential_stops_the_sweep_and_is_never_retried(pool: PgPool) {
     use circle_appview::error::AuthReason;
     let setup = setup_sync_test(pool.clone()).await;
-    register_notify_fresh(&setup, &pool).await;
-    setup.mock_transport.set_list_repos_response(
+    create_notify_registration(&setup).await;
+    setup.mock_transport.set_list_writers_response(
         SPACE_URI,
-        catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput {
+        ListWritersOutput {
             cursor: Some("3l7spacerev2a".into()),
-            repos: vec![
-                catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-                    did: Did::from(String::from(OWNER_DID)),
-                    data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                        &[0x11; 32],
-                    ),
-                    repo_rev: Tid::from(String::from("3l7234567a234")),
-                    space_rev: Tid::from(String::from("3l7spacerev2a")),
-                    extra_data: None,
-                },
-            ],
-            extra_data: None,
+            repos: vec![WriterUpdate::RepoWrite(RepoWrite {
+                repo: OWNER_DID.into(),
+                data: bytes::Bytes::copy_from_slice(&[0x11; 32]),
+                repo_rev: "3l7234567a234".into(),
+                space_rev: "3l7spacerev2a".into(),
+                prev_space_rev: None,
+            })],
         },
     );
     setup
@@ -4846,8 +4047,8 @@ async fn rejected_credential_stops_the_sweep_and_is_never_retried(pool: PgPool) 
     assert!(setup.state.credential_store.get(SPACE_URI).await.is_none());
     assert_eq!(
         credential_use_methods(&setup),
-        vec!["com.atproto.space.listRepos"],
-        "one refused listRepos, then nothing else with that credential"
+        vec!["com.atproto.space.listWriters"],
+        "one refused listWriters, then nothing else with that credential"
     );
 
     // The host would accept requests again, but the evicted credential is gone
@@ -4858,28 +4059,26 @@ async fn rejected_credential_stops_the_sweep_and_is_never_retried(pool: PgPool) 
     assert_eq!(summary.repos_failed, 1, "credential acquisition failed");
     assert_eq!(
         credential_use_methods(&setup),
-        vec!["com.atproto.space.listRepos"],
+        vec!["com.atproto.space.listWriters"],
         "the rejected credential is never retried"
     );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn credential_rejected_by_register_notify_is_not_used_to_list(pool: PgPool) {
+async fn credential_rejected_by_list_writers_is_not_used_for_repo_reads(pool: PgPool) {
     use circle_appview::error::AuthReason;
     let setup = setup_sync_test(pool.clone()).await;
-    // No registration yet, so the sweep registers before listing.
     setup
         .mock_transport
         .reject_credential_uses(Some(AuthReason::BadSpaceAudience));
 
     let summary = sweep_once(&setup.state).await.unwrap();
     assert_eq!(summary.spaces_checked, 1);
-    assert_eq!(summary.repos_failed, 1);
     assert!(setup.state.credential_store.get(SPACE_URI).await.is_none());
     assert_eq!(
         credential_use_methods(&setup),
-        vec!["com.atproto.space.registerNotify"],
-        "no listRepos with a credential registerNotify just had rejected"
+        vec!["com.atproto.space.listWriters"],
+        "no repo read uses a credential listWriters rejected"
     );
 }
 
@@ -4890,43 +4089,40 @@ fn space_rev(i: usize) -> String {
     format!("3l7spacerv{}{}{}", digit(10), digit(5), digit(0))
 }
 
-fn writer_entry(i: usize) -> catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-    catbird_atproto::generated::com_atproto::space::list_repos::Repo {
-        did: Did::from(format!("did:plc:resume-writer-{i}")),
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x22; 32]),
-        repo_rev: Tid::from(String::from("3l7234567a234")),
-        space_rev: Tid::from(space_rev(i)),
-        extra_data: None,
-    }
+fn writer_entry(i: usize) -> WriterUpdate {
+    WriterUpdate::RepoWrite(RepoWrite {
+        repo: format!("did:plc:resume-writer-{i}"),
+        data: bytes::Bytes::copy_from_slice(&[0x22; 32]),
+        repo_rev: "3l7234567a234".into(),
+        space_rev: space_rev(i),
+        prev_space_rev: None,
+    })
 }
 
-/// listRepos ascends by spaceRev, so a listing the sweep budget cuts short must
-/// resume after its last processed entry rather than restart: restarting would
-/// always drop the most recently updated writers. A finished listing starts over.
+/// listWriters ascends by spaceRev, so a listing the sweep budget cuts short
+/// resumes after its last processed entry rather than restarting and starving
+/// the most recently updated writers. A finished listing starts over.
 #[sqlx::test(migrations = "./migrations")]
 async fn sweep_resumes_a_budget_cut_listing_from_its_last_processed_space_rev(pool: PgPool) {
-    use catbird_atproto::generated::com_atproto::space::list_repos::ListReposOutput;
     use circle_appview::sync::MAX_REPOS_PER_SWEEP;
     let setup = setup_sync_test(pool.clone()).await;
-    register_notify_fresh(&setup, &pool).await;
+    create_notify_registration(&setup).await;
     let writers = MAX_REPOS_PER_SWEEP + 5;
     assert!(space_rev(0) < space_rev(1) && space_rev(1) < space_rev(writers - 1));
 
-    setup.mock_transport.set_list_repos_response(
+    setup.mock_transport.set_list_writers_response(
         SPACE_URI,
-        ListReposOutput {
-            cursor: Some(space_rev(writers - 1).into()),
+        ListWritersOutput {
+            cursor: Some(space_rev(writers - 1)),
             repos: (0..writers).map(writer_entry).collect(),
-            extra_data: None,
         },
     );
     let cut_at = space_rev(MAX_REPOS_PER_SWEEP - 1);
-    setup.mock_transport.set_list_repos_response(
+    setup.mock_transport.set_list_writers_response(
         &format!("{SPACE_URI}:{cut_at}"),
-        ListReposOutput {
-            cursor: Some(space_rev(writers - 1).into()),
+        ListWritersOutput {
+            cursor: Some(space_rev(writers - 1)),
             repos: (MAX_REPOS_PER_SWEEP..writers).map(writer_entry).collect(),
-            extra_data: None,
         },
     );
     // Past the last writer the mock answers the empty, cursor-less final page.
@@ -4946,7 +4142,7 @@ async fn sweep_resumes_a_budget_cut_listing_from_its_last_processed_space_rev(po
     assert_eq!(third.repos_checked, MAX_REPOS_PER_SWEEP);
 
     assert_eq!(
-        setup.mock_transport.recorded_list_repos_cursors(),
+        setup.mock_transport.recorded_list_writers_cursors(),
         vec![None, Some(cut_at), Some(space_rev(writers - 1)), None,],
         "resume after the last processed spaceRev, then start over once finished"
     );

@@ -434,7 +434,7 @@ async fn verifies_public_health_and_capabilities_unauthenticated(pool: PgPool) {
     );
     assert_eq!(
         caps.protocol_revision.as_str(),
-        "5d88b414a98de1ada22c94c78fa0667a7028163c"
+        "d4def6e9f521896ed8222f576d54923d00b5fbeb"
     );
     assert!(!caps.supports_images);
 }
@@ -3084,7 +3084,7 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
     endpoints.insert(
         "/xrpc/com.atproto.space.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
-            "uri": "at://did:plc:space-auth/space/com.example.space/1",
+            "space": "at://did:plc:space-auth/space/com.example.space/1",
             "policy": {
                 "$type": "com.atproto.memberspace.policy",
                 "publicRead": false,
