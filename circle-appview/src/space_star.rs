@@ -1,178 +1,92 @@
-//! Strict DASL STAR repository replacement. No records escape before full digest validation.
+//! Strict DASL STAR v0.2 repository replacement, delegated to `atproto-spaces`.
+//! No records escape before full digest validation.
 use crate::{
-    commit::{create_cid_bytes_from_data, json_to_ipld, LtHash},
+    commit::{json_to_ipld, LtHash},
     error::AppError,
     space_mac::Commit,
 };
-use serde::{Deserialize, Serialize};
+use bytes::Bytes;
+use catbird_atproto::jacquard_common::types::{
+    aturi::AtSpaceUri,
+    string::{Did, Tid},
+    value::Data,
+};
 
 pub const MAX_STAR_BYTES: usize = 50 * 1024 * 1024;
-pub const MAX_METADATA_BYTES: usize = 64 * 1024;
-pub const MAX_KEY_BYTES: usize = 4 * 1024;
-pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+pub const MAX_METADATA_BYTES: usize = atproto_spaces::star::MAX_METADATA_BYTES;
+pub const MAX_KEY_BYTES: usize = atproto_spaces::star::MAX_KEY_BYTES;
+pub const MAX_RECORD_BYTES: usize = atproto_spaces::star::MAX_RECORD_BYTES;
 pub const MAX_RECORDS: usize = 10_000;
-pub const MAGIC: &[u8] = &[0x2a, 0x6c, 0x01, 0x00];
+pub const MAGIC: &[u8] = &atproto_spaces::star::STAR_LITE_MAGIC;
 pub type RepoRecords = Vec<(String, String, String, serde_json::Value)>;
+
 pub struct RepoSnapshot {
     pub commit: Commit,
     pub records: RepoRecords,
     pub lthash: LtHash,
 }
-#[derive(Serialize, Deserialize)]
-struct Meta {
-    #[serde(rename = "$type")]
-    kind: String,
-    ver: i64,
-    repo: String,
-    space: String,
-    rev: String,
-    #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
-}
-fn invalid(message: &str) -> AppError {
+
+fn invalid(message: impl std::fmt::Display) -> AppError {
     AppError::InvalidRequest(format!("Invalid STAR: {message}"))
 }
-fn frame<'a>(input: &mut &'a [u8], max: usize) -> Result<&'a [u8], AppError> {
-    let mut len = 0usize;
-    let mut done = false;
-    for i in 0..6 {
-        let (&b, rest) = input
-            .split_first()
-            .ok_or_else(|| invalid("truncated varint"))?;
-        *input = rest;
-        len |= ((b & 127) as usize) << (7 * i);
-        if b < 128 {
-            if i > 0 && b == 0 {
-                return Err(invalid("nonminimal varint"));
-            }
-            done = true;
-            break;
-        }
-    }
-    if !done || len > max {
-        return Err(invalid("frame length exceeds limit"));
-    }
-    if input.len() < len {
-        return Err(invalid("truncated frame"));
-    }
-    let (value, rest) = input.split_at(len);
-    *input = rest;
-    Ok(value)
+
+fn commit_from_meta(meta: &atproto_spaces::star::StarCommitMetadata) -> Result<Commit, AppError> {
+    let space =
+        AtSpaceUri::new_owned(meta.space.clone()).map_err(|_| invalid("invalid space URI"))?;
+    let repo = Did::new_owned(meta.repo.clone()).map_err(|_| invalid("invalid repo DID"))?;
+    let rev = Tid::new(meta.rev.as_str()).map_err(|_| invalid("invalid rev TID"))?;
+    Ok(Commit {
+        space,
+        repo,
+        rev,
+        data: Bytes::copy_from_slice(&meta.data),
+        ver: 1,
+        extra_data: None,
+    })
 }
-fn pair<'a>(input: &mut &'a [u8]) -> Result<Option<(&'a [u8], &'a [u8])>, AppError> {
-    let (&control, rest) = input
-        .split_first()
-        .ok_or_else(|| invalid("unexpected end of archive"))?;
-    *input = rest;
-    match control {
-        0x00 if input.is_empty() => Ok(None),
-        0x00 => Err(invalid("unexpected bytes after end of archive")),
-        0x01 => {
-            let key = frame(input, MAX_KEY_BYTES)?;
-            let value = frame(input, MAX_RECORD_BYTES)?;
-            Ok(Some((key, value)))
-        }
-        _ => Err(invalid("invalid control byte")),
-    }
-}
-fn canonical(
-    bytes: &[u8],
-) -> Result<jacquard_common::types::value::Data<jacquard_common::SmolStr>, AppError> {
-    let value = serde_ipld_dagcbor::from_slice(bytes).map_err(|_| invalid("invalid DRISL"))?;
-    if serde_ipld_dagcbor::to_vec(&value).map_err(|_| invalid("invalid DRISL"))? != bytes {
-        return Err(invalid("noncanonical DRISL"));
-    }
-    // DRISL excludes floats even when a general CBOR decoder can round-trip them.
-    let json = serde_json::to_value(&value).map_err(|_| invalid("invalid DRISL value"))?;
-    json_to_ipld(&json).map_err(|_| invalid("forbidden DRISL value"))?;
-    Ok(value)
-}
-/// MAC verification is performed by the HTTP transport before it releases these bytes.
-/// The parser also checks all metadata, records, framing, canonical encoding and final digest.
+
+/// Parse and validate ONLY the leading STAR metadata frame (`<= 64 KiB`) so the HTTP
+/// transport can verify the commit MAC BEFORE any record frames are parsed.
 pub fn read_commit(bytes: &[u8], space: &str, repo: &str) -> Result<Commit, AppError> {
     if bytes.len() > MAX_STAR_BYTES {
         return Err(invalid("archive exceeds limit"));
     }
-    let mut input = bytes
-        .strip_prefix(MAGIC)
-        .ok_or_else(|| invalid("wrong magic"))?;
-    let metadata = frame(&mut input, MAX_METADATA_BYTES)?;
-    canonical(metadata)?;
-    let meta: Meta =
-        serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid metadata"))?;
-    if meta.kind != "atproto-space-repo"
-        || meta.ver != 1
-        || meta.space != space
-        || meta.repo != repo
-        || meta.data.len() != 32
-    {
-        return Err(invalid("metadata context mismatch"));
-    }
-    let commit: Commit =
-        serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid commit"))?;
-    while pair(&mut input)?.is_some() {}
-    Ok(commit)
+    let meta = atproto_spaces::star::read_star_metadata(bytes, space, repo).map_err(invalid)?;
+    commit_from_meta(&meta)
 }
 
 pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnapshot, AppError> {
     if bytes.len() > MAX_STAR_BYTES {
         return Err(invalid("archive exceeds limit"));
     }
-    let mut input = bytes
-        .strip_prefix(MAGIC)
-        .ok_or_else(|| invalid("wrong magic"))?;
-    let metadata = frame(&mut input, MAX_METADATA_BYTES)?;
-    canonical(metadata)?;
-    let meta: Meta =
-        serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid metadata"))?;
-    if meta.kind != "atproto-space-repo"
-        || meta.ver != 1
-        || meta.space != space
-        || meta.repo != repo
-        || meta.data.len() != 32
-    {
-        return Err(invalid("metadata context mismatch"));
+    let parsed = atproto_spaces::star::read_star_repo(bytes, space, repo).map_err(invalid)?;
+    if parsed.records.len() > MAX_RECORDS {
+        return Err(invalid("too many records"));
     }
-    let commit: Commit =
-        serde_ipld_dagcbor::from_slice(metadata).map_err(|_| invalid("invalid commit"))?;
-    let mut records = Vec::new();
-    let mut last: Option<Vec<u8>> = None;
+    let meta = atproto_spaces::star::StarCommitMetadata {
+        space: parsed.space,
+        repo: parsed.repo,
+        rev: parsed.rev,
+        data: parsed.data,
+    };
+    let commit = commit_from_meta(&meta)?;
+
+    let mut records = Vec::with_capacity(parsed.records.len());
     let mut lthash = LtHash::default();
-    while let Some((path_bytes, record_bytes)) = pair(&mut input)? {
-        if records.len() >= MAX_RECORDS {
-            return Err(invalid("too many records"));
-        }
-        if last
-            .as_ref()
-            .is_some_and(|last| last.as_slice() >= path_bytes)
-        {
-            return Err(invalid("duplicate or unordered path"));
-        }
-        let path = std::str::from_utf8(path_bytes).map_err(|_| invalid("non-UTF8 path"))?;
-        let (collection, rkey) = path
-            .split_once('/')
-            .ok_or_else(|| invalid("invalid record path"))?;
-        if collection
-            .parse::<jacquard_common::types::nsid::Nsid>()
-            .is_err()
-            || rkey
-                .parse::<jacquard_common::types::string::Rkey>()
-                .is_err()
-        {
-            return Err(invalid("invalid collection or rkey"));
-        }
-        let value = canonical(record_bytes)?;
+    for rec in parsed.records {
+        let value: Data<jacquard_common::SmolStr> =
+            serde_ipld_dagcbor::from_slice(&rec.record_dagcbor)
+                .map_err(|_| invalid("invalid DRISL"))?;
         let json = serde_json::to_value(value).map_err(|_| invalid("invalid record JSON"))?;
         json_to_ipld(&json).map_err(|_| invalid("invalid record value"))?;
         if !json.is_object() {
             return Err(invalid("record must be a map"));
         }
-        let (_, cid) = create_cid_bytes_from_data(record_bytes);
-        lthash.add(&format!("{path}/{cid}"));
-        records.push((collection.into(), rkey.into(), cid, json));
-        last = Some(path_bytes.to_vec());
+        let cid_str = rec.cid.to_string();
+        lthash.add(&format!("{}/{cid_str}", rec.path));
+        records.push((rec.collection, rec.rkey, cid_str, json));
     }
-    if lthash.digest().as_slice() != meta.data {
+    if lthash.digest() != meta.data {
         return Err(invalid("digest mismatch"));
     }
     Ok(RepoSnapshot {
@@ -185,6 +99,21 @@ pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit::create_cid_bytes_from_data;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct Meta {
+        #[serde(rename = "$type")]
+        kind: String,
+        ver: i64,
+        repo: String,
+        space: String,
+        rev: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    }
+
     fn append_frame(out: &mut Vec<u8>, bytes: &[u8]) {
         let mut n = bytes.len();
         loop {
@@ -197,6 +126,7 @@ mod tests {
         }
         out.extend_from_slice(bytes);
     }
+
     fn archive(pairs: &[(&str, &[u8])]) -> Vec<u8> {
         let mut hash = LtHash::default();
         for (path, bytes) in pairs {
@@ -220,6 +150,7 @@ mod tests {
         bytes.push(0x00);
         bytes
     }
+
     fn parse(bytes: &[u8]) -> Result<RepoSnapshot, AppError> {
         parse_repo_star(
             bytes,
@@ -227,6 +158,7 @@ mod tests {
             "did:plc:author",
         )
     }
+
     #[test]
     fn empty_and_record_roundtrip() {
         assert!(parse(&archive(&[])).unwrap().records.is_empty());
@@ -239,6 +171,7 @@ mod tests {
             1
         );
     }
+
     #[test]
     fn rejects_duplicate_order_truncation_digest() {
         let value = serde_ipld_dagcbor::to_vec(&serde_json::json!({"text":"hello"})).unwrap();
@@ -250,17 +183,19 @@ mod tests {
         }
         let mut bytes = archive(&[("app.bsky.feed.post/a", &value)]);
         bytes.pop();
-
         assert!(parse(&bytes).is_err());
+
         let mut bytes = archive(&[]);
         bytes.push(0x80);
         bytes.push(0);
         assert!(parse(&bytes).is_err());
+
         let mut bytes = archive(&[("app.bsky.feed.post/a", &value)]);
         let end = bytes.len() - 1;
         bytes[end] ^= 1;
         assert!(parse(&bytes).is_err());
     }
+
     #[test]
     fn rejects_missing_end_bad_control_and_trailing_bytes() {
         let complete = archive(&[]);
@@ -278,10 +213,9 @@ mod tests {
         trailing.push(0xff);
         assert!(parse(&trailing).is_err());
     }
+
     #[test]
     fn rejects_noncanonical_or_forbidden_records_even_with_matching_digest() {
-        // Each archive has a digest computed from the exact supplied bytes.
-        // The parser must reject the representation, not merely a bad digest.
         for record in [
             vec![0xa2, 0x62, b'a', b'a', 1, 0x61, b'b', 2], // wrong map-key order
             vec![0xa2, 0x61, b'a', 1, 0x61, b'a', 2],       // duplicate map key
@@ -291,6 +225,7 @@ mod tests {
             assert!(parse(&archive(&[("app.bsky.feed.post/a", &record)])).is_err());
         }
     }
+
     #[test]
     fn rejects_wrong_metadata_context_and_non_utf8_paths() {
         let bytes = archive(&[]);
@@ -306,17 +241,23 @@ mod tests {
             "did:plc:other"
         )
         .is_err());
-        let mut input = &bytes[MAGIC.len()..];
-        let mut meta: Meta =
-            serde_ipld_dagcbor::from_slice(frame(&mut input, 65536).unwrap()).unwrap();
-        meta.ver = 2;
+
+        let invalid_meta = Meta {
+            kind: "atproto-space-repo".into(),
+            ver: 2,
+            repo: "did:plc:author".into(),
+            space: "at://did:plc:authority/space/blue.catbird.circle/test".into(),
+            rev: "3jzfcijpj2m2a".into(),
+            data: LtHash::default().digest().to_vec(),
+        };
         let mut invalid_version = MAGIC.to_vec();
         append_frame(
             &mut invalid_version,
-            &serde_ipld_dagcbor::to_vec(&meta).unwrap(),
+            &serde_ipld_dagcbor::to_vec(&invalid_meta).unwrap(),
         );
         invalid_version.push(0x00);
         assert!(parse(&invalid_version).is_err());
+
         let mut invalid_path = bytes;
         invalid_path.pop();
         invalid_path.push(0x01);

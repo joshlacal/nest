@@ -696,6 +696,17 @@ impl DidResolver {
     }
 
     async fn resolve_plc(&self, did: &str) -> Result<DidDocument, AuthReason> {
+        let suffix = did
+            .strip_prefix("did:plc:")
+            .ok_or(AuthReason::UnsupportedDidMethod)?;
+        if suffix.len() != 24
+            || !suffix
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+        {
+            return Err(AuthReason::DidResolutionFailed);
+        }
+
         let url = format!("{}/{}", self.plc_directory_url.trim_end_matches('/'), did);
         let resp = self
             .http_client
@@ -720,7 +731,7 @@ impl DidResolver {
         let raw = did
             .strip_prefix("did:web:")
             .ok_or(AuthReason::UnsupportedDidMethod)?;
-        if raw.is_empty() {
+        if raw.is_empty() || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(AuthReason::DidResolutionFailed);
         }
 
@@ -749,10 +760,43 @@ impl DidResolver {
             return Err(AuthReason::SsrfBlocked);
         }
 
+        if hostname == "."
+            || hostname == ".."
+            || hostname.starts_with('.')
+            || hostname.contains("..")
+            || hostname.chars().any(|c| {
+                matches!(c, '/' | '\\' | '?' | '#' | '@' | ':' | '%')
+                    || c.is_control()
+                    || c.is_whitespace()
+            })
+        {
+            return Err(AuthReason::DidResolutionFailed);
+        }
+
         if let Ok(ip) = hostname.parse::<IpAddr>() {
             if is_private_ip(&ip) {
                 return Err(AuthReason::SsrfBlocked);
             }
+        }
+
+        let mut path_segments = Vec::with_capacity(parts.len().saturating_sub(1));
+        for seg in &parts[1..] {
+            if seg.is_empty() || *seg == "." || *seg == ".." {
+                return Err(AuthReason::DidResolutionFailed);
+            }
+            let seg_decoded = urlencoding_decode(seg)?;
+            if seg_decoded.is_empty()
+                || seg_decoded == "."
+                || seg_decoded == ".."
+                || seg_decoded.chars().any(|c| {
+                    matches!(c, '/' | '\\' | '?' | '#' | '@' | '%')
+                        || c.is_control()
+                        || c.is_whitespace()
+                })
+            {
+                return Err(AuthReason::DidResolutionFailed);
+            }
+            path_segments.push(seg_decoded);
         }
 
         // DNS resolution via injected web_transport
@@ -770,13 +814,9 @@ impl DidResolver {
 
         let pinned_addr = addrs[0];
 
-        let url_path = if parts.len() == 1 {
+        let url_path = if path_segments.is_empty() {
             "/.well-known/did.json".to_string()
         } else {
-            let path_segments = parts[1..]
-                .iter()
-                .map(|seg| urlencoding_decode(seg))
-                .collect::<Result<Vec<_>, _>>()?;
             format!("/{}/did.json", path_segments.join("/"))
         };
 

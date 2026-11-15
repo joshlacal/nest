@@ -205,3 +205,23 @@ async fn space_form_parent_still_resolves(pool: PgPool) {
     let (parent_uri, _) = reply_row(&pool, &s.space_uri(BOB_DID, POST, "3l7replyaaaa1")).await;
     assert_eq!(parent_uri.as_deref(), Some(root_uri.as_str()));
 }
+
+/// Catbird's sealer encodes the reply through Petrel's `ReplyRef`, which always writes
+/// `"$type": "app.bsky.feed.post#replyRef"`; that envelope must ingest.
+#[sqlx::test(migrations = "./migrations")]
+async fn typed_encrypted_reply_as_catbird_sends_it_is_indexed(pool: PgPool) {
+    let s = setup(&pool, ENC_SPACE, Some(ENCRYPTED_TYPE)).await;
+    let (root_uri, root_cid) = seed_encrypted_root(&s).await;
+    let mut reply = envelope_reply(
+        1,
+        &standard_uri(OWNER_DID, POST, "3l7postaaaaa1"),
+        &root_cid,
+    );
+    reply["reply"]["$type"] = json!("app.bsky.feed.post#replyRef");
+    assert_eq!(
+        s.sync(BOB_DID, &[(POST, "3l7replyaaaa1", reply)]).await,
+        (1, 0)
+    );
+    let (parent_uri, _) = reply_row(&pool, &s.space_uri(BOB_DID, POST, "3l7replyaaaa1")).await;
+    assert_eq!(parent_uri.as_deref(), Some(root_uri.as_str()));
+}

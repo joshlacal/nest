@@ -381,18 +381,9 @@ pub async fn purge_deleted_space(db: &PgPool, credential_store: &CredentialStore
 }
 
 pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
-    let stripped = space_uri.strip_prefix("at://").ok_or_else(|| {
-        AppError::InvalidRequest("Invalid Space URI: must start with at://".into())
-    })?;
-    let did = stripped.split('/').next().ok_or_else(|| {
-        AppError::InvalidRequest("Invalid Space URI: missing authority DID".into())
-    })?;
-    if did.is_empty() {
-        return Err(AppError::InvalidRequest(
-            "Invalid Space URI: empty authority DID".into(),
-        ));
-    }
-    Ok(did.to_string())
+    atproto_spaces::SpaceUri::parse_hedged(space_uri)
+        .map(|parsed| parsed.authority)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid Space URI: {e}")))
 }
 
 /// Resolve a Space authority's space-host endpoint, and the service identifier

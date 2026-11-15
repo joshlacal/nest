@@ -44,6 +44,10 @@ pub enum InvalidRecord {
     BadByteLength { field: &'static str, got: usize },
     #[error("Envelope carries unknown top-level field {0}")]
     UnknownEnvelopeField(String),
+    #[error("circleId does not match the Space's Circle")]
+    CircleIdMismatch,
+    #[error("Key record sender.did is not the record author")]
+    SenderNotAuthor,
 }
 
 impl InvalidRecord {
@@ -64,6 +68,8 @@ impl InvalidRecord {
             Self::KeyVersionAheadOfKeys { .. } => "key_version_ahead_of_keys",
             Self::BadByteLength { .. } => "bad_byte_length",
             Self::UnknownEnvelopeField(_) => "unknown_envelope_field",
+            Self::CircleIdMismatch => "circle_id_mismatch",
+            Self::SenderNotAuthor => "sender_not_author",
         }
     }
 }
@@ -79,6 +85,8 @@ pub struct ValidationPolicy {
     pub space_type: String,
     /// Highest `blue.catbird.circle.key` version stored for this Space, if any.
     pub latest_key_version: Option<i64>,
+    /// The Space's `circles.circle_id`; when set, key and envelope records must carry it.
+    pub circle_id: Option<String>,
 }
 
 impl ValidationPolicy {
@@ -99,11 +107,17 @@ impl ValidationPolicy {
             known_posts: HashMap::new(),
             space_type: PLAINTEXT_SPACE_TYPE.to_string(),
             latest_key_version: None,
+            circle_id: None,
         }
     }
 
     pub fn with_space_type(mut self, space_type: impl Into<String>) -> Self {
         self.space_type = space_type.into();
+        self
+    }
+
+    pub fn with_circle_id(mut self, circle_id: impl Into<String>) -> Self {
+        self.circle_id = Some(circle_id.into());
         self
     }
 
@@ -243,18 +257,37 @@ pub fn to_space_form(uri: &str, space_uri: &str) -> String {
     if space_uri.is_empty() {
         return uri.to_string();
     }
-    if uri
-        .strip_prefix(space_uri)
-        .is_some_and(|rest| rest.starts_with('/'))
+    let parsed_space = atproto_spaces::SpaceUri::parse_hedged(space_uri).ok();
+    let canonical_space = parsed_space
+        .as_ref()
+        .map(atproto_spaces::SpaceUri::as_str)
+        .unwrap_or(space_uri);
+
+    if let Some(rest) = uri
+        .strip_prefix(canonical_space)
+        .filter(|rest| rest.starts_with('/'))
     {
+        return format!("{canonical_space}{rest}");
+    }
+    if let Some(rest) = uri
+        .strip_prefix(space_uri)
+        .filter(|rest| rest.starts_with('/'))
+    {
+        return format!("{canonical_space}{rest}");
+    }
+    let Some(rest) = uri.strip_prefix("at://") else {
+        return uri.to_string();
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() != 3 || !parts[0].starts_with("did:") {
         return uri.to_string();
     }
-    match uri.strip_prefix("at://") {
-        Some(rest) if rest.split('/').count() == 3 && rest.starts_with("did:") => {
-            format!("{space_uri}/{rest}")
+    if let Some(space) = &parsed_space {
+        if let Ok(record_uri) = space.record_uri(parts[0], parts[1], parts[2]) {
+            return record_uri;
         }
-        _ => uri.to_string(),
     }
+    format!("{canonical_space}/{rest}")
 }
 
 /// Look up a same-space reference: the space form first, then the URI as submitted.
@@ -663,6 +696,24 @@ mod space_form_tests {
         assert_eq!(
             to_space_form("at://did:plc:bob/app.bsky.feed.post/3k2", ""),
             "at://did:plc:bob/app.bsky.feed.post/3k2"
+        );
+    }
+
+    #[test]
+    fn hedged_and_legacy_space_uris_normalize_via_atproto_spaces_space_uri() {
+        assert_eq!(
+            to_space_form(
+                "at://did:plc:bob/blue.catbird.circle.post/3k2",
+                "at:space/did:plc:owner/blue.catbird.circle.encrypted/c1"
+            ),
+            format!("{SPACE}/did:plc:bob/blue.catbird.circle.post/3k2")
+        );
+        assert_eq!(
+            to_space_form(
+                "at://did:plc:bob/blue.catbird.circle.post/3k2",
+                "at://did:plc:owner/com.atproto.space.space/blue.catbird.circle.encrypted:c1"
+            ),
+            format!("{SPACE}/did:plc:bob/blue.catbird.circle.post/3k2")
         );
     }
 }

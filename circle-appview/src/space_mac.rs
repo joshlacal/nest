@@ -1,45 +1,14 @@
-//! November 12 Spaces response authentication: HPKE export and RFC 9421 HMAC signatures.
-
-use std::borrow::Cow;
-
+//! November 12 Spaces request authentication and RFC 9421 MAC verification,
+//! delegated to `atproto-spaces` (`kem` + `mac`).
 use crate::{
     auth::{parse_verification_key, DidDocument, ParsedVerifyingKey},
     error::{AppError, AuthReason},
 };
-pub use catbird_atproto::generated::com_atproto::space::Commit;
-use hkdf::{Hkdf, HkdfExtract};
-use hmac::{Hmac, Mac};
-use p256::{
-    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
-    PublicKey, SecretKey,
+pub use atproto_spaces::mac::{
+    MacProfile, ACCEPT_SIGNATURE_HEADER, COMMIT_MAC_PROFILE, RECORD_MAC_PROFILE,
 };
-use sfv::{BareItem, Dictionary, FieldType, ListEntry, Parser, Version};
-use sha2::Sha256;
-
-pub const ACCEPT_SIGNATURE_HEADER: &str = "accept-signature";
-pub const COMMIT_MAC_PROFILE: &str = "atproto-space-commit";
-pub const RECORD_MAC_PROFILE: &str = "atproto-space-record";
-
-const HPKE_VERSION: &[u8] = b"HPKE-v1";
-const KEM_ID: &[u8] = b"KEM\x00\x10";
-const SUITE_ID: &[u8] = b"HPKE\x00\x10\x00\x01\xff\xff";
-const MODE_BASE: &[u8] = &[0x00];
-const HPKE_INFO: &[u8] = b"atproto-mac";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MacProfile {
-    Commit,
-    Record,
-}
-
-impl MacProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Commit => COMMIT_MAC_PROFILE,
-            Self::Record => RECORD_MAC_PROFILE,
-        }
-    }
-}
+pub use catbird_atproto::generated::com_atproto::space::Commit;
+use p256::{PublicKey, SecretKey};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MacRequest {
@@ -54,16 +23,6 @@ impl std::fmt::Debug for MacRequest {
             .field("key_share", &self.key_share)
             .field("profile", &self.profile)
             .finish_non_exhaustive()
-    }
-}
-
-impl MacRequest {
-    pub fn header(&self) -> String {
-        let profile = self.profile.as_str();
-        format!(
-            "mac=(\"{profile}\";sf);keyid=\"{}\";tag=\"{profile}\"",
-            self.key_share
-        )
     }
 }
 
@@ -103,210 +62,51 @@ pub fn kem_key(doc: &DidDocument, did: &str) -> Result<PublicKey, AppError> {
 }
 
 pub fn encapsulate(author: &PublicKey, profile: MacProfile) -> Result<MacRequest, AppError> {
-    let ephemeral = SecretKey::random(&mut OsRng);
-    let public = ephemeral.public_key();
-    let shared_secret = derive_secret(&ephemeral, author, &public, author)?;
-    let mut multikey = vec![0x80, 0x24];
-    multikey.extend_from_slice(public.to_encoded_point(true).as_bytes());
+    let author_did_key = atproto_spaces::kem::encode_p256_did_key(author);
+    let encap =
+        atproto_spaces::kem::encapsulate_p256(&author_did_key).map_err(|_| invalid_mac())?;
     Ok(MacRequest {
-        key_share: format!(
-            "did:key:{}",
-            multibase::encode(multibase::Base::Base58Btc, multikey)
-        ),
-        shared_secret,
+        key_share: encap.key_share_did_key,
+        shared_secret: encap.shared_secret,
         profile,
     })
 }
 
 /// HPKE base-mode secret export using DHKEM(P-256, HKDF-SHA256), HKDF-SHA256,
-/// Export-only AEAD, `info = "atproto-mac"`, and an empty exporter context.
+/// Export-only AEAD, `info = "atproto-mac"`, and an empty exporter context,
+/// delegated to `atproto_spaces::kem`.
 pub fn derive_secret(
     secret: &SecretKey,
     other: &PublicKey,
     syncer: &PublicKey,
     author: &PublicKey,
 ) -> Result<[u8; 32], AppError> {
-    let dh = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), other.as_affine());
-    let enc = syncer.to_encoded_point(false);
-    let author = author.to_encoded_point(false);
-
-    let eae_prk = labeled_extract(KEM_ID, &[], b"eae_prk", &[dh.raw_secret_bytes()]);
-    let mut kem_secret = [0; 32];
-    labeled_expand(
-        KEM_ID,
-        &eae_prk,
-        b"shared_secret",
-        &[enc.as_bytes(), author.as_bytes()],
-        &mut kem_secret,
-    )?;
-
-    let psk_id_hash = labeled_extract(SUITE_ID, &[], b"psk_id_hash", &[]);
-    let info_hash = labeled_extract(SUITE_ID, &[], b"info_hash", &[HPKE_INFO]);
-    let secret = labeled_extract(SUITE_ID, &kem_secret, b"secret", &[]);
-    let mut exporter_secret = [0; 32];
-    labeled_expand(
-        SUITE_ID,
-        &secret,
-        b"exp",
-        &[MODE_BASE, &psk_id_hash, &info_hash],
-        &mut exporter_secret,
-    )?;
-    let mut shared_secret = [0; 32];
-    labeled_expand(SUITE_ID, &exporter_secret, b"sec", &[], &mut shared_secret)?;
-    Ok(shared_secret)
-}
-
-fn labeled_extract(id: &[u8], salt: &[u8], label: &[u8], ikm: &[&[u8]]) -> [u8; 32] {
-    let mut extract = HkdfExtract::<Sha256>::new(Some(salt));
-    extract.input_ikm(HPKE_VERSION);
-    extract.input_ikm(id);
-    extract.input_ikm(label);
-    for part in ikm {
-        extract.input_ikm(part);
-    }
-    let (prk, _) = extract.finalize();
-    prk.into()
-}
-
-fn labeled_expand(
-    id: &[u8],
-    prk: &[u8; 32],
-    label: &[u8],
-    info: &[&[u8]],
-    output: &mut [u8],
-) -> Result<(), AppError> {
-    let length = u16::try_from(output.len())
-        .map_err(|_| invalid_mac())?
-        .to_be_bytes();
-    let hkdf = Hkdf::<Sha256>::from_prk(prk).map_err(|_| invalid_mac())?;
-    let result = match info {
-        [] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label], output),
-        [a] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a], output),
-        [a, b] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a, b], output),
-        [a, b, c] => hkdf.expand_multi_info(&[&length, HPKE_VERSION, id, label, a, b, c], output),
-        _ => return Err(invalid_mac()),
-    };
-    result.map_err(|_| invalid_mac())
-}
-
-fn combined_header<'a>(
-    headers: &'a reqwest::header::HeaderMap,
-    name: &str,
-) -> Result<Cow<'a, str>, AppError> {
-    let mut values = headers.get_all(name).iter();
-    let first = values
-        .next()
-        .ok_or_else(invalid_mac)?
-        .to_str()
-        .map_err(|_| invalid_mac())?;
-    let Some(second) = values.next() else {
-        return Ok(Cow::Borrowed(first));
-    };
-    let second = second.to_str().map_err(|_| invalid_mac())?;
-    let mut combined = String::with_capacity(first.len() + second.len() + 2);
-    combined.push_str(first);
-    combined.push_str(", ");
-    combined.push_str(second);
-    for value in values {
-        combined.push_str(", ");
-        combined.push_str(value.to_str().map_err(|_| invalid_mac())?);
-    }
-    Ok(Cow::Owned(combined))
-}
-
-fn parse_dictionary(value: &str) -> Result<Dictionary, AppError> {
-    Parser::new(value)
-        .with_version(Version::Rfc8941)
-        .parse_dictionary()
-        .map_err(|_| invalid_mac())
-}
-
-fn string_item(item: &BareItem) -> Option<&str> {
-    match item {
-        BareItem::String(value) => Some(value.as_str()),
-        _ => None,
+    let own_pub = secret.public_key();
+    if &own_pub == author && other == syncer {
+        let syncer_did_key = atproto_spaces::kem::encode_p256_did_key(syncer);
+        atproto_spaces::kem::decapsulate_p256(secret, &syncer_did_key).map_err(|_| invalid_mac())
+    } else if &own_pub == syncer && other == author {
+        let author_did_key = atproto_spaces::kem::encode_p256_did_key(author);
+        atproto_spaces::kem::encapsulate_p256_deterministic(&author_did_key, secret)
+            .map(|e| e.shared_secret)
+            .map_err(|_| invalid_mac())
+    } else {
+        Err(invalid_mac())
     }
 }
 
-fn bare_item<'a>(fields: &'a Dictionary, key: &str) -> Option<&'a BareItem> {
-    match fields.get(key) {
-        Some(ListEntry::Item(item)) => Some(&item.bare_item),
-        _ => None,
-    }
-}
-
-fn verify_mac(
-    request: &MacRequest,
-    headers: &reqwest::header::HeaderMap,
-) -> Result<Dictionary, AppError> {
-    let profile = request.profile.as_str();
-    let input_value = combined_header(headers, "signature-input")?;
-    let inputs = parse_dictionary(&input_value)?;
-    let mut tagged = None;
-    for (label, entry) in &inputs {
-        let ListEntry::InnerList(inner) = entry else {
-            continue;
-        };
-        if inner
-            .params
-            .get("tag")
-            .and_then(string_item)
-            .is_some_and(|tag| tag == profile)
-        {
-            if tagged.is_some() {
-                return Err(invalid_mac());
-            }
-            tagged = Some((label, entry, inner));
-        }
-    }
-    let (label, entry, inner) = tagged.ok_or_else(invalid_mac)?;
-    if inner.items.len() != 1
-        || string_item(&inner.items[0].bare_item) != Some(profile)
-        || inner.items[0].params.len() != 1
-        || !matches!(
-            inner.items[0].params.get("sf"),
-            Some(BareItem::Boolean(true))
+impl MacRequest {
+    pub fn header(&self) -> String {
+        atproto_spaces::mac::format_accept_signature(self.profile, &self.key_share).unwrap_or_else(
+            |_| {
+                let profile = self.profile.as_str();
+                format!(
+                    "mac=(\"{profile}\";sf);keyid=\"{}\";tag=\"{profile}\"",
+                    self.key_share
+                )
+            },
         )
-    {
-        return Err(invalid_mac());
     }
-    if let Some(alg) = inner.params.get("alg") {
-        if string_item(alg) != Some("hmac-sha256") {
-            return Err(invalid_mac());
-        }
-    }
-    if let Some(key_id) = inner.params.get("keyid") {
-        if string_item(key_id) != Some(request.key_share.as_str()) {
-            return Err(invalid_mac());
-        }
-    }
-
-    let signatures = parse_dictionary(&combined_header(headers, "signature")?)?;
-    let signature = match signatures.get(label) {
-        Some(ListEntry::Item(item)) if item.params.is_empty() => match &item.bare_item {
-            BareItem::ByteSequence(value) => value.as_slice(),
-            _ => return Err(invalid_mac()),
-        },
-        _ => return Err(invalid_mac()),
-    };
-
-    let mut serializer = sfv::ListSerializer::new();
-    serializer.members(std::slice::from_ref(entry));
-    let signature_params = serializer.finish().ok_or_else(invalid_mac)?;
-
-    let covered_value = combined_header(headers, profile)?;
-    let fields = parse_dictionary(&covered_value)?;
-    let canonical = fields.serialize().ok_or_else(invalid_mac)?;
-    let mut hmac =
-        Hmac::<Sha256>::new_from_slice(&request.shared_secret).map_err(|_| invalid_mac())?;
-    hmac.update(b"\"");
-    hmac.update(profile.as_bytes());
-    hmac.update(b"\";sf: ");
-    hmac.update(canonical.as_bytes());
-    hmac.update(b"\n\"@signature-params\": ");
-    hmac.update(signature_params.as_bytes());
-    hmac.verify_slice(signature).map_err(|_| invalid_mac())?;
-    Ok(fields)
 }
 
 pub fn verify_commit(
@@ -318,26 +118,22 @@ pub fn verify_commit(
 ) -> Result<(), AppError> {
     if request.profile != MacProfile::Commit
         || commit.ver != 1
-        || commit.data.len() != 32
         || commit.space.as_str() != space
         || commit.repo.as_str() != repo
     {
         return Err(invalid_mac());
     }
-    let fields = verify_mac(request, headers)?;
-    let matches = matches!(bare_item(&fields, "ver"), Some(BareItem::Integer(value)) if i64::from(*value) == commit.ver)
-        && string_item(bare_item(&fields, "repo").ok_or_else(invalid_mac)?)
-            == Some(commit.repo.as_str())
-        && string_item(bare_item(&fields, "space").ok_or_else(invalid_mac)?)
-            == Some(commit.space.as_str())
-        && string_item(bare_item(&fields, "rev").ok_or_else(invalid_mac)?)
-            == Some(commit.rev.as_str())
-        && matches!(bare_item(&fields, "data"), Some(BareItem::ByteSequence(value)) if value.as_slice() == commit.data.as_ref());
-    if matches {
-        Ok(())
-    } else {
-        Err(invalid_mac())
-    }
+    let data_32: &[u8; 32] = commit.data.as_ref().try_into().map_err(|_| invalid_mac())?;
+    atproto_spaces::mac::verify_commit_mac(
+        &request.shared_secret,
+        &request.key_share,
+        headers,
+        commit.space.as_str(),
+        commit.repo.as_str(),
+        commit.rev.as_str(),
+        data_32,
+    )
+    .map_err(|_| invalid_mac())
 }
 
 pub fn verify_record(
@@ -354,22 +150,25 @@ pub fn verify_record(
     {
         return Err(invalid_mac());
     }
-    let fields = verify_mac(request, headers)?;
-    let cid = cid.to_string();
-    if string_item(bare_item(&fields, "uri").ok_or_else(invalid_mac)?) == Some(uri)
-        && string_item(bare_item(&fields, "cid").ok_or_else(invalid_mac)?) == Some(cid.as_str())
-    {
-        Ok(())
-    } else {
-        Err(invalid_mac())
-    }
+    let cid_str = cid.to_string();
+    atproto_spaces::mac::verify_record_mac(
+        &request.shared_secret,
+        &request.key_share,
+        headers,
+        uri,
+        &cid_str,
+    )
+    .map_err(|_| invalid_mac())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
+    use hmac::{Hmac, Mac};
+    use p256::elliptic_curve::rand_core::OsRng;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use sha2::Sha256;
 
     fn hex(value: &str) -> Vec<u8> {
         value
@@ -405,10 +204,9 @@ mod tests {
             request.key_share
         );
         let params = params.unwrap_or(&default_params);
-        let canonical = parse_dictionary(covered).unwrap().serialize().unwrap();
         let mut hmac = Hmac::<Sha256>::new_from_slice(&request.shared_secret).unwrap();
         hmac.update(
-            format!("\"{profile}\";sf: {canonical}\n\"@signature-params\": {params}").as_bytes(),
+            format!("\"{profile}\";sf: {covered}\n\"@signature-params\": {params}").as_bytes(),
         );
         let signature = STANDARD.encode(hmac.finalize().into_bytes());
         let mut headers = HeaderMap::new();
@@ -602,6 +400,7 @@ mod tests {
 
     #[test]
     fn real_reference_plc_document_and_strict_kem_selection() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
         let doc: DidDocument = serde_json::from_str(include_str!(
             "../tests/fixtures/reference-plc-ac0c9f1-did.json"
         ))

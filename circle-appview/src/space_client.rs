@@ -2032,20 +2032,9 @@ fn extract_authority_from_space_uri(space: &str) -> Result<String, AppError> {
 }
 
 fn parse_space_uri_parts(space: &str) -> Result<(String, String, String), AppError> {
-    let without_prefix = space
-        .strip_prefix("at://")
-        .ok_or_else(|| AppError::InvalidRequest("Space URI must start with at://".into()))?;
-    let segments: Vec<&str> = without_prefix.split('/').collect();
-    if segments.len() < 4 || segments[1] != "space" {
-        return Err(AppError::InvalidRequest(
-            "Invalid Space URI format (expected at://{authority}/space/{spaceType}/{skey})".into(),
-        ));
-    }
-    Ok((
-        segments[0].to_string(),
-        segments[2].to_string(),
-        segments[3].to_string(),
-    ))
+    let parsed = atproto_spaces::SpaceUri::parse_hedged(space)
+        .map_err(|e| AppError::InvalidRequest(format!("Invalid Space URI format: {e}")))?;
+    Ok((parsed.authority, parsed.space_type, parsed.rkey))
 }
 
 /// Query URLs for the space-host, getSpace and memberspace reads, built from the
@@ -2060,7 +2049,9 @@ pub mod xrpc_query {
     use catbird_atproto::jacquard_common::types::string::{Cid, Did, Tid};
 
     fn space_ref(space: &str) -> Result<AtSpaceUri<SmolStr>, AppError> {
-        AtSpaceUri::new(SmolStr::new(space))
+        let canonical = atproto_spaces::SpaceUri::parse_hedged(space)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid space reference: {e}")))?;
+        AtSpaceUri::new(SmolStr::new(canonical.as_str()))
             .map_err(|e| AppError::InvalidRequest(format!("Invalid space reference: {e}")))
     }
 

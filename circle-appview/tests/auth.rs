@@ -3339,3 +3339,130 @@ async fn private_routes_and_capabilities_require_configured_caught_up_lifecycle(
         assert_eq!(body["error"], "UnsupportedPDS");
     }
 }
+
+#[tokio::test]
+async fn b6_did_resolver_rejects_plc_and_web_path_traversal_before_network() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    struct CountingWebTransport {
+        dns_calls: AtomicUsize,
+        fetch_calls: AtomicUsize,
+        captured_urls: Mutex<Vec<String>>,
+    }
+
+    impl DidWebTransport for CountingWebTransport {
+        fn resolve_dns<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>, AuthReason>> + Send + 'a>,
+        > {
+            self.dns_calls.fetch_add(1, Ordering::SeqCst);
+            let public_addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
+            Box::pin(async move { Ok(vec![public_addr]) })
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+            _host: &'a str,
+            _pinned_addr: SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<DidDocument, AuthReason>> + Send + 'a>,
+        > {
+            self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_urls.lock().unwrap().push(url.to_string());
+            Box::pin(async move {
+                Ok(DidDocument {
+                    id: "did:web:example.org".into(),
+                    verification_method: vec![],
+                    service: vec![],
+                })
+            })
+        }
+    }
+
+    let plc_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+            "verificationMethod": [],
+            "service": []
+        })))
+        .mount(&plc_mock)
+        .await;
+
+    let web_transport = Arc::new(CountingWebTransport {
+        dns_calls: AtomicUsize::new(0),
+        fetch_calls: AtomicUsize::new(0),
+        captured_urls: Mutex::new(Vec::new()),
+    });
+
+    let resolver = DidResolver::with_transport(
+        plc_mock.uri(),
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        web_transport.clone(),
+    );
+
+    let invalid_dids = [
+        "did:plc:../../etc",
+        "did:plc:..%2f..%2fadmin",
+        "did:plc:UPPERCASE234567234567234",
+        "did:plc:short",
+        "did:plc:invalidchars0189abcdefgh",
+        "did:web:example.org:..%2fadmin",
+        "did:web:example.org:..",
+        "did:web:example.org:.",
+        "did:web:example.org:%2e%2e",
+        "did:web:example.org:a%2fb",
+        "did:web:example.org:a%5cb",
+        "did:web:example.org:user%3fadmin=1",
+        "did:web:example.org:user%23frag",
+        "did:web:example.org:user%40evil",
+        "did:web:example.org%2f..:user",
+        "did:web:user%40example.org",
+        "did:web:example.org:bad%00seg",
+    ];
+
+    for bad_did in invalid_dids {
+        let res = resolver.resolve(bad_did).await;
+        assert!(
+            res.is_err(),
+            "Malformed or path-traversing DID `{bad_did}` must be rejected, got: {res:?}"
+        );
+    }
+
+    let plc_requests = plc_mock.received_requests().await.unwrap();
+    assert!(
+        plc_requests.is_empty(),
+        "No PLC HTTP requests may be issued for malformed did:plc inputs, got: {plc_requests:?}"
+    );
+    assert_eq!(
+        web_transport.dns_calls.load(Ordering::SeqCst),
+        0,
+        "No DNS lookups may be issued for malformed did:web inputs"
+    );
+    assert_eq!(
+        web_transport.fetch_calls.load(Ordering::SeqCst),
+        0,
+        "No HTTPS fetches may be issued for malformed did:web inputs"
+    );
+
+    // Positive controls: valid 24-char base32 did:plc and multi-segment did:web still resolve
+    resolver
+        .resolve("did:plc:ewvi7nxzyoun6zhxrhs64oiz")
+        .await
+        .expect("Valid 24-char base32 did:plc must resolve");
+    assert_eq!(plc_mock.received_requests().await.unwrap().len(), 1);
+
+    resolver
+        .resolve("did:web:example.org:users:alice")
+        .await
+        .expect("Valid multi-segment did:web must resolve");
+    assert_eq!(
+        web_transport.captured_urls.lock().unwrap().as_slice(),
+        &["https://example.org:443/users/alice/did.json"]
+    );
+}
