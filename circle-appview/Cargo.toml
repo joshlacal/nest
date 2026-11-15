@@ -10,8 +10,8 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
 jacquard-repo = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["crypto-ed25519", "crypto-k256", "crypto-p256"] }
-catbird-atproto = { path = "/Users/joshlacalamito/Developer/.workspaces/dec1-w0/wave1-catbird-atproto", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
-atproto-spaces = { path = "/Users/joshlacalamito/Developer/.workspaces/dec1-w0/wave1-catbird-atproto/atproto-spaces" }
+catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
+atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
 bytes = { version = "1", features = ["serde"] }
 cid = "0.11"
 multihash = "0.19.3"
