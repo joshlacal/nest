@@ -196,9 +196,49 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/oauth-client-metadata", get(oauth_client_metadata));
 
     Router::new()
+        .route(
+            "/oauth/client-config",
+            get(oauth_client_config).layer(middleware::from_fn_with_state(
+                rate_limit_state.clone(),
+                ip_rate_limit,
+            )),
+        )
         .nest("/auth", auth_routes)
         .nest("/xrpc", public_xrpc_routes.merge(xrpc_routes))
         .nest("/.well-known", wellknown_routes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConfigResponse {
+    pub mls_chat_enabled: bool,
+    pub circles_spaces_enabled: bool,
+}
+
+pub(crate) fn build_client_config_response(
+    features: &crate::config::FeaturesConfig,
+) -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        )],
+        axum::Json(ClientConfigResponse {
+            mls_chat_enabled: features.mls_chat_enabled,
+            circles_spaces_enabled: features.circles_spaces_enabled,
+        }),
+    )
+}
+
+/// Public client runtime feature-flag endpoint (`A2`).
+///
+/// `GET /oauth/client-config`
+///
+/// Fails closed (`false` / `false`) unless explicitly enabled via `[features]` or env.
+async fn oauth_client_config(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    build_client_config_response(&state.config.features)
 }
 
 /// OAuth client metadata endpoint
@@ -389,5 +429,79 @@ mod tests {
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oauth_client_config_defaults_to_fail_closed_and_honors_feature_overrides() {
+        let default_cfg = crate::config::AppConfig::test_default();
+        assert!(!default_cfg.features.mls_chat_enabled);
+        assert!(!default_cfg.features.circles_spaces_enabled);
+
+        let default_app = Router::new().route(
+            "/oauth/client-config",
+            get({
+                let features = default_cfg.features.clone();
+                move || {
+                    let f = features.clone();
+                    async move { build_client_config_response(&f) }
+                }
+            }),
+        );
+        let res = default_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/oauth/client-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "mlsChatEnabled": false,
+                "circlesSpacesEnabled": false,
+            })
+        );
+
+        let mut overridden = crate::config::FeaturesConfig::default();
+        overridden.apply_env_overrides_from(Some("true"), Some("0"));
+        assert!(overridden.mls_chat_enabled);
+        assert!(!overridden.circles_spaces_enabled);
+
+        let enabled_app = Router::new().route(
+            "/oauth/client-config",
+            get(move || async move { build_client_config_response(&overridden) }),
+        );
+        let res2 = enabled_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/oauth/client-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let bytes2 = axum::body::to_bytes(res2.into_body(), 4096).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(
+            json2,
+            serde_json::json!({
+                "mlsChatEnabled": true,
+                "circlesSpacesEnabled": false,
+            })
+        );
     }
 }

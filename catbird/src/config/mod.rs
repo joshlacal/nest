@@ -28,6 +28,38 @@ pub struct AppConfig {
     /// Standalone Circle AppView direct-routing configuration.
     #[serde(default)]
     pub circle: CircleConfig,
+    /// Client-facing runtime feature flags served at `GET /oauth/client-config` (`A2`).
+    #[serde(default)]
+    pub features: FeaturesConfig,
+}
+
+/// Client-facing runtime feature-flag configuration (`GET /oauth/client-config`, `A2`).
+/// Both flags default to `false` (fail-closed) until explicitly enabled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct FeaturesConfig {
+    #[serde(default)]
+    pub mls_chat_enabled: bool,
+    #[serde(default)]
+    pub circles_spaces_enabled: bool,
+}
+
+fn parse_optional_bool_env(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+impl FeaturesConfig {
+    pub fn apply_env_overrides_from(&mut self, mls_env: Option<&str>, circles_env: Option<&str>) {
+        if let Some(v) = parse_optional_bool_env(mls_env) {
+            self.mls_chat_enabled = v;
+        }
+        if let Some(v) = parse_optional_bool_env(circles_env) {
+            self.circles_spaces_enabled = v;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -731,6 +763,17 @@ impl AppConfig {
                 }
             }
         }
+        let mls_feature_env = std::env::var("CATBIRD__FEATURES__MLS_CHAT_ENABLED")
+            .or_else(|_| std::env::var("CATBIRD_MLS_CHAT_ENABLED"))
+            .or_else(|_| std::env::var("MLS_CHAT_ENABLED"))
+            .ok();
+        let circles_feature_env = std::env::var("CATBIRD__FEATURES__CIRCLES_SPACES_ENABLED")
+            .or_else(|_| std::env::var("CATBIRD_CIRCLES_SPACES_ENABLED"))
+            .or_else(|_| std::env::var("CIRCLES_SPACES_ENABLED"))
+            .ok();
+        app_config
+            .features
+            .apply_env_overrides_from(mls_feature_env.as_deref(), circles_feature_env.as_deref());
 
         Ok(app_config)
     }

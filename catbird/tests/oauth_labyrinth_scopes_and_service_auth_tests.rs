@@ -810,3 +810,37 @@ async fn get_service_auth_permits_user_declared_atproto_mls_did_and_rejects_arbi
     .expect_err("unassociated service-auth aud must be rejected");
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn oauth_client_config_route_serves_fail_closed_defaults_without_authentication() {
+    let config = AppConfig::test_default();
+    let state = base_test_state(config).await;
+    let router = create_router(state.clone()).with_state(state);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/oauth/client-config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        payload,
+        json!({
+            "mlsChatEnabled": false,
+            "circlesSpacesEnabled": false,
+        })
+    );
+}

@@ -66,3 +66,8 @@ redirect_uri = "http://localhost:3000/auth/callback"
 [push]
 # Chat wake payload mode handed to APNs/FCM ("sealed" = constant-size Sealed Wake v2; "clear" = legacy v1 rollback).
 wake_envelope = "sealed"
+
+[features]
+# Runtime client feature flags served at GET /oauth/client-config (default false / fail-closed).
+mls_chat_enabled = false
+circles_spaces_enabled = false
