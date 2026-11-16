@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Verifies that both nest crates build against the exact catbird-atproto
-# commit recorded in scripts/canonical-sibling-provenance.env, and that each
+# commit recorded in scripts/canonical-sibling-provenance.conf, and that each
 # tracked Cargo.lock matches its recorded hash. Run before every release build.
 set -euo pipefail
 
 # No overrides are accepted: provenance comes only from this checkout and the
 # sibling Cargo resolves from the crates' own manifests.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-manifest="$repo_root/scripts/canonical-sibling-provenance.env"
+manifest="$repo_root/scripts/canonical-sibling-provenance.conf"
 
 if [[ $# -ne 0 ]]; then
   printf 'usage: %s\n' "$0" >&2

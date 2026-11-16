@@ -25,7 +25,7 @@ cd nest/catbird && cargo test
 cd nest/catbird && cargo fmt && cargo clippy
 
 # Before a release build: both crates must resolve ../../catbird-atproto at the
-# commit in scripts/canonical-sibling-provenance.env, with matching lock files
+# commit in scripts/canonical-sibling-provenance.conf, with matching lock files
 nest/scripts/check-canonical-sibling-provenance.sh
 ```
 

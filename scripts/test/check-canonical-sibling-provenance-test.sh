@@ -14,6 +14,12 @@ copy_checkout() {
   rsync -a --exclude target --exclude _trash --exclude .jj --exclude .git "$repo_root/" "$1/"
 }
 
+# The manifest must be a tracked file, not one an ignore rule drops.
+if git -C "$repo_root" check-ignore -q scripts/canonical-sibling-provenance.conf; then
+  printf 'scripts/canonical-sibling-provenance.conf is ignored and would not be committed\n' >&2
+  exit 1
+fi
+
 copy_checkout "$fixture/ws/nest"
 ln -s "$sibling" "$fixture/ws/catbird-atproto"
 
@@ -40,9 +46,9 @@ expect_failure() {
 manifest_case() {
   local name=$1 sed_expr=$2 want=$3 env_file
   copy_checkout "$fixture/ws/$name"
-  env_file="$fixture/ws/$name/scripts/canonical-sibling-provenance.env"
-  sed "$sed_expr" "$fixture/ws/nest/scripts/canonical-sibling-provenance.env" >"$env_file"
-  if cmp -s "$env_file" "$fixture/ws/nest/scripts/canonical-sibling-provenance.env"; then
+  env_file="$fixture/ws/$name/scripts/canonical-sibling-provenance.conf"
+  sed "$sed_expr" "$fixture/ws/nest/scripts/canonical-sibling-provenance.conf" >"$env_file"
+  if cmp -s "$env_file" "$fixture/ws/nest/scripts/canonical-sibling-provenance.conf"; then
     printf 'negative case %s did not change the manifest\n' "$name" >&2
     exit 1
   fi
