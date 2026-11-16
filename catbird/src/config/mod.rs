@@ -775,7 +775,41 @@ impl AppConfig {
             .features
             .apply_env_overrides_from(mls_feature_env.as_deref(), circles_feature_env.as_deref());
 
+        app_config
+            .validate_chat_device_scopes()
+            .map_err(config::ConfigError::Message)?;
+
         Ok(app_config)
+    }
+
+    /// Whether this deployment serves MLS chat to clients.
+    pub fn chat_is_enabled(&self) -> bool {
+        self.chat.enabled || self.mls.service_url.is_some() || self.features.mls_chat_enabled
+    }
+
+    /// When chat is enabled, the declared maximum OAuth scopes must include
+    /// the scopes a chat device needs to publish its own records.
+    pub fn validate_chat_device_scopes(&self) -> Result<(), String> {
+        if !self.chat_is_enabled() {
+            return Ok(());
+        }
+        let mut missing = Vec::new();
+        for scope in [
+            crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE,
+            crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE,
+        ] {
+            if !self.oauth.is_scope_allowed(scope)? {
+                missing.push(scope);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "Chat is enabled but the declared OAuth max_scopes omit {}. Unset \
+             CATBIRD__OAUTH__MAX_SCOPES to use the default list, or add the missing scopes.",
+            missing.join(" and ")
+        ))
     }
 
     /// Provide a valid default AppConfig for test environments without panicking on unset env vars.
@@ -853,6 +887,18 @@ fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Err
     Ok(())
 }
 
+/// Decodes `SESSION_ENCRYPTION_KEY` with the same decoder the push gateway
+/// uses. A set key must be exactly 32 non-zero bytes, or startup fails. An
+/// unset or blank key is `None`; the session store then refuses to start.
+fn parse_session_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, anyhow::Error> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    crate::services::push::gateway::decode_exact_32_byte_key(raw)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("Invalid SESSION_ENCRYPTION_KEY: {e}"))
+}
+
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         validate_configured_oauth_scopes(&config.oauth.scopes)?;
@@ -882,23 +928,8 @@ impl AppState {
         let redis_client = redis::Client::open(config.redis.url.as_str())?;
         let redis = redis::aio::ConnectionManager::new(redis_client).await?;
 
-        // Parse encryption key from env (base64-encoded 32-byte key)
-        let session_encryption_key = std::env::var("SESSION_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|b64| {
-                use base64::Engine;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&b64)
-                    .ok()?;
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    Some(arr)
-                } else {
-                    tracing::warn!("SESSION_ENCRYPTION_KEY must be 32 bytes (44 base64 chars)");
-                    None
-                }
-            });
+        let session_encryption_key =
+            parse_session_encryption_key(std::env::var("SESSION_ENCRYPTION_KEY").ok().as_deref())?;
 
         // Parse CATMOS_OAUTH_SCOPES (defaulting to "atproto transition:generic")
         let catmos_scope_str = std::env::var("CATMOS_OAUTH_SCOPES")
@@ -1294,6 +1325,132 @@ impl AppState {
             jacquard_identity::resolver::ResolverOptions::default(),
         );
         resolver.with_system_dns()
+    }
+}
+
+#[cfg(test)]
+mod session_key_and_chat_scope_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn all_zero_session_encryption_key_is_rejected() {
+        let zero = b64(&[0u8; 32]);
+        assert!(parse_session_encryption_key(Some(&zero)).is_err());
+    }
+
+    #[test]
+    fn wrong_length_or_undecodable_session_encryption_key_is_rejected() {
+        for raw in [
+            b64(&[7u8; 16]),
+            b64(&[7u8; 33]),
+            "not base64 !!".to_string(),
+        ] {
+            assert!(
+                parse_session_encryption_key(Some(&raw)).is_err(),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_session_encryption_key_decodes_to_the_same_bytes() {
+        let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(1));
+        let parsed = parse_session_encryption_key(Some(&b64(&key))).unwrap();
+        assert_eq!(parsed, Some(key));
+    }
+
+    #[test]
+    fn unset_or_blank_session_encryption_key_is_absent() {
+        assert_eq!(parse_session_encryption_key(None).unwrap(), None);
+        assert_eq!(parse_session_encryption_key(Some("")).unwrap(), None);
+        assert_eq!(parse_session_encryption_key(Some("  ")).unwrap(), None);
+    }
+
+    fn oauth_with(max_scopes: Option<Vec<&str>>, legacy: Option<Vec<&str>>) -> OAuthConfig {
+        let initial = if legacy.is_some() {
+            None
+        } else {
+            Some(default_initial_scopes())
+        };
+        OAuthConfig::try_from(RawOAuthConfig {
+            client_id: "https://example.com".to_string(),
+            private_key_path: None,
+            private_key_base64: None,
+            private_key_paths: vec![],
+            active_key_id: "key-1".to_string(),
+            redirect_uri: "https://example.com/callback".to_string(),
+            initial_scopes: initial,
+            max_scopes: max_scopes.map(|v| v.into_iter().map(String::from).collect()),
+            scopes: legacy.map(|v| v.into_iter().map(String::from).collect()),
+        })
+        .expect("valid oauth config")
+    }
+
+    /// The explicit maximum scope list older deployment templates carried.
+    const OLDER_TEMPLATE_MAX: [&str; 6] = [
+        "atproto",
+        "transition:generic",
+        "transition:chat.bsky",
+        "identity:handle",
+        "account:email?action=manage",
+        "account:status?action=manage",
+    ];
+
+    fn config(oauth: OAuthConfig) -> AppConfig {
+        let mut config = AppConfig::test_default();
+        config.oauth = oauth;
+        config
+    }
+
+    #[test]
+    fn chat_enabled_with_max_scopes_missing_chat_device_scopes_fails() {
+        let mut cfg = config(oauth_with(Some(OLDER_TEMPLATE_MAX.to_vec()), None));
+        cfg.chat.enabled = true;
+        let err = cfg.validate_chat_device_scopes().unwrap_err();
+        assert!(err.contains(crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE));
+        assert!(err.contains(crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE));
+    }
+
+    #[test]
+    fn chat_enabled_with_only_the_revocation_scope_missing_fails() {
+        let mut max = OLDER_TEMPLATE_MAX.to_vec();
+        max.push(crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE);
+        let mut cfg = config(oauth_with(Some(max), None));
+        cfg.mls.service_url = Some("http://127.0.0.1:3001".to_string());
+        let err = cfg.validate_chat_device_scopes().unwrap_err();
+        assert!(err.contains(crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE));
+        assert!(!err.contains(crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE));
+    }
+
+    #[test]
+    fn chat_feature_flag_with_legacy_only_scopes_fails() {
+        let mut cfg = config(oauth_with(
+            None,
+            Some(vec!["atproto", "transition:generic"]),
+        ));
+        cfg.features.mls_chat_enabled = true;
+        assert!(cfg.validate_chat_device_scopes().is_err());
+    }
+
+    #[test]
+    fn chat_enabled_with_default_max_scopes_passes() {
+        let mut cfg = config(oauth_with(None, None));
+        cfg.chat.enabled = true;
+        cfg.validate_chat_device_scopes()
+            .expect("default maximum scopes carry every chat device scope");
+    }
+
+    #[test]
+    fn chat_disabled_keeps_narrow_max_scopes_valid() {
+        let cfg = config(oauth_with(Some(OLDER_TEMPLATE_MAX.to_vec()), None));
+        assert!(!cfg.chat_is_enabled());
+        cfg.validate_chat_device_scopes()
+            .expect("deployments without chat may keep a narrow scope list");
     }
 }
 
