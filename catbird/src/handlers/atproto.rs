@@ -1451,14 +1451,18 @@ async fn proxy_circle_request(
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
-/// Sensitive PDS session and credential-management XRPC methods that must never
-/// be proxied directly through the confidential OAuth gateway (B-1, 2026-10-31 review).
+/// Sensitive PDS session, credential-management and account-deletion XRPC
+/// methods that are never proxied through the confidential OAuth gateway.
+/// Account deletion takes the account password, which must never pass
+/// through the gateway; clients send it to their PDS directly.
 const BLOCKED_PROXY_XRPC_NSIDS: &[&str] = &[
     "com.atproto.server.createSession",
     "com.atproto.server.refreshSession",
     "com.atproto.server.deleteSession",
     "com.atproto.server.createAppPassword",
     "com.atproto.server.revokeAppPassword",
+    "com.atproto.server.requestAccountDelete",
+    "com.atproto.server.deleteAccount",
 ];
 
 const SERVICE_AUTH_NSID: &str = "com.atproto.server.getServiceAuth";
@@ -3258,6 +3262,29 @@ mod proxy_lexicon_case_tests {
             let (authority, name) = blocked.rsplit_once('.').unwrap();
             let upper_name = format!("{authority}.{}", name.to_ascii_uppercase());
             assert!(refused(&upper_name), "{upper_name} must be refused");
+        }
+    }
+
+    #[test]
+    fn account_deletion_methods_and_their_case_variants_are_refused() {
+        for method in [
+            "com.atproto.server.requestAccountDelete",
+            "com.atproto.server.deleteAccount",
+        ] {
+            assert!(
+                BLOCKED_PROXY_XRPC_NSIDS.contains(&method),
+                "{method} must be on the gateway block list"
+            );
+            assert!(refused(method), "{method} must be refused");
+            let (authority, name) = method.rsplit_once('.').unwrap();
+            for variant in [
+                method.to_ascii_lowercase(),
+                format!("{authority}.{}", name.to_ascii_uppercase()),
+                format!("{authority}.{}", name.to_ascii_lowercase()),
+                format!("{}.{name}", authority.to_ascii_uppercase()),
+            ] {
+                assert!(refused(&variant), "{variant} must be refused");
+            }
         }
     }
 
