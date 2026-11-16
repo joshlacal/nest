@@ -23,7 +23,35 @@ cd nest/catbird && cargo test
 
 # Format + lint
 cd nest/catbird && cargo fmt && cargo clippy
+
+# Before a release build: both crates must resolve ../../catbird-atproto at the
+# commit in scripts/canonical-sibling-provenance.env, with matching lock files
+nest/scripts/check-canonical-sibling-provenance.sh
 ```
+
+### Ignored tests
+
+`#[ignore]` marks tests that need a resource `cargo test` cannot provide by
+itself. Do not add new ones; a new test that needs a database uses the existing
+disposable fixtures. Run the database-backed set with a throwaway loopback
+Postgres (any port but 5432) and Redis (any port but 6379):
+
+```bash
+LITE_PUSH_DISPOSABLE=1 DATABASE_URL=postgres://postgres@127.0.0.1:<pg-port>/postgres \
+  REDIS_URL=redis://127.0.0.1:<redis-port> cargo test -- --include-ignored
+```
+
+Ignored tests added with the sealed wake envelope and session-scoped wake keys,
+and the exact dependency each needs:
+
+| Test | Needs |
+|------|-------|
+| `services::push::request_events::paired_harness::live_ds_worker_to_nest` | A running mls-ds worker process started by `mls-ds/e2e-tests`, plus `CATBIRD_REQUEST_PUSH_PAIRED_DIR` and `CATBIRD_REQUEST_PUSH_TEST_DB`. Fails standalone by design. |
+| `services::push::request_events::c32_paired_harness::live_ds_worker_to_nest_c32` | Same paired mls-ds process and variables as above. |
+| `tests/c26_paired_nest.rs` `live_c26_nest_proxy_worker` | A delivery-service URL and fixture paths written to its stdin by the mls-ds e2e scenario `c26_maximum_device_limits`, which launches it as a companion process. |
+| `tests/push_session_signout.rs` `signing_out_a_session_revokes_only_its_wake_keys` | Disposable Postgres and Redis (command above). |
+| `tests/push_session_signout.rs` `wake_keys_follow_an_upgraded_session_and_are_revoked_with_it` | Disposable Postgres and Redis. |
+| `tests/push_session_signout.rs` `cleanup_retired_session_revokes_leaving_session_wake_keys_and_preserves_other_sessions` | Disposable Postgres and Redis. |
 
 ## Environment Variables
 
