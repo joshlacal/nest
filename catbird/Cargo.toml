@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Catbird Nest - A BFF Gateway for ATProto/Bluesky"
 license = "MIT"
+publish = false
 
 [dependencies]
 # Web Framework
