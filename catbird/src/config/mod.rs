@@ -28,9 +28,66 @@ pub struct AppConfig {
     /// Standalone Circle AppView direct-routing configuration.
     #[serde(default)]
     pub circle: CircleConfig,
+    /// Standalone Community Intelligence & Onboarding XRPC service configuration.
+    #[serde(default)]
+    pub intel: IntelConfig,
     /// Client-facing runtime feature flags served at `GET /oauth/client-config` (`A2`).
     #[serde(default)]
     pub features: FeaturesConfig,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct IntelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_intel_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_intel_service_did")]
+    pub service_did: String,
+    #[serde(default = "default_intel_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub internal_bff_secret: Option<String>,
+}
+
+impl std::fmt::Debug for IntelConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IntelConfig")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("service_did", &self.service_did)
+            .field("timeout_ms", &self.timeout_ms)
+            .field(
+                "internal_bff_secret",
+                &self.internal_bff_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+fn default_intel_base_url() -> String {
+    "http://127.0.0.1:3210".to_string()
+}
+
+fn default_intel_service_did() -> String {
+    "did:web:intel.catbird.blue#catbird_intel".to_string()
+}
+
+fn default_intel_timeout_ms() -> u64 {
+    8000
+}
+
+impl Default for IntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_intel_base_url(),
+            service_did: default_intel_service_did(),
+            timeout_ms: default_intel_timeout_ms(),
+            internal_bff_secret: None,
+        }
+    }
 }
 
 /// Client-facing runtime feature-flag configuration (`GET /oauth/client-config`, `A2`).
@@ -774,6 +831,33 @@ impl AppConfig {
         app_config
             .features
             .apply_env_overrides_from(mls_feature_env.as_deref(), circles_feature_env.as_deref());
+
+        if let Ok(val) = std::env::var("INTEL_ENABLED") {
+            app_config.intel.enabled =
+                matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("INTEL_BASE_URL") {
+            if !val.is_empty() {
+                app_config.intel.base_url = val;
+            }
+        }
+        if let Ok(val) = std::env::var("INTEL_SERVICE_DID") {
+            if !val.is_empty() {
+                app_config.intel.service_did = val;
+            }
+        }
+        if let Ok(val) = std::env::var("INTEL_TIMEOUT_MS") {
+            if let Ok(ms) = val.parse::<u64>() {
+                if ms > 0 {
+                    app_config.intel.timeout_ms = ms;
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("INTEL_INTERNAL_BFF_SECRET") {
+            if !val.is_empty() {
+                app_config.intel.internal_bff_secret = Some(val);
+            }
+        }
 
         app_config
             .validate_chat_device_scopes()

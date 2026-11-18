@@ -178,6 +178,7 @@ async fn make_test_app_state(
         push: Default::default(),
         chat: Default::default(),
         circle: Default::default(),
+        intel: Default::default(),
         features: Default::default(),
     };
     let http_client = reqwest::Client::new();

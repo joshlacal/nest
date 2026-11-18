@@ -31,6 +31,7 @@ use crate::models::{
 };
 use crate::services::{
     AtProtoClient, MlsAuthService, ProxyResponse, ServiceAuthProvider, CIRCLE_ENDPOINTS,
+    INTEL_ENDPOINTS,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1451,6 +1452,166 @@ async fn proxy_circle_request(
     Ok((status, headers, bytes::Bytes::from(bytes)))
 }
 
+const MAX_INTEL_REQUEST_BODY_SIZE: usize = 64 * 1024;
+const MAX_INTEL_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
+const MAX_INTEL_GRAPH_BUNDLE_RESPONSE_SIZE: usize = 8 * 1024 * 1024;
+const INTEL_POST_ENDPOINTS: &[&str] = &[
+    "blue.catbird.intel.getActorVectors",
+    "blue.catbird.intel.getPostVectors",
+    "blue.catbird.intel.searchGraphPosts",
+    "blue.catbird.onboarding.getCalibrationSwipes",
+    "blue.catbird.onboarding.previewTimeline",
+    "blue.catbird.onboarding.solveBundle",
+];
+
+fn validate_intel_method_and_body(
+    method: &Method,
+    lexicon: &str,
+    body_len: usize,
+) -> AppResult<()> {
+    let is_post_procedure = INTEL_POST_ENDPOINTS.contains(&lexicon);
+    let expected = if is_post_procedure {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    if method != expected {
+        return Err(AppError::AtprotoResponse {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            error: "MethodNotAllowed".to_string(),
+            message: format!("XRPC method '{lexicon}' requires {expected}"),
+        });
+    }
+    if is_post_procedure {
+        if body_len > MAX_INTEL_REQUEST_BODY_SIZE {
+            return Err(AppError::BadRequest(format!(
+                "Intel request body exceeds {} bytes",
+                MAX_INTEL_REQUEST_BODY_SIZE
+            )));
+        }
+    } else if body_len > 0 {
+        return Err(AppError::BadRequest(
+            "GET request must not carry a body".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn max_intel_response_size(lexicon: &str) -> usize {
+    if lexicon == "blue.catbird.intel.getGraphNeighborhoodBundle" {
+        MAX_INTEL_GRAPH_BUNDLE_RESPONSE_SIZE
+    } else {
+        MAX_INTEL_RESPONSE_SIZE
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_intel_request(
+    state: Arc<AppState>,
+    session: &CatbirdSession,
+    base_url: &str,
+    audience: &str,
+    timeout_ms: u64,
+    dpop_data: &JacquardDpopData,
+    method: reqwest::Method,
+    lexicon: &str,
+    query: Option<&str>,
+    body: Option<bytes::Bytes>,
+    content_type: Option<&str>,
+) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
+    let mut url = format!("{}/xrpc/{lexicon}", base_url.trim_end_matches('/'));
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let token = ServiceAuthProvider::new(state.clone())
+        .token_for_intel_with_dpop(session, audience, lexicon, dpop_data)
+        .await?;
+    let mut request = state
+        .http_client
+        .request(method, &url)
+        .timeout(std::time::Duration::from_millis(timeout_ms.max(500)))
+        .bearer_auth(token);
+    if let Some(content_type) = content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+
+    let max_response_size = max_intel_response_size(lexicon);
+    let response_size_error = || {
+        AppError::ResponseTooLarge(format!(
+            "Intel service response exceeds {} MiB",
+            max_response_size / (1024 * 1024)
+        ))
+    };
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let mut headers = response.headers().clone();
+    let had_content_encoding = headers.remove(reqwest::header::CONTENT_ENCODING).is_some();
+    let content_length = if had_content_encoding {
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        None
+    } else {
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    if content_length.is_some_and(|length| length > max_response_size) {
+        return Err(response_size_error());
+    }
+
+    let mut held_permit = if content_length.is_none()
+        || had_content_encoding
+        || content_length.is_some_and(|length| length > crate::services::STREAM_THRESHOLD)
+    {
+        Some(
+            state
+                .active_stream_semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+        )
+    } else {
+        None
+    };
+
+    let session_id_str = session.id.to_string();
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len() + chunk.len() > max_response_size {
+            return Err(response_size_error());
+        }
+        if held_permit.is_none() && bytes.len() + chunk.len() > crate::services::STREAM_THRESHOLD {
+            held_permit = Some(
+                state
+                    .active_stream_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| AppError::RateLimitExceeded { retry_after: 5 })?,
+            );
+        }
+        state
+            .rate_limit
+            .check_and_record_bytes(&session_id_str, chunk.len() as u64)
+            .await
+            .map_err(|retry_after| AppError::RateLimitExceeded { retry_after })?;
+        bytes.extend_from_slice(&chunk);
+    }
+
+    headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        reqwest::header::HeaderValue::from(bytes.len()),
+    );
+
+    Ok((status, headers, bytes::Bytes::from(bytes)))
+}
+
 /// Sensitive PDS session, credential-management and account-deletion XRPC
 /// methods that are never proxied through the confidential OAuth gateway.
 /// Account deletion takes the account password, which must never pass
@@ -1811,6 +1972,7 @@ fn is_non_canonical_policy_nsid(lexicon: &str) -> bool {
         .iter()
         .chain(std::iter::once(&SERVICE_AUTH_NSID))
         .chain(CIRCLE_ENDPOINTS)
+        .chain(INTEL_ENDPOINTS)
         .chain(crate::services::CHAT_ENDPOINTS)
         .chain(MODERATION_MUTATION_NSIDS)
         .chain(CREATE_ONLY_GUARDED_REPO_NSIDS)
@@ -1866,6 +2028,12 @@ pub async fn proxy_xrpc(
         if let Some((_, frag)) = state.config.circle.service_did.split_once('#') {
             extra_service_ids.push(frag);
         }
+        if INTEL_ENDPOINTS.contains(&lexicon.as_str()) {
+            extra_service_ids.push("catbird_intel");
+            if let Some((_, frag)) = state.config.intel.service_did.split_once('#') {
+                extra_service_ids.push(frag);
+            }
+        }
         crate::services::validate_atproto_proxy_headers(&headers, &extra_service_ids)?;
     }
 
@@ -1905,13 +2073,24 @@ pub async fn proxy_xrpc(
     }
     let body_bytes = bytes::Bytes::from(buffered);
 
-    // Log request receipt with body shape
-    let body_shape = json_shape(&body_bytes);
+    // Actor vector requests carry private graph state. Do not derive or emit
+    // metadata from their query parameters or request bodies.
+    let log_payload_metadata = should_log_xrpc_payload_metadata(&lexicon);
+    let query_keys = if log_payload_metadata {
+        query_string.as_deref().map(query_param_names)
+    } else {
+        None
+    };
+    let body_shape = if log_payload_metadata {
+        json_shape(&body_bytes)
+    } else {
+        None
+    };
     tracing::info!(
         request_id = %request_id,
         lexicon = %lexicon,
         method = %method,
-        query_keys = ?query_string.as_deref().map(query_param_names),
+        query_keys = ?query_keys,
         content_type = ?content_type,
         body_bytes = body_bytes.len(),
         body_shape = ?body_shape,
@@ -1923,6 +2102,61 @@ pub async fn proxy_xrpc(
     } else {
         Some(body_bytes.clone())
     };
+
+    if INTEL_ENDPOINTS.contains(&lexicon.as_str()) {
+        if !state.config.intel.enabled {
+            return Err(AppError::AtprotoResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "UpstreamUnavailable".to_string(),
+                message: "Catbird intelligence service is disabled".to_string(),
+            });
+        }
+        validate_intel_method_and_body(&method, &lexicon, body_bytes.len())?;
+        tracing::info!(
+            request_id = %request_id,
+            lexicon = %lexicon,
+            user = %session.did,
+            "Routing Intel request directly to standalone Catbird Intel service"
+        );
+        let intel_dpop = dpop_data
+            .as_ref()
+            .map(|extension| &extension.0)
+            .ok_or(AppError::InvalidSession)?;
+        let (status, response_headers, response_body) = proxy_intel_request(
+            state.clone(),
+            &session,
+            &state.config.intel.base_url,
+            &state.config.intel.service_did,
+            state.config.intel.timeout_ms,
+            intel_dpop,
+            method,
+            &lexicon,
+            query_string.as_deref(),
+            body_option,
+            content_type,
+        )
+        .await?;
+
+        metrics::record_proxy_request(&lexicon, status, start.elapsed().as_secs_f64());
+        let mut response = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+        for (name, value) in response_headers.iter() {
+            if matches!(
+                name.as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-disposition"
+                    | "cache-control"
+                    | "etag"
+                    | "last-modified"
+            ) {
+                if let Ok(value) = value.to_str() {
+                    response = response.header(name.as_str(), value);
+                }
+            }
+        }
+        return Ok(response.body(Body::from(response_body)).unwrap());
+    }
 
     if CIRCLE_ENDPOINTS.contains(&lexicon.as_str()) {
         tracing::info!(
@@ -2152,7 +2386,10 @@ pub async fn proxy_xrpc(
     }
 }
 
-/// Extract JSON shape information for logging (top-level keys and array lengths)
+fn should_log_xrpc_payload_metadata(lexicon: &str) -> bool {
+    lexicon != "blue.catbird.intel.getActorVectors"
+}
+
 /// Parameter names from a raw query string, without values. Values carry actor
 /// identifiers, cursors and search terms, so only the names are ever logged.
 fn query_param_names(query: &str) -> Vec<String> {
@@ -2169,6 +2406,7 @@ fn query_param_names(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract JSON shape information for logging (top-level keys and array lengths).
 fn json_shape(data: &[u8]) -> Option<String> {
     let json: Value = serde_json::from_slice(data).ok()?;
     Some(describe_json_shape(&json, 0))
@@ -3182,7 +3420,7 @@ mod tests {
 
 #[cfg(test)]
 mod query_logging_tests {
-    use super::query_param_names;
+    use super::{query_param_names, should_log_xrpc_payload_metadata};
 
     #[test]
     fn logs_parameter_names_but_never_values() {
@@ -3192,6 +3430,13 @@ mod query_logging_tests {
         assert!(!joined.contains("did"));
         assert!(!joined.contains("private"));
         assert!(!joined.contains("xyz"));
+    }
+
+    #[test]
+    fn never_logs_actor_vector_request_metadata() {
+        assert!(!should_log_xrpc_payload_metadata(
+            "blue.catbird.intel.getActorVectors"
+        ));
     }
 
     #[test]

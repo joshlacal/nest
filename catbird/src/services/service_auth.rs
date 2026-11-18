@@ -9,10 +9,16 @@ use crate::middleware::JacquardDpopData;
 use crate::models::CatbirdSession;
 use crate::services::{AtProtoClient, ProxyResponse};
 use axum::http::StatusCode;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::Utc;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::borrow::Cow;
 use std::sync::Arc;
 pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
 pub const CIRCLE_APPVIEW_SERVICE_REF: &str = "did:web:circles.catbird.blue#atproto_circles";
+pub const INTEL_APPVIEW_SERVICE_REF: &str = "did:web:intel.catbird.blue#catbird_intel";
 pub const CIRCLE_ENDPOINTS: &[&str] = &[
     "blue.catbird.circle.activateCircle",
     "blue.catbird.circle.getFeed",
@@ -23,6 +29,23 @@ pub const CIRCLE_ENDPOINTS: &[&str] = &[
     "blue.catbird.circle.listNotifications",
     "blue.catbird.circle.reportRecord",
     "blue.catbird.circle.updatePreferences",
+];
+pub const INTEL_ENDPOINTS: &[&str] = &[
+    "blue.catbird.intel.listCommunities",
+    "blue.catbird.intel.getCommunity",
+    "blue.catbird.intel.getAuthorModes",
+    "blue.catbird.intel.getGraphNeighborhoodBundle",
+    "blue.catbird.intel.getActorVectors",
+    "blue.catbird.intel.getPostVectors",
+    "blue.catbird.intel.searchGraphPosts",
+    "blue.catbird.intel.expandGraphNeighborhood",
+    "blue.catbird.intel.getQuoteChain",
+    "blue.catbird.intel.getTopicClusters",
+    "blue.catbird.onboarding.getCatalog",
+    "blue.catbird.onboarding.getSceneCards",
+    "blue.catbird.onboarding.getCalibrationSwipes",
+    "blue.catbird.onboarding.previewTimeline",
+    "blue.catbird.onboarding.solveBundle",
 ];
 
 pub struct ServiceAuthProvider {
@@ -84,6 +107,38 @@ impl ServiceAuthProvider {
             .await
     }
 
+    /// Prefer PDS service auth, falling back only for Intel RPC scope rejections
+    /// from an otherwise valid Catbird session.
+    pub async fn token_for_intel_with_dpop(
+        &self,
+        session: &CatbirdSession,
+        audience: &str,
+        lexicon: &str,
+        dpop_data: &JacquardDpopData,
+    ) -> AppResult<String> {
+        match self
+            .token_for_audience_with_dpop(session, audience, lexicon, dpop_data)
+            .await
+        {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                if INTEL_ENDPOINTS.contains(&lexicon) && is_pds_scope_rejection(&error) {
+                    if let Some(key) = self
+                        .state
+                        .config
+                        .intel
+                        .internal_bff_secret
+                        .as_deref()
+                        .and_then(internal_bff_key)
+                    {
+                        return mint_internal_bff_token(session, audience, lexicon, key.as_ref());
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn validate_audience_and_lexicon(&self, audience: &str, lexicon: &str) -> AppResult<()> {
         if audience.is_empty()
             || audience != audience.trim()
@@ -123,6 +178,16 @@ impl ServiceAuthProvider {
             if !CIRCLE_ENDPOINTS.contains(&lexicon) {
                 return Err(AppError::BadRequest(format!(
                     "Unsupported Circle service auth lexicon: {lexicon}"
+                )));
+            }
+            return Ok(());
+        }
+
+        if audience == INTEL_APPVIEW_SERVICE_REF || audience == self.state.config.intel.service_did
+        {
+            if !INTEL_ENDPOINTS.contains(&lexicon) {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported Intel service auth lexicon: {lexicon}"
                 )));
             }
             return Ok(());
@@ -174,15 +239,18 @@ impl ServiceAuthProvider {
                     let msg = String::from_utf8_lossy(&body).into_owned();
                     let status_code =
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-                    let error_code = match status {
-                        401 => "AuthRequired",
-                        403 => "AccessRemoved",
-                        400 => "InvalidRequest",
-                        _ => "UpstreamUnavailable",
-                    };
+                    let error_code = xrpc_error_code(&body).unwrap_or_else(|| {
+                        match status {
+                            401 => "AuthRequired",
+                            403 => "AccessRemoved",
+                            400 => "InvalidRequest",
+                            _ => "UpstreamUnavailable",
+                        }
+                        .to_string()
+                    });
                     return Err(AppError::AtprotoResponse {
                         status: status_code,
-                        error: error_code.into(),
+                        error: error_code,
                         message: format!(
                             "com.atproto.server.getServiceAuth failed ({status}): {msg}"
                         ),
@@ -236,6 +304,83 @@ impl ServiceAuthProvider {
             dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
         })
     }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn xrpc_error_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.as_str()?;
+    let valid = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.'));
+    valid.then(|| code.to_string())
+}
+
+fn is_pds_scope_rejection(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::AtprotoResponse {
+            status: StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN,
+            error,
+            ..
+        } if matches!(error.as_str(), "InvalidToken" | "InsufficientScope" | "BadRequest")
+    )
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn internal_bff_key(secret: &str) -> Option<Cow<'_, [u8]>> {
+    let is_hex = secret.len() % 2 == 0 && secret.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_hex {
+        return (secret.len() >= 32).then_some(Cow::Borrowed(secret.as_bytes()));
+    }
+
+    let decoded: Vec<u8> = secret
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+        .collect();
+    (decoded.len() >= 32).then_some(Cow::Owned(decoded))
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("caller validates hexadecimal input"),
+    }
+}
+
+fn mint_internal_bff_token(
+    session: &CatbirdSession,
+    audience: &str,
+    lexicon: &str,
+    key: &[u8],
+) -> AppResult<String> {
+    let now = Utc::now().timestamp();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "iss": session.did.as_str(),
+        "aud": audience,
+        "lxm": lexicon,
+        "iat": now,
+        "exp": now + 60,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    }))
+    .map_err(|error| AppError::Internal(format!("Failed to serialize BFF assertion: {error}")))?;
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|error| AppError::Internal(format!("Failed to initialize BFF HMAC: {error}")))?;
+    mac.update(payload_b64.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    Ok(format!(
+        "bff.{payload_b64}.{}",
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
 }
 
 #[cfg(test)]
@@ -660,5 +805,20 @@ mod tests {
             0,
             "must never call PDS with an unbound random DPoP key"
         );
+    }
+
+    #[test]
+    fn bff_fallback_never_treats_local_invalid_session_as_scope_rejection() {
+        assert!(!is_pds_scope_rejection(&AppError::InvalidSession));
+    }
+
+    #[test]
+    fn bff_secret_accepts_strong_raw_and_hex_keys() {
+        let raw = "raw-secret-that-is-at-least-thirty-two-bytes";
+        assert_eq!(internal_bff_key(raw).unwrap().as_ref(), raw.as_bytes());
+
+        let hex = "11".repeat(32);
+        assert_eq!(internal_bff_key(&hex).unwrap(), vec![0x11; 32]);
+        assert!(internal_bff_key("too-short").is_none());
     }
 }
