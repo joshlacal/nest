@@ -865,7 +865,9 @@ async fn handle_upgrade_callback(
     let granted_scopes = session_data
         .scopes
         .iter()
-        .map(|s| s.to_string_normalized().to_string())
+        .map(|s| {
+            crate::services::oauth_upgrade::server_scope_spelling(s.to_string_normalized().as_str())
+        })
         .collect::<Vec<_>>();
 
     let result = match upgrade_service

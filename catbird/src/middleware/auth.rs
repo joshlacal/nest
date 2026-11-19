@@ -314,7 +314,9 @@ fn validate_authoritative_granted_scopes(
 
     Ok(parsed_scopes
         .iter()
-        .map(|s| s.to_string_normalized().to_string())
+        .map(|s| {
+            crate::services::oauth_upgrade::server_scope_spelling(s.to_string_normalized().as_str())
+        })
         .collect())
 }
 

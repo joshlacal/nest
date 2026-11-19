@@ -142,6 +142,51 @@ fn space_scope_matches_lexicon_expansion(
     })
 }
 
+/// Reads a `space:` scope the way the reference authorization server writes it.
+///
+/// The reference `oauth-scopes` package gives a `space:` scope the default actions (read,
+/// create, update, delete) whenever `action` is absent, and its formatter leaves `action`
+/// out when the actions are exactly that default set. So a server that was asked for
+/// `space:x?action=create&action=delete&action=read&action=update&manage=create` writes
+/// the grant back as `space:x?manage=create`. `jacquard-oauth` applies the default only
+/// when `manage` is absent as well, and would read that grant as carrying no actions.
+/// This restores the reference meaning on a scope a server wrote.
+pub fn with_reference_space_action_default(
+    scope: Scope<smol_str::SmolStr>,
+) -> Scope<smol_str::SmolStr> {
+    use jacquard_oauth::scopes::SpaceAction;
+
+    match scope {
+        Scope::Space(mut space) if space.actions.is_empty() => {
+            space.actions.extend([
+                SpaceAction::Read,
+                SpaceAction::Create,
+                SpaceAction::Update,
+                SpaceAction::Delete,
+            ]);
+            Scope::Space(space)
+        }
+        other => other,
+    }
+}
+
+/// Parses a scope string an authorization server wrote. `None` when it is not a scope.
+pub fn parse_server_scope(raw: &str) -> Option<Scope<smol_str::SmolStr>> {
+    Scope::<smol_str::SmolStr>::parse(raw)
+        .ok()
+        .map(with_reference_space_action_default)
+}
+
+/// The spelling the gateway reports to its clients for a scope a server granted: the
+/// normalized form with a `space:` scope's default actions written out, so a client that
+/// compares scope strings sees the actions it asked for. A string that is not a scope is
+/// returned unchanged.
+pub fn server_scope_spelling(raw: &str) -> String {
+    parse_server_scope(raw)
+        .map(|scope| scope.to_string_normalized().to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
 fn registered_scope_covers_grant(registered: &Scope, granted: &Scope, account_did: &str) -> bool {
     registered == granted
         || (registered.grants(granted) && granted.grants(registered))
@@ -705,9 +750,11 @@ impl OAuthUpgradeService {
         let parsed_current = current_scopes
             .iter()
             .map(|scope| {
-                Scope::<smol_str::SmolStr>::parse(scope).map_err(|_| {
-                    UpgradeError::DisallowedScope(format!("invalid current scope: {scope}"))
-                })
+                Scope::<smol_str::SmolStr>::parse(scope)
+                    .map(with_reference_space_action_default)
+                    .map_err(|_| {
+                        UpgradeError::DisallowedScope(format!("invalid current scope: {scope}"))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !parsed_current
@@ -975,7 +1022,7 @@ impl OAuthUpgradeService {
         // Parse and validate granted scopes
         let mut parsed_granted = Vec::new();
         for s in &granted_scopes {
-            let parsed = Scope::<smol_str::SmolStr>::parse(s).map_err(|_| {
+            let parsed = parse_server_scope(s).ok_or_else(|| {
                 UpgradeError::ScopeDowngrade(format!("invalid or unparseable granted scope: {s}"))
             })?;
             parsed_granted.push(parsed);
@@ -1028,9 +1075,20 @@ impl OAuthUpgradeService {
             }
         }
 
-        // Require session_data.scopes agrees with the passed grants
+        // Require session_data.scopes agrees with the passed grants. The session's scopes
+        // are the server's own writing too, so they are read the same way.
+        let mut session_scopes = Vec::new();
+        for s in session_data.scopes.iter() {
+            let spelling = s.to_string_normalized();
+            let parsed = parse_server_scope(spelling.as_str()).ok_or_else(|| {
+                UpgradeError::ScopeDowngrade(format!(
+                    "invalid or unparseable session scope: {spelling}"
+                ))
+            })?;
+            session_scopes.push(parsed);
+        }
         for grant in &parsed_granted {
-            let in_session = session_data.scopes.iter().any(|s| {
+            let in_session = session_scopes.iter().any(|s| {
                 s.to_string_normalized() == grant.to_string_normalized() || s.grants(grant)
             });
             if !in_session {
@@ -1040,10 +1098,10 @@ impl OAuthUpgradeService {
                 )));
             }
         }
-        for s in session_data.scopes.iter() {
+        for s in &session_scopes {
             let in_granted = parsed_granted
                 .iter()
-                .any(|g| g.to_string_normalized() == s.to_string_normalized() || g.grants(&s));
+                .any(|g| g.to_string_normalized() == s.to_string_normalized() || g.grants(s));
             if !in_granted {
                 return Err(UpgradeError::ScopeDowngrade(format!(
                     "session_data.scopes contains ungranted scope '{}'",
@@ -2785,5 +2843,101 @@ mod disposable_fence_tests {
             Err(UpgradeError::OldSessionInactive)
         ));
         fixture.finish().await;
+    }
+}
+
+#[cfg(test)]
+mod reference_space_default_tests {
+    use super::*;
+
+    const DID: &str = "did:plc:6u6rzv6fk3ga37kgs3tybgdk";
+    const COLLECTIONS: &str =
+        "collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch";
+
+    fn requested() -> Scope<smol_str::SmolStr> {
+        let raw = format!(
+            "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&{COLLECTIONS}&manage=create&manage=delete"
+        );
+        Scope::<smol_str::SmolStr>::parse(&raw).expect("requested scope")
+    }
+
+    /// What the reference server (and Swan) writes back for `requested()`: the account DID
+    /// as authority, and no `action` because the actions are the default set.
+    fn server_written(did: &str) -> String {
+        format!("space:blue.catbird.labyrinth.mailbox?authority={did}&{COLLECTIONS}&manage=create&manage=delete")
+    }
+
+    #[test]
+    fn a_server_written_grant_without_action_carries_the_default_actions() {
+        let granted = parse_server_scope(&server_written(DID)).expect("granted scope");
+        assert!(space_scope_matches_lexicon_expansion(
+            &requested(),
+            &granted,
+            DID
+        ));
+        assert!(registered_scope_covers_grant(&requested(), &granted, DID));
+    }
+
+    #[test]
+    fn the_library_reading_alone_does_not_match() {
+        // Pins the reason the helper exists: without it the grant reads as manage-only.
+        let granted =
+            Scope::<smol_str::SmolStr>::parse(&server_written(DID)).expect("granted scope");
+        assert!(!space_scope_matches_lexicon_expansion(
+            &requested(),
+            &granted,
+            DID
+        ));
+    }
+
+    #[test]
+    fn a_grant_for_another_account_still_does_not_match() {
+        let granted = parse_server_scope(&server_written("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"))
+            .expect("granted scope");
+        assert!(!space_scope_matches_lexicon_expansion(
+            &requested(),
+            &granted,
+            DID
+        ));
+    }
+
+    #[test]
+    fn stated_actions_are_left_as_stated() {
+        let raw = format!("space:blue.catbird.labyrinth.mailbox?action=read_self&authority={DID}&{COLLECTIONS}&manage=create");
+        let granted = parse_server_scope(&raw).expect("granted scope");
+        assert!(!space_scope_matches_lexicon_expansion(
+            &requested(),
+            &granted,
+            DID
+        ));
+        assert_eq!(
+            server_scope_spelling(&raw),
+            Scope::<smol_str::SmolStr>::parse(&raw)
+                .unwrap()
+                .to_string_normalized()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn the_reported_spelling_writes_the_default_actions_out() {
+        let spelling = server_scope_spelling(&server_written(DID));
+        for action in [
+            "action=create",
+            "action=delete",
+            "action=read",
+            "action=update",
+        ] {
+            assert!(spelling.contains(action), "{spelling} lacks {action}");
+        }
+        assert!(spelling.contains(&format!("authority={DID}")));
+        assert!(spelling.contains("manage=create&manage=delete"));
+        // Idempotent, and scopes outside the family are untouched.
+        assert_eq!(server_scope_spelling(&spelling), spelling);
+        assert_eq!(
+            server_scope_spelling("transition:generic"),
+            "transition:generic"
+        );
+        assert_eq!(server_scope_spelling("not a scope"), "not a scope");
     }
 }

@@ -559,9 +559,16 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         )
         .await
         .expect_err("retired Labyrinth grants must not satisfy the new scopes");
+    // The retired mailbox grant states `manage` and no `action`. Read the way the reference
+    // server writes scopes it carries the default actions, so the refusal now comes from
+    // the "granted beyond the requested target" check (it names no collections, the
+    // request names nine) rather than from "requested scope not granted". Either way the
+    // retired grant must not complete the upgrade.
     assert!(
-        matches!(&err, UpgradeError::ScopeDowngrade(msg) if msg.contains(REQUIRED_CLEAN_SLATE_SCOPES[mailbox_idx])),
-        "expected missing mailbox scope downgrade, got: {err}"
+        matches!(&err, UpgradeError::ScopeDowngrade(msg)
+            if msg.contains(REQUIRED_CLEAN_SLATE_SCOPES[mailbox_idx])
+                || msg.contains("unexpected scope 'space:blue.catbird.labyrinth.mailbox?")),
+        "expected the retired mailbox grant to be refused, got: {err}"
     );
 
     // A custom registration maximum drops an unrelated formerly granted
