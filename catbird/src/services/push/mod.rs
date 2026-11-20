@@ -1,5 +1,8 @@
 pub mod apns;
 pub mod decision;
+pub mod delivery_service_declaration;
+#[cfg(test)]
+mod delivery_service_resolver_tests;
 pub mod gateway;
 pub mod lock;
 pub mod moderation_verdict;
@@ -190,6 +193,7 @@ impl PushServices {
             &config,
             &default_base_url,
             raw_http_client,
+            None,
         )?);
 
         Ok(Self {

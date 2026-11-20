@@ -13,6 +13,11 @@
 //!   `#atproto` DID-JWT (`ES256` or `ES256K`) bound to `(htm="POST", htu, iat, exp, jti, body_sha256)` (`+-60s`
 //!   skew, single-use `(iss, jti)` replay cache). Per-`caller_ds_did` and per-`push_key` token buckets drop
 //!   excess wakes before touching APNs/FCM, and unauthorized DSes never touch a victim's per-`push_key` bucket.
+//! - **Who may wake a key:** each key is bound at registration to one delivery service. That is the
+//!   `#atproto_mls` service in the account's DID document when it has one. Otherwise it is the
+//!   `deliveryService` of the account's public `blue.catbird.chat.declaration/self` record, and only if the
+//!   operator allows that service (`delivery_service_declaration.rs`, `with_declaration_fallback`). The binding
+//!   is stored with the key and is not re-read on delivery.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -44,6 +49,10 @@ use subtle::ConstantTimeEq;
 use url::Url;
 use uuid::Uuid;
 
+use super::delivery_service_declaration::{
+    declaration_record_url, is_supported_delivery_service_did, parse_declaration_response,
+    DeclarationError, MAX_DECLARATION_RESPONSE_BYTES,
+};
 use super::wake_envelope;
 use crate::{
     config::{ApnsConfig, PushConfig},
@@ -151,11 +160,88 @@ pub trait PushGatewayTransport: Send + Sync {
     async fn send(&self, push: DispatchedGatewayPush) -> Result<GatewayDeliveryOutcome>;
 }
 
+/// Which public statement named the delivery service a push key is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryServiceSource {
+    /// The `#atproto_mls` service entry in the account's DID document.
+    DidDocument,
+    /// The account's `blue.catbird.chat.declaration/self` repo record, used
+    /// only when the DID document has no `#atproto_mls` entry.
+    ChatDeclaration,
+}
+
+impl DeliveryServiceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DidDocument => "did_document",
+            Self::ChatDeclaration => "chat_declaration",
+        }
+    }
+}
+
+/// The delivery service allowed to wake an account's push keys, and where
+/// that came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDeliveryService {
+    pub did: String,
+    pub source: DeliveryServiceSource,
+}
+
+/// Why no delivery service could be bound to a push key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserDeliveryServiceError {
+    /// Neither the DID document nor a chat declaration names one.
+    NotDeclared,
+    /// A source names one, but the entry or record is malformed.
+    Invalid(String),
+    /// The chat declaration names a delivery service this gateway does not
+    /// accept from a repo record.
+    NotAllowed(String),
+    /// The DID document or the PDS could not be read; retrying may succeed.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for UserDeliveryServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDeclared => f.write_str("no delivery service is declared"),
+            Self::Invalid(why) => write!(f, "delivery service declaration is invalid: {why}"),
+            Self::NotAllowed(did) => {
+                write!(f, "declared delivery service '{did}' is not allowed")
+            }
+            Self::Unavailable(why) => write!(f, "delivery service lookup unavailable: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for UserDeliveryServiceError {}
+
 #[async_trait::async_trait]
 pub trait MlsDsIdentityResolver: Send + Sync {
     /// Resolve `account_did`'s DID document and extract the canonical bare DID of its
     /// `#atproto_mls` (`AtprotoMLSDeliveryService`) service entry.
+    ///
+    /// DID document only. `getServiceAuth` audience checks rely on this never
+    /// consulting a repo record.
     async fn resolve_user_mls_service_did(&self, account_did: &str) -> Result<String>;
+
+    /// Resolve the delivery service allowed to wake `account_did`'s push keys.
+    ///
+    /// The DID document's `#atproto_mls` entry decides when present. A
+    /// resolver may fall back to the account's public chat declaration when
+    /// that entry is absent; this default does not.
+    async fn resolve_user_push_delivery_service(
+        &self,
+        account_did: &str,
+    ) -> std::result::Result<UserDeliveryService, UserDeliveryServiceError> {
+        self.resolve_user_mls_service_did(account_did)
+            .await
+            .map(|did| UserDeliveryService {
+                did,
+                source: DeliveryServiceSource::DidDocument,
+            })
+            .map_err(|e| UserDeliveryServiceError::Invalid(e.to_string()))
+    }
 
     /// Resolve `caller_ds_did`'s `#atproto` P-256 (`ES256`) or secp256k1 (`ES256K`) verifying key.
     async fn resolve_ds_atproto_key(
@@ -171,8 +257,57 @@ pub struct HttpMlsDsIdentityResolver {
     http_client: reqwest::Client,
     plc_directory_url: String,
     ds_key_cache: DashMap<String, (SpaceVerifyingKey, Instant)>,
+    /// DID-document `#atproto_mls` answers. `getServiceAuth` reads this cache,
+    /// so a declaration-sourced answer must never be stored here.
     user_mls_cache: DashMap<String, (String, Instant)>,
+    /// Chat-declaration answers that passed the allowlist.
+    user_declared_ds_cache: DashMap<String, (String, Instant)>,
+    /// Delivery services a chat declaration may select. Empty: the
+    /// declaration is never read.
+    declaration_allowed_services: Vec<String>,
     cache_ttl: Duration,
+}
+
+/// Deadline for the one public `getRecord` read of a chat declaration.
+const DECLARATION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Environment override for the delivery services a chat declaration may
+/// select: comma-separated DIDs. Set but empty turns the fallback off.
+pub const DECLARATION_DELIVERY_SERVICES_ENV: &str = "CATBIRD_PUSH_DECLARATION_DELIVERY_SERVICES";
+
+/// Resolves the delivery services a chat declaration may select.
+///
+/// `env_value` (the raw [`DECLARATION_DELIVERY_SERVICES_ENV`] value) wins when
+/// set, even if it lists nothing. Otherwise the list is the gateway's own
+/// delivery service, `default_service_did`. Entries are bare DIDs: a
+/// `#fragment` is dropped, and anything that is not a supported DID is
+/// ignored with a warning rather than widening the list.
+pub fn declaration_delivery_services(
+    env_value: Option<&str>,
+    default_service_did: Option<&str>,
+) -> Vec<String> {
+    let raw: Vec<&str> = match env_value {
+        Some(value) => value.split(',').collect(),
+        None => default_service_did.into_iter().collect(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        let bare = entry.trim().split('#').next().unwrap_or_default();
+        if bare.is_empty() {
+            continue;
+        }
+        if !is_supported_delivery_service_did(bare) {
+            tracing::warn!(
+                entry = %bare,
+                "Ignoring unsupported DID in the push declaration delivery-service allowlist"
+            );
+            continue;
+        }
+        if !out.iter().any(|did| did == bare) {
+            out.push(bare.to_string());
+        }
+    }
+    out
 }
 
 impl HttpMlsDsIdentityResolver {
@@ -182,8 +317,56 @@ impl HttpMlsDsIdentityResolver {
             plc_directory_url: plc_directory_url.into(),
             ds_key_cache: DashMap::new(),
             user_mls_cache: DashMap::new(),
+            user_declared_ds_cache: DashMap::new(),
+            declaration_allowed_services: Vec::new(),
             cache_ttl: Duration::from_secs(300),
         }
+    }
+
+    /// Lets push-key registration fall back to an account's public
+    /// `blue.catbird.chat.declaration/self` record when its DID document has
+    /// no `#atproto_mls` entry, but only for the delivery services listed
+    /// here. A repo record is easier to change than a DID document, so it may
+    /// only select a service the operator already trusts.
+    pub fn with_declaration_fallback(mut self, allowed_services: Vec<String>) -> Self {
+        self.declaration_allowed_services = allowed_services;
+        self
+    }
+
+    /// Reads `account_did`'s chat declaration from the PDS its DID document
+    /// names: one public GET with no credentials, through the gateway's
+    /// hardened client (no redirects, no proxy, private addresses refused at
+    /// DNS resolution), with a deadline and a streamed body cap.
+    async fn fetch_declared_delivery_service(
+        &self,
+        did_doc_bytes: &[u8],
+        account_did: &str,
+    ) -> std::result::Result<Option<String>, DeclarationError> {
+        let url = declaration_record_url(did_doc_bytes, account_did)?;
+        let unavailable = |why: String| DeclarationError::Unavailable(why);
+        let resp = self
+            .http_client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(DECLARATION_READ_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| unavailable(format!("getRecord request failed: {e}")))?;
+        let status = resp.status().as_u16();
+        // A redirect or server error is never parsed; only 200, 400 and 404
+        // carry a body the declaration rules give meaning to.
+        if !matches!(status, 200 | 400 | 404) {
+            return Err(unavailable(format!("getRecord answered HTTP {status}")));
+        }
+        let body = read_capped_body(resp, MAX_DECLARATION_RESPONSE_BYTES)
+            .await
+            .map_err(|e| match e {
+                CappedBodyError::TooLarge => {
+                    unavailable("getRecord answer exceeds the size cap".to_string())
+                }
+                CappedBodyError::Read(e) => unavailable(format!("getRecord body read failed: {e}")),
+            })?;
+        parse_declaration_response(account_did, status, &body)
     }
 
     async fn fetch_did_document(&self, did: &str) -> Result<Vec<u8>> {
@@ -252,25 +435,41 @@ const MAX_DID_DOCUMENT_BYTES: usize = 256 * 1024;
 /// unauthenticated caller. The body is therefore never buffered whole: a
 /// declared length over the cap is refused up front, and an undeclared one is
 /// cut off at the first chunk that crosses it.
-async fn read_did_document_body(mut resp: reqwest::Response, did: &str) -> Result<Vec<u8>> {
-    let too_large = || anyhow!("DID document for {did} exceeds 256 KiB");
+async fn read_did_document_body(resp: reqwest::Response, did: &str) -> Result<Vec<u8>> {
+    match read_capped_body(resp, MAX_DID_DOCUMENT_BYTES).await {
+        Ok(body) => Ok(body),
+        Err(CappedBodyError::TooLarge) => Err(anyhow!("DID document for {did} exceeds 256 KiB")),
+        Err(CappedBodyError::Read(e)) => {
+            Err(anyhow::Error::new(e).context(format!("read DID document for {did}")))
+        }
+    }
+}
+
+enum CappedBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+/// Reads a response body of at most `cap` bytes without ever buffering more:
+/// a declared length over the cap is refused before reading, and an
+/// undeclared one is cut off at the first chunk that crosses it.
+async fn read_capped_body(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> std::result::Result<Vec<u8>, CappedBodyError> {
     let declared = resp.content_length().or_else(|| {
         resp.headers()
             .get(reqwest::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
-    if declared.is_some_and(|len| len > MAX_DID_DOCUMENT_BYTES as u64) {
-        return Err(too_large());
+    if declared.is_some_and(|len| len > cap as u64) {
+        return Err(CappedBodyError::TooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("read DID document for {did}"))?
-    {
-        if chunk.len() > MAX_DID_DOCUMENT_BYTES - body.len() {
-            return Err(too_large());
+    while let Some(chunk) = resp.chunk().await.map_err(CappedBodyError::Read)? {
+        if chunk.len() > cap - body.len() {
+            return Err(CappedBodyError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -286,6 +485,18 @@ pub fn extract_user_atproto_mls_service_did(
     did_doc_bytes: &[u8],
     user_did: &str,
 ) -> Result<String> {
+    find_user_atproto_mls_service_did(did_doc_bytes, user_did)?
+        .ok_or_else(|| anyhow!("DID document for {user_did} has no #atproto_mls service"))
+}
+
+/// Like [`extract_user_atproto_mls_service_did`], but tells a DID document
+/// that has no `#atproto_mls` entry (`Ok(None)`) apart from one whose entry or
+/// whose document is unusable (`Err`). Only the first case may fall back to
+/// the account's chat declaration.
+pub fn find_user_atproto_mls_service_did(
+    did_doc_bytes: &[u8],
+    user_did: &str,
+) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct DidDoc {
         id: String,
@@ -312,7 +523,7 @@ pub fn extract_user_atproto_mls_service_did(
     }
 
     let expected_full = format!("{user_did}#atproto_mls");
-    let entry = doc
+    let Some(entry) = doc
         .service
         .iter()
         .find(|s| {
@@ -325,7 +536,9 @@ pub fn extract_user_atproto_mls_service_did(
                 .iter()
                 .find(|s| s.id == "#atproto_mls" || s.id == expected_full)
         })
-        .ok_or_else(|| anyhow!("DID document for {user_did} has no #atproto_mls service"))?;
+    else {
+        return Ok(None);
+    };
 
     let endpoint_str = entry
         .service_endpoint
@@ -338,7 +551,7 @@ pub fn extract_user_atproto_mls_service_did(
             .split_once('#')
             .map(|(d, _)| d)
             .unwrap_or(endpoint_str);
-        return Ok(bare.to_string());
+        return Ok(Some(bare.to_string()));
     }
 
     let parsed = Url::parse(endpoint_str)
@@ -357,7 +570,7 @@ pub fn extract_user_atproto_mls_service_did(
         Some(port) => format!("did:web:{host}%3A{port}"),
         None => format!("did:web:{host}"),
     };
-    Ok(did_web)
+    Ok(Some(did_web))
 }
 
 #[async_trait::async_trait]
@@ -375,6 +588,69 @@ impl MlsDsIdentityResolver for HttpMlsDsIdentityResolver {
             (service_did.clone(), Instant::now()),
         );
         Ok(service_did)
+    }
+
+    async fn resolve_user_push_delivery_service(
+        &self,
+        account_did: &str,
+    ) -> std::result::Result<UserDeliveryService, UserDeliveryServiceError> {
+        let fresh = |cache: &DashMap<String, (String, Instant)>| {
+            cache
+                .get(account_did)
+                .filter(|entry| entry.value().1.elapsed() < self.cache_ttl)
+                .map(|entry| entry.value().0.clone())
+        };
+        if let Some(did) = fresh(&self.user_mls_cache) {
+            return Ok(UserDeliveryService {
+                did,
+                source: DeliveryServiceSource::DidDocument,
+            });
+        }
+        if let Some(did) = fresh(&self.user_declared_ds_cache) {
+            return Ok(UserDeliveryService {
+                did,
+                source: DeliveryServiceSource::ChatDeclaration,
+            });
+        }
+
+        let doc_bytes = self
+            .fetch_did_document(account_did)
+            .await
+            .map_err(|e| UserDeliveryServiceError::Unavailable(format!("{e:#}")))?;
+
+        // The DID document decides whenever it has an `#atproto_mls` entry,
+        // usable or not: a repo record must never override it.
+        if let Some(did) = find_user_atproto_mls_service_did(&doc_bytes, account_did)
+            .map_err(|e| UserDeliveryServiceError::Invalid(format!("{e:#}")))?
+        {
+            self.user_mls_cache
+                .insert(account_did.to_string(), (did.clone(), Instant::now()));
+            return Ok(UserDeliveryService {
+                did,
+                source: DeliveryServiceSource::DidDocument,
+            });
+        }
+
+        if self.declaration_allowed_services.is_empty() {
+            return Err(UserDeliveryServiceError::NotDeclared);
+        }
+        let declared = self
+            .fetch_declared_delivery_service(&doc_bytes, account_did)
+            .await
+            .map_err(|e| match e {
+                DeclarationError::Malformed(why) => UserDeliveryServiceError::Invalid(why),
+                DeclarationError::Unavailable(why) => UserDeliveryServiceError::Unavailable(why),
+            })?
+            .ok_or(UserDeliveryServiceError::NotDeclared)?;
+        if !self.declaration_allowed_services.contains(&declared) {
+            return Err(UserDeliveryServiceError::NotAllowed(declared));
+        }
+        self.user_declared_ds_cache
+            .insert(account_did.to_string(), (declared.clone(), Instant::now()));
+        Ok(UserDeliveryService {
+            did: declared,
+            source: DeliveryServiceSource::ChatDeclaration,
+        })
     }
 
     async fn resolve_ds_atproto_key(
@@ -789,6 +1065,31 @@ struct RegisterServiceJwtClaims {
     jti: Option<String>,
 }
 
+/// What `registerKey` answers when no delivery service can be bound.
+///
+/// Permanent causes keep the `400 InvalidMlsServiceDid` clients already
+/// handle. A source that could not be read is `503`, so a directory or PDS
+/// outage is not reported as the account's fault.
+fn register_key_resolution_error(error: &UserDeliveryServiceError) -> AppError {
+    let invalid = |why: &str| AppError::BadRequest(format!("InvalidMlsServiceDid: {why}"));
+    match error {
+        UserDeliveryServiceError::NotDeclared => invalid(
+            "account has no #atproto_mls service in its DID document \
+             and no usable blue.catbird.chat.declaration record",
+        ),
+        UserDeliveryServiceError::Invalid(_) => {
+            invalid("account's delivery service entry or chat declaration is malformed")
+        }
+        UserDeliveryServiceError::NotAllowed(_) => invalid(
+            "the delivery service in the account's chat declaration is not accepted by this \
+             gateway; name it in the DID document #atproto_mls service instead",
+        ),
+        UserDeliveryServiceError::Unavailable(_) => AppError::ServiceUnavailable(
+            "Could not read the account's DID document or chat declaration; try again".into(),
+        ),
+    }
+}
+
 const REGISTER_SERVICE_JWT_MAX_LIFETIME_SECS: i64 = 300;
 const MAX_JTI_CACHE_ENTRIES: usize = 65_536;
 
@@ -820,18 +1121,35 @@ impl PushGatewayService {
         }
     }
 
+    /// `own_delivery_service_did` is the delivery service this gateway routes
+    /// chat to (`mls.service_did`). Unless
+    /// [`DECLARATION_DELIVERY_SERVICES_ENV`] says otherwise, it is the only
+    /// delivery service an account's chat declaration may bind push keys to;
+    /// `None` leaves that fallback off.
     pub fn new_postgres(
         db_pool: PgPool,
         push_config: &PushConfig,
         base_url: &str,
         raw_http_client: reqwest::Client,
+        own_delivery_service_did: Option<&str>,
     ) -> Result<Self> {
         let plc_url = std::env::var("PLC_DIRECTORY_URL")
             .unwrap_or_else(|_| "https://plc.directory".to_string());
-        let resolver = Arc::new(HttpMlsDsIdentityResolver::new(
-            raw_http_client.clone(),
-            plc_url,
-        ));
+        let env_services = std::env::var(DECLARATION_DELIVERY_SERVICES_ENV).ok();
+        let declaration_services =
+            declaration_delivery_services(env_services.as_deref(), own_delivery_service_did);
+        // `PushServices::new` builds a placeholder gateway with nothing
+        // configured; only a configured one is worth a startup line.
+        if env_services.is_some() || own_delivery_service_did.is_some() {
+            tracing::info!(
+                allowed_delivery_services = ?declaration_services,
+                "Push gateway chat-declaration fallback for accounts without #atproto_mls"
+            );
+        }
+        let resolver = Arc::new(
+            HttpMlsDsIdentityResolver::new(raw_http_client.clone(), plc_url)
+                .with_declaration_fallback(declaration_services),
+        );
         let transport = Arc::new(LivePushGatewayTransport::from_config(
             &push_config.apns,
             raw_http_client,
@@ -950,14 +1268,21 @@ impl PushGatewayService {
             ));
         };
 
-        let allowed_mls_service_did = self
+        let delivery_service = self
             .resolver
-            .resolve_user_mls_service_did(account_did)
+            .resolve_user_push_delivery_service(account_did)
             .await
             .map_err(|e| {
-                tracing::warn!(did = %account_did, error = %e, "Failed to resolve #atproto_mls DID for registerKey");
-                AppError::BadRequest("InvalidMlsServiceDid: user DID document missing valid #atproto_mls service".into())
+                tracing::warn!(did = %account_did, error = %e, "Failed to resolve delivery service for registerKey");
+                register_key_resolution_error(&e)
             })?;
+        tracing::info!(
+            did = %account_did,
+            delivery_service = %delivery_service.did,
+            source = delivery_service.source.as_str(),
+            "Binding push key to delivery service"
+        );
+        let allowed_mls_service_did = delivery_service.did;
 
         let mut raw_key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut raw_key);
@@ -1661,6 +1986,52 @@ impl PushGatewayService {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod register_key_resolution_error_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    async fn answer(error: UserDeliveryServiceError) -> (StatusCode, Value) {
+        let response = register_key_resolution_error(&error).into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn permanent_causes_keep_the_invalid_mls_service_did_error() {
+        for error in [
+            UserDeliveryServiceError::NotDeclared,
+            UserDeliveryServiceError::Invalid("'value' must be an object".into()),
+            UserDeliveryServiceError::NotAllowed("did:web:evil-ds.example.com".into()),
+        ] {
+            let (status, body) = answer(error.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error:?}");
+            let message = body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.starts_with("InvalidMlsServiceDid: "),
+                "{error:?} answered {body}"
+            );
+            assert!(
+                !message.contains("evil-ds") && !message.contains("must be an object"),
+                "the answer must not echo record contents: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_source_is_a_retryable_503() {
+        let (status, body) = answer(UserDeliveryServiceError::Unavailable(
+            "getRecord answered HTTP 503".into(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "TemporarilyUnavailable");
     }
 }
 

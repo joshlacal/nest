@@ -32,8 +32,9 @@ use catbird::{
     handlers::push_gateway,
     models::CatbirdSession,
     services::push::gateway::{
-        DispatchedGatewayPush, GatewayDeliveryOutcome, GatewayPlatform, MlsDsIdentityResolver,
-        PushGatewayConfig, PushGatewayService, PushGatewayTransport,
+        DispatchedGatewayPush, GatewayDeliveryOutcome, GatewayPlatform, HttpMlsDsIdentityResolver,
+        MlsDsIdentityResolver, PushGatewayConfig, PushGatewayService, PushGatewayTransport,
+        UserDeliveryService, UserDeliveryServiceError,
     },
 };
 use catbird_atproto::generated::blue_catbird::push::register_key::{
@@ -188,6 +189,14 @@ struct TestGatewayEnv {
 
 impl TestGatewayEnv {
     async fn setup() -> Self {
+        Self::setup_with(|resolver| Arc::new(resolver)).await
+    }
+
+    /// Like [`Self::setup`], but lets a test wrap the static resolver, for
+    /// example to answer account lookups through the production HTTP resolver.
+    async fn setup_with(
+        wrap: impl FnOnce(StaticDidResolver) -> Arc<dyn MlsDsIdentityResolver>,
+    ) -> Self {
         let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
         let db_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| format!("postgres://{user}@localhost:5432/postgres"));
@@ -285,7 +294,7 @@ impl TestGatewayEnv {
         let gateway = Arc::new(PushGatewayService::new(
             pool.clone(),
             gw_cfg,
-            Arc::new(resolver),
+            wrap(resolver),
             Arc::new(spy_transport.clone()),
         ));
 
@@ -1379,6 +1388,254 @@ async fn service_jwt_register_key_accepts_valid_token_and_rejects_forgery_and_re
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     }
+
+    env.teardown().await;
+}
+
+/// Account lookups through the production HTTP resolver (mock PLC directory
+/// and PDS); delivery-service signing keys from the static table.
+struct DeclarationFallbackResolver {
+    accounts: HttpMlsDsIdentityResolver,
+    ds_keys: StaticDidResolver,
+}
+
+#[async_trait::async_trait]
+impl MlsDsIdentityResolver for DeclarationFallbackResolver {
+    async fn resolve_user_mls_service_did(&self, account_did: &str) -> anyhow::Result<String> {
+        self.accounts
+            .resolve_user_mls_service_did(account_did)
+            .await
+    }
+
+    async fn resolve_user_push_delivery_service(
+        &self,
+        account_did: &str,
+    ) -> Result<UserDeliveryService, UserDeliveryServiceError> {
+        self.accounts
+            .resolve_user_push_delivery_service(account_did)
+            .await
+    }
+
+    async fn resolve_ds_atproto_key(
+        &self,
+        caller_ds_did: &str,
+        force_refresh: bool,
+    ) -> anyhow::Result<SpaceVerifyingKey> {
+        self.ds_keys
+            .resolve_ds_atproto_key(caller_ds_did, force_refresh)
+            .await
+    }
+}
+
+/// Serves `account`'s DID document (PDS only, no `#atproto_mls`) from `plc`,
+/// and `get_record` as its PDS's answer for the chat declaration.
+async fn serve_declaring_account(
+    plc: &wiremock::MockServer,
+    pds: &wiremock::MockServer,
+    account: &str,
+    get_record: wiremock::ResponseTemplate,
+) {
+    use wiremock::matchers::{method, path, query_param};
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/{account}")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": account,
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": pds.uri(),
+            }],
+        })))
+        .mount(plc)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .and(query_param("repo", account))
+        .and(query_param("collection", "blue.catbird.chat.declaration"))
+        .and(query_param("rkey", "self"))
+        .respond_with(get_record)
+        .mount(pds)
+        .await;
+}
+
+fn chat_declaration(account: &str, delivery_service: &str) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+        "uri": format!("at://{account}/blue.catbird.chat.declaration/self"),
+        "value": {
+            "$type": "blue.catbird.chat.declaration",
+            "createdAt": "2026-11-18T23:34:19.690Z",
+            "allowIncoming": "all",
+            "deliveryService": delivery_service,
+            "protocolVersion": "2",
+        },
+    }))
+}
+
+async fn try_register(env: &TestGatewayEnv, account: &str) -> Result<String, (StatusCode, Value)> {
+    use axum::response::IntoResponse;
+    match push_gateway::register_key_with_service(
+        State(env.gateway.clone()),
+        Extension(make_session(account)),
+        Json(RegisterKey {
+            app_id: "blue.catbird".into(),
+            device_id: Uuid::new_v4().to_string().into(),
+            native_token: "0123456789abcdef0123456789abcdef".into(),
+            platform: RegisterKeyPlatform::Apns,
+            extra_data: None,
+        }),
+    )
+    .await
+    {
+        Ok(Json(out)) => Ok(out.push_key.to_string()),
+        Err(error) => {
+            let response = error.into_response();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            Err((status, serde_json::from_slice(&body).unwrap()))
+        }
+    }
+}
+
+async fn keys_for(env: &TestGatewayEnv, account: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM push_gateway_keys WHERE account_did = $1")
+        .bind(account)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+}
+
+/// The production failure of Nov 19 2026: an account with only `#atproto_pds`
+/// in its DID document and a public chat declaration naming the Catbird
+/// delivery service could not register a wake key.
+#[tokio::test]
+async fn an_account_with_only_a_chat_declaration_registers_and_is_woken_by_its_declared_service() {
+    let plc = wiremock::MockServer::start().await;
+    let pds = wiremock::MockServer::start().await;
+    let declaring = "did:plc:simjzkp2kphgi6zutwqxhyzm";
+    let other_ds = "did:plc:6u6rzv6fk3ga37kgs3tybgdk";
+    let no_record = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    let pds_down = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+    serve_declaring_account(
+        &plc,
+        &pds,
+        declaring,
+        chat_declaration(declaring, "did:web:chat.catbird.blue"),
+    )
+    .await;
+
+    let plc_uri = plc.uri();
+    let env = TestGatewayEnv::setup_with(move |ds_keys| {
+        Arc::new(DeclarationFallbackResolver {
+            accounts: HttpMlsDsIdentityResolver::new(
+                catbird::services::build_hardened_raw_http_client().unwrap(),
+                plc_uri,
+            )
+            .with_declaration_fallback(vec!["did:web:chat.catbird.blue".to_string()]),
+            ds_keys,
+        })
+    })
+    .await;
+
+    // Registration succeeds and binds the key to the declared service.
+    let push_key = try_register(&env, declaring)
+        .await
+        .expect("an account with a valid chat declaration must be able to register");
+    let bound: String = sqlx::query_scalar(
+        "SELECT allowed_mls_service_did FROM push_gateway_keys WHERE account_did = $1",
+    )
+    .bind(declaring)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(bound, "did:web:chat.catbird.blue");
+
+    // The declared service wakes the device; another service is dropped with
+    // the same uniform answer and never reaches the provider.
+    assert_eq!(wake(&env, &push_key).await, StatusCode::ACCEPTED);
+    assert_eq!(env.spy_transport.sent_calls().len(), 1);
+
+    let body_bytes = serde_json::to_vec(&json!({
+        "pushKey": push_key,
+        "appId": "blue.catbird",
+        "payload": {
+            "wakeKind": "applicationMessage",
+            "conversationId": Uuid::new_v4().to_string(),
+            "generation": 0,
+            "seq": 2,
+            "epoch": 1
+        }
+    }))
+    .unwrap();
+    let now = Utc::now().timestamp();
+    let evil_jwt = sign_ds_wake_jwt(
+        &env.evil_ds_sk,
+        "did:web:evil-ds.example",
+        "https://api.catbird.blue/xrpc/blue.catbird.push.deliver",
+        &Uuid::new_v4().to_string(),
+        now,
+        now + 30,
+        &body_bytes,
+    );
+    let spoofed = env
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/blue.catbird.push.deliver")
+                .header("authorization", format!("Bearer {evil_jwt}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spoofed.status(), StatusCode::ACCEPTED);
+    assert_eq!(env.spy_transport.sent_calls().len(), 1);
+
+    // A stored key keeps its binding: delivery never goes back to the PDS,
+    // even once the record is gone.
+    pds.reset().await;
+    assert_eq!(wake(&env, &push_key).await, StatusCode::ACCEPTED);
+    assert_eq!(env.spy_transport.sent_calls().len(), 2);
+    assert!(pds.received_requests().await.unwrap().is_empty());
+
+    // A declaration cannot select a service the operator has not allowed,
+    // and an account with no declaration still cannot register.
+    serve_declaring_account(
+        &plc,
+        &pds,
+        other_ds,
+        chat_declaration(other_ds, "did:web:evil-ds.example.com"),
+    )
+    .await;
+    serve_declaring_account(
+        &plc,
+        &pds,
+        no_record,
+        wiremock::ResponseTemplate::new(400).set_body_json(json!({ "error": "RecordNotFound" })),
+    )
+    .await;
+    serve_declaring_account(&plc, &pds, pds_down, wiremock::ResponseTemplate::new(503)).await;
+    for account in [other_ds, no_record] {
+        let (status, body) = try_register(&env, account)
+            .await
+            .expect_err("registration must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{account}: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("InvalidMlsServiceDid: ")),
+            "{account}: {body}"
+        );
+        assert_eq!(keys_for(&env, account).await, 0);
+    }
+
+    // A PDS that cannot answer is a retryable failure, not a verdict.
+    let (status, body) = try_register(&env, pds_down)
+        .await
+        .expect_err("registration must not succeed while the PDS is down");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(keys_for(&env, pds_down).await, 0);
 
     env.teardown().await;
 }

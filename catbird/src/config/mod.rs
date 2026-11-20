@@ -1146,6 +1146,7 @@ impl AppState {
                 &self.config.push,
                 &self.config.server.base_url,
                 self.raw_http_client.clone(),
+                Some(&self.config.mls.service_did),
             )?,
         );
         let services = crate::services::push::PushServices::new(pool, self.config.push.clone())?
