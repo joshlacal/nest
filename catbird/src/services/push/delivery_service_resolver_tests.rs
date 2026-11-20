@@ -341,11 +341,140 @@ async fn a_failing_pds_is_unavailable_never_absent() {
 }
 
 #[tokio::test]
+async fn a_failing_directory_is_unavailable() {
+    // Every answer here can change on its own, so the client should retry.
+    for status in [500, 502, 503, 504, 429, 408, 403, 400] {
+        let world = World::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{ACCOUNT}")))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&world.plc)
+            .await;
+
+        let resolved = world
+            .resolver()
+            .resolve_user_push_delivery_service(ACCOUNT)
+            .await;
+
+        assert!(
+            matches!(resolved, Err(UserDeliveryServiceError::Unavailable(_))),
+            "HTTP {status}: {resolved:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_unreachable_directory_is_unavailable() {
+    // A port nothing listens on.
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let resolver = HttpMlsDsIdentityResolver::new(
+        crate::services::build_hardened_raw_http_client().expect("hardened client"),
+        format!("http://127.0.0.1:{closed_port}"),
+    )
+    .with_declaration_fallback(vec![CATBIRD_DS.to_string()]);
+
+    let resolved = resolver.resolve_user_push_delivery_service(ACCOUNT).await;
+
+    assert!(
+        matches!(resolved, Err(UserDeliveryServiceError::Unavailable(_))),
+        "{resolved:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_directory_address_is_unavailable() {
+    // The directory address is this gateway's configuration, not the account's.
+    let resolver = HttpMlsDsIdentityResolver::new(
+        crate::services::build_hardened_raw_http_client().expect("hardened client"),
+        "http://10.0.0.1".to_string(),
+    )
+    .with_declaration_fallback(vec![CATBIRD_DS.to_string()]);
+
+    let resolved = resolver.resolve_user_push_delivery_service(ACCOUNT).await;
+
+    assert!(
+        matches!(resolved, Err(UserDeliveryServiceError::Unavailable(_))),
+        "{resolved:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_did_the_directory_does_not_have_is_unresolvable() {
+    // 404: never registered. 410: tombstoned. Neither changes on retry.
+    for status in [404, 410] {
+        let world = World::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{ACCOUNT}")))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(json!({ "message": format!("DID not registered: {ACCOUNT}") })),
+            )
+            .mount(&world.plc)
+            .await;
+
+        let resolved = world
+            .resolver()
+            .resolve_user_push_delivery_service(ACCOUNT)
+            .await;
+
+        assert!(
+            matches!(resolved, Err(UserDeliveryServiceError::Unresolvable(_))),
+            "HTTP {status}: {resolved:?}"
+        );
+        assert!(world.pds_requests().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_did_that_can_never_be_looked_up_is_unresolvable() {
+    let unusable = [
+        // Not a method this gateway resolves.
+        "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+        "did:example:alice",
+        "not-a-did",
+        // Not a PLC identifier: wrong length, wrong alphabet.
+        "did:plc:tooshort",
+        "did:plc:SIMJZKP2KPHGI6ZUTWQXHYZM",
+        // did:web with no host, or a path that could leave its directory.
+        "did:web:",
+        "did:web:example.com:..:did.json",
+        "did:web:example.com::users",
+        // did:web on an address the gateway refuses to contact.
+        "did:web:10.0.0.1",
+        "did:web:169.254.169.254",
+    ];
+    let world = World::start().await;
+    for did in unusable {
+        let resolved = world
+            .resolver()
+            .resolve_user_push_delivery_service(did)
+            .await;
+
+        assert!(
+            matches!(resolved, Err(UserDeliveryServiceError::Unresolvable(_))),
+            "{did}: {resolved:?}"
+        );
+    }
+    assert!(
+        world
+            .plc
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "none of these may reach the directory"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_did_document_is_unresolvable() {
     let world = World::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/{ACCOUNT}")))
-        .respond_with(ResponseTemplate::new(502))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; 256 * 1024 + 1]))
         .mount(&world.plc)
         .await;
 
@@ -355,8 +484,38 @@ async fn an_unreachable_directory_is_unavailable() {
         .await;
 
     assert!(
-        matches!(resolved, Err(UserDeliveryServiceError::Unavailable(_))),
+        matches!(resolved, Err(UserDeliveryServiceError::Unresolvable(_))),
         "{resolved:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_did_document_only_lookup_reports_the_same_failures_as_before() {
+    // `getServiceAuth` uses this lookup; its error text is unchanged.
+    let world = World::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{ACCOUNT}")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&world.plc)
+        .await;
+    let resolver = world.resolver();
+
+    let missing = resolver
+        .resolve_user_mls_service_did(ACCOUNT)
+        .await
+        .expect_err("a 404 is an error");
+    assert_eq!(
+        missing.to_string(),
+        format!("DID document lookup for {ACCOUNT} returned HTTP 404 Not Found")
+    );
+
+    let unsupported = resolver
+        .resolve_user_mls_service_did("did:example:alice")
+        .await
+        .expect_err("an unsupported method is an error");
+    assert_eq!(
+        unsupported.to_string(),
+        "unsupported DID method 'did:example:alice'"
     );
 }
 

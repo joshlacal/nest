@@ -197,6 +197,11 @@ pub enum UserDeliveryServiceError {
     /// The chat declaration names a delivery service this gateway does not
     /// accept from a repo record.
     NotAllowed(String),
+    /// The account's DID document can never be read as things stand: the
+    /// directory does not have the DID, the DID is not one this gateway can
+    /// look up, or the document is larger than the gateway reads. Retrying
+    /// the same request cannot succeed.
+    Unresolvable(String),
     /// The DID document or the PDS could not be read; retrying may succeed.
     Unavailable(String),
 }
@@ -209,6 +214,7 @@ impl std::fmt::Display for UserDeliveryServiceError {
             Self::NotAllowed(did) => {
                 write!(f, "declared delivery service '{did}' is not allowed")
             }
+            Self::Unresolvable(why) => write!(f, "DID document cannot be resolved: {why}"),
             Self::Unavailable(why) => write!(f, "delivery service lookup unavailable: {why}"),
         }
     }
@@ -369,7 +375,12 @@ impl HttpMlsDsIdentityResolver {
         parse_declaration_response(account_did, status, &body)
     }
 
-    async fn fetch_did_document(&self, did: &str) -> Result<Vec<u8>> {
+    async fn fetch_did_document(
+        &self,
+        did: &str,
+    ) -> std::result::Result<Vec<u8>, DidDocumentFetchError> {
+        use DidDocumentFetchError::{Permanent, Transient};
+
         let did = did.trim();
         let url = if let Some(plc_suffix) = did.strip_prefix("did:plc:") {
             if plc_suffix.len() != 24
@@ -377,7 +388,7 @@ impl HttpMlsDsIdentityResolver {
                     .bytes()
                     .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
             {
-                return Err(anyhow!("invalid did:plc identifier '{did}'"));
+                return Err(Permanent(anyhow!("invalid did:plc identifier '{did}'")));
             }
             format!("{}/{}", self.plc_directory_url.trim_end_matches('/'), did)
         } else if let Some(web_rest) = did.strip_prefix("did:web:") {
@@ -385,25 +396,36 @@ impl HttpMlsDsIdentityResolver {
             let raw_host = segments
                 .next()
                 .filter(|h| !h.is_empty())
-                .ok_or_else(|| anyhow!("missing host in did:web '{did}'"))?;
+                .ok_or_else(|| Permanent(anyhow!("missing host in did:web '{did}'")))?;
             let host = urlencoding::decode(raw_host)
-                .map_err(|e| anyhow!("invalid did:web host encoding: {e}"))?;
+                .map_err(|e| Permanent(anyhow!("invalid did:web host encoding: {e}")))?;
             let path_segments: Vec<&str> = segments.collect();
             if path_segments.is_empty() {
                 format!("https://{host}/.well-known/did.json")
             } else {
                 for seg in &path_segments {
                     if seg.is_empty() || *seg == "." || *seg == ".." || seg.contains('/') {
-                        return Err(anyhow!("invalid path segment in did:web '{did}'"));
+                        return Err(Permanent(anyhow!(
+                            "invalid path segment in did:web '{did}'"
+                        )));
                     }
                 }
                 format!("https://{host}/{}/did.json", path_segments.join("/"))
             }
         } else {
-            return Err(anyhow!("unsupported DID method '{did}'"));
+            return Err(Permanent(anyhow!("unsupported DID method '{did}'")));
         };
 
-        validate_pds_url(&url).map_err(|e| anyhow!("DID resolution URL blocked: {e}"))?;
+        if let Err(e) = validate_pds_url(&url) {
+            let blocked = anyhow!("DID resolution URL blocked: {e}");
+            // A did:web names its own host, so a refused host is a property of
+            // the DID. The did:plc host is this gateway's own configuration.
+            return Err(if did.starts_with("did:web:") {
+                Permanent(blocked)
+            } else {
+                Transient(blocked)
+            });
+        }
         let resp = self
             .http_client
             .get(&url)
@@ -413,14 +435,55 @@ impl HttpMlsDsIdentityResolver {
             )
             .send()
             .await
-            .with_context(|| format!("fetch DID document for {did}"))?;
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "DID document lookup for {did} returned HTTP {}",
-                resp.status()
-            ));
+            .map_err(|e| {
+                Transient(anyhow::Error::new(e).context(format!("fetch DID document for {did}")))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let failed = anyhow!("DID document lookup for {did} returned HTTP {status}");
+            // 404: the directory or host has no such DID. 410: it is
+            // tombstoned. Every other status can change while the DID stays
+            // the same.
+            return Err(
+                if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+                    Permanent(failed)
+                } else {
+                    Transient(failed)
+                },
+            );
         }
         read_did_document_body(resp, did).await
+    }
+}
+
+/// Why a DID document could not be fetched.
+///
+/// `registerKey` answers the two cases differently. Every other caller only
+/// needs the underlying error, which [`From`] hands back unchanged.
+#[derive(Debug)]
+enum DidDocumentFetchError {
+    /// Asking again cannot succeed: the DID is not one the gateway can look
+    /// up, its host is refused, the directory does not have it, or its
+    /// document is over the size cap.
+    Permanent(anyhow::Error),
+    /// Asking again may succeed: the request did not complete, or the
+    /// directory or host answered with a failure of its own.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for DidDocumentFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Permanent(e) | Self::Transient(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<DidDocumentFetchError> for anyhow::Error {
+    fn from(error: DidDocumentFetchError) -> Self {
+        match error {
+            DidDocumentFetchError::Permanent(e) | DidDocumentFetchError::Transient(e) => e,
+        }
     }
 }
 
@@ -435,13 +498,18 @@ const MAX_DID_DOCUMENT_BYTES: usize = 256 * 1024;
 /// unauthenticated caller. The body is therefore never buffered whole: a
 /// declared length over the cap is refused up front, and an undeclared one is
 /// cut off at the first chunk that crosses it.
-async fn read_did_document_body(resp: reqwest::Response, did: &str) -> Result<Vec<u8>> {
+async fn read_did_document_body(
+    resp: reqwest::Response,
+    did: &str,
+) -> std::result::Result<Vec<u8>, DidDocumentFetchError> {
     match read_capped_body(resp, MAX_DID_DOCUMENT_BYTES).await {
         Ok(body) => Ok(body),
-        Err(CappedBodyError::TooLarge) => Err(anyhow!("DID document for {did} exceeds 256 KiB")),
-        Err(CappedBodyError::Read(e)) => {
-            Err(anyhow::Error::new(e).context(format!("read DID document for {did}")))
-        }
+        Err(CappedBodyError::TooLarge) => Err(DidDocumentFetchError::Permanent(anyhow!(
+            "DID document for {did} exceeds 256 KiB"
+        ))),
+        Err(CappedBodyError::Read(e)) => Err(DidDocumentFetchError::Transient(
+            anyhow::Error::new(e).context(format!("read DID document for {did}")),
+        )),
     }
 }
 
@@ -616,7 +684,14 @@ impl MlsDsIdentityResolver for HttpMlsDsIdentityResolver {
         let doc_bytes = self
             .fetch_did_document(account_did)
             .await
-            .map_err(|e| UserDeliveryServiceError::Unavailable(format!("{e:#}")))?;
+            .map_err(|e| match e {
+                DidDocumentFetchError::Permanent(e) => {
+                    UserDeliveryServiceError::Unresolvable(format!("{e:#}"))
+                }
+                DidDocumentFetchError::Transient(e) => {
+                    UserDeliveryServiceError::Unavailable(format!("{e:#}"))
+                }
+            })?;
 
         // The DID document decides whenever it has an `#atproto_mls` entry,
         // usable or not: a repo record must never override it.
@@ -1068,7 +1143,9 @@ struct RegisterServiceJwtClaims {
 /// What `registerKey` answers when no delivery service can be bound.
 ///
 /// Permanent causes keep the `400 InvalidMlsServiceDid` clients already
-/// handle. A source that could not be read is `503`, so a directory or PDS
+/// handle, including a DID document that can never be read (not in the
+/// directory, a DID the gateway cannot look up, an oversized document). A
+/// source that failed in a way a retry can fix is `503`, so a directory or PDS
 /// outage is not reported as the account's fault.
 fn register_key_resolution_error(error: &UserDeliveryServiceError) -> AppError {
     let invalid = |why: &str| AppError::BadRequest(format!("InvalidMlsServiceDid: {why}"));
@@ -1084,6 +1161,9 @@ fn register_key_resolution_error(error: &UserDeliveryServiceError) -> AppError {
             "the delivery service in the account's chat declaration is not accepted by this \
              gateway; name it in the DID document #atproto_mls service instead",
         ),
+        UserDeliveryServiceError::Unresolvable(_) => {
+            invalid("account's DID document cannot be resolved")
+        }
         UserDeliveryServiceError::Unavailable(_) => AppError::ServiceUnavailable(
             "Could not read the account's DID document or chat declaration; try again".into(),
         ),
@@ -2009,6 +2089,9 @@ mod register_key_resolution_error_tests {
             UserDeliveryServiceError::NotDeclared,
             UserDeliveryServiceError::Invalid("'value' must be an object".into()),
             UserDeliveryServiceError::NotAllowed("did:web:evil-ds.example.com".into()),
+            UserDeliveryServiceError::Unresolvable(
+                "DID document lookup for did:plc:gone returned HTTP 404 Not Found".into(),
+            ),
         ] {
             let (status, body) = answer(error.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error:?}");
@@ -2018,8 +2101,10 @@ mod register_key_resolution_error_tests {
                 "{error:?} answered {body}"
             );
             assert!(
-                !message.contains("evil-ds") && !message.contains("must be an object"),
-                "the answer must not echo record contents: {body}"
+                !message.contains("evil-ds")
+                    && !message.contains("must be an object")
+                    && !message.contains("HTTP 404"),
+                "the answer must not echo record contents or lookup details: {body}"
             );
         }
     }
