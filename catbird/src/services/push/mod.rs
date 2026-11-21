@@ -1201,13 +1201,15 @@ pub(crate) async fn resolve_background_session(
         .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
     let did = Did::new(account_did)
         .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
-    let session_data = jacquard_client
-        .registry
-        .get(&did, session_data.session_id.as_str(), true)
-        .await
-        .map_err(|err| {
-            anyhow!("Jacquard session lookup/refresh failed for DID {account_did}: {err}")
-        })?;
+    let session_data = crate::services::session_refresh::get_refreshed_session(
+        jacquard_client,
+        did.as_str(),
+        session_data.session_id.as_str(),
+    )
+    .await
+    .map_err(|err| {
+        anyhow!("Jacquard session lookup/refresh failed for DID {account_did}: {err}")
+    })?;
     let expires_at = session_data
         .token_set
         .expires_at

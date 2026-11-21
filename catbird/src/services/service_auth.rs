@@ -293,11 +293,24 @@ impl ServiceAuthProvider {
             .ok_or(AppError::InvalidSession)?;
         let did = jacquard_common::types::did::Did::new(session.did.as_str())
             .map_err(|_| AppError::InvalidSession)?;
-        let session_data = jacquard_client
-            .registry
-            .get(&did, &session_id_str, true)
-            .await
-            .map_err(|_| AppError::InvalidSession)?;
+        let session_data = crate::services::session_refresh::get_refreshed_session(
+            jacquard_client,
+            did.as_str(),
+            &session_id_str,
+        )
+        .await
+        .map_err(|error| {
+            if error.is_permanent() {
+                AppError::InvalidSession
+            } else {
+                // A store or authorization server that could not be reached is not a dead
+                // session. Answering "invalid session" for it signs a working account out.
+                tracing::warn!(error = %error, "Session read for service auth failed; retryable");
+                AppError::AuthTemporarilyUnavailable(
+                    "Authentication service is temporarily unavailable. Please retry.".into(),
+                )
+            }
+        })?;
 
         Ok(JacquardDpopData {
             dpop_key: session_data.dpop_data.dpop_key.clone(),

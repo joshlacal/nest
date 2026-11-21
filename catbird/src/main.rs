@@ -241,6 +241,18 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    // A token refresh still in flight must be stored before the process exits: once the
+    // authorization server has consumed the old refresh token, losing the new one costs the
+    // account its session (`services::session_refresh`).
+    let unfinished =
+        services::session_refresh::finish_detached_work(std::time::Duration::from_secs(20)).await;
+    if unfinished > 0 {
+        tracing::warn!(
+            unfinished,
+            "Exiting with session reads still in flight; a refresh among them may be lost"
+        );
+    }
+
     Ok(())
 }
 

@@ -221,12 +221,16 @@ async fn resolve_session_via_jacquard(
         .oauth_client_for_profile(&oauth_profile)
         .ok_or_else(|| AppError::Internal("Jacquard client not configured".into()))?;
 
-    // Step 2: Get session from registry (auto_refresh=true triggers token refresh if needed)
-    let session_data = jacquard_client
-        .registry
-        .get(&did, session_id, true)
-        .await
-        .map_err(|e| AppError::OAuth(format!("Jacquard session get failed: {e}")))?;
+    // Step 2: Get the session, refreshing its tokens if they are about to expire. The read
+    // runs on its own task: a client that drops this request must not take a refresh in
+    // flight down with it (see `services::session_refresh`).
+    let session_data = crate::services::session_refresh::get_refreshed_session(
+        jacquard_client,
+        did.as_str(),
+        session_id,
+    )
+    .await
+    .map_err(|e| AppError::OAuth(format!("Jacquard session get failed: {e}")))?;
 
     // Step 3: Convert ClientSessionData → CatbirdSession for backward compatibility
     let expires_at = session_data

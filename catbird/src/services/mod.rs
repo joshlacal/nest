@@ -21,6 +21,7 @@ pub use redis_auth_store::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
 pub mod redis_crypto;
 pub mod revocation;
 pub mod service_auth;
+pub mod session_refresh;
 mod ssrf;
 
 pub use atproto_client::{

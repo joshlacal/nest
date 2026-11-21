@@ -86,6 +86,8 @@ ipnet = "2.10"
 a2 = "0.10"
 
 [dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`).
+tokio = { version = "1", features = ["test-util"] }
 axum-test = "15"
 tokio-test = "0.4"
 wiremock = "0.6"
