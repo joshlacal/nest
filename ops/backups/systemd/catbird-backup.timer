@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Catbird database backup
+
+[Timer]
+# 08:17 UTC is 3:17 AM Eastern (4:17 AM in summer), a quiet hour for US users.
+OnCalendar=*-*-* 08:17:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
