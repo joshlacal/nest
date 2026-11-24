@@ -39,12 +39,11 @@ pub async fn report_record_handler(
 ) -> Result<Json<ReportRecordOutput>, AppError> {
     tracing::debug!("Handling reportRecord request");
     let details_ref = input.details.as_ref().map(|s| s.as_str());
-    let disclosed_media = input
-        .disclosed_media
-        .as_ref()
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| AppError::InvalidRequest(format!("Invalid disclosedMedia: {e}")))?;
+    // `disclosedPostKey` / `disclosedMedia` are deliberately ignored: the
+    // operator never receives the means to decrypt Circle content.
+    if input.disclosed_post_key.is_some() || input.disclosed_media.is_some() {
+        tracing::info!("reportRecord: discarded disclosed decryption keys from an older client");
+    }
     let id = crate::reports::report_record(
         &state,
         &user.did,
@@ -52,8 +51,6 @@ pub async fn report_record_handler(
         input.uri.as_str(),
         input.reason,
         details_ref,
-        input.disclosed_post_key.as_deref(),
-        disclosed_media.as_ref(),
     )
     .await?;
 
