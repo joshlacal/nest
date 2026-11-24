@@ -3,7 +3,8 @@
 -- Reports go from the app through the reporter's PDS straight to Catbird's
 -- Ozone service and carry ids only. When the operator takes an account down
 -- in Ozone, Ozone labels the account DID `!takedown` (or `!suspend` with an
--- expiry). The label poller (src/moderation/mod.rs) mirrors those labels here.
+-- expiry). The label poller (src/moderation/mod.rs) mirrors those labels here,
+-- and startup drops any row the current configuration no longer enforces.
 -- Newest `cts` wins per (src, did, val); a negation lifts the restriction.
 CREATE TABLE IF NOT EXISTS moderation_account_labels (
     src TEXT NOT NULL,
@@ -18,12 +19,6 @@ CREATE TABLE IF NOT EXISTS moderation_account_labels (
 
 CREATE INDEX IF NOT EXISTS moderation_account_labels_live_idx
     ON moderation_account_labels (did) WHERE NOT neg;
-
-CREATE TABLE IF NOT EXISTS moderation_label_cursors (
-    src TEXT PRIMARY KEY,
-    cursor TEXT,
-    updated_at TIMESTAMPTZ NOT NULL
-);
 
 -- Every account whose content must drop out of views: deactivated, suspended
 -- or deleted at its PDS, or taken down by the operator. Feed, thread,

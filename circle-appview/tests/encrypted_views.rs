@@ -36,7 +36,9 @@ use catbird_atproto::jacquard_common::types::string::{Did, Handle};
 use circle_appview::auth::AuthenticatedUser;
 use circle_appview::config::AppState;
 use circle_appview::moderation::labels::AccountLabelEvent;
-use circle_appview::moderation::{apply_label_event, is_account_restricted};
+use circle_appview::moderation::{
+    apply_label_event, is_account_restricted, prune_to_config, ModerationLabelConfig,
+};
 use circle_appview::routes::create_router;
 use circle_appview::space_client::MockSpaceHostTransport;
 
@@ -677,6 +679,33 @@ async fn timed_suspension_lapses(pool: PgPool) {
     assert!(!is_account_restricted(&pool, BOB_DID).await.unwrap());
     let (feed, _) = get_feed(&setup, SPACE_URI).await;
     assert_eq!(feed.feed.len(), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn startup_prune_drops_labels_the_config_no_longer_enforces(pool: PgPool) {
+    let setup = setup(&pool).await;
+    ingest_thread_fixture(&setup).await;
+    let ev = takedown_event(BOB_DID, -60, false);
+    apply_label_event(&pool, &ev).await.unwrap();
+    assert!(is_account_restricted(&pool, BOB_DID).await.unwrap());
+
+    let cfg = ModerationLabelConfig {
+        labeler_did: ev.src.clone(),
+        labeler_url: "https://ozone.example".into(),
+        enforced_labels: vec!["!suspend".into()],
+        poll_interval: std::time::Duration::from_secs(30),
+    };
+    // `!takedown` is no longer enforced, so its row goes and Bob's content
+    // returns to views.
+    assert_eq!(prune_to_config(&pool, Some(&cfg)).await.unwrap(), 1);
+    assert!(!is_account_restricted(&pool, BOB_DID).await.unwrap());
+    let (feed, _) = get_feed(&setup, SPACE_URI).await;
+    assert_eq!(feed.feed.len(), 1);
+
+    // Unconfigured moderation keeps nothing.
+    apply_label_event(&pool, &ev).await.unwrap();
+    assert_eq!(prune_to_config(&pool, None).await.unwrap(), 1);
+    assert!(!is_account_restricted(&pool, BOB_DID).await.unwrap());
 }
 
 #[sqlx::test(migrations = "./migrations")]

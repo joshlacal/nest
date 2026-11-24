@@ -196,7 +196,7 @@ where
         TOMBSTONE_RETENTION_DAYS,
     );
     let moderation_task =
-        moderation::spawn_label_poller(state.db.clone(), state.http_client.clone());
+        moderation::spawn_label_poller(state.db.clone(), state.http_client.clone()).await;
     let server_res = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
         .await;

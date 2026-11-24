@@ -40,6 +40,55 @@ pub struct WireLabel {
     pub exp: Option<String>,
 }
 
+/// Where a reconcile walk starts: every DID begins with this.
+pub const RECONCILE_ROOT: &str = "did:";
+
+/// Characters a DID may continue with: the stored DID shape minus `%`, which
+/// Ozone strips from patterns, so it cannot narrow a bucket.
+const DID_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-";
+
+/// One `queryLabels` request in a reconcile walk.
+///
+/// Ozone pages `queryLabels` without an `ORDER BY`, so following its cursor
+/// can skip rows. A request whose page comes back short is complete, so the
+/// walk asks for subject prefixes and splits any prefix whose page is full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelBucket {
+    /// Every subject starting with this.
+    Prefix(String),
+    /// Exactly this subject.
+    Exact(String),
+}
+
+impl LabelBucket {
+    /// The `uriPatterns` value for this bucket.
+    pub fn pattern(&self) -> String {
+        match self {
+            Self::Prefix(prefix) => format!("{prefix}*"),
+            Self::Exact(subject) => subject.clone(),
+        }
+    }
+
+    /// Narrower buckets that together cover this one, or `None` when it
+    /// cannot be narrowed further.
+    pub fn split(&self) -> Option<Vec<LabelBucket>> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Prefix(prefix) if prefix.len() >= MAX_DID_LEN => None,
+            Self::Prefix(prefix) => {
+                let mut out = Vec::with_capacity(DID_CHARS.len() + 1);
+                out.push(Self::Exact(prefix.clone()));
+                out.extend(
+                    DID_CHARS
+                        .chars()
+                        .map(|c| Self::Prefix(format!("{prefix}{c}"))),
+                );
+                Some(out)
+            }
+        }
+    }
+}
+
 /// One account-level label state change from the trusted labeler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountLabelEvent {
@@ -258,5 +307,43 @@ mod tests {
         assert_eq!(out.cursor.as_deref(), Some("42"));
         assert_eq!(out.labels.len(), 1);
         assert!(!out.labels[0].neg);
+    }
+
+    #[test]
+    fn bucket_patterns() {
+        assert_eq!(LabelBucket::Prefix("did:".into()).pattern(), "did:*");
+        assert_eq!(
+            LabelBucket::Exact("did:plc:abc".into()).pattern(),
+            "did:plc:abc"
+        );
+    }
+
+    #[test]
+    fn splitting_a_bucket_covers_it_exactly() {
+        let parts = LabelBucket::Prefix("did:plc:ab".into())
+            .split()
+            .expect("prefix splits");
+        assert_eq!(parts[0], LabelBucket::Exact("did:plc:ab".into()));
+        // Every DID under the prefix lands in exactly one part.
+        for did in [
+            "did:plc:ab",
+            "did:plc:abz7",
+            "did:plc:abQ",
+            "did:plc:ab.x",
+            "did:plc:ab-_",
+        ] {
+            let hits = parts
+                .iter()
+                .filter(|part| match part {
+                    LabelBucket::Exact(subject) => did == subject.as_str(),
+                    LabelBucket::Prefix(prefix) => did.starts_with(prefix.as_str()),
+                })
+                .count();
+            assert_eq!(hits, 1, "{did}");
+        }
+        assert!(LabelBucket::Exact("did:plc:ab".into()).split().is_none());
+        assert!(LabelBucket::Prefix("d".repeat(MAX_DID_LEN))
+            .split()
+            .is_none());
     }
 }
