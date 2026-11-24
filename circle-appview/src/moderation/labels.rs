@@ -43,8 +43,9 @@ pub struct WireLabel {
 /// Where a reconcile walk starts: every DID begins with this.
 pub const RECONCILE_ROOT: &str = "did:";
 
-/// Characters a DID may continue with: the stored DID shape minus `%`, which
-/// Ozone strips from patterns, so it cannot narrow a bucket.
+/// Every character [`is_account_did`] accepts after the method, so splitting a
+/// bucket on these covers it exactly. `%` is not among them: Ozone strips it
+/// from patterns, so no bucket could narrow onto a percent-encoded DID.
 const DID_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-";
 
 /// One `queryLabels` request in a reconcile walk.
@@ -133,6 +134,11 @@ pub fn parse_enforced_labels(raw: Option<&str>) -> Vec<String> {
 
 /// A bare account DID (`did:plc:…` or `did:web:…`), not a record URI and not
 /// a DID URL with a fragment or path.
+///
+/// A percent-encoded `did:web` (a host with a port, like
+/// `did:web:localhost%3A2583`) is not an account here. atproto only allows
+/// ports on localhost for development, and the reconcile walk cannot reach
+/// such a DID, so enforcing it would be silently partial.
 pub fn is_account_did(uri: &str) -> bool {
     if uri.len() > MAX_DID_LEN {
         return false;
@@ -147,7 +153,7 @@ pub fn is_account_did(uri: &str) -> bool {
     !rest.is_empty()
         && rest
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'%' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
         && !rest.ends_with(':')
 }
 
@@ -269,6 +275,25 @@ mod tests {
         assert!(!is_account_did("did:plc:abc#atproto"));
         assert!(!is_account_did("did:key:z6Mk"));
         assert!(!is_account_did("did:plc:"));
+        assert!(!is_account_did("did:web:localhost%3A2583"));
+    }
+
+    #[test]
+    fn bucket_splits_reach_every_account_did() {
+        // Each byte an account DID may hold after `did:` has its own child
+        // bucket, so a full bucket's children always cover it.
+        for b in 0u8..=127 {
+            let c = b as char;
+            let did = format!("did:web:a{c}b");
+            if is_account_did(&did) {
+                assert!(DID_CHARS.contains(c), "{c:?} is accepted but never walked");
+            }
+        }
+        let plc = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        assert!(is_account_did(plc));
+        assert!(plc[RECONCILE_ROOT.len()..]
+            .chars()
+            .all(|c| DID_CHARS.contains(c)));
     }
 
     #[test]
