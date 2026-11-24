@@ -1,0 +1,22 @@
+[Unit]
+Description=Catbird backup restore test and repository check
+Documentation=file:///opt/catbird-backup/README.md
+Wants=network-online.target
+After=network-online.target postgresql.service catbird-backup.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/catbird-backup/backup.env
+# Restores the newest dump of every database into a scratch database, then
+# drops it, then reads back 5% of the repository's data to check it.
+ExecStart=/usr/local/sbin/catbird-backup verify
+ExecStart=/usr/local/sbin/catbird-backup check
+StateDirectory=catbird-backup
+CacheDirectory=catbird-backup
+Nice=15
+IOSchedulingClass=idle
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=yes
+TimeoutStartSec=3h

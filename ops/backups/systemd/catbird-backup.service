@@ -1,0 +1,21 @@
+[Unit]
+Description=Catbird encrypted database backup
+Documentation=file:///opt/catbird-backup/README.md
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/catbird-backup/backup.env
+# Doppler alternative (no env file on disk), as the other Catbird units do:
+# ExecStart=/usr/bin/doppler run --project catbird-backup --config prd -- /usr/local/sbin/catbird-backup backup
+ExecStart=/usr/local/sbin/catbird-backup backup
+StateDirectory=catbird-backup
+CacheDirectory=catbird-backup
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=yes
+TimeoutStartSec=2h
