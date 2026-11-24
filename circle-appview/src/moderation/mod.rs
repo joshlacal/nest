@@ -249,24 +249,35 @@ async fn query_bucket(
 /// and a full page is split into longer prefixes until every bucket fits.
 /// A small labeler costs one request per pass. Returns how many labels were
 /// applied.
+///
+/// `pending` carries the walk between calls: a pass that runs out of its
+/// request budget, or fails, leaves its unvisited buckets there and the next
+/// call picks up where it stopped instead of restarting at the root, so no
+/// prefix is starved. An empty `pending` starts a fresh pass.
 async fn reconcile(
     pool: &DbPool,
     http: &reqwest::Client,
     cfg: &ModerationLabelConfig,
+    pending: &mut Vec<LabelBucket>,
 ) -> Result<usize, ReconcileError> {
-    let mut pending = vec![LabelBucket::Prefix(labels::RECONCILE_ROOT.to_owned())];
+    if pending.is_empty() {
+        pending.push(LabelBucket::Prefix(labels::RECONCILE_ROOT.to_owned()));
+    }
     let mut requests = 0usize;
     let mut applied = 0usize;
-    while let Some(bucket) = pending.pop() {
+    while let Some(bucket) = pending.last().cloned() {
         if requests >= MAX_REQUESTS_PER_RECONCILE {
-            return Err(anyhow::anyhow!(
-                "reconcile stopped after {requests} requests; {} prefixes left",
-                pending.len() + 1
-            )
-            .into());
+            tracing::info!(
+                left = pending.len(),
+                "moderation label pass continues next poll"
+            );
+            return Ok(applied);
         }
         requests += 1;
+        // Leave the bucket queued until its rows are applied, so a failed
+        // request is retried on the next call.
         let Some(rows) = query_bucket(http, cfg, &bucket).await? else {
+            pending.pop();
             match bucket.split() {
                 Some(children) => pending.extend(children),
                 None => tracing::error!(
@@ -284,6 +295,7 @@ async fn reconcile(
                 Err(skip) => tracing::debug!(?skip, "moderation label skipped"),
             }
         }
+        pending.pop();
     }
     Ok(applied)
 }
@@ -301,8 +313,9 @@ pub async fn run_label_poller(
         labels = ?cfg.enforced_labels,
         "moderation label poller started"
     );
+    let mut pending = Vec::new();
     loop {
-        match reconcile(&pool, &http, &cfg).await {
+        match reconcile(&pool, &http, &cfg, &mut pending).await {
             Ok(applied) => tracing::debug!(applied, "moderation labels reconciled"),
             Err(ReconcileError::WildcardsDisabled) => tracing::error!(
                 "Ozone refuses wildcard label queries, so takedowns are NOT enforced; \
