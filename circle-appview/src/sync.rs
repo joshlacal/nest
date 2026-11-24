@@ -1134,10 +1134,12 @@ impl SyncEngine {
         let identities = vec![author_did.to_owned(), extract_authority_did(space_uri)?];
         let account_states: Vec<(bool,)> =
             sqlx::query_as("SELECT active FROM circle_account_status WHERE did=ANY($1) FOR SHARE")
-                .bind(identities)
+                .bind(&identities)
                 .fetch_all(&mut *tx)
                 .await?;
-        if account_states.iter().any(|(active,)| !active) {
+        if account_states.iter().any(|(active,)| !active)
+            || crate::moderation::any_restricted(&mut *tx, &identities).await?
+        {
             return Err(AppError::Forbidden(
                 "Account became unavailable during synchronization".into(),
             ));
@@ -1154,7 +1156,7 @@ impl SyncEngine {
                     JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri AND meta.access_epoch = c.access_epoch AND meta.app_access_granted = true
                     WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_read = true
                       AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
-                      AND NOT EXISTS (SELECT 1 FROM circle_account_status a WHERE a.did IN (m.member_did, c.authority_did) AND NOT a.active)
+                      AND NOT EXISTS (SELECT 1 FROM circle_inactive_dids a WHERE a.did IN (m.member_did, c.authority_did))
                     "#,
                 )
                 .bind(space_uri)
@@ -1695,10 +1697,12 @@ impl SyncEngine {
         let identities = vec![author_did.to_owned(), extract_authority_did(space_uri)?];
         let account_states: Vec<(bool,)> =
             sqlx::query_as("SELECT active FROM circle_account_status WHERE did=ANY($1) FOR SHARE")
-                .bind(identities)
+                .bind(&identities)
                 .fetch_all(&mut *tx)
                 .await?;
-        if account_states.iter().any(|(active,)| !active) {
+        if account_states.iter().any(|(active,)| !active)
+            || crate::moderation::any_restricted(&mut *tx, &identities).await?
+        {
             return Err(AppError::Forbidden(
                 "Account became unavailable during synchronization".into(),
             ));
@@ -1715,7 +1719,7 @@ impl SyncEngine {
                     JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri AND meta.access_epoch = c.access_epoch AND meta.app_access_granted = true
                     WHERE m.space_uri = $1 AND m.member_did = $2 AND m.can_read = true
                       AND meta.last_refreshed_at > now() - INTERVAL '30 seconds'
-                      AND NOT EXISTS (SELECT 1 FROM circle_account_status a WHERE a.did IN (m.member_did, c.authority_did) AND NOT a.active)
+                      AND NOT EXISTS (SELECT 1 FROM circle_inactive_dids a WHERE a.did IN (m.member_did, c.authority_did))
                     "#,
                 )
                 .bind(space_uri)

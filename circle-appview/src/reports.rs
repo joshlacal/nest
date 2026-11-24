@@ -4,10 +4,13 @@ use crate::error::AppError;
 use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordReason;
 use uuid::Uuid;
 
-/// Length of an encrypted Circle post's per-post key (`postKey`).
-pub const DISCLOSED_POST_KEY_LEN: usize = 32;
-
-#[allow(clippy::too_many_arguments)]
+/// Store a member's report of a Circle record.
+///
+/// Reports carry ids only. Catbird's operator never reads Circle content, so
+/// any `disclosedPostKey` / `disclosedMedia` an older app build still sends is
+/// dropped by the handler and never reaches this function or the database.
+/// Current builds report to the operator's Ozone service instead; this
+/// endpoint stays so older builds keep working.
 pub async fn report_record(
     state: &AppState,
     reporter_did: &str,
@@ -15,20 +18,9 @@ pub async fn report_record(
     subject_uri: &str,
     reason: ReportRecordReason,
     details: Option<&str>,
-    disclosed_post_key: Option<&[u8]>,
-    disclosed_media: Option<&serde_json::Value>,
 ) -> Result<String, AppError> {
     // 1. Require verified member access in the Space
     access::check_member_access(state, space_uri, reporter_did).await?;
-
-    // A disclosed per-post key is the 32-byte `postKey`; anything else is malformed.
-    if let Some(key) = disclosed_post_key {
-        if key.len() != DISCLOSED_POST_KEY_LEN {
-            return Err(AppError::InvalidRequest(format!(
-                "disclosedPostKey must be exactly {DISCLOSED_POST_KEY_LEN} bytes"
-            )));
-        }
-    }
 
     // 2. Validate details length (max 500 chars in database constraint)
     if let Some(d) = details {
@@ -99,8 +91,8 @@ pub async fn report_record(
 
     sqlx::query(
         r#"
-        INSERT INTO circle_reports (id, reporter_did, space_uri, subject_uri, reason, details, disclosed_post_key, disclosed_media, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+        INSERT INTO circle_reports (id, reporter_did, space_uri, subject_uri, reason, details, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, now())
         "#,
     )
     .bind(report_id)
@@ -109,8 +101,6 @@ pub async fn report_record(
     .bind(&verified_subject_uri)
     .bind(reason_str)
     .bind(details)
-    .bind(disclosed_post_key)
-    .bind(disclosed_media)
     .execute(&state.db)
     .await
     .map_err(AppError::Database)?;

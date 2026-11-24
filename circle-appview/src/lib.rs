@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod hydration;
 pub mod identity_events;
 pub mod media;
+pub mod moderation;
 pub mod notifications;
 pub mod notify;
 pub mod oauth;
@@ -194,6 +195,8 @@ where
         std::time::Duration::from_secs(3600),
         TOMBSTONE_RETENTION_DAYS,
     );
+    let moderation_task =
+        moderation::spawn_label_poller(state.db.clone(), state.http_client.clone()).await;
     let server_res = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
         .await;
@@ -206,11 +209,17 @@ where
     if let Some((_, sender)) = &identity_task {
         let _ = sender.send(true);
     }
+    if let Some((_, sender)) = &moderation_task {
+        let _ = sender.send(true);
+    }
     let sweep_res = sweep_handle.await;
     let jti_res = jti_handle.await;
     let rejections_res = rejections_handle.await;
     let tombstone_res = tombstone_handle.await;
     if let Some((handle, _)) = identity_task {
+        handle.await?;
+    }
+    if let Some((handle, _)) = moderation_task {
         handle.await?;
     }
     match (

@@ -35,6 +35,10 @@ use catbird_atproto::jacquard_common::types::string::{Did, Handle};
 
 use circle_appview::auth::AuthenticatedUser;
 use circle_appview::config::AppState;
+use circle_appview::moderation::labels::AccountLabelEvent;
+use circle_appview::moderation::{
+    apply_label_event, is_account_restricted, prune_to_config, ModerationLabelConfig,
+};
 use circle_appview::routes::create_router;
 use circle_appview::space_client::MockSpaceHostTransport;
 
@@ -482,17 +486,19 @@ async fn get_keys_denies_non_member(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn report_stores_disclosed_key(pool: PgPool) {
+async fn report_discards_disclosed_key(pool: PgPool) {
+    // Catbird's operator never gets the means to decrypt Circle content. An
+    // older client that still sends a post key and media keys with a report
+    // gets the report filed, and the keys are thrown away.
     let setup = setup(&pool).await;
     let (root_uri, _) = ingest_thread_fixture(&setup).await;
     let std_uri = format!("at://{OWNER_DID}/{POST}/{ROOT_RKEY}");
-    let post_key = [9u8; 32];
     let media_cid = blob_cid(b"encrypted-blob");
     let input = json!({
         "space": SPACE_URI,
         "uri": std_uri,
         "reason": "abuse",
-        "disclosedPostKey": {"$bytes": STANDARD_NO_PAD.encode(post_key)},
+        "disclosedPostKey": {"$bytes": STANDARD_NO_PAD.encode([9u8; 32])},
         "disclosedMedia": [{
             "cid": media_cid,
             "key": {"$bytes": STANDARD_NO_PAD.encode([5u8; 32])},
@@ -511,48 +517,32 @@ async fn report_stores_disclosed_key(pool: PgPool) {
     let id: Value = serde_json::from_slice(&body).unwrap();
     let report_id = uuid::Uuid::parse_str(id["id"].as_str().unwrap()).unwrap();
 
-    let (subject, key, media): (String, Option<Vec<u8>>, Option<Value>) = sqlx::query_as(
-        "SELECT subject_uri, disclosed_post_key, disclosed_media FROM circle_reports WHERE id = $1",
+    let (subject, reason): (String, String) =
+        sqlx::query_as("SELECT subject_uri, reason FROM circle_reports WHERE id = $1")
+            .bind(report_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(subject, root_uri);
+    assert_eq!(reason, "abuse");
+
+    // There is nowhere left to store a key.
+    let key_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'circle_reports' \
+            AND column_name LIKE 'disclosed%'",
     )
-    .bind(report_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(subject, root_uri);
-    assert_eq!(key.as_deref(), Some(post_key.as_slice()));
-    let media = media.unwrap();
-    assert_eq!(media[0]["cid"], json!(media_cid));
-    let decoded = |field: &str| {
-        STANDARD_NO_PAD
-            .decode(
-                media[0][field]["$bytes"]
-                    .as_str()
-                    .unwrap()
-                    .trim_end_matches('='),
-            )
-            .unwrap()
-    };
-    assert_eq!(decoded("key"), vec![5u8; 32]);
-    assert_eq!(decoded("iv"), vec![6u8; 12]);
+    assert_eq!(
+        key_columns, 0,
+        "circle_reports must not hold disclosed keys"
+    );
 
-    // A disclosed key must be exactly 32 bytes.
-    let mut bad = input.clone();
-    bad["disclosedPostKey"] = json!({"$bytes": STANDARD_NO_PAD.encode([9u8; 31])});
-    let (status, body) = xrpc_post(
-        &setup,
-        BOB_DID,
-        &setup.bob_key,
-        "blue.catbird.circle.reportRecord",
-        &bad,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let err: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err["error"], json!("InvalidRequest"));
-
-    // Reports without disclosure are still accepted.
+    // Reports without disclosure are accepted as before.
     let plain = json!({"space": SPACE_URI, "uri": std_uri, "reason": "spam"});
-    let (status, body) = xrpc_post(
+    let (status, _) = xrpc_post(
         &setup,
         BOB_DID,
         &setup.bob_key,
@@ -561,20 +551,161 @@ async fn report_stores_disclosed_key(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let id: Value = serde_json::from_slice(&body).unwrap();
-    let (key, media): (Option<Vec<u8>>, Option<Value>) = sqlx::query_as(
-        "SELECT disclosed_post_key, disclosed_media FROM circle_reports WHERE id = $1",
-    )
-    .bind(uuid::Uuid::parse_str(id["id"].as_str().unwrap()).unwrap())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(key.is_none() && media.is_none());
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM circle_reports")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(total, 2, "the malformed disclosure stored nothing");
+    assert_eq!(total, 2);
+}
+
+fn takedown_event(did: &str, cts_offset_secs: i64, neg: bool) -> AccountLabelEvent {
+    AccountLabelEvent {
+        src: "did:plc:catbird-ozone".into(),
+        did: did.into(),
+        val: "!takedown".into(),
+        cts: Utc::now() + chrono::Duration::seconds(cts_offset_secs),
+        exp: None,
+        neg,
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn operator_takedown_locks_account_out_and_hides_its_content(pool: PgPool) {
+    let setup = setup(&pool).await;
+    let (_root_uri, _) = ingest_thread_fixture(&setup).await;
+    let feed_query = format!("space={}&includeEncrypted=true", url_encode(SPACE_URI));
+
+    // The operator takes Bob down in Ozone.
+    apply_label_event(&pool, &takedown_event(BOB_DID, -60, false))
+        .await
+        .unwrap();
+
+    // Bob is refused on every authenticated route.
+    let (status, body) = xrpc_get(
+        &setup,
+        BOB_DID,
+        &setup.bob_key,
+        "blue.catbird.circle.getFeed",
+        &feed_query,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let err: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(err["error"], json!("Forbidden"));
+    let (status, _) = xrpc_post(
+        &setup,
+        BOB_DID,
+        &setup.bob_key,
+        "blue.catbird.circle.reportRecord",
+        &json!({"space": SPACE_URI, "uri": format!("at://{OWNER_DID}/{POST}/{ROOT_RKEY}"), "reason": "spam"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Bob's reply and like drop out of what the owner sees.
+    let (status, body) = xrpc_get(
+        &setup,
+        OWNER_DID,
+        &setup.owner_key,
+        "blue.catbird.circle.getFeed",
+        &feed_query,
+    )
+    .await;
+    let text = String::from_utf8(body).unwrap();
+    assert_eq!(status, StatusCode::OK, "owner getFeed failed: {text}");
+    let feed: GetFeedOutput = serde_json::from_str(&text).unwrap();
+    let FeedItemPost::EncryptedPostView(view) = &feed.feed[0].post else {
+        panic!("an envelope must be served as encryptedPostView");
+    };
+    assert_eq!(view.like_count, Some(0));
+    assert_eq!(view.reply_count, Some(0));
+
+    // A stale reversal (older than the takedown) changes nothing.
+    apply_label_event(&pool, &takedown_event(BOB_DID, -120, true))
+        .await
+        .unwrap();
+    let (status, _) = xrpc_get(
+        &setup,
+        BOB_DID,
+        &setup.bob_key,
+        "blue.catbird.circle.getFeed",
+        &feed_query,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The operator reverses the takedown; Bob and his content come back.
+    apply_label_event(&pool, &takedown_event(BOB_DID, 0, true))
+        .await
+        .unwrap();
+    let (feed, _) = get_feed(&setup, SPACE_URI).await;
+    let FeedItemPost::EncryptedPostView(view) = &feed.feed[0].post else {
+        panic!("an envelope must be served as encryptedPostView");
+    };
+    assert_eq!(view.like_count, Some(1));
+    assert_eq!(view.reply_count, Some(1));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn operator_takedown_of_owner_closes_the_circle(pool: PgPool) {
+    let setup = setup(&pool).await;
+    ingest_thread_fixture(&setup).await;
+    apply_label_event(&pool, &takedown_event(OWNER_DID, -60, false))
+        .await
+        .unwrap();
+    let (status, _) = xrpc_get(
+        &setup,
+        BOB_DID,
+        &setup.bob_key,
+        "blue.catbird.circle.getFeed",
+        &format!("space={}&includeEncrypted=true", url_encode(SPACE_URI)),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a taken-down owner's Circle must not be served"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn timed_suspension_lapses(pool: PgPool) {
+    let setup = setup(&pool).await;
+    ingest_thread_fixture(&setup).await;
+    let mut ev = takedown_event(BOB_DID, -60, false);
+    ev.val = "!suspend".into();
+    ev.exp = Some(Utc::now() - chrono::Duration::seconds(1));
+    apply_label_event(&pool, &ev).await.unwrap();
+    assert!(!is_account_restricted(&pool, BOB_DID).await.unwrap());
+    let (feed, _) = get_feed(&setup, SPACE_URI).await;
+    assert_eq!(feed.feed.len(), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn startup_prune_drops_labels_the_config_no_longer_enforces(pool: PgPool) {
+    let setup = setup(&pool).await;
+    ingest_thread_fixture(&setup).await;
+    let ev = takedown_event(BOB_DID, -60, false);
+    apply_label_event(&pool, &ev).await.unwrap();
+    assert!(is_account_restricted(&pool, BOB_DID).await.unwrap());
+
+    let cfg = ModerationLabelConfig {
+        labeler_did: ev.src.clone(),
+        labeler_url: "https://ozone.example".into(),
+        enforced_labels: vec!["!suspend".into()],
+        poll_interval: std::time::Duration::from_secs(30),
+    };
+    // `!takedown` is no longer enforced, so its row goes and Bob's content
+    // returns to views.
+    assert_eq!(prune_to_config(&pool, Some(&cfg)).await.unwrap(), 1);
+    assert!(!is_account_restricted(&pool, BOB_DID).await.unwrap());
+    let (feed, _) = get_feed(&setup, SPACE_URI).await;
+    assert_eq!(feed.feed.len(), 1);
+
+    // Unconfigured moderation keeps nothing.
+    apply_label_event(&pool, &ev).await.unwrap();
+    assert_eq!(prune_to_config(&pool, None).await.unwrap(), 1);
+    assert!(!is_account_restricted(&pool, BOB_DID).await.unwrap());
 }
 
 #[sqlx::test(migrations = "./migrations")]

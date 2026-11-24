@@ -87,7 +87,13 @@ pub async fn require_active_account(pool: &PgPool, did: &str) -> Result<(), AppE
         Some((false, _)) => Err(AppError::Forbidden(
             "Account temporarily unavailable".into(),
         )),
-        _ => Ok(()),
+        _ => {
+            // Operator takedown in Ozone (mirrored by the moderation poller).
+            if crate::moderation::is_account_restricted(pool, did).await? {
+                return Err(AppError::Forbidden("Account unavailable".into()));
+            }
+            Ok(())
+        }
     }
 }
 

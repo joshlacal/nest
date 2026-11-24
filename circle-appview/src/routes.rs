@@ -99,6 +99,11 @@ pub fn create_router(state: AppState) -> Router {
             "/xrpc/blue.catbird.circle.activateCircle",
             post(activate_circle_handler),
         )
+        // Innermost: runs after `authenticate` has set the caller's DID.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_not_operator_restricted,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_lifecycle_ready,
@@ -183,6 +188,29 @@ async fn require_lifecycle_ready(
     next.run(request).await
 }
 
+/// Refuse every authenticated call from an account the operator took down in
+/// Ozone. Fails closed: a database error refuses the request.
+async fn require_not_operator_restricted(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(did) = request
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .map(|user| user.did.clone())
+    else {
+        // `authenticate` always runs first; a missing caller is a wiring bug.
+        return AppError::Internal("caller identity missing".into()).into_response();
+    };
+    match crate::moderation::is_account_restricted(&state.db, &did).await {
+        Ok(false) => next.run(request).await,
+        Ok(true) => AppError::Forbidden("Account unavailable".into()).into_response(),
+        Err(error) => AppError::Database(error).into_response(),
+    }
+}
+
 async fn get_capabilities(State(state): State<AppState>) -> Json<GetCapabilitiesOutput> {
     Json(GetCapabilitiesOutput {
         enabled: lifecycle_ready(&state).await,
@@ -263,7 +291,7 @@ async fn list_circles_handler(
         LEFT JOIN circle_member_cache m ON m.space_uri = c.space_uri AND m.member_did = $1 AND m.can_read = true
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = c.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = c.space_uri AND pref.member_did = $1
-        WHERE c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
+        WHERE c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_inactive_dids) AND c.app_access_granted = true
           AND (
               c.authority_did = $1
               OR (

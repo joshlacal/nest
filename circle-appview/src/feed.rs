@@ -352,13 +352,13 @@ pub async fn get_feed(
             c.display_name AS circle_name,
             c.authority_did AS circle_owner,
             COALESCE(pref.muted, false) AS circle_muted,
-            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri) AS like_count,
+            (SELECT count(*) FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_inactive_dids) WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri) AS like_count,
             (
                 SELECT count(*)
                 FROM circle_records rep
                 WHERE rep.parent_uri = r.uri
                   AND rep.space_uri = r.space_uri
-                  AND rep.deleted_at IS NULL AND NOT rep.stale_key AND rep.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+                  AND rep.deleted_at IS NULL AND NOT rep.stale_key AND rep.author_did NOT IN (SELECT did FROM circle_inactive_dids)
                   AND (
                       rep.root_uri IS NULL
                       OR EXISTS (
@@ -370,7 +370,7 @@ pub async fn get_feed(
                                END
                            ))
                              AND root.space_uri = r.space_uri
-                             AND root.deleted_at IS NULL AND NOT root.stale_key AND root.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+                             AND root.deleted_at IS NULL AND NOT root.stale_key AND root.author_did NOT IN (SELECT did FROM circle_inactive_dids)
                              AND root.collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')
                        )
                    )
@@ -385,19 +385,19 @@ pub async fn get_feed(
                                END
                            ))
                              AND p.space_uri = r.space_uri
-                             AND p.deleted_at IS NULL AND NOT p.stale_key AND p.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+                             AND p.deleted_at IS NULL AND NOT p.stale_key AND p.author_did NOT IN (SELECT did FROM circle_inactive_dids)
                              AND p.collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')
                        )
                    )
              ) AS reply_count,
-            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
+            (SELECT l.uri FROM circle_likes l JOIN circle_records lr ON lr.uri = l.uri AND lr.deleted_at IS NULL AND lr.author_did NOT IN (SELECT did FROM circle_inactive_dids) WHERE l.post_uri = r.uri AND l.space_uri = r.space_uri AND l.author_did = $1) AS viewer_like_uri
         FROM circle_records r
-        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active) AND c.app_access_granted = true
+        JOIN circles c ON c.space_uri = r.space_uri AND c.deleted_at IS NULL AND c.authority_did NOT IN (SELECT did FROM circle_inactive_dids) AND c.app_access_granted = true
         LEFT JOIN circle_member_cache m ON m.space_uri = r.space_uri AND m.member_did = $1 AND m.can_read = true
         LEFT JOIN circle_member_cache_meta meta ON meta.space_uri = r.space_uri
         LEFT JOIN circle_preferences pref ON pref.space_uri = r.space_uri AND pref.member_did = $1
         WHERE r.collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')
-          AND r.deleted_at IS NULL AND NOT r.stale_key AND r.author_did NOT IN (SELECT did FROM circle_account_status WHERE NOT active)
+          AND r.deleted_at IS NULL AND NOT r.stale_key AND r.author_did NOT IN (SELECT did FROM circle_inactive_dids)
           AND r.parent_uri IS NULL
           AND (
               c.authority_did = $1
