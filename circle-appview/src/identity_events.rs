@@ -218,6 +218,10 @@ enum Confirmation {
     Status(ConfirmedStatus),
     /// The current PDS answered `RepoNotFound`: it no longer hosts this DID.
     RepoNotFound { pds_url: String },
+    /// The DID no longer resolves because its latest PLC operation is a
+    /// tombstone. Swan tombstones the DID as part of permanent deletion, after
+    /// it sequences `#account deleted`, so there is no PDS left to ask.
+    Tombstoned,
 }
 /// The current PDS did not confirm a status. Nothing was written yet.
 struct Unconfirmed {
@@ -246,8 +250,10 @@ pub async fn refresh_account(
 /// `Err` only for local (database) failures, and `Some` when the PDS did not
 /// confirm a status. Deletion needs the PDS: either an explicit `deleted`
 /// status, or RepoNotFound after the relay reported this account deleted (the
-/// reference PDS removes the account before sequencing that event). A relay
-/// hint alone, or RepoNotFound alone, never purges.
+/// reference PDS removes the account before sequencing that event), or a PLC
+/// tombstone after the relay reported this account deleted (Swan tombstones
+/// the DID during deletion, so it stops resolving). A relay hint alone,
+/// RepoNotFound alone, or a tombstone alone never purges.
 async fn refresh(
     state: &AppState,
     did: &str,
@@ -289,6 +295,21 @@ async fn refresh(
                     "PDS answered RepoNotFound without an account deletion event"
                 ),
                 pds_url: Some(pds_url),
+                deletion_hint,
+            }))
+        }
+        Ok(Confirmation::Tombstoned) if deletion_hint => ConfirmedStatus {
+            active: false,
+            status: Some("deleted".into()),
+            pds_url: previous
+                .as_ref()
+                .map(|(_, pds_url)| pds_url.clone())
+                .unwrap_or_default(),
+        },
+        Ok(Confirmation::Tombstoned) => {
+            return Ok(Some(Unconfirmed {
+                reason: anyhow::anyhow!("DID is tombstoned without an account deletion event"),
+                pds_url: None,
                 deletion_hint,
             }))
         }
@@ -400,11 +421,18 @@ async fn confirm_status_with_transport(
     // KEM keys are read from this same DID-document cache; invalidating it also
     // prevents reuse of an old KEM key on the next Space response-MAC request.
     state.did_resolver.invalidate_cached(did);
-    let doc = state
-        .did_resolver
-        .resolve_identity_event(did)
-        .await
-        .map_err(|_| anyhow::anyhow!("Cannot confirm current account PDS"))?;
+    let doc = match state.did_resolver.resolve_identity_event(did).await {
+        Ok(doc) => doc,
+        Err(_) => {
+            // A tombstoned did:plc stops resolving. Report that, so refresh()
+            // can settle a deletion the relay announced; any other failure
+            // confirms nothing.
+            if matches!(state.did_resolver.plc_tombstoned(did).await, Ok(true)) {
+                return Ok(Confirmation::Tombstoned);
+            }
+            anyhow::bail!("Cannot confirm current account PDS");
+        }
+    };
     let (endpoint, _) = crate::access::resolve_pds_endpoint(&doc, did)?;
     let mut target = url::Url::parse(&endpoint)?;
     anyhow::ensure!(
@@ -1082,6 +1110,206 @@ mod tests {
             require_active_account(&pool, AUTHOR).await,
             Err(AppError::AccessRemoved(_))
         ));
+    }
+
+    /// Makes the fixture's PLC directory answer for `did` the way plc.directory
+    /// does once the DID is tombstoned: the document is gone (410) and the
+    /// latest operation is the tombstone.
+    async fn tombstone(pds: &PdsFixture, did: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{did}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(410)
+                    .set_body_json(json!({"message":format!("DID not available: {did}")})),
+            )
+            .with_priority(1)
+            .mount(&pds._plc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{did}/log/last")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                json!({"type":"plc_tombstone","prev":"bafyreifixtureprev","sig":"fixture-sig"}),
+            ))
+            .mount(&pds._plc)
+            .await;
+    }
+
+    /// Swan sequences `#account deleted` and then tombstones the DID, so the
+    /// AppView can no longer find a PDS to ask. The deletion event plus the
+    /// tombstone at the configured PLC directory is a confirmed deletion.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn swan_deletion_with_plc_tombstone_purges(pool: PgPool) {
+        seed(&pool).await;
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[OWNER]).await;
+        tombstone(&pds, AUTHOR).await;
+        let deleted = lifecycle_event(
+            "#account",
+            json!({"seq":10,"did":AUTHOR,"active":false,"status":"deleted","time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &deleted, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, AUTHOR).await,
+            Some((false, Some("deleted".into())))
+        );
+        assert_eq!(
+            record_count(&pool).await,
+            0,
+            "deleted author payload purged"
+        );
+        let memberships: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM circle_member_cache WHERE member_did=$1")
+                .bind(AUTHOR)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memberships, 0, "deleted member's cached memberships purged");
+        assert_eq!(cursor(&pool).await, 10, "event checkpointed");
+        require_active_account(&pool, OWNER).await.unwrap();
+    }
+
+    /// The owner's Circles go with a tombstoned owner, as with any confirmed
+    /// owner deletion.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tombstoned_owner_deletion_deletes_owned_circles(pool: PgPool) {
+        seed(&pool).await;
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[AUTHOR]).await;
+        tombstone(&pds, OWNER).await;
+        let deleted = lifecycle_event(
+            "#account",
+            json!({"seq":10,"did":OWNER,"active":false,"status":"deleted","time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &deleted, &pds.transport)
+            .await
+            .unwrap();
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM circles WHERE authority_did=$1 AND deleted_at IS NULL",
+        )
+        .bind(OWNER)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 0, "owned Circle deleted");
+        assert_eq!(
+            record_count(&pool).await,
+            0,
+            "the Circle's posts went with it"
+        );
+    }
+
+    /// A tombstone without a deletion event is not enough, and neither is a
+    /// deletion event whose DID merely fails to resolve. Both leave the account
+    /// denied and unpurged until a later re-check confirms it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tombstone_alone_or_unresolvable_did_does_not_purge(pool: PgPool) {
+        seed(&pool).await;
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[OWNER]).await;
+        tombstone(&pds, AUTHOR).await;
+        let identity = lifecycle_event(
+            "#identity",
+            json!({"seq":10,"did":AUTHOR,"time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &identity, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, AUTHOR).await,
+            Some((false, Some(UNCONFIRMED.into())))
+        );
+        assert_eq!(
+            record_count(&pool).await,
+            1,
+            "tombstone alone purges nothing"
+        );
+
+        // An unresolvable DID whose latest PLC operation is not a tombstone.
+        const STRANGER: &str = "did:plc:lifecyclestrangerabcdefg";
+        sqlx::query("INSERT INTO circle_member_cache(space_uri,member_did,can_read,can_write) VALUES($1,$2,true,false)")
+            .bind(SPACE).bind(STRANGER).execute(&pool).await.unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{STRANGER}/log/last")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"type":"plc_operation","prev":null,"sig":"s"})),
+            )
+            .mount(&pds._plc)
+            .await;
+        let deleted = lifecycle_event(
+            "#account",
+            json!({"seq":11,"did":STRANGER,"active":false,"status":"deleted","time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &deleted, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, STRANGER).await,
+            Some((false, Some(DELETION_UNCONFIRMED.into())))
+        );
+        let memberships: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM circle_member_cache WHERE member_did=$1")
+                .bind(STRANGER)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memberships, 1, "unconfirmed deletion purges nothing");
+    }
+
+    /// A deletion event that arrived while the DID was unresolvable is settled
+    /// by the re-check once the tombstone is visible.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recheck_settles_deletion_once_tombstone_is_visible(pool: PgPool) {
+        seed(&pool).await;
+        let mut app = state(pool.clone());
+        let pds = PdsFixture::start(&mut app, &[OWNER]).await;
+        let deleted = lifecycle_event(
+            "#account",
+            json!({"seq":10,"did":AUTHOR,"active":false,"status":"deleted","time":Utc::now()}),
+        );
+        process_lifecycle_event(&app, RELAY, &deleted, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, AUTHOR).await,
+            Some((false, Some(DELETION_UNCONFIRMED.into())))
+        );
+        assert_eq!(record_count(&pool).await, 1);
+        tombstone(&pds, AUTHOR).await;
+        sqlx::query("UPDATE circle_account_status SET confirmed_at = now() - interval '1 hour' WHERE did=$1")
+            .bind(AUTHOR)
+            .execute(&pool)
+            .await
+            .unwrap();
+        recheck_unconfirmed(&app, RELAY, 11, &pds.transport)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger_status(&pool, AUTHOR).await,
+            Some((false, Some("deleted".into())))
+        );
+        assert_eq!(record_count(&pool).await, 0);
+    }
+
+    /// Rejection records name their author, so a deleted author's go too.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deleted_author_purge_removes_their_rejection_records(pool: PgPool) {
+        seed(&pool).await;
+        for author in [AUTHOR, OWNER] {
+            sqlx::query("INSERT INTO circle_rejections(space_uri,author_did,rev,uri_hash,reason_code,observed_at) VALUES($1,$2,'rev',$3,'invalid',now())")
+                .bind(SPACE).bind(author).bind(author.as_bytes().to_vec())
+                .execute(&pool).await.unwrap();
+        }
+        crate::purge::purge_deleted_author(&pool, AUTHOR)
+            .await
+            .unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT author_did FROM circle_rejections")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![OWNER.to_string()]);
     }
 
     async fn ledger_status(pool: &PgPool, did: &str) -> Option<(bool, Option<String>)> {

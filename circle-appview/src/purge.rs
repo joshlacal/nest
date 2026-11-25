@@ -534,6 +534,7 @@ pub async fn purge_deleted_author(pool: &PgPool, author: &str) -> Result<(), Pur
     for (table, predicate) in [
         ("circle_notifications", "actor_did=$1 OR recipient_did=$1"),
         ("circle_reports", "reporter_did=$1"),
+        ("circle_rejections", "author_did=$1"),
         ("circle_preferences", "member_did=$1"),
         ("circle_repo_sync_state", "author_did=$1"),
         ("circle_keys", "owner_did=$1"),
