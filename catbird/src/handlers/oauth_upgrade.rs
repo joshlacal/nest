@@ -267,11 +267,9 @@ pub async fn upgrade_start(
     let oauth_profile = state.session_oauth_profile(&session.did, &session_id).await;
     let registered_max_scopes: Vec<String> =
         if matches!(oauth_profile.trim(), "catmos" | "catmos-web") {
-            state
-                .catmos_oauth_scopes
-                .iter()
-                .map(|scope| scope.to_string_normalized().to_string())
-                .collect()
+            // The upgrade ceiling, not the sign-in list: catmos sign-in stays
+            // narrow, while an upgrade may reach the encrypted-chat scopes.
+            state.catmos_oauth_upgrade_scopes.clone()
         } else {
             state.config.oauth.max_scopes.clone()
         };

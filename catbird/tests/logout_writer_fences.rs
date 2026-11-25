@@ -259,6 +259,7 @@ fn fixture_state(
         jacquard_client: None,
         catmos_jacquard_client: None,
         catmos_oauth_scopes: vec![],
+        catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
         auth_store: Some(f.store.clone()),
         push: Some(push),

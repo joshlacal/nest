@@ -696,6 +696,51 @@ pub fn default_optional_scopes() -> Vec<String> {
     ]
 }
 
+/// Encrypted-chat scopes a catmos-web session may be upgraded to when
+/// `CATMOS_OAUTH_MAX_SCOPES` is not set. They are never asked for at sign-in,
+/// only on the just-in-time upgrade, and only after the client has checked that
+/// the account's server supports Spaces.
+pub fn default_catmos_upgrade_scopes() -> Vec<String> {
+    vec![
+        crate::models::oauth_upgrade::BLOB_ALL_SCOPE.to_string(),
+        crate::models::oauth_upgrade::LABYRINTH_MAILBOX_KEYS_REPO_SCOPE.to_string(),
+        crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REPO_SCOPE.to_string(),
+        crate::models::oauth_upgrade::MLS_CHAT_DEVICE_REVOCATION_REPO_SCOPE.to_string(),
+        crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE.to_string(),
+        crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE.to_string(),
+    ]
+}
+
+/// Builds the catmos-web upgrade maximum: the sign-in scopes, then either the
+/// whitespace-separated `CATMOS_OAUTH_MAX_SCOPES` or, when that is unset, the
+/// default encrypted-chat scopes. Raw spellings are kept byte-exact; each one
+/// must still parse as a scope.
+pub fn parse_catmos_upgrade_scopes(
+    signin_raw: &[String],
+    max_env: Option<&str>,
+) -> Result<Vec<String>, anyhow::Error> {
+    let extra: Vec<String> = match max_env {
+        None => default_catmos_upgrade_scopes(),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("CATMOS_OAUTH_MAX_SCOPES cannot be empty when set");
+            }
+            trimmed.split_whitespace().map(str::to_string).collect()
+        }
+    };
+    for scope in &extra {
+        jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(scope).map_err(|e| {
+            anyhow::anyhow!("Invalid CATMOS_OAUTH_MAX_SCOPES scope '{scope}': {e:?}")
+        })?;
+    }
+    let derived = derive_max_scopes(signin_raw, &extra);
+    if !derived.iter().any(|s| s == "atproto") {
+        anyhow::bail!("catmos upgrade scopes must contain mandatory 'atproto' scope");
+    }
+    Ok(derived)
+}
+
 /// Derives maximum scopes as the union of initial scopes and optional/configured max scopes,
 /// preserving initial scope order, appending non-duplicate extra scopes, without overwriting operator policy.
 pub fn derive_max_scopes(initial: &[String], optional_or_max: &[String]) -> Vec<String> {
@@ -939,8 +984,14 @@ pub struct AppState {
     pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
     /// Jacquard OAuth client for catmos-web
     pub catmos_jacquard_client: Option<Arc<JacquardOAuthClient>>,
-    /// Scopes configured for catmos-web OAuth client
+    /// Scopes catmos-web asks for at sign-in (`CATMOS_OAUTH_SCOPES`).
     pub catmos_oauth_scopes: Vec<jacquard_oauth::scopes::Scope>,
+    /// Scopes a catmos-web session may be upgraded to later
+    /// (`CATMOS_OAUTH_MAX_SCOPES`), kept as byte-exact raw strings because
+    /// they go on the wire at PAR. Always a superset of the sign-in scopes.
+    /// Kept apart from `catmos_oauth_scopes` so widening what an upgrade may
+    /// ask for never widens what every sign-in asks for.
+    pub catmos_oauth_upgrade_scopes: Vec<String>,
     /// Trusted reverse proxy CIDRs (empty = none trusted; forwarding headers ignored)
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Redis-backed auth store for Jacquard sessions
@@ -1040,6 +1091,15 @@ impl AppState {
             anyhow::bail!("CATMOS_OAUTH_SCOPES must contain mandatory 'atproto' scope");
         }
 
+        let catmos_signin_raw: Vec<String> = trimmed_catmos
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let catmos_oauth_upgrade_scopes = parse_catmos_upgrade_scopes(
+            &catmos_signin_raw,
+            std::env::var("CATMOS_OAUTH_MAX_SCOPES").ok().as_deref(),
+        )?;
+
         let rate_limit = Arc::new(crate::middleware::RateLimitState::with_trusted_proxies(
             parsed_trusted_proxies.clone(),
         ));
@@ -1055,6 +1115,7 @@ impl AppState {
             jacquard_client: None,
             catmos_jacquard_client: None,
             catmos_oauth_scopes,
+            catmos_oauth_upgrade_scopes,
             trusted_proxies: parsed_trusted_proxies,
             auth_store: None,
             push: None,
@@ -2296,6 +2357,47 @@ mod tests {
                 "identity:handle".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn catmos_upgrade_scopes_default_adds_encrypted_chat_but_signin_stays_narrow() {
+        let signin = vec!["atproto".to_string(), "transition:generic".to_string()];
+        let upgrade = parse_catmos_upgrade_scopes(&signin, None).unwrap();
+        assert_eq!(&upgrade[..2], &signin[..]);
+        for scope in default_catmos_upgrade_scopes() {
+            assert!(upgrade.contains(&scope), "missing {scope}");
+            assert!(!signin.contains(&scope));
+        }
+        // Raw spellings must survive byte-exact for PAR.
+        assert!(upgrade
+            .iter()
+            .any(|s| s == crate::models::oauth_upgrade::LABYRINTH_MAILBOX_SPACE_SCOPE));
+        // Every default upgrade scope is one the upgrade endpoint allows.
+        for scope in default_catmos_upgrade_scopes() {
+            assert!(
+                crate::models::oauth_upgrade::ALLOWLISTED_UPGRADE_SCOPES.contains(&scope.as_str()),
+                "{scope} not allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn catmos_upgrade_scopes_env_override_keeps_signin_scopes() {
+        let signin = vec!["atproto".to_string(), "transition:generic".to_string()];
+        let upgrade =
+            parse_catmos_upgrade_scopes(&signin, Some("  blob:*/*  identity:handle ")).unwrap();
+        assert_eq!(
+            upgrade,
+            vec![
+                "atproto".to_string(),
+                "transition:generic".to_string(),
+                "blob:*/*".to_string(),
+                "identity:handle".to_string(),
+            ]
+        );
+        assert!(parse_catmos_upgrade_scopes(&signin, Some("   ")).is_err());
+        let no_atproto = vec!["transition:generic".to_string()];
+        assert!(parse_catmos_upgrade_scopes(&no_atproto, None).is_err());
     }
 
     #[test]

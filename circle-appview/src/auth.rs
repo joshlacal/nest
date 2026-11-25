@@ -509,6 +509,20 @@ pub async fn read_bounded_response_bytes(
     read_bounded_public_response_bytes(response, max_bytes).await
 }
 
+fn validate_plc_did(did: &str) -> Result<(), AuthReason> {
+    let suffix = did
+        .strip_prefix("did:plc:")
+        .ok_or(AuthReason::UnsupportedDidMethod)?;
+    if suffix.len() != 24
+        || !suffix
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+    {
+        return Err(AuthReason::DidResolutionFailed);
+    }
+    Ok(())
+}
+
 pub const MAX_DID_CACHE_CAPACITY: usize = 10_000;
 pub struct DidResolver {
     plc_directory_url: String,
@@ -696,16 +710,7 @@ impl DidResolver {
     }
 
     async fn resolve_plc(&self, did: &str) -> Result<DidDocument, AuthReason> {
-        let suffix = did
-            .strip_prefix("did:plc:")
-            .ok_or(AuthReason::UnsupportedDidMethod)?;
-        if suffix.len() != 24
-            || !suffix
-                .bytes()
-                .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
-        {
-            return Err(AuthReason::DidResolutionFailed);
-        }
+        validate_plc_did(did)?;
 
         let url = format!("{}/{}", self.plc_directory_url.trim_end_matches('/'), did);
         let resp = self
@@ -725,6 +730,47 @@ impl DidResolver {
 
         serde_json::from_slice::<DidDocument>(&body_bytes)
             .map_err(|_| AuthReason::DidDocumentInvalid)
+    }
+
+    /// Whether the configured PLC directory's latest operation for `did` is a
+    /// `plc_tombstone`. A tombstoned DID no longer resolves, so this is how a
+    /// lifecycle re-check tells "deactivated for good" apart from "PLC is
+    /// unreachable". `Ok(false)` for a non-PLC DID or any other latest
+    /// operation; `Err` when the directory gives no usable answer.
+    pub async fn plc_tombstoned(&self, did: &str) -> Result<bool, AuthReason> {
+        if !did.starts_with("did:plc:") {
+            return Ok(false);
+        }
+        validate_plc_did(did)?;
+        let _permit = public_flow_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthReason::DidResolutionFailed)?;
+        let url = format!(
+            "{}/{}/log/last",
+            self.plc_directory_url.trim_end_matches('/'),
+            did
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|_| AuthReason::DidResolutionFailed)?;
+        if !resp.status().is_success() {
+            return Err(AuthReason::DidResolutionFailed);
+        }
+        let body_bytes = read_bounded_response_bytes(resp, MAX_DID_DOC_BYTES)
+            .await
+            .map_err(|_| AuthReason::DidDocumentInvalid)?;
+        #[derive(serde::Deserialize)]
+        struct LastOperation {
+            #[serde(rename = "type")]
+            kind: String,
+        }
+        let last: LastOperation =
+            serde_json::from_slice(&body_bytes).map_err(|_| AuthReason::DidDocumentInvalid)?;
+        Ok(last.kind == "plc_tombstone")
     }
 
     async fn resolve_web(&self, did: &str) -> Result<DidDocument, AuthReason> {
