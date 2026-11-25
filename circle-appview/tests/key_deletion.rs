@@ -23,7 +23,7 @@ use circle_appview::sync::{latest_key_version, SyncMode};
 
 const OWNER_DID: &str = "did:plc:alice-key-delete";
 const BOB_DID: &str = "did:plc:bob-key-delete";
-const SPACE: &str = "at://did:plc:alice-key-delete/space/blue.catbird.circle.encrypted/kd";
+const SPACE: &str = "at:space/did:plc:alice-key-delete/blue.catbird.circle.encrypted/kd";
 const REV2: &str = "3l7bbbbbbbbbb";
 
 struct Setup {

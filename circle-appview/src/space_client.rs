@@ -2726,7 +2726,7 @@ mod tests {
         }
     }
 
-    const SPACE: &str = "at://did:plc:authority123/space/blue.catbird.circle/3kabcdefghi22";
+    const SPACE: &str = "at:space/did:plc:authority123/blue.catbird.circle/3kabcdefghi22";
     const REPO: &str = "did:plc:author456";
     const CID: &str = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
     const REV: &str = "3kabcdefghi22";

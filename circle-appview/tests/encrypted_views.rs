@@ -46,9 +46,8 @@ const AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const OWNER_DID: &str = "did:plc:alice-enc-views";
 const BOB_DID: &str = "did:plc:bob-enc-views";
 const CHARLIE_DID: &str = "did:plc:charlie-enc-views";
-const SPACE_URI: &str =
-    "at://did:plc:alice-enc-views/space/blue.catbird.circle.encrypted/enc-circle";
-const PLAIN_SPACE_URI: &str = "at://did:plc:alice-enc-views/space/blue.catbird.circle/plain-circle";
+const SPACE_URI: &str = "at:space/did:plc:alice-enc-views/blue.catbird.circle.encrypted/enc-circle";
+const PLAIN_SPACE_URI: &str = "at:space/did:plc:alice-enc-views/blue.catbird.circle/plain-circle";
 const LIKE: &str = "app.bsky.feed.like";
 const PLAIN_CIRCLE_ID: &str = "3jzfcijpj2z2b";
 const ROOT_RKEY: &str = "3l7postaaaaa1";

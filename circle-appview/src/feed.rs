@@ -55,6 +55,9 @@ pub async fn summary_key_version(
         .map(|(version, _)| version))
 }
 
+/// Prefix of every Space ref and in-space record URI (`at:space/{spaceDid}/...`).
+pub const SPACE_URI_PREFIX: &str = "at:space/";
+
 pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
     let col_idx = uri
         .rfind("/app.bsky.")
@@ -282,7 +285,7 @@ pub async fn get_feed(
 
     // Authorize cursor Space if cursor provided
     if let Some(ref c) = cursor {
-        let alt_cursor_uri = if c.uri.contains("/space/") {
+        let alt_cursor_uri = if c.uri.starts_with(SPACE_URI_PREFIX) {
             normalize_uri_to_standard_aturi(&c.uri)
         } else if let Some(rest) = c.uri.strip_prefix("at://") {
             format!("at://{rest}")
@@ -301,7 +304,7 @@ pub async fn get_feed(
         let cursor_space_uri = match cursor_space {
             Some((sp,)) => sp,
             None => {
-                if c.uri.contains("/space/") {
+                if c.uri.starts_with(SPACE_URI_PREFIX) {
                     let parts: Vec<&str> = c.uri.split("/app.bsky.feed.post/").collect();
                     if let Some(prefix) = parts.first() {
                         prefix.to_string()
@@ -365,7 +368,7 @@ pub async fn get_feed(
                           SELECT 1 FROM circle_records root
                           WHERE (root.uri = rep.root_uri OR root.uri = (
                               CASE
-                                   WHEN rep.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.root_uri, '/space/', 2)
+                                   WHEN rep.root_uri LIKE 'at:space/%' THEN 'at://' || SUBSTRING(rep.root_uri FROM '^at:space/[^/]+/(.*)$')
                                    ELSE rep.root_uri
                                END
                            ))
@@ -380,7 +383,7 @@ pub async fn get_feed(
                            SELECT 1 FROM circle_records p
                            WHERE (p.uri = rep.parent_uri OR p.uri = (
                                CASE
-                                   WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
+                                   WHEN rep.parent_uri LIKE 'at:space/%' THEN 'at://' || SUBSTRING(rep.parent_uri FROM '^at:space/[^/]+/(.*)$')
                                    ELSE rep.parent_uri
                                END
                            ))

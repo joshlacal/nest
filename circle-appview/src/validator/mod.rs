@@ -206,6 +206,14 @@ pub struct ValidatedRecord {
 }
 
 fn normalize_uri_to_standard_aturi(uri: &str) -> String {
+    // `at:space/{spaceDid}/{type}/{skey}/{author}/{collection}/{rkey}` -> standard form, so
+    // schema deserialization never depends on the `at:space/` scheme being accepted.
+    if let Some(rest) = uri.strip_prefix("at:space/") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 6 && parts.iter().all(|p| !p.is_empty()) {
+            return format!("at://{}/{}/{}", parts[3], parts[4], parts[5]);
+        }
+    }
     if let Some(col_idx) = uri.rfind("/app.bsky.") {
         let prefix = &uri[..col_idx];
         if let Some(slash_idx) = prefix.rfind('/') {
@@ -248,14 +256,34 @@ fn normalize_for_lexicon_deser(val: &serde_json::Value) -> serde_json::Value {
     normalized
 }
 
+/// Lenient: map an alpha-era `at://{spaceDid}/space/{rest}` Space ref or in-space record
+/// URI to the current `at:space/{spaceDid}/{rest}` form; `None` for any other shape.
+/// Only for refs inside record VALUES read back from a space (e.g. a reply ref written
+/// during the alpha, whose CID covers the old spelling). Never for request params.
+// TODO: remove before beta
+pub fn from_legacy_space_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("at://")?;
+    let (space_did, tail) = rest.split_once('/')?;
+    let tail = tail.strip_prefix("space/")?;
+    if !space_did.starts_with("did:") || tail.is_empty() {
+        return None;
+    }
+    Some(format!("at:space/{space_did}/{tail}"))
+}
+
 /// Map a standard-form `at://<did>/<collection>/<rkey>` reference (the form the AppView
 /// serves and clients send back) to the stored space form
-/// `<space_uri>/<did>/<collection>/<rkey>`. A URI already in this Space's form, or any
-/// other shape (another Space's record, a malformed ref), is returned unchanged, so the
-/// mapping is idempotent and never makes a foreign reference resolve.
+/// `<space_uri>/<did>/<collection>/<rkey>` (`at:space/...`). A legacy
+/// `at://{spaceDid}/space/...` ref is first normalized via [`from_legacy_space_uri`].
+/// A URI already in this Space's form, or any other shape (another Space's record, a
+/// malformed ref), is returned unchanged, so the mapping is idempotent and never makes a
+/// foreign reference resolve.
 pub fn to_space_form(uri: &str, space_uri: &str) -> String {
     if space_uri.is_empty() {
         return uri.to_string();
+    }
+    if let Some(normalized) = from_legacy_space_uri(uri) {
+        return to_space_form(&normalized, space_uri);
     }
     let parsed_space = atproto_spaces::SpaceUri::parse_hedged(space_uri).ok();
     let canonical_space = parsed_space
@@ -669,9 +697,9 @@ pub async fn prune_rejections(pool: &sqlx::PgPool, max_age_days: i32) -> Result<
 
 #[cfg(test)]
 mod space_form_tests {
-    use super::to_space_form;
+    use super::{from_legacy_space_uri, to_space_form};
 
-    const SPACE: &str = "at://did:plc:owner/space/blue.catbird.circle.encrypted/c1";
+    const SPACE: &str = "at:space/did:plc:owner/blue.catbird.circle.encrypted/c1";
 
     #[test]
     fn standard_form_maps_into_the_space() {
@@ -690,13 +718,42 @@ mod space_form_tests {
     #[test]
     fn foreign_space_refs_and_malformed_refs_are_unchanged() {
         let other =
-            "at://did:plc:eve/space/blue.catbird.circle/c9/did:plc:bob/app.bsky.feed.post/3k2";
+            "at:space/did:plc:eve/blue.catbird.circle/c9/did:plc:bob/app.bsky.feed.post/3k2";
         assert_eq!(to_space_form(other, SPACE), other);
         assert_eq!(to_space_form("at://did:plc:bob", SPACE), "at://did:plc:bob");
         assert_eq!(
             to_space_form("at://did:plc:bob/app.bsky.feed.post/3k2", ""),
             "at://did:plc:bob/app.bsky.feed.post/3k2"
         );
+    }
+
+    #[test]
+    fn legacy_space_form_refs_normalize_to_the_new_form() {
+        assert_eq!(
+            to_space_form(
+                "at://did:plc:owner/space/blue.catbird.circle.encrypted/c1/did:plc:bob/app.bsky.feed.post/3k2",
+                SPACE
+            ),
+            format!("{SPACE}/did:plc:bob/app.bsky.feed.post/3k2")
+        );
+        // A legacy ref into another Space normalizes but still never resolves here.
+        assert_eq!(
+            to_space_form(
+                "at://did:plc:eve/space/blue.catbird.circle/c9/did:plc:bob/app.bsky.feed.post/3k2",
+                SPACE
+            ),
+            "at:space/did:plc:eve/blue.catbird.circle/c9/did:plc:bob/app.bsky.feed.post/3k2"
+        );
+        assert_eq!(
+            from_legacy_space_uri("at://did:plc:owner/space/blue.catbird.circle/c1").as_deref(),
+            Some("at:space/did:plc:owner/blue.catbird.circle/c1")
+        );
+        assert_eq!(from_legacy_space_uri("at://alice.test/space/a.b/c"), None);
+        assert_eq!(
+            from_legacy_space_uri("at://did:plc:bob/app.bsky.feed.post/3k2"),
+            None
+        );
+        assert_eq!(from_legacy_space_uri(SPACE), None);
     }
 
     #[test]

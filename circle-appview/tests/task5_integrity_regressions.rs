@@ -28,7 +28,7 @@ use circle_appview::{
 const CIRCLE_AUDIENCE: &str = "did:web:circles.catbird.blue#atproto_circles";
 const OWNER_DID: &str = "did:plc:alice-task5-test";
 const BOB_DID: &str = "did:plc:bob-task5-test";
-const SPACE_URI: &str = "at://did:plc:alice-task5-test/space/blue.catbird.circle/task5-circle";
+const SPACE_URI: &str = "at:space/did:plc:alice-task5-test/blue.catbird.circle/task5-circle";
 
 #[derive(Clone)]
 struct TestLtHash {

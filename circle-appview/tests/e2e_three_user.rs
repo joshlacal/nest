@@ -608,10 +608,7 @@ impl ThreeUserEnv {
     }
 
     pub async fn create_circle(&self, name: &str, initial_members: &[&str]) -> CircleInfo {
-        let space_uri = format!(
-            "at://{}/space/blue.catbird.circle/3l7family",
-            self.alice.did
-        );
+        let space_uri = format!("at:space/{}/blue.catbird.circle/3l7family", self.alice.did);
 
         // Insert circle
         sqlx::query(

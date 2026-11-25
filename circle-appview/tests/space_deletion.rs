@@ -32,7 +32,7 @@ use circle_appview::sync::{sweep_once, SyncEngine};
 
 const OWNER_DID: &str = "did:plc:owner-space-deletion";
 const BOB_DID: &str = "did:plc:bob-space-deletion";
-const SPACE_URI: &str = "at://did:plc:owner-space-deletion/space/blue.catbird.circle/3l7deleted111";
+const SPACE_URI: &str = "at:space/did:plc:owner-space-deletion/blue.catbird.circle/3l7deleted111";
 
 struct Setup {
     state: AppState,
@@ -522,7 +522,7 @@ async fn scheduled_tombstone_purge_removes_only_expired_tombstones(pool: PgPool)
         sqlx::query(
             "INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at, deleted_at) VALUES ($1, $2, $3, 'Gone', now(), now() - make_interval(days => $4))",
         )
-        .bind(format!("at://{OWNER_DID}/space/blue.catbird.circle/{space}"))
+        .bind(format!("at:space/{OWNER_DID}/blue.catbird.circle/{space}"))
         .bind(space)
         .bind(OWNER_DID)
         .bind(age_days)

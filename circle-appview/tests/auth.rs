@@ -1439,7 +1439,7 @@ async fn privacy_safe_auth_errors_and_logs_contain_no_canaries(pool: PgPool) {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let iss_canary = "did:plc:alice-secret-canary-42";
-    let space_canary = "at://did:plc:alice/space/circle/canary99";
+    let space_canary = "at:space/did:plc:alice/circle/canary99";
     let jti_canary = "jti-canary-secret-777";
     let lxm_canary = "blue.catbird.circle.secretLxmCanary";
 
@@ -3084,7 +3084,7 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
     endpoints.insert(
         "/xrpc/com.atproto.space.getSpace?space=at%3A%2F%2Fdid%3Aplc%3Aspace-auth%2Fspace%2Fcom.example.space%2F1".to_string(),
         (200, serde_json::json!({
-            "space": "at://did:plc:space-auth/space/com.example.space/1",
+            "space": "at:space/did:plc:space-auth/com.example.space/1",
             "policy": {
                 "$type": "com.atproto.memberspace.policy",
                 "publicRead": false,
@@ -3142,14 +3142,14 @@ async fn space_client_member_dids_and_get_space_keep_injected_fixture_transport(
 
     // 1. member_dids uses transport.build_pinned_client and succeeds over TLS with injected resolver/cert
     let members = space_client
-        .member_dids("at://did:plc:space-auth/space/com.example.space/1")
+        .member_dids("at:space/did:plc:space-auth/com.example.space/1")
         .await
         .unwrap();
     assert_eq!(members, vec!["did:plc:member-1", "did:plc:member-2"]);
 
     // 2. get_space uses transport.build_pinned_client and succeeds over TLS with injected resolver/cert
     let space_config = space_client
-        .get_space("at://did:plc:space-auth/space/com.example.space/1")
+        .get_space("at:space/did:plc:space-auth/com.example.space/1")
         .await
         .unwrap();
     assert_eq!(space_config.authority, "did:plc:space-auth");

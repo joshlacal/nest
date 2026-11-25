@@ -30,10 +30,10 @@ use circle_appview::{
 const OWNER_DID: &str = "did:plc:owner-notify-registration";
 const MEMBER_DID: &str = "did:plc:member-notify-registration";
 const SPACE_URI: &str =
-    "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg1";
+    "at:space/did:plc:owner-notify-registration/blue.catbird.circle/3l7notifyreg1";
 const SPACE_HOST: &str = "https://space.owner.example";
 const OTHER_SPACE_URI: &str =
-    "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg2";
+    "at:space/did:plc:owner-notify-registration/blue.catbird.circle/3l7notifyreg2";
 
 struct Setup {
     state: AppState,
@@ -247,7 +247,7 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
     let mut rejections = Vec::new();
     for (space, token) in [
         (SPACE_URI, "wrong-token"),
-        ("at://did:plc:missing/space/x/y", first.token.as_str()),
+        ("at:space/did:plc:missing/x/y", first.token.as_str()),
     ] {
         let error = notify::confirm_registration_handler(
             State(setup.state.clone()),

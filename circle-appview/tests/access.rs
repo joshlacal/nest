@@ -213,7 +213,7 @@ fn register_did_doc(
 }
 
 fn space_uri() -> String {
-    format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2space1")
+    format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2space1")
 }
 
 fn mint_delegation_token(
@@ -369,7 +369,7 @@ async fn delegation_token_validation_passes_and_fails_on_tampering(pool: PgPool)
     let wrong_space_token = mint_delegation_token(
         &setup.alice_signing_key,
         ALICE_DID,
-        "at://did:plc:other/space/blue.catbird.circle/3k2other",
+        "at:space/did:plc:other/blue.catbird.circle/3k2other",
         CIRCLE_AUDIENCE,
         now + 300,
         now,
@@ -776,8 +776,8 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
             },
         )
         .await;
-    let space1 = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2space1");
-    let space2 = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2space2");
+    let space1 = format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2space1");
+    let space2 = format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2space2");
 
     // Seed Space 1 and Space 2
     sqlx::query("INSERT INTO circles (space_uri, circle_id, authority_did, display_name, created_at) VALUES ($1, '3k2space1tidx', $2, 'Circle 1', now())")
@@ -1016,7 +1016,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
                         .and_then(|(_, body)| serde_json::from_str(body).ok())
                         .unwrap_or_default();
                     let lower = req_str.to_ascii_lowercase();
-                    let body_contract = body["space"] == "at://did:plc:auth/space/1"
+                    let body_contract = body["space"] == "at:space/did:plc:auth/1"
                         && body["delegationToken"] == "test-delegation-token"
                         && body["clientAttestation"] == "test-attestation"
                         && body["credentialKey"]
@@ -1096,7 +1096,7 @@ async fn ssrf_safe_transport_dns_seam_validations() {
 
     let exchange_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let exchange_request = circle_appview::space_client::AuthorizeSpaceSyncRequest {
-        space: "at://did:plc:auth/space/1".into(),
+        space: "at:space/did:plc:auth/1".into(),
         credential_key: circle_appview::space_signature::p256_did_key(exchange_key.verifying_key()),
         delegation_token: Some("test-delegation-token".into()),
         client_attestation: Some("test-attestation".into()),
@@ -1129,7 +1129,7 @@ async fn space_lock_manager_idle_eviction_and_capacity_bounding() {
 
     // Acquire and release a lock
     {
-        let _guard = lock_mgr.acquire("at://did:plc:space1/space/1").await;
+        let _guard = lock_mgr.acquire("at:space/did:plc:space1/1").await;
         assert_eq!(lock_mgr.lock_count().await, 1);
     }
 
@@ -1145,7 +1145,7 @@ async fn space_lock_manager_idle_eviction_and_capacity_bounding() {
     // Fill to capacity
     let mut guards = Vec::new();
     for i in 0..5 {
-        let space = format!("at://did:plc:space{i}/space/{i}");
+        let space = format!("at:space/did:plc:space{i}/{i}");
         guards.push(lock_mgr.acquire(&space).await);
     }
     assert_eq!(lock_mgr.lock_count().await, 5);
@@ -1165,7 +1165,7 @@ async fn space_lock_manager_concurrent_acquire_drop_race_maintains_mutual_exclus
     let lock_mgr = Arc::new(access::SpaceLockManager::with_capacity(10));
     let inside_critical = Arc::new(AtomicUsize::new(0));
     let violation_detected = Arc::new(AtomicBool::new(false));
-    let space = "at://did:plc:race-test/space/race";
+    let space = "at:space/did:plc:race-test/race";
 
     let mut handles = Vec::new();
     for _ in 0..50 {
@@ -1201,7 +1201,7 @@ async fn space_lock_manager_concurrent_acquire_drop_race_maintains_mutual_exclus
 #[tokio::test]
 async fn space_lock_manager_cancellation_decrements_waiter_count() {
     let lock_mgr = Arc::new(access::SpaceLockManager::with_capacity(10));
-    let space = "at://did:plc:cancel-test/space/test";
+    let space = "at:space/did:plc:cancel-test/test";
 
     // First acquire the lock so subsequent acquires must wait
     let guard = lock_mgr.acquire(space).await;
@@ -1354,7 +1354,7 @@ async fn list_members_bounds_and_repeated_cursor_detection_fails_closed(pool: Pg
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
-    let space = "at://did:plc:authspace/space/1";
+    let space = "at:space/did:plc:authspace/1";
 
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.memberspace.listMembers"))
@@ -1433,7 +1433,7 @@ async fn test_activate_circle_missing_grant_returns_auth_required_not_404_and_pr
 
     // 1. Missing AppView OAuth grant: AUTHORITY_DID has no session in oauth_sessions.
     // An unconfigured space triggers get_space which tries to fetch a token for AUTHORITY_DID.
-    let ungranted_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/ungranted");
+    let ungranted_space = format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/ungranted");
     let missing_grant_res =
         access::activate_circle(&setup.state, ALICE_DID, &ungranted_space).await;
 
@@ -1466,7 +1466,7 @@ async fn test_activate_circle_missing_grant_returns_auth_required_not_404_and_pr
     );
 
     // 2. True NotFound: when PDS returns SpaceNotFound, it must return NotFound (404), not 401 or 500
-    let not_found_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/nonexistent");
+    let not_found_space = format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/nonexistent");
     setup
         .mock_transport
         .set_space_config_error(&not_found_space, "SpaceNotFound".into());
@@ -1481,7 +1481,7 @@ async fn test_activate_circle_missing_grant_returns_auth_required_not_404_and_pr
     }
 
     // 3. Upstream failure: when PDS returns server error / unavailable, it must retain Internal (500), not 404
-    let upstream_err_space = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/upstream-err");
+    let upstream_err_space = format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/upstream-err");
     setup.mock_transport.set_space_config_error(
         &upstream_err_space,
         "Upstream server error (503 Service Unavailable)".into(),
@@ -1700,7 +1700,7 @@ async fn readded_member_sees_quiet_circle_again_through_own_listing(pool: PgPool
 async fn former_member_revalidation_is_capped_and_reveals_nothing(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
     let spaces: Vec<String> = (0..7)
-        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2former{i}"))
+        .map(|i| format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2former{i}"))
         .collect();
     for space in &spaces {
         seed_circle_with_members(&setup, space, &[BOB_DID]).await;
@@ -1805,9 +1805,9 @@ fn sorted(mut uris: Vec<String>) -> Vec<String> {
 #[sqlx::test(migrations = "./migrations")]
 async fn relisted_member_loses_former_row_and_frees_the_cap(pool: PgPool) {
     let setup = setup_test(pool.clone()).await;
-    let readded = format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2readded");
+    let readded = format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2readded");
     let removed: Vec<String> = (0..access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST)
-        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2removed{i}"))
+        .map(|i| format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2removed{i}"))
         .collect();
     for space in std::iter::once(&readded).chain(&removed) {
         seed_circle_with_members(&setup, space, &[BOB_DID]).await;
@@ -1856,7 +1856,7 @@ async fn former_member_host_failures_are_retried_at_most_every_thirty_seconds(po
     let cap = access::MAX_FORMER_MEMBER_REVALIDATIONS_PER_REQUEST;
     // Ordered by URI: the first `cap` Circles are picked first and their host fails.
     let spaces: Vec<String> = (0..=cap)
-        .map(|i| format!("at://{AUTHORITY_DID}/space/blue.catbird.circle/3k2throttle{i}"))
+        .map(|i| format!("at:space/{AUTHORITY_DID}/blue.catbird.circle/3k2throttle{i}"))
         .collect();
     let (failing, waiting) = spaces.split_at(cap as usize);
     for space in &spaces {

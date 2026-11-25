@@ -136,7 +136,7 @@ mod tests {
             kind: "atproto-space-repo".into(),
             ver: 1,
             repo: "did:plc:author".into(),
-            space: "at://did:plc:authority/space/blue.catbird.circle/test".into(),
+            space: "at:space/did:plc:authority/blue.catbird.circle/test".into(),
             rev: "3jzfcijpj2m2a".into(),
             data: hash.digest().to_vec(),
         };
@@ -154,7 +154,7 @@ mod tests {
     fn parse(bytes: &[u8]) -> Result<RepoSnapshot, AppError> {
         parse_repo_star(
             bytes,
-            "at://did:plc:authority/space/blue.catbird.circle/test",
+            "at:space/did:plc:authority/blue.catbird.circle/test",
             "did:plc:author",
         )
     }
@@ -231,13 +231,13 @@ mod tests {
         let bytes = archive(&[]);
         assert!(parse_repo_star(
             &bytes,
-            "at://did:plc:other/space/blue.catbird.circle/test",
+            "at:space/did:plc:other/blue.catbird.circle/test",
             "did:plc:author"
         )
         .is_err());
         assert!(parse_repo_star(
             &bytes,
-            "at://did:plc:authority/space/blue.catbird.circle/test",
+            "at:space/did:plc:authority/blue.catbird.circle/test",
             "did:plc:other"
         )
         .is_err());
@@ -246,7 +246,7 @@ mod tests {
             kind: "atproto-space-repo".into(),
             ver: 2,
             repo: "did:plc:author".into(),
-            space: "at://did:plc:authority/space/blue.catbird.circle/test".into(),
+            space: "at:space/did:plc:authority/blue.catbird.circle/test".into(),
             rev: "3jzfcijpj2m2a".into(),
             data: LtHash::default().digest().to_vec(),
         };
