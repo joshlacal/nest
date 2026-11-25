@@ -276,6 +276,50 @@ async fn registration_is_stable_and_confirmation_authenticates_token(pool: PgPoo
         "unknown spaces and wrong tokens must disclose the same response"
     );
 }
+/// A token stored before the at:space/ URI migration is encrypted against the legacy
+/// `at://{spaceDid}/space/...` URI. It must still authenticate after the migration
+/// rewrote `space_uri`, be re-encrypted under the new URI, and keep its value across
+/// reauthorization.
+// TODO: remove before beta
+#[sqlx::test(migrations = "./migrations")]
+async fn legacy_encrypted_token_authenticates_and_is_reencrypted(pool: PgPool) {
+    let setup = setup(pool.clone()).await;
+    let key = setup.state.oauth_service.session_encryption_key;
+    let legacy_space =
+        "at://did:plc:owner-notify-registration/space/blue.catbird.circle/3l7notifyreg1";
+    let token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB";
+    let legacy_envelope =
+        circle_appview::oauth::encrypt_secret(&key, legacy_space, token.as_bytes()).unwrap();
+    sqlx::query(
+        "INSERT INTO circle_space_notify_tokens (space_uri, endpoint, token, updated_at) VALUES ($1, $2, $3, now())",
+    )
+    .bind(SPACE_URI)
+    .bind("http://127.0.0.1:3002")
+    .bind(&legacy_envelope)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    notify::authenticate(&pool, &key, SPACE_URI, token)
+        .await
+        .expect("legacy-encrypted token must authenticate");
+
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT token FROM circle_space_notify_tokens WHERE space_uri = $1")
+            .bind(SPACE_URI)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(stored, legacy_envelope, "token must be re-encrypted");
+    assert_eq!(
+        circle_appview::oauth::decrypt_secret(&key, SPACE_URI, &stored).unwrap(),
+        token.as_bytes(),
+    );
+
+    let reauthorized = registration(&setup).await;
+    assert_eq!(reauthorized.token, token, "reauthorization keeps the token");
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn checkpoint_never_moves_backwards(pool: PgPool) {
     let setup = setup(pool.clone()).await;
