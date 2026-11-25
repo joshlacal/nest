@@ -160,7 +160,7 @@ fn test_notification_reason_open_union() {
 fn test_get_capabilities_output_contract() {
     let output = GetCapabilitiesOutput {
         enabled: true,
-        protocol_revision: SmolStr::new("d4def6e9f521896ed8222f576d54923d00b5fbeb"),
+        protocol_revision: SmolStr::new("1f510f8e36a973f6fd055da349b586918805ae66"),
         supports_images: false,
         supports_encrypted_posts: None,
         extra_data: None,
@@ -170,7 +170,7 @@ fn test_get_capabilities_output_contract() {
     assert_eq!(serialized["enabled"], true);
     assert_eq!(
         serialized["protocolRevision"],
-        "d4def6e9f521896ed8222f576d54923d00b5fbeb"
+        "1f510f8e36a973f6fd055da349b586918805ae66"
     );
     assert_eq!(serialized["supportsImages"], false);
 }
