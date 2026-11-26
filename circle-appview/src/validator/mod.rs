@@ -768,7 +768,7 @@ mod space_form_tests {
         assert_eq!(
             to_space_form(
                 "at://did:plc:bob/blue.catbird.circle.post/3k2",
-                "at://did:plc:owner/com.atproto.space.space/blue.catbird.circle.encrypted:c1"
+                "at://did:plc:owner/space/blue.catbird.circle.encrypted/c1"
             ),
             format!("{SPACE}/did:plc:bob/blue.catbird.circle.post/3k2")
         );

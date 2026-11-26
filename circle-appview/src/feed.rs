@@ -68,7 +68,10 @@ pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
         let did = if last_segment.starts_with("did:") {
             last_segment
         } else {
-            let stripped = prefix.strip_prefix("at://").unwrap_or(prefix);
+            let stripped = prefix
+                .strip_prefix("at://")
+                .or_else(|| prefix.strip_prefix("at:space/"))
+                .unwrap_or(prefix);
             stripped.split('/').next().unwrap_or(stripped)
         };
         let rest = &uri[col_idx..];
@@ -567,4 +570,29 @@ pub async fn get_feed(
         cursor: next_cursor,
         extra_data: None,
     })
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_uri_to_standard_aturi;
+
+    #[test]
+    fn in_space_record_uris_map_to_the_author_repo() {
+        assert_eq!(
+            normalize_uri_to_standard_aturi(
+                "at:space/did:plc:owner/blue.catbird.circle/c1/did:plc:bob/app.bsky.feed.post/3k2"
+            ),
+            "at://did:plc:bob/app.bsky.feed.post/3k2"
+        );
+    }
+
+    #[test]
+    fn a_space_uri_without_an_author_falls_back_to_the_space_authority() {
+        assert_eq!(
+            normalize_uri_to_standard_aturi(
+                "at:space/did:plc:owner/blue.catbird.circle/c1/app.bsky.feed.post/3k2"
+            ),
+            "at://did:plc:owner/app.bsky.feed.post/3k2"
+        );
+    }
 }
