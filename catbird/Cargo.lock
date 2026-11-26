@@ -2814,7 +2814,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jacquard-common"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "base64 0.23.1",
  "bon",
@@ -2863,7 +2863,7 @@ dependencies = [
 [[package]]
 name = "jacquard-derive"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "heck",
  "jacquard-lexicon",
@@ -2875,7 +2875,7 @@ dependencies = [
 [[package]]
 name = "jacquard-identity"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "bon",
  "bytes",
@@ -2898,7 +2898,7 @@ dependencies = [
 [[package]]
 name = "jacquard-lexicon"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "cid",
  "dashmap 6.2.1",
@@ -2925,7 +2925,7 @@ dependencies = [
 [[package]]
 name = "jacquard-oauth"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3332,7 +3332,7 @@ dependencies = [
 [[package]]
 name = "mini-moka-wasm"
 version = "0.10.99"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",

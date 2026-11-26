@@ -22,9 +22,9 @@ reqwest = { version = "0.13", features = ["rustls", "json", "cookies", "multipar
 flate2 = "1.0"
 brotli = "8.0"
 # Jacquard (AT Protocol)
-jacquard-oauth = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["default"] }
-jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }
-jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["dns", "cache"] }
+jacquard-oauth = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825", features = ["default"] }
+jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825", features = ["reqwest-client"] }
+jacquard-identity = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825", features = ["dns", "cache"] }
 jose-jwk = { version = "0.1", features = ["p256"] }
 catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-bluecatbird", "namespace-site-standard"] }
 atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
