@@ -812,7 +812,7 @@ mod tests {
     const RELAY: &str = "wss://relay.example.com/";
     const OWNER: &str = "did:plc:lifecycleownerabcdefghij";
     const AUTHOR: &str = "did:plc:lifecycleauthorabcdefghi";
-    const SPACE: &str = "at://did:plc:lifecycleownerabcdefghij/space/blue.catbird.circle/test";
+    const SPACE: &str = "at:space/did:plc:lifecycleownerabcdefghij/blue.catbird.circle/test";
 
     fn frame(kind: &str, body: serde_json::Value) -> Vec<u8> {
         let mut bytes = Vec::new();

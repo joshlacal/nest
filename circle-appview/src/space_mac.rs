@@ -181,7 +181,7 @@ mod tests {
     fn commit() -> Commit {
         Commit {
             space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(
-                "at://did:example:space/space/app.bsky.group/test",
+                "at:space/did:example:space/app.bsky.group/test",
             )
             .unwrap(),
             repo: "did:example:alice".to_owned().into(),
@@ -381,7 +381,7 @@ mod tests {
             .1
             .parse()
             .unwrap();
-        let uri = "at://did:example:space/space/app.bsky.group/test/did:example:alice/app.bsky.feed.post/self";
+        let uri = "at:space/did:example:space/app.bsky.group/test/did:example:alice/app.bsky.feed.post/self";
         let request = MacRequest {
             key_share: "did:key:zDnaRecord".into(),
             shared_secret: [9; 32],

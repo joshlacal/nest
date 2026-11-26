@@ -1,7 +1,7 @@
 use crate::access;
 use crate::config::AppState;
 use crate::error::AppError;
-use crate::feed::{build_post_view, normalize_uri_to_standard_aturi};
+use crate::feed::{build_post_view, normalize_uri_to_standard_aturi, SPACE_URI_PREFIX};
 use crate::hydration::ProfileHydrator;
 use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
 use catbird_atproto::generated::app_bsky::feed::{
@@ -126,7 +126,7 @@ pub async fn get_post_thread(
     };
 
     // 2. Fetch target post (must be in same space and authorized)
-    let alt_post_uri = if post_uri.contains("/space/") {
+    let alt_post_uri = if post_uri.starts_with(SPACE_URI_PREFIX) {
         normalize_uri_to_standard_aturi(post_uri)
     } else if let Some(rest) = post_uri.strip_prefix("at://") {
         format!("{space_uri}/{rest}")
@@ -225,7 +225,7 @@ pub async fn get_post_thread(
             if let Some((Some(_), parent_u, root_u)) = post_exists {
                 let has_active_context = if let Some(ref p_u) = parent_u {
                     let parent_active: Option<(i32,)> = sqlx::query_as(
-                        "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE '%/space/%' THEN 'at://' || SPLIT_PART($1, '/space/', 2) ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
+                        "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE 'at:space/%' THEN 'at://' || SUBSTRING($1 FROM '^at:space/[^/]+/(.*)$') ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
                     )
                     .bind(p_u)
                     .bind(space_uri)
@@ -234,7 +234,7 @@ pub async fn get_post_thread(
                     parent_active.is_some()
                 } else if let Some(ref r_u) = root_u {
                     let root_active: Option<(i32,)> = sqlx::query_as(
-                        "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE '%/space/%' THEN 'at://' || SPLIT_PART($1, '/space/', 2) ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
+                        "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE 'at:space/%' THEN 'at://' || SUBSTRING($1 FROM '^at:space/[^/]+/(.*)$') ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
                     )
                     .bind(r_u)
                     .bind(space_uri)
@@ -267,7 +267,7 @@ pub async fn get_post_thread(
     // If the requested post is a reply, verify that its root and parent posts exist and are not deleted
     if let Some(ref r_uri) = root_data.7 {
         let root_active: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE '%/space/%' THEN 'at://' || SPLIT_PART($1, '/space/', 2) ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
+            "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE 'at:space/%' THEN 'at://' || SUBSTRING($1 FROM '^at:space/[^/]+/(.*)$') ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
         )
         .bind(r_uri)
         .bind(space_uri)
@@ -281,7 +281,7 @@ pub async fn get_post_thread(
     }
     if let Some(ref p_uri) = root_data.6 {
         let parent_active: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE '%/space/%' THEN 'at://' || SPLIT_PART($1, '/space/', 2) ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
+            "SELECT 1 FROM circle_records WHERE (uri = $1 OR uri = CASE WHEN $1 LIKE 'at:space/%' THEN 'at://' || SUBSTRING($1 FROM '^at:space/[^/]+/(.*)$') ELSE $1 END) AND space_uri = $2 AND deleted_at IS NULL AND NOT stale_key AND collection IN ('app.bsky.feed.post', 'blue.catbird.circle.post')",
         )
         .bind(p_uri)
         .bind(space_uri)
@@ -321,7 +321,7 @@ pub async fn get_post_thread(
             break;
         }
 
-        let alt_p_uri = if p_uri.contains("/space/") {
+        let alt_p_uri = if p_uri.starts_with(SPACE_URI_PREFIX) {
             normalize_uri_to_standard_aturi(&p_uri)
         } else if let Some(rest) = p_uri.strip_prefix("at://") {
             format!("{space_uri}/{rest}")
@@ -627,7 +627,7 @@ async fn fetch_replies_batch(
     let mut all_match_uris = Vec::new();
     for p in parent_uris {
         all_match_uris.push(p.clone());
-        if p.contains("/space/") {
+        if p.starts_with(SPACE_URI_PREFIX) {
             all_match_uris.push(normalize_uri_to_standard_aturi(p));
         } else if let Some(rest) = p.strip_prefix("at://") {
             all_match_uris.push(format!("{space_uri}/{rest}"));
@@ -761,7 +761,7 @@ async fn fetch_thread_replies_set_based(
         let mut children_by_parent: std::collections::HashMap<String, Vec<RawThreadNode>> =
             std::collections::HashMap::new();
         for (parent_uri, node) in child_level {
-            let normalized_parent = if parent_uri.contains("/space/") {
+            let normalized_parent = if parent_uri.starts_with(SPACE_URI_PREFIX) {
                 normalize_uri_to_standard_aturi(&parent_uri)
             } else {
                 parent_uri.clone()

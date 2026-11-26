@@ -22,7 +22,7 @@ use circle_appview::space_client::MockSpaceHostTransport;
 
 const OWNER_DID: &str = "did:plc:alice-stale";
 const BOB_DID: &str = "did:plc:bob-stale";
-const SPACE: &str = "at://did:plc:alice-stale/space/blue.catbird.circle.encrypted/st";
+const SPACE: &str = "at:space/did:plc:alice-stale/blue.catbird.circle.encrypted/st";
 
 struct Setup {
     state: AppState,

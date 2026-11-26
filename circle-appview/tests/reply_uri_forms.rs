@@ -18,8 +18,8 @@ use circle_appview::space_client::MockSpaceHostTransport;
 
 const OWNER_DID: &str = "did:plc:alice-uri-forms";
 const BOB_DID: &str = "did:plc:bob-uri-forms";
-const ENC_SPACE: &str = "at://did:plc:alice-uri-forms/space/blue.catbird.circle.encrypted/enc";
-const PLAIN_SPACE: &str = "at://did:plc:alice-uri-forms/space/blue.catbird.circle/plain";
+const ENC_SPACE: &str = "at:space/did:plc:alice-uri-forms/blue.catbird.circle.encrypted/enc";
+const PLAIN_SPACE: &str = "at:space/did:plc:alice-uri-forms/blue.catbird.circle/plain";
 const PLAIN_POST: &str = "app.bsky.feed.post";
 const LIKE: &str = "app.bsky.feed.like";
 
@@ -204,6 +204,30 @@ async fn space_form_parent_still_resolves(pool: PgPool) {
     );
     let (parent_uri, _) = reply_row(&pool, &s.space_uri(BOB_DID, POST, "3l7replyaaaa1")).await;
     assert_eq!(parent_uri.as_deref(), Some(root_uri.as_str()));
+}
+
+/// A reply written during the alpha carries its parent in the old
+/// `at://{spaceDid}/space/...` spelling (the record's CID covers it, so it is never
+/// rewritten). Ingestion normalizes it leniently to `at:space/...`. TODO: remove before beta.
+#[sqlx::test(migrations = "./migrations")]
+async fn legacy_space_form_parent_resolves_to_new_form(pool: PgPool) {
+    let s = setup(&pool, ENC_SPACE, Some(ENCRYPTED_TYPE)).await;
+    let (root_uri, root_cid) = seed_encrypted_root(&s).await;
+    let legacy_parent = root_uri.replacen(
+        "at:space/did:plc:alice-uri-forms/",
+        "at://did:plc:alice-uri-forms/space/",
+        1,
+    );
+    assert_ne!(legacy_parent, root_uri);
+    let reply = envelope_reply(1, &legacy_parent, &root_cid);
+    assert_eq!(
+        s.sync(BOB_DID, &[(POST, "3l7replyaaaa1", reply)]).await,
+        (1, 0)
+    );
+    let (parent_uri, stored_root) =
+        reply_row(&pool, &s.space_uri(BOB_DID, POST, "3l7replyaaaa1")).await;
+    assert_eq!(parent_uri.as_deref(), Some(root_uri.as_str()));
+    assert_eq!(stored_root.as_deref(), Some(root_uri.as_str()));
 }
 
 /// Catbird's sealer encodes the reply through Petrel's `ReplyRef`, which always writes

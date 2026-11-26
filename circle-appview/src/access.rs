@@ -1001,6 +1001,12 @@ pub async fn activate_circle(
     user_did: &str,
     space_uri: &str,
 ) -> Result<CircleSummary, AppError> {
+    // Strict: a request param must already be in the `at:space/{did}/...` form.
+    if !space_uri.starts_with(crate::feed::SPACE_URI_PREFIX) {
+        return Err(AppError::InvalidRequest(
+            "Invalid Space URI: expected at:space/{did}/{type}/{skey}".into(),
+        ));
+    }
     let authority_did = extract_authority_did(space_uri)?;
 
     ensure_active_account(state, user_did).await?;
@@ -1514,7 +1520,7 @@ mod tests {
     }
 
     const TEST_SPACE_URI: &str =
-        "at://did:plc:authority-space-owner/space/blue.catbird.circle/3k2space1";
+        "at:space/did:plc:authority-space-owner/blue.catbird.circle/3k2space1";
     const TEST_USER_DID: &str = "did:plc:alice-member-user";
     const TEST_AUTHORITY_DID: &str = "did:plc:authority-space-owner";
     const TEST_SPACE_HOST: &str = "https://space-host.example.com";
@@ -2342,7 +2348,7 @@ mod tests {
         assert!(
             !state
                 .credential_store
-                .acquisition_failed_recently("at://did:plc:other/space/blue.catbird.circle/x")
+                .acquisition_failed_recently("at:space/did:plc:other/blue.catbird.circle/x")
                 .await
         );
 
@@ -2807,7 +2813,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn test_activate_circle_persists_encrypted_space_type(pool: PgPool) {
         const ENCRYPTED_SPACE_URI: &str =
-            "at://did:plc:authority-space-owner/space/blue.catbird.circle.encrypted/3k2space1";
+            "at:space/did:plc:authority-space-owner/blue.catbird.circle.encrypted/3k2space1";
         let (state, _pds_endpoint, _mock_pds_handle) =
             activation_fixture(&pool, ENCRYPTED_SPACE_URI, false).await;
 

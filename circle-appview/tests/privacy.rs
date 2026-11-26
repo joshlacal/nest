@@ -36,9 +36,8 @@ const ALICE_DID: &str = "did:plc:alice-privacy-owner";
 const BOB_DID: &str = "did:plc:bob-privacy-member";
 const DAVE_DID: &str = "did:plc:dave-privacy-unauthorized";
 const MEDIA_BASE: &str = "https://media.catbird.blue";
-const SPACE_1: &str = "at://did:plc:alice-privacy-owner/space/blue.catbird.circle/3l7privacy1";
-const SPACE_2: &str =
-    "at://did:plc:dave-privacy-unauthorized/space/blue.catbird.circle/3l7privacy2";
+const SPACE_1: &str = "at:space/did:plc:alice-privacy-owner/blue.catbird.circle/3l7privacy1";
+const SPACE_2: &str = "at:space/did:plc:dave-privacy-unauthorized/blue.catbird.circle/3l7privacy2";
 
 /// Exercises the retained media implementation directly, without enabling the
 /// production route or claiming private-blob host qualification.

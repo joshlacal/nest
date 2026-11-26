@@ -31,7 +31,7 @@ use serde_json::json;
 #[test]
 fn test_activate_circle_contract_serialization() {
     let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
     ))
     .unwrap();
     let input = ActivateCircle {
@@ -42,13 +42,13 @@ fn test_activate_circle_contract_serialization() {
     let serialized = serde_json::to_value(&input).unwrap();
     assert_eq!(
         serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey"
     );
 
     let deserialized: ActivateCircle = serde_json::from_value(serialized).unwrap();
     assert_eq!(
         deserialized.space.as_str(),
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey"
     );
 }
 
@@ -57,7 +57,7 @@ fn test_activate_circle_output_contract() {
     let circle_summary = CircleSummary {
         circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
         uri: AtSpaceUri::new(SmolStr::new(
-            "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+            "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
         ))
         .unwrap(),
         name: SmolStr::new("Test Circle"),
@@ -89,7 +89,7 @@ fn test_circle_summary_contract() {
     let summary = CircleSummary {
         circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
         uri: AtSpaceUri::new(SmolStr::new(
-            "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+            "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
         ))
         .unwrap(),
         name: SmolStr::new("Alice's Inner Circle"),
@@ -104,7 +104,7 @@ fn test_circle_summary_contract() {
     assert_eq!(serialized["circleId"], "3l7aaaaaaaaaa");
     assert_eq!(
         serialized["uri"],
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey"
     );
     assert_eq!(serialized["name"], "Alice's Inner Circle");
     assert_eq!(serialized["owner"], "did:plc:alice");
@@ -160,7 +160,7 @@ fn test_notification_reason_open_union() {
 fn test_get_capabilities_output_contract() {
     let output = GetCapabilitiesOutput {
         enabled: true,
-        protocol_revision: SmolStr::new("d4def6e9f521896ed8222f576d54923d00b5fbeb"),
+        protocol_revision: SmolStr::new("1f510f8e36a973f6fd055da349b586918805ae66"),
         supports_images: false,
         supports_encrypted_posts: None,
         extra_data: None,
@@ -170,7 +170,7 @@ fn test_get_capabilities_output_contract() {
     assert_eq!(serialized["enabled"], true);
     assert_eq!(
         serialized["protocolRevision"],
-        "d4def6e9f521896ed8222f576d54923d00b5fbeb"
+        "1f510f8e36a973f6fd055da349b586918805ae66"
     );
     assert_eq!(serialized["supportsImages"], false);
 }
@@ -178,7 +178,7 @@ fn test_get_capabilities_output_contract() {
 #[test]
 fn test_get_feed_query_and_output_contract() {
     let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
     ))
     .unwrap();
     let query = GetFeed {
@@ -190,7 +190,7 @@ fn test_get_feed_query_and_output_contract() {
     let serialized = serde_json::to_value(&query).unwrap();
     assert_eq!(
         serialized["space"],
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey"
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey"
     );
     assert_eq!(serialized["limit"], 25);
     assert_eq!(serialized["cursor"], "cursor123");
@@ -248,7 +248,7 @@ fn test_list_notifications_query_and_output_contract() {
 #[test]
 fn test_get_media_and_post_thread_contract() {
     let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
     ))
     .unwrap();
     let aturi = AtUri::new(SmolStr::new(
@@ -280,7 +280,7 @@ fn test_get_media_and_post_thread_contract() {
 #[test]
 fn test_moderation_and_preferences_contract() {
     let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at://did:plc:alice/space/blue.catbird.circle/3l7skey",
+        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
     ))
     .unwrap();
     let aturi = AtUri::new(SmolStr::new(

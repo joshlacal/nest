@@ -46,8 +46,8 @@ const ALICE_DID: &str = "did:plc:alice-circle-owner";
 const BOB_DID: &str = "did:plc:bob-circle-member";
 const CHARLIE_DID: &str = "did:plc:charlie-circle-nonmember";
 const MEDIA_BASE: &str = "https://media.catbird.blue";
-const SPACE_1: &str = "at://did:plc:alice-circle-owner/space/blue.catbird.circle/3l7space1";
-const SPACE_2: &str = "at://did:plc:alice-circle-owner/space/blue.catbird.circle/3l7space2";
+const SPACE_1: &str = "at:space/did:plc:alice-circle-owner/blue.catbird.circle/3l7space1";
+const SPACE_2: &str = "at:space/did:plc:alice-circle-owner/blue.catbird.circle/3l7space2";
 #[allow(dead_code)]
 struct ViewTestSetup {
     app: axum::Router,
@@ -2450,27 +2450,27 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
     // Create 5 circles for Alice: two sharing the exact same timestamp to test stability
     let spaces = [
         (
-            "at://did:plc:alice/space/blue.catbird.circle/circle-1",
+            "at:space/did:plc:alice/blue.catbird.circle/circle-1",
             "Circle 1",
             fixed_time + Duration::seconds(10),
         ),
         (
-            "at://did:plc:alice/space/blue.catbird.circle/circle-2",
+            "at:space/did:plc:alice/blue.catbird.circle/circle-2",
             "Circle 2",
             fixed_time + Duration::seconds(20),
         ),
         (
-            "at://did:plc:alice/space/blue.catbird.circle/circle-3",
+            "at:space/did:plc:alice/blue.catbird.circle/circle-3",
             "Circle 3",
             fixed_time + Duration::seconds(20),
         ), // Same timestamp as 2
         (
-            "at://did:plc:alice/space/blue.catbird.circle/circle-4",
+            "at:space/did:plc:alice/blue.catbird.circle/circle-4",
             "Circle 4",
             fixed_time + Duration::seconds(30),
         ),
         (
-            "at://did:plc:alice/space/blue.catbird.circle/circle-5",
+            "at:space/did:plc:alice/blue.catbird.circle/circle-5",
             "Circle 5",
             fixed_time + Duration::seconds(40),
         ),
@@ -2586,23 +2586,23 @@ async fn list_circles_keyset_pagination_limit_plus_one_no_gaps_no_dupes(pool: Pg
     );
     assert_eq!(
         all_uris[0],
-        "at://did:plc:alice/space/blue.catbird.circle/circle-5"
+        "at:space/did:plc:alice/blue.catbird.circle/circle-5"
     );
     assert_eq!(
         all_uris[1],
-        "at://did:plc:alice/space/blue.catbird.circle/circle-4"
+        "at:space/did:plc:alice/blue.catbird.circle/circle-4"
     );
     assert_eq!(
         all_uris[2],
-        "at://did:plc:alice/space/blue.catbird.circle/circle-3"
+        "at:space/did:plc:alice/blue.catbird.circle/circle-3"
     );
     assert_eq!(
         all_uris[3],
-        "at://did:plc:alice/space/blue.catbird.circle/circle-2"
+        "at:space/did:plc:alice/blue.catbird.circle/circle-2"
     );
     assert_eq!(
         all_uris[4],
-        "at://did:plc:alice/space/blue.catbird.circle/circle-1"
+        "at:space/did:plc:alice/blue.catbird.circle/circle-1"
     );
 }
 

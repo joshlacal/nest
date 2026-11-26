@@ -24,8 +24,7 @@ use circle_appview::validator::compute_uri_hash;
 
 const OWNER_DID: &str = "did:plc:alice-enc-sync";
 const BOB_DID: &str = "did:plc:bob-enc-sync";
-const SPACE_URI: &str =
-    "at://did:plc:alice-enc-sync/space/blue.catbird.circle.encrypted/enc-circle";
+const SPACE_URI: &str = "at:space/did:plc:alice-enc-sync/blue.catbird.circle.encrypted/enc-circle";
 
 struct Setup {
     state: AppState,

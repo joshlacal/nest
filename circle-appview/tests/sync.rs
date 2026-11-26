@@ -73,7 +73,7 @@ use circle_appview::validator::{
 const OWNER_DID: &str = "did:plc:alice-sync-test";
 const BOB_DID: &str = "did:plc:bob-sync-test";
 const DAVE_DID: &str = "did:plc:dave-sync-test";
-const SPACE_URI: &str = "at://did:plc:alice-sync-test/space/blue.catbird.circle/test-circle";
+const SPACE_URI: &str = "at:space/did:plc:alice-sync-test/blue.catbird.circle/test-circle";
 const OWNER_POST_CID: &str = "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5z";
 const WRONG_POST_CID: &str = "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5w";
 const OTHER_POST_CID: &str = "bafyreibw72zfc6x2jwhvhk3w23vgt4i7l67v5k2k4z6w7i4j5z4w6i4j5y";
@@ -195,11 +195,11 @@ fn cross_space_reply() -> RecordCandidate {
             "createdAt": "2026-08-24T12:25:00.000Z",
             "reply": {
                 "root": {
-                    "uri": "at://did:plc:other/space/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
+                    "uri": "at:space/did:plc:other/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
                     "cid": OTHER_POST_CID
                 },
                 "parent": {
-                    "uri": "at://did:plc:other/space/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
+                    "uri": "at:space/did:plc:other/blue.catbird.circle/other/did:plc:other/app.bsky.feed.post/3l7otherpost1",
                     "cid": OTHER_POST_CID
                 }
             }
@@ -1470,7 +1470,7 @@ async fn notify_space_update_wrong_token_and_unknown_space_leak_same_error(pool:
                 .header("Content-Type", "application/json")
                 .body(axum::body::Body::from(
                     serde_json::to_vec(&json!({
-                        "space": "at://did:plc:unknown/space/blue.catbird.circle/missing",
+                        "space": "at:space/did:plc:unknown/blue.catbird.circle/missing",
                         "token": token,
                         "update": update,
                     }))

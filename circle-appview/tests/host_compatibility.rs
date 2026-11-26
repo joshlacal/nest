@@ -30,7 +30,7 @@ use circle_appview::space_client::{
 use circle_appview::space_signature::p256_did_key;
 
 const OWNER_DID: &str = "did:plc:owner-host-gate";
-const SPACE_URI: &str = "at://did:plc:owner-host-gate/space/blue.catbird.circle/3l7hostgate11";
+const SPACE_URI: &str = "at:space/did:plc:owner-host-gate/blue.catbird.circle/3l7hostgate11";
 
 fn owner_doc(key: &SigningKey) -> DidDocument {
     let point = EncodedPoint::from(key.verifying_key());

@@ -55,6 +55,9 @@ pub async fn summary_key_version(
         .map(|(version, _)| version))
 }
 
+/// Prefix of every Space ref and in-space record URI (`at:space/{spaceDid}/...`).
+pub const SPACE_URI_PREFIX: &str = "at:space/";
+
 pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
     let col_idx = uri
         .rfind("/app.bsky.")
@@ -65,7 +68,10 @@ pub fn normalize_uri_to_standard_aturi(uri: &str) -> String {
         let did = if last_segment.starts_with("did:") {
             last_segment
         } else {
-            let stripped = prefix.strip_prefix("at://").unwrap_or(prefix);
+            let stripped = prefix
+                .strip_prefix("at://")
+                .or_else(|| prefix.strip_prefix("at:space/"))
+                .unwrap_or(prefix);
             stripped.split('/').next().unwrap_or(stripped)
         };
         let rest = &uri[col_idx..];
@@ -282,7 +288,7 @@ pub async fn get_feed(
 
     // Authorize cursor Space if cursor provided
     if let Some(ref c) = cursor {
-        let alt_cursor_uri = if c.uri.contains("/space/") {
+        let alt_cursor_uri = if c.uri.starts_with(SPACE_URI_PREFIX) {
             normalize_uri_to_standard_aturi(&c.uri)
         } else if let Some(rest) = c.uri.strip_prefix("at://") {
             format!("at://{rest}")
@@ -301,7 +307,7 @@ pub async fn get_feed(
         let cursor_space_uri = match cursor_space {
             Some((sp,)) => sp,
             None => {
-                if c.uri.contains("/space/") {
+                if c.uri.starts_with(SPACE_URI_PREFIX) {
                     let parts: Vec<&str> = c.uri.split("/app.bsky.feed.post/").collect();
                     if let Some(prefix) = parts.first() {
                         prefix.to_string()
@@ -365,7 +371,7 @@ pub async fn get_feed(
                           SELECT 1 FROM circle_records root
                           WHERE (root.uri = rep.root_uri OR root.uri = (
                               CASE
-                                   WHEN rep.root_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.root_uri, '/space/', 2)
+                                   WHEN rep.root_uri LIKE 'at:space/%' THEN 'at://' || SUBSTRING(rep.root_uri FROM '^at:space/[^/]+/(.*)$')
                                    ELSE rep.root_uri
                                END
                            ))
@@ -380,7 +386,7 @@ pub async fn get_feed(
                            SELECT 1 FROM circle_records p
                            WHERE (p.uri = rep.parent_uri OR p.uri = (
                                CASE
-                                   WHEN rep.parent_uri LIKE '%/space/%' THEN 'at://' || SPLIT_PART(rep.parent_uri, '/space/', 2)
+                                   WHEN rep.parent_uri LIKE 'at:space/%' THEN 'at://' || SUBSTRING(rep.parent_uri FROM '^at:space/[^/]+/(.*)$')
                                    ELSE rep.parent_uri
                                END
                            ))
@@ -564,4 +570,29 @@ pub async fn get_feed(
         cursor: next_cursor,
         extra_data: None,
     })
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_uri_to_standard_aturi;
+
+    #[test]
+    fn in_space_record_uris_map_to_the_author_repo() {
+        assert_eq!(
+            normalize_uri_to_standard_aturi(
+                "at:space/did:plc:owner/blue.catbird.circle/c1/did:plc:bob/app.bsky.feed.post/3k2"
+            ),
+            "at://did:plc:bob/app.bsky.feed.post/3k2"
+        );
+    }
+
+    #[test]
+    fn a_space_uri_without_an_author_falls_back_to_the_space_authority() {
+        assert_eq!(
+            normalize_uri_to_standard_aturi(
+                "at:space/did:plc:owner/blue.catbird.circle/c1/app.bsky.feed.post/3k2"
+            ),
+            "at://did:plc:owner/app.bsky.feed.post/3k2"
+        );
+    }
 }
