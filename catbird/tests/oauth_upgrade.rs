@@ -359,7 +359,11 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
     });
     Mock::given(method("POST"))
         .and(path("/oauth/par"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(par_resp))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("DPoP-Nonce", "mock-par-nonce")
+                .set_body_json(par_resp),
+        )
         .mount(mock)
         .await;
 
@@ -373,7 +377,11 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
     });
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(token_resp))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("DPoP-Nonce", "mock-token-nonce")
+                .set_body_json(token_resp),
+        )
         .mount(mock)
         .await;
 }
@@ -403,6 +411,8 @@ async fn setup_test_server_with_provider(
     let mut config = AppConfig::load().expect("default test config must load");
     config.push.database_url = None;
     config.redis.url = redis_url;
+    config.oauth.client_id = "https://api.catbird.blue/.well-known/oauth-client-metadata".into();
+    config.oauth.redirect_uri = "https://api.catbird.blue/auth/callback".into();
     config.oauth.private_key_base64 =
         Some(base64::engine::general_purpose::STANDARD.encode(TEST_PRIVATE_KEY_PEM));
     config.oauth.active_key_id = "catbird-key-1".to_string();
@@ -693,32 +703,35 @@ async fn test_initial_login_still_sends_core_subset() {
 
 #[tokio::test]
 async fn test_upgrade_callback_denial_leaves_old_session_valid() {
-    let (state, server, upgrade_service, _redis) = setup_test_server().await;
+    let provider = MockServer::start().await;
+    let did_str = FIXED_TEST_DID;
+    setup_mock_oauth_provider(&provider, did_str, "atproto transition:generic").await;
+    let (state, server, _service, _redis) = setup_test_server_with_provider(Some(&provider)).await;
     let old_session_id = Uuid::new_v4().to_string();
-    let did_str = "did:plc:denialtestuser456";
-
-    seed_active_session(
+    seed_active_session_with_pds(
         &state,
         &old_session_id,
         did_str,
         vec!["atproto", "transition:generic"],
+        ISSUER,
     )
     .await;
-
-    // Start upgrade flow in service
-    let start_result = upgrade_service
-        .start_upgrade_flow(
-            &old_session_id,
-            did_str,
-            &scope_names(&["atproto", "transition:generic"]),
-            &state.config.oauth.max_scopes,
-            &scope_names(&["identity:handle"]),
-            BROWSER_NONCE,
-        )
+    server
+        .post("/auth/upgrade")
+        .add_header(AUTHORIZATION, format!("Bearer {old_session_id}"))
+        .add_header("origin", CATBIRD_ORIGIN)
+        .json(&json!({"additional_scopes":["identity:handle"],"browser_nonce":BROWSER_NONCE}))
         .await
-        .expect("start upgrade flow");
-
-    let upg_state = &start_result.state;
+        .assert_status_ok();
+    let requests = provider.received_requests().await.unwrap();
+    let par = requests
+        .iter()
+        .find(|request| request.url.path() == "/oauth/par")
+        .unwrap();
+    let upg_state = url::form_urlencoded::parse(&par.body)
+        .find(|(name, _)| name == "state")
+        .unwrap()
+        .1;
     assert!(upg_state.starts_with("upg_"));
 
     // Simulate callback denial redirect from provider
@@ -1651,7 +1664,7 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
             "revocation_endpoint": format!("{provider_url}/oauth/revoke"),
             "pushed_authorization_request_endpoint": format!("{provider_url}/oauth/par"),
             "require_pushed_authorization_requests": true,
-        "client_id_metadata_document_supported": true,
+            "client_id_metadata_document_supported": true,
             "dpop_signing_alg_values_supported": ["ES256"],
             "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
             "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
@@ -1666,10 +1679,14 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         .await;
     Mock::given(method("POST"))
         .and(path("/oauth/par"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "request_uri": "urn:ietf:params:oauth:request_uri:catmos-par-1",
-            "expires_in": 300
-        })))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("DPoP-Nonce", "catmos-par-nonce")
+                .set_body_json(json!({
+                    "request_uri": "urn:ietf:params:oauth:request_uri:catmos-par-1",
+                    "expires_in": 300
+                })),
+        )
         .mount(&mock)
         .await;
     Mock::given(method("POST"))
@@ -1718,6 +1735,7 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
     let mut state_clone: AppState = (*base_state).clone();
     state_clone.catmos_oauth_client = Some(Arc::new(catmos_client));
     state_clone.catmos_oauth_scopes = catmos_scopes_vec;
+    state_clone.catmos_oauth_upgrade_scopes = catmos_scope_names;
     let state = Arc::new(state_clone);
     let app = create_router(state.clone()).with_state(state.clone());
     let server = TestServer::new(app).expect("create TestServer");

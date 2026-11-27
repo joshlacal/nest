@@ -21,7 +21,6 @@ use axum::{
     response::IntoResponse,
     Extension,
 };
-use base64::Engine;
 use catbird::services::petrel_storage::{
     ClientSessionData, DpopClientData, OAuthTokenType, TokenSet,
 };
@@ -66,12 +65,6 @@ const RETIRED_LABYRINTH_SPACE_SCOPES: &[&str] = &[
     "space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete",
     "space:blue.catbird.labyrinth.conversation?authority=*",
 ];
-
-const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgED1AAgC7Fc9kPh5T
-4i4Tn+z+tc47W1zYgzXtyjJtD92hRANCAAT80DqC+Z/JpTO7/pkPBmWqIV1IGh1P
-gbGGr0pN+oSing7cZ0169JaRHTNh+0LNQXrFobInX6cj95FzEdRyT4T3
------END PRIVATE KEY-----"#;
 
 fn test_dpop_data() -> SessionDpopData {
     let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
@@ -262,12 +255,10 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
     let auth_store = RedisAuthStore::new(redis.clone(), prefix.clone(), 3600, Some(enc_key))
         .expect("create RedisAuthStore");
 
-    let mut ks_cfg = AppConfig::test_default();
-    ks_cfg.push.database_url = None;
-    ks_cfg.oauth.private_key_base64 =
-        Some(base64::engine::general_purpose::STANDARD.encode(TEST_PRIVATE_KEY_PEM));
-    ks_cfg.oauth.active_key_id = "catbird-key-1".into();
-    let ks_state = AppState::new(ks_cfg).await.expect("AppState with KeyStore");
+    let key_store = catbird::services::KeyStore::from_key(
+        "test-key",
+        p256::SecretKey::from_slice(&[3; 32]).unwrap(),
+    );
     let raw_requested: Vec<String> = REQUIRED_CLEAN_SLATE_SCOPES
         .iter()
         .map(|s| (*s).to_string())
@@ -276,7 +267,7 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         catbird::config::OAuthConfig::parse_and_validate_scopes(&raw_requested).unwrap();
     let oauth_client = GatewayOAuth::with_transport(
         auth_store.clone(),
-        ks_state.key_store.as_ref().expect("test client key"),
+        &key_store,
         "https://api.catbird.blue/.well-known/oauth-client-metadata",
         DEFAULT_UPGRADE_CALLBACK_URL,
         &raw_requested.join(" "),
