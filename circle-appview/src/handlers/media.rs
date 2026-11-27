@@ -37,7 +37,7 @@ impl MediaQuery {
             }
         }
         let missing = |name: &str| AppError::InvalidRequest(format!("Missing parameter {name}"));
-        let space = SpaceRef::parse(space.ok_or_else(|| missing("space"))?)
+        let space = crate::space_uri::parse_lenient(&space.ok_or_else(|| missing("space"))?)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid space: {e}")))?;
         let did = Did::parse(did.ok_or_else(|| missing("did"))?)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid did: {e}")))?;
@@ -91,12 +91,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_space_form_decodes_like_the_canonical_form() {
+        let legacy = "at%3A%2F%2Fdid%3Aplc%3Aowner%2Fspace%2Fblue.catbird.circle%2Fc1";
+        for space in [SPACE, legacy] {
+            let q = MediaQuery::from_query_str(&format!("space={space}&did=did%3Aplc%3Abob&cid=x"))
+                .unwrap();
+            assert_eq!(
+                q.space.as_str(),
+                "at:space/did:plc:owner/blue.catbird.circle/c1"
+            );
+        }
+    }
+
+    #[test]
     fn missing_or_malformed_space_and_did_are_invalid_requests() {
         for raw in [
             "did=did%3Aplc%3Abob&cid=x".to_string(),
             format!("space={SPACE}&cid=x"),
             format!("space={SPACE}&did=did%3Aplc%3Abob"),
             "space=nope&did=did%3Aplc%3Abob&cid=x".to_string(),
+            "space=at%3A%2F%2Fdid%3Aplc%3Aowner%2Fspace%2Fx&did=did%3Aplc%3Abob&cid=x".to_string(),
             format!("space={SPACE}&did=bob&cid=x"),
         ] {
             assert!(

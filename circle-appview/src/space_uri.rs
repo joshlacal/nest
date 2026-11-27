@@ -14,6 +14,16 @@ pub fn parse_lenient(raw: &str) -> Result<SpaceRef, SyntaxError> {
     }
 }
 
+/// Rewrite a spaces-alpha reference (`at://{spaceDid}/space/{type}/{skey}`) to the
+/// canonical `at:space/` form; any other value is returned unchanged, so a malformed
+/// value still fails the typed decode that follows.
+pub fn normalize_legacy(raw: &str) -> std::borrow::Cow<'_, str> {
+    match AtUri::from_legacy_space_uri(raw) {
+        Some(current) => std::borrow::Cow::Owned(current),
+        None => std::borrow::Cow::Borrowed(raw),
+    }
+}
+
 /// Parse a space reference in its canonical `at:space/` form only.
 pub fn parse_strict(raw: &str) -> Result<SpaceRef, SyntaxError> {
     SpaceRef::parse(raw)
