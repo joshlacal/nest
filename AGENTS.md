@@ -24,8 +24,9 @@ cd nest/catbird && cargo test
 # Format + lint
 cd nest/catbird && cargo fmt && cargo clippy
 
-# Before a release build: both crates must resolve ../../catbird-atproto at the
-# commit in scripts/canonical-sibling-provenance.conf, with matching lock files
+# Before a release build: nest/catbird must resolve ../../catbird-atproto at the
+# commit in scripts/canonical-sibling-provenance.conf, and both crates' lock
+# files must match (circle-appview builds against sibling Petrel Rust instead)
 nest/scripts/check-canonical-sibling-provenance.sh
 ```
 

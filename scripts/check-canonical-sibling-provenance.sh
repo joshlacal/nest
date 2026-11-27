@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Verifies that both nest crates build against the exact catbird-atproto
-# commit recorded in scripts/canonical-sibling-provenance.conf, and that each
-# tracked Cargo.lock matches its recorded hash. Run before every release build.
+# Verifies that nest/catbird builds against the exact catbird-atproto commit
+# recorded in scripts/canonical-sibling-provenance.conf, and that each tracked
+# Cargo.lock matches its recorded hash. Run before every release build.
+# circle-appview no longer depends on catbird-atproto (it builds against the
+# sibling Petrel Rust crates), so only its lock hash is checked here.
 set -euo pipefail
 
 # No overrides are accepted: provenance comes only from this checkout and the
@@ -78,7 +80,6 @@ printf 'nest canonical sibling provenance\n'
 check_lock catbird CATBIRD_LOCK_SHA256
 check_lock circle-appview CIRCLE_APPVIEW_LOCK_SHA256
 check_resolution catbird
-check_resolution circle-appview
 
 # The sibling's working copy must be an empty change on top of the recorded
 # commit. The empty working-copy commit id itself is not pinned, because jj
