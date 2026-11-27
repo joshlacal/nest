@@ -15,10 +15,10 @@
 //! - One pending upgrade per old UUID
 //! - Commit is idempotent for same candidate and rejects competing candidates
 
+use super::gateway_scope::Scope;
+use crate::services::petrel_storage::ClientSessionData;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use jacquard_oauth::scopes::Scope;
-use jacquard_oauth::session::ClientSessionData;
 use rand::RngCore;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -92,28 +92,18 @@ fn space_scope_matches_lexicon_expansion(
     granted: &Scope,
     account_did: &str,
 ) -> bool {
-    use jacquard_oauth::scopes::{SpaceAuthority, SpaceCollection, SpaceType};
-
     let (Scope::Space(req_sp), Scope::Space(grant_sp)) = (requested, granted) else {
         return false;
     };
-    let (SpaceType::Nsid(req_nsid), SpaceType::Nsid(grant_nsid)) =
-        (&req_sp.space_type, &grant_sp.space_type)
-    else {
-        return false;
-    };
-    if req_nsid.as_str() != grant_nsid.as_str() {
+    if req_sp.space_type == "*" || req_sp.space_type != grant_sp.space_type {
         return false;
     }
     if req_sp.skey != grant_sp.skey || req_sp.manage != grant_sp.manage {
         return false;
     }
 
-    let authority_ok = match (&req_sp.authority, &grant_sp.authority) {
-        (a, b) if a == b => true,
-        (SpaceAuthority::Self_, SpaceAuthority::Did(did)) => did.as_str() == account_did,
-        _ => false,
-    };
+    let authority_ok = req_sp.authority == grant_sp.authority
+        || (req_sp.authority == "self" && grant_sp.authority == account_did);
     if !authority_ok {
         return false;
     }
@@ -130,16 +120,16 @@ fn space_scope_matches_lexicon_expansion(
         return false;
     }
 
-    let Some(expected_cols) = known_space_lexicon_collections(req_nsid.as_str()) else {
+    let Some(expected_cols) = known_space_lexicon_collections(&req_sp.space_type) else {
         return false;
     };
     if grant_sp.collections.len() != expected_cols.len() {
         return false;
     }
-    grant_sp.collections.iter().all(|c| match c {
-        SpaceCollection::Nsid(n) => expected_cols.contains(&n.as_str()),
-        SpaceCollection::All => false,
-    })
+    grant_sp
+        .collections
+        .iter()
+        .all(|c| expected_cols.contains(&c.as_str()))
 }
 
 /// Reads a `space:` scope the way the reference authorization server writes it.
@@ -148,31 +138,16 @@ fn space_scope_matches_lexicon_expansion(
 /// create, update, delete) whenever `action` is absent, and its formatter leaves `action`
 /// out when the actions are exactly that default set. So a server that was asked for
 /// `space:x?action=create&action=delete&action=read&action=update&manage=create` writes
-/// the grant back as `space:x?manage=create`. `jacquard-oauth` applies the default only
+/// the grant back as `space:x?manage=create`. The registered request grammar applies the default only
 /// when `manage` is absent as well, and would read that grant as carrying no actions.
 /// This restores the reference meaning on a scope a server wrote.
-pub fn with_reference_space_action_default(
-    scope: Scope<smol_str::SmolStr>,
-) -> Scope<smol_str::SmolStr> {
-    use jacquard_oauth::scopes::SpaceAction;
-
-    match scope {
-        Scope::Space(mut space) if space.actions.is_empty() => {
-            space.actions.extend([
-                SpaceAction::Read,
-                SpaceAction::Create,
-                SpaceAction::Update,
-                SpaceAction::Delete,
-            ]);
-            Scope::Space(space)
-        }
-        other => other,
-    }
+pub fn with_reference_space_action_default(scope: Scope) -> Scope {
+    scope.with_server_defaults()
 }
 
 /// Parses a scope string an authorization server wrote. `None` when it is not a scope.
-pub fn parse_server_scope(raw: &str) -> Option<Scope<smol_str::SmolStr>> {
-    Scope::<smol_str::SmolStr>::parse(raw)
+pub fn parse_server_scope(raw: &str) -> Option<Scope> {
+    Scope::parse(raw)
         .ok()
         .map(with_reference_space_action_default)
 }
@@ -292,6 +267,7 @@ if KEYS[11] and KEYS[11] ~= '' then
     redis.call('SETEX', KEYS[11], tonumber(ARGV[6]), ARGV[1])
 end
 redis.call('DEL', KEYS[6])
+if KEYS[13] then redis.call('DEL', KEYS[13]) end
 redis.call('DEL', KEYS[7])
 redis.call('DEL', KEYS[10])
 redis.call('SETEX', KEYS[3], tonumber(ARGV[8]), ARGV[1])
@@ -475,6 +451,8 @@ pub struct UpgradeFlowState {
 /// Inactive candidate session staged in Redis prior to commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StagedCandidateSession {
+    #[serde(default)]
+    pub version: u8,
     pub candidate_session_id: String,
     pub old_session_id: String,
     pub did: String,
@@ -750,7 +728,7 @@ impl OAuthUpgradeService {
         let parsed_current = current_scopes
             .iter()
             .map(|scope| {
-                Scope::<smol_str::SmolStr>::parse(scope)
+                Scope::parse(scope)
                     .map(with_reference_space_action_default)
                     .map_err(|_| {
                         UpgradeError::DisallowedScope(format!("invalid current scope: {scope}"))
@@ -769,7 +747,7 @@ impl OAuthUpgradeService {
         let registered = registered_max_scopes
             .iter()
             .map(|raw| {
-                Scope::<smol_str::SmolStr>::parse(raw)
+                Scope::parse(raw)
                     .map(|parsed| (raw.trim().to_string(), parsed))
                     .map_err(|_| {
                         UpgradeError::DisallowedScope(format!(
@@ -787,7 +765,7 @@ impl OAuthUpgradeService {
             ));
         }
 
-        let registered_spelling = |grant: &Scope<smol_str::SmolStr>| {
+        let registered_spelling = |grant: &Scope| {
             registered
                 .iter()
                 .find(|(_, requested)| registered_scope_covers_grant(requested, grant, old_did))
@@ -802,8 +780,8 @@ impl OAuthUpgradeService {
             }
         }
         for scope in additional_scopes {
-            let parsed = Scope::<smol_str::SmolStr>::parse(scope)
-                .map_err(|_| UpgradeError::DisallowedScope(scope.clone()))?;
+            let parsed =
+                Scope::parse(scope).map_err(|_| UpgradeError::DisallowedScope(scope.clone()))?;
             let registered = registered_spelling(&parsed).ok_or_else(|| {
                 UpgradeError::DisallowedScope(format!(
                     "scope is absent from current client registration: {scope}"
@@ -1031,7 +1009,7 @@ impl OAuthUpgradeService {
         // Parse requested scopes from flow
         let mut parsed_requested = Vec::new();
         for s in &flow.requested_scopes {
-            let parsed = Scope::<smol_str::SmolStr>::parse(s).map_err(|_| {
+            let parsed = Scope::parse(s).map_err(|_| {
                 UpgradeError::ScopeDowngrade(format!("invalid or unparseable requested scope: {s}"))
             })?;
             parsed_requested.push(parsed);
@@ -1078,8 +1056,7 @@ impl OAuthUpgradeService {
         // Require session_data.scopes agrees with the passed grants. The session's scopes
         // are the server's own writing too, so they are read the same way.
         let mut session_scopes = Vec::new();
-        for s in session_data.scopes.iter() {
-            let spelling = s.to_string_normalized();
+        for spelling in session_data.scopes.raw_scopes() {
             let parsed = parse_server_scope(spelling.as_str()).ok_or_else(|| {
                 UpgradeError::ScopeDowngrade(format!(
                     "invalid or unparseable session scope: {spelling}"
@@ -1122,6 +1099,7 @@ impl OAuthUpgradeService {
         let exchange_code = generate_exchange_code();
 
         let staged_candidate = StagedCandidateSession {
+            version: 3,
             candidate_session_id: candidate_session_id.clone(),
             old_session_id: flow.old_session_id.clone(),
             did: flow.old_did.clone(),
@@ -1271,6 +1249,9 @@ impl OAuthUpgradeService {
         )
         .map_err(|e| UpgradeError::Internal(format!("Candidate decryption failed: {e}")))?;
         let candidate: StagedCandidateSession = serde_json::from_str(&cand_json)?;
+        if candidate.version != 3 {
+            return Err(UpgradeError::CandidateNotFound);
+        }
         if candidate.expected_old_session_blob.is_empty() {
             return Err(UpgradeError::OldSessionInactive);
         }
@@ -1349,6 +1330,10 @@ impl OAuthUpgradeService {
             .key(format!(
                 "{}account_erasure:{}",
                 self.key_prefix, candidate.did
+            ))
+            .key(format!(
+                "{}ps:{old_fp}",
+                super::petrel_storage::v3_prefix(&self.key_prefix)
             ))
             .arg(&cand_fp)
             .arg(&old_fp)
@@ -2441,6 +2426,7 @@ mod tests {
 
         // StagedCandidateSession.flow_state must store the HMAC fingerprint of state, not raw state
         let staged = StagedCandidateSession {
+            version: 3,
             candidate_session_id: candidate_id.to_string(),
             old_session_id: old_session_id.to_string(),
             did: did.to_string(),
@@ -2519,8 +2505,8 @@ mod tests {
 #[cfg(test)]
 mod disposable_fence_tests {
     use super::*;
-    use jacquard_oauth::session::DpopClientData;
-    use jacquard_oauth::types::{OAuthTokenType, TokenSet};
+    use crate::services::petrel_storage::DpopClientData;
+    use crate::services::petrel_storage::{OAuthTokenType, TokenSet};
     use std::collections::BTreeSet;
 
     const KEY: [u8; 32] = [0x24; 32];
@@ -2592,6 +2578,7 @@ mod disposable_fence_tests {
             self.put(&old_key, "synthetic-old-session-cas").await;
             self.put(&old_index, DID).await;
             let staged = StagedCandidateSession {
+                version: 3,
                 candidate_session_id: candidate.into(),
                 old_session_id: old.into(),
                 did: DID.into(),
@@ -2633,7 +2620,7 @@ mod disposable_fence_tests {
     }
 
     fn grant(bearer: &str) -> ClientSessionData {
-        let did = jacquard_common::types::did::Did::new_owned(DID.to_string()).unwrap();
+        let did = petrel_core::Did::parse(DID.to_string()).unwrap();
         let dpop_key: jose_jwk::Key = serde_json::from_value(serde_json::json!({
             "kty":"EC", "crv":"P-256", "x":"f83OJ3D2xFMTbKEBaGizdGlIUKEWx5q15odEB00stfg",
             "y":"x_daaqundbgUvJV358vRBgULGnpH7aRFZZDYyEiNg2g", "d":"jpsQnnGQmL-YxOmH1UmOBHg10OJ45DBTWh0n52qxzMQ"
@@ -2641,14 +2628,11 @@ mod disposable_fence_tests {
         ClientSessionData {
             account_did: did.clone(),
             session_id: bearer.to_owned().into(),
-            host_url: jacquard_common::deps::fluent_uri::Uri::parse("http://127.0.0.1:9")
-                .unwrap()
-                .to_owned(),
+            host_url: url::Url::parse("http://127.0.0.1:9").unwrap().to_owned(),
             authserver_url: "http://127.0.0.1:9".into(),
             authserver_token_endpoint: "".into(),
             authserver_revocation_endpoint: None,
-            scopes: jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("atproto"))
-                .unwrap(),
+            scopes: petrel_oauth_scopes::ScopeSet::parse("atproto").unwrap(),
             dpop_data: DpopClientData {
                 dpop_key,
                 dpop_authserver_nonce: "".into(),
@@ -2854,11 +2838,11 @@ mod reference_space_default_tests {
     const COLLECTIONS: &str =
         "collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch";
 
-    fn requested() -> Scope<smol_str::SmolStr> {
+    fn requested() -> Scope {
         let raw = format!(
             "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&{COLLECTIONS}&manage=create&manage=delete"
         );
-        Scope::<smol_str::SmolStr>::parse(&raw).expect("requested scope")
+        Scope::parse(&raw).expect("requested scope")
     }
 
     /// What the reference server (and Swan) writes back for `requested()`: the account DID
@@ -2881,8 +2865,7 @@ mod reference_space_default_tests {
     #[test]
     fn the_library_reading_alone_does_not_match() {
         // Pins the reason the helper exists: without it the grant reads as manage-only.
-        let granted =
-            Scope::<smol_str::SmolStr>::parse(&server_written(DID)).expect("granted scope");
+        let granted = Scope::parse(&server_written(DID)).expect("granted scope");
         assert!(!space_scope_matches_lexicon_expansion(
             &requested(),
             &granted,
@@ -2912,7 +2895,7 @@ mod reference_space_default_tests {
         ));
         assert_eq!(
             server_scope_spelling(&raw),
-            Scope::<smol_str::SmolStr>::parse(&raw)
+            Scope::parse(&raw)
                 .unwrap()
                 .to_string_normalized()
                 .to_string()

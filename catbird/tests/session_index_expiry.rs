@@ -1,8 +1,8 @@
 //! Real Redis expiry regressions. Synthetic sessions use a fresh owned prefix;
 //! explicit disposable loopback URLs are mandatory. Root owns execution.
 use catbird::services::{push::registry::session_fingerprint, RedisAuthStore};
-use jacquard_common::types::did::Did;
-use jacquard_oauth::authstore::ClientAuthStore;
+use petrel_core::Did;
+
 use uuid::Uuid;
 
 #[path = "support/cleanup_auth.rs"]
@@ -110,7 +110,7 @@ async fn corrupt_blob_read_does_not_slide_blob_or_indexes() {
         .await
         .unwrap();
     let before = shorten(&store, &all).await;
-    let did: Did = Did::new_owned(DID.to_string()).unwrap();
+    let did: Did = Did::parse(DID.to_string()).unwrap();
     for _ in 0..3 {
         assert!(store.get_session(&did, &bearer).await.is_err());
     }
@@ -144,7 +144,7 @@ async fn only_verified_session_read_slides_expiration() {
         .unwrap()
         .is_some());
     assert_not_extended(&before, &ttls(&store, &all).await);
-    let did: Did = Did::new_owned(DID.to_string()).unwrap();
+    let did: Did = Did::parse(DID.to_string()).unwrap();
     let read = store.get_session(&did, &bearer).await.unwrap().unwrap();
     assert_eq!(read.session_id.as_str(), bearer);
     for ttl in ttls(&store, &all).await {

@@ -44,6 +44,12 @@ const READ_BOUNDED: &str = r#"
 local kind = redis.call('TYPE', KEYS[1]).ok
 local ttl = redis.call('TTL', KEYS[1])
 if kind == 'none' then return {kind, ttl, {}} end
+if kind == 'hash' then
+  if redis.call('HSTRLEN',KEYS[1],'nest.owner') > tonumber(ARGV[1]) then return {'oversize',ttl,{}} end
+  local owner = redis.call('HGET',KEYS[1],'nest.owner')
+  if owner then return {kind, ttl, {owner}} end
+  return {kind,ttl,{}}
+end
 if kind == 'string' then
   if redis.call('STRLEN', KEYS[1]) > tonumber(ARGV[1]) then return {'oversize', ttl, {}} end
   return {kind, ttl, {redis.call('GET', KEYS[1])}}
@@ -275,11 +281,7 @@ fn metadata_owner(
     Ok(())
 }
 fn suffix<'a>(prefix: &str, family: RedisFamily, key: &'a str) -> Result<&'a str, DiscoveryError> {
-    let stem = if family == RedisFamily::Exchange {
-        family.stem().to_owned()
-    } else {
-        format!("{prefix}{}", family.stem())
-    };
+    let stem = family.key_stem(prefix);
     key.strip_prefix(&stem)
         .filter(|s| !s.is_empty())
         .ok_or(DiscoveryError::InvalidEvidence)
@@ -404,15 +406,44 @@ pub async fn discover_account_redis(
     }
     let mut families = BTreeMap::new();
     for &family in REDIS_FAMILIES {
-        let stem = if family == RedisFamily::Exchange {
-            family.stem().to_owned()
-        } else {
-            format!("{prefix}{}", family.stem())
-        };
+        let stem = family.key_stem(prefix);
         let records = reader.scan(&format!("{stem}*")).await?;
         // Only a completed cursor=0 scan can insert this family.
         discovery.completely_inspected.insert(family);
         families.insert(family, records);
+    }
+    // Only a field authenticated to this exact v3 hash establishes its owner.
+    for family in [RedisFamily::PetrelSession, RedisFamily::PetrelFlow] {
+        for record in &families[&family] {
+            if record.kind != "hash" || !hex(suffix(prefix, family, &record.key)?) {
+                return Err(DiscoveryError::InvalidEvidence);
+            }
+            if record.values.is_empty()
+                && family == RedisFamily::PetrelFlow
+                && (0..=600).contains(&record.ttl)
+            {
+                discovery.preserved_preaccount_operational += 1;
+                continue;
+            }
+            let cipher = record
+                .values
+                .first()
+                .ok_or(DiscoveryError::InvalidEvidence)?;
+            let aad = super::redis_crypto::build_aad(
+                "petrel_secret",
+                &record.key,
+                None,
+                Some("nest.owner"),
+            );
+            let (bytes, legacy) =
+                super::redis_crypto::open_session_dual_read(store.enc_key(), cipher, &aad)
+                    .map_err(|_| DiscoveryError::InvalidEvidence)?;
+            let owner = std::str::from_utf8(&bytes).map_err(|_| DiscoveryError::InvalidEvidence)?;
+            if legacy || !valid_did(owner) {
+                return Err(DiscoveryError::InvalidEvidence);
+            }
+            owned(&mut discovery, &target.did, owner, family, &record.key);
+        }
     }
     // First establish authenticated session/grant and upgrade lineage globally;
     // plain pointer records are interpreted only after this evidence exists.
@@ -678,7 +709,9 @@ pub async fn discover_account_redis(
                         "created_at",
                     ],
                 )?;
-                if value["version"].as_u64() != Some(2) || !value["client_selector"].is_string() {
+                if !matches!(value["version"].as_u64(), Some(2 | 3))
+                    || !value["client_selector"].is_string()
+                {
                     return Err(DiscoveryError::InvalidEvidence);
                 }
                 evidence.preaccount_flows.insert(fp.to_owned());

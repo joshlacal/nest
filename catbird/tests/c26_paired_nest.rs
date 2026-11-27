@@ -25,7 +25,7 @@ use axum::{
     Router,
 };
 use catbird::config::{AppConfig, AppState};
-use catbird::middleware::{JacquardDpopData, RateLimitState};
+use catbird::middleware::{RateLimitState, SessionDpopData};
 use catbird::models::CatbirdSession;
 use catbird::services::DpopNonceCache;
 use chrono::Utc;
@@ -104,8 +104,8 @@ async fn fixture_state(service_url: &str) -> (Arc<AppState>, OwnedRedis) {
         redis: redis::aio::ConnectionManager::new(client).await.unwrap(),
         push_db: None,
         key_store: None,
-        jacquard_client: None,
-        catmos_jacquard_client: None,
+        oauth_client: None,
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
@@ -139,9 +139,9 @@ fn session(pds: &MockServer, did: &str) -> CatbirdSession {
 
 /// The session's DPoP key material, as the OAuth session of a signed-in app
 /// holds it: a fresh P-256 key and no host nonce yet.
-fn session_dpop() -> JacquardDpopData {
+fn session_dpop() -> SessionDpopData {
     let secret = p256::SecretKey::random(&mut rand::thread_rng());
-    JacquardDpopData {
+    SessionDpopData {
         dpop_key: jose_jwk::Key::from(&jose_jwk::crypto::Key::from(secret)),
         dpop_host_nonce: String::new(),
     }
@@ -186,7 +186,7 @@ async fn live_c26_nest_proxy_worker() {
         // body is bounded by xrpc_ingress's exact per-procedure limit instead.
         .layer(DefaultBodyLimit::max(11 * 1024 * 1024))
         .layer(Extension(session(&pds, &cfg.session_did)))
-        // A real app session's request carries its Jacquard DPoP key (inserted
+        // A real app session's request carries its session DPoP key (inserted
         // by auth_middleware); the clean-chat proxy mints service auth with it.
         .layer(Extension(session_dpop()))
         .with_state(state);

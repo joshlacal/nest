@@ -2,7 +2,6 @@
 //!
 //! Handles loading configuration from environment variables and config files.
 
-use jacquard_common::IntoStatic;
 use serde::Deserialize;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::sync::Arc;
@@ -512,7 +511,7 @@ impl TryFrom<RawOAuthConfig> for OAuthConfig {
                         return Err("Legacy OAuth scopes cannot be empty".to_string());
                     }
                     for s in legacy {
-                        jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(s)
+                        crate::services::gateway_scope::Scope::parse(s)
                             .map_err(|e| format!("Invalid legacy OAuth scope '{s}': {e:?}"))?;
                     }
                 }
@@ -551,7 +550,7 @@ impl TryFrom<RawOAuthConfig> for OAuthConfig {
 
         // Validate all initial_scopes entries
         for s in &initial_scopes {
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(s)
+            crate::services::gateway_scope::Scope::parse(s)
                 .map_err(|e| format!("Invalid OAuth initial_scope '{s}': {e:?}"))?;
         }
 
@@ -563,7 +562,7 @@ impl TryFrom<RawOAuthConfig> for OAuthConfig {
 
         // Validate all max_scopes entries
         for s in &max_scopes {
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(s)
+            crate::services::gateway_scope::Scope::parse(s)
                 .map_err(|e| format!("Invalid OAuth max_scope '{s}': {e:?}"))?;
         }
 
@@ -589,16 +588,15 @@ impl TryFrom<RawOAuthConfig> for OAuthConfig {
 }
 
 impl OAuthConfig {
-    /// Parse and validate a slice of scope strings into Jacquard Scope objects.
+    /// Parse and validate a slice of scope strings into gateway scopes.
     /// Fails fast on ANY malformed scope instead of silently ignoring or truncating.
     pub fn parse_and_validate_scopes(
         scopes: &[String],
-    ) -> Result<Vec<jacquard_oauth::scopes::Scope>, String> {
+    ) -> Result<Vec<crate::services::gateway_scope::Scope>, String> {
         scopes
             .iter()
             .map(|s| {
-                jacquard_oauth::scopes::Scope::parse(s)
-                    .map(|sc: jacquard_oauth::scopes::Scope<smol_str::SmolStr>| sc.into_static())
+                crate::services::gateway_scope::Scope::parse(s)
                     .map_err(|e| format!("Invalid OAuth scope '{s}': {e:?}"))
             })
             .collect()
@@ -621,7 +619,7 @@ impl OAuthConfig {
     /// Validates whether a requested scope string is allowed by declared max_scopes.
     /// Excludes app-password and account deletion scopes by design.
     pub fn is_scope_allowed(&self, scope_str: &str) -> Result<bool, String> {
-        let parsed = jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(scope_str)
+        let parsed = crate::services::gateway_scope::Scope::parse(scope_str)
             .map_err(|e| format!("Invalid scope '{scope_str}': {e:?}"))?;
         let normalized = parsed.to_string_normalized();
         let max_normalized = self.normalized_max_scopes()?;
@@ -730,7 +728,7 @@ pub fn parse_catmos_upgrade_scopes(
         }
     };
     for scope in &extra {
-        jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(scope).map_err(|e| {
+        crate::services::gateway_scope::Scope::parse(scope).map_err(|e| {
             anyhow::anyhow!("Invalid CATMOS_OAUTH_MAX_SCOPES scope '{scope}': {e:?}")
         })?;
     }
@@ -799,21 +797,21 @@ impl AppConfig {
 
         // Fail startup on any malformed scope in initial_scopes, max_scopes, or scopes
         for scope_str in &app_config.oauth.initial_scopes {
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(scope_str).map_err(|e| {
+            crate::services::gateway_scope::Scope::parse(scope_str).map_err(|e| {
                 config::ConfigError::Message(format!(
                     "Malformed OAuth initial_scope '{scope_str}': {e:?}"
                 ))
             })?;
         }
         for scope_str in &app_config.oauth.max_scopes {
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(scope_str).map_err(|e| {
+            crate::services::gateway_scope::Scope::parse(scope_str).map_err(|e| {
                 config::ConfigError::Message(format!(
                     "Malformed OAuth max_scope '{scope_str}': {e:?}"
                 ))
             })?;
         }
         for scope_str in &app_config.oauth.scopes {
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(scope_str).map_err(|e| {
+            crate::services::gateway_scope::Scope::parse(scope_str).map_err(|e| {
                 config::ConfigError::Message(format!("Malformed OAuth scope '{scope_str}': {e:?}"))
             })?;
         }
@@ -966,11 +964,7 @@ impl AppConfig {
     }
 }
 
-/// Concrete Jacquard OAuth client type used throughout nest.
-pub type JacquardOAuthClient = jacquard_oauth::client::OAuthClient<
-    jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient>,
-    crate::services::RedisAuthStore,
->;
+pub use crate::services::petrel_oauth::GatewayOAuth;
 
 /// Shared application state
 #[derive(Clone)]
@@ -981,11 +975,11 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub push_db: Option<Pool<Postgres>>,
     pub key_store: Option<Arc<crate::services::KeyStore>>,
-    pub jacquard_client: Option<Arc<JacquardOAuthClient>>,
-    /// Jacquard OAuth client for catmos-web
-    pub catmos_jacquard_client: Option<Arc<JacquardOAuthClient>>,
+    pub oauth_client: Option<Arc<GatewayOAuth>>,
+    /// Petrel OAuth client for catmos-web
+    pub catmos_oauth_client: Option<Arc<GatewayOAuth>>,
     /// Scopes catmos-web asks for at sign-in (`CATMOS_OAUTH_SCOPES`).
-    pub catmos_oauth_scopes: Vec<jacquard_oauth::scopes::Scope>,
+    pub catmos_oauth_scopes: Vec<crate::services::gateway_scope::Scope>,
     /// Scopes a catmos-web session may be upgraded to later
     /// (`CATMOS_OAUTH_MAX_SCOPES`), kept as byte-exact raw strings because
     /// they go on the wire at PAR. Always a superset of the sign-in scopes.
@@ -994,7 +988,7 @@ pub struct AppState {
     pub catmos_oauth_upgrade_scopes: Vec<String>,
     /// Trusted reverse proxy CIDRs (empty = none trusted; forwarding headers ignored)
     pub trusted_proxies: Vec<ipnet::IpNet>,
-    /// Redis-backed auth store for Jacquard sessions
+    /// Redis-backed auth store for gateway sessions
     pub auth_store: Option<Arc<crate::services::RedisAuthStore>>,
     /// Push subsystem managers (only present when push is configured)
     pub push: Option<Arc<crate::services::push::PushServices>>,
@@ -1012,10 +1006,10 @@ pub struct AppState {
 }
 
 fn validate_configured_oauth_scopes(scopes: &[String]) -> Result<(), anyhow::Error> {
-    use jacquard_oauth::scopes::Scope;
+    use crate::services::gateway_scope::Scope;
 
     for scope in scopes {
-        Scope::<smol_str::SmolStr>::parse(scope).map_err(|error| {
+        Scope::parse(scope).map_err(|error| {
             anyhow::anyhow!("Invalid configured OAuth scope {scope:?}: {error:?}")
         })?;
     }
@@ -1073,11 +1067,10 @@ impl AppState {
         if trimmed_catmos.is_empty() {
             anyhow::bail!("CATMOS_OAUTH_SCOPES cannot be empty");
         }
-        let catmos_oauth_scopes: Vec<jacquard_oauth::scopes::Scope> = trimmed_catmos
+        let catmos_oauth_scopes: Vec<crate::services::gateway_scope::Scope> = trimmed_catmos
             .split_whitespace()
             .map(|s| {
-                jacquard_oauth::scopes::Scope::parse(s)
-                    .map(|sc: jacquard_oauth::scopes::Scope<smol_str::SmolStr>| sc.into_static())
+                crate::services::gateway_scope::Scope::parse(s)
                     .map_err(|e| anyhow::anyhow!("Invalid catmos OAuth scope '{s}': {e:?}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1085,7 +1078,7 @@ impl AppState {
             anyhow::bail!("CATMOS_OAUTH_SCOPES cannot be empty");
         }
         if !catmos_oauth_scopes.iter().any(|s| {
-            matches!(s, jacquard_oauth::scopes::Scope::Atproto)
+            matches!(s, crate::services::gateway_scope::Scope::Atproto)
                 || s.to_string_normalized() == "atproto"
         }) {
             anyhow::bail!("CATMOS_OAUTH_SCOPES must contain mandatory 'atproto' scope");
@@ -1112,8 +1105,8 @@ impl AppState {
             redis,
             push_db,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes,
             catmos_oauth_upgrade_scopes,
             trusted_proxies: parsed_trusted_proxies,
@@ -1141,15 +1134,15 @@ impl AppState {
             }
         }
         if let Some(ref key_store) = state.key_store {
-            match Self::init_jacquard(&state, key_store).await {
+            match Self::init_oauth(&state, key_store).await {
                 Ok((store, client)) => {
                     state.auth_store = Some(Arc::new(store));
-                    state.jacquard_client = Some(Arc::new(client));
-                    tracing::info!("Jacquard OAuthClient and RedisAuthStore initialized");
+                    state.oauth_client = Some(Arc::new(client));
+                    tracing::info!("OAuth client and RedisAuthStore initialized");
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to initialize Jacquard OAuthClient: {e}"
+                        "Failed to initialize Petrel OAuth client: {e}"
                     ));
                 }
             }
@@ -1162,18 +1155,17 @@ impl AppState {
                     .unwrap_or_else(|_| format!("{}/auth/callback", state.config.server.base_url));
                 let catmos_store = auth_store
                     .with_oauth_profile(crate::services::redis_auth_store::CATMOS_OAUTH_PROFILE);
-                match Self::build_jacquard_client(
-                    &state,
+                match GatewayOAuth::new(
+                    catmos_store,
                     key_store,
-                    &catmos_store,
                     &catmos_client_id,
                     &catmos_redirect,
-                    &state.catmos_oauth_scopes,
+                    &state.catmos_oauth_upgrade_scopes.join(" "),
                 ) {
                     Ok(client) => {
-                        state.catmos_jacquard_client = Some(Arc::new(client));
+                        state.catmos_oauth_client = Some(Arc::new(client));
                         tracing::info!(
-                            "Catmos Jacquard OAuthClient initialized (client_id={})",
+                            "Catmos OAuth client initialized (client_id={})",
                             catmos_client_id
                         );
                     }
@@ -1240,11 +1232,11 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Select the `JacquardOAuthClient` owning a session profile (`"catbird"` vs `"catmos"`).
-    pub fn oauth_client_for_profile(&self, profile: &str) -> Option<&Arc<JacquardOAuthClient>> {
+    /// Select the `GatewayOAuth` owning a session profile (`"catbird"` vs `"catmos"`).
+    pub fn oauth_client_for_profile(&self, profile: &str) -> Option<&Arc<GatewayOAuth>> {
         match profile.trim() {
-            "catmos" | "catmos-web" => self.catmos_jacquard_client.as_ref(),
-            _ => self.jacquard_client.as_ref(),
+            "catmos" | "catmos-web" => self.catmos_oauth_client.as_ref(),
+            _ => self.oauth_client.as_ref(),
         }
     }
 
@@ -1346,131 +1338,26 @@ impl AppState {
         ))
     }
 
-    /// Build the Jacquard RedisAuthStore and OAuthClient from current state.
-    async fn init_jacquard(
+    /// Build the Redis session store and Petrel OAuth client from current state.
+    async fn init_oauth(
         state: &AppState,
         key_store: &crate::services::KeyStore,
-    ) -> Result<(crate::services::RedisAuthStore, JacquardOAuthClient), anyhow::Error> {
-        use jacquard_oauth::atproto::AtprotoClientMetadata;
-        use jacquard_oauth::scopes::{Scope, Scopes};
-        use jacquard_oauth::session::ClientData;
+    ) -> anyhow::Result<(crate::services::RedisAuthStore, GatewayOAuth)> {
         let store = crate::services::RedisAuthStore::new(
             state.redis.clone(),
             state.config.redis.key_prefix.clone(),
             state.config.redis.session_ttl_seconds,
             state.session_encryption_key,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to initialize RedisAuthStore: {e}"))?;
-
-        let keyset = key_store.to_jacquard_keyset()?;
-        // Build AtprotoClientMetadata for confidential client
-        let client_id =
-            jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.client_id.as_str())
-                .map_err(|e| anyhow::anyhow!("Invalid client_id URI: {e:?}"))?
-                .to_owned();
-        let redirect_uri =
-            jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.redirect_uri.as_str())
-                .map_err(|e| anyhow::anyhow!("Invalid redirect_uri: {e:?}"))?
-                .to_owned();
-        let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
-            format!(
-                "{}/.well-known/jwks.json",
-                state.config.server.base_url.trim_end_matches('/')
-            )
-            .as_str(),
-        )
-        .map_err(|e| anyhow::anyhow!("Invalid jwks_uri: {e:?}"))?
-        .to_owned();
-
-        let scopes: Vec<Scope> = state
-            .config
-            .oauth
-            .max_scopes
-            .iter()
-            .map(|s| {
-                Scope::parse(s)
-                    .map(|sc: Scope<smol_str::SmolStr>| sc.into_static())
-                    .map_err(|e| anyhow::anyhow!("Invalid OAuth max_scope '{s}': {e:?}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let scopes = Scopes::from_scopes(scopes.into_iter().map(|s| s.convert()))
-            .map_err(|e| anyhow::anyhow!("Invalid scopes: {e:?}"))?;
-        let metadata = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes))
-            .with_jwks_uri(jwks_uri);
-
-        let client_data = ClientData::new(Some(keyset), metadata);
-        let resolver = Self::build_resolver();
-        let client = JacquardOAuthClient::new_from_resolver(store.clone(), resolver, client_data);
-
+        )?;
+        let oauth = &state.config.oauth;
+        let client = GatewayOAuth::new(
+            store.clone(),
+            key_store,
+            &oauth.client_id,
+            &oauth.redirect_uri,
+            &oauth.max_scopes.join(" "),
+        )?;
         Ok((store, client))
-    }
-
-    /// Build a client whose PAR requests exactly `scopes`, reusing an existing
-    /// `RedisAuthStore` so a later callback resolves through any client backed by
-    /// the same store.
-    pub(crate) fn build_jacquard_client(
-        state: &AppState,
-        key_store: &crate::services::KeyStore,
-        existing_store: &crate::services::RedisAuthStore,
-        client_id_str: &str,
-        redirect_uri_str: &str,
-        scopes: &[jacquard_oauth::scopes::Scope],
-    ) -> Result<JacquardOAuthClient, anyhow::Error> {
-        use jacquard_oauth::atproto::AtprotoClientMetadata;
-        use jacquard_oauth::scopes::Scopes;
-        use jacquard_oauth::session::ClientData;
-
-        let keyset = key_store.to_jacquard_keyset()?;
-
-        let client_id = jacquard_common::deps::fluent_uri::Uri::parse(client_id_str)
-            .map_err(|e| anyhow::anyhow!("Invalid client_id URI: {e:?}"))?
-            .to_owned();
-        let redirect_uri = jacquard_common::deps::fluent_uri::Uri::parse(redirect_uri_str)
-            .map_err(|e| anyhow::anyhow!("Invalid redirect_uri: {e:?}"))?
-            .to_owned();
-        let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
-            format!(
-                "{}/.well-known/jwks.json",
-                state.config.server.base_url.trim_end_matches('/')
-            )
-            .as_str(),
-        )
-        .map_err(|e| anyhow::anyhow!("Invalid jwks_uri: {e:?}"))?
-        .to_owned();
-
-        if scopes.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Refusing to build an OAuth client with an empty scope set"
-            ));
-        }
-        let scopes = Scopes::from_scopes(scopes.iter().cloned().map(|s| s.convert()))
-            .map_err(|e| anyhow::anyhow!("Invalid scopes: {e:?}"))?;
-        let metadata = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes))
-            .with_jwks_uri(jwks_uri);
-
-        let client_data = ClientData::new(Some(keyset), metadata);
-        let resolver = Self::build_resolver();
-        let client =
-            JacquardOAuthClient::new_from_resolver(existing_store.clone(), resolver, client_data);
-
-        Ok(client)
-    }
-
-    /// Build a JacquardResolver with DNS enabled but no in-memory cache.
-    ///
-    /// Nest handles low-volume OAuth login flows where correctness matters more
-    /// than saving a PLC directory lookup. Caching with time-to-idle TTLs caused
-    /// stale identity data to persist indefinitely when users retried login.
-    pub(crate) fn build_resolver(
-    ) -> jacquard_identity::JacquardResolver<crate::services::HardenedHttpClient> {
-        let resolver_client = crate::services::build_hardened_http_client()
-            .expect("Failed to build hardened HTTP client for identity resolver");
-        let hardened_client = crate::services::HardenedHttpClient::new(resolver_client);
-        let resolver = jacquard_identity::JacquardResolver::new(
-            hardened_client,
-            jacquard_identity::resolver::ResolverOptions::default(),
-        );
-        resolver.with_system_dns()
     }
 }
 
@@ -1738,7 +1625,7 @@ mod tests {
                 "transition:chat.bsky".to_string(),
             ]
         );
-        let expected_conv_normalized = jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(
+        let expected_conv_normalized = crate::services::gateway_scope::Scope::parse(
             crate::models::oauth_upgrade::LABYRINTH_CONVERSATION_SPACE_SCOPE,
         )
         .unwrap()
@@ -2111,13 +1998,13 @@ mod tests {
 
     #[test]
     fn test_catmos_scopes_defaults_and_explicit_subsets() {
-        use jacquard_oauth::scopes::Scope;
+        use crate::services::gateway_scope::Scope;
 
         // Default Catmos scopes
         let default_scope_str = "atproto transition:generic";
         let parsed_default: Vec<Scope> = default_scope_str
             .split_whitespace()
-            .map(|s| Scope::<smol_str::SmolStr>::parse(s).unwrap().into_static())
+            .map(|s| Scope::parse(s).unwrap())
             .collect();
         assert_eq!(parsed_default.len(), 2);
         assert_eq!(
@@ -2402,7 +2289,7 @@ mod tests {
 
     #[test]
     fn test_catmos_oauth_scopes_validation_logic() {
-        use jacquard_oauth::scopes::Scope;
+        use crate::services::gateway_scope::Scope;
 
         // Helper simulating the validation in AppState::new
         fn validate_catmos_scopes(scope_str: &str) -> Result<Vec<Scope>, String> {
@@ -2412,11 +2299,7 @@ mod tests {
             }
             let scopes: Vec<Scope> = trimmed
                 .split_whitespace()
-                .map(|s| {
-                    Scope::parse(s)
-                        .map(|sc: Scope<smol_str::SmolStr>| sc.into_static())
-                        .map_err(|e| format!("Invalid scope '{s}': {e:?}"))
-                })
+                .map(|s| Scope::parse(s).map_err(|e| format!("Invalid scope '{s}': {e:?}")))
                 .collect::<Result<Vec<_>, _>>()?;
             if scopes.is_empty() {
                 return Err("CATMOS_OAUTH_SCOPES cannot be empty".to_string());

@@ -234,6 +234,8 @@ pub enum RedisFamily {
     RevokeClaim,
     LogoutGrant,
     Retired,
+    PetrelSession,
+    PetrelFlow,
 }
 
 /// Every family must have been inspected completely, even if no owned record
@@ -259,9 +261,22 @@ pub const REDIS_FAMILIES: &[RedisFamily] = &[
     RedisFamily::RevokeClaim,
     RedisFamily::LogoutGrant,
     RedisFamily::Retired,
+    RedisFamily::PetrelSession,
+    RedisFamily::PetrelFlow,
 ];
 
 impl RedisFamily {
+    pub(crate) fn key_stem(self, prefix: &str) -> String {
+        match self {
+            Self::Exchange => self.stem().to_owned(),
+            Self::PetrelSession | Self::PetrelFlow => format!(
+                "{}{}",
+                super::petrel_storage::v3_prefix(prefix),
+                self.stem()
+            ),
+            _ => format!("{prefix}{}", self.stem()),
+        }
+    }
     pub fn stem(self) -> &'static str {
         match self {
             Self::Session => "session:",
@@ -283,6 +298,8 @@ impl RedisFamily {
             Self::RevokeClaim => "revoke_claim:",
             Self::LogoutGrant => "logout_cleanup_grant:",
             Self::Retired => "upgrade_retired:",
+            Self::PetrelSession => "ps:",
+            Self::PetrelFlow => "flow:",
         }
     }
 }
@@ -356,11 +373,7 @@ fn valid_did(did: &str) -> bool {
 }
 
 fn key_valid(prefix: &str, did: &str, record: &VerifiedRedisRecord) -> bool {
-    let start = if record.family == RedisFamily::Exchange {
-        record.family.stem().to_owned()
-    } else {
-        format!("{prefix}{}", record.family.stem())
-    };
+    let start = record.family.key_stem(prefix);
     let Some(suffix) = record.key.strip_prefix(&start) else {
         return false;
     };

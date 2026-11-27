@@ -193,8 +193,8 @@ async fn make_test_app_state(
         redis,
         push_db: Some(pool),
         key_store: None,
-        jacquard_client: None,
-        catmos_jacquard_client: None,
+        oauth_client: None,
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
@@ -1966,9 +1966,8 @@ async fn late_apns_outcome_preserves_fresh_same_token_registration() {
     wait_for_test_barrier(&captured).await;
     // Synthetic erasure of this fixture's three populated account tables. The
     // production erasure inventory has separate all-table transaction fixtures.
-    use jacquard_oauth::authstore::ClientAuthStore;
-    let parsed_did: jacquard_common::types::did::Did =
-        jacquard_common::types::did::Did::new_owned(did.to_string()).unwrap();
+
+    let parsed_did: petrel_core::Did = petrel_core::Did::parse(did.to_string()).unwrap();
     auth_store
         .delete_session(&parsed_did, &old.id.to_string())
         .await

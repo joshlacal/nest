@@ -1,10 +1,10 @@
 //! Synthetic contract tests for the real cleanup coordinator. These do not
 //! exercise the production HTTP/SQL/Redis adapters or contact an OAuth provider.
 use async_trait::async_trait;
+use catbird::services::petrel_storage::ClientSessionData;
 use catbird::services::{
     logout_cleanup::*, push::registry::session_fingerprint, revocation::RevokeOutcome,
 };
-use jacquard_oauth::session::ClientSessionData;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -116,11 +116,7 @@ impl CleanupStore for Fake {
         s.receipts.insert(request.bearer.clone(), journal.clone());
         Ok(CleanupAttempt {
             journal,
-            grant: Some(fixture::grant(
-                DID,
-                &request.bearer,
-                "https://synthetic.invalid",
-            )),
+            grant: Some(fixture::grant(DID, &request.bearer, "https://synthetic.invalid").into()),
         })
     }
     async fn checkpoint(&self, journal: &mut CleanupJournal) -> Result<(), CleanupError> {
@@ -172,7 +168,11 @@ impl CleanupEffects for Fake {
         s.events.push("erase_account");
         s.erase_results.pop_front().unwrap_or(Ok(()))
     }
-    async fn revoke(&self, grant: &mut ClientSessionData, _: Uuid) -> RevokeOutcome {
+    async fn revoke(
+        &self,
+        grant: &mut catbird::services::revocation::StoredGrantV3,
+        _: Uuid,
+    ) -> RevokeOutcome {
         let (never_finishes, outcome) = {
             let mut s = self.state.lock().unwrap();
             assert!(!s.live.contains(grant.session_id.as_str()));
@@ -436,7 +436,6 @@ async fn unsupported_provider_is_not_reported_revoked() {
 #[tokio::test]
 #[ignore = "requires explicit disposable Redis fixture"]
 async fn redis_concurrent_retirement_is_authoritative_and_fences_new_login() {
-    use jacquard_oauth::authstore::ClientAuthStore;
     let store = fixture::store().await;
     let a = request(CredentialRetention::Forbidden);
     let b = request(CredentialRetention::Forbidden);
@@ -506,7 +505,6 @@ async fn redis_concurrent_retirement_is_authoritative_and_fences_new_login() {
 #[tokio::test]
 #[ignore = "requires explicit disposable Redis fixture"]
 async fn stale_device_link_cannot_be_written_after_retirement() {
-    use jacquard_oauth::authstore::ClientAuthStore;
     let store = fixture::store().await;
     let r = request(CredentialRetention::Forbidden);
     store
@@ -533,7 +531,6 @@ async fn stale_device_link_cannot_be_written_after_retirement() {
 #[tokio::test]
 #[ignore = "requires explicit disposable Redis fixture"]
 async fn unreadable_session_candidate_does_not_become_false_other_active_session() {
-    use jacquard_oauth::authstore::ClientAuthStore;
     let store = fixture::store().await;
     let r = request(CredentialRetention::Forbidden);
     store

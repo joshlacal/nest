@@ -11,11 +11,10 @@
 
 use std::sync::Arc;
 
-use jacquard_oauth::request::{revoke, OAuthMetadata};
-use jacquard_oauth::session::ClientSessionData;
+use crate::services::petrel_storage::ClientSessionData;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppState, JacquardOAuthClient};
+use crate::config::{AppState, GatewayOAuth};
 use crate::services::redis_crypto::{
     open_v2_with_metadata, seal_v2_with_metadata, EnvelopeMetadata,
 };
@@ -38,51 +37,152 @@ pub enum RevokeOutcome {
     Failed(String),
 }
 
+/// Only the bound token required to revoke a retired grant. This value is
+/// persisted exclusively in authenticated, short-lived cleanup envelopes.
+#[derive(Clone, Serialize)]
+pub struct StoredGrantV3 {
+    version: u8,
+    pub account_did: petrel_core::Did,
+    pub session_id: String,
+    credential: Option<RevocationCredential>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct RevocationCredential {
+    issuer: String,
+    pds: String,
+    token: String,
+    scalar: [u8; 32],
+}
+
+impl From<ClientSessionData> for StoredGrantV3 {
+    fn from(grant: ClientSessionData) -> Self {
+        // A malformed historical grant may still be retired locally. Retain
+        // no unusable credential and report upstream revocation as unconfirmed.
+        let credential = grant.to_petrel(0).ok().and_then(|(record, scalar)| {
+            Some(RevocationCredential {
+                issuer: record.account.expected_issuer?,
+                pds: record.account.pds,
+                token: record
+                    .session
+                    .refresh_token()
+                    .unwrap_or_else(|| record.session.access_token())
+                    .to_owned(),
+                scalar,
+            })
+        });
+        Self {
+            version: 3,
+            account_did: grant.account_did,
+            session_id: grant.session_id,
+            credential,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredGrantV3 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        #[derive(Deserialize)]
+        struct V3 {
+            version: u8,
+            account_did: petrel_core::Did,
+            session_id: String,
+            credential: Option<RevocationCredential>,
+        }
+        let value = serde_json::Value::deserialize(d)?;
+        if value.get("version").is_none() {
+            return serde_json::from_value::<ClientSessionData>(value)
+                .map(Self::from)
+                .map_err(D::Error::custom);
+        }
+        let wire: V3 = serde_json::from_value(value).map_err(D::Error::custom)?;
+        if wire.version != 3 {
+            return Err(D::Error::custom("unsupported stored grant version"));
+        }
+        Ok(Self {
+            version: wire.version,
+            account_did: wire.account_did,
+            session_id: wire.session_id,
+            credential: wire.credential,
+        })
+    }
+}
+
+impl StoredGrantV3 {
+    fn revocation_record(&self) -> anyhow::Result<(petrel::oauth::SessionRecord, &[u8; 32])> {
+        use petrel::crypto::{DpopSigner, SoftwareDpopSigner};
+        use petrel::oauth::{Account, SessionRecord};
+        let grant = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no usable revocation grant"))?;
+        let jkt = SoftwareDpopSigner::from_bytes(&grant.scalar)?
+            .public_jwk()
+            .thumbprint()?;
+        // This one-operation Petrel session has no refresh authority. The SDK
+        // passes its sole token to the revocation endpoint without a type hint.
+        let session = serde_json::from_value(serde_json::json!({
+            "did": self.account_did, "access_token": grant.token,
+            "created_at": 0, "expires_in": 0, "scope": ""
+        }))?;
+        Ok((
+            SessionRecord {
+                account: Account {
+                    did: self.account_did.clone(),
+                    handle: None,
+                    pds: grant.pds.clone(),
+                    authorization_server: None,
+                    expected_issuer: Some(grant.issuer.clone()),
+                },
+                session,
+                dpop_key_id: format!("nest-{jkt}"),
+                dpop_jkt: jkt,
+            },
+            &grant.scalar,
+        ))
+    }
+}
+
 /// Revokes the grant behind `session` at its authorization server.
 ///
 /// Uses the refresh token when present: the atproto provider deletes the whole token
 /// record either way, and a refresh token stays resolvable after the access token
 /// expires. Unlike `OAuthSession::logout`, a failed revocation is reported, not ignored.
-pub async fn revoke_upstream(
-    client: &JacquardOAuthClient,
-    session: &mut ClientSessionData,
-) -> RevokeOutcome {
-    let meta = match OAuthMetadata::new(
-        client.client.as_ref(),
-        &client.registry.client_data,
-        session,
-    )
-    .await
-    {
-        Ok(meta) => meta,
-        Err(e) => return RevokeOutcome::Failed(format!("authorization server metadata: {e}")),
-    };
-    if meta.server_metadata.revocation_endpoint.is_none() {
-        return RevokeOutcome::NoRevocationEndpoint;
+pub async fn revoke_upstream(client: &GatewayOAuth, session: &StoredGrantV3) -> RevokeOutcome {
+    let result: anyhow::Result<RevokeOutcome> = async {
+        // Retirement leaves the receipt as the only owner of this grant.
+        let (mut record, scalar) = session.revocation_record()?;
+        let metadata = client.revocation_metadata(&record).await?;
+        if metadata.revocation_endpoint.is_none() {
+            return Ok(RevokeOutcome::NoRevocationEndpoint);
+        }
+        record.account.authorization_server = Some(metadata);
+        let store = petrel::storage::SessionStore::new(
+            Arc::new(petrel::storage::MemorySecretStore::new()),
+            "revocation",
+        )?;
+        store.save_dpop_key(&record.dpop_key_id, scalar).await?;
+        store.save_session(&record).await?;
+        if client
+            .client(store)?
+            .revoke_session(&session.account_did)
+            .await?
+        {
+            Ok(RevokeOutcome::Revoked)
+        } else {
+            Err(anyhow::anyhow!("revocation unconfirmed"))
+        }
     }
-    let token = session
-        .token_set
-        .refresh_token
-        .as_ref()
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| session.token_set.access_token.to_string());
-    match revoke(
-        client.client.as_ref(),
-        &mut session.dpop_data,
-        &token,
-        &meta,
-    )
-    .await
-    {
-        Ok(()) => RevokeOutcome::Revoked,
-        Err(e) if e.to_string() == "http status: 200 OK" => RevokeOutcome::Revoked,
-        Err(e) => RevokeOutcome::Failed(format!("revocation request: {e}")),
-    }
+    .await;
+    result.unwrap_or_else(|_| {
+        RevokeOutcome::Failed("authorization server did not confirm revocation".into())
+    })
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct RevokeJob {
-    pub session: ClientSessionData,
+    pub session: StoredGrantV3,
     pub attempts: u32,
     pub next_attempt_at: i64,
 }
@@ -156,7 +256,7 @@ pub async fn enqueue_retry(
         &store.fingerprint(session.session_id.as_str()),
     );
     let job = RevokeJob {
-        session,
+        session: session.into(),
         attempts: 1,
         next_attempt_at: now + backoff_seconds(1) as i64,
     };
@@ -201,9 +301,9 @@ pub(crate) mod tests {
     const KEY: [u8; 32] = [7u8; 32];
 
     pub(crate) fn session(did_str: &str, sid: &str) -> ClientSessionData {
-        use jacquard_oauth::session::DpopClientData;
-        use jacquard_oauth::types::{OAuthTokenType, TokenSet};
-        let did = jacquard_common::types::did::Did::new_owned(did_str.to_string()).unwrap();
+        use crate::services::petrel_storage::DpopClientData;
+        use crate::services::petrel_storage::{OAuthTokenType, TokenSet};
+        let did = petrel_core::Did::parse(did_str.to_string()).unwrap();
         let dpop_key: jose_jwk::Key = serde_json::from_value(serde_json::json!({
             "kty": "EC",
             "crv": "P-256",
@@ -215,14 +315,11 @@ pub(crate) mod tests {
         ClientSessionData {
             account_did: did.clone(),
             session_id: sid.to_string().into(),
-            host_url: jacquard_common::deps::fluent_uri::Uri::parse("https://pds.example")
-                .unwrap()
-                .to_owned(),
+            host_url: url::Url::parse("https://pds.example").unwrap().to_owned(),
             authserver_url: "https://auth.example".to_string().into(),
             authserver_token_endpoint: "".into(),
             authserver_revocation_endpoint: None,
-            scopes: jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("atproto"))
-                .unwrap(),
+            scopes: petrel_oauth_scopes::ScopeSet::parse("atproto").unwrap(),
             dpop_data: DpopClientData {
                 dpop_key,
                 dpop_authserver_nonce: "".into(),
@@ -244,10 +341,38 @@ pub(crate) mod tests {
 
     fn job(did: &str, sid: &str) -> RevokeJob {
         RevokeJob {
-            session: session(did, sid),
+            session: session(did, sid).into(),
             attempts: 1,
             next_attempt_at: 100,
         }
+    }
+
+    #[test]
+    fn old_grants_decode_and_new_jobs_keep_only_the_token_needed_at_revocation() {
+        use petrel::crypto::{base64url, DpopSigner, SoftwareDpopSigner};
+        let mut legacy = session("did:plc:alice", "session");
+        let scalar = [14; 32];
+        let jwk = SoftwareDpopSigner::from_bytes(&scalar)
+            .unwrap()
+            .public_jwk();
+        legacy.dpop_data.dpop_key = serde_json::from_value(serde_json::json!({
+            "kty":"EC","crv":"P-256","x":jwk.x,"y":jwk.y,"d":base64url(&scalar)
+        }))
+        .unwrap();
+        let old_job = serde_json::json!({"session": legacy, "attempts":1, "next_attempt_at":1});
+        let job: RevokeJob = serde_json::from_value(old_job).unwrap();
+        let wire = serde_json::to_value(&job).unwrap();
+        assert_eq!(wire["session"]["version"], 3);
+        assert_eq!(wire["session"]["credential"]["token"], "refresh-secret");
+        assert!(!wire.to_string().contains("access-secret"));
+        let restored: RevokeJob = serde_json::from_value(wire).unwrap();
+        let (record, key) = restored.session.revocation_record().unwrap();
+        assert_eq!(key, &scalar);
+        assert_eq!(record.session.access_token(), "refresh-secret");
+        assert_eq!(
+            record.account.expected_issuer.as_deref(),
+            Some("https://auth.example")
+        );
     }
 
     #[test]

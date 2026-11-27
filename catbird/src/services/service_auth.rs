@@ -5,7 +5,7 @@
 
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
-use crate::middleware::JacquardDpopData;
+use crate::middleware::SessionDpopData;
 use crate::models::CatbirdSession;
 use crate::services::{AtProtoClient, ProxyResponse};
 use axum::http::StatusCode;
@@ -86,7 +86,7 @@ impl ServiceAuthProvider {
         &self,
         session: &CatbirdSession,
         lexicon: &str,
-        dpop_data: &JacquardDpopData,
+        dpop_data: &SessionDpopData,
     ) -> AppResult<String> {
         self.token_for_audience_with_dpop(session, MLS_APPVIEW_SERVICE_REF, lexicon, dpop_data)
             .await
@@ -100,7 +100,7 @@ impl ServiceAuthProvider {
         session: &CatbirdSession,
         audience: &str,
         lexicon: &str,
-        dpop_data: &JacquardDpopData,
+        dpop_data: &SessionDpopData,
     ) -> AppResult<String> {
         self.validate_audience_and_lexicon(audience, lexicon)?;
         self.fetch_service_auth_from_pds(session, audience, lexicon, Some(dpop_data))
@@ -114,7 +114,7 @@ impl ServiceAuthProvider {
         session: &CatbirdSession,
         audience: &str,
         lexicon: &str,
-        dpop_data: &JacquardDpopData,
+        dpop_data: &SessionDpopData,
     ) -> AppResult<String> {
         match self
             .token_for_audience_with_dpop(session, audience, lexicon, dpop_data)
@@ -202,7 +202,7 @@ impl ServiceAuthProvider {
         session: &CatbirdSession,
         audience: &str,
         lexicon: &str,
-        dpop_data: Option<&JacquardDpopData>,
+        dpop_data: Option<&SessionDpopData>,
     ) -> AppResult<String> {
         let client = AtProtoClient::new(self.state.clone());
         let now = Utc::now().timestamp();
@@ -281,20 +281,20 @@ impl ServiceAuthProvider {
         Ok(token)
     }
 
-    async fn resolve_dpop_data(&self, session: &CatbirdSession) -> AppResult<JacquardDpopData> {
+    async fn resolve_dpop_data(&self, session: &CatbirdSession) -> AppResult<SessionDpopData> {
         let session_id_str = session.id.to_string();
         let profile = self
             .state
             .session_oauth_profile(&session.did, &session_id_str)
             .await;
-        let jacquard_client = self
+        let oauth_client = self
             .state
             .oauth_client_for_profile(&profile)
             .ok_or(AppError::InvalidSession)?;
-        let did = jacquard_common::types::did::Did::new(session.did.as_str())
-            .map_err(|_| AppError::InvalidSession)?;
+        let did =
+            petrel_core::Did::parse(session.did.as_str()).map_err(|_| AppError::InvalidSession)?;
         let session_data = crate::services::session_refresh::get_refreshed_session(
-            jacquard_client,
+            oauth_client,
             did.as_str(),
             &session_id_str,
         )
@@ -312,7 +312,7 @@ impl ServiceAuthProvider {
             }
         })?;
 
-        Ok(JacquardDpopData {
+        Ok(SessionDpopData {
             dpop_key: session_data.dpop_data.dpop_key.clone(),
             dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
         })
@@ -527,8 +527,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -573,11 +573,11 @@ mod tests {
         decode_claim(token, "jti")
     }
 
-    fn test_dpop_data() -> JacquardDpopData {
+    fn test_dpop_data() -> SessionDpopData {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        JacquardDpopData {
+        SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         }
@@ -765,8 +765,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],

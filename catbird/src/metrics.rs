@@ -49,6 +49,25 @@ lazy_static! {
         &["status"]
     ).unwrap();
 
+    pub static ref PETREL_REFRESH_OUTCOMES: CounterVec = CounterVec::new(
+        Opts::new("catbird_petrel_refresh_outcomes_total", "Refresh token HTTP exchanges by provider or transport outcome"),
+        &["outcome"]
+    ).unwrap();
+    pub static ref PETREL_CONVERSIONS: CounterVec = CounterVec::new(
+        Opts::new("catbird_petrel_session_conversions_total", "Lazy session conversions by outcome"),
+        &["outcome"]
+    ).unwrap();
+    pub static ref PETREL_MIRROR_WRITES: IntCounter = IntCounter::new(
+        "catbird_petrel_mirror_writes_total", "Committed token records mirrored atomically into v2 Redis grants"
+    ).unwrap();
+    pub static ref PETREL_CAS_CONFLICTS: CounterVec = CounterVec::new(
+        Opts::new("catbird_petrel_cas_conflicts_total", "Petrel Redis compare-and-swap conflicts by record class"),
+        &["class"]
+    ).unwrap();
+    pub static ref PETREL_REFRESH_LEASE_READS: IntCounter = IntCounter::new(
+        "catbird_petrel_existing_refresh_lease_reads_total", "Refresh lease reads that encountered an existing Redis lease"
+    ).unwrap();
+
     pub static ref ACTIVE_SESSIONS: Gauge = Gauge::new(
         "catbird_active_sessions",
         "Number of active sessions in Redis"
@@ -104,6 +123,21 @@ pub fn register_metrics() {
         .unwrap();
     REGISTRY
         .register(Box::new(TOKEN_REFRESHES_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PETREL_REFRESH_OUTCOMES.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PETREL_CONVERSIONS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PETREL_MIRROR_WRITES.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PETREL_CAS_CONFLICTS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PETREL_REFRESH_LEASE_READS.clone()))
         .unwrap();
     REGISTRY
         .register(Box::new(ACTIVE_SESSIONS.clone()))

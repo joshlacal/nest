@@ -14,7 +14,7 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
 use futures_util::StreamExt;
-use jacquard_common::types::{did::Did, string::Handle};
+use petrel_core::{Did, Handle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::config::AppState;
 use crate::error::{AppError, AppResult};
 use crate::metrics;
-use crate::middleware::JacquardDpopData;
+use crate::middleware::SessionDpopData;
 use crate::middleware::SESSION_COOKIE_NAME;
 use crate::models::{
     oauth_upgrade::FIXED_UPGRADE_CALLBACK_URL, CatbirdSession, ExchangeRequest, ExchangeResponse,
@@ -138,8 +138,8 @@ pub async fn login(
     if is_explicit_url {
         crate::services::validate_pds_url(raw_identifier)?;
     } else {
-        let is_did = Did::new(raw_identifier.as_str()).is_ok();
-        let is_handle = Handle::new(raw_identifier.as_str()).is_ok();
+        let is_did = Did::parse(raw_identifier.as_str()).is_ok();
+        let is_handle = Handle::parse(raw_identifier.as_str()).is_ok();
         if !is_did && !is_handle {
             return Err(AppError::BadRequest(
                 "Invalid identifier: must be a valid Handle or DID".into(),
@@ -205,7 +205,7 @@ pub async fn login(
         client_selector
     );
 
-    let jacquard_client = if is_catmos {
+    let oauth_client = if is_catmos {
         state
             .oauth_client_for_profile("catmos")
             .or_else(|| state.oauth_client_for_profile("catbird"))
@@ -213,16 +213,16 @@ pub async fn login(
     } else {
         state
             .oauth_client_for_profile("catbird")
-            .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
+            .ok_or_else(|| AppError::Internal("OAuth client not initialized".into()))?
     };
 
-    // Generate a clean UUID for the OAuth state (= Jacquard session_id).
+    // Generate a correlation ID for this login before Petrel creates its single-use state.
     let session_nonce = uuid::Uuid::new_v4().to_string();
 
     // Persist versioned AES-GCM-encrypted flow record under v2 prefix keyed by HMAC/state fingerprint
     let state_fp = crate::services::redis_auth_store::fingerprint_id(enc_key, &session_nonce);
     let flow_record = OAuthFlowRecord {
-        version: 2,
+        version: 3,
         mode,
         client_selector: client_selector.to_string(),
         redirect_to,
@@ -284,7 +284,7 @@ pub async fn login(
     // to be asked for only on a later just-in-time upgrade. See
     // `services::oauth_authorize`.
     let auth_url = crate::services::oauth_authorize::start_auth_with_scopes(
-        jacquard_client,
+        oauth_client,
         identifier,
         &requested_scopes,
         &session_nonce,
@@ -314,14 +314,24 @@ pub async fn login(
 /// GET /auth/callback?code=...&state=...&iss=...
 pub async fn oauth_callback(
     State(state): State<Arc<AppState>>,
-    Query(callback): Query<OAuthCallback>,
+    Query(mut callback): Query<OAuthCallback>,
     jar: CookieJar,
 ) -> AppResult<(CookieJar, Response)> {
     tracing::info!("OAuth callback received");
 
+    let store = state
+        .auth_store
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("OAuth session store unavailable".into()))?;
+    let wire_state = callback.state;
+    callback.state = crate::services::petrel_oauth::callback_route(store, &wire_state)
+        .await
+        .map_err(|_| AppError::AuthTemporarilyUnavailable("OAuth store unavailable".into()))?
+        .ok_or_else(|| AppError::Unauthorized("OAuth session expired or invalid".into()))?;
+
     // Early branch for progressive OAuth upgrade callback flows
     if callback.state.starts_with("upg_") {
-        return handle_upgrade_callback(state, callback, jar).await;
+        return handle_upgrade_callback(state, callback, wire_state, jar).await;
     }
 
     let enc_key = state.session_encryption_key.as_ref().ok_or_else(|| {
@@ -476,7 +486,7 @@ pub async fn oauth_callback(
         }
     };
 
-    if flow_record.version != 2 {
+    if flow_record.version != 3 {
         let _ = redis::cmd("DEL")
             .arg(&claim_key)
             .query_async::<_, ()>(&mut conn)
@@ -493,7 +503,7 @@ pub async fn oauth_callback(
     let is_catmos = flow_record.client_selector == "catmos";
     let is_exchange_mode = matches!(flow_record.mode, OAuthMode::Exchange);
 
-    // Validate mode-specific invariants BEFORE calling jacquard_client.callback
+    // Validate mode-specific invariants BEFORE calling oauth_client.callback
     let validated_canonical_origin = if is_exchange_mode {
         let (Some(r), Some(nonce)) = (&flow_record.redirect_to, &flow_record.browser_nonce) else {
             let _ = redis::cmd("DEL")
@@ -562,7 +572,7 @@ pub async fn oauth_callback(
         None
     };
 
-    let jacquard_client = if is_catmos {
+    let oauth_client = if is_catmos {
         state
             .oauth_client_for_profile("catmos")
             .or_else(|| state.oauth_client_for_profile("catbird"))
@@ -572,20 +582,16 @@ pub async fn oauth_callback(
     } else {
         state
             .oauth_client_for_profile("catbird")
-            .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?
+            .ok_or_else(|| AppError::Internal("OAuth client not initialized".into()))?
     };
 
-    use jacquard_oauth::types::CallbackParams;
-    let params = CallbackParams {
-        code: code.into(),
-        state: Some(callback.state.clone().into()),
-        iss: callback.iss.map(|s| s.into()),
-    };
-
-    let oauth_session = match jacquard_client.callback(params).await {
+    let session_data = match oauth_client
+        .complete(&callback.state, &wire_state, &code, callback.iss.as_deref())
+        .await
+    {
         Ok(session) => session,
         Err(e) => {
-            tracing::error!(error = %e, "Jacquard OAuth callback exchange failed");
+            tracing::error!(error = %e, "OAuth callback exchange failed");
             // Release claim on transient token failure, but retain flow record state for retry
             let _ = redis::cmd("DEL")
                 .arg(&claim_key)
@@ -597,9 +603,8 @@ pub async fn oauth_callback(
         }
     };
 
-    // Jacquard stores the session in RedisAuthStore automatically.
+    // The completed login has installed its gateway session.
     // Extract session_id, DID, and host_url (PDS URL).
-    let session_data = oauth_session.data.read().await;
     let did = session_data.account_did.as_str().to_string();
     let session_id = session_data.session_id.to_string();
     let pds_url = session_data.host_url.to_string();
@@ -772,7 +777,7 @@ pub async fn oauth_callback(
             }
 
             // 3. Revoke/delete session locally and with auth server
-            cleanup_new_session(&state, jacquard_client, &did, &session_id).await;
+            cleanup_new_session(&state, oauth_client, &did, &session_id).await;
 
             // 4. Release claim key
             let _ = redis::cmd("DEL")
@@ -789,6 +794,7 @@ pub async fn oauth_callback(
 async fn handle_upgrade_callback(
     state: Arc<AppState>,
     callback: OAuthCallback,
+    wire_state: String,
     jar: CookieJar,
 ) -> AppResult<(CookieJar, Response)> {
     let upgrade_service = crate::handlers::oauth_upgrade::get_upgrade_service(&state)?;
@@ -819,20 +825,17 @@ async fn handle_upgrade_callback(
     let flow_profile = upgrade_service
         .peek_flow_oauth_profile(&callback.state)
         .await;
-    let jacquard_client = state
+    let oauth_client = state
         .oauth_client_for_profile(&flow_profile)
-        .ok_or_else(|| AppError::Internal("Jacquard OAuthClient not initialized".into()))?;
+        .ok_or_else(|| AppError::Internal("OAuth client not initialized".into()))?;
 
-    use jacquard_oauth::types::CallbackParams;
-    let params = CallbackParams {
-        code: code.into(),
-        state: Some(callback.state.clone().into()),
-        iss: callback.iss.map(|s| s.into()),
-    };
-    let oauth_session = match jacquard_client.callback(params).await {
+    let session_data = match oauth_client
+        .complete(&callback.state, &wire_state, &code, callback.iss.as_deref())
+        .await
+    {
         Ok(session) => session,
         Err(e) => {
-            tracing::error!(error = %e, "Jacquard callback failed for upgrade");
+            tracing::error!(error = %e, "OAuth callback failed for upgrade");
             if let Err(cleanup) = upgrade_service.cancel_or_deny_flow(&callback.state).await {
                 tracing::error!(error = %cleanup, "OAuth upgrade cleanup failed");
                 return Err(AppError::AuthTemporarilyUnavailable(
@@ -854,20 +857,11 @@ async fn handle_upgrade_callback(
         }
     };
 
-    let session_data = oauth_session.data.read().await.clone();
-
-    // Clean up the stray session created by callback() in store & registry cache so the upgrade service manages the session lifecycle.
-    let _ = oauth_session
-        .registry
-        .del(&session_data.account_did, session_data.session_id.as_str())
-        .await;
-
     let granted_scopes = session_data
         .scopes
+        .raw_scopes()
         .iter()
-        .map(|s| {
-            crate::services::oauth_upgrade::server_scope_spelling(s.to_string_normalized().as_str())
-        })
+        .map(|s| crate::services::oauth_upgrade::server_scope_spelling(s.as_str()))
         .collect::<Vec<_>>();
 
     let result = match upgrade_service
@@ -943,37 +937,25 @@ fn build_error_redirect(redirect_to: Option<&str>, error: &str) -> String {
     })
 }
 
-/// Helper to clean up a newly created session from Jacquard and RedisAuthStore on post-callback failure.
+/// Helper to clean up a newly created session at the provider and in Redis on post-callback failure.
 async fn cleanup_new_session(
     state: &Arc<AppState>,
-    jacquard_client: &Arc<crate::config::JacquardOAuthClient>,
+    oauth_client: &Arc<crate::config::GatewayOAuth>,
     did: &str,
     session_id: &str,
 ) {
-    if let Ok(parsed_did) = jacquard_common::types::did::Did::new(did) {
+    if let Ok(parsed_did) = petrel_core::Did::parse(did) {
         let session_fp = redact_session_id(session_id);
-        let revoked = match jacquard_client.restore(&parsed_did, session_id).await {
-            Ok(oauth_session) => oauth_session.logout().await.map_err(|e| e.to_string()),
-            Err(e) => {
-                tracing::warn!(
-                    did = %did,
-                    session_fp = %session_fp,
-                    error = %e,
-                    "Could not restore OAuthSession for remote revocation after callback error"
-                );
-                Err("missing OAuthSession".to_string())
-            }
-        };
+        let revoked = oauth_client.revoke(&parsed_did, session_id).await;
         if let Err(e) = revoked {
             tracing::warn!(
                 did = %did,
                 session_fp = %session_fp,
                 error = %e,
-                "Best-effort Jacquard session revocation failed after callback error"
+                "Best-effort upstream session revocation failed after callback error"
             );
         }
         if let Some(store) = state.auth_store.as_ref() {
-            use jacquard_oauth::authstore::ClientAuthStore;
             if let Err(e) = store.delete_session(&parsed_did, session_id).await {
                 tracing::warn!(
                     did = %did,
@@ -1361,7 +1343,7 @@ async fn proxy_circle_request(
     session: &CatbirdSession,
     base_url: &str,
     audience: &str,
-    dpop_data: &JacquardDpopData,
+    dpop_data: &SessionDpopData,
     method: reqwest::Method,
     lexicon: &str,
     query: Option<&str>,
@@ -1514,7 +1496,7 @@ async fn proxy_intel_request(
     base_url: &str,
     audience: &str,
     timeout_ms: u64,
-    dpop_data: &JacquardDpopData,
+    dpop_data: &SessionDpopData,
     method: reqwest::Method,
     lexicon: &str,
     query: Option<&str>,
@@ -1659,7 +1641,7 @@ fn is_allowed_mls_service_auth_lxm(lxm: Option<&str>) -> bool {
             !nsid.is_empty()
                 && !nsid.contains('*')
                 && !nsid.contains(char::is_whitespace)
-                && jacquard_common::types::nsid::Nsid::new(nsid).is_ok()
+                && petrel_core::Nsid::parse(nsid).is_ok()
                 && (nsid.starts_with("blue.catbird.chat.")
                     || nsid.starts_with("blue.catbird.mlsChat.")
                     || nsid.starts_with("blue.catbird.labyrinth.")
@@ -1822,7 +1804,7 @@ fn validate_proxy_lexicon(lexicon: &str) -> AppResult<()> {
     {
         return Err(AppError::BadRequest("Invalid XRPC lexicon NSID".into()));
     }
-    if jacquard_common::types::nsid::Nsid::new(lexicon).is_err() {
+    if petrel_core::Nsid::parse(lexicon).is_err() {
         return Err(AppError::BadRequest("Invalid XRPC lexicon NSID".into()));
     }
     if is_non_canonical_policy_nsid(lexicon) {
@@ -2001,7 +1983,7 @@ pub async fn proxy_xrpc(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<CatbirdSession>,
     req_extensions: Option<Extension<crate::middleware::RequestId>>,
-    dpop_data: Option<Extension<JacquardDpopData>>,
+    dpop_data: Option<Extension<SessionDpopData>>,
     method: Method,
     Path(lexicon): Path<String>,
     RawQuery(raw_query): RawQuery,
@@ -2281,7 +2263,7 @@ pub async fn proxy_xrpc(
     );
 
     let client = AtProtoClient::new(state.clone());
-    let jacquard_dpop = dpop_data.map(|ext| ext.0);
+    let session_dpop = dpop_data.map(|ext| ext.0);
     let proxy_response = client
         .proxy_request(
             &session,
@@ -2292,7 +2274,7 @@ pub async fn proxy_xrpc(
             content_type,
             Some(&headers),
             &request_id,
-            jacquard_dpop.as_ref(),
+            session_dpop.as_ref(),
         )
         .await?;
 
@@ -2859,8 +2841,7 @@ mod tests {
 
     #[test]
     fn test_default_and_catmos_explicit_scope_subsets() {
-        use jacquard_common::IntoStatic;
-        use jacquard_oauth::scopes::Scope;
+        use crate::services::gateway_scope::Scope;
 
         // Default client scopes
         let default_initial = crate::config::default_initial_scopes();
@@ -2874,7 +2855,7 @@ mod tests {
         let catmos_str = "atproto transition:generic";
         let catmos_parsed: Vec<Scope> = catmos_str
             .split_whitespace()
-            .map(|s| Scope::<smol_str::SmolStr>::parse(s).unwrap().into_static())
+            .map(|s| Scope::parse(s).unwrap())
             .collect();
         let catmos_names: Vec<String> = catmos_parsed
             .iter()
@@ -2936,21 +2917,21 @@ mod tests {
     #[test]
     fn test_login_identifier_admission_rules() {
         // Valid DIDs
-        assert!(Did::new("did:plc:ragtjsm2j2vknq6z").is_ok());
-        assert!(Did::new("did:web:example.com").is_ok());
+        assert!(Did::parse("did:plc:ragtjsm2j2vknq6z").is_ok());
+        assert!(Did::parse("did:web:example.com").is_ok());
 
         // Valid Handles
-        assert!(Handle::new("alice.bsky.social").is_ok());
-        assert!(Handle::new("bob.test.com").is_ok());
+        assert!(Handle::parse("alice.bsky.social").is_ok());
+        assert!(Handle::parse("bob.test.com").is_ok());
 
         // Valid PDS / Issuer URLs
         assert!(crate::services::validate_pds_url("https://bsky.social").is_ok());
         assert!(crate::services::validate_pds_url("https://pds.example.com").is_ok());
 
         // Invalid Handle / DID syntax
-        assert!(Did::new("not_a_did").is_err());
-        assert!(Handle::new("bad!handle").is_err());
-        assert!(Handle::new("").is_err());
+        assert!(Did::parse("not_a_did").is_err());
+        assert!(Handle::parse("bad!handle").is_err());
+        assert!(Handle::parse("").is_err());
 
         // SSRF blocked URLs
         // Loopback is permitted in debug builds for WireMock-backed tests; see
@@ -2964,7 +2945,7 @@ mod tests {
     fn test_oauth_flow_record_sealing_and_strict_deserialization() {
         let key = [0x42u8; 32];
         let record = OAuthFlowRecord {
-            version: 2,
+            version: 3,
             mode: OAuthMode::Exchange,
             client_selector: "catmos".to_string(),
             redirect_to: Some("https://catmos.catbird.blue/callback".to_string()),
@@ -2978,7 +2959,7 @@ mod tests {
         let opened = crate::services::redis_crypto::open_strict(&key, &sealed).unwrap();
         let recovered: OAuthFlowRecord = serde_json::from_str(&opened).unwrap();
 
-        assert_eq!(recovered.version, 2);
+        assert_eq!(recovered.version, 3);
         assert_eq!(recovered.mode, OAuthMode::Exchange);
         assert_eq!(recovered.client_selector, "catmos");
         assert_eq!(
@@ -3033,7 +3014,7 @@ mod tests {
         // 4. Missing nonce + any redirect -> Rejection (redirects require exchange mode)
         // Direct mode is strictly only when no redirect is requested
         let direct_flow = OAuthFlowRecord {
-            version: 2,
+            version: 3,
             mode: OAuthMode::Direct,
             client_selector: "default".to_string(),
             redirect_to: None,
@@ -3084,7 +3065,7 @@ mod tests {
     fn test_direct_mode_browser_nonce_comparison_logic() {
         let nonce = "550e8400-e29b-41d4-a716-446655440000";
         let flow_record = OAuthFlowRecord {
-            version: 2,
+            version: 3,
             mode: OAuthMode::Direct,
             client_selector: "default".to_string(),
             redirect_to: None,
@@ -3111,7 +3092,7 @@ mod tests {
         use crate::services::logout_cleanup::{
             CleanupError, CredentialRetention, LogoutRequest, RedisCleanupStore,
         };
-        use jacquard_oauth::authstore::ClientAuthStore;
+
         assert_eq!(std::env::var("LITE_PUSH_DISPOSABLE").as_deref(), Ok("1"));
         let url =
             url::Url::parse(&std::env::var("REDIS_URL").expect("explicit fixture URL")).unwrap();
@@ -3136,8 +3117,8 @@ mod tests {
             redis: redis.clone(),
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -3299,8 +3280,7 @@ mod tests {
     #[tokio::test]
     async fn test_b4_logout_revoke_retry_never_stores_plaintext_session_id() {
         use axum::http::HeaderValue;
-        use jacquard_common::IntoStatic;
-        use jacquard_oauth::authstore::ClientAuthStore;
+
         use uuid::Uuid;
 
         let mut config = crate::config::AppConfig::test_default();
@@ -3327,11 +3307,7 @@ mod tests {
         );
         let signing_key = p256::SecretKey::random(&mut rand::thread_rng());
         let key_store = crate::services::KeyStore::from_key("catbird-b4-key", signing_key);
-        let scopes = vec![
-            jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse("atproto")
-                .unwrap()
-                .into_static(),
-        ];
+        let scopes = vec![crate::services::gateway_scope::Scope::parse("atproto").unwrap()];
 
         let state_proto = crate::config::AppState {
             config: Arc::new(config),
@@ -3340,8 +3316,8 @@ mod tests {
             redis: redis.clone(),
             push_db: None,
             key_store: Some(Arc::new(key_store.clone())),
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -3354,17 +3330,16 @@ mod tests {
             session_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_index_readiness: Arc::new(tokio::sync::Notify::new()),
         };
-        let jacquard_client = crate::config::AppState::build_jacquard_client(
-            &state_proto,
+        let oauth_client = crate::config::GatewayOAuth::new(
+            (*auth_store).clone(),
             &key_store,
-            &auth_store,
             "https://catbird.test/client-metadata.json",
             "https://catbird.test/auth/callback",
-            &scopes,
+            "atproto",
         )
         .unwrap();
         let state = Arc::new(crate::config::AppState {
-            jacquard_client: Some(Arc::new(jacquard_client)),
+            oauth_client: Some(Arc::new(oauth_client)),
             ..state_proto
         });
 

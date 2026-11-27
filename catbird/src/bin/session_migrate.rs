@@ -33,6 +33,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check v2 grants for Petrel compatibility without changing any Redis data.
+    Convert {
+        #[arg(long)]
+        redis_url: String,
+        #[arg(long, default_value = "catbird:v2:session:")]
+        prefix: String,
+        #[arg(long, env = "SESSION_ENCRYPTION_KEY", hide_env_values = true)]
+        encryption_key: String,
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+        /// This release supports inspection only.
+        #[arg(long, required = true)]
+        dry_run: bool,
+    },
     /// Export sessions from a Redis instance to a JSON file
     Export {
         /// Redis connection URL
@@ -670,6 +684,57 @@ fn parse_encryption_key(raw_key: &str) -> anyhow::Result<[u8; 32]> {
     Ok(key_bytes)
 }
 
+async fn run_conversion_check(
+    redis_url: &str,
+    prefix: &str,
+    encryption_key: &str,
+    batch_size: usize,
+) -> anyhow::Result<()> {
+    use catbird::services::{petrel_storage::inspect_legacy_session, RedisAuthStore};
+    use std::collections::BTreeMap;
+
+    anyhow::ensure!(
+        batch_size > 0 && prefix.contains(":v2:") && !prefix.contains(['*', '?', '[', ']', '\\']),
+        "expected a literal v2 prefix and a positive batch size"
+    );
+    let key = parse_encryption_key(encryption_key)?;
+    let mut conn = connect(redis_url).await?;
+    let store = RedisAuthStore::from_key(conn.clone(), prefix.into(), 86400 * 30, key)
+        .map_err(|_| anyhow::anyhow!("invalid Redis store configuration"))?;
+    let keys = scan_keys(&mut conn, &format!("{prefix}session:"), batch_size).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let mut convertible = 0usize;
+    let mut expired = 0usize;
+    let mut disappeared = 0usize;
+    let mut reasons = BTreeMap::new();
+    for key in keys {
+        let value: Option<String> = conn.get(&key).await?;
+        let Some(value) = value else {
+            disappeared += 1;
+            continue;
+        };
+        match inspect_legacy_session(&store, &key, &value, now) {
+            Ok(is_expired) => {
+                convertible += 1;
+                expired += usize::from(is_expired);
+            }
+            Err(err) => *reasons.entry(err.to_string()).or_insert(0usize) += 1,
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({"convertible":convertible,"already_expired":expired,
+        "disappeared":disappeared,"unconvertible_by_reason":reasons})
+    );
+    anyhow::ensure!(
+        reasons.is_empty(),
+        "one or more sessions could not be converted"
+    );
+    Ok(())
+}
+
 // ── main ─────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -677,6 +742,14 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Command::Convert {
+            redis_url,
+            prefix,
+            encryption_key,
+            batch_size,
+            dry_run: true,
+        } => run_conversion_check(&redis_url, &prefix, &encryption_key, batch_size).await,
+        Command::Convert { .. } => Err(anyhow::anyhow!("only --dry-run is supported")),
         Command::Export {
             redis_url,
             output,
@@ -762,7 +835,7 @@ async fn run_rekey(
             && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
     }
 
-    /// Upgrade legacy session JSON shapes to the current jacquard schema:
+    /// Upgrade legacy session JSON shapes to the v2 rollback schema:
     /// `scopes` was serialized as an array of strings; it is now a single
     /// space-delimited string.
     fn upgrade_session_json(mut v: serde_json::Value) -> serde_json::Value {
@@ -836,9 +909,9 @@ async fn run_rekey(
                         failed += 1;
                     }
                     Ok((plain, _meta, _is_v1)) => {
-                        if serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(
-                            &plain,
-                        )
+                        if serde_json::from_str::<
+                            catbird::services::petrel_storage::ClientSessionData,
+                        >(&plain)
                         .is_ok()
                         {
                             skipped += 1;
@@ -853,9 +926,10 @@ async fn run_rekey(
                             };
                             let upgraded = upgrade_session_json(v);
                             let upgraded_str = serde_json::to_string(&upgraded)?;
-                            match serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(
-                                &upgraded_str,
-                            ) {
+                            match serde_json::from_str::<
+                                catbird::services::petrel_storage::ClientSessionData,
+                            >(&upgraded_str)
+                            {
                                 Ok(_) => {
                                     if dry_run {
                                         println!("would upgrade payload of {k} (ttl {ttl})");
@@ -960,7 +1034,7 @@ async fn run_rekey(
         let upgraded = upgrade_session_json(json.clone());
         let json_str = serde_json::to_string(&upgraded)?;
         if let Err(e) =
-            serde_json::from_str::<jacquard_oauth::session::ClientSessionData>(&json_str)
+            serde_json::from_str::<catbird::services::petrel_storage::ClientSessionData>(&json_str)
         {
             eprintln!("rekey: '{k}' fails typed parse even after upgrade: {e}");
             failed += 1;
@@ -971,8 +1045,9 @@ async fn run_rekey(
             .map_err(|e| anyhow::anyhow!("rekey: reseal failed for '{k}': {e}"))?;
 
         if dry_run {
-            if let Err(e) =
-                serde_json::from_slice::<jacquard_oauth::session::ClientSessionData>(&plain)
+            if let Err(e) = serde_json::from_slice::<
+                catbird::services::petrel_storage::ClientSessionData,
+            >(&plain)
             {
                 eprintln!("typed-parse FAILS for {k}: {e}");
             }

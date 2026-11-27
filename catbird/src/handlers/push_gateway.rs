@@ -21,8 +21,8 @@ use crate::{
     models::CatbirdSession,
     services::push::{gateway::PushGatewayService, push_unavailable_error},
 };
-use catbird_atproto::generated::blue_catbird::push::register_key::{
-    RegisterKey, RegisterKeyOutput,
+use petrel_catbird::generated::blue::catbird::push::register_key::{
+    Input as RegisterKey, Output as RegisterKeyOutput,
 };
 
 fn bearer_looks_like_compact_jwt(headers: &HeaderMap) -> Option<&str> {
@@ -62,6 +62,20 @@ fn configured_gateway_audiences(state: &AppState) -> Vec<String> {
     out
 }
 
+fn parse_register_input(value: serde_json::Value) -> AppResult<RegisterKey> {
+    let known = ["appId", "deviceId", "nativeToken", "platform"];
+    if value
+        .as_object()
+        .is_none_or(|m| m.keys().any(|k| !known.contains(&k.as_str())))
+    {
+        return Err(crate::error::AppError::BadRequest(
+            "Invalid registerKey fields".into(),
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|_| crate::error::AppError::BadRequest("Invalid registerKey input".into()))
+}
+
 /// `POST /xrpc/blue.catbird.push.registerKey` (`D-09` dual authentication):
 /// - First-party Nest clients authenticate with `Bearer <session_uuid>` or `catbird_session` cookie.
 /// - External / direct ATProto clients authenticate with a PDS-minted `ServiceJWT`
@@ -69,8 +83,9 @@ fn configured_gateway_audiences(state: &AppState) -> Vec<String> {
 pub async fn register_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(input): Json<RegisterKey>,
+    Json(value): Json<serde_json::Value>,
 ) -> AppResult<Json<RegisterKeyOutput>> {
+    let input = parse_register_input(value)?;
     if let Some(raw_auth) = bearer_looks_like_compact_jwt(&headers) {
         let push = state.push.as_ref().ok_or_else(push_unavailable_error)?;
         let allowed_aud = configured_gateway_audiences(&state);
@@ -126,8 +141,9 @@ pub async fn register_key_with_service(
 pub async fn register_key_service_jwt_with_service(
     State(gateway): State<Arc<PushGatewayService>>,
     headers: HeaderMap,
-    Json(input): Json<RegisterKey>,
+    Json(value): Json<serde_json::Value>,
 ) -> AppResult<Json<RegisterKeyOutput>> {
+    let input = parse_register_input(value)?;
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());

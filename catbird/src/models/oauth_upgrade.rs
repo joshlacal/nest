@@ -13,14 +13,14 @@ pub const MAX_ADDITIONAL_SCOPES: usize = 16;
 /// 512 accommodates parameterized `space:` scopes (the Labyrinth mailbox scope is ~440 chars).
 pub const MAX_SCOPE_LEN: usize = 512;
 
-/// Circle Space scope, in jacquard-normalized form (params sorted, defaults omitted).
+/// Circle Space scope, in normalized form (params sorted, defaults omitted).
 /// Grants record read_self/create/update/delete on any collection in
 /// `blue.catbird.circle` spaces under any authority, plus space
 /// create/update/delete management. Requested just-in-time when the user
 /// first creates or writes to a Circle.
 pub const CIRCLE_SPACE_SCOPE: &str = "space:blue.catbird.circle?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update";
 
-/// Encrypted Circle Space scope (`blue.catbird.circle.encrypted`), in jacquard-normalized form.
+/// Encrypted Circle Space scope (`blue.catbird.circle.encrypted`), in normalized form.
 pub const CIRCLE_ENCRYPTED_SPACE_SCOPE: &str = "space:blue.catbird.circle.encrypted?action=create&action=delete&action=read_self&action=update&authority=*&collection=*&manage=create&manage=delete&manage=update";
 
 /// Wildcard blob upload/fetch scope required for encrypted media & Space avatars.

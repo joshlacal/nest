@@ -21,12 +21,10 @@ enum PrimeStepResult {
     LocalBudgetExhausted,
     PdsRateLimited {
         retry_after: u64,
-        next_nonce: Option<String>,
     },
     Non200 {
         status: u16,
         body: Vec<u8>,
-        next_nonce: Option<String>,
     },
     Success {
         next_nonce: Option<String>,
@@ -123,7 +121,7 @@ pub(crate) async fn poll_account_with_session(
     rate_budget: &PdsRateBudget,
     row: &ChatPollRow,
     session: &crate::models::CatbirdSession,
-    dpop: &crate::middleware::JacquardDpopData,
+    dpop: &crate::middleware::SessionDpopData,
     session_id: &str,
     auth_generation: i64,
     prime_start: std::time::Instant,
@@ -135,16 +133,11 @@ pub(crate) async fn poll_account_with_session(
         return Ok(());
     }
 
-    // Host DPoP nonce to try first. Seeded from dpop data or cached PDS origin nonce;
-    // `fetch_log_page` updates it in place whenever a `use_dpop_nonce` 401
-    // forces a retry with a fresh one, so later pages in this same poll (and
-    // the persist call below) reuse it instead of eating the round trip again.
-    let mut dpop_nonce: Option<String> = if dpop.dpop_host_nonce.is_empty() {
-        crate::services::DpopNonceCache::origin_key(&session.pds_url)
-            .and_then(|origin| state.dpop_nonce_cache.get(&origin))
-    } else {
-        Some(dpop.dpop_host_nonce.clone())
-    };
+    // Fetches update the per-origin cache on each DPoP challenge or response.
+    // A migrated grant can seed the first request after a restart.
+    let mut dpop_nonce = crate::services::DpopNonceCache::origin_key(&session.pds_url)
+        .and_then(|origin| state.dpop_nonce_cache.get(&origin))
+        .or_else(|| (!dpop.dpop_host_nonce.is_empty()).then(|| dpop.dpop_host_nonce.clone()));
 
     // PRIME PASS: first poll for this account. Fast-forward the cursor to
     // "now" WITHOUT notifying — enrolling must never replay backlog.
@@ -184,24 +177,16 @@ pub(crate) async fn poll_account_with_session(
                     FetchLogOutcome::LocalBudgetExhausted => {
                         Ok(PrimeStepResult::LocalBudgetExhausted)
                     }
-                    FetchLogOutcome::PdsRateLimited {
-                        retry_after,
-                        next_nonce,
-                    } => Ok(PrimeStepResult::PdsRateLimited {
-                        retry_after,
-                        next_nonce,
-                    }),
+                    FetchLogOutcome::PdsRateLimited { retry_after, .. } => {
+                        Ok(PrimeStepResult::PdsRateLimited { retry_after })
+                    }
                     FetchLogOutcome::Success {
                         status,
                         body,
                         next_nonce,
                     } => {
                         if status != 200 {
-                            return Ok(PrimeStepResult::Non200 {
-                                status,
-                                body,
-                                next_nonce,
-                            });
+                            return Ok(PrimeStepResult::Non200 { status, body });
                         }
 
                         let page: GetLogResponse = serde_json::from_slice(&body)?;
@@ -283,16 +268,7 @@ pub(crate) async fn poll_account_with_session(
                         .await?;
                     return Ok(());
                 }
-                PrimeStepResult::PdsRateLimited {
-                    retry_after,
-                    next_nonce,
-                } => {
-                    if next_nonce != dpop_nonce {
-                        if let Some(n) = &next_nonce {
-                            persist_host_nonce(state, &row.account_did, session_id, n).await;
-                        }
-                    }
-
+                PrimeStepResult::PdsRateLimited { retry_after } => {
                     tracing::warn!(
                         did = %row.account_did,
                         pds = %row.pds_host,
@@ -306,17 +282,7 @@ pub(crate) async fn poll_account_with_session(
                         .await?;
                     return Ok(());
                 }
-                PrimeStepResult::Non200 {
-                    status,
-                    body,
-                    next_nonce,
-                } => {
-                    if next_nonce != dpop_nonce {
-                        if let Some(n) = &next_nonce {
-                            persist_host_nonce(state, &row.account_did, session_id, n).await;
-                        }
-                    }
-
+                PrimeStepResult::Non200 { status, body } => {
                     tracing::warn!(
                         did = %row.account_did,
                         status,
@@ -334,12 +300,7 @@ pub(crate) async fn poll_account_with_session(
                     new_cursor,
                     page_done,
                 } => {
-                    if next_nonce != dpop_nonce {
-                        if let Some(n) = &next_nonce {
-                            persist_host_nonce(state, &row.account_did, session_id, n).await;
-                        }
-                        dpop_nonce = next_nonce;
-                    }
+                    dpop_nonce = next_nonce;
 
                     cursor = (!new_cursor.is_empty()).then_some(new_cursor);
                     if page_done {
@@ -387,7 +348,7 @@ pub(crate) async fn poll_account_with_session(
     )
     .await?;
 
-    let (status, body, _) = match outcome {
+    let (status, body) = match outcome {
         FetchLogOutcome::LocalBudgetExhausted => {
             tracing::debug!(
                 did = %row.account_did,
@@ -399,15 +360,7 @@ pub(crate) async fn poll_account_with_session(
                 .await?;
             return Ok(());
         }
-        FetchLogOutcome::PdsRateLimited {
-            retry_after,
-            next_nonce,
-        } => {
-            if next_nonce != dpop_nonce {
-                if let Some(n) = &next_nonce {
-                    persist_host_nonce(state, &row.account_did, session_id, n).await;
-                }
-            }
+        FetchLogOutcome::PdsRateLimited { retry_after, .. } => {
             tracing::warn!(
                 did = %row.account_did,
                 pds = %row.pds_host,
@@ -420,18 +373,7 @@ pub(crate) async fn poll_account_with_session(
                 .await?;
             return Ok(());
         }
-        FetchLogOutcome::Success {
-            status,
-            body,
-            next_nonce,
-        } => {
-            if next_nonce != dpop_nonce {
-                if let Some(n) = &next_nonce {
-                    persist_host_nonce(state, &row.account_did, session_id, n).await;
-                }
-            }
-            (status, body, next_nonce)
-        }
+        FetchLogOutcome::Success { status, body, .. } => (status, body),
     };
 
     // Handle auth errors
@@ -579,7 +521,7 @@ async fn send_get_log_request(
     client: &crate::services::AtProtoClient,
     state: &Arc<AppState>,
     session: &crate::models::CatbirdSession,
-    dpop: &crate::middleware::JacquardDpopData,
+    dpop: &crate::middleware::SessionDpopData,
     url: &str,
     nonce: Option<String>,
     max_bytes: usize,
@@ -683,7 +625,7 @@ async fn send_get_log_request(
 async fn fetch_log_page(
     state: &Arc<AppState>,
     session: &crate::models::CatbirdSession,
-    dpop: &crate::middleware::JacquardDpopData,
+    dpop: &crate::middleware::SessionDpopData,
     cursor: Option<&str>,
     nonce_hint: Option<&str>,
     rate_budget: &PdsRateBudget,
@@ -806,58 +748,6 @@ async fn fetch_log_page(
         body: body.to_vec(),
         next_nonce: nonce_hint.map(str::to_string),
     })
-}
-
-/// Persist a freshly-issued DPoP host nonce back to the Jacquard session
-/// registry so the next poll cycle for this account starts with a valid
-/// nonce instead of paying the `use_dpop_nonce` round trip again. Best
-/// effort: on failure the next cycle just repeats the retry-once dance in
-/// `fetch_log_page`.
-async fn persist_host_nonce(
-    state: &Arc<AppState>,
-    account_did: &str,
-    session_id: &str,
-    nonce: &str,
-) {
-    use jacquard_common::types::did::Did;
-
-    let profile = state.session_oauth_profile(account_did, session_id).await;
-    let Some(jacquard_client) = state.oauth_client_for_profile(&profile) else {
-        return;
-    };
-
-    let did = match Did::new(account_did) {
-        Ok(did) => did,
-        Err(err) => {
-            tracing::debug!(
-                did = %account_did,
-                error = %err,
-                "Chat poll: invalid DID, skipping DPoP nonce persist"
-            );
-            return;
-        }
-    };
-
-    let mut session_data = match jacquard_client.registry.get(&did, session_id, false).await {
-        Ok(data) => data,
-        Err(err) => {
-            tracing::debug!(
-                did = %account_did,
-                error = %err,
-                "Chat poll: failed to load session for DPoP nonce persist"
-            );
-            return;
-        }
-    };
-
-    session_data.dpop_data.dpop_host_nonce = nonce.to_string().into();
-    if let Err(err) = jacquard_client.registry.set(session_data).await {
-        tracing::debug!(
-            did = %account_did,
-            error = %err,
-            "Chat poll: failed to persist DPoP host nonce"
-        );
-    }
 }
 
 /// Whether a CreateMessage at `rev` should trigger a push, given the
@@ -1383,8 +1273,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1415,7 +1305,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -1514,8 +1404,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1546,7 +1436,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -1611,8 +1501,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1643,7 +1533,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -1695,8 +1585,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1713,7 +1603,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -1968,8 +1858,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -2021,7 +1911,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -2191,8 +2081,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -2223,7 +2113,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -2286,8 +2176,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -2318,7 +2208,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -2404,8 +2294,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -2457,7 +2347,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };

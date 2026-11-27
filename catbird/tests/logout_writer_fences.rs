@@ -16,8 +16,8 @@ use catbird::{
         RedisAuthStore,
     },
 };
-use jacquard_common::types::did::Did;
-use jacquard_oauth::authstore::ClientAuthStore;
+use petrel_core::Did;
+
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -109,7 +109,7 @@ async fn request_waiting_for_account_lock_cannot_change_preferences_after_retire
     });
     // Retirement happens while the stale writer cannot yet hold its write lock.
     f.store
-        .delete_session(&Did::new(DID).unwrap(), &old.id.to_string())
+        .delete_session(&Did::parse(DID).unwrap(), &old.id.to_string())
         .await
         .unwrap();
     lock.commit().await.unwrap();
@@ -139,7 +139,7 @@ async fn fresh_login_does_not_reauthorize_an_old_bearer_for_any_experience_write
     let old = session();
     cleanup_auth::seed(&f.store, &old).await;
     f.store
-        .delete_session(&Did::new(DID).unwrap(), &old.id.to_string())
+        .delete_session(&Did::parse(DID).unwrap(), &old.id.to_string())
         .await
         .unwrap();
     let fresh = session();
@@ -256,8 +256,8 @@ fn fixture_state(
         redis: f.store.redis_connection(),
         push_db: Some(f.pool.clone()),
         key_store: None,
-        jacquard_client: None,
-        catmos_jacquard_client: None,
+        oauth_client: None,
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
@@ -457,7 +457,7 @@ async fn expiry_auth_failure_and_account_switch_never_erase_account_experience()
         .await
         .unwrap();
     f.store
-        .delete_session(&Did::new(DID).unwrap(), &expired.id.to_string())
+        .delete_session(&Did::parse(DID).unwrap(), &expired.id.to_string())
         .await
         .unwrap();
 

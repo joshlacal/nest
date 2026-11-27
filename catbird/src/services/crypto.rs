@@ -17,6 +17,23 @@ pub struct SigningKey {
     pub secret_key: SecretKey,
 }
 
+impl petrel::oauth::AssertionSigner for SigningKey {
+    fn key_id(&self) -> &str {
+        &self.kid
+    }
+
+    fn sign<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> petrel::rt::BoxFuture<'a, Result<[u8; 64], petrel::crypto::CryptoError>> {
+        use petrel::crypto::{DpopSigner, SoftwareDpopSigner};
+        Box::pin(async move {
+            let signer = SoftwareDpopSigner::from_bytes(&self.secret_key.to_bytes().into())?;
+            signer.sign(input).await
+        })
+    }
+}
+
 /// Store for multiple signing keys, supporting key rotation
 #[derive(Clone)]
 pub struct KeyStore {
@@ -132,27 +149,6 @@ impl KeyStore {
             kid: kid.to_string(),
             secret_key: secret_key.clone(),
         })
-    }
-
-    /// Convert loaded keys into a Jacquard `Keyset` for OAuth client authentication.
-    pub fn to_jacquard_keyset(&self) -> AppResult<jacquard_oauth::keyset::Keyset> {
-        let jwks: Vec<jose_jwk::Jwk> = self
-            .keys
-            .iter()
-            .map(|(kid, secret_key)| jose_jwk::Jwk {
-                key: {
-                    let crypto_key = jose_jwk::crypto::Key::from(secret_key.clone());
-                    jose_jwk::Key::from(&crypto_key)
-                },
-                prm: jose_jwk::Parameters {
-                    kid: Some(kid.clone()),
-                    ..Default::default()
-                },
-            })
-            .collect();
-
-        jacquard_oauth::keyset::Keyset::try_from(jwks)
-            .map_err(|e| AppError::Crypto(format!("Failed to create Jacquard keyset: {}", e)))
     }
 
     /// Convert all public keys to JWK format for JWKS endpoint

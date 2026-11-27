@@ -3,9 +3,9 @@
 #![allow(dead_code)]
 
 use catbird::{models::CatbirdSession, services::RedisAuthStore};
-use jacquard_oauth::authstore::ClientAuthStore;
-use jacquard_oauth::session::{ClientSessionData, DpopClientData};
-use jacquard_oauth::types::{OAuthTokenType, TokenSet};
+
+use catbird::services::petrel_storage::{ClientSessionData, DpopClientData};
+use catbird::services::petrel_storage::{OAuthTokenType, TokenSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -63,7 +63,7 @@ pub async fn seed(store: &RedisAuthStore, session: &CatbirdSession) {
 }
 
 pub fn grant(did: &str, bearer: &str, pds_url: &str) -> ClientSessionData {
-    let did = jacquard_common::types::did::Did::new_owned(did.to_string()).unwrap();
+    let did = petrel_core::Did::parse(did.to_string()).unwrap();
     // Public synthetic test-only key, inherited from push_session_signout.rs.
     let dpop_key: jose_jwk::Key = serde_json::from_value(serde_json::json!({
         "kty": "EC", "crv": "P-256",
@@ -75,14 +75,11 @@ pub fn grant(did: &str, bearer: &str, pds_url: &str) -> ClientSessionData {
     ClientSessionData {
         account_did: did.clone(),
         session_id: bearer.to_string().into(),
-        host_url: jacquard_common::deps::fluent_uri::Uri::parse(pds_url)
-            .unwrap()
-            .to_owned(),
+        host_url: url::Url::parse(pds_url).unwrap().to_owned(),
         authserver_url: pds_url.to_string().into(),
         authserver_token_endpoint: "".into(),
         authserver_revocation_endpoint: None,
-        scopes: jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("atproto"))
-            .unwrap(),
+        scopes: petrel_oauth_scopes::ScopeSet::parse("atproto").unwrap(),
         dpop_data: DpopClientData {
             dpop_key,
             dpop_authserver_nonce: "".into(),

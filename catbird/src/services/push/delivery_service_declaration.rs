@@ -212,9 +212,7 @@ fn is_public_hostname(host: &str) -> bool {
 fn is_canonical_cid(cid: &str) -> bool {
     (2..=128).contains(&cid.len())
         && cid.is_ascii()
-        && jacquard_common::types::cid::Cid::str(cid)
-            .to_ipld()
-            .is_ok_and(|parsed| parsed.to_string() == cid)
+        && petrel_core::Cid::parse(cid).is_ok_and(|parsed| parsed.to_string() == cid)
 }
 
 /// Builds the public `getRecord` URL for `account_did`'s declaration from its

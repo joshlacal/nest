@@ -13,7 +13,7 @@ use catbird::{
         RedisAuthStore,
     },
 };
-use jacquard_oauth::authstore::ClientAuthStore;
+
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -380,7 +380,7 @@ async fn revoked_account_or_original_bearer_cannot_recreate_local_settings() {
     fixture
         .store
         .delete_session(
-            &jacquard_common::types::did::Did::new(fixture.session.did.as_str()).unwrap(),
+            &petrel_core::Did::parse(fixture.session.did.as_str()).unwrap(),
             &fixture.session.id.to_string(),
         )
         .await
