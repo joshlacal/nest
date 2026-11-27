@@ -1,0 +1,17 @@
+**
+!Petrel/rust
+!Petrel/rust/**/Cargo.toml
+!Petrel/rust/Cargo.toml
+!Petrel/rust/**/src
+!Petrel/rust/**/src/**
+!Petrel/rust/**/build.rs
+!PetrelCatbird/rust/petrel-catbird
+!PetrelCatbird/rust/petrel-catbird/Cargo.toml
+!PetrelCatbird/rust/petrel-catbird/src/**
+!nest/catbird/Cargo.toml
+!nest/catbird/Cargo.lock
+!nest/catbird/src/**
+!nest/catbird/migrations/**
+!nest/catbird/migrations_phase2/**
+!nest/catbird/config/default.toml
+**/target/**
