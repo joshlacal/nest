@@ -266,7 +266,7 @@ pub const REDIS_FAMILIES: &[RedisFamily] = &[
 ];
 
 impl RedisFamily {
-    pub(crate) fn key_stem(self, prefix: &str) -> String {
+    pub fn key_stem(self, prefix: &str) -> String {
         match self {
             Self::Exchange => self.stem().to_owned(),
             Self::PetrelSession | Self::PetrelFlow => format!(
