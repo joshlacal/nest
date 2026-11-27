@@ -256,10 +256,14 @@ impl GatewayOAuth {
         did: &Did,
         id: &str,
     ) -> Result<ClientSessionData, OAuthError> {
-        let (storage, observed_mirror) = RedisSessionSecrets::new(&self.store, did, id)
-            .load_with_mirror()
-            .await?
-            .ok_or(OAuthError::MissingSession)?;
+        let (storage, observed_mirror) =
+            match super::petrel_storage::load_for_refresh(&self.store, did, id).await {
+                Err(error @ (OAuthError::InvalidGrant | OAuthError::RefreshPersistencePending)) => {
+                    self.evict_session(id);
+                    return Err(error);
+                }
+                other => other?.ok_or(OAuthError::MissingSession)?,
+            };
         let client = {
             let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
             let key = storage.namespace().to_owned();

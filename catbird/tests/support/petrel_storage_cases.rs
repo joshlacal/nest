@@ -346,3 +346,138 @@ async fn petrel_storage_rollback_refreshes_at_the_same_single_use_provider() {
         Some("test-refresh-three")
     );
 }
+
+fn permanent(error: petrel::oauth::OAuthError) -> bool {
+    catbird::services::session_refresh::SessionReadError::Registry(Box::new(error)).is_permanent()
+}
+
+#[tokio::test]
+async fn petrel_storage_retires_structurally_unconvertible_grants_as_permanent() {
+    use catbird::services::petrel_storage::load_for_refresh;
+    use petrel::oauth::OAuthError;
+
+    let (state, _server, _service, _redis) = super::setup_test_server().await;
+    let store = state.auth_store.as_ref().unwrap();
+    let did = Did::parse("did:plc:unconvertiblefixture").unwrap();
+    type Shape = (&'static str, fn(&mut Value));
+    let shapes: [Shape; 7] = [
+        ("issuer origin differs from the authorization server", |g| {
+            g["iss"] = "https://other.example".into()
+        }),
+        ("issuer has a path", |g| {
+            g["iss"] = "https://auth.example/tenant".into()
+        }),
+        ("host has a path", |g| {
+            g["host_url"] = "https://pds.example/xrpc".into()
+        }),
+        ("grant lacks atproto", |g| {
+            g["scopes"] = "transition:generic".into();
+            g["scope"] = "transition:generic".into();
+        }),
+        ("DPoP key is not P-256", |g| {
+            g["dpop_key"]["crv"] = "P-384".into()
+        }),
+        ("DPoP public coordinates do not match d", |g| {
+            let x = g["dpop_key"]["x"].clone();
+            g["dpop_key"]["x"] = g["dpop_key"]["y"].clone();
+            g["dpop_key"]["y"] = x;
+        }),
+        ("token type is not DPoP", |g| {
+            g["token_type"] = "Bearer".into()
+        }),
+    ];
+    for (shape, mutate) in shapes {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut bad = grant(&did, &id, "catbird");
+        mutate(&mut bad);
+        let (key, raw) = install(store, &did, &id, &bad).await;
+        let mut conn = store.redis_connection();
+
+        // The read-only path still leaves the record in place (rollback, dry run).
+        let plain = RedisSessionSecrets::new(store, &did, &id);
+        assert!(plain.load_or_convert().await.is_err(), "{shape}");
+        assert_eq!(conn.get::<_, String>(&key).await.unwrap(), raw, "{shape}");
+
+        // The refresh path retires it and answers "sign in again".
+        let error = load_for_refresh(store, &did, &id).await.err().unwrap();
+        assert!(
+            matches!(error, OAuthError::InvalidGrant),
+            "{shape}: {error:?}"
+        );
+        assert!(permanent(error), "{shape}");
+        assert!(
+            conn.get::<_, Option<String>>(&key).await.unwrap().is_none(),
+            "{shape}: grant not retired"
+        );
+        assert!(
+            conn.exists::<_, bool>(store.retired_key(&id))
+                .await
+                .unwrap(),
+            "{shape}: no retirement tombstone"
+        );
+    }
+}
+
+#[tokio::test]
+async fn petrel_storage_keeps_transient_conversion_failures_temporary() {
+    use catbird::services::petrel_storage::load_for_refresh;
+    use petrel::oauth::OAuthError;
+    use petrel::storage::StoreError;
+
+    let (state, _server, _service, _redis) = super::setup_test_server().await;
+    let store = state.auth_store.as_ref().unwrap();
+    let did = Did::parse("did:plc:transientfixture").unwrap();
+    let mut conn = store.redis_connection();
+
+    // A v2 envelope that does not decrypt is not proof the grant is dead.
+    let id = uuid::Uuid::new_v4().to_string();
+    let key = store.session_key(did.as_str(), &id);
+    let _: () = conn.set_ex(&key, "not-an-envelope", 60).await.unwrap();
+    let error = load_for_refresh(store, &did, &id).await.err().unwrap();
+    assert!(
+        matches!(error, OAuthError::Store(StoreError::Corrupt(_))),
+        "{error:?}"
+    );
+    assert!(!permanent(error));
+    assert_eq!(
+        conn.get::<_, String>(&key).await.unwrap(),
+        "not-an-envelope"
+    );
+
+    // Conversion result -2: a refresh exchange is pending on the converted copy while the
+    // previous binary rewrote the v2 grant. Retrying later must stay possible.
+    let id = uuid::Uuid::new_v4().to_string();
+    let original = grant(&did, &id, "catbird");
+    install(store, &did, &id, &original).await;
+    RedisSessionSecrets::new(store, &did, &id)
+        .load_or_convert()
+        .await
+        .unwrap()
+        .unwrap();
+    let pattern = format!("*ps:{}", store.fingerprint(&id));
+    let hashes: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(hashes.len(), 1, "{hashes:?}");
+    let _: () = conn
+        .hset(
+            &hashes[0],
+            format!("session.pending.{}", did.as_str()),
+            "pending",
+        )
+        .await
+        .unwrap();
+    let mut rolled_back = original;
+    rolled_back["refresh_token"] = "test-refresh-rolled-back".into();
+    let (key, raw) = install(store, &did, &id, &rolled_back).await;
+    let error = load_for_refresh(store, &did, &id).await.err().unwrap();
+    assert!(matches!(error, OAuthError::Store(_)), "{error:?}");
+    assert!(!permanent(error));
+    assert_eq!(conn.get::<_, String>(&key).await.unwrap(), raw);
+    assert!(!conn
+        .exists::<_, bool>(store.retired_key(&id))
+        .await
+        .unwrap());
+}

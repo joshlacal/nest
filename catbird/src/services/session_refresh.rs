@@ -331,6 +331,16 @@ mod tests {
         assert_eq!(missing.to_string(), expected);
         assert!(missing.is_permanent());
 
+        let registry = |e| SessionReadError::Registry(Box::new(e));
+        assert!(registry(petrel::oauth::OAuthError::InvalidGrant).is_permanent());
+        assert!(!registry(petrel::oauth::OAuthError::RefreshPersistencePending).is_permanent());
+        for transient in [
+            petrel::storage::StoreError::Unavailable("Redis operation failed".into()),
+            petrel::storage::StoreError::Corrupt("invalid v2 session envelope".into()),
+        ] {
+            assert!(!registry(transient.into()).is_permanent());
+        }
+
         let unfinished = SessionReadError::TaskFailed("cancelled".into());
         assert!(unfinished.to_string().contains("did not finish"));
         assert!(!unfinished.is_permanent());

@@ -49,6 +49,77 @@ pub struct RedisSessionSecrets {
     binding: Option<SessionBinding>,
 }
 
+/// Why a session could not be loaded for use.
+#[derive(Debug)]
+pub enum SessionLoadError {
+    /// The store could not be read, decrypted or updated. Possibly transient.
+    Store(StoreError),
+    /// The stored v2 grant authenticated but can never become a Petrel session (wrong token
+    /// type, issuer or scope binding, or a DPoP key that is not a matching P-256 pair). Only
+    /// signing in again helps. `observed_mirror` is the exact v2 envelope that was rejected,
+    /// the compare-and-swap token for retiring it.
+    Unconvertible {
+        observed_mirror: String,
+        error: StoreError,
+    },
+}
+
+impl From<StoreError> for SessionLoadError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl SessionLoadError {
+    fn into_store_error(self) -> StoreError {
+        match self {
+            Self::Store(error) | Self::Unconvertible { error, .. } => error,
+        }
+    }
+}
+
+/// Load a session for a refresh. A v2 grant that can never convert is retired through the
+/// same compare-and-swap path as a refused refresh, so the caller is asked to sign in again
+/// (`InvalidGrant`). If a concurrent writer replaced the grant first, nothing is retired and
+/// the answer is the temporary `RefreshPersistencePending`. Store failures stay temporary.
+pub async fn load_for_refresh(
+    store: &RedisAuthStore,
+    did: &Did,
+    session_id: &str,
+) -> Result<Option<(SessionStore, String)>, petrel::oauth::OAuthError> {
+    use petrel::oauth::OAuthError;
+    match RedisSessionSecrets::new(store, did, session_id)
+        .load_with_mirror()
+        .await
+    {
+        Ok(loaded) => Ok(loaded),
+        Err(SessionLoadError::Store(error)) => Err(error.into()),
+        Err(SessionLoadError::Unconvertible {
+            observed_mirror, ..
+        }) => {
+            let retired = store
+                .retire_session(did, session_id, &observed_mirror)
+                .await
+                .map_err(|_| StoreError::Unavailable("session retirement".into()))?;
+            let outcome = if retired {
+                "retired_unconvertible"
+            } else {
+                "unconvertible_replaced"
+            };
+            PETREL_CONVERSIONS.with_label_values(&[outcome]).inc();
+            tracing::warn!(
+                outcome,
+                "Legacy session cannot convert to Petrel; asking the client to sign in again"
+            );
+            Err(if retired {
+                OAuthError::InvalidGrant
+            } else {
+                OAuthError::RefreshPersistencePending
+            })
+        }
+    }
+}
+
 fn unavailable(_: redis::RedisError) -> StoreError {
     StoreError::Unavailable("Redis operation failed".into())
 }
@@ -230,17 +301,26 @@ impl RedisSessionSecrets {
 
     /// Load a live, validated session. A cached v3 copy is reusable only while
     /// the corresponding v2 grant is still current and has not been retired.
+    ///
+    /// A grant that cannot convert is reported as `StoreError::Corrupt` and left in place;
+    /// only [`load_for_refresh`] retires it.
     pub async fn load_or_convert(&self) -> Result<Option<SessionStore>, StoreError> {
-        Ok(self.load_with_mirror().await?.map(|(store, _)| store))
+        Ok(self
+            .load_with_mirror()
+            .await
+            .map_err(SessionLoadError::into_store_error)?
+            .map(|(store, _)| store))
     }
 
     /// The encrypted mirror is the compare-and-swap token for retiring a
     /// rejected refresh without affecting a concurrent replacement grant.
     pub(super) async fn load_with_mirror(
         &self,
-    ) -> Result<Option<(SessionStore, String)>, StoreError> {
+    ) -> Result<Option<(SessionStore, String)>, SessionLoadError> {
         let result = self.load_or_convert_inner().await;
-        if let Err(error) = &result {
+        if let Err(SessionLoadError::Store(error) | SessionLoadError::Unconvertible { error, .. }) =
+            &result
+        {
             let reason = match error {
                 StoreError::Corrupt(s) if s.contains("DPoP") => "invalid_key",
                 StoreError::Corrupt(s) if s.contains("scope") => "invalid_scope",
@@ -255,7 +335,9 @@ impl RedisSessionSecrets {
         result
     }
 
-    async fn load_or_convert_inner(&self) -> Result<Option<(SessionStore, String)>, StoreError> {
+    async fn load_or_convert_inner(
+        &self,
+    ) -> Result<Option<(SessionStore, String)>, SessionLoadError> {
         let b = self.binding.as_ref().ok_or(StoreError::InvalidNamespace)?;
         let mut conn = self.conn.clone();
         // Up to three retries if a concurrent reader rotated the encrypted v2 grant.
@@ -289,18 +371,23 @@ impl RedisSessionSecrets {
                 .as_deref()
                 .is_some_and(|did| did != b.did.as_str())
             {
-                return Err(corrupt("session envelope DID mismatch"));
+                return Err(corrupt("session envelope DID mismatch").into());
             }
             let old: LegacySessionV2 =
                 serde_json::from_str(&json).map_err(|_| corrupt("invalid v2 session"))?;
             if old.account_did != b.did || old.session_id != b.id {
-                return Err(corrupt("session identity mismatch"));
+                return Err(corrupt("session identity mismatch").into());
             }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| StoreError::Unavailable("clock before epoch".into()))?
                 .as_secs();
-            let (record, scalar) = old.to_petrel(now)?;
+            let (record, scalar) =
+                old.to_petrel(now)
+                    .map_err(|error| SessionLoadError::Unconvertible {
+                        observed_mirror: raw.clone(),
+                        error,
+                    })?;
             // Ask Petrel to encode its versioned records, including the account catalog.
             let memory = Arc::new(MemorySecretStore::new());
             let staging = SessionStore::new(memory.clone(), &self.namespace)?;
@@ -339,13 +426,11 @@ impl RedisSessionSecrets {
                 }
                 // Another process completed conversion. Read its committed mirror.
                 2 => continue,
-                -2 => return Err(corrupt("mirror changed during pending refresh")),
+                -2 => return Err(corrupt("mirror changed during pending refresh").into()),
                 _ => {}
             }
         }
-        Err(StoreError::Unavailable(
-            "session changed during conversion".into(),
-        ))
+        Err(StoreError::Unavailable("session changed during conversion".into()).into())
     }
 
     fn seal_mirror(&self, b: &SessionBinding, json: &str) -> Result<String, StoreError> {
