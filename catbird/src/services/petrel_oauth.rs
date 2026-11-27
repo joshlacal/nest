@@ -234,18 +234,12 @@ impl GatewayOAuth {
         if !route.starts_with("upg_") {
             if let Err(error) = self.store.upsert_session(data.clone()).await {
                 let _ = client.revoke_session(&session.did).await;
-                let _ = storage
-                    .secrets()
-                    .delete_namespace(storage.namespace())
-                    .await;
+                let _ = discard_flow(&self.store, route, wire_state).await;
                 return Err(error.into());
             }
         }
-        // The cache expires after ten minutes even if the caller disconnects here.
-        let _ = storage
-            .secrets()
-            .delete_namespace(storage.namespace())
-            .await;
+        // A disconnected callback or transient cleanup failure is bounded by both TTLs.
+        let _ = discard_flow(&self.store, route, wire_state).await;
         Ok(data)
     }
 
@@ -381,6 +375,19 @@ fn flow_route_key(store: &RedisAuthStore, state: &str) -> String {
         store.key_prefix(),
         store.fingerprint(state)
     )
+}
+
+pub async fn discard_flow(store: &RedisAuthStore, route: &str, state: &str) -> anyhow::Result<()> {
+    let storage = RedisSessionSecrets::flow_store(store, route)?;
+    storage
+        .secrets()
+        .delete_namespace(storage.namespace())
+        .await?;
+    let _: usize = redis::cmd("DEL")
+        .arg(flow_route_key(store, state))
+        .query_async(&mut store.redis_connection())
+        .await?;
+    Ok(())
 }
 
 pub async fn callback_route(store: &RedisAuthStore, state: &str) -> anyhow::Result<Option<String>> {

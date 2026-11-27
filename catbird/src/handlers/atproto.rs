@@ -389,6 +389,11 @@ pub async fn oauth_callback(
         }
         metrics::record_oauth_login(false);
 
+        crate::services::petrel_oauth::discard_flow(store, &callback.state, &wire_state)
+            .await
+            .map_err(|_| {
+                AppError::AuthTemporarilyUnavailable("OAuth flow cleanup unavailable".into())
+            })?;
         let target = build_error_redirect(redirect_to.as_deref(), err);
         return Ok((
             jar,
@@ -807,6 +812,13 @@ async fn handle_upgrade_callback(
             return Err(AppError::AuthTemporarilyUnavailable(
                 "OAuth upgrade temporarily unavailable; please retry".into(),
             ));
+        }
+        if let Some(store) = state.auth_store.as_deref() {
+            crate::services::petrel_oauth::discard_flow(store, &callback.state, &wire_state)
+                .await
+                .map_err(|_| {
+                    AppError::AuthTemporarilyUnavailable("OAuth flow cleanup unavailable".into())
+                })?;
         }
         let target = format!("{FIXED_UPGRADE_CALLBACK_URL}?error=access_denied");
         return Ok((
