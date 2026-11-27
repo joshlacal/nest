@@ -37,7 +37,7 @@ for service in catbird circle-appview; do
   expect_failure "$service/Cargo.lock provenance mismatch" "$service"
   cp "$repo/$service/Cargo.lock" "$fixture/nest/$service/Cargo.lock"
 done
-ln -s "$repo/../Petrel" "$fixture/Petrel-alt"
-sed 's#../../Petrel/rust#../../Petrel-alt/rust#g' "$repo/catbird/Cargo.toml" >"$fixture/nest/catbird/Cargo.toml"
+ln -s "$repo/../PetrelCatbird" "$fixture/PetrelCatbird-alt"
+sed 's#../../PetrelCatbird/rust#../../PetrelCatbird-alt/rust#g' "$repo/catbird/Cargo.toml" >"$fixture/nest/catbird/Cargo.toml"
 expect_failure 'outside its pinned sibling' catbird
 printf 'canonical sibling provenance guard test passed\n'

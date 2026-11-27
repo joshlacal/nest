@@ -13,5 +13,4 @@
 !nest/catbird/src/**
 !nest/catbird/migrations/**
 !nest/catbird/migrations_phase2/**
-!nest/catbird/config/default.toml
 **/target/**

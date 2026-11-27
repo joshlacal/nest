@@ -13,7 +13,6 @@ FROM debian:bookworm-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/nest/catbird/target/release/catbird /app/catbird
-COPY --from=builder /build/nest/catbird/config/default.toml /app/config/default.toml
 RUN useradd -r -s /bin/false catbird
 USER catbird
 EXPOSE 3000 9090
