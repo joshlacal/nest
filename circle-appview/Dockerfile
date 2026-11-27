@@ -13,7 +13,15 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only this service; shared contracts resolve from the locked Git revision.
+# Copy this service and the Petrel Rust sources it builds against. The crate
+# names them as sibling path dependencies (../../Petrel/rust/..., and
+# ../../PetrelCatbird/rust/petrel-catbird), and the record validator compiles
+# in four PetrelCatbird lexicon documents, so the build context must be the
+# directory holding nest/, Petrel/ and PetrelCatbird/. The whole Petrel/rust
+# workspace is copied because Cargo loads every workspace member's manifest.
+COPY Petrel/rust ./Petrel/rust
+COPY PetrelCatbird/rust/petrel-catbird ./PetrelCatbird/rust/petrel-catbird
+COPY PetrelCatbird/lexicons ./PetrelCatbird/lexicons
 COPY nest/circle-appview ./nest/circle-appview
 
 WORKDIR /app/nest/circle-appview
