@@ -5,7 +5,6 @@ use axum::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
 use chrono::{DateTime, Utc};
 use circle_appview::{
     auth::{
@@ -21,6 +20,7 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::Signature;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::EncodedPoint;
+use petrel_catbird::generated::blue::catbird::circle::get_capabilities::Output as GetCapabilitiesOutput;
 use serde_json::json;
 use sqlx::PgPool;
 use std::future::Future;

@@ -2,14 +2,15 @@ use crate::auth::AuthenticatedUser;
 use crate::config::AppState;
 use crate::error::AppError;
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, State},
     Json,
 };
-use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Parameters as GetFeed;
 
 pub async fn get_feed_handler(
     Extension(user): Extension<AuthenticatedUser>,
-    Query(query): Query<GetFeed>,
+    crate::xrpc_query::XrpcQuery(query): crate::xrpc_query::XrpcQuery<GetFeed>,
     State(state): State<AppState>,
 ) -> Result<Json<GetFeedOutput>, AppError> {
     tracing::debug!("Handling getFeed request");
@@ -18,7 +19,7 @@ pub async fn get_feed_handler(
         &state,
         &user.did,
         space_filter,
-        query.limit,
+        Some(query.limit),
         query.cursor.as_deref(),
         query.include_encrypted.unwrap_or(false),
     )

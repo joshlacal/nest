@@ -3,11 +3,11 @@ use crate::auth::AuthenticatedUser;
 use crate::config::AppState;
 use crate::error::AppError;
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, State},
     http::header,
     response::{IntoResponse, Response},
 };
-use catbird_atproto::generated::blue_catbird::circle::get_keys::GetKeys;
+use petrel_catbird::generated::blue::catbird::circle::get_keys::Parameters as GetKeys;
 
 /// Server cap on the keys returned by one `getKeys` call (and the default `limit`).
 pub const GET_KEYS_MAX_ROWS: i64 = 64;
@@ -44,12 +44,12 @@ const PAGE_ENVELOPE_BYTES: usize = 128;
 /// again with `sinceVersion` set to that last version.
 pub async fn get_keys_handler(
     Extension(user): Extension<AuthenticatedUser>,
-    Query(q): Query<GetKeys>,
+    crate::xrpc_query::XrpcQuery(q): crate::xrpc_query::XrpcQuery<GetKeys>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
     tracing::debug!("Handling getKeys request");
     let space_uri = q.space.as_str();
-    let limit = checked_limit(q.limit)?;
+    let limit = checked_limit(Some(q.limit))?;
     access::check_member_access(&state, space_uri, &user.did).await?;
 
     let rows: Vec<(i64, String, String, serde_json::Value)> = sqlx::query_as(

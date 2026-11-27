@@ -34,19 +34,19 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
-use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
-use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
-use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, FeedItem};
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_catbird::generated::blue::catbird::circle::defs::CircleSummary;
+use petrel_catbird::generated::blue::catbird::circle::defs::FeedItem;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_post_thread::Output as GetPostThreadOutput;
+use petrel_catbird::generated::blue::catbird::circle::list_circles::Output as ListCirclesOutput;
+use petrel_catbird::generated::blue::catbird::circle::list_notifications::Output as ListNotificationsOutput;
+use petrel_core::Did;
+use petrel_core::Handle;
 
 use circle_appview::{
     access::{ActiveSpaceCredential, CredentialStore, SpaceLockManager},
     auth::{DidDocument, DidResolver, PublicKeyJwk, VerificationMethod},
-    commit::create_cid_bytes_from_data,
     config::{AppState, Config},
     db,
     hydration::ProfileHydrator,
@@ -70,9 +70,7 @@ const CAROL_PDS: &str = "https://pds-carol.test";
 const DAVE_PDS: &str = "https://pds-dave.test";
 
 fn compute_record_cid(val: &Value) -> String {
-    let bytes = serde_ipld_dagcbor::to_vec(val).unwrap();
-    let (_, cid_str) = create_cid_bytes_from_data(&bytes);
-    cid_str
+    circle_appview::commit::compute_dagcbor_cid(val).unwrap()
 }
 
 fn compute_blob_cid(data: &[u8]) -> String {
@@ -574,9 +572,9 @@ impl ThreeUserEnv {
                 .set_cached_profile(
                     did,
                     ProfileViewBasic {
-                        did: Did::new(SmolStr::new(did)).unwrap(),
-                        handle: Handle::new(SmolStr::new(handle)).unwrap(),
-                        display_name: Some(SmolStr::new(name)),
+                        did: Did::parse(did).unwrap(),
+                        handle: Handle::parse(handle).unwrap(),
+                        display_name: Some(String::from(name)),
                         avatar: None,
                         associated: None,
                         viewer: None,

@@ -9,37 +9,31 @@ use sha2::{Digest, Sha256};
 
 pub fn fixture_commit(space: &str, repo: &str, rev: &str, state: &[u8; 2048]) -> Commit {
     Commit {
-        space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(space)
-            .unwrap(),
-        repo: repo.to_owned().into(),
-        rev: rev.to_owned().into(),
+        space: petrel_core::SpaceRef::parse(space).unwrap(),
+        repo: petrel_core::Did::parse(repo).unwrap(),
+        rev: petrel_core::Tid::parse(rev).unwrap(),
         ver: 1,
-        data: bytes::Bytes::copy_from_slice(&Sha256::digest(state)),
+        data: petrel_core::Bytes(Sha256::digest(state).to_vec()),
         extra_data: None,
     }
 }
 pub fn fixture_star(commit: &Commit, records: &[RepoRecord]) -> anyhow::Result<Vec<u8>> {
-    #[derive(serde::Serialize)]
-    struct Meta<'a> {
-        #[serde(rename = "$type")]
-        kind: &'static str,
-        ver: i64,
-        repo: &'a str,
-        space: &'a str,
-        rev: &'a str,
-        #[serde(with = "serde_bytes")]
-        data: &'a [u8],
-    }
-    let meta = Meta {
-        kind: "atproto-space-repo",
-        ver: commit.ver,
-        repo: commit.repo.as_str(),
-        space: commit.space.as_str(),
-        rev: commit.rev.as_str(),
-        data: commit.data.as_ref(),
-    };
+    use petrel_core::Value;
+    let meta = Value::Object(
+        [
+            ("$type", Value::String("atproto-space-repo".into())),
+            ("ver", Value::Integer(commit.ver)),
+            ("repo", Value::String(commit.repo.as_str().into())),
+            ("space", Value::String(commit.space.as_str().into())),
+            ("rev", Value::String(commit.rev.as_str().into())),
+            ("data", Value::Bytes(commit.data.0.clone())),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    );
     let mut out = circle_appview::space_star::MAGIC.to_vec();
-    frame(&mut out, &serde_ipld_dagcbor::to_vec(&meta)?);
+    frame(&mut out, &petrel_core::dagcbor::try_encode(&meta)?);
     let mut records: Vec<_> = records.iter().collect();
     records.sort_by_key(|r| format!("{}/{}", r.collection, r.rkey));
     for r in records {
@@ -47,7 +41,7 @@ pub fn fixture_star(commit: &Commit, records: &[RepoRecord]) -> anyhow::Result<V
         frame(&mut out, format!("{}/{}", r.collection, r.rkey).as_bytes());
         frame(
             &mut out,
-            &serde_ipld_dagcbor::to_vec(&json_to_ipld(&r.value)?)?,
+            &petrel_core::dagcbor::try_encode(&json_to_ipld(&r.value)?)?,
         );
     }
     out.push(0x00);
@@ -78,10 +72,10 @@ pub async fn healthy_identity_fixture(pool: &sqlx::PgPool, dids: &[&str]) {
 
 /// The plaintext arm of a feed item; the plaintext view suites index only plaintext posts.
 pub fn plain(
-    item: &catbird_atproto::generated::blue_catbird::circle::FeedItem,
-) -> &catbird_atproto::generated::app_bsky::feed::FeedViewPost {
+    item: &petrel_catbird::generated::blue::catbird::circle::defs::FeedItem,
+) -> &petrel_api::generated::app::bsky::feed::defs::FeedViewPost {
     match &item.post {
-        catbird_atproto::generated::blue_catbird::circle::FeedItemPost::FeedViewPost(v) => v,
+        petrel_catbird::generated::blue::catbird::circle::defs::FeedItemPost::FeedViewPost(v) => v,
         _ => {
             panic!("expected a plaintext feedViewPost")
         }

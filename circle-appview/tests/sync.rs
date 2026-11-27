@@ -12,11 +12,10 @@ use p256::EncodedPoint;
 use serde_json::json;
 use sqlx::PgPool;
 
-use catbird_atproto::jacquard_common::types::cid::Cid;
-use catbird_atproto::jacquard_common::types::nsid::Nsid;
-use catbird_atproto::jacquard_common::types::recordkey::RecordKey;
-use catbird_atproto::jacquard_common::types::string::Rkey;
-use catbird_atproto::jacquard_common::types::tid::Tid;
+use petrel_core::CidString as Cid;
+use petrel_core::Nsid;
+use petrel_core::RecordKey;
+use petrel_core::Tid;
 
 use circle_appview::access::{ActiveSpaceCredential, CredentialStore, SpaceLockManager};
 use circle_appview::auth::{
@@ -50,11 +49,12 @@ impl TestLtHash {
         Self::default()
     }
     fn add(&mut self, collection: &str, rkey: &str, cid: &str) {
-        self.inner.add(&format!("{collection}/{rkey}/{cid}"));
+        self.inner.add_entry(&format!("{collection}/{rkey}"), cid);
         self.state_buf = self.inner.state().to_vec();
     }
     fn remove(&mut self, collection: &str, rkey: &str, cid: &str) {
-        self.inner.remove(&format!("{collection}/{rkey}/{cid}"));
+        self.inner
+            .remove_entry(&format!("{collection}/{rkey}"), cid);
         self.state_buf = self.inner.state().to_vec();
     }
     fn as_bytes(&self) -> &[u8; 2048] {
@@ -568,23 +568,21 @@ async fn incremental_sync_applies_ops_and_updates_sync_state(pool: PgPool) {
     let rev = "3l7aaaaaaaaaa";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7post111111"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7post111111").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
 
-    let list_ops_output =
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
-            commit,
-            cursor: None,
-            ops: vec![op_entry],
-            extra_data: None,
-        };
+    let list_ops_output = petrel_api::generated::com::atproto::space::list_repo_ops::Output {
+        commit,
+        cursor: None,
+        ops: vec![op_entry],
+    };
 
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup
@@ -654,12 +652,12 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
 
     let bad_commit = fixture_commit(SPACE_URI, OWNER_DID, "3l7aaaaaaaaaa", bad_lthash.as_bytes());
 
-    let inc_op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(inc_post_cid)),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let inc_op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(inc_post_cid).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from("3l7aaaaaaaaaa")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7post111111"))),
+        rev: Tid::parse("3l7aaaaaaaaaa").unwrap(),
+        rkey: RecordKey::parse("3l7post111111").unwrap(),
         value: Some(serde_json::from_value(inc_post_val).unwrap()),
         extra_data: None,
     };
@@ -667,11 +665,10 @@ async fn hash_mismatch_forces_full_repo_recovery(pool: PgPool) {
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: bad_commit,
             cursor: None,
             ops: vec![inc_op_entry],
-            extra_data: None,
         },
     );
 
@@ -752,12 +749,12 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
     let rev = "3l7aaaaaaaaaa";
     let commit = fixture_commit(SPACE_URI, BOB_DID, rev, lthash.as_bytes());
 
-    let invalid_op = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid)),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let invalid_op = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7bobinval11"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7bobinval11").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
@@ -765,11 +762,10 @@ async fn rejected_records_stored_only_in_circle_rejections_diagnostics(pool: PgP
     let key = format!("{SPACE_URI}:{BOB_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![invalid_op],
-            extra_data: None,
         },
     );
 
@@ -823,22 +819,21 @@ async fn notify_space_update_repo_write_triggers_immediate_sync(pool: PgPool) {
     lthash.add("app.bsky.feed.post", "3l7notifypost", &post_cid);
     let rev = "3l7aaaaaaaaaa";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7notifypost"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7notifypost").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 
@@ -892,12 +887,12 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     let rev = "3l7aaaaaaaaaa";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7sweeppost1"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7sweeppost1").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
@@ -905,11 +900,10 @@ async fn periodic_sweep_repairs_missed_notifications(pool: PgPool) {
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 
@@ -975,9 +969,8 @@ fn dagcbor_cid_computation_and_mismatch_rejection() {
         "DAG-CBOR CIDv1 base32 must start with bafyre, got {cid_str}"
     );
 
-    // Direct serialization of Jacquard Data with link and raw bytes preserves DAG-CBOR tags
-    let data_with_link: catbird_atproto::jacquard_common::types::value::Data =
-        serde_json::from_value(post_val).unwrap();
+    // Direct serialization of a Petrel Value with link and raw bytes preserves DAG-CBOR tags
+    let data_with_link: petrel_core::Value = serde_json::from_value(post_val).unwrap();
     let direct_cid =
         compute_dagcbor_cid(&data_with_link).expect("Direct Data CID computation must succeed");
     assert_eq!(cid_str, direct_cid);
@@ -1203,23 +1196,23 @@ async fn multi_page_cursor_pagination_empty_terminal_and_same_batch_reply(pool: 
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
     // Page 1: owner post with cursor="page2"
-    let op_page1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(owner_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_page1 = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(owner_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from("3l7pageaaaaaa")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7page1root"))),
+        rev: Tid::parse("3l7pageaaaaaa").unwrap(),
+        rkey: RecordKey::parse("3l7page1root").unwrap(),
         value: Some(serde_json::from_value(owner_post_val).unwrap()),
         extra_data: None,
     };
 
     // Page 2: reply on another full page. A full page still carries a cursor.
-    let op_page2 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(reply_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_page2 = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(reply_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7page2reply"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7page2reply").unwrap(),
         value: Some(serde_json::from_value(reply_post_val).unwrap()),
         extra_data: None,
     };
@@ -1227,22 +1220,20 @@ async fn multi_page_cursor_pagination_empty_terminal_and_same_batch_reply(pool: 
     let key_initial = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key_initial,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: Some("page2".into()),
             ops: vec![op_page1],
-            extra_data: None,
         },
     );
 
     let key_page2 = format!("{SPACE_URI}:{OWNER_DID}:page2");
     setup.mock_transport.set_list_repo_ops_response(
         &key_page2,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: Some("page3".into()),
             ops: vec![op_page2],
-            extra_data: None,
         },
     );
 
@@ -1251,11 +1242,10 @@ async fn multi_page_cursor_pagination_empty_terminal_and_same_batch_reply(pool: 
     let key_page3 = format!("{SPACE_URI}:{OWNER_DID}:page3");
     setup.mock_transport.set_list_repo_ops_response(
         &key_page3,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![],
-            extra_data: None,
         },
     );
 
@@ -1412,7 +1402,7 @@ async fn star_roundtrip_and_tampered_record_rejection(pool: PgPool) {
 /// The repo revision and space sequencing fields live inside `repoWrite`.
 #[test]
 fn notify_space_update_body_parses_the_nov12_shape() {
-    use catbird_atproto::generated::com_atproto::space::notify_space_update::NotifySpaceUpdate;
+    use petrel_api::generated::com::atproto::space::notify_space_update::Input as NotifySpaceUpdate;
 
     let update = repo_write_update(OWNER_DID, "3l7rev234567a", &[9; 32], "3l7spacerev2a", None);
     let wire = json!({
@@ -1420,7 +1410,7 @@ fn notify_space_update_body_parses_the_nov12_shape() {
         "token": "opaque-registration-token",
         "update": update,
     });
-    let parsed: NotifySpaceUpdate<String> = serde_json::from_value(wire.clone()).unwrap();
+    let parsed: NotifySpaceUpdate = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(parsed.token, "opaque-registration-token");
     assert_eq!(wire["update"]["$type"], "com.atproto.space.defs#repoWrite");
     assert_eq!(wire["update"]["repoRev"], "3l7rev234567a");
@@ -1434,7 +1424,7 @@ fn notify_space_update_body_parses_the_nov12_shape() {
         "repoRev": "3l7rev234567a",
         "data": vec![9; 32],
     });
-    assert!(serde_json::from_value::<NotifySpaceUpdate<String>>(legacy).is_err());
+    assert!(serde_json::from_value::<NotifySpaceUpdate>(legacy).is_err());
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1520,7 +1510,7 @@ async fn full_recovery_verifies_against_authority_expected_hash_and_rejects_mism
     let sync_engine = SyncEngine::new(&setup.state);
 
     // 1. Full recovery with correct expected hash succeeds
-    let expected_hash = commit.data.as_ref();
+    let expected_hash = commit.data.0.as_slice();
     let result = sync_engine
         .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(expected_hash))
         .await
@@ -1588,12 +1578,12 @@ async fn federated_repo_sync_routes_to_member_pds_endpoint(pool: PgPool) {
     let rev = "3l7bobfedreva";
     let bob_commit = fixture_commit(SPACE_URI, BOB_DID, rev, bob_lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(bob_reply_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(bob_reply_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7bobreplyfed"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7bobreplyfed").unwrap(),
         value: Some(serde_json::from_value(bob_reply_val).unwrap()),
         extra_data: None,
     };
@@ -1601,11 +1591,10 @@ async fn federated_repo_sync_routes_to_member_pds_endpoint(pool: PgPool) {
     let key = format!("{SPACE_URI}:{BOB_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: bob_commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 
@@ -1662,32 +1651,32 @@ async fn ordered_operations_preserve_delete_then_recreate_on_same_path(pool: PgP
     let rev = "3l7recreateaa";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
-    let op_create_1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(original_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_create_1 = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(original_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from("3l7stepaaaaaa")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7samepath"))),
+        rev: Tid::parse("3l7stepaaaaaa").unwrap(),
+        rkey: RecordKey::parse("3l7samepath").unwrap(),
         value: Some(serde_json::from_value(original_val).unwrap()),
         extra_data: None,
     };
 
-    let op_delete = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+    let op_delete = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
         cid: None,
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
-        prev: Some(Cid::from(original_cid)),
-        rev: Tid::from(String::from("3l7stepbbbbbb")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7samepath"))),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
+        prev: Some(Cid::parse(original_cid).unwrap()),
+        rev: Tid::parse("3l7stepbbbbbb").unwrap(),
+        rkey: RecordKey::parse("3l7samepath").unwrap(),
         value: None,
         extra_data: None,
     };
 
-    let op_create_2 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(new_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_create_2 = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(new_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7samepath"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7samepath").unwrap(),
         value: Some(serde_json::from_value(new_val).unwrap()),
         extra_data: None,
     };
@@ -1695,11 +1684,10 @@ async fn ordered_operations_preserve_delete_then_recreate_on_same_path(pool: PgP
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_create_1, op_delete, op_create_2],
-            extra_data: None,
         },
     );
 
@@ -1754,12 +1742,12 @@ async fn strong_reference_validation_rejects_without_fail_open_and_ignores_non_p
     let rev = "3l7failopenra";
     let commit = fixture_commit(SPACE_URI, BOB_DID, rev, lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(random_reply_cid)),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(random_reply_cid).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7randomrep"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7randomrep").unwrap(),
         value: Some(serde_json::from_value(random_reply_val).unwrap()),
         extra_data: None,
     };
@@ -1767,11 +1755,10 @@ async fn strong_reference_validation_rejects_without_fail_open_and_ignores_non_p
     let key = format!("{SPACE_URI}:{BOB_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 
@@ -1862,7 +1849,7 @@ async fn like_reconciliation_updates_in_place_and_preserves_cross_user_likes_on_
 
     let sync_engine = SyncEngine::new(&setup.state);
     let result = sync_engine
-        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(full_commit.data.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(full_commit.data.0.as_slice()))
         .await
         .unwrap();
     assert_eq!(result.mode, SyncMode::FullRecovery);
@@ -1954,12 +1941,12 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     let rev = "3l7page2revbb";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7sweepp2"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7sweepp2").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
@@ -1967,11 +1954,10 @@ async fn sweep_once_paginates_multiple_pages_of_repos(pool: PgPool) {
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 
@@ -2111,11 +2097,10 @@ async fn list_writers_repo_removed_then_repo_write_readds_writer(pool: PgPool) {
     let commit = fixture_commit(SPACE_URI, BOB_DID, repo_rev, &state);
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: None,
             ops: vec![],
-            extra_data: None,
         },
     );
     setup.mock_transport.set_list_writers_response(
@@ -2125,7 +2110,7 @@ async fn list_writers_repo_removed_then_repo_write_readds_writer(pool: PgPool) {
             repos: vec![WriterUpdate::RepoWrite(RepoWrite {
                 repo: BOB_DID.into(),
                 repo_rev: repo_rev.into(),
-                data: commit.data,
+                data: bytes::Bytes::from(commit.data.0),
                 space_rev: "3l7readdedaaa".into(),
                 prev_space_rev: Some("3l7removedaaa".into()),
             })],
@@ -2160,22 +2145,21 @@ async fn notify_space_update_verifies_expected_hash_before_advancing(pool: PgPoo
     lthash.add("app.bsky.feed.post", "3l7postnotify1", &post_cid);
     let rev = "3l7notifysync";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7postnotify1"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7postnotify1").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
     let token = callback_token(&setup).await;
@@ -2253,21 +2237,20 @@ async fn full_recovery_excludes_prior_author_posts_from_initial_policy(pool: PgP
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit1,
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(Cid::from(p1_cid.clone())),
-                    collection: Nsid::from(String::from("app.bsky.feed.post")),
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+                    cid: Some(Cid::parse(p1_cid.clone()).unwrap()),
+                    collection: Nsid::parse("app.bsky.feed.post").unwrap(),
                     prev: None,
-                    rev: Tid::from(String::from("3l7rev234567a")),
-                    rkey: RecordKey::from(Rkey::from(String::from("3l7postp11111"))),
+                    rev: Tid::parse("3l7rev234567a").unwrap(),
+                    rkey: RecordKey::parse("3l7postp11111").unwrap(),
                     value: Some(serde_json::from_value(p1_val).unwrap()),
                     extra_data: None,
                 },
             ],
-            extra_data: None,
         },
     );
 
@@ -2329,21 +2312,20 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
 
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit_a1,
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(Cid::from(p1_cid.clone())),
-                    collection: Nsid::from(String::from("app.bsky.feed.post")),
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+                    cid: Some(Cid::parse(p1_cid.clone()).unwrap()),
+                    collection: Nsid::parse("app.bsky.feed.post").unwrap(),
                     prev: None,
-                    rev: Tid::from(String::from("3l7234567a234")),
-                    rkey: RecordKey::from(Rkey::from(String::from("3l7targetp111"))),
+                    rev: Tid::parse("3l7234567a234").unwrap(),
+                    rkey: RecordKey::parse("3l7targetp111").unwrap(),
                     value: Some(serde_json::from_value(p1_val).unwrap()),
                     extra_data: None,
                 },
             ],
-            extra_data: None,
         },
     );
     sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
@@ -2363,21 +2345,20 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
 
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit_b1,
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(Cid::from(l1_cid.clone())),
-                    collection: Nsid::from(String::from("app.bsky.feed.like")),
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+                    cid: Some(Cid::parse(l1_cid.clone()).unwrap()),
+                    collection: Nsid::parse("app.bsky.feed.like").unwrap(),
                     prev: None,
-                    rev: Tid::from(String::from("3l7234567b234")),
-                    rkey: RecordKey::from(Rkey::from(String::from("3l7like111111"))),
+                    rev: Tid::parse("3l7234567b234").unwrap(),
+                    rkey: RecordKey::parse("3l7like111111").unwrap(),
                     value: Some(serde_json::from_value(l1_val).unwrap()),
                     extra_data: None,
                 },
             ],
-            extra_data: None,
         },
     );
     sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
@@ -2405,21 +2386,20 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
 
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{BOB_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit_b2,
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(Cid::from(l1_invalid_cid.clone())),
-                    collection: Nsid::from(String::from("app.bsky.feed.like")),
-                    prev: Some(Cid::from(l1_cid.clone())),
-                    rev: Tid::from(String::from("3l7234567c234")),
-                    rkey: RecordKey::from(Rkey::from(String::from("3l7like111111"))),
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+                    cid: Some(Cid::parse(l1_invalid_cid.clone()).unwrap()),
+                    collection: Nsid::parse("app.bsky.feed.like").unwrap(),
+                    prev: Some(Cid::parse(l1_cid.clone()).unwrap()),
+                    rev: Tid::parse("3l7234567c234").unwrap(),
+                    rkey: RecordKey::parse("3l7like111111").unwrap(),
                     value: Some(serde_json::from_value(l1_invalid_val).unwrap()),
                     extra_data: None,
                 },
             ],
-            extra_data: None,
         },
     );
     let res_b2 = sync_engine.sync_repo(SPACE_URI, BOB_DID).await.unwrap();
@@ -2443,21 +2423,20 @@ async fn invalid_update_and_post_delete_cleans_derived_likes_and_notifications(p
     let commit_a2 = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567d234", lthash_a2.as_bytes());
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit_a2,
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
                     cid: None,
-                    collection: Nsid::from(String::from("app.bsky.feed.post")),
-                    prev: Some(Cid::from(p1_cid.clone())),
-                    rev: Tid::from(String::from("3l7234567d234")),
-                    rkey: RecordKey::from(Rkey::from(String::from("3l7targetp111"))),
+                    collection: Nsid::parse("app.bsky.feed.post").unwrap(),
+                    prev: Some(Cid::parse(p1_cid.clone()).unwrap()),
+                    rev: Tid::parse("3l7234567d234").unwrap(),
+                    rkey: RecordKey::parse("3l7targetp111").unwrap(),
                     value: None,
                     extra_data: None,
                 },
             ],
-            extra_data: None,
         },
     );
     sync_engine.sync_repo(SPACE_URI, OWNER_DID).await.unwrap();
@@ -2494,29 +2473,26 @@ async fn incremental_sync_cursor_cycle_detected_and_enters_recovery(pool: PgPool
 
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: Some("cursor_A".into()),
             ops: vec![],
-            extra_data: None,
         },
     );
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{key}:cursor_A"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: Some("cursor_B".into()),
             ops: vec![],
-            extra_data: None,
         },
     );
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{key}:cursor_B"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: Some("cursor_A".into()), // Cycle!
             ops: vec![],
-            extra_data: None,
         },
     );
 
@@ -2619,12 +2595,12 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
     let commit_rev = "3l7234567a234";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, commit_rev, lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(commit_rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7postrev1"))),
+        rev: Tid::parse(commit_rev).unwrap(),
+        rkey: RecordKey::parse("3l7postrev1").unwrap(),
         value: Some(serde_json::from_value(post_val.clone()).unwrap()),
         extra_data: None,
     };
@@ -2632,11 +2608,10 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit.clone(),
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 
@@ -2654,7 +2629,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
         .sync_repo_with_expected_commit(
             SPACE_URI,
             OWNER_DID,
-            Some(commit.data.as_ref()),
+            Some(commit.data.0.as_slice()),
             Some(commit_rev),
         )
         .await
@@ -2667,7 +2642,7 @@ async fn incremental_and_recovery_bind_and_verify_both_hash_and_rev(pool: PgPool
         .sync_repo_with_expected_commit(
             SPACE_URI,
             OWNER_DID,
-            Some(commit.data.as_ref()),
+            Some(commit.data.0.as_slice()),
             Some("3l7234567b234"),
         )
         .await;
@@ -2773,7 +2748,7 @@ async fn full_recovery_retains_other_authors_when_recovering_authority(pool: PgP
 
     // Force full recovery on owner
     let res_recovery = sync_engine
-        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(commit_owner2.data.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_URI, OWNER_DID, Some(commit_owner2.data.0.as_slice()))
         .await
         .unwrap();
     assert_eq!(res_recovery.mode, SyncMode::FullRecovery);
@@ -2849,32 +2824,31 @@ async fn staged_rejection_removes_uri_from_policy_preventing_stale_deps(pool: Pg
 
     let commit2 = fixture_commit(SPACE_URI, OWNER_DID, "3l7234567b234", lthash.as_bytes());
 
-    let op1 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(p1_invalid_cid)),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
-        prev: Some(Cid::from(p1_cid)),
-        rev: Tid::from(String::from("3l7234567b234")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7p1target"))),
+    let op1 = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(p1_invalid_cid).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
+        prev: Some(Cid::parse(p1_cid).unwrap()),
+        rev: Tid::parse("3l7234567b234").unwrap(),
+        rkey: RecordKey::parse("3l7p1target").unwrap(),
         value: Some(serde_json::from_value(p1_invalid_val).unwrap()),
         extra_data: None,
     };
-    let op2 = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(reply_cid)),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op2 = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(reply_cid).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from("3l7234567b234")),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7replyattempt"))),
+        rev: Tid::parse("3l7234567b234").unwrap(),
+        rkey: RecordKey::parse("3l7replyattempt").unwrap(),
         value: Some(serde_json::from_value(reply_val).unwrap()),
         extra_data: None,
     };
 
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit: commit2,
             cursor: None,
             ops: vec![op1, op2],
-            extra_data: None,
         },
     );
 
@@ -3372,7 +3346,8 @@ async fn alpha_migration_purges_legacy_notifications_and_enforces_source_provena
 fn validator_rejects_missing_or_mismatched_type_and_unsupported_embeds() {
     let p1_uri = format!("{SPACE_URI}/{OWNER_DID}/app.bsky.feed.post/3l7p1");
     let real_cid = compute_dagcbor_cid(&json!({"test": "p1"})).unwrap();
-    let blob_cid = compute_dagcbor_cid(&json!({"test": "blob"})).unwrap();
+    // A blob ref is a raw-codec CID, the only form a PDS issues.
+    let blob_cid = petrel_core::Cid::for_raw(b"blob").to_string();
 
     let pol = policy(owner(), active_members(&[bob()]))
         .with_space_uri(space())
@@ -3481,7 +3456,7 @@ fn validator_rejects_missing_or_mismatched_type_and_unsupported_embeds() {
             }
         }),
     };
-    assert!(validate(images_post, &pol).is_ok());
+    validate(images_post, &pol).unwrap();
 
     // 6. Post with float -> MalformedRecord
     let float_post = RecordCandidate {
@@ -3787,12 +3762,12 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
     let rev = "3l7234567a234";
     let commit = fixture_commit(SPACE_URI, OWNER_DID, rev, lthash.as_bytes());
 
-    let op_entry = catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-        cid: Some(Cid::from(post_cid.clone())),
-        collection: Nsid::from(String::from("app.bsky.feed.post")),
+    let op_entry = petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+        cid: Some(Cid::parse(post_cid.clone()).unwrap()),
+        collection: Nsid::parse("app.bsky.feed.post").unwrap(),
         prev: None,
-        rev: Tid::from(String::from(rev)),
-        rkey: RecordKey::from(Rkey::from(String::from("3l7sweepsch1"))),
+        rev: Tid::parse(rev).unwrap(),
+        rkey: RecordKey::parse("3l7sweepsch1").unwrap(),
         value: Some(serde_json::from_value(post_val).unwrap()),
         extra_data: None,
     };
@@ -3800,11 +3775,10 @@ async fn scheduled_revision_sweep_task_repairs_missed_notification_and_shuts_dow
     let key = format!("{SPACE_URI}:{OWNER_DID}");
     setup.mock_transport.set_list_repo_ops_response(
         &key,
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             commit,
             cursor: None,
             ops: vec![op_entry],
-            extra_data: None,
         },
     );
 

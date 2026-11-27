@@ -24,14 +24,14 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::app_bsky::feed::ThreadViewPostRepliesItem;
-use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
-use catbird_atproto::generated::blue_catbird::circle::FeedItemPost;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_api::generated::app::bsky::feed::defs::ThreadViewPostReplies;
+use petrel_catbird::generated::blue::catbird::circle::defs::FeedItemPost;
+use petrel_catbird::generated::blue::catbird::circle::get_capabilities::Output as GetCapabilitiesOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_post_thread::Output as GetPostThreadOutput;
+use petrel_core::Did;
+use petrel_core::Handle;
 
 use circle_appview::auth::AuthenticatedUser;
 use circle_appview::config::AppState;
@@ -117,8 +117,8 @@ fn blob_cid(data: &[u8]) -> String {
 
 fn profile(did: &str, handle: &str) -> ProfileViewBasic {
     ProfileViewBasic {
-        did: Did::new(SmolStr::new(did)).unwrap(),
-        handle: Handle::new(SmolStr::new(handle)).unwrap(),
+        did: Did::parse(did).unwrap(),
+        handle: Handle::parse(handle).unwrap(),
         display_name: None,
         avatar: None,
         associated: None,
@@ -324,8 +324,11 @@ async fn feed_returns_encrypted_post_view_for_envelopes(pool: PgPool) {
     assert_eq!(view.cid.as_str(), cid_of(&root));
     assert_eq!(view.author.did.as_str(), OWNER_DID);
     assert_eq!(view.record.key_version, 1);
-    assert_eq!(view.record.ciphertext.as_ref(), vec![7u8; 100].as_slice());
-    assert_eq!(view.record.sig.len(), 64);
+    assert_eq!(
+        view.record.ciphertext.0.as_slice(),
+        vec![7u8; 100].as_slice()
+    );
+    assert_eq!(view.record.sig.0.len(), 64);
     assert_eq!(view.like_count, Some(1));
     assert_eq!(view.reply_count, Some(1));
     let viewer_like = view.viewer.as_ref().and_then(|v| v.like.as_ref()).unwrap();
@@ -339,7 +342,12 @@ async fn feed_returns_encrypted_post_view_for_envelopes(pool: PgPool) {
         raw["feed"][0]["post"]["$type"],
         json!("blue.catbird.circle.defs#encryptedPostView")
     );
-    assert!(raw["feed"][0]["post"]["record"]["ciphertext"]["$bytes"].is_string());
+    // Wire pin: served views write `$bytes` as unpadded standard base64 (Petrel's
+    // encoding; the previous stack padded it). 100 bytes would carry "==" if padded.
+    assert_eq!(
+        raw["feed"][0]["post"]["record"]["ciphertext"]["$bytes"],
+        json!(STANDARD_NO_PAD.encode([7u8; 100]))
+    );
     assert!(
         !text.contains("\"text\""),
         "an encrypted feed item must carry no plaintext field: {text}"
@@ -891,7 +899,7 @@ async fn thread_includes_encrypted_replies_and_excludes_stale(pool: PgPool) {
 
     let replies = out.thread.replies.unwrap();
     assert_eq!(replies.len(), 1, "the stale-key reply is excluded");
-    let ThreadViewPostRepliesItem::ThreadViewPost(reply) = &replies[0] else {
+    let ThreadViewPostReplies::ThreadViewPost(reply) = &replies[0] else {
         panic!("expected a thread view post reply");
     };
     assert_eq!(
@@ -912,7 +920,7 @@ async fn thread_envelope_nodes_carry_no_embed(pool: PgPool) {
     ingest_thread_fixture(&setup).await;
     let junk = json!({"embed": {
         "$type": "app.bsky.embed.images",
-        "images": [{"alt": "x", "image": {"ref": {"$link": "bafkreijunkjunkjunkjunkjunk"}}}],
+        "images": [{"alt": "x", "image": {"ref": {"$link": "bafkreihuhrvkw25tq7bote4itvajpmwnz6zeswnrntz6gb4fa4x4mtntvm"}}}],
     }});
     let touched = sqlx::query(
         "UPDATE circle_records SET record_json = record_json || $1 WHERE collection = $2",

@@ -1,13 +1,12 @@
 //! atproto Spaces HTTP message signatures (RFC 9421), November 12, 2026 alpha,
-//! delegating P-256 `did:key` encoding and RFC 9421 signing to `atproto-spaces`.
+//! delegating P-256 `did:key` encoding and RFC 9421 signing to `petrel_spaces`.
 
 use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::{PublicKey, SecretKey};
 
 /// The signature label in `Signature-Input` and `Signature`.
 pub const SIGNATURE_LABEL: &str = "sig";
 /// Header naming the DID a space credential is being presented to.
-pub const AUDIENCE_HEADER: &str = atproto_spaces::http_signature::SPACE_AUDIENCE_HEADER;
+pub const AUDIENCE_HEADER: &str = petrel_spaces::SPACE_AUDIENCE_HEADER;
 /// Authorization scheme for a space credential.
 pub const CREDENTIAL_AUTH_SCHEME: &str = "Atproto-Space-Credential";
 
@@ -74,22 +73,20 @@ impl SpaceAuthHeaders {
 }
 
 /// The `did:key` form of a P-256 public key: multicodec `p256-pub`, compressed
-/// SEC1 point, base58btc multibase, delegated to `atproto_spaces::kem`.
+/// SEC1 point, base58btc multibase, delegated to `petrel_spaces::kem`.
 pub fn p256_did_key(key: &VerifyingKey) -> String {
-    let pubkey = PublicKey::from_affine(*key.as_affine()).expect("VerifyingKey is on P-256");
-    atproto_spaces::kem::encode_p256_did_key(&pubkey)
+    petrel_spaces::encode_p256_did_key(key.to_encoded_point(true).as_bytes())
+        .expect("a compressed P-256 point is 33 bytes")
 }
 
 /// Headers for a request authenticated with a space credential, addressed to `audience`.
 pub fn credential_headers(key: &SigningKey, credential: &str, audience: &str) -> SpaceAuthHeaders {
-    let secret = SecretKey::from_bytes(&key.to_bytes()).expect("SigningKey scalar is non-zero");
-    if let Ok(signed) = atproto_spaces::http_signature::sign_credential_request_minimal(
-        &secret, credential, audience,
-    ) {
-        let label_prefix = format!(
-            "{}=",
-            atproto_spaces::http_signature::SPACE_CREDENTIAL_LABEL
-        );
+    let signed =
+        petrel_spaces::SigningKeyPair::from_p256_bytes(&key.to_bytes()).and_then(|proof_key| {
+            petrel_spaces::sign_credential_request_minimal(credential.trim(), &proof_key, audience)
+        });
+    if let Ok(signed) = signed {
+        let label_prefix = format!("{}=", petrel_spaces::SPACE_SIGNATURE_LABEL);
         let signature_input = signed
             .signature_input
             .strip_prefix(&label_prefix)
@@ -148,9 +145,9 @@ mod tests {
     use p256::elliptic_curve::rand_core::OsRng;
 
     fn parse_p256_did_key(did_key: &str) -> Option<VerifyingKey> {
-        atproto_spaces::kem::decode_p256_did_key(did_key)
+        petrel_spaces::decode_p256_did_key(did_key)
             .ok()
-            .map(|pk| VerifyingKey::from(&pk))
+            .and_then(|sec1| VerifyingKey::from_sec1_bytes(&sec1).ok())
     }
 
     fn signature_bytes(headers: &SpaceAuthHeaders) -> Vec<u8> {

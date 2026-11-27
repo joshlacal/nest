@@ -13,12 +13,12 @@ use p256::EncodedPoint;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-use catbird_atproto::generated::com_atproto::space::list_repo_ops::{ListRepoOpsOutput, OpEntry};
-use catbird_atproto::jacquard_common::types::cid::Cid;
-use catbird_atproto::jacquard_common::types::nsid::Nsid;
-use catbird_atproto::jacquard_common::types::recordkey::RecordKey;
-use catbird_atproto::jacquard_common::types::string::Rkey;
-use catbird_atproto::jacquard_common::types::tid::Tid;
+use petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry;
+use petrel_api::generated::com::atproto::space::list_repo_ops::Output as ListRepoOpsOutput;
+use petrel_core::CidString as Cid;
+use petrel_core::Nsid;
+use petrel_core::RecordKey;
+use petrel_core::Tid;
 
 use circle_appview::access::{ActiveSpaceCredential, CredentialStore};
 use circle_appview::auth::{
@@ -107,13 +107,13 @@ pub fn serve_ops(
     let mut ops = Vec::new();
     for (collection, rkey, value) in records {
         let cid = cid_of(value);
-        lthash.add(&format!("{collection}/{rkey}/{cid}"));
+        lthash.add_entry(&format!("{collection}/{rkey}"), &cid);
         ops.push(OpEntry {
-            cid: Some(Cid::from(cid)),
-            collection: Nsid::from(collection.to_string()),
+            cid: Some(Cid::parse(cid).unwrap()),
+            collection: Nsid::parse(collection.to_string()).unwrap(),
             prev: None,
-            rev: Tid::from(String::from(REV)),
-            rkey: RecordKey::from(Rkey::from(rkey.to_string())),
+            rev: Tid::parse(REV).unwrap(),
+            rkey: RecordKey::parse(rkey.to_string()).unwrap(),
             value: Some(serde_json::from_value(value.clone()).unwrap()),
             extra_data: None,
         });
@@ -126,7 +126,6 @@ pub fn serve_ops(
             commit,
             cursor: None,
             ops,
-            extra_data: None,
         },
     );
 }
@@ -143,18 +142,18 @@ pub fn serve_delete_ops(
 ) {
     let mut lthash = LtHash::default();
     for (collection, rkey, value) in before {
-        lthash.add(&format!("{collection}/{rkey}/{}", cid_of(value)));
+        lthash.add_entry(&format!("{collection}/{rkey}"), &cid_of(value));
     }
     let mut ops = Vec::new();
     for (collection, rkey, value) in deleted {
         let cid = cid_of(value);
-        lthash.remove(&format!("{collection}/{rkey}/{cid}"));
+        lthash.remove_entry(&format!("{collection}/{rkey}"), &cid);
         ops.push(OpEntry {
             cid: None,
-            collection: Nsid::from(collection.to_string()),
-            prev: Some(Cid::from(cid)),
-            rev: Tid::from(rev.to_string()),
-            rkey: RecordKey::from(Rkey::from(rkey.to_string())),
+            collection: Nsid::parse(collection.to_string()).unwrap(),
+            prev: Some(Cid::parse(cid).unwrap()),
+            rev: Tid::parse(rev.to_string()).unwrap(),
+            rkey: RecordKey::parse(rkey.to_string()).unwrap(),
             value: None,
             extra_data: None,
         });
@@ -166,7 +165,6 @@ pub fn serve_delete_ops(
             commit: super::fixture_commit(space, author, rev, &state),
             cursor: None,
             ops,
-            extra_data: None,
         },
     );
 }
@@ -182,7 +180,7 @@ pub fn serve_full_recovery(
 ) {
     let key = format!("{space}:{author}");
     let mut bad = LtHash::default();
-    bad.add("app.bsky.feed.post/3l7tampered11/bafytamperedcid");
+    bad.add_entry("app.bsky.feed.post/3l7tampered11", "bafytamperedcid");
     let bad_state: [u8; 2048] = bad.state().as_slice().try_into().unwrap();
     mock.set_list_repo_ops_response(
         &key,
@@ -190,7 +188,6 @@ pub fn serve_full_recovery(
             commit: super::fixture_commit(space, author, rev, &bad_state),
             cursor: None,
             ops: vec![],
-            extra_data: None,
         },
     );
     let mut lthash = LtHash::default();
@@ -198,7 +195,7 @@ pub fn serve_full_recovery(
         .iter()
         .map(|(collection, rkey, value)| {
             let cid = cid_of(value);
-            lthash.add(&format!("{collection}/{rkey}/{cid}"));
+            lthash.add_entry(&format!("{collection}/{rkey}"), &cid);
             RepoRecord {
                 collection: collection.to_string(),
                 rkey: rkey.to_string(),

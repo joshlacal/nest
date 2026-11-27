@@ -1,21 +1,21 @@
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, State},
     middleware,
     routing::{get, post},
     Json, Router,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::blue_catbird::circle::{
-    activate_circle::{ActivateCircle, ActivateCircleOutput},
-    get_capabilities::GetCapabilitiesOutput,
-    list_circles::{ListCircles, ListCirclesOutput},
-    CircleSummary,
-};
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
-use catbird_atproto::jacquard_common::types::string::{Did, Tid};
 use chrono::{DateTime, Utc};
+use petrel_catbird::generated::blue::catbird::circle::{
+    activate_circle::{Input as ActivateCircle, Output as ActivateCircleOutput},
+    defs::CircleSummary,
+    get_capabilities::Output as GetCapabilitiesOutput,
+    list_circles::{Output as ListCirclesOutput, Parameters as ListCircles},
+};
+use petrel_core::Did;
+use petrel_core::SpaceRef;
+use petrel_core::Tid;
 use serde::{Deserialize, Serialize};
 
 use crate::access;
@@ -217,7 +217,6 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<GetCapabilities
         protocol_revision: CIRCLE_PROTOCOL_REVISION.into(),
         supports_images: crate::SUPPORTS_IMAGES,
         supports_encrypted_posts: Some(true),
-        extra_data: None,
     })
 }
 
@@ -244,13 +243,13 @@ pub fn decode_circle_cursor(cursor_str: &str) -> Result<CircleListCursor, AppErr
 #[allow(clippy::type_complexity)]
 async fn list_circles_handler(
     Extension(user): Extension<AuthenticatedUser>,
-    Query(query): Query<ListCircles>,
+    crate::xrpc_query::XrpcQuery(query): crate::xrpc_query::XrpcQuery<ListCircles>,
     State(state): State<AppState>,
 ) -> Result<Json<ListCirclesOutput>, AppError> {
     tracing::debug!("Handling listCircles request");
     access::ensure_active_account(&state, &user.did).await?;
     access::revalidate_stale_member_spaces(&state, &user.did).await?;
-    let limit = query.limit.unwrap_or(50);
+    let limit = query.limit;
     if !(1..=100).contains(&limit) {
         return Err(AppError::InvalidRequest(
             "Limit must be between 1 and 100".into(),
@@ -347,18 +346,18 @@ async fn list_circles_handler(
                 "Circle membership changed while listing".into(),
             ));
         }
-        let circle_tid = Tid::new(SmolStr::new(circle_id))
+        let circle_tid = Tid::parse(circle_id)
             .map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
-        let uri = AtSpaceUri::new(SmolStr::new(space_uri))
+        let uri = SpaceRef::parse(space_uri)
             .map_err(|e| AppError::Internal(format!("Invalid space ref: {e}")))?;
-        let owner = Did::new(SmolStr::new(authority_did))
+        let owner = Did::parse(authority_did)
             .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
 
         circles.push(CircleSummary {
             circle_id: circle_tid,
             member_count: member_count.map(|c| c as i64),
             muted: Some(*muted),
-            name: SmolStr::new(display_name),
+            name: String::from(display_name),
             owner,
             uri,
             latest_key_version: crate::feed::summary_key_version(&state.db, space_uri).await?,
@@ -368,8 +367,7 @@ async fn list_circles_handler(
 
     Ok(Json(ListCirclesOutput {
         circles,
-        cursor: next_cursor.map(SmolStr::new),
-        extra_data: None,
+        cursor: next_cursor,
     }))
 }
 
@@ -382,8 +380,5 @@ async fn activate_circle_handler(
 
     let summary = access::activate_circle(&state, &user.did, input.space.as_str()).await?;
 
-    Ok(Json(ActivateCircleOutput {
-        circle: summary,
-        extra_data: None,
-    }))
+    Ok(Json(ActivateCircleOutput { circle: summary }))
 }

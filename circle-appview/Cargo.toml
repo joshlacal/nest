@@ -9,15 +9,16 @@ axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
-jacquard-repo = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
-jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825", features = ["crypto-ed25519", "crypto-k256", "crypto-p256"] }
-catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-bluecatbird", "namespace-atproto-space"] }
-atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
+# Petrel Rust: AT Protocol types, Spaces crypto and runtime lexicon validation.
+# Sibling path dependencies; the Docker build copies Petrel/rust and PetrelCatbird.
+petrel-core = { path = "../../Petrel/rust/petrel-core", features = ["chrono"] }
+petrel-api = { path = "../../Petrel/rust/petrel-api", features = ["app_bsky", "com_atproto"] }
+petrel-spaces = { path = "../../Petrel/rust/petrel-spaces" }
+petrel-lexicon = { path = "../../Petrel/rust/petrel-lexicon" }
+petrel-catbird = { path = "../../PetrelCatbird/rust/petrel-catbird" }
 bytes = { version = "1", features = ["serde"] }
 cid = "0.11"
-multihash = "0.19.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-iroh-car = "0.5"
 n0-future = "0.3"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -32,8 +33,6 @@ hmac = "0.12"
 hkdf = "0.12"
 blake3 = "1"
 aes-gcm = "0.10"
-serde_ipld_dagcbor = "0.6"
-serde_bytes = "0.11"
 base64 = "0.22"
 rand = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -46,6 +45,8 @@ futures-util = "0.3"
 ciborium = "0.2"
 sfv = "=0.16.1"
 thiserror = "1"
+unicode-segmentation = "1"
+zeroize = "1"
 anyhow = "1"
 
 [dev-dependencies]

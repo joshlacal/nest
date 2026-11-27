@@ -3,14 +3,16 @@ use crate::error::AppError;
 use crate::hydration::ProfileHydrator;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
-use catbird_atproto::generated::blue_catbird::circle::{
-    CircleSummary, Notification, NotificationReason,
-};
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
-use catbird_atproto::jacquard_common::types::string::{AtUri, Datetime, Did, Tid};
 use chrono::{DateTime, Utc};
+use petrel_catbird::generated::blue::catbird::circle::defs::CircleSummary;
+use petrel_catbird::generated::blue::catbird::circle::defs::Notification;
+use petrel_catbird::generated::blue::catbird::circle::defs::NotificationReason;
+use petrel_catbird::generated::blue::catbird::circle::list_notifications::Output as ListNotificationsOutput;
+use petrel_core::AtUri;
+use petrel_core::Datetime;
+use petrel_core::Did;
+use petrel_core::SpaceRef;
+use petrel_core::Tid;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -133,7 +135,6 @@ pub async fn list_notifications(
         return Ok(ListNotificationsOutput {
             cursor: None,
             notifications: Vec::new(),
-            extra_data: None,
         });
     }
 
@@ -167,20 +168,20 @@ pub async fn list_notifications(
             "reply" => NotificationReason::Reply,
             "like" => NotificationReason::Like,
             "invite" => NotificationReason::Invite,
-            other => NotificationReason::Other(SmolStr::new(other)),
+            other => NotificationReason::Unknown(String::from(other)),
         };
 
-        let circle_tid = Tid::new(SmolStr::new(circle_id))
+        let circle_tid = Tid::parse(circle_id)
             .map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
-        let circle_space_ref = AtSpaceUri::new(SmolStr::new(space_uri))
+        let circle_space_ref = SpaceRef::parse(space_uri)
             .map_err(|e| AppError::Internal(format!("Invalid space ref: {e}")))?;
-        let circle_owner_did = Did::new(SmolStr::new(circle_owner))
+        let circle_owner_did = Did::parse(circle_owner)
             .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
 
         let circle_summary = CircleSummary {
             circle_id: circle_tid,
             uri: circle_space_ref,
-            name: SmolStr::new(circle_name),
+            name: String::from(circle_name),
             owner: circle_owner_did,
             member_count: None,
             muted: Some(circle_muted),
@@ -195,7 +196,7 @@ pub async fn list_notifications(
             Some(u) => {
                 let normalized = crate::feed::normalize_uri_to_standard_aturi(u);
                 Some(
-                    AtUri::new(SmolStr::new(normalized))
+                    AtUri::parse(normalized)
                         .map_err(|e| AppError::Internal(format!("Invalid subject URI: {e}")))?,
                 )
             }
@@ -203,7 +204,7 @@ pub async fn list_notifications(
         };
 
         notifications.push(Notification {
-            id: SmolStr::new(notif_id.to_string()),
+            id: notif_id.to_string(),
             actor: actor_profile,
             circle: circle_summary,
             reason,
@@ -225,8 +226,7 @@ pub async fn list_notifications(
             .await?;
     }
     Ok(ListNotificationsOutput {
-        cursor: next_cursor.map(SmolStr::new),
+        cursor: next_cursor,
         notifications,
-        extra_data: None,
     })
 }

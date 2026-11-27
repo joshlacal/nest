@@ -722,12 +722,12 @@ async fn space_app_access_naming_only_service_did_is_rejected(pool: PgPool) {
 async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
-    use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-    use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-    use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
-    use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
-    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-    use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+    use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+    use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+    use petrel_catbird::generated::blue::catbird::circle::list_circles::Output as ListCirclesOutput;
+    use petrel_catbird::generated::blue::catbird::circle::list_notifications::Output as ListNotificationsOutput;
+    use petrel_core::Did;
+    use petrel_core::Handle;
     use tower::ServiceExt;
 
     let setup = setup_test(pool.clone()).await;
@@ -737,9 +737,9 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
         .set_cached_profile(
             AUTHORITY_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(AUTHORITY_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("authority.test")).unwrap(),
-                display_name: Some(SmolStr::new("Authority")),
+                did: Did::parse(AUTHORITY_DID).unwrap(),
+                handle: Handle::parse("authority.test").unwrap(),
+                display_name: Some(String::from("Authority")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -760,9 +760,9 @@ async fn removed_member_is_denied_on_batch_and_fanout_endpoints(pool: PgPool) {
         .set_cached_profile(
             BOB_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(BOB_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("bob.test")).unwrap(),
-                display_name: Some(SmolStr::new("Bob Member")),
+                did: Did::parse(BOB_DID).unwrap(),
+                handle: Handle::parse("bob.test").unwrap(),
+                display_name: Some(String::from("Bob Member")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -1237,10 +1237,10 @@ async fn space_lock_manager_cancellation_decrements_waiter_count() {
 
 #[tokio::test]
 async fn did_resolver_and_profile_hydrator_cache_capacity_and_ttl_eviction() {
-    use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-    use catbird_atproto::jacquard_common::types::string::{Did, Handle};
     use circle_appview::hydration::ProfileHydrator;
+    use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+    use petrel_core::Did;
+    use petrel_core::Handle;
 
     let http_client = reqwest::Client::new();
 
@@ -1296,9 +1296,9 @@ async fn did_resolver_and_profile_hydrator_cache_capacity_and_ttl_eviction() {
     for i in 0..10 {
         let did = format!("did:plc:boundedprofile{i}");
         let profile = ProfileViewBasic {
-            did: Did::new(SmolStr::new(&did)).unwrap(),
-            handle: Handle::new(SmolStr::new(format!("bounded{i}.test"))).unwrap(),
-            display_name: Some(SmolStr::new(format!("Bounded {i}"))),
+            did: Did::parse(&did).unwrap(),
+            handle: Handle::parse(format!("bounded{i}.test")).unwrap(),
+            display_name: Some(format!("Bounded {i}")),
             avatar: None,
             associated: None,
             viewer: None,
@@ -1325,9 +1325,9 @@ async fn did_resolver_and_profile_hydrator_cache_capacity_and_ttl_eviction() {
     for i in 0..50 {
         let did = format!("did:plc:hydrated{i}");
         let profile = ProfileViewBasic {
-            did: Did::new(SmolStr::new(&did)).unwrap(),
-            handle: Handle::new(SmolStr::new(format!("user{i}.test"))).unwrap(),
-            display_name: Some(SmolStr::new(format!("User {i}"))),
+            did: Did::parse(&did).unwrap(),
+            handle: Handle::parse(format!("user{i}.test")).unwrap(),
+            display_name: Some(format!("User {i}")),
             avatar: None,
             associated: None,
             viewer: None,
@@ -1579,7 +1579,7 @@ async fn listed_circles(
 ) -> Vec<String> {
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
-    use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
+    use petrel_catbird::generated::blue::catbird::circle::list_circles::Output as ListCirclesOutput;
     use tower::ServiceExt;
 
     let jwt = mint_service_jwt(did, "blue.catbird.circle.listCircles", signing_key);
@@ -1937,7 +1937,7 @@ async fn feed_circles(
     did: &str,
     signing_key: &p256::ecdsa::SigningKey,
 ) -> Vec<String> {
-    use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
+    use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
 
     let body = xrpc_get_ok(setup, did, signing_key, "blue.catbird.circle.getFeed").await;
     let output: GetFeedOutput = serde_json::from_slice(&body).unwrap();
@@ -1954,7 +1954,7 @@ async fn notification_circles(
     did: &str,
     signing_key: &p256::ecdsa::SigningKey,
 ) -> Vec<String> {
-    use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
+    use petrel_catbird::generated::blue::catbird::circle::list_notifications::Output as ListNotificationsOutput;
 
     let body = xrpc_get_ok(
         setup,
@@ -1972,9 +1972,9 @@ async fn notification_circles(
 }
 
 async fn cache_profile(setup: &TestSetup, did: &str, handle: &str) {
-    use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-    use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+    use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+    use petrel_core::Did;
+    use petrel_core::Handle;
 
     setup
         .state
@@ -1982,8 +1982,8 @@ async fn cache_profile(setup: &TestSetup, did: &str, handle: &str) {
         .set_cached_profile(
             did,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(did)).unwrap(),
-                handle: Handle::new(SmolStr::new(handle)).unwrap(),
+                did: Did::parse(did).unwrap(),
+                handle: Handle::parse(handle).unwrap(),
                 display_name: None,
                 avatar: None,
                 associated: None,

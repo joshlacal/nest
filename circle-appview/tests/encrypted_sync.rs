@@ -15,12 +15,12 @@ use p256::elliptic_curve::rand_core::OsRng;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-use catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput;
 use circle_appview::commit::{LtHash, RepoRecord};
 use circle_appview::config::AppState;
 use circle_appview::space_client::MockSpaceHostTransport;
 use circle_appview::sync::{latest_key_version, SyncMode};
 use circle_appview::validator::compute_uri_hash;
+use petrel_api::generated::com::atproto::space::list_repo_ops::Output as ListRepoOpsOutput;
 
 const OWNER_DID: &str = "did:plc:alice-enc-sync";
 const BOB_DID: &str = "did:plc:bob-enc-sync";
@@ -314,14 +314,13 @@ async fn full_recovery_indexes_keys_and_envelopes(pool: PgPool) {
 
     // Incremental page with a commit that does not match its ops forces full recovery.
     let mut bad = LtHash::default();
-    bad.add("app.bsky.feed.post/3l7tampered11/bafytamperedcid");
+    bad.add_entry("app.bsky.feed.post/3l7tampered11", "bafytamperedcid");
     setup.mock.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
         ListRepoOpsOutput {
             commit: fixture_commit(SPACE_URI, OWNER_DID, REV, &state_bytes(&bad)),
             cursor: None,
             ops: vec![],
-            extra_data: None,
         },
     );
 
@@ -337,7 +336,7 @@ async fn full_recovery_indexes_keys_and_envelopes(pool: PgPool) {
         .iter()
         .map(|(collection, rkey, value)| {
             let cid = cid_of(value);
-            lthash.add(&format!("{collection}/{rkey}/{cid}"));
+            lthash.add_entry(&format!("{collection}/{rkey}"), &cid);
             RepoRecord {
                 collection: collection.to_string(),
                 rkey: rkey.to_string(),

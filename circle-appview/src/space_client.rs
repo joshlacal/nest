@@ -183,12 +183,35 @@ pub enum WriterUpdate {
     Unknown,
 }
 
+/// `{"$bytes": "<base64>"}` for a `bytes::Bytes` field. Writes padded standard
+/// base64, as this service always has; reads padded or unpadded through Petrel.
+mod dollar_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        bytes: &bytes::Bytes,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("$bytes", &STANDARD.encode(bytes))?;
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<bytes::Bytes, D::Error> {
+        petrel_core::Bytes::deserialize(deserializer).map(|bytes| bytes::Bytes::from(bytes.0))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoWrite {
     pub repo: String,
     pub repo_rev: String,
-    #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
+    #[serde(with = "dollar_bytes")]
     pub data: bytes::Bytes,
     pub space_rev: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,7 +313,17 @@ pub trait SpaceHostTransport: Send + Sync {
         _repo_did: &'a str,
         _since: Option<&'a str>,
         _cursor: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput, AppError>> + Send + 'a>>{
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        petrel_api::generated::com::atproto::space::list_repo_ops::Output,
+                        AppError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             Err(AppError::NotFound(
                 "list_repo_ops not implemented on transport".into(),
@@ -338,7 +371,7 @@ pub trait SpaceHostTransport: Send + Sync {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::Commit,
+                        petrel_api::generated::com::atproto::space::defs::Commit,
                         AppError,
                     >,
                 > + Send
@@ -719,13 +752,13 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
+                        petrel_api::generated::com::atproto::space::list_repo_ops::Output,
                         AppError,
                     >,
                 > + Send
                 + 'a,
         >,
-    >{
+    > {
         let target_url = target_url.clone();
         let auth = auth.clone();
         let space_uri = space_uri.to_string();
@@ -763,8 +796,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 MAX_SPACE_RESPONSE_BYTES,
             )
             .await?;
-            let output: catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput = serde_json::from_slice(&body_bytes)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let output: petrel_api::generated::com::atproto::space::list_repo_ops::Output =
+                serde_json::from_slice(&body_bytes)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
             crate::space_mac::verify_commit(
                 &output.commit,
                 &space_uri,
@@ -858,7 +892,7 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::Commit,
+                        petrel_api::generated::com::atproto::space::defs::Commit,
                         AppError,
                     >,
                 > + Send
@@ -894,7 +928,9 @@ impl SpaceHostTransport for DefaultSpaceHostTransport {
                 MAX_SPACE_RESPONSE_BYTES,
             )
             .await?;
-            let output: catbird_atproto::generated::com_atproto::space::get_latest_commit::GetLatestCommitOutput = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Internal(e.to_string()))?;
+            let output: petrel_api::generated::com::atproto::space::get_latest_commit::Output =
+                serde_json::from_slice(&body_bytes)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
             crate::space_mac::verify_commit(
                 &output.commit,
                 &space_uri,
@@ -979,15 +1015,12 @@ pub struct MockSpaceHostTransport {
     authority_keys: Mutex<HashMap<String, p256::ecdsa::SigningKey>>,
     authorize_space_revs: Mutex<HashMap<String, Option<String>>>,
     list_writers_responses: Mutex<HashMap<String, ListWritersOutput>>,
-    list_repo_ops_responses: Mutex<
-        HashMap<
-            String,
-            catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
-        >,
-    >,
+    list_repo_ops_responses:
+        Mutex<HashMap<String, petrel_api::generated::com::atproto::space::list_repo_ops::Output>>,
     list_repo_ops_not_found: Mutex<HashSet<String>>,
     get_repo_responses: Mutex<HashMap<String, Vec<u8>>>,
-    latest_commits: Mutex<HashMap<String, catbird_atproto::generated::com_atproto::space::Commit>>,
+    latest_commits:
+        Mutex<HashMap<String, petrel_api::generated::com::atproto::space::defs::Commit>>,
     calls: Mutex<Vec<RecordedSpaceHostCall>>,
     #[allow(clippy::type_complexity)]
     blob_responses: Mutex<HashMap<String, (Option<String>, Vec<u8>)>>,
@@ -1103,7 +1136,7 @@ impl MockSpaceHostTransport {
     pub fn set_list_repo_ops_response(
         &self,
         space_and_repo: &str,
-        output: catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
+        output: petrel_api::generated::com::atproto::space::list_repo_ops::Output,
     ) {
         let mut lock = self.list_repo_ops_responses.lock().unwrap();
         lock.insert(space_and_repo.to_string(), output);
@@ -1124,7 +1157,7 @@ impl MockSpaceHostTransport {
     pub fn set_latest_commit(
         &self,
         space_and_repo: &str,
-        commit: catbird_atproto::generated::com_atproto::space::Commit,
+        commit: petrel_api::generated::com::atproto::space::defs::Commit,
     ) {
         let mut lock = self.latest_commits.lock().unwrap();
         lock.insert(space_and_repo.to_string(), commit);
@@ -1310,13 +1343,13 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
+                        petrel_api::generated::com::atproto::space::list_repo_ops::Output,
                         AppError,
                     >,
                 > + Send
                 + 'a,
         >,
-    >{
+    > {
         if let Err(e) = self.use_credential("com.atproto.space.listRepoOps", space_uri, auth) {
             return Box::pin(async move { Err(e) });
         }
@@ -1378,7 +1411,7 @@ impl SpaceHostTransport for MockSpaceHostTransport {
         Box<
             dyn Future<
                     Output = Result<
-                        catbird_atproto::generated::com_atproto::space::Commit,
+                        petrel_api::generated::com::atproto::space::defs::Commit,
                         AppError,
                     >,
                 > + Send
@@ -1624,7 +1657,7 @@ impl SpaceClient {
                     "listMembers aggregate byte limit exceeded".into(),
                 ));
             }
-            let data: catbird_atproto::generated::com_atproto::memberspace::list_members::ListMembersOutput<String> =
+            let data: petrel_api::generated::com::atproto::memberspace::list_members::Output =
                 serde_json::from_slice(&body_bytes).map_err(|e| {
                     AppError::Internal(format!("Failed to parse listMembers output: {e}"))
                 })?;
@@ -1942,10 +1975,7 @@ impl SpaceClient {
         cursor: Option<&str>,
         space_credential: &str,
         signing_key: &p256::ecdsa::SigningKey,
-    ) -> Result<
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput,
-        AppError,
-    > {
+    ) -> Result<petrel_api::generated::com::atproto::space::list_repo_ops::Output, AppError> {
         let xrpc_url = construct_xrpc_url(service_endpoint, "com.atproto.space.listRepoOps")?;
         for retry in 0..2 {
             let auth = self
@@ -2032,66 +2062,53 @@ fn extract_authority_from_space_uri(space: &str) -> Result<String, AppError> {
 }
 
 fn parse_space_uri_parts(space: &str) -> Result<(String, String, String), AppError> {
-    let parsed = atproto_spaces::SpaceUri::parse_hedged(space)
+    let parsed = crate::space_uri::parse_lenient(space)
         .map_err(|e| AppError::InvalidRequest(format!("Invalid Space URI format: {e}")))?;
-    Ok((parsed.authority, parsed.space_type, parsed.rkey))
+    Ok((
+        parsed.space_did().as_str().to_owned(),
+        parsed.space_type().as_str().to_owned(),
+        parsed.skey().as_str().to_owned(),
+    ))
 }
 
 /// Query URLs for the space-host, getSpace and memberspace reads, built from the
-/// lexicon-generated `catbird_atproto` params structs so the wire keys come from
-/// the lexicon rather than hand-typed strings. A hand-typed `did` in place of
+/// lexicon-generated Petrel `Parameters` structs so the wire keys come from the
+/// lexicon rather than hand-typed strings. A hand-typed `did` in place of
 /// getBlob's `repo` once made every Circle image request fail upstream.
 pub mod xrpc_query {
     use super::AppError;
-    use catbird_atproto::generated::com_atproto::{memberspace, space};
-    use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-    use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
-    use catbird_atproto::jacquard_common::types::string::{Cid, Did, Tid};
+    use petrel_api::generated::com::atproto::{memberspace, space};
+    use petrel_core::{CidString, Did, SpaceRef, Tid, ToQueryParams};
 
-    fn space_ref(space: &str) -> Result<AtSpaceUri<SmolStr>, AppError> {
-        let canonical = atproto_spaces::SpaceUri::parse_hedged(space)
-            .map_err(|e| AppError::InvalidRequest(format!("Invalid space reference: {e}")))?;
-        AtSpaceUri::new(SmolStr::new(canonical.as_str()))
+    fn space_ref(space: &str) -> Result<SpaceRef, AppError> {
+        crate::space_uri::parse_lenient(space)
             .map_err(|e| AppError::InvalidRequest(format!("Invalid space reference: {e}")))
     }
 
-    fn did(value: &str) -> Result<Did<SmolStr>, AppError> {
-        Did::new(SmolStr::new(value))
-            .map_err(|e| AppError::InvalidRequest(format!("Invalid repo DID: {e}")))
+    fn did(value: &str) -> Result<Did, AppError> {
+        Did::parse(value).map_err(|e| AppError::InvalidRequest(format!("Invalid repo DID: {e}")))
     }
 
-    fn with_params<P: serde::Serialize>(
+    /// Append `params` to `target_url`, leaving out `unset`: parameters this service never
+    /// sets, which Petrel's `ToQueryParams` writes anyway at their lexicon default. Omitting
+    /// them keeps the request byte-identical to what deployed space hosts already receive.
+    fn with_params<P: ToQueryParams>(
         target_url: &url::Url,
         params: &P,
-    ) -> Result<url::Url, AppError> {
-        let value = serde_json::to_value(params)
-            .map_err(|e| AppError::Internal(format!("Failed to encode XRPC params: {e}")))?;
-        let serde_json::Value::Object(map) = value else {
-            return Err(AppError::Internal(
-                "XRPC params must encode as an object".into(),
-            ));
-        };
+        unset: &[&str],
+    ) -> url::Url {
+        let mut pairs = Vec::new();
+        params.to_query_params(&mut pairs);
         let mut url = target_url.clone();
         {
             let mut query = url.query_pairs_mut();
-            for (key, value) in map {
-                match value {
-                    serde_json::Value::Null => {}
-                    serde_json::Value::String(s) => {
-                        query.append_pair(&key, &s);
-                    }
-                    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-                        query.append_pair(&key, &value.to_string());
-                    }
-                    other => {
-                        return Err(AppError::Internal(format!(
-                            "Unsupported XRPC param value for {key}: {other}"
-                        )));
-                    }
+            for (key, value) in pairs {
+                if !unset.contains(&key) {
+                    query.append_pair(key, &value);
                 }
             }
         }
-        Ok(url)
+        url
     }
 
     pub fn get_blob(
@@ -2100,14 +2117,13 @@ pub mod xrpc_query {
         repo: &str,
         cid: &str,
     ) -> Result<url::Url, AppError> {
-        with_params(
+        let cid = CidString::parse(cid)
+            .map_err(|e| AppError::InvalidRequest(format!("Invalid blob CID: {e}")))?;
+        Ok(with_params(
             target_url,
-            &space::get_blob::GetBlob::<SmolStr> {
-                space: space_ref(space_uri)?,
-                repo: did(repo)?,
-                cid: Cid::Str(SmolStr::new(cid)),
-            },
-        )
+            &space::get_blob::Parameters::new(space_ref(space_uri)?, did(repo)?, cid),
+            &[],
+        ))
     }
 
     pub fn list_repo_ops(
@@ -2119,22 +2135,19 @@ pub mod xrpc_query {
     ) -> Result<url::Url, AppError> {
         let since = since
             .map(|s| {
-                Tid::new(s).map_err(|e| {
+                Tid::parse(s).map_err(|e| {
                     AppError::Internal(format!("listRepoOps since is not a TID rev: {e}"))
                 })
             })
             .transpose()?;
-        with_params(
+        let mut params = space::list_repo_ops::Parameters::new(space_ref(space_uri)?, did(repo)?);
+        params.since = since;
+        params.cursor = cursor.map(str::to_owned);
+        Ok(with_params(
             target_url,
-            &space::list_repo_ops::ListRepoOps::<SmolStr> {
-                cursor: cursor.map(SmolStr::new),
-                exclude_values: None,
-                limit: None,
-                repo: did(repo)?,
-                since,
-                space: space_ref(space_uri)?,
-            },
-        )
+            &params,
+            &["limit", "excludeValues"],
+        ))
     }
 
     pub fn get_repo(
@@ -2142,13 +2155,11 @@ pub mod xrpc_query {
         space_uri: &str,
         repo: &str,
     ) -> Result<url::Url, AppError> {
-        with_params(
+        Ok(with_params(
             target_url,
-            &space::get_repo::GetRepo::<SmolStr> {
-                repo: did(repo)?,
-                space: space_ref(space_uri)?,
-            },
-        )
+            &space::get_repo::Parameters::new(space_ref(space_uri)?, did(repo)?),
+            &[],
+        ))
     }
 
     pub fn get_latest_commit(
@@ -2156,13 +2167,11 @@ pub mod xrpc_query {
         space_uri: &str,
         repo: &str,
     ) -> Result<url::Url, AppError> {
-        with_params(
+        Ok(with_params(
             target_url,
-            &space::get_latest_commit::GetLatestCommit::<SmolStr> {
-                repo: did(repo)?,
-                space: space_ref(space_uri)?,
-            },
-        )
+            &space::get_latest_commit::Parameters::new(space_ref(space_uri)?, did(repo)?),
+            &[],
+        ))
     }
 
     pub fn list_writers(
@@ -2182,12 +2191,11 @@ pub mod xrpc_query {
     }
 
     pub fn get_space(target_url: &url::Url, space_uri: &str) -> Result<url::Url, AppError> {
-        with_params(
+        Ok(with_params(
             target_url,
-            &space::get_space::GetSpace::<SmolStr> {
-                space: space_ref(space_uri)?,
-            },
-        )
+            &space::get_space::Parameters::new(space_ref(space_uri)?),
+            &[],
+        ))
     }
 
     pub fn list_members(
@@ -2195,14 +2203,9 @@ pub mod xrpc_query {
         space_uri: &str,
         cursor: Option<&str>,
     ) -> Result<url::Url, AppError> {
-        with_params(
-            target_url,
-            &memberspace::list_members::ListMembers::<SmolStr> {
-                cursor: cursor.map(SmolStr::new),
-                limit: None,
-                space: space_ref(space_uri)?,
-            },
-        )
+        let mut params = memberspace::list_members::Parameters::new(space_ref(space_uri)?);
+        params.cursor = cursor.map(str::to_owned);
+        Ok(with_params(target_url, &params, &["limit"]))
     }
 }
 
@@ -2470,6 +2473,25 @@ pub fn mint_mock_space_credential(
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+
+    #[test]
+    fn repo_write_bytes_write_padded_and_read_either_form() {
+        let write = RepoWrite {
+            repo: "did:plc:alice".into(),
+            repo_rev: "3l7aaaaaaaaaa".into(),
+            data: bytes::Bytes::from_static(&[1, 2, 3, 4]),
+            space_rev: "3l7bbbbbbbbbb".into(),
+            prev_space_rev: None,
+        };
+        let encoded = serde_json::to_value(&write).unwrap();
+        assert_eq!(encoded["data"], json!({"$bytes": "AQIDBA=="}));
+        for form in ["AQIDBA==", "AQIDBA"] {
+            let mut value = encoded.clone();
+            value["data"] = json!({ "$bytes": form });
+            let decoded: RepoWrite = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded, write, "{form}");
+        }
+    }
 
     #[test]
     fn list_writers_open_union_accepts_unknown_entries() {
@@ -3186,6 +3208,13 @@ mod tests {
         let commit = crate::test_support::fixture_commit(SPACE, REPO, "3jzfcijpj2m2a", &[0; 2048]);
         let star = crate::test_support::fixture_star(&commit, &[]).unwrap();
         let key = p256::ecdsa::SigningKey::random(&mut OsRng);
+        // petrel-spaces requires keyid to be a P-256 did:key, so both are real keys.
+        let key_share =
+            crate::space_mac::p256_did_key(&p256::SecretKey::random(&mut OsRng).public_key())
+                .unwrap();
+        let other_key_share =
+            crate::space_mac::p256_did_key(&p256::SecretKey::random(&mut OsRng).public_key())
+                .unwrap();
         for endpoint in ["getLatestCommit", "getRepo", "listRepoOps"] {
             for mode in [
                 "good",
@@ -3199,7 +3228,7 @@ mod tests {
                 let server = MockServer::start().await;
                 let mut auth = credential_headers(&key, "cred", REPO);
                 auth.mac = Some(MacRequest {
-                    key_share: "did:key:fixture".into(),
+                    key_share: key_share.clone(),
                     shared_secret: [7; 32],
                     profile: MacProfile::Commit,
                 });
@@ -3208,7 +3237,7 @@ mod tests {
                     commit.repo,
                     commit.space,
                     commit.rev,
-                    base64::engine::general_purpose::STANDARD.encode(&commit.data)
+                    base64::engine::general_purpose::STANDARD.encode(&commit.data.0)
                 );
                 if mode == "version" {
                     covered = covered.replacen("ver=1", "ver=2", 1);
@@ -3219,9 +3248,9 @@ mod tests {
                     COMMIT_MAC_PROFILE
                 };
                 let keyid = if mode == "keyid" {
-                    "did:key:zDnaOther"
+                    other_key_share.as_str()
                 } else {
-                    "did:key:fixture"
+                    key_share.as_str()
                 };
                 let params =
                     format!("(\"{COMMIT_MAC_PROFILE}\";sf);keyid=\"{keyid}\";tag=\"{tag}\"");

@@ -1,23 +1,26 @@
-//! Strict DASL STAR v0.2 repository replacement, delegated to `atproto-spaces`.
+//! Strict DASL STAR v0.2 repository replacement, delegated to `petrel_spaces::star`.
 //! No records escape before full digest validation.
 use crate::{
     commit::{json_to_ipld, LtHash},
     error::AppError,
     space_mac::Commit,
 };
-use bytes::Bytes;
-use catbird_atproto::jacquard_common::types::{
-    aturi::AtSpaceUri,
-    string::{Did, Tid},
-    value::Data,
-};
 
 pub const MAX_STAR_BYTES: usize = 50 * 1024 * 1024;
-pub const MAX_METADATA_BYTES: usize = atproto_spaces::star::MAX_METADATA_BYTES;
-pub const MAX_KEY_BYTES: usize = atproto_spaces::star::MAX_KEY_BYTES;
-pub const MAX_RECORD_BYTES: usize = atproto_spaces::star::MAX_RECORD_BYTES;
+/// Largest STAR metadata frame.
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
+/// Longest STAR record path (`{collection}/{rkey}`).
+pub const MAX_KEY_BYTES: usize = 4 * 1024;
+/// Largest DAG-CBOR record in a STAR archive.
+pub const MAX_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_RECORDS: usize = 10_000;
-pub const MAGIC: &[u8] = &atproto_spaces::star::STAR_LITE_MAGIC;
+/// `*l` followed by the little-endian STAR version 1.
+pub const MAGIC: &[u8] = &[
+    petrel_spaces::STAR_MAGIC[0],
+    petrel_spaces::STAR_MAGIC[1],
+    petrel_spaces::STAR_VERSION.to_le_bytes()[0],
+    petrel_spaces::STAR_VERSION.to_le_bytes()[1],
+];
 pub type RepoRecords = Vec<(String, String, String, serde_json::Value)>;
 
 pub struct RepoSnapshot {
@@ -30,17 +33,46 @@ fn invalid(message: impl std::fmt::Display) -> AppError {
     AppError::InvalidRequest(format!("Invalid STAR: {message}"))
 }
 
-fn commit_from_meta(meta: &atproto_spaces::star::StarCommitMetadata) -> Result<Commit, AppError> {
-    let space =
-        AtSpaceUri::new_owned(meta.space.clone()).map_err(|_| invalid("invalid space URI"))?;
-    let repo = Did::new_owned(meta.repo.clone()).map_err(|_| invalid("invalid repo DID"))?;
-    let rev = Tid::new(meta.rev.as_str()).map_err(|_| invalid("invalid rev TID"))?;
+/// Length of the metadata frame that follows the 4-byte magic. petrel-spaces bounds
+/// the whole archive; the frame limit is this service's own resource bound.
+fn metadata_frame_len(bytes: &[u8]) -> Result<usize, AppError> {
+    let mut len: u64 = 0;
+    for (index, byte) in bytes.iter().skip(MAGIC.len()).take(10).enumerate() {
+        len |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return usize::try_from(len).map_err(|_| invalid("metadata frame too large"));
+        }
+    }
+    Err(invalid("truncated metadata frame length"))
+}
+
+fn check_metadata_frame(bytes: &[u8]) -> Result<(), AppError> {
+    if !bytes.starts_with(MAGIC) {
+        return Err(invalid("bad magic"));
+    }
+    if metadata_frame_len(bytes)? > MAX_METADATA_BYTES {
+        return Err(invalid("metadata frame exceeds limit"));
+    }
+    Ok(())
+}
+
+fn commit_from_meta(
+    meta: &petrel_spaces::StarRepoMetadata,
+    space: &str,
+    repo: &str,
+) -> Result<Commit, AppError> {
+    if meta.space.as_str() != space {
+        return Err(invalid("space does not match the request"));
+    }
+    if meta.repo.as_str() != repo {
+        return Err(invalid("repo does not match the request"));
+    }
     Ok(Commit {
-        space,
-        repo,
-        rev,
-        data: Bytes::copy_from_slice(&meta.data),
         ver: 1,
+        repo: meta.repo.clone(),
+        space: meta.space.clone(),
+        rev: meta.rev.clone(),
+        data: petrel_core::Bytes(meta.data.to_vec()),
         extra_data: None,
     })
 }
@@ -51,42 +83,52 @@ pub fn read_commit(bytes: &[u8], space: &str, repo: &str) -> Result<Commit, AppE
     if bytes.len() > MAX_STAR_BYTES {
         return Err(invalid("archive exceeds limit"));
     }
-    let meta = atproto_spaces::star::read_star_metadata(bytes, space, repo).map_err(invalid)?;
-    commit_from_meta(&meta)
+    check_metadata_frame(bytes)?;
+    let meta = petrel_spaces::read_star_metadata(bytes).map_err(invalid)?;
+    commit_from_meta(&meta, space, repo)
 }
 
 pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnapshot, AppError> {
     if bytes.len() > MAX_STAR_BYTES {
         return Err(invalid("archive exceeds limit"));
     }
-    let parsed = atproto_spaces::star::read_star_repo(bytes, space, repo).map_err(invalid)?;
+    check_metadata_frame(bytes)?;
+    let parsed = petrel_spaces::read_star_repo(bytes, MAX_STAR_BYTES).map_err(invalid)?;
+    let commit = commit_from_meta(&parsed.metadata, space, repo)?;
     if parsed.records.len() > MAX_RECORDS {
         return Err(invalid("too many records"));
     }
-    let meta = atproto_spaces::star::StarCommitMetadata {
-        space: parsed.space,
-        repo: parsed.repo,
-        rev: parsed.rev,
-        data: parsed.data,
-    };
-    let commit = commit_from_meta(&meta)?;
 
     let mut records = Vec::with_capacity(parsed.records.len());
     let mut lthash = LtHash::default();
-    for rec in parsed.records {
-        let value: Data<jacquard_common::SmolStr> =
-            serde_ipld_dagcbor::from_slice(&rec.record_dagcbor)
-                .map_err(|_| invalid("invalid DRISL"))?;
-        let json = serde_json::to_value(value).map_err(|_| invalid("invalid record JSON"))?;
-        json_to_ipld(&json).map_err(|_| invalid("invalid record value"))?;
-        if !json.is_object() {
+    let mut previous: Option<&str> = None;
+    for rec in &parsed.records {
+        if rec.path.len() > MAX_KEY_BYTES {
+            return Err(invalid("record path exceeds limit"));
+        }
+        if rec.cbor.len() > MAX_RECORD_BYTES {
+            return Err(invalid("record exceeds limit"));
+        }
+        // Paths are strictly ascending by UTF-8 bytes, which also rules out duplicates.
+        if previous.is_some_and(|prev| rec.path.as_bytes() <= prev.as_bytes()) {
+            return Err(invalid("record paths out of order"));
+        }
+        previous = Some(rec.path.as_str());
+        if !matches!(rec.value, petrel_core::Value::Object(_)) {
             return Err(invalid("record must be a map"));
         }
+        let json = serde_json::to_value(&rec.value).map_err(|_| invalid("invalid record JSON"))?;
+        json_to_ipld(&json).map_err(|_| invalid("invalid record value"))?;
         let cid_str = rec.cid.to_string();
-        lthash.add(&format!("{}/{cid_str}", rec.path));
-        records.push((rec.collection, rec.rkey, cid_str, json));
+        lthash.add_entry(&rec.path, &cid_str);
+        records.push((
+            rec.collection.as_str().to_owned(),
+            rec.rkey.as_str().to_owned(),
+            cid_str,
+            json,
+        ));
     }
-    if lthash.digest() != meta.data {
+    if lthash.digest() != parsed.metadata.data {
         return Err(invalid("digest mismatch"));
     }
     Ok(RepoSnapshot {
@@ -100,18 +142,34 @@ pub fn parse_repo_star(bytes: &[u8], space: &str, repo: &str) -> Result<RepoSnap
 mod tests {
     use super::*;
     use crate::commit::create_cid_bytes_from_data;
-    use serde::{Deserialize, Serialize};
+    use petrel_core::Value;
+    use std::collections::BTreeMap;
 
-    #[derive(Serialize, Deserialize)]
     struct Meta {
-        #[serde(rename = "$type")]
         kind: String,
         ver: i64,
         repo: String,
         space: String,
         rev: String,
-        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+    }
+
+    impl Meta {
+        fn to_dagcbor(&self) -> Vec<u8> {
+            let map = BTreeMap::from([
+                ("$type".to_owned(), Value::String(self.kind.clone())),
+                ("ver".to_owned(), Value::Integer(self.ver)),
+                ("repo".to_owned(), Value::String(self.repo.clone())),
+                ("space".to_owned(), Value::String(self.space.clone())),
+                ("rev".to_owned(), Value::String(self.rev.clone())),
+                ("data".to_owned(), Value::Bytes(self.data.clone())),
+            ]);
+            petrel_core::dagcbor::encode(&Value::Object(map))
+        }
+    }
+
+    fn cbor(json: serde_json::Value) -> Vec<u8> {
+        crate::commit::encode_dagcbor(&json_to_ipld(&json).unwrap()).unwrap()
     }
 
     fn append_frame(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -130,7 +188,7 @@ mod tests {
     fn archive(pairs: &[(&str, &[u8])]) -> Vec<u8> {
         let mut hash = LtHash::default();
         for (path, bytes) in pairs {
-            hash.add(&format!("{path}/{}", create_cid_bytes_from_data(bytes).1));
+            hash.add_entry(path, &create_cid_bytes_from_data(bytes).1);
         }
         let meta = Meta {
             kind: "atproto-space-repo".into(),
@@ -141,7 +199,7 @@ mod tests {
             data: hash.digest().to_vec(),
         };
         let mut bytes = MAGIC.to_vec();
-        append_frame(&mut bytes, &serde_ipld_dagcbor::to_vec(&meta).unwrap());
+        append_frame(&mut bytes, &meta.to_dagcbor());
         for (path, value) in pairs {
             bytes.push(0x01);
             append_frame(&mut bytes, path.as_bytes());
@@ -162,7 +220,7 @@ mod tests {
     #[test]
     fn empty_and_record_roundtrip() {
         assert!(parse(&archive(&[])).unwrap().records.is_empty());
-        let value = serde_ipld_dagcbor::to_vec(&serde_json::json!({"text":"hello"})).unwrap();
+        let value = cbor(serde_json::json!({"text":"hello"}));
         assert_eq!(
             parse(&archive(&[("app.bsky.feed.post/a", &value)]))
                 .unwrap()
@@ -174,7 +232,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_order_truncation_digest() {
-        let value = serde_ipld_dagcbor::to_vec(&serde_json::json!({"text":"hello"})).unwrap();
+        let value = cbor(serde_json::json!({"text":"hello"}));
         for keys in [
             ["app.bsky.feed.post/a", "app.bsky.feed.post/a"],
             ["app.bsky.feed.post/b", "app.bsky.feed.post/a"],
@@ -219,8 +277,11 @@ mod tests {
         for record in [
             vec![0xa2, 0x62, b'a', b'a', 1, 0x61, b'b', 2], // wrong map-key order
             vec![0xa2, 0x61, b'a', 1, 0x61, b'a', 2],       // duplicate map key
-            serde_ipld_dagcbor::to_vec(&serde_json::json!({"float":1.5})).unwrap(),
-            serde_ipld_dagcbor::to_vec(&serde_json::json!([1, 2])).unwrap(),
+            // {"float": 1.5}: DAG-CBOR float64
+            vec![
+                0xa1, 0x65, b'f', b'l', b'o', b'a', b't', 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0,
+            ],
+            vec![0x82, 0x01, 0x02], // [1, 2]
         ] {
             assert!(parse(&archive(&[("app.bsky.feed.post/a", &record)])).is_err());
         }
@@ -251,10 +312,7 @@ mod tests {
             data: LtHash::default().digest().to_vec(),
         };
         let mut invalid_version = MAGIC.to_vec();
-        append_frame(
-            &mut invalid_version,
-            &serde_ipld_dagcbor::to_vec(&invalid_meta).unwrap(),
-        );
+        append_frame(&mut invalid_version, &invalid_meta.to_dagcbor());
         invalid_version.push(0x00);
         assert!(parse(&invalid_version).is_err());
 
@@ -276,7 +334,7 @@ mod tests {
     #[test]
     fn rejects_oversized_key() {
         let key = "a".repeat(MAX_KEY_BYTES + 1);
-        let value = serde_ipld_dagcbor::to_vec(&serde_json::json!({})).unwrap();
+        let value = cbor(serde_json::json!({}));
         assert!(parse(&archive(&[(key.as_str(), value.as_slice())])).is_err());
     }
 }

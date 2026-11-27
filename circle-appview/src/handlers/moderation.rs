@@ -5,13 +5,10 @@ use axum::{
     extract::{Extension, State},
     Json,
 };
-use catbird_atproto::generated::blue_catbird::circle::report_record::{
-    ReportRecord, ReportRecordOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::update_preferences::{
-    UpdatePreferences, UpdatePreferencesOutput,
-};
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
+use petrel_catbird::generated::blue::catbird::circle::report_record::Input as ReportRecord;
+use petrel_catbird::generated::blue::catbird::circle::report_record::Output as ReportRecordOutput;
+use petrel_catbird::generated::blue::catbird::circle::update_preferences::Input as UpdatePreferences;
+use petrel_catbird::generated::blue::catbird::circle::update_preferences::Output as UpdatePreferencesOutput;
 
 pub async fn update_preferences_handler(
     Extension(user): Extension<AuthenticatedUser>,
@@ -26,10 +23,7 @@ pub async fn update_preferences_handler(
         input.muted,
     )
     .await?;
-    Ok(Json(UpdatePreferencesOutput {
-        muted,
-        extra_data: None,
-    }))
+    Ok(Json(UpdatePreferencesOutput { muted }))
 }
 
 pub async fn report_record_handler(
@@ -38,7 +32,7 @@ pub async fn report_record_handler(
     Json(input): Json<ReportRecord>,
 ) -> Result<Json<ReportRecordOutput>, AppError> {
     tracing::debug!("Handling reportRecord request");
-    let details_ref = input.details.as_ref().map(|s| s.as_str());
+    let details_ref = input.details.as_deref();
     // `disclosedPostKey` / `disclosedMedia` are deliberately ignored: the
     // operator never receives the means to decrypt Circle content.
     if input.disclosed_post_key.is_some() || input.disclosed_media.is_some() {
@@ -54,8 +48,5 @@ pub async fn report_record_handler(
     )
     .await?;
 
-    Ok(Json(ReportRecordOutput {
-        id: SmolStr::new(id),
-        extra_data: None,
-    }))
+    Ok(Json(ReportRecordOutput { id }))
 }
