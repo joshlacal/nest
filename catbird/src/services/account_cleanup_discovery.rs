@@ -727,6 +727,8 @@ pub async fn discover_account_redis(
         if matches!(
             family,
             RedisFamily::Session
+                | RedisFamily::PetrelSession
+                | RedisFamily::PetrelFlow
                 | RedisFamily::RevokeJob
                 | RedisFamily::LogoutGrant
                 | RedisFamily::UpgradeFlow

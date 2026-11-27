@@ -59,11 +59,7 @@ impl CleanupStore for Fake {
                 return Err(CleanupError::ReceiptConflict);
             }
             let grant = if journal.retained_credential {
-                Some(fixture::grant(
-                    DID,
-                    &request.bearer,
-                    "https://synthetic.invalid",
-                ))
+                Some(fixture::grant(DID, &request.bearer, "https://synthetic.invalid").into())
             } else {
                 None
             };
