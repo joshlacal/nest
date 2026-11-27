@@ -264,7 +264,7 @@ async fn resolve_oauth_session(
     // Extract and validate authoritative granted scopes returned by PDS/OAuth server.
     // Authenticate only sessions with authoritative parseable nonempty granted scopes containing `atproto`.
     // No unwrap_or_default or legacy empty acceptance.
-    let token_scope_str = session_data.token_set.scope.as_ref().map(|s| s.as_str());
+    let token_scope_str = session_data.token_set.scope.as_deref();
     let granted_scopes =
         validate_authoritative_granted_scopes(&session_data.scopes, token_scope_str)?;
     let session = CatbirdSession {

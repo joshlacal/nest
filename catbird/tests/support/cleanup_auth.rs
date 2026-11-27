@@ -64,12 +64,13 @@ pub async fn seed(store: &RedisAuthStore, session: &CatbirdSession) {
 
 pub fn grant(did: &str, bearer: &str, pds_url: &str) -> ClientSessionData {
     let did = petrel_core::Did::parse(did.to_string()).unwrap();
-    // Public synthetic test-only key, inherited from push_session_signout.rs.
+    use petrel::crypto::{base64url, DpopSigner, SoftwareDpopSigner};
+    let scalar = [42u8; 32];
+    let jwk = SoftwareDpopSigner::from_bytes(&scalar)
+        .unwrap()
+        .public_jwk();
     let dpop_key: jose_jwk::Key = serde_json::from_value(serde_json::json!({
-        "kty": "EC", "crv": "P-256",
-        "x": "f83OJ3D2xFMTbKEBaGizdGlIUKEWx5q15odEB00stfg",
-        "y": "x_daaqundbgUvJV358vRBgULGnpH7aRFZZDYyEiNg2g",
-        "d": "jpsQnnGQmL-YxOmH1UmOBHg10OJ45DBTWh0n52qxzMQ"
+        "kty":"EC", "crv":"P-256", "x":jwk.x, "y":jwk.y, "d":base64url(&scalar)
     }))
     .unwrap();
     ClientSessionData {
