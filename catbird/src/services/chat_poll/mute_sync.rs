@@ -134,7 +134,7 @@ pub(crate) async fn sync_mutes_for_session(
     state: &Arc<AppState>,
     scheduler: &ChatPollScheduler,
     session: &crate::models::CatbirdSession,
-    dpop: &crate::middleware::JacquardDpopData,
+    dpop: &crate::middleware::SessionDpopData,
     did: &str,
     start_time: std::time::Instant,
 ) -> Result<()> {
@@ -145,7 +145,7 @@ async fn sync_mutes_for_session_fenced(
     state: &Arc<AppState>,
     scheduler: &ChatPollScheduler,
     session: &crate::models::CatbirdSession,
-    dpop: &crate::middleware::JacquardDpopData,
+    dpop: &crate::middleware::SessionDpopData,
     did: &str,
     start_time: std::time::Instant,
     expected_auth_generation: Option<i64>,
@@ -499,8 +499,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -532,7 +532,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -608,8 +608,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -641,7 +641,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -726,8 +726,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -759,7 +759,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -835,8 +835,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -868,7 +868,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -949,8 +949,8 @@ mod tests {
             redis,
             push_db: Some(pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -982,7 +982,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };

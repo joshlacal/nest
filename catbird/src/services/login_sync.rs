@@ -11,7 +11,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 
 use super::atproto_client::{AtProtoClient, ProxyResponse};
-use crate::middleware::JacquardDpopData;
+use crate::middleware::SessionDpopData;
 use crate::models::CatbirdSession;
 
 const MAX_DURATION: Duration = Duration::from_secs(30);
@@ -113,7 +113,7 @@ impl Budget {
 pub async fn fetch_login_snapshots(
     client: &AtProtoClient,
     session: &CatbirdSession,
-    dpop: Option<&JacquardDpopData>,
+    dpop: Option<&SessionDpopData>,
     request_id: &str,
 ) -> Value {
     let mut budget = Budget {
@@ -170,7 +170,7 @@ pub async fn fetch_login_snapshots(
 async fn fetch_body(
     client: &AtProtoClient,
     session: &CatbirdSession,
-    dpop: Option<&JacquardDpopData>,
+    dpop: Option<&SessionDpopData>,
     request_id: &str,
     source: Source,
     query: Option<&str>,
@@ -250,7 +250,7 @@ fn parse_response(status: u16, bytes: &[u8]) -> Result<Value, Failure> {
 async fn fetch_single(
     client: &AtProtoClient,
     session: &CatbirdSession,
-    dpop: Option<&JacquardDpopData>,
+    dpop: Option<&SessionDpopData>,
     request_id: &str,
     source: Source,
     budget: &mut Budget,
@@ -393,7 +393,7 @@ impl Pages {
 async fn fetch_pages(
     client: &AtProtoClient,
     session: &CatbirdSession,
-    dpop: Option<&JacquardDpopData>,
+    dpop: Option<&SessionDpopData>,
     request_id: &str,
     source: Source,
     budget: &mut Budget,

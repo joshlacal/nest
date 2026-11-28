@@ -2,7 +2,7 @@
 //!
 //! Handles communication with ATProto PDS servers, including:
 //! - Request proxying with DPoP nonce retry
-//! - DPoP proof generation via Jacquard
+//! - DPoP proof generation via Petrel
 
 use super::ssrf::validate_pds_url;
 use crate::config::AppState;
@@ -127,7 +127,7 @@ impl AtProtoClient {
         content_type: Option<&str>,
         client_headers: Option<&HeaderMap>,
         request_id: &str,
-        jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        session_dpop: Option<&crate::middleware::SessionDpopData>,
     ) -> AppResult<ProxyResponse> {
         self.proxy_request_with_limit(
             session,
@@ -138,7 +138,7 @@ impl AtProtoClient {
             content_type,
             client_headers,
             request_id,
-            jacquard_dpop,
+            session_dpop,
             MAX_RESPONSE_SIZE,
         )
         .await
@@ -157,7 +157,7 @@ impl AtProtoClient {
         content_type: Option<&str>,
         client_headers: Option<&HeaderMap>,
         request_id: &str,
-        jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        session_dpop: Option<&crate::middleware::SessionDpopData>,
         max_bytes: usize,
     ) -> AppResult<ProxyResponse> {
         if let Some(ch) = client_headers {
@@ -219,7 +219,7 @@ impl AtProtoClient {
                 method.as_str(),
                 &url,
                 cached_nonce,
-                jacquard_dpop,
+                session_dpop,
             )
             .await?;
 
@@ -344,7 +344,7 @@ impl AtProtoClient {
                                     client_headers,
                                     request_id,
                                     2,
-                                    jacquard_dpop,
+                                    session_dpop,
                                     origin.as_deref(),
                                     remaining_budget,
                                 )
@@ -517,13 +517,13 @@ impl AtProtoClient {
         client_headers: Option<&HeaderMap>,
         request_id: &str,
         attempt: u8,
-        jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        session_dpop: Option<&crate::middleware::SessionDpopData>,
         origin: Option<&str>,
         max_bytes: usize,
     ) -> AppResult<ProxyResponse> {
         let has_nonce = nonce.is_some();
         let mut headers = self
-            .build_auth_headers_for_request(session, method.as_str(), url, nonce, jacquard_dpop)
+            .build_auth_headers_for_request(session, method.as_str(), url, nonce, session_dpop)
             .await?;
 
         if let Some(ct) = content_type {
@@ -798,32 +798,38 @@ impl AtProtoClient {
         method: &str,
         url: &str,
         nonce: Option<String>,
-        jacquard_dpop: Option<&crate::middleware::JacquardDpopData>,
+        session_dpop: Option<&crate::middleware::SessionDpopData>,
     ) -> AppResult<HeaderMap> {
         let mut headers = HeaderMap::new();
 
-        let dpop_data = jacquard_dpop
-            .ok_or_else(|| AppError::Internal("Missing Jacquard DPoP data for request".into()))?;
+        let dpop_data = session_dpop
+            .ok_or_else(|| AppError::Internal("Missing session DPoP data for request".into()))?;
 
-        use base64::Engine;
-        use sha2::{Digest, Sha256};
-
-        // Compute access token hash (ath)
-        let ath = {
-            let hash = Sha256::digest(session.access_token.as_bytes());
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+        let jose_jwk::Key::Ec(ec) = &dpop_data.dpop_key else {
+            return Err(AppError::Crypto("Invalid session DPoP key type".into()));
         };
-
-        let dpop_htu = url.split('?').next().unwrap_or(url);
-
-        let dpop_proof = jacquard_oauth::dpop::build_dpop_proof(
-            &dpop_data.dpop_key,
-            method,
-            dpop_htu,
+        let key = p256::SecretKey::try_from(ec)
+            .map_err(|_| AppError::Crypto("Invalid session DPoP private key".into()))?;
+        let signer = petrel::crypto::SoftwareDpopSigner::from_bytes(&key.to_bytes().into())
+            .map_err(|e| AppError::Crypto(e.to_string()))?;
+        let method = http::Method::from_bytes(method.as_bytes())
+            .map_err(|_| AppError::Internal("Invalid proxy method".into()))?;
+        let target =
+            url::Url::parse(url).map_err(|_| AppError::Internal("Invalid proxy target".into()))?;
+        let now = chrono::Utc::now()
+            .timestamp()
+            .try_into()
+            .map_err(|_| AppError::Internal("Invalid system time".into()))?;
+        let dpop_proof = petrel::oauth::dpop_proof(
+            &signer,
+            &method,
+            &target,
+            now,
+            Some(&session.access_token),
             nonce.as_deref(),
-            Some(ath.as_str()),
         )
-        .map_err(|e| AppError::Internal(format!("Jacquard DPoP proof failed: {}", e)))?;
+        .await
+        .map_err(|e| AppError::Crypto(format!("DPoP proof failed: {e}")))?;
 
         let auth_value = format!("DPoP {}", session.access_token);
         headers.insert(
@@ -1568,8 +1574,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1600,7 +1606,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };
@@ -1673,8 +1679,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1705,7 +1711,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };

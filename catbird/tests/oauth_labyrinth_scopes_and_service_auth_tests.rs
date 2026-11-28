@@ -21,19 +21,14 @@ use axum::{
     response::IntoResponse,
     Extension,
 };
-use base64::Engine;
+use catbird::services::petrel_storage::{
+    ClientSessionData, DpopClientData, OAuthTokenType, TokenSet,
+};
 use chrono::Utc;
-use jacquard_common::types::did::Did;
-use jacquard_identity::{
-    resolver::{PlcSource, ResolverOptions},
-    JacquardResolver,
-};
-use jacquard_oauth::{
-    atproto::AtprotoClientMetadata,
-    scopes::Scopes,
-    session::{ClientData, ClientSessionData, DpopClientData},
-    types::{OAuthTokenType, TokenSet},
-};
+use petrel_core::Did;
+use petrel_oauth_scopes::ScopeSet;
+#[path = "support/petrel_fixture.rs"]
+mod petrel_fixture;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -43,8 +38,8 @@ use wiremock::{
 };
 
 use catbird::{
-    config::{AppConfig, AppState, JacquardOAuthClient},
-    middleware::JacquardDpopData,
+    config::{AppConfig, AppState, GatewayOAuth},
+    middleware::SessionDpopData,
     models::{CatbirdSession, ALLOWLISTED_UPGRADE_SCOPES},
     routes::atproto::create_router,
     services::{
@@ -52,8 +47,7 @@ use catbird::{
             gateway::{HttpMlsDsIdentityResolver, PushGatewayConfig, PushGatewayService},
             PushServices,
         },
-        HardenedHttpClient, OAuthUpgradeService, RedisAuthStore, UpgradeError,
-        DEFAULT_UPGRADE_CALLBACK_URL,
+        OAuthUpgradeService, RedisAuthStore, UpgradeError, DEFAULT_UPGRADE_CALLBACK_URL,
     },
 };
 
@@ -72,17 +66,11 @@ const RETIRED_LABYRINTH_SPACE_SCOPES: &[&str] = &[
     "space:blue.catbird.labyrinth.conversation?authority=*",
 ];
 
-const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgED1AAgC7Fc9kPh5T
-4i4Tn+z+tc47W1zYgzXtyjJtD92hRANCAAT80DqC+Z/JpTO7/pkPBmWqIV1IGh1P
-gbGGr0pN+oSing7cZ0169JaRHTNh+0LNQXrFobInX6cj95FzEdRyT4T3
------END PRIVATE KEY-----"#;
-
-fn test_dpop_data() -> JacquardDpopData {
+fn test_dpop_data() -> SessionDpopData {
     let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
     let crypto_key = jose_jwk::crypto::Key::from(secret_key);
     let dpop_key = jose_jwk::Key::from(&crypto_key);
-    JacquardDpopData {
+    SessionDpopData {
         dpop_key,
         dpop_host_nonce: String::new(),
     }
@@ -106,8 +94,8 @@ async fn base_test_state(config: AppConfig) -> Arc<AppState> {
         redis,
         push_db: None,
         key_store: None,
-        jacquard_client: None,
-        catmos_jacquard_client: None,
+        oauth_client: None,
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
@@ -195,12 +183,9 @@ async fn well_known_oauth_client_metadata_and_allowlist_contain_all_labyrinth_an
 #[tokio::test]
 async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_upgrade() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    unsafe {
-        std::env::set_var("JACQUARD_OAUTH_TEST_ALLOW_LOCAL", "1");
-    }
 
     let mock_as = MockServer::start().await;
-    let origin = mock_as.uri();
+    let origin = petrel_fixture::ISSUER.to_string();
     let user_did = "did:plc:z72i7hdynmk6r22z27h6tvur";
 
     Mock::given(method("GET"))
@@ -243,6 +228,7 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
             "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
             "dpop_signing_alg_values_supported": ["ES256"],
             "require_pushed_authorization_requests": true,
+            "authorization_response_iss_parameter_supported": true,
             "client_id_metadata_document_supported": true,
             "scopes_supported": ["atproto"],
             "protected_resources": [origin],
@@ -269,57 +255,26 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
     let auth_store = RedisAuthStore::new(redis.clone(), prefix.clone(), 3600, Some(enc_key))
         .expect("create RedisAuthStore");
 
-    let mut ks_cfg = AppConfig::test_default();
-    ks_cfg.push.database_url = None;
-    ks_cfg.oauth.private_key_base64 =
-        Some(base64::engine::general_purpose::STANDARD.encode(TEST_PRIVATE_KEY_PEM));
-    ks_cfg.oauth.active_key_id = "test-key-1".into();
-    let ks_state = AppState::new(ks_cfg).await.expect("AppState with KeyStore");
-    let keyset = ks_state
-        .key_store
-        .as_ref()
-        .and_then(|ks| ks.to_jacquard_keyset().ok());
-
+    let key_store = catbird::services::KeyStore::from_key(
+        "test-key",
+        p256::SecretKey::from_slice(&[3; 32]).unwrap(),
+    );
     let raw_requested: Vec<String> = REQUIRED_CLEAN_SLATE_SCOPES
         .iter()
         .map(|s| (*s).to_string())
         .collect();
     let parsed_scopes =
         catbird::config::OAuthConfig::parse_and_validate_scopes(&raw_requested).unwrap();
-    let scopes_obj =
-        Scopes::from_scopes(parsed_scopes.iter().cloned().map(|s| s.convert())).unwrap();
-
-    let client_id = jacquard_common::deps::fluent_uri::Uri::parse(
+    let oauth_client = GatewayOAuth::with_transport(
+        auth_store.clone(),
+        &key_store,
         "https://api.catbird.blue/.well-known/oauth-client-metadata",
+        DEFAULT_UPGRADE_CALLBACK_URL,
+        &raw_requested.join(" "),
+        petrel_fixture::transport(&mock_as),
+        url::Url::parse(petrel_fixture::PLC).unwrap(),
     )
-    .unwrap()
-    .to_owned();
-    let redirect_uri = jacquard_common::deps::fluent_uri::Uri::parse(DEFAULT_UPGRADE_CALLBACK_URL)
-        .unwrap()
-        .to_owned();
-    let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
-        "https://api.catbird.blue/.well-known/jwks.json",
-    )
-    .unwrap()
-    .to_owned();
-
-    let client_meta = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes_obj))
-        .with_jwks_uri(jwks_uri);
-    let client_data = ClientData::new(keyset, client_meta);
-
-    let plc_base = jacquard_common::deps::fluent_uri::Uri::parse(format!("{origin}/").as_str())
-        .unwrap()
-        .to_owned();
-    let resolver_opts = ResolverOptions {
-        plc_source: PlcSource::PlcDirectory { base: plc_base },
-        ..ResolverOptions::default()
-    };
-    let resolver = JacquardResolver::new(
-        HardenedHttpClient::new(reqwest::Client::new()),
-        resolver_opts,
-    );
-    let oauth_client =
-        JacquardOAuthClient::new_from_resolver(auth_store.clone(), resolver, client_data);
+    .unwrap();
 
     let _auth_url = catbird::services::oauth_authorize::start_auth_with_raw_scopes(
         &oauth_client,
@@ -364,25 +319,16 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         &auth_store,
         Some(DEFAULT_UPGRADE_CALLBACK_URL.to_string()),
     );
-    let did = Did::new_owned(user_did.to_string()).unwrap();
-    let dpop_jwk: jose_jwk::Key = serde_json::from_value(json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": "f83OJ3D2xFMTbKEBaGizdGlIUKEWx5q15odEB00stfg",
-        "y": "x_daaqundbgUvJV358vRBgULGnpH7aRFZZDYyEiNg2g",
-        "d": "jpsQnnGQmL-YxOmH1UmOBHg10OJ45DBTWh0n52qxzMQ"
-    }))
-    .unwrap();
+    let did = Did::parse(user_did.to_string()).unwrap();
+    let dpop_jwk = petrel_fixture::dpop_key();
     let session = |session_id: &str, scopes: &[String]| ClientSessionData {
         account_did: did.clone(),
         session_id: session_id.to_string().into(),
-        host_url: jacquard_common::deps::fluent_uri::Uri::parse(origin.as_str())
-            .unwrap()
-            .to_owned(),
+        host_url: url::Url::parse(origin.as_str()).unwrap().to_owned(),
         authserver_url: origin.clone().into(),
         authserver_token_endpoint: format!("{origin}/oauth/token").into(),
         authserver_revocation_endpoint: None,
-        scopes: Scopes::new(scopes.join(" ").into()).unwrap(),
+        scopes: ScopeSet::parse(&scopes.join(" ")).unwrap(),
         dpop_data: DpopClientData {
             dpop_key: dpop_jwk.clone(),
             dpop_authserver_nonce: "".into(),
@@ -404,12 +350,10 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
 
     let old_session_id = Uuid::new_v4().to_string();
     let atproto_only = vec!["atproto".to_string()];
-    jacquard_oauth::authstore::ClientAuthStore::upsert_session(
-        &auth_store,
-        session(&old_session_id, &atproto_only),
-    )
-    .await
-    .unwrap();
+    auth_store
+        .upsert_session(session(&old_session_id, &atproto_only))
+        .await
+        .unwrap();
     let start_res = upgrade_service
         .start_upgrade_flow(
             &old_session_id,
@@ -445,12 +389,10 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
     // A later unrelated upgrade must carry the registered spelling for an existing
     // self-authority grant, not retire it because Swan resolved `self` to this DID.
     let resolved_session_id = Uuid::new_v4().to_string();
-    jacquard_oauth::authstore::ClientAuthStore::upsert_session(
-        &auth_store,
-        session(&resolved_session_id, &swan_grants),
-    )
-    .await
-    .unwrap();
+    auth_store
+        .upsert_session(session(&resolved_session_id, &swan_grants))
+        .await
+        .unwrap();
     let mut registration_with_handle = raw_requested.clone();
     registration_with_handle.push("identity:handle".to_string());
     let resolved_start = upgrade_service
@@ -485,12 +427,10 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         .chain(RETIRED_LABYRINTH_SPACE_SCOPES)
         .map(|s| (*s).to_string())
         .collect();
-    jacquard_oauth::authstore::ClientAuthStore::upsert_session(
-        &auth_store,
-        session(&old_scope_session_id, &old_scopes),
-    )
-    .await
-    .unwrap();
+    auth_store
+        .upsert_session(session(&old_scope_session_id, &old_scopes))
+        .await
+        .unwrap();
     let old_scope_start = upgrade_service
         .start_upgrade_flow(
             &old_scope_session_id,
@@ -580,12 +520,10 @@ async fn par_requests_exact_labyrinth_space_scopes_and_old_scope_sessions_must_u
         "account:email?action=manage".to_string(),
         RETIRED_LABYRINTH_SPACE_SCOPES[0].to_string(),
     ];
-    jacquard_oauth::authstore::ClientAuthStore::upsert_session(
-        &auth_store,
-        session(&custom_session_id, &custom_current),
-    )
-    .await
-    .unwrap();
+    auth_store
+        .upsert_session(session(&custom_session_id, &custom_current))
+        .await
+        .unwrap();
     let custom_max = vec!["atproto".to_string(), "identity:handle".to_string()];
     let custom = upgrade_service
         .start_upgrade_flow(
@@ -748,8 +686,8 @@ async fn get_service_auth_permits_user_declared_atproto_mls_did_and_rejects_arbi
         redis,
         push_db: Some(pool),
         key_store: None,
-        jacquard_client: None,
-        catmos_jacquard_client: None,
+        oauth_client: None,
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],

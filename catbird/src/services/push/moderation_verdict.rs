@@ -39,7 +39,7 @@ fn valid_follow_record_uri(uri: &str) -> bool {
     else {
         return false;
     };
-    jacquard_common::types::did::Did::new(authority).is_ok()
+    petrel_core::Did::parse(authority).is_ok()
         && collection == "app.bsky.graph.follow"
         && !rkey.is_empty()
         && rkey.len() <= 512

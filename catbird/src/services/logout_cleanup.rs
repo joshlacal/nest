@@ -6,8 +6,8 @@
 //! variants remain for isolated coordinator tests, not runtime configuration.
 //! Neither a receipt UUID nor a DID alone authorizes a retry; the receipt is bound
 //! to the original bearer HMAC.
+use crate::services::petrel_storage::ClientSessionData;
 use async_trait::async_trait;
-use jacquard_oauth::session::ClientSessionData;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -193,7 +193,7 @@ pub enum WorkFailure {
 pub struct CleanupAttempt {
     pub journal: CleanupJournal,
     /// Only retained across calls when the explicit policy permits it.
-    pub grant: Option<ClientSessionData>,
+    pub grant: Option<super::revocation::StoredGrantV3>,
 }
 
 #[async_trait]
@@ -224,7 +224,11 @@ pub trait CleanupEffects: Send + Sync {
         target: &CleanupTarget,
         receipt_id: Uuid,
     ) -> Result<(), WorkFailure>;
-    async fn revoke(&self, grant: &mut ClientSessionData, receipt_id: Uuid) -> RevokeOutcome;
+    async fn revoke(
+        &self,
+        grant: &mut super::revocation::StoredGrantV3,
+        receipt_id: Uuid,
+    ) -> RevokeOutcome;
 }
 
 /// One bounded attempt. A pending receipt can be retried after local retirement.
@@ -407,7 +411,13 @@ impl RedisCleanupStore<'_> {
                 .await
                 .map_err(|_| CleanupError::StorageUnavailable)?;
             encoded
-                .map(|value| self.open::<ClientSessionData>("logout_cleanup_grant", &key, &value))
+                .map(|value| {
+                    self.open::<super::revocation::StoredGrantV3>(
+                        "logout_cleanup_grant",
+                        &key,
+                        &value,
+                    )
+                })
                 .transpose()?
         } else {
             None
@@ -462,6 +472,7 @@ redis.call('SET', KEYS[1], encoded)
 if ARGV[10] ~= '' then redis.call('SET', KEYS[8], ARGV[10], 'EX', ARGV[11]) end
 redis.call('SET', KEYS[4], 'logout', 'EX', ARGV[9])
 redis.call('DEL', KEYS[2], KEYS[3], KEYS[5], KEYS[7])
+if KEYS[10] then redis.call('DEL', KEYS[10]) end
 if redis.call('GET', KEYS[6]) == ARGV[12] then redis.call('DEL', KEYS[6]) end
 return {0, encoded}
 "#;
@@ -591,6 +602,7 @@ impl CleanupStore for RedisCleanupStore<'_> {
         final_journal.fence_released = false;
         let ordinary = self.seal("logout_cleanup", &key, &did, &journal)?;
         let final_encoded = self.seal("logout_cleanup", &key, &did, &final_journal)?;
+        let grant = super::revocation::StoredGrantV3::from(grant);
         let sealed_grant = if seconds > 0 {
             self.seal("logout_cleanup_grant", &self.grant_key(&hmac), &did, &grant)?
         } else {
@@ -614,6 +626,10 @@ impl CleanupStore for RedisCleanupStore<'_> {
             .key(self.store.pending_upgrade_key(&request.bearer))
             .key(self.grant_key(&hmac))
             .key(self.store.account_erasure_key(&did))
+            .key(format!(
+                "{}ps:{hmac}",
+                super::petrel_storage::v3_prefix(self.store.key_prefix())
+            ))
             .arg(snapshot)
             .arg(&did)
             .arg(pattern)
@@ -971,7 +987,11 @@ impl CleanupEffects for NestCleanupEffects<'_> {
         // contains only authenticated deletion identities, never provider tokens.
         Ok(())
     }
-    async fn revoke(&self, grant: &mut ClientSessionData, receipt_id: Uuid) -> RevokeOutcome {
+    async fn revoke(
+        &self,
+        grant: &mut super::revocation::StoredGrantV3,
+        receipt_id: Uuid,
+    ) -> RevokeOutcome {
         let Some(store) = self.state.auth_store.as_deref() else {
             return RevokeOutcome::Failed("local store unavailable".into());
         };
@@ -986,16 +1006,7 @@ impl CleanupEffects for NestCleanupEffects<'_> {
         let Some(client) = self.state.oauth_client_for_profile(&self.oauth_profile) else {
             return RevokeOutcome::Failed("OAuth client unavailable".into());
         };
-        // Evict the cached object after local retirement. It cannot refresh an
-        // absent/tombstoned store entry, and no raw bearer is retained in receipt.
-        if client
-            .registry
-            .del(&grant.account_did, grant.session_id.as_str())
-            .await
-            .is_err()
-        {
-            return RevokeOutcome::Failed("OAuth cache retirement not confirmed".into());
-        }
+        client.evict_session(&grant.session_id);
         with_revocation_deadline(
             crate::services::revocation::revoke_upstream(client, grant),
             PROVIDER_REVOKE_DEADLINE,
@@ -1173,13 +1184,7 @@ pub async fn run_runtime_cleanup(
             .begin_or_resume(request, chrono::Utc::now().timestamp())
             .await?;
         if let Some(client) = state.oauth_client_for_profile(&oauth_profile) {
-            let did = jacquard_common::types::did::Did::new(attempt.journal.target.did.as_str())
-                .map_err(|_| CleanupError::ReceiptConflict)?;
-            client
-                .registry
-                .del(&did, &request.bearer)
-                .await
-                .map_err(|_| CleanupError::StorageUnavailable)?;
+            client.evict_session(&request.bearer);
         }
         continue_cleanup(
             &backend,

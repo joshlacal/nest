@@ -13,7 +13,7 @@ use catbird::{
     },
 };
 use chrono::Utc;
-use jacquard_oauth::authstore::ClientAuthStore;
+
 use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
 use std::{sync::Arc, time::Duration};
@@ -141,12 +141,12 @@ async fn make_test_app_state(
             session_ttl_seconds: 86400,
         },
         oauth: catbird::config::OAuthConfig {
-            client_id: "http://127.0.0.1:3000/oauth/client-metadata.json".into(),
+            client_id: "https://nest.test/oauth/client-metadata.json".into(),
             private_key_path: None,
             private_key_base64: None,
             private_key_paths: vec![],
             active_key_id: "key-1".into(),
-            redirect_uri: "http://127.0.0.1:3000/oauth/callback".into(),
+            redirect_uri: "https://nest.test/oauth/callback".into(),
             initial_scopes: vec!["atproto".into()],
             max_scopes: vec!["atproto".into()],
             scopes: vec!["atproto".into()],
@@ -163,28 +163,18 @@ async fn make_test_app_state(
     config.redis.key_prefix = auth_store.key_prefix().into();
     let redis = auth_store.redis_connection();
 
-    let metadata = jacquard_oauth::atproto::AtprotoClientMetadata::new(
-        vec![
-            jacquard_common::deps::fluent_uri::Uri::parse(config.oauth.redirect_uri.as_str())
-                .unwrap()
-                .to_owned(),
-        ],
-        jacquard_common::deps::fluent_uri::Uri::parse(config.oauth.client_id.as_str())
-            .unwrap()
-            .to_owned(),
-        Some(
-            jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static("atproto")).unwrap(),
-        ),
+    let keys = catbird::services::KeyStore::from_key(
+        "test-key",
+        p256::SecretKey::random(&mut rand::thread_rng()),
     );
-    let resolver = jacquard_identity::JacquardResolver::new(
-        catbird::services::HardenedHttpClient::new(http_client.clone()),
-        jacquard_identity::resolver::ResolverOptions::default(),
-    );
-    let client = catbird::config::JacquardOAuthClient::new_from_resolver(
+    let client = catbird::config::GatewayOAuth::new(
         auth_store.as_ref().clone(),
-        resolver,
-        jacquard_oauth::session::ClientData::new(None, metadata),
-    );
+        &keys,
+        &config.oauth.client_id,
+        &config.oauth.redirect_uri,
+        "atproto",
+    )
+    .unwrap();
     Arc::new(AppState {
         config: Arc::new(config),
         http_client: http_client.clone(),
@@ -192,8 +182,8 @@ async fn make_test_app_state(
         redis,
         push_db: Some(pool),
         key_store: None,
-        jacquard_client: Some(Arc::new(client)),
-        catmos_jacquard_client: None,
+        oauth_client: Some(Arc::new(client)),
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
@@ -259,10 +249,7 @@ impl Fixture {
         };
         let mut grant = cleanup_auth::grant(DID, &session.id.to_string(), &provider.uri());
         grant.token_set.expires_at = Some(
-            jacquard_common::types::string::Datetime::try_from(
-                session.access_token_expires_at.to_rfc3339(),
-            )
-            .unwrap(),
+            petrel_core::Datetime::try_from(session.access_token_expires_at.to_rfc3339()).unwrap(),
         );
         db.auth_store.upsert_session(grant).await.unwrap();
         let fake = Arc::new(FakeApns::default());

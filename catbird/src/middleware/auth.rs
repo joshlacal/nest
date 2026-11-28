@@ -16,9 +16,9 @@ use crate::error::AppError;
 use crate::models::CatbirdSession;
 use chrono::Utc;
 
-/// DPoP key data from Jacquard session, inserted into request extensions for the proxy.
+/// DPoP key data from the gateway session, inserted into request extensions for the proxy.
 #[derive(Clone)]
-pub struct JacquardDpopData {
+pub struct SessionDpopData {
     pub dpop_key: jose_jwk::Key,
     pub dpop_host_nonce: String,
 }
@@ -151,7 +151,7 @@ fn extract_session_id(req: &Request<Body>) -> Result<String, AppError> {
 pub async fn authenticate_session_headers(
     state: &Arc<AppState>,
     headers: &axum::http::HeaderMap,
-) -> Result<(CatbirdSession, JacquardDpopData), AppError> {
+) -> Result<(CatbirdSession, SessionDpopData), AppError> {
     let session_id = extract_session_id_from_headers(headers)?;
 
     // Strict rejection of non-UUID session IDs — never fabricate or proceed with malformed identity
@@ -162,7 +162,7 @@ pub async fn authenticate_session_headers(
         classify_auth_error(AppError::Internal("Auth store not configured".into()))
     })?;
 
-    resolve_session_via_jacquard(state, auth_store, &session_id)
+    resolve_oauth_session(state, auth_store, &session_id)
         .await
         .map_err(classify_auth_error)
 }
@@ -171,7 +171,7 @@ pub async fn authenticate_session_headers(
 ///
 /// This middleware:
 /// 1. Extracts the session ID from cookie or Authorization header
-/// 2. Validates the session via Jacquard SessionRegistry (with automatic token refresh)
+/// 2. Validates the session through Petrel (with automatic token refresh)
 /// 3. Injects the session into request extensions
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -185,17 +185,17 @@ pub async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
-/// Resolve a session via Jacquard's SessionRegistry with automatic token refresh.
+/// Resolve a session with automatic token refresh.
 ///
 /// iOS sends only session_id. We use the session_index to look up the DID,
 /// then call SessionRegistry.get() which handles token refresh atomically
 /// using in-process DashMap mutex (no Redis distributed locks needed).
-async fn resolve_session_via_jacquard(
+async fn resolve_oauth_session(
     state: &AppState,
     auth_store: &crate::services::RedisAuthStore,
     session_id: &str,
-) -> Result<(CatbirdSession, JacquardDpopData), AppError> {
-    use jacquard_common::types::did::Did;
+) -> Result<(CatbirdSession, SessionDpopData), AppError> {
+    use petrel_core::Did;
 
     // Strict UUID validation — reject malformed session IDs immediately
     let session_uuid = uuid::Uuid::parse_str(session_id).map_err(|_| AppError::InvalidSession)?;
@@ -207,7 +207,7 @@ async fn resolve_session_via_jacquard(
         .map_err(AppError::Redis)?
         .ok_or(AppError::InvalidSession)?;
 
-    let did = Did::new(did_str.as_str()).map_err(|_| AppError::InvalidSession)?;
+    let did = Did::parse(did_str.as_str()).map_err(|_| AppError::InvalidSession)?;
 
     // Step 1b: Resolve which OAuth client profile owns this session so token refresh
     // uses the matching confidential client metadata (`catbird` vs `catmos`).
@@ -217,20 +217,26 @@ async fn resolve_session_via_jacquard(
         .ok()
         .flatten()
         .unwrap_or_else(crate::services::redis_auth_store::default_oauth_profile);
-    let jacquard_client = state
+    let oauth_client = state
         .oauth_client_for_profile(&oauth_profile)
-        .ok_or_else(|| AppError::Internal("Jacquard client not configured".into()))?;
+        .ok_or_else(|| AppError::Internal("OAuth client not configured".into()))?;
 
     // Step 2: Get the session, refreshing its tokens if they are about to expire. The read
     // runs on its own task: a client that drops this request must not take a refresh in
     // flight down with it (see `services::session_refresh`).
     let session_data = crate::services::session_refresh::get_refreshed_session(
-        jacquard_client,
+        oauth_client,
         did.as_str(),
         session_id,
     )
     .await
-    .map_err(|e| AppError::OAuth(format!("Jacquard session get failed: {e}")))?;
+    .map_err(|e| {
+        if e.is_permanent() {
+            AppError::SessionExpired
+        } else {
+            AppError::AuthTemporarilyUnavailable("Failed to refresh the session".into())
+        }
+    })?;
 
     // Step 3: Convert ClientSessionData → CatbirdSession for backward compatibility
     let expires_at = session_data
@@ -238,7 +244,7 @@ async fn resolve_session_via_jacquard(
         .expires_at
         .as_ref()
         .and_then(|dt| {
-            // Parse jacquard Datetime to chrono
+            // Parse AT Protocol Datetime to chrono
             let s = dt.as_str();
             chrono::DateTime::parse_from_rfc3339(s)
                 .ok()
@@ -247,7 +253,7 @@ async fn resolve_session_via_jacquard(
         .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(3600));
 
     // Extract DPoP data for the proxy
-    let dpop_data = JacquardDpopData {
+    let dpop_data = SessionDpopData {
         dpop_key: session_data.dpop_data.dpop_key.clone(),
         dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
     };
@@ -258,7 +264,7 @@ async fn resolve_session_via_jacquard(
     // Extract and validate authoritative granted scopes returned by PDS/OAuth server.
     // Authenticate only sessions with authoritative parseable nonempty granted scopes containing `atproto`.
     // No unwrap_or_default or legacy empty acceptance.
-    let token_scope_str = session_data.token_set.scope.as_ref().map(|s| s.as_str());
+    let token_scope_str = session_data.token_set.scope.as_deref();
     let granted_scopes =
         validate_authoritative_granted_scopes(&session_data.scopes, token_scope_str)?;
     let session = CatbirdSession {
@@ -275,11 +281,12 @@ async fn resolve_session_via_jacquard(
             .unwrap_or_default(),
         scopes: session_data
             .scopes
+            .raw_scopes()
             .iter()
             .map(|scope| scope.to_string())
             .collect(),
         access_token_expires_at: expires_at,
-        created_at: Utc::now(), // Not tracked in Jacquard session
+        created_at: Utc::now(), // Not tracked in the v2 session
         last_used_at: Utc::now(),
         granted_scopes,
     };
@@ -292,36 +299,31 @@ async fn resolve_session_via_jacquard(
 /// Enforces that:
 /// 1. Scopes are non-empty and parseable without falling back to defaults.
 /// 2. Scopes explicitly contain the required `atproto` scope.
-fn validate_authoritative_granted_scopes(
-    scopes: &jacquard_oauth::scopes::Scopes,
+pub(crate) fn validate_authoritative_granted_scopes(
+    scopes: &petrel_oauth_scopes::ScopeSet,
     token_scope: Option<&str>,
 ) -> Result<Vec<String>, AppError> {
-    use jacquard_oauth::scopes::{Scope, Scopes};
-
-    let parsed_scopes: Scopes = if !scopes.is_empty() {
-        scopes.clone()
-    } else if let Some(scope_str) = token_scope {
-        Scopes::new(smol_str::SmolStr::from(scope_str)).map_err(|_| AppError::InvalidSession)?
+    let from_token;
+    let granted = if scopes.raw_scopes().is_empty() {
+        from_token =
+            petrel_oauth_scopes::ScopeSet::parse(token_scope.ok_or(AppError::InvalidSession)?)
+                .map_err(|_| AppError::InvalidSession)?;
+        &from_token
     } else {
-        return Err(AppError::InvalidSession);
+        scopes
     };
-
-    if parsed_scopes.is_empty() {
+    if !granted.includes_atproto() {
         return Err(AppError::InvalidSession);
     }
-
-    if !parsed_scopes.grants(&Scope::atproto())
-        && !parsed_scopes.iter().any(|s| matches!(s, Scope::Atproto))
-    {
-        return Err(AppError::InvalidSession);
-    }
-
-    Ok(parsed_scopes
+    granted
+        .raw_scopes()
         .iter()
-        .map(|s| {
-            crate::services::oauth_upgrade::server_scope_spelling(s.to_string_normalized().as_str())
+        .map(|wire| {
+            crate::services::oauth_upgrade::parse_server_scope(wire)
+                .map(|s| s.to_string_normalized().to_string())
+                .ok_or(AppError::InvalidSession)
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -482,24 +484,21 @@ mod tests {
 
     #[test]
     fn scope_validation_accepts_authoritative_atproto_scope() {
-        let scopes = jacquard_oauth::scopes::Scopes::atproto();
+        let scopes = petrel_oauth_scopes::ScopeSet::parse("atproto").unwrap();
         let granted = validate_authoritative_granted_scopes(&scopes, None).unwrap();
         assert_eq!(granted, vec!["atproto"]);
     }
 
     #[test]
     fn scope_validation_accepts_atproto_with_additional_scopes() {
-        let scopes = jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static(
-            "atproto transition:generic",
-        ))
-        .unwrap();
+        let scopes = petrel_oauth_scopes::ScopeSet::parse("atproto transition:generic").unwrap();
         let granted = validate_authoritative_granted_scopes(&scopes, None).unwrap();
         assert_eq!(granted, vec!["atproto", "transition:generic"]);
     }
 
     #[test]
     fn scope_validation_accepts_parseable_token_scope_with_atproto() {
-        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        let empty_scopes = petrel_oauth_scopes::ScopeSet::parse("").unwrap();
         let granted = validate_authoritative_granted_scopes(
             &empty_scopes,
             Some("atproto transition:generic"),
@@ -510,7 +509,7 @@ mod tests {
 
     #[test]
     fn scope_validation_rejects_empty_scopes() {
-        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        let empty_scopes = petrel_oauth_scopes::ScopeSet::parse("").unwrap();
         assert!(matches!(
             validate_authoritative_granted_scopes(&empty_scopes, None),
             Err(AppError::InvalidSession)
@@ -523,7 +522,7 @@ mod tests {
 
     #[test]
     fn scope_validation_rejects_unparseable_token_scope_without_defaulting() {
-        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        let empty_scopes = petrel_oauth_scopes::ScopeSet::parse("").unwrap();
         assert!(matches!(
             validate_authoritative_granted_scopes(&empty_scopes, Some("invalid:::scope;;;")),
             Err(AppError::InvalidSession)
@@ -532,16 +531,13 @@ mod tests {
 
     #[test]
     fn scope_validation_rejects_scopes_missing_atproto() {
-        let scopes = jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static(
-            "transition:generic",
-        ))
-        .unwrap();
+        let scopes = petrel_oauth_scopes::ScopeSet::parse("transition:generic").unwrap();
         assert!(matches!(
             validate_authoritative_granted_scopes(&scopes, None),
             Err(AppError::InvalidSession)
         ));
 
-        let empty_scopes = jacquard_oauth::scopes::Scopes::empty();
+        let empty_scopes = petrel_oauth_scopes::ScopeSet::parse("").unwrap();
         assert!(matches!(
             validate_authoritative_granted_scopes(&empty_scopes, Some("transition:generic")),
             Err(AppError::InvalidSession)

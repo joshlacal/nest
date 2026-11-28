@@ -22,16 +22,15 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum_test::{TestResponse, TestServer};
 use base64::Engine;
+use catbird::services::petrel_storage::{
+    ClientSessionData, DpopClientData, OAuthTokenType, TokenSet,
+};
 use chrono::Utc;
-use jacquard_common::types::did::Did;
-use jacquard_common::IntoStatic;
-use jacquard_identity::resolver::{PlcSource, ResolverOptions};
-use jacquard_identity::JacquardResolver;
-use jacquard_oauth::atproto::{AtprotoClientMetadata, GrantType};
-use jacquard_oauth::authstore::ClientAuthStore;
-use jacquard_oauth::scopes::{IdentityScope, Scope, Scopes, TransitionScope};
-use jacquard_oauth::session::{ClientData, ClientSessionData, DpopClientData};
-use jacquard_oauth::types::{OAuthTokenType, TokenSet};
+use petrel_core::Did;
+use petrel_oauth_scopes::ScopeSet;
+#[path = "support/petrel_fixture.rs"]
+mod petrel_fixture;
+use petrel_fixture::{ISSUER, PLC};
 use serde_json::{json, Value};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerAsync;
@@ -42,19 +41,17 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 
-use catbird::config::{AppConfig, AppState, JacquardOAuthClient};
+use catbird::config::{AppConfig, AppState, GatewayOAuth};
 use catbird::models::{ALLOWLISTED_UPGRADE_SCOPES, FIXED_UPGRADE_CALLBACK_URL};
 use catbird::routes::atproto::create_router;
-use catbird::services::{
-    HardenedHttpClient, OAuthUpgradeService, RedisAuthStore, DEFAULT_UPGRADE_CALLBACK_URL,
-};
+use catbird::services::{OAuthUpgradeService, RedisAuthStore, DEFAULT_UPGRADE_CALLBACK_URL};
 
 /// Test encryption key for deterministic AES-256-GCM fixture storage
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42u8; 32];
 static INIT_TEST_ENV: Once = Once::new();
 const BROWSER_NONCE: &str = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V";
 const CATBIRD_ORIGIN: &str = "https://catbird.blue";
-const FIXED_TEST_DID: &str = "did:plc:upgradetestuser";
+const FIXED_TEST_DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
 
 /// Deterministic ES256 PKCS#8 PEM private key for test confidential client
 const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -63,42 +60,27 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgED1AAgC7Fc9kPh5T
 gbGGr0pN+oSing7cZ0169JaRHTNh+0LNQXrFobInX6cj95FzEdRyT4T3
 -----END PRIVATE KEY-----"#;
 
-/// Deterministic EC P-256 JWK fixture for DPoP client data
-fn deterministic_dpop_key() -> jose_jwk::Key {
-    let jwk_json = json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": "f83OJ3D2xFMTbKEBaGizdGlIUKEWx5q15odEB00stfg",
-        "y": "x_daaqundbgUvJV358vRBgULGnpH7aRFZZDYyEiNg2g",
-        "d": "jpsQnnGQmL-YxOmH1UmOBHg10OJ45DBTWh0n52qxzMQ"
-    });
-    serde_json::from_value(jwk_json).expect("valid P-256 JWK")
-}
-
 /// Create a deterministic `ClientSessionData` fixture for testing with a specified PDS URL
 fn create_test_session_data_with_pds(
     session_id: &str,
     did_str: &str,
-    scopes: Vec<Scope>,
+    scopes: Vec<&str>,
     pds_url: &str,
 ) -> ClientSessionData {
-    let did = Did::new_owned(did_str.to_string()).expect("valid DID");
-    let scopes_obj =
-        jacquard_oauth::scopes::Scopes::from_scopes(scopes.into_iter().map(|s| s.convert()))
-            .expect("valid scopes");
+    let did = Did::parse(did_str.to_string()).expect("valid DID");
+    let scope = scopes.join(" ");
+    let scopes_obj = ScopeSet::parse(&scope).expect("valid scopes");
 
     ClientSessionData {
         account_did: did.clone(),
         session_id: session_id.to_string().into(),
-        host_url: jacquard_common::deps::fluent_uri::Uri::parse(pds_url)
-            .expect("valid PDS URI")
-            .to_owned(),
+        host_url: url::Url::parse(pds_url).expect("valid PDS URI").to_owned(),
         authserver_url: pds_url.to_string().into(),
-        authserver_token_endpoint: "".into(),
+        authserver_token_endpoint: format!("{pds_url}/oauth/token"),
         authserver_revocation_endpoint: None,
         scopes: scopes_obj,
         dpop_data: DpopClientData {
-            dpop_key: deterministic_dpop_key(),
+            dpop_key: petrel_fixture::dpop_key(),
             dpop_authserver_nonce: "".into(),
             dpop_host_nonce: "".into(),
         },
@@ -106,12 +88,12 @@ fn create_test_session_data_with_pds(
             iss: pds_url.to_string().into(),
             sub: did.clone(),
             aud: pds_url.to_string().into(),
-            scope: Some("atproto transition:generic transition:chat.bsky".into()),
+            scope: Some(scope),
             refresh_token: Some("refresh_token_xyz".into()),
             access_token: "access_token_abc".into(),
             token_type: OAuthTokenType::DPoP,
             expires_at: Some(
-                jacquard_common::types::string::Datetime::try_from(
+                petrel_core::Datetime::parse(
                     (Utc::now() + chrono::Duration::hours(2)).to_rfc3339(),
                 )
                 .expect("valid datetime"),
@@ -125,7 +107,7 @@ fn create_test_session_data_with_pds(
 fn create_test_session_data(
     session_id: &str,
     did_str: &str,
-    scopes: Vec<Scope>,
+    scopes: Vec<&str>,
 ) -> ClientSessionData {
     create_test_session_data_with_pds(session_id, did_str, scopes, "https://pds.example.com")
 }
@@ -134,7 +116,7 @@ async fn seed_active_session_with_pds(
     state: &AppState,
     session_id: &str,
     did: &str,
-    scopes: Vec<Scope>,
+    scopes: Vec<&str>,
     pds_url: &str,
 ) {
     state
@@ -148,7 +130,7 @@ async fn seed_active_session_with_pds(
         .expect("seed active session");
 }
 
-async fn seed_active_session(state: &AppState, session_id: &str, did: &str, scopes: Vec<Scope>) {
+async fn seed_active_session(state: &AppState, session_id: &str, did: &str, scopes: Vec<&str>) {
     seed_active_session_with_pds(state, session_id, did, scopes, "https://pds.example.com").await;
 }
 
@@ -248,18 +230,6 @@ enum RedisGuard {
     Container(ContainerAsync<Redis>),
 }
 
-fn build_mock_resolver(mock: &MockServer) -> JacquardResolver<HardenedHttpClient> {
-    let plc_base =
-        jacquard_common::deps::fluent_uri::Uri::parse(format!("{}/", mock.uri()).as_str())
-            .expect("valid mock plc url")
-            .to_owned();
-    let opts = ResolverOptions {
-        plc_source: PlcSource::PlcDirectory { base: plc_base },
-        ..ResolverOptions::default()
-    };
-    JacquardResolver::new(HardenedHttpClient::new(reqwest::Client::new()), opts)
-}
-
 /// Formats received mock requests for diagnostic assertion output.
 /// Method and path are included along with safe body field names (redacting assertion/code/nonce/token).
 fn format_mock_requests_diagnostics(requests: &[WiremockRequest]) -> String {
@@ -322,7 +292,7 @@ fn extract_safe_body_field_names(body: &[u8]) -> Vec<String> {
 }
 
 async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &str) {
-    let provider_url = mock.uri();
+    let provider_url = ISSUER;
     let supported_scopes = [
         "atproto",
         "transition:generic",
@@ -366,6 +336,7 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
         "token_endpoint": format!("{provider_url}/oauth/token"),
         "pushed_authorization_request_endpoint": format!("{provider_url}/oauth/par"),
         "require_pushed_authorization_requests": true,
+        "client_id_metadata_document_supported": true,
         "dpop_signing_alg_values_supported": ["ES256"],
         "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
         "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
@@ -388,7 +359,11 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
     });
     Mock::given(method("POST"))
         .and(path("/oauth/par"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(par_resp))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("DPoP-Nonce", "mock-par-nonce")
+                .set_body_json(par_resp),
+        )
         .mount(mock)
         .await;
 
@@ -402,14 +377,18 @@ async fn setup_mock_oauth_provider(mock: &MockServer, did: &str, token_scope: &s
     });
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(token_resp))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("DPoP-Nonce", "mock-token-nonce")
+                .set_body_json(token_resp),
+        )
         .mount(mock)
         .await;
 }
 
 /// Set up an isolated Redis-backed AppState and TestServer with optional custom resolver.
-async fn setup_test_server_with_resolver(
-    custom_resolver: Option<JacquardResolver<HardenedHttpClient>>,
+async fn setup_test_server_with_provider(
+    provider: Option<&MockServer>,
 ) -> (Arc<AppState>, TestServer, OAuthUpgradeService, RedisGuard) {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let (redis_url, redis_guard) = if let Some((url, local)) = start_local_redis().await {
@@ -432,6 +411,8 @@ async fn setup_test_server_with_resolver(
     let mut config = AppConfig::load().expect("default test config must load");
     config.push.database_url = None;
     config.redis.url = redis_url;
+    config.oauth.client_id = "https://api.catbird.blue/.well-known/oauth-client-metadata".into();
+    config.oauth.redirect_uri = "https://api.catbird.blue/auth/callback".into();
     config.oauth.private_key_base64 =
         Some(base64::engine::general_purpose::STANDARD.encode(TEST_PRIVATE_KEY_PEM));
     config.oauth.active_key_id = "catbird-key-1".to_string();
@@ -440,7 +421,6 @@ async fn setup_test_server_with_resolver(
             "SESSION_ENCRYPTION_KEY",
             base64::engine::general_purpose::STANDARD.encode(TEST_ENCRYPTION_KEY),
         );
-        std::env::set_var("JACQUARD_OAUTH_TEST_ALLOW_LOCAL", "1");
     });
     let mut state_obj = AppState::new(config)
         .await
@@ -462,54 +442,23 @@ async fn setup_test_server_with_resolver(
 
     state_obj.auth_store = Some(Arc::new(store.clone()));
 
-    let keyset = state_obj
-        .key_store
-        .as_ref()
-        .and_then(|ks| ks.to_jacquard_keyset().ok());
-
-    let client_id =
-        jacquard_common::deps::fluent_uri::Uri::parse(state_obj.config.oauth.client_id.as_str())
-            .expect("valid client_id URL")
-            .to_owned();
-    let redirect_uri =
-        jacquard_common::deps::fluent_uri::Uri::parse(state_obj.config.oauth.redirect_uri.as_str())
-            .expect("valid redirect_uri URL")
-            .to_owned();
-    let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
-        format!(
-            "{}/.well-known/jwks.json",
-            state_obj.config.server.base_url.trim_end_matches('/')
-        )
-        .as_str(),
-    )
-    .expect("valid jwks_uri URL")
-    .to_owned();
-
-    let scopes: Vec<Scope> = state_obj
-        .config
-        .oauth
-        .max_scopes
-        .iter()
-        .filter_map(|s| {
-            Scope::<smol_str::SmolStr>::parse(s)
-                .ok()
-                .map(|sc| sc.into_static())
-        })
-        .collect();
-    let scopes =
-        Scopes::from_scopes(scopes.into_iter().map(|s| s.convert())).expect("valid scopes");
-
-    let metadata = AtprotoClientMetadata::new(vec![redirect_uri], client_id, Some(scopes))
-        .with_jwks_uri(jwks_uri);
-    let client_data = ClientData::new(keyset, metadata);
-    let resolver = custom_resolver.unwrap_or_else(|| {
-        JacquardResolver::new(
-            HardenedHttpClient::new(reqwest::Client::new()),
-            ResolverOptions::default(),
-        )
-    });
-    let jacquard_client = JacquardOAuthClient::new_from_resolver(store, resolver, client_data);
-    state_obj.jacquard_client = Some(Arc::new(jacquard_client));
+    let key = state_obj.key_store.as_ref().expect("test client key");
+    let config = &state_obj.config.oauth;
+    let scope = config.max_scopes.join(" ");
+    let oauth_client = match provider {
+        Some(mock) => GatewayOAuth::with_transport(
+            store,
+            key,
+            &config.client_id,
+            &config.redirect_uri,
+            &scope,
+            petrel_fixture::transport(mock),
+            url::Url::parse(PLC).unwrap(),
+        ),
+        None => GatewayOAuth::new(store, key, &config.client_id, &config.redirect_uri, &scope),
+    }
+    .unwrap();
+    state_obj.oauth_client = Some(Arc::new(oauth_client));
 
     let state = Arc::new(state_obj);
     let app = create_router(state.clone()).with_state(state.clone());
@@ -520,7 +469,7 @@ async fn setup_test_server_with_resolver(
 
 /// Set up an isolated Redis-backed AppState and TestServer for every test.
 async fn setup_test_server() -> (Arc<AppState>, TestServer, OAuthUpgradeService, RedisGuard) {
-    setup_test_server_with_resolver(None).await
+    setup_test_server_with_provider(None).await
 }
 
 async fn start_local_redis() -> Option<(String, LocalRedis)> {
@@ -586,7 +535,7 @@ async fn test_upgrade_start_missing_or_cookie_only_or_wrong_bearer_rejected() {
         &state,
         &valid_session_id,
         "did:plc:cookieonly",
-        vec![Scope::Atproto],
+        vec!["atproto"],
     )
     .await;
 
@@ -634,7 +583,7 @@ async fn test_upgrade_start_unknown_or_disallowed_scope_rejected() {
         &state,
         &old_session_id,
         "did:plc:upgradeuser123",
-        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        vec!["atproto", "transition:generic"],
     )
     .await;
 
@@ -692,7 +641,7 @@ async fn test_initial_login_still_sends_core_subset() {
     .await;
 
     let (_state, server, _upgrade_service, _redis) =
-        setup_test_server_with_resolver(Some(build_mock_resolver(&mock))).await;
+        setup_test_server_with_provider(Some(&mock)).await;
 
     let encoded_did = urlencoding::encode(did);
     let login_resp = server
@@ -713,7 +662,7 @@ async fn test_initial_login_still_sends_core_subset() {
     let location = login_resp.header("Location");
     let location_str = location.to_str().expect("valid Location header");
     assert!(
-        location_str.starts_with(&format!("{}/oauth/authorize", mock.uri())),
+        location_str.starts_with(&format!("{}/oauth/authorize", ISSUER)),
         "Location must redirect to mock authorization endpoint, got: {location_str}"
     );
 
@@ -754,32 +703,35 @@ async fn test_initial_login_still_sends_core_subset() {
 
 #[tokio::test]
 async fn test_upgrade_callback_denial_leaves_old_session_valid() {
-    let (state, server, upgrade_service, _redis) = setup_test_server().await;
+    let provider = MockServer::start().await;
+    let did_str = FIXED_TEST_DID;
+    setup_mock_oauth_provider(&provider, did_str, "atproto transition:generic").await;
+    let (state, server, _service, _redis) = setup_test_server_with_provider(Some(&provider)).await;
     let old_session_id = Uuid::new_v4().to_string();
-    let did_str = "did:plc:denialtestuser456";
-
-    seed_active_session(
+    seed_active_session_with_pds(
         &state,
         &old_session_id,
         did_str,
-        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        vec!["atproto", "transition:generic"],
+        ISSUER,
     )
     .await;
-
-    // Start upgrade flow in service
-    let start_result = upgrade_service
-        .start_upgrade_flow(
-            &old_session_id,
-            did_str,
-            &scope_names(&["atproto", "transition:generic"]),
-            &state.config.oauth.max_scopes,
-            &scope_names(&["identity:handle"]),
-            BROWSER_NONCE,
-        )
+    server
+        .post("/auth/upgrade")
+        .add_header(AUTHORIZATION, format!("Bearer {old_session_id}"))
+        .add_header("origin", CATBIRD_ORIGIN)
+        .json(&json!({"additional_scopes":["identity:handle"],"browser_nonce":BROWSER_NONCE}))
         .await
-        .expect("start upgrade flow");
-
-    let upg_state = &start_result.state;
+        .assert_status_ok();
+    let requests = provider.received_requests().await.unwrap();
+    let par = requests
+        .iter()
+        .find(|request| request.url.path() == "/oauth/par")
+        .unwrap();
+    let upg_state = url::form_urlencoded::parse(&par.body)
+        .find(|(name, _)| name == "state")
+        .unwrap()
+        .1;
     assert!(upg_state.starts_with("upg_"));
 
     // Simulate callback denial redirect from provider
@@ -840,18 +792,14 @@ async fn test_upgrade_start_and_callback_flow_success() {
     .await;
 
     let (state, server, _upgrade_service, _redis) =
-        setup_test_server_with_resolver(Some(build_mock_resolver(&mock))).await;
+        setup_test_server_with_provider(Some(&mock)).await;
 
     let old_session_id = Uuid::new_v4().to_string();
     seed_active_session(
         &state,
         &old_session_id,
         did,
-        vec![
-            Scope::Atproto,
-            Scope::Transition(TransitionScope::Generic),
-            Scope::Transition(TransitionScope::ChatBsky),
-        ],
+        vec!["atproto", "transition:generic", "transition:chat.bsky"],
     )
     .await;
     // 1. POST /auth/upgrade
@@ -880,7 +828,7 @@ async fn test_upgrade_start_and_callback_flow_success() {
         .as_str()
         .expect("authorization_url string");
     assert!(
-        auth_url.starts_with(&format!("{}/oauth/authorize", mock.uri())),
+        auth_url.starts_with(&format!("{}/oauth/authorize", ISSUER)),
         "Authorization URL must point to mock provider, got: {auth_url}"
     );
 
@@ -933,11 +881,11 @@ async fn test_upgrade_start_and_callback_flow_success() {
     );
 
     // 3. Provider callback: GET /auth/callback?code=...&state=...&iss=...
-    let mock_uri = mock.uri();
+    let mock_uri = ISSUER;
     let callback_resp = server
         .get(&format!(
             "/auth/callback?code=mock_upgrade_code_777&state={upgrade_state}&iss={}",
-            urlencoding::encode(&mock_uri)
+            urlencoding::encode(mock_uri)
         ))
         .await;
     assert_status(
@@ -1133,7 +1081,7 @@ async fn test_upgrade_exchange_wrong_nonce_origin_or_bearer_cannot_burn_exchange
         &state,
         &old_session_id,
         did_str,
-        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        vec!["atproto", "transition:generic"],
     )
     .await;
     let start_result = upgrade_service
@@ -1151,11 +1099,7 @@ async fn test_upgrade_exchange_wrong_nonce_origin_or_bearer_cannot_burn_exchange
     let upgraded_session = create_test_session_data(
         &old_session_id,
         did_str,
-        vec![
-            Scope::Atproto,
-            Scope::Transition(TransitionScope::Generic),
-            Scope::Identity(IdentityScope::Handle),
-        ],
+        vec!["atproto", "transition:generic", "identity:handle"],
     );
     let callback_res = upgrade_service
         .complete_callback(
@@ -1174,7 +1118,7 @@ async fn test_upgrade_exchange_wrong_nonce_origin_or_bearer_cannot_burn_exchange
         &state,
         &other_session_id,
         "did:plc:otheruser999",
-        vec![Scope::Atproto],
+        vec!["atproto"],
     )
     .await;
 
@@ -1259,7 +1203,7 @@ async fn test_staged_candidate_gets_401_on_auth_session_and_xrpc() {
     let old_session_id = Uuid::new_v4().to_string();
     let did_str = "did:plc:stageduser202";
 
-    seed_active_session(&state, &old_session_id, did_str, vec![Scope::Atproto]).await;
+    seed_active_session(&state, &old_session_id, did_str, vec!["atproto"]).await;
     let start_result = upgrade_service
         .start_upgrade_flow(
             &old_session_id,
@@ -1272,11 +1216,8 @@ async fn test_staged_candidate_gets_401_on_auth_session_and_xrpc() {
         .await
         .expect("start upgrade flow");
 
-    let upgraded_session = create_test_session_data(
-        &old_session_id,
-        did_str,
-        vec![Scope::Atproto, Scope::Identity(IdentityScope::Handle)],
-    );
+    let upgraded_session =
+        create_test_session_data(&old_session_id, did_str, vec!["atproto", "identity:handle"]);
     let callback_res = upgrade_service
         .complete_callback(
             &start_result.state,
@@ -1337,7 +1278,7 @@ async fn test_upgrade_commit_idempotent_and_lifecycle() {
         &state,
         &old_session_id,
         did_str,
-        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        vec!["atproto", "transition:generic"],
     )
     .await;
     let start_result = upgrade_service
@@ -1355,11 +1296,7 @@ async fn test_upgrade_commit_idempotent_and_lifecycle() {
     let upgraded_session = create_test_session_data(
         &old_session_id,
         did_str,
-        vec![
-            Scope::Atproto,
-            Scope::Transition(TransitionScope::Generic),
-            Scope::Identity(IdentityScope::Handle),
-        ],
+        vec!["atproto", "transition:generic", "identity:handle"],
     );
     let callback_res = upgrade_service
         .complete_callback(
@@ -1458,20 +1395,14 @@ async fn test_concurrent_candidate_loses_without_winner_id() {
     let old_session_id = Uuid::new_v4().to_string();
     let did_str = "did:plc:concurrentuser404";
 
-    seed_active_session(&state, &old_session_id, did_str, vec![Scope::Atproto]).await;
+    seed_active_session(&state, &old_session_id, did_str, vec!["atproto"]).await;
 
     let flow_specs = [
-        (
-            BROWSER_NONCE,
-            "identity:handle",
-            Scope::Identity(IdentityScope::Handle),
-        ),
+        (BROWSER_NONCE, "identity:handle", "identity:handle"),
         (
             "B1C2D3E4F5G6H7I8J9K0L1M2N3O4P5Q6R7S8T9U0V1W",
             "account:email?action=manage",
-            Scope::<smol_str::SmolStr>::parse("account:email?action=manage")
-                .expect("valid account email manage scope")
-                .into_static(),
+            "account:email?action=manage",
         ),
     ];
     let mut candidate_ids = Vec::with_capacity(flow_specs.len());
@@ -1488,7 +1419,7 @@ async fn test_concurrent_candidate_loses_without_winner_id() {
             .await
             .expect("start competing upgrade flow");
         let upgraded_session =
-            create_test_session_data(&old_session_id, did_str, vec![Scope::Atproto, parsed_scope]);
+            create_test_session_data(&old_session_id, did_str, vec!["atproto", parsed_scope]);
         let callback = upgrade_service
             .complete_callback(
                 &start.state,
@@ -1689,7 +1620,7 @@ fn extract_oauth_request_client_id(req: &WiremockRequest) -> Option<String> {
 async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgrade_and_logout() {
     let mock = MockServer::start().await;
     let did = FIXED_TEST_DID;
-    let provider_url = mock.uri();
+    let provider_url = ISSUER;
     let catmos_client_id_str = "https://catmos.catbird.blue/client-metadata.json";
 
     // Mount DID doc + OAuth metadata WITH revocation_endpoint
@@ -1733,6 +1664,7 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
             "revocation_endpoint": format!("{provider_url}/oauth/revoke"),
             "pushed_authorization_request_endpoint": format!("{provider_url}/oauth/par"),
             "require_pushed_authorization_requests": true,
+            "client_id_metadata_document_supported": true,
             "dpop_signing_alg_values_supported": ["ES256"],
             "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
             "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
@@ -1747,10 +1679,14 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         .await;
     Mock::given(method("POST"))
         .and(path("/oauth/par"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "request_uri": "urn:ietf:params:oauth:request_uri:catmos-par-1",
-            "expires_in": 300
-        })))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("DPoP-Nonce", "catmos-par-nonce")
+                .set_body_json(json!({
+                    "request_uri": "urn:ietf:params:oauth:request_uri:catmos-par-1",
+                    "expires_in": 300
+                })),
+        )
         .mount(&mock)
         .await;
     Mock::given(method("POST"))
@@ -1772,7 +1708,7 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         .await;
 
     let (base_state, _old_server, _upgrade_service, _redis) =
-        setup_test_server_with_resolver(Some(build_mock_resolver(&mock))).await;
+        setup_test_server_with_provider(Some(&mock)).await;
 
     let base_store = base_state
         .auth_store
@@ -1782,41 +1718,24 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         .clone();
     let catmos_store = base_store.with_oauth_profile("catmos");
 
-    let keyset = base_state
-        .key_store
-        .as_ref()
-        .and_then(|ks| ks.to_jacquard_keyset().ok());
-    let catmos_cid = jacquard_common::deps::fluent_uri::Uri::parse(catmos_client_id_str)
-        .unwrap()
-        .to_owned();
-    let catmos_redirect =
-        jacquard_common::deps::fluent_uri::Uri::parse("https://api.catbird.blue/auth/callback")
-            .unwrap()
-            .to_owned();
-    let jwks_uri = jacquard_common::deps::fluent_uri::Uri::parse(
-        "https://api.catbird.blue/.well-known/jwks.json",
-    )
-    .unwrap()
-    .to_owned();
-    let catmos_scopes_vec = vec![
-        Scope::Atproto,
-        Scope::Transition(TransitionScope::Generic),
-        Scope::Identity(IdentityScope::Handle),
-    ];
-    let catmos_scopes =
-        Scopes::from_scopes(catmos_scopes_vec.iter().cloned().map(|s| s.convert())).unwrap();
-    let catmos_md =
-        AtprotoClientMetadata::new(vec![catmos_redirect], catmos_cid, Some(catmos_scopes))
-            .with_jwks_uri(jwks_uri);
-    let catmos_client = JacquardOAuthClient::new_from_resolver(
+    let catmos_scope_names = scope_names(&["atproto", "transition:generic", "identity:handle"]);
+    let catmos_scopes_vec =
+        catbird::config::OAuthConfig::parse_and_validate_scopes(&catmos_scope_names).unwrap();
+    let catmos_client = GatewayOAuth::with_transport(
         catmos_store.clone(),
-        build_mock_resolver(&mock),
-        ClientData::new(keyset, catmos_md),
-    );
+        base_state.key_store.as_ref().expect("test client key"),
+        catmos_client_id_str,
+        "https://api.catbird.blue/auth/callback",
+        &catmos_scope_names.join(" "),
+        petrel_fixture::transport(&mock),
+        url::Url::parse(PLC).unwrap(),
+    )
+    .unwrap();
 
     let mut state_clone: AppState = (*base_state).clone();
-    state_clone.catmos_jacquard_client = Some(Arc::new(catmos_client));
+    state_clone.catmos_oauth_client = Some(Arc::new(catmos_client));
     state_clone.catmos_oauth_scopes = catmos_scopes_vec;
+    state_clone.catmos_oauth_upgrade_scopes = catmos_scope_names;
     let state = Arc::new(state_clone);
     let app = create_router(state.clone()).with_state(state.clone());
     let server = TestServer::new(app).expect("create TestServer");
@@ -1826,22 +1745,18 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         state
             .oauth_client_for_profile("catmos")
             .expect("catmos client"),
-        state.catmos_jacquard_client.as_ref().unwrap()
+        state.catmos_oauth_client.as_ref().unwrap()
     ));
     assert!(Arc::ptr_eq(
         state
             .oauth_client_for_profile("catbird")
             .expect("catbird client"),
-        state.jacquard_client.as_ref().unwrap()
+        state.oauth_client.as_ref().unwrap()
     ));
 
     let legacy_session_id = Uuid::new_v4().to_string();
-    let legacy_data = create_test_session_data_with_pds(
-        &legacy_session_id,
-        did,
-        vec![Scope::Atproto],
-        &provider_url,
-    );
+    let legacy_data =
+        create_test_session_data_with_pds(&legacy_session_id, did, vec!["atproto"], &provider_url);
     // Write raw ClientSessionData JSON WITHOUT oauth_profile field to verify #[serde(default)] backwards compatibility
     let legacy_session_key = base_store.session_key(did, &legacy_session_id);
     let legacy_json = serde_json::to_string(&legacy_data).unwrap();
@@ -1868,22 +1783,20 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         "Legacy sessions without oauth_profile field must default to 'catbird'"
     );
 
-    // 2. Seed an expired catmos session so auth_middleware refreshes it via catmos_jacquard_client
+    // 2. Seed an expired catmos session so auth_middleware refreshes it via catmos_oauth_client
     let catmos_session_id = Uuid::new_v4().to_string();
     let mut catmos_session_data = create_test_session_data_with_pds(
         &catmos_session_id,
         did,
-        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        vec!["atproto", "transition:generic"],
         &provider_url,
     );
     catmos_session_data.authserver_token_endpoint = format!("{provider_url}/oauth/token").into();
     catmos_session_data.authserver_revocation_endpoint =
         Some(format!("{provider_url}/oauth/revoke").into());
     catmos_session_data.token_set.expires_at = Some(
-        jacquard_common::types::string::Datetime::try_from(
-            (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
-        )
-        .unwrap(),
+        petrel_core::Datetime::parse((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
+            .unwrap(),
     );
     catmos_store
         .upsert_session(catmos_session_data)
@@ -1956,7 +1869,7 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
     // Under main's logout_cleanup coordinator, upstream revocation executes only
     // when retiring the final active session for an account and requires push_db
     // for SQL inventory fencing.
-    let logout_did = "did:plc:catmoslogoutuser";
+    let logout_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
     Mock::given(method("GET"))
         .and(path(format!("/{logout_did}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2002,7 +1915,7 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
     let mut logout_data = create_test_session_data_with_pds(
         &catmos_logout_id,
         logout_did,
-        vec![Scope::Atproto, Scope::Transition(TransitionScope::Generic)],
+        vec!["atproto", "transition:generic"],
         &provider_url,
     );
     logout_data.authserver_token_endpoint = format!("{provider_url}/oauth/token").into();
@@ -2036,3 +1949,6 @@ async fn test_b2_catmos_oauth_profile_selects_catmos_client_across_refresh_upgra
         "logout remote PDS revocation MUST use catmos OAuth client"
     );
 }
+
+#[path = "support/petrel_storage_cases.rs"]
+mod petrel_storage_cases;

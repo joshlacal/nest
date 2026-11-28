@@ -457,7 +457,7 @@ async fn upgraded_session_keeps_its_device_ownership_when_another_session_owns_p
     use catbird::services::logout_cleanup::{
         CleanupStore, CredentialRetention, LogoutRequest, RedisCleanupStore,
     };
-    use jacquard_oauth::authstore::ClientAuthStore;
+
     let db = TestDb::new().await;
     let store = cleanup_auth::store().await;
     let registry = PushRegistry::with_config(
@@ -508,7 +508,7 @@ async fn upgraded_session_keeps_its_device_ownership_when_another_session_owns_p
     let new_fp = session_fingerprint(&successor_id);
     // Model the successful local upgrade-commit boundary: the candidate is live
     // and the old bearer is irreversibly retired. No provider calls are made.
-    let parsed_did = jacquard_common::types::did::Did::new(DID).unwrap();
+    let parsed_did = petrel_core::Did::parse(DID).unwrap();
     store.delete_session(&parsed_did, &a_id).await.unwrap();
     let mut conn = store.redis_connection();
     let _: () = redis::cmd("SET")
@@ -728,8 +728,8 @@ async fn interrupted_upgrade_transfer_cannot_claim_candidate_device_cleanup_comp
         run_cleanup, CleanupEffects, CleanupTarget, Completion, CredentialRetention, LogoutRequest,
         RedisCleanupStore, WorkFailure, WorkStatus,
     };
+    use catbird::services::petrel_storage::ClientSessionData;
     use catbird::services::revocation::RevokeOutcome;
-    use jacquard_oauth::{authstore::ClientAuthStore, session::ClientSessionData};
     struct Effects<'a>(&'a PushRegistry);
     #[async_trait::async_trait]
     impl CleanupEffects for Effects<'_> {
@@ -743,7 +743,11 @@ async fn interrupted_upgrade_transfer_cannot_claim_candidate_device_cleanup_comp
         async fn erase_account(&self, _: &CleanupTarget, _: Uuid) -> Result<(), WorkFailure> {
             panic!("B is still live")
         }
-        async fn revoke(&self, _: &mut ClientSessionData, _: Uuid) -> RevokeOutcome {
+        async fn revoke(
+            &self,
+            _: &mut catbird::services::revocation::StoredGrantV3,
+            _: Uuid,
+        ) -> RevokeOutcome {
             panic!("shared-grant revocation must be deferred")
         }
     }
@@ -761,7 +765,7 @@ async fn interrupted_upgrade_transfer_cannot_claim_candidate_device_cleanup_comp
     let (b, b_device) = sign_in_with_device(&store, &registry, &"ef".repeat(32)).await;
     let successor = catbird_session();
     cleanup_auth::seed(&store, &successor).await;
-    let did = jacquard_common::types::did::Did::new(DID).unwrap();
+    let did = petrel_core::Did::parse(DID).unwrap();
     store.delete_session(&did, &a.id.to_string()).await.unwrap();
     let mut conn = store.redis_connection();
     let _: () = redis::cmd("SET")

@@ -32,7 +32,6 @@ use aes_gcm::{
     Aes256Gcm,
 };
 use anyhow::{anyhow, Context, Result};
-use atproto_spaces::{did_resolver::DidDocument, tokens::SpaceVerifyingKey};
 use axum::http::StatusCode;
 use base64::{
     engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD as BASE64URL},
@@ -40,6 +39,7 @@ use base64::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
+use petrel::crypto::ATProtoJWTVerificationKey as SpaceVerifyingKey;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -63,11 +63,24 @@ use crate::{
     },
     services::validate_pds_url,
 };
-use catbird_atproto::generated::blue_catbird::push::{
-    deliver::{Deliver, WakePayloadWakeKind},
-    register_key::{RegisterKey, RegisterKeyOutput, RegisterKeyPlatform},
+use petrel_catbird::generated::blue::catbird::push::{
+    deliver::{Input as Deliver, WakePayloadWakeKind},
+    register_key::{
+        Input as RegisterKey, InputPlatform as RegisterKeyPlatform, Output as RegisterKeyOutput,
+    },
 };
-use jacquard_common::types::string::UriValue;
+use petrel_core::Uri;
+
+pub fn parse_atproto_key(expected_did: &str, bytes: &[u8]) -> Result<SpaceVerifyingKey> {
+    let document: petrel::identity::DidDocument = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(
+        document.id.as_str() == expected_did,
+        "unexpected DID document identity"
+    );
+    Ok(SpaceVerifyingKey::from_public_key(
+        &document.atproto_signing_key()?,
+    ))
+}
 
 /// Maximum inline MLS `PrivateMessage` ciphertext bytes allowed in a push wake (`I12`).
 pub const MAX_INLINE_CIPHERTEXT_BYTES: usize = 2200;
@@ -127,13 +140,13 @@ impl GatewayPlatform {
         }
     }
 
-    pub fn from_lexicon<S: jacquard_common::BosStr>(p: &RegisterKeyPlatform<S>) -> Option<Self> {
+    pub fn from_lexicon(p: &RegisterKeyPlatform) -> Option<Self> {
         match p {
             RegisterKeyPlatform::Apns => Some(Self::Apns),
             RegisterKeyPlatform::ApnsSandbox => Some(Self::ApnsSandbox),
             RegisterKeyPlatform::Fcm => Some(Self::Fcm),
             RegisterKeyPlatform::Webpush => Some(Self::Webpush),
-            RegisterKeyPlatform::Other(_) => None,
+            RegisterKeyPlatform::Unknown(_) => None,
         }
     }
 }
@@ -741,11 +754,7 @@ impl MlsDsIdentityResolver for HttpMlsDsIdentityResolver {
             }
         }
         let doc_bytes = self.fetch_did_document(caller_ds_did).await?;
-        let doc = DidDocument::parse_json(caller_ds_did, &doc_bytes)
-            .map_err(|e| anyhow!("parse DID document for {caller_ds_did}: {e}"))?;
-        let vk = doc
-            .atproto_key
-            .ok_or_else(|| anyhow!("DID document for {caller_ds_did} has no #atproto key"))?;
+        let vk = parse_atproto_key(caller_ds_did, &doc_bytes)?;
         self.ds_key_cache
             .insert(caller_ds_did.to_string(), (vk.clone(), Instant::now()));
         Ok(vk)
@@ -1320,11 +1329,6 @@ impl PushGatewayService {
     ) -> AppResult<RegisterKeyOutput> {
         let session_fingerprint =
             session_id.map(crate::services::push::registry::normalize_or_hash_session_fingerprint);
-        if req.extra_data.as_ref().is_some_and(|m| !m.is_empty()) {
-            return Err(AppError::BadRequest(
-                "InvalidRequest: unexpected extra fields in registerKey".into(),
-            ));
-        }
         let app_id = req.app_id.as_str().trim();
         if app_id.is_empty() || app_id.len() > 128 || !app_id.bytes().all(|b| b.is_ascii_graphic())
         {
@@ -1416,14 +1420,13 @@ impl PushGatewayService {
             AppError::Internal("Failed to persist push gateway registration".into())
         })?;
 
-        let gateway_url = UriValue::new_owned(self.config.gateway_url.clone())
+        let gateway_url = Uri::parse(self.config.gateway_url.clone())
             .map_err(|e| AppError::Internal(format!("Invalid configured gateway_url: {e}")))?;
 
         Ok(RegisterKeyOutput {
             app_id: app_id.into(),
             gateway_url,
-            push_key: push_key.into(),
-            extra_data: None,
+            push_key,
         })
     }
 
@@ -1521,7 +1524,7 @@ impl PushGatewayService {
 
         let caller_did = claims.iss.trim();
         if caller_did.contains('#')
-            || jacquard_common::types::did::Did::new(caller_did).is_err()
+            || petrel_core::Did::parse(caller_did).is_err()
             || !(caller_did.starts_with("did:plc:") || caller_did.starts_with("did:web:"))
         {
             return Err(unauthorized("Invalid ServiceJWT issuer DID"));
@@ -1584,12 +1587,27 @@ impl PushGatewayService {
             .await
             .map_err(|_| unauthorized("Unable to resolve caller #atproto key"))?;
 
-        let verified = if vk.verify_raw(&header.alg, signing_input.as_bytes(), &sig_bytes) {
+        let verified = if vk
+            .verify_with_options(
+                &sig_bytes,
+                signing_input.as_bytes(),
+                &header.alg,
+                petrel::crypto::ATProtoSignatureVerificationOptions::JWT,
+            )
+            .unwrap_or(false)
+        {
             true
         } else if let Ok(refreshed_vk) =
             self.resolver.resolve_ds_atproto_key(caller_did, true).await
         {
-            refreshed_vk.verify_raw(&header.alg, signing_input.as_bytes(), &sig_bytes)
+            refreshed_vk
+                .verify_with_options(
+                    &sig_bytes,
+                    signing_input.as_bytes(),
+                    &header.alg,
+                    petrel::crypto::ATProtoSignatureVerificationOptions::JWT,
+                )
+                .unwrap_or(false)
         } else {
             false
         };
@@ -1732,14 +1750,29 @@ impl PushGatewayService {
             .await
             .map_err(|_| unauthorized("Unable to resolve caller mls-ds #atproto key"))?;
 
-        let verified = if vk.verify_raw(&header.alg, signing_input.as_bytes(), &sig_bytes) {
+        let verified = if vk
+            .verify_with_options(
+                &sig_bytes,
+                signing_input.as_bytes(),
+                &header.alg,
+                petrel::crypto::ATProtoSignatureVerificationOptions::JWT,
+            )
+            .unwrap_or(false)
+        {
             true
         } else if let Ok(refreshed_vk) = self
             .resolver
             .resolve_ds_atproto_key(caller_ds_did, true)
             .await
         {
-            refreshed_vk.verify_raw(&header.alg, signing_input.as_bytes(), &sig_bytes)
+            refreshed_vk
+                .verify_with_options(
+                    &sig_bytes,
+                    signing_input.as_bytes(),
+                    &header.alg,
+                    petrel::crypto::ATProtoSignatureVerificationOptions::JWT,
+                )
+                .unwrap_or(false)
         } else {
             false
         };
@@ -1817,16 +1850,7 @@ impl PushGatewayService {
         let req: Deliver = serde_json::from_value(root)
             .map_err(|_| bad_req("Invalid Deliver schema or ciphertext encoding"))?;
 
-        if req.extra_data.as_ref().is_some_and(|m| !m.is_empty())
-            || req
-                .payload
-                .extra_data
-                .as_ref()
-                .is_some_and(|m| !m.is_empty())
-        {
-            return Err(bad_req("Extra fields are forbidden in Deliver"));
-        }
-        if matches!(req.payload.wake_kind, WakePayloadWakeKind::Other(_)) {
+        if matches!(req.payload.wake_kind, WakePayloadWakeKind::Unknown(_)) {
             return Err(bad_req("Unsupported wakeKind"));
         }
         let push_key = req.push_key.as_str();
@@ -1848,7 +1872,7 @@ impl PushGatewayService {
             return Err(bad_req("generation, seq, or epoch out of bounds"));
         }
         if let Some(ct) = req.payload.ciphertext.as_ref() {
-            if ct.is_empty() || ct.len() > MAX_INLINE_CIPHERTEXT_BYTES {
+            if ct.0.is_empty() || ct.0.len() > MAX_INLINE_CIPHERTEXT_BYTES {
                 return Err(bad_req(
                     "Inline ciphertext exceeds I12 2200-byte limit or is empty",
                 ));
@@ -2027,7 +2051,7 @@ impl PushGatewayService {
                 generation: req.payload.generation,
                 seq: req.payload.seq,
                 epoch: req.payload.epoch,
-                ciphertext: req.payload.ciphertext.as_deref(),
+                ciphertext: req.payload.ciphertext.as_ref().map(|b| b.0.as_slice()),
                 utc_day: &Utc::now().format("%Y-%m-%d").to_string(),
             },
         ) {

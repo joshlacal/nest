@@ -167,6 +167,31 @@ impl Fixture {
     async fn seed_all_families(&mut self) {
         let hmac = self.target.session_hmac.clone();
         let sha = self.target.session_fingerprint.clone();
+        // This fixture already holds the erasure fence, so build pre-existing
+        // hash owner records with the same field-bound encryption as RedisSessionSecrets.
+        for family in [RedisFamily::PetrelSession, RedisFamily::PetrelFlow] {
+            let key = format!("{}{hmac}", family.key_stem(self.store.key_prefix()));
+            let owner = catbird::services::redis_crypto::seal_with_aad(
+                &cleanup_auth::KEY,
+                DID.as_bytes(),
+                &build_aad("petrel_secret", &key, None, Some("nest.owner")),
+            )
+            .unwrap();
+            redis::pipe()
+                .cmd("HSET")
+                .arg(&key)
+                .arg("nest.owner")
+                .arg(owner)
+                .ignore()
+                .cmd("EXPIRE")
+                .arg(&key)
+                .arg(600)
+                .ignore()
+                .query_async::<_, ()>(&mut self.store.redis_connection())
+                .await
+                .unwrap();
+            self.keys.push(key);
+        }
         let grant =
             serde_json::to_value(cleanup_auth::grant(DID, &self.bearer, "http://127.0.0.1:9"))
                 .unwrap();

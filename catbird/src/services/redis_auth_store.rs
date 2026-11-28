@@ -1,15 +1,21 @@
-//! Redis-backed implementation of Jacquard's `ClientAuthStore`.
+//! Redis gateway session indexes and encrypted v2 rollback records.
 //!
 //! Stores session data in Redis with required AES-256-GCM encryption and
 //! HMAC-SHA256 bearer key fingerprinting under an explicit v2 namespace.
 
 use hmac::{Hmac, Mac};
-use jacquard_common::session::SessionStoreError;
-use jacquard_common::types::did::Did;
+#[derive(Debug, thiserror::Error)]
+pub enum SessionStoreError {
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+use petrel_core::Did;
 
 use super::redis_crypto::{open_v2_with_metadata, seal_v2_with_metadata, EnvelopeMetadata};
-use jacquard_oauth::authstore::ClientAuthStore;
-use jacquard_oauth::session::{AuthRequestData, ClientSessionData};
+
+use crate::services::petrel_storage::{AuthRequestData, ClientSessionData};
 use redis::AsyncCommands;
 use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
@@ -164,6 +170,10 @@ const LUA_LOGOUT_RETIRE_SCRIPT: &str = r#"
 -- 3: key_prefix
 -- 4: did
 
+-- A stale refresh must never retire an upgraded or concurrently refreshed session.
+if ARGV[7] ~= '' and (redis.call('EXISTS', KEYS[1]) ~= 0 or redis.call('GET', KEYS[2]) ~= ARGV[7]) then
+    return 1
+end
 local current_winner = redis.call('GET', KEYS[1])
 if current_winner and current_winner ~= '' and current_winner ~= 'logout' then
     local prefix = ARGV[3]
@@ -178,6 +188,7 @@ if current_winner and current_winner ~= '' and current_winner ~= 'logout' then
         
         redis.call('SETEX', winner_retired, tonumber(ARGV[1]), ARGV[2])
         redis.call('DEL', winner_session)
+        if ARGV[6] then redis.call('DEL', ARGV[6] .. current_winner) end
         redis.call('DEL', winner_index)
         redis.call('DEL', winner_receipt)
         redis.call('DEL', winner_candidate)
@@ -186,6 +197,7 @@ if current_winner and current_winner ~= '' and current_winner ~= 'logout' then
 end
 
 redis.call('SETEX', KEYS[1], tonumber(ARGV[1]), ARGV[2])
+if ARGV[6] then redis.call('DEL', ARGV[6] .. ARGV[5]) end
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
@@ -288,9 +300,9 @@ fn other_err(msg: &str) -> SessionStoreError {
 
 /// Validates that deserialized `ClientSessionData` matches the requested DID and session ID.
 /// Returns a fail-closed `SessionStoreError` on any mismatch.
-fn validate_session_identity<D: jacquard_common::BosStr>(
+fn validate_session_identity(
     session: ClientSessionData,
-    expected_did: &Did<D>,
+    expected_did: &Did,
     expected_session_id: &str,
 ) -> Result<ClientSessionData, SessionStoreError> {
     if session.account_did.as_str() != expected_did.as_str() {
@@ -384,7 +396,7 @@ pub(crate) fn deserialize_client_session_data(
     serde_json::from_value(val)
 }
 
-/// Redis-backed auth store for Jacquard OAuth.
+/// Redis-backed gateway session and OAuth state store.
 ///
 /// Key schema:
 ///   `{prefix}session:{did}_{session_fingerprint}`   → encrypted ClientSessionData JSON
@@ -517,7 +529,7 @@ impl RedisAuthStore {
         did: &str,
         session_id: &str,
     ) -> Result<Option<ClientSessionData>, SessionStoreError> {
-        let parsed_did = Did::new(did).map_err(|_| other_err("invalid account DID"))?;
+        let parsed_did = Did::parse(did).map_err(|_| other_err("invalid account DID"))?;
         let session_key = self.session_key(did, session_id);
         let mut conn = self.redis_connection();
         let encrypted: Option<String> = redis::Script::new(
@@ -750,7 +762,7 @@ impl RedisAuthStore {
         session_id: &str,
         did: &str,
     ) -> Result<(), redis::RedisError> {
-        let did = Did::new(did).map_err(|_| {
+        let did = Did::parse(did).map_err(|_| {
             redis::RedisError::from((redis::ErrorKind::ResponseError, "invalid session identity"))
         })?;
         let live = self.get_session(&did, session_id).await.map_err(|_| {
@@ -1317,13 +1329,13 @@ impl RedisAuthStore {
     }
 }
 
-impl ClientAuthStore for RedisAuthStore {
+impl RedisAuthStore {
     /// Sliding expiration: fetch the session blob with `GETEX`, resetting its
     /// TTL to `self.session_ttl` on every successful read.
     /// Hashed lookup only. Fails closed with no plaintext fallback.
-    async fn get_session<D: jacquard_common::BosStr + Send + Sync>(
+    pub async fn get_session(
         &self,
-        did: &Did<D>,
+        did: &Did,
         session_id: &str,
     ) -> Result<Option<ClientSessionData>, SessionStoreError> {
         let hashed_session_key = self.session_key(did.as_str(), session_id);
@@ -1397,7 +1409,10 @@ impl ClientAuthStore for RedisAuthStore {
         Ok(None)
     }
     /// Upsert a session into hashed keys. Atomically checks retired tombstones.
-    async fn upsert_session(&self, session: ClientSessionData) -> Result<(), SessionStoreError> {
+    pub async fn upsert_session(
+        &self,
+        session: ClientSessionData,
+    ) -> Result<(), SessionStoreError> {
         let hashed_session = self.session_key(session.account_did.as_str(), &session.session_id);
         let hashed_index = self.session_index_key(&session.session_id);
         let hashed_retired = self.retired_key(&session.session_id);
@@ -1444,11 +1459,21 @@ impl ClientAuthStore for RedisAuthStore {
 
     /// Atomic logout retirement: sets retired tombstone on hashed key,
     /// and deletes hashed session blob, index entry, SHA-256 fp index, DID index, and pending upgrade state pointer.
-    async fn delete_session<D: jacquard_common::BosStr + Send + Sync>(
+    pub async fn delete_session(
         &self,
-        did: &Did<D>,
+        did: &Did,
         session_id: &str,
     ) -> Result<(), SessionStoreError> {
+        self.retire_session(did, session_id, "").await.map(|_| ())
+    }
+
+    /// A nonempty expected mirror restricts retirement to that one live grant.
+    pub(super) async fn retire_session(
+        &self,
+        did: &Did,
+        session_id: &str,
+        expected_mirror: &str,
+    ) -> Result<bool, SessionStoreError> {
         let hashed_retired = self.retired_key(session_id);
         let hashed_session = self.session_key(did.as_str(), session_id);
         let hashed_index = self.session_index_key(session_id);
@@ -1458,7 +1483,7 @@ impl ClientAuthStore for RedisAuthStore {
 
         let mut conn = self.redis.clone();
         let script = redis::Script::new(LUA_LOGOUT_RETIRE_SCRIPT);
-        let _: i32 = script
+        let result: i32 = script
             .key(&hashed_retired)
             .key(&hashed_session)
             .key(&hashed_index)
@@ -1470,14 +1495,19 @@ impl ClientAuthStore for RedisAuthStore {
             .arg(&self.key_prefix)
             .arg(did.as_str())
             .arg(self.fingerprint(session_id))
+            .arg(format!(
+                "{}ps:",
+                super::petrel_storage::v3_prefix(self.key_prefix())
+            ))
+            .arg(expected_mirror)
             .invoke_async(&mut conn)
             .await
             .map_err(redis_err)?;
 
-        Ok(())
+        Ok(result == 0)
     }
 
-    async fn get_auth_req_info(
+    pub async fn get_auth_req_info(
         &self,
         state: &str,
     ) -> Result<Option<AuthRequestData>, SessionStoreError> {
@@ -1500,7 +1530,7 @@ impl ClientAuthStore for RedisAuthStore {
         }
     }
 
-    async fn save_auth_req_info(
+    pub async fn save_auth_req_info(
         &self,
         auth_req_info: &AuthRequestData,
     ) -> Result<(), SessionStoreError> {
@@ -1519,7 +1549,7 @@ impl ClientAuthStore for RedisAuthStore {
         Ok(())
     }
 
-    async fn delete_auth_req_info(&self, state: &str) -> Result<(), SessionStoreError> {
+    pub async fn delete_auth_req_info(&self, state: &str) -> Result<(), SessionStoreError> {
         let key = self.auth_req_key(state);
         let mut conn = self.redis.clone();
 
@@ -1531,9 +1561,9 @@ impl ClientAuthStore for RedisAuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::petrel_storage::{DpopClientData, DpopReqData};
+    use crate::services::petrel_storage::{OAuthTokenType, TokenSet};
     use crate::services::redis_crypto::{open_strict, seal_strict};
-    use jacquard_oauth::session::{DpopClientData, DpopReqData};
-    use jacquard_oauth::types::{OAuthTokenType, TokenSet};
 
     const TEST_KEY: [u8; 32] = [0x42u8; 32];
     #[test]
@@ -1744,7 +1774,7 @@ mod tests {
     }
 
     fn make_test_session_data(did_str: &str, session_id_str: &str) -> ClientSessionData {
-        let did = jacquard_common::types::did::Did::new_owned(did_str.to_string()).unwrap();
+        let did = petrel_core::Did::parse(did_str.to_string()).unwrap();
         let jwk_json = serde_json::json!({
             "kty": "EC",
             "crv": "P-256",
@@ -1757,16 +1787,13 @@ mod tests {
         ClientSessionData {
             account_did: did.clone(),
             session_id: session_id_str.to_string().into(),
-            host_url: jacquard_common::deps::fluent_uri::Uri::parse("https://pds.example.com")
+            host_url: url::Url::parse("https://pds.example.com")
                 .unwrap()
                 .to_owned(),
             authserver_url: "https://pds.example.com".to_string().into(),
             authserver_token_endpoint: "".into(),
             authserver_revocation_endpoint: None,
-            scopes: jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static(
-                "atproto transition:generic",
-            ))
-            .unwrap(),
+            scopes: petrel_oauth_scopes::ScopeSet::parse("atproto transition:generic").unwrap(),
             dpop_data: DpopClientData {
                 dpop_key: jwk_key,
                 dpop_authserver_nonce: "".into(),
@@ -1788,7 +1815,7 @@ mod tests {
 
     #[test]
     fn test_validate_session_identity_success() {
-        let did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
         let session = make_test_session_data(did.as_str(), session_id);
 
@@ -1801,7 +1828,7 @@ mod tests {
 
     #[test]
     fn test_validate_session_identity_swapped_did_fails() {
-        let requested_did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let requested_did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         let actual_did = "did:plc:attacker999999999";
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
         let session = make_test_session_data(actual_did, session_id);
@@ -1815,7 +1842,7 @@ mod tests {
 
     #[test]
     fn test_validate_session_identity_swapped_session_id_fails() {
-        let did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         let requested_session_id = "550e8400-e29b-41d4-a716-446655440000";
         let actual_session_id = "660e8400-e29b-41d4-a716-446655440000";
         let session = make_test_session_data(did.as_str(), actual_session_id);
@@ -1829,7 +1856,7 @@ mod tests {
 
     #[test]
     fn test_get_session_swapped_payload_simulation() {
-        let correct_did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let correct_did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         let attacker_did = "did:plc:attacker999999999";
         let correct_session_id = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -1853,7 +1880,7 @@ mod tests {
 
     #[test]
     fn test_get_session_corrupt_payload_simulation() {
-        let did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
 
         // 1. Corrupt ciphertext fails decryption
@@ -1897,11 +1924,8 @@ mod tests {
         AuthRequestData {
             state: state_str.to_string().into(),
             authserver_url: "https://pds.example.com".to_string().into(),
-            account_did: Some(Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap()),
-            scopes: jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::new_static(
-                "atproto transition:generic",
-            ))
-            .unwrap(),
+            account_did: Some(Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap()),
+            scopes: petrel_oauth_scopes::ScopeSet::parse("atproto transition:generic").unwrap(),
             request_uri: "urn:ietf:params:oauth:request_uri:123".to_string().into(),
             authserver_token_endpoint: "https://pds.example.com/oauth/token".to_string().into(),
             authserver_revocation_endpoint: None,
@@ -2064,7 +2088,7 @@ mod tests {
                 &self,
                 prefix: &str,
                 key: &[u8; 32],
-                did: &Did<jacquard_common::DefaultStr>,
+                did: &Did,
                 session_id: &str,
             ) -> Result<Option<ClientSessionData>, SessionStoreError> {
                 let fp = fingerprint_id(key, session_id);
@@ -2090,7 +2114,7 @@ mod tests {
         };
 
         let prefix = "catbird:v2:session:";
-        let did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
         let session = make_test_session_data(did.as_str(), session_id);
 
@@ -2100,7 +2124,7 @@ mod tests {
 
         // 2. Lookup DID from index
         let resolved_did = sim.lookup_did(prefix, &TEST_KEY, session_id);
-        let did: Did = Did::new_static("did:plc:ragtjsm2j2vknq6z").unwrap();
+        let did: Did = Did::parse("did:plc:ragtjsm2j2vknq6z").unwrap();
         assert_eq!(resolved_did.as_deref(), Some(did.as_str()));
 
         // 3. Get session data
@@ -2164,7 +2188,7 @@ mod tests {
                 let session: ClientSessionData = serde_json::from_str(&json)
                     .map_err(|e| MockAuthError::Internal(e.to_string()))?;
 
-                let did = Did::new(did_str.as_str())
+                let did = Did::parse(did_str.as_str())
                     .map_err(|e| MockAuthError::Internal(e.to_string()))?;
                 let validated = validate_session_identity(session, &did, session_id_header)
                     .map_err(|e| MockAuthError::Internal(e.to_string()))?;
@@ -3582,6 +3606,49 @@ mod tests {
         assert!(resolved_legacy2.is_some());
         assert_eq!(sim.direct_lookups.get(), 3);
         assert_eq!(sim.scan_iterations.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_retires_only_the_observed_live_grant() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let conn = redis::aio::ConnectionManager::new(redis::Client::open(url).unwrap())
+            .await
+            .unwrap();
+        let store = RedisAuthStore::from_key(
+            conn.clone(),
+            format!("test:v2:{}:", uuid::Uuid::new_v4()),
+            3600,
+            TEST_KEY,
+        )
+        .unwrap();
+        let did = Did::parse("did:plc:z72i7hdynmk6r22z27h6tvur").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut grant = make_test_session_data(did.as_str(), &id);
+        store.upsert_session(grant.clone()).await.unwrap();
+        let mut conn = conn;
+        let old: String = conn
+            .get(store.session_key(did.as_str(), &id))
+            .await
+            .unwrap();
+        grant.token_set.access_token = "replacement".into();
+        store.upsert_session(grant).await.unwrap();
+        let current: String = conn
+            .get(store.session_key(did.as_str(), &id))
+            .await
+            .unwrap();
+        assert!(!store.retire_session(&did, &id, &old).await.unwrap());
+        assert_eq!(
+            store
+                .get_session(&did, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .token_set
+                .access_token,
+            "replacement"
+        );
+        assert!(store.retire_session(&did, &id, &current).await.unwrap());
+        assert!(store.get_session(&did, &id).await.unwrap().is_none());
     }
 
     #[tokio::test]

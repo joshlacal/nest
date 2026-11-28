@@ -8,6 +8,7 @@ mod atproto_client;
 pub mod chat_poll;
 mod crypto;
 mod dpop_nonce_cache;
+pub mod gateway_scope;
 pub mod login_apply;
 pub mod login_restore;
 pub mod login_sync;
@@ -15,6 +16,8 @@ pub mod logout_cleanup;
 mod mls_auth;
 pub mod oauth_authorize;
 pub mod oauth_upgrade;
+pub mod petrel_oauth;
+pub mod petrel_storage;
 pub mod push;
 pub(crate) mod redis_auth_store;
 pub use redis_auth_store::{fingerprint_id, SESSION_INDEX_TTL_SECONDS};
@@ -56,6 +59,5 @@ pub use service_auth::{
 };
 pub use ssrf::{
     build_hardened_http_client, build_hardened_raw_http_client, resolve_and_validate_public_url,
-    validate_pds_url, HardenedHttpClient, HardenedHttpClientError, SafeDnsResolver,
-    MAX_OAUTH_RESPONSE_SIZE,
+    validate_pds_url, SafeDnsResolver, MAX_OAUTH_RESPONSE_SIZE,
 };

@@ -24,7 +24,6 @@ use std::{
 };
 
 use anyhow::{anyhow, ensure, Result};
-use atproto_spaces::{did_resolver::DidDocument, tokens::SpaceVerifyingKey};
 use axum::{
     body::Bytes,
     extract::State,
@@ -32,8 +31,9 @@ use axum::{
     routing::post,
     Extension, Json, Router,
 };
-use catbird_atproto::generated::blue_catbird::push::register_key::RegisterKey;
 use chrono::Utc;
+use petrel::crypto::ATProtoJWTVerificationKey as SpaceVerifyingKey;
+use petrel_catbird::generated::blue::catbird::push::register_key::Input as RegisterKey;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -103,10 +103,7 @@ impl MlsDsIdentityResolver for FixtureResolver {
         caller_ds_did: &str,
         _force_refresh: bool,
     ) -> Result<SpaceVerifyingKey> {
-        DidDocument::parse_json(caller_ds_did, &self.ds_document)
-            .map_err(|error| anyhow!("caller DS document: {error}"))?
-            .atproto_key
-            .ok_or_else(|| anyhow!("caller DS document has no #atproto key"))
+        super::gateway::parse_atproto_key(caller_ds_did, &self.ds_document)
     }
 }
 

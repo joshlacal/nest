@@ -379,8 +379,8 @@ async fn poller_live_getlog_priming_and_reopening_emit_no_push() {
         redis,
         push_db: Some(db.pool.clone()),
         key_store: None,
-        jacquard_client: None,
-        catmos_jacquard_client: None,
+        oauth_client: None,
+        catmos_oauth_client: None,
         catmos_oauth_scopes: vec![],
         catmos_oauth_upgrade_scopes: vec![],
         trusted_proxies: vec![],
@@ -408,7 +408,7 @@ async fn poller_live_getlog_priming_and_reopening_emit_no_push() {
     };
     let secret = p256::SecretKey::random(&mut rand::thread_rng());
     let crypto_key = jose_jwk::crypto::Key::from(secret);
-    let dpop = crate::middleware::JacquardDpopData {
+    let dpop = crate::middleware::SessionDpopData {
         dpop_key: jose_jwk::Key::from(&crypto_key),
         dpop_host_nonce: String::new(),
     };

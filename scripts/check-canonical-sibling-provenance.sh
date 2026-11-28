@@ -1,106 +1,62 @@
 #!/usr/bin/env bash
-# Verifies that nest/catbird builds against the exact catbird-atproto commit
-# recorded in scripts/canonical-sibling-provenance.conf, and that each tracked
-# Cargo.lock matches its recorded hash. Run before every release build.
-# circle-appview no longer depends on catbird-atproto (it builds against the
-# sibling Petrel Rust crates), so only its lock hash is checked here.
+# Check the exact SDK sources and locked Cargo graphs used by release builds.
 set -euo pipefail
-
-# No overrides are accepted: provenance comes only from this checkout and the
-# sibling Cargo resolves from the crates' own manifests.
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+workspace=$(dirname "$repo_root")
 manifest="$repo_root/scripts/canonical-sibling-provenance.conf"
+case "${1:-all}" in
+  all) services=(catbird circle-appview) ;;
+  catbird|circle-appview) services=("$1") ;;
+  *) printf 'usage: %s [catbird|circle-appview]\n' "$0" >&2; exit 2 ;;
+esac
+if (( $# > 1 )); then printf 'usage: %s [catbird|circle-appview]\n' "$0" >&2; exit 2; fi
 
-if [[ $# -ne 0 ]]; then
-  printf 'usage: %s\n' "$0" >&2
-  exit 2
-fi
-[[ -f "$manifest" ]] || { printf 'provenance manifest not found: %s\n' "$manifest" >&2; exit 1; }
-
-manifest_value() {
-  local key=$1 value
-  value=$(awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$manifest")
-  [[ -n "$value" ]] || { printf 'missing provenance value: %s\n' "$key" >&2; exit 1; }
-  printf '%s' "$value"
+value() {
+  local raw
+  raw=$(awk -F= -v key="$1" '$1 == key {print $2}' "$manifest")
+  if [[ -z "$raw" ]]; then printf 'missing provenance value: %s\n' "$1" >&2; return 1; fi
+  printf '%s' "$raw"
 }
 
-sibling_rel=$(manifest_value CATBIRD_ATPROTO_SIBLING_DIR)
-expected_commit=$(manifest_value CATBIRD_ATPROTO_COMMIT)
-if [[ ! "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
-  printf 'CATBIRD_ATPROTO_COMMIT is not a 40-character commit id: %s\n' "$expected_commit" >&2
-  exit 1
-fi
-sibling="$repo_root/$sibling_rel"
-[[ -d "$sibling" ]] || { printf 'catbird-atproto sibling not found: %s\n' "$sibling" >&2; exit 1; }
-sibling=$(cd "$sibling" && pwd)
-
-check_lock() {
-  local crate=$1 key=$2 expected actual
-  expected=$(manifest_value "$key")
-  [[ -f "$repo_root/$crate/Cargo.lock" ]] || { printf 'tracked lock not found: %s/Cargo.lock\n' "$crate" >&2; exit 1; }
-  actual=$(shasum -a 256 "$repo_root/$crate/Cargo.lock" | awk '{print $1}')
-  if [[ "$actual" != "$expected" ]]; then
-    printf '%s/Cargo.lock provenance mismatch: expected %s, got %s\n' "$crate" "$expected" "$actual" >&2
-    exit 1
+check_sibling() {
+  local sibling=$1 key=$2 expected actual changes
+  expected=$(value "$key")
+  if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s is not a 40-character commit id\n' "$key" >&2; return 1
   fi
-  printf '  %s/Cargo.lock sha256=%s\n' "$crate" "$actual"
+  # A colocated jj working copy with an empty change has Git HEAD at its
+  # parent. Plain Git checkouts used by a Linux release builder work too.
+  actual=$(git -C "$workspace/$sibling" rev-parse HEAD)
+  if [[ "$actual" != "$expected" ]]; then printf '%s provenance mismatch: expected %s, found %s\n' "$sibling" "$expected" "$actual" >&2; return 1; fi
+  changes=$(git -C "$workspace/$sibling" status --porcelain --untracked-files=all)
+  if [[ -n "$changes" ]]; then printf '%s sibling has uncommitted files\n' "$sibling" >&2; return 1; fi
+  printf '  %s %s\n' "$sibling" "$actual"
 }
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+check_sibling Petrel PETREL_COMMIT
+check_sibling PetrelCatbird PETREL_CATBIRD_COMMIT
 
-check_resolution() {
-  local crate=$1 pkg resolved
-  if ! CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo metadata --manifest-path "$repo_root/$crate/Cargo.toml" \
-    --format-version 1 --locked --offline >"$tmp/$crate.json" 2>"$tmp/$crate.err"; then
-    printf 'locked Cargo metadata failed for %s; refusing unverified sibling provenance\n' "$crate" >&2
-    cat "$tmp/$crate.err" >&2
-    exit 1
-  fi
-  for pkg in catbird-atproto atproto-spaces; do
-    resolved=$(jq -er --arg n "$pkg" \
-      '[.packages[] | select(.name == $n) | .manifest_path] | if length == 1 then .[0] else error("expected exactly one package named " + $n) end' \
-      "$tmp/$crate.json")
-    if [[ "$resolved" != "$sibling"/* ]]; then
-      printf '%s resolved %s outside the checked sibling\nexpected under: %s\nactual:         %s\n' \
-        "$crate" "$pkg" "$sibling" "$resolved" >&2
-      exit 1
-    fi
-  done
-}
-
-tree_of() {
-  local id
-  id=$(cd "$sibling" && jj --ignore-working-copy log -r "$1" --no-graph -T 'commit_id')
-  (cd "$sibling" && jj --ignore-working-copy debug object commit "$id") |
-    awk '/TreeId\(/ { getline; gsub(/[",[:space:]]/, ""); print; exit }'
-}
-
-printf 'nest canonical sibling provenance\n'
-check_lock catbird CATBIRD_LOCK_SHA256
-check_lock circle-appview CIRCLE_APPVIEW_LOCK_SHA256
-check_resolution catbird
-
-# The sibling's working copy must be an empty change on top of the recorded
-# commit. The empty working-copy commit id itself is not pinned, because jj
-# rewrites it on every snapshot; its parent commit and tree are stable.
-status_output=$(cd "$sibling" && jj --ignore-working-copy st)
-if ! grep -Fq 'The working copy has no changes.' <<<"$status_output"; then
-  printf 'catbird-atproto sibling is dirty or conflicted: %s\n%s\n' "$sibling" "$status_output" >&2
-  exit 1
-fi
-actual_parent=$(cd "$sibling" && jj --ignore-working-copy log -r '@-' --no-graph -T 'commit_id')
-if [[ "$actual_parent" != "$expected_commit" ]]; then
-  printf 'catbird-atproto provenance mismatch\nexpected commit: %s\nactual @-:       %s\n' \
-    "$expected_commit" "$actual_parent" >&2
-  exit 1
-fi
-parent_tree=$(tree_of "$expected_commit")
-child_tree=$(tree_of '@')
-if [[ -z "$parent_tree" || "$parent_tree" != "$child_tree" ]]; then
-  printf 'catbird-atproto working-copy tree %s differs from recorded commit tree %s\n' \
-    "$child_tree" "$parent_tree" >&2
-  exit 1
-fi
-printf '  catbird-atproto commit=%s tree=%s root=%s\n' "$expected_commit" "$parent_tree" "$sibling"
+for service in "${services[@]}"; do
+  case "$service" in catbird) key=CATBIRD_LOCK_SHA256 ;; circle-appview) key=CIRCLE_APPVIEW_LOCK_SHA256 ;; esac
+  expected=$(value "$key")
+  lock="$repo_root/$service/Cargo.lock"
+  actual=$(shasum -a 256 "$lock" | awk '{print $1}')
+  if [[ "$expected" != "$actual" ]]; then printf '%s/Cargo.lock provenance mismatch\n' "$service" >&2; exit 1; fi
+  # Match the manifest paths of the resolved graph, including transitive SDK
+  # crates. The lockfile alone cannot distinguish two local path dependencies.
+  cargo metadata --locked --offline --manifest-path "$repo_root/$service/Cargo.toml" --format-version 1 |
+    jq -er --arg petrel "$workspace/Petrel/rust" --arg overlay "$workspace/PetrelCatbird/rust" '
+      .packages as $packages |
+      if any($packages[]; (.name | startswith("jacquard")) or .name == "catbird-atproto" or .name == "atproto-spaces") then
+        error("legacy SDK in resolved dependency graph")
+      elif (["petrel-core", "petrel-catbird"] - [$packages[].name] | length) != 0 then
+        error("missing Petrel dependency")
+      else
+        $packages[] | select(.name == "petrel" or (.name | startswith("petrel-"))) |
+        (if .name == "petrel-catbird" then $overlay else $petrel end) as $base |
+        if .manifest_path == ($base + "/" + .name + "/Cargo.toml") then empty
+        else error("resolved " + .name + " outside its pinned sibling") end
+      end, true' >/dev/null
+  printf '  %s/Cargo.lock %s\n' "$service" "$actual"
+done
 printf 'verified\n'

@@ -30,7 +30,7 @@ This document details the architecture of the **Confidential** path.
 ## 3. Technology Stack
 
 *   **Language:** Rust (Axum, Tokio).
-*   **AT Protocol:** Jacquard (`jacquard-oauth`, `jacquard-common`, `jacquard-identity`).
+*   **AT Protocol** uses Petrel Rust for OAuth, identity and XRPC. PetrelCatbird supplies the generated Catbird lexicon types.
 *   **Storage:** Redis (Session Store).
 
 ## 4. Architecture Components

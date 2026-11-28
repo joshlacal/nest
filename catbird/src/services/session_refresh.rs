@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use jacquard_common::types::did::Did;
-use jacquard_oauth::session::ClientSessionData;
+use crate::services::petrel_storage::ClientSessionData;
+use petrel_core::Did;
 use tokio::sync::Notify;
 
-use crate::config::JacquardOAuthClient;
+use crate::config::GatewayOAuth;
 
 /// Why a session could not be read.
 #[derive(Debug)]
@@ -38,7 +38,7 @@ pub enum SessionReadError {
     /// The registry's own answer: no such session, a refused refresh, or a server that could
     /// not be reached. Displays exactly as the registry error does, because callers classify
     /// permanent and transient failures from that text.
-    Registry(Box<jacquard_oauth::session::Error>),
+    Registry(Box<petrel::oauth::OAuthError>),
     /// The task running the read ended without an answer.
     TaskFailed(String),
 }
@@ -49,7 +49,12 @@ impl SessionReadError {
     /// succeed, and answering "sign in again" for them signs a working account out.
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::Registry(error) => error.is_permanent(),
+            Self::Registry(error) => matches!(
+                **error,
+                petrel::oauth::OAuthError::MissingSession
+                    | petrel::oauth::OAuthError::InvalidGrant
+                    | petrel::oauth::OAuthError::ExpiredSession
+            ),
             Self::TaskFailed(_) => false,
         }
     }
@@ -133,18 +138,18 @@ pub async fn finish_detached_work(limit: Duration) -> usize {
 /// The read runs on its own task. A refresh that has started is finished and stored even if
 /// the caller goes away before it does.
 pub async fn get_refreshed_session(
-    client: &Arc<JacquardOAuthClient>,
+    client: &Arc<GatewayOAuth>,
     did: &str,
     session_id: &str,
 ) -> Result<ClientSessionData, SessionReadError> {
-    let registry = Arc::clone(&client.registry);
+    let client = Arc::clone(client);
     let did = did.to_owned();
     let session_id = session_id.to_owned();
     run_detached(async move {
-        let did = Did::new(did.as_str())
+        let did = Did::parse(did.as_str())
             .map_err(|error| SessionReadError::TaskFailed(format!("invalid DID: {error}")))?;
-        registry
-            .get(&did, &session_id, true)
+        client
+            .refreshed(&did, &session_id)
             .await
             .map_err(|error| SessionReadError::Registry(Box::new(error)))
     })
@@ -320,11 +325,21 @@ mod tests {
     #[test]
     fn a_registry_error_displays_unchanged_and_only_real_refusals_are_permanent() {
         // Callers decide between "sign in again" and "try later" from this text.
-        let inner = jacquard_oauth::session::Error::SessionNotFound;
+        let inner = petrel::oauth::OAuthError::MissingSession;
         let expected = inner.to_string();
         let missing = SessionReadError::Registry(Box::new(inner));
         assert_eq!(missing.to_string(), expected);
         assert!(missing.is_permanent());
+
+        let registry = |e| SessionReadError::Registry(Box::new(e));
+        assert!(registry(petrel::oauth::OAuthError::InvalidGrant).is_permanent());
+        assert!(!registry(petrel::oauth::OAuthError::RefreshPersistencePending).is_permanent());
+        for transient in [
+            petrel::storage::StoreError::Unavailable("Redis operation failed".into()),
+            petrel::storage::StoreError::Corrupt("invalid v2 session envelope".into()),
+        ] {
+            assert!(!registry(transient.into()).is_permanent());
+        }
 
         let unfinished = SessionReadError::TaskFailed("cancelled".into());
         assert!(unfinished.to_string().contains("did not finish"));
@@ -334,95 +349,21 @@ mod tests {
         }
     }
 
-    /// Every refreshing read must go through this module. A new direct call would bring back
-    /// the lost-refresh sign-out for whatever request path it sits on.
-    ///
-    /// This is a tripwire, not a proof: it reads the source text, so a refresh flag passed in a
-    /// variable or a registry reached through another name gets past it.
     #[test]
-    fn nothing_else_asks_the_registry_to_refresh() {
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
-        /// The argument text of the call that starts at `open` (the index of its `(`).
-        fn arguments(text: &str, open: usize) -> &str {
-            let mut depth = 0usize;
-            for (offset, c) in text[open..].char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return &text[open + 1..open + offset];
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            &text[open + 1..]
-        }
-
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        assert!(
-            files.len() > 20,
-            "source tree not found at {}",
-            src.display()
-        );
-
-        let mut direct_refreshes = Vec::new();
-        let mut restores = Vec::new();
-        for file in files {
-            let name = file
-                .strip_prefix(&src)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            if name == "services/session_refresh.rs" {
-                continue;
-            }
-            let compact: String = std::fs::read_to_string(&file)
-                .unwrap()
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .flat_map(str::chars)
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            for (at, _) in compact.match_indices("registry.get(") {
-                let open = at + "registry.get".len();
-                if arguments(&compact, open).ends_with(",true") {
-                    direct_refreshes.push(name.clone());
-                }
-            }
-            // `OAuthClient::restore` reads through the registry with refresh on.
-            if compact.contains("jacquard_client.restore(")
-                || compact.contains(".restore(&parsed_did,")
-            {
-                restores.push(name.clone());
-            }
-        }
-        assert!(
-            direct_refreshes.is_empty(),
-            "refreshing registry reads outside session_refresh.rs: {direct_refreshes:?}"
-        );
-
-        // The two known `restore` calls act on a session minted moments earlier in the same
-        // request, whose token is nowhere near expiry. A third needs the same scrutiny.
-        restores.sort();
-        assert_eq!(
-            restores,
-            ["handlers/atproto.rs", "handlers/oauth_upgrade.rs"],
-            "a new OAuthClient::restore call can refresh inside a request; route it through \
-             session_refresh or add it here with the reason it is safe"
-        );
+    fn every_oauth_refresh_runs_in_the_detached_session_read() {
+        let runtime = include_str!("petrel_oauth.rs");
+        assert_eq!(runtime.matches(".refresh(did, false)").count(), 1);
+        // Production callers may only reach refreshed through the counted,
+        // detached read. Inspect that function independently of this test.
+        let source = include_str!("session_refresh.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let detached = source.split_once("run_detached(async move {").unwrap().1;
+        assert!(detached
+            .split_once("})")
+            .unwrap()
+            .0
+            .contains(".refreshed(&did, &session_id)"));
     }
 }

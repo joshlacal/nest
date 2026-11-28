@@ -173,7 +173,7 @@ fn validate_post_uri(uri: &str) -> Result<()> {
     let did = parts
         .next()
         .ok_or_else(|| anyhow!("thread_evidence_post_uri"))?;
-    jacquard_common::types::did::Did::new(did).map_err(|_| anyhow!("thread_evidence_post_uri"))?;
+    petrel_core::Did::parse(did).map_err(|_| anyhow!("thread_evidence_post_uri"))?;
     ensure!(
         parts.next() == Some(POST),
         "thread_evidence_post_collection"

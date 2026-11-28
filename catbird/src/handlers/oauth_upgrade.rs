@@ -75,7 +75,7 @@ fn verify_session_bearer(headers: &HeaderMap, expected_session_id: Uuid) -> AppR
 
     Ok(())
 }
-/// Resolve the identifier passed to `jacquard_client.start_auth`.
+/// Resolve the identifier passed to `oauth_client.start_auth`.
 ///
 /// In release builds (`!debug_assertions`), this is always the validated `session_pds_url`.
 /// In debug builds, allows an environment-provided `CATBIRD_TEST_OAUTH_IDENTIFIER` if it is
@@ -84,7 +84,7 @@ pub(crate) fn resolve_oauth_identifier(session_pds_url: &str) -> String {
     #[cfg(debug_assertions)]
     {
         if let Ok(env_id) = std::env::var("CATBIRD_TEST_OAUTH_IDENTIFIER") {
-            if jacquard_common::types::did::Did::new(env_id.as_str()).is_ok() {
+            if petrel_core::Did::parse(env_id.as_str()).is_ok() {
                 return env_id;
             }
         }
@@ -241,8 +241,8 @@ pub async fn upgrade_start(
         ));
     }
     let has_atproto = session.granted_scopes.iter().any(|s| {
-        jacquard_oauth::scopes::Scope::<smol_str::SmolStr>::parse(s)
-            .map(|sc| matches!(sc, jacquard_oauth::scopes::Scope::Atproto))
+        crate::services::gateway_scope::Scope::parse(s)
+            .map(|sc| matches!(sc, crate::services::gateway_scope::Scope::Atproto))
             .unwrap_or(false)
     });
     if !has_atproto {
@@ -287,24 +287,24 @@ pub async fn upgrade_start(
         .await
         .map_err(map_upgrade_error)?;
 
-    // 7. Parse explicit combined scope vector for Jacquard AuthorizeOptions
+    // 7. Parse explicit combined scope vector for the authorization request
     let parsed_scopes = OAuthConfig::parse_and_validate_scopes(&start_result.requested_scopes)
         .map_err(|e| {
             tracing::error!(
-                category = "jacquard",
+                category = "oauth",
                 error = %e,
-                "Failed to parse requested scopes for Jacquard authorization"
+                "Failed to parse requested scopes for Petrel authorization"
             );
             AppError::Internal("OAuth upgrade operation failed".into())
         })?;
 
-    let jacquard_client = state
+    let oauth_client = state
         .oauth_client_for_profile(&start_result.oauth_profile)
         .ok_or_else(|| {
             tracing::error!(
-                category = "jacquard",
+                category = "oauth",
                 oauth_profile = %start_result.oauth_profile,
-                "Jacquard OAuthClient not initialized for session profile"
+                "OAuth client not initialized for session profile"
             );
             AppError::Internal("OAuth upgrade operation failed".into())
         })?;
@@ -313,7 +313,7 @@ pub async fn upgrade_start(
         None
     } else {
         Some(
-            jacquard_common::deps::fluent_uri::Uri::parse(state.config.oauth.redirect_uri.as_str())
+            url::Url::parse(state.config.oauth.redirect_uri.as_str())
                 .map_err(|e| {
                     tracing::error!(
                         category = "url_parse",
@@ -334,7 +334,7 @@ pub async fn upgrade_start(
     // `AuthorizeOptions`, so the request is built per call. See
     // `services::oauth_authorize`.
     let auth_url = match crate::services::oauth_authorize::start_auth_with_raw_scopes(
-        jacquard_client,
+        oauth_client,
         &auth_identifier,
         &parsed_scopes,
         &start_result.requested_scopes,
@@ -346,9 +346,9 @@ pub async fn upgrade_start(
         Ok(auth_url) => auth_url,
         Err(err) => {
             tracing::error!(
-                category = "jacquard",
+                category = "oauth",
                 error = %err,
-                "Jacquard authorization initiation failed during OAuth upgrade"
+                "OAuth authorization initiation failed during OAuth upgrade"
             );
             if let Err(cleanup_err) = upgrade_service.cancel_or_deny_flow(&flow_state).await {
                 tracing::error!(
@@ -499,11 +499,10 @@ pub async fn upgrade_commit(
     }
 
     // 5. Verify candidate session is still active (detect if concurrent logout won race)
-    let parsed_did = jacquard_common::types::did::Did::new(receipt.did.as_str())
+    let parsed_did = petrel_core::Did::parse(receipt.did.as_str())
         .map_err(|e| AppError::Internal(format!("Invalid DID in upgrade receipt: {e}")))?;
 
     let is_candidate_active = if let Some(store) = &state.auth_store {
-        use jacquard_oauth::authstore::ClientAuthStore;
         store
             .get_session(&parsed_did, &receipt.candidate_session_id)
             .await
@@ -530,33 +529,20 @@ pub async fn upgrade_commit(
         );
 
         // Compensation 1: Revoke candidate session at Auth server (remote)
-        if let Some(jacquard_client) = state.oauth_client_for_profile(&receipt.oauth_profile) {
-            let revoked = match jacquard_client
-                .restore(&parsed_did, &receipt.candidate_session_id)
-                .await
-            {
-                Ok(oauth_session) => oauth_session.logout().await.map_err(|e| e.to_string()),
-                Err(e) => {
-                    tracing::warn!(
-                        did = %receipt.did,
-                        candidate_fp = %candidate_fp,
-                        error = %e,
-                        "Could not restore candidate OAuthSession for remote revocation during compensation"
-                    );
-                    Err("missing candidate OAuthSession".to_string())
-                }
-            };
+        if let Some(oauth_client) = state.oauth_client_for_profile(&receipt.oauth_profile) {
+            let revoked = oauth_client
+                .revoke(&parsed_did, &receipt.candidate_session_id)
+                .await;
             if let Err(e) = revoked {
                 tracing::warn!(
                     did = %receipt.did,
                     candidate_fp = %candidate_fp,
                     error = %e,
-                    "Best-effort candidate Jacquard revocation failed during compensation"
+                    "Best-effort candidate OAuth revocation failed during compensation"
                 );
             }
         }
         if let Some(store) = &state.auth_store {
-            use jacquard_oauth::authstore::ClientAuthStore;
             let _ = store
                 .delete_session(&parsed_did, &receipt.candidate_session_id)
                 .await;
@@ -953,7 +939,7 @@ mod tests {
         let guard = EnvVarGuard::new("CATBIRD_TEST_OAUTH_IDENTIFIER");
         guard.remove();
 
-        // Progressive upgrade uses authenticated session.pds_url for Jacquard authorization
+        // Progressive upgrade uses authenticated session.pds_url for Petrel authorization
         // rather than resolving session.did, avoiding resolver drift.
         let pds_url = "https://pds.example.com";
         let did = "did:plc:test12345";
@@ -1057,7 +1043,7 @@ mod tests {
         assert_ne!(old_session, candidate_session);
         assert!(Uuid::parse_str(&old_session).is_ok());
         assert!(Uuid::parse_str(&candidate_session).is_ok());
-        assert!(jacquard_common::types::did::Did::new(did).is_ok());
+        assert!(petrel_core::Did::parse(did).is_ok());
 
         // Inactive candidate error invariant: maps to Unauthorized
         let err = AppError::Unauthorized("Session was logged out during upgrade".into());

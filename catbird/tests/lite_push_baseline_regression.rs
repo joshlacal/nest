@@ -118,7 +118,7 @@ impl Fixture {
         eprintln!("Baseline regression fixture retained in disposable cluster: {name}");
         let auth_store = cleanup_auth::store().await;
         let bearer = Uuid::new_v4().to_string();
-        use jacquard_oauth::authstore::ClientAuthStore;
+
         auth_store
             .upsert_session(cleanup_auth::grant(DID, &bearer, "http://127.0.0.1:9"))
             .await
@@ -184,8 +184,8 @@ impl Fixture {
             redis,
             push_db: Some(self.pool.clone()),
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],

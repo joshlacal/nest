@@ -681,7 +681,7 @@ impl MlsAuthService {
         body: Option<bytes::Bytes>,
         content_type: Option<&str>,
         device_id_override: Option<&str>,
-        dpop_data: Option<&crate::middleware::JacquardDpopData>,
+        dpop_data: Option<&crate::middleware::SessionDpopData>,
     ) -> AppResult<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
         let service_url = self
             .service_url()
@@ -1099,8 +1099,8 @@ mod tests {
             redis,
             push_db: None,
             key_store: None,
-            jacquard_client: None,
-            catmos_jacquard_client: None,
+            oauth_client: None,
+            catmos_oauth_client: None,
             catmos_oauth_scopes: vec![],
             catmos_oauth_upgrade_scopes: vec![],
             trusted_proxies: vec![],
@@ -1131,7 +1131,7 @@ mod tests {
         let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
         let crypto_key = jose_jwk::crypto::Key::from(secret_key);
         let dpop_key = jose_jwk::Key::from(&crypto_key);
-        let dpop_data = crate::middleware::JacquardDpopData {
+        let dpop_data = crate::middleware::SessionDpopData {
             dpop_key,
             dpop_host_nonce: String::new(),
         };

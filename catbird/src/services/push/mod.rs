@@ -27,7 +27,7 @@ use sqlx::{Pool, Postgres, Row};
 use crate::{
     config::{AppState, PushConfig},
     error::AppError,
-    middleware::JacquardDpopData,
+    middleware::SessionDpopData,
     models::CatbirdSession,
 };
 
@@ -1179,8 +1179,8 @@ pub(crate) async fn resolve_background_session(
     account_did: &str,
     session_id: &str,
     pds_url: &str,
-) -> Result<(CatbirdSession, JacquardDpopData)> {
-    use jacquard_common::types::did::Did;
+) -> Result<(CatbirdSession, SessionDpopData)> {
+    use petrel_core::Did;
 
     let auth_store = state
         .auth_store
@@ -1196,19 +1196,23 @@ pub(crate) async fn resolve_background_session(
     let profile = state
         .session_oauth_profile(account_did, session_data.session_id.as_str())
         .await;
-    let jacquard_client = state
+    let oauth_client = state
         .oauth_client_for_profile(&profile)
-        .ok_or_else(|| anyhow!("Jacquard client not configured"))?;
-    let did = Did::new(account_did)
+        .ok_or_else(|| anyhow!("OAuth client not configured"))?;
+    let did = Did::parse(account_did)
         .map_err(|err| anyhow!("Invalid DID in push background session: {}", err))?;
     let session_data = crate::services::session_refresh::get_refreshed_session(
-        jacquard_client,
+        oauth_client,
         did.as_str(),
         session_data.session_id.as_str(),
     )
     .await
     .map_err(|err| {
-        anyhow!("Jacquard session lookup/refresh failed for DID {account_did}: {err}")
+        if err.is_permanent() {
+            anyhow!("invalid_grant")
+        } else {
+            anyhow!("OAuth session refresh is temporarily unavailable: {err}")
+        }
     })?;
     let expires_at = session_data
         .token_set
@@ -1218,30 +1222,15 @@ pub(crate) async fn resolve_background_session(
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(3600));
 
-    let dpop = JacquardDpopData {
+    let dpop = SessionDpopData {
         dpop_key: session_data.dpop_data.dpop_key.clone(),
         dpop_host_nonce: session_data.dpop_data.dpop_host_nonce.to_string(),
     };
 
-    let granted_scopes: Vec<String> = if !session_data.scopes.is_empty() {
-        session_data
-            .scopes
-            .iter()
-            .map(|s| s.to_string_normalized().to_string())
-            .collect()
-    } else if let Some(scope_str) = &session_data.token_set.scope {
-        jacquard_oauth::scopes::Scopes::new(smol_str::SmolStr::from(scope_str.as_str()))
-            .map(|scopes| {
-                scopes
-                    .iter()
-                    .map(|s| s.to_string_normalized().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
+    let granted_scopes = crate::middleware::auth::validate_authoritative_granted_scopes(
+        &session_data.scopes,
+        session_data.token_set.scope.as_deref(),
+    )?;
     let raw_session_uuid = uuid::Uuid::parse_str(session_data.session_id.as_str())
         .unwrap_or_else(|_| uuid::Uuid::new_v4());
 
@@ -1263,6 +1252,7 @@ pub(crate) async fn resolve_background_session(
             .unwrap_or_default(),
         scopes: session_data
             .scopes
+            .raw_scopes()
             .iter()
             .map(|scope| scope.to_string())
             .collect(),
@@ -1296,7 +1286,7 @@ pub(crate) fn is_auth_revocation_error(err: &anyhow::Error) -> bool {
         || message.contains("no refresh token")
         || message.contains("no per-session oauth data")
         || message.contains("session expired")
-        // Jacquard phrases a missing session as "session does not exist".
+        // The legacy error classifies a missing session as "session does not exist".
         // Without this the event is rescheduled forever, because the session
         // is never coming back.
         || message.contains("session does not exist")
@@ -1350,7 +1340,7 @@ mod terminal_failure_tests {
     fn session_does_not_exist_is_auth_revocation() {
         // Observed verbatim in production: 57 occurrences in six minutes,
         // each one rescheduled forever because this phrasing was not matched.
-        let err = anyhow::anyhow!("Jacquard session lookup failed: session does not exist");
+        let err = anyhow::anyhow!("OAuth session lookup failed: session does not exist");
         assert!(is_auth_revocation_error(&err));
     }
 
@@ -1399,11 +1389,11 @@ mod terminal_failure_tests {
     #[test]
     fn registry_refresh_error_phrasings_match_auth_revocation() {
         for err_msg in [
-            "Jacquard session lookup/refresh failed for DID did:plc:alice: invalid_grant",
-            "Jacquard session lookup/refresh failed for DID did:plc:alice: session does not exist",
-            "Jacquard session lookup/refresh failed for DID did:plc:alice: invalid_token",
-            "Jacquard session lookup/refresh failed for DID did:plc:alice: session expired",
-            "Jacquard session lookup/refresh failed for DID did:plc:alice: no refresh token",
+            "OAuth session lookup/refresh failed for DID did:plc:alice: invalid_grant",
+            "OAuth session lookup/refresh failed for DID did:plc:alice: session does not exist",
+            "OAuth session lookup/refresh failed for DID did:plc:alice: invalid_token",
+            "OAuth session lookup/refresh failed for DID did:plc:alice: session expired",
+            "OAuth session lookup/refresh failed for DID did:plc:alice: no refresh token",
         ] {
             let err = anyhow::anyhow!("{err_msg}");
             assert!(

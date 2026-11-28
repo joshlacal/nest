@@ -17,7 +17,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use atproto_spaces::tokens::{SpaceSigningKey, SpaceVerifyingKey};
+use petrel::crypto::{ATProtoJWTVerificationKey as SpaceVerifyingKey, ATProtoKeyCurve, PublicKey};
+fn verifying_key(secret: &p256::SecretKey) -> SpaceVerifyingKey {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    let key = secret.public_key().to_encoded_point(true);
+    SpaceVerifyingKey::from_public_key(
+        &PublicKey::from_sec1(ATProtoKeyCurve::P256, key.as_bytes()).unwrap(),
+    )
+}
 use axum::{
     body::{to_bytes, Body},
     extract::State,
@@ -37,12 +44,12 @@ use catbird::{
         UserDeliveryService, UserDeliveryServiceError,
     },
 };
-use catbird_atproto::generated::blue_catbird::push::register_key::{
-    RegisterKey, RegisterKeyPlatform,
-};
 use chrono::Utc;
 use p256::ecdsa::{
     signature::Signer as _, Signature as P256Signature, SigningKey as P256SigningKey,
+};
+use petrel_catbird::generated::blue::catbird::push::register_key::{
+    Input as RegisterKey, InputPlatform as RegisterKeyPlatform,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -261,23 +268,17 @@ impl TestGatewayEnv {
             [
                 (
                     "did:plc:alicecatbird000000000001",
-                    SpaceSigningKey::from_p256_secret(&alice_atproto_secret, "#atproto")
-                        .verifying_key(),
+                    verifying_key(&alice_atproto_secret),
                 ),
                 (
                     "did:web:chat.catbird.blue",
-                    SpaceSigningKey::from_p256_secret(&catbird_ds_secret, "#atproto")
-                        .verifying_key(),
+                    verifying_key(&catbird_ds_secret),
                 ),
                 (
                     "did:web:mls.bob-home.org",
-                    SpaceSigningKey::from_p256_secret(&self_hosted_ds_secret, "#atproto")
-                        .verifying_key(),
+                    verifying_key(&self_hosted_ds_secret),
                 ),
-                (
-                    "did:web:evil-ds.example",
-                    SpaceSigningKey::from_p256_secret(&evil_ds_secret, "#atproto").verifying_key(),
-                ),
+                ("did:web:evil-ds.example", verifying_key(&evil_ds_secret)),
             ],
         );
 
@@ -354,7 +355,6 @@ async fn authorized_wake_delivers_nest_owned_aps_and_supports_self_hosted_ds() {
             device_id: device_id.clone().into(),
             native_token: native_token.into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -362,7 +362,7 @@ async fn authorized_wake_delivers_nest_owned_aps_and_supports_self_hosted_ds() {
 
     assert_eq!(reg_out.app_id.as_str(), "blue.catbird");
     assert_eq!(
-        reg_out.gateway_url.as_ref(),
+        reg_out.gateway_url.as_str(),
         "https://api.catbird.blue/xrpc/blue.catbird.push.deliver"
     );
     assert_eq!(
@@ -478,7 +478,6 @@ async fn authorized_wake_delivers_nest_owned_aps_and_supports_self_hosted_ds() {
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "fcm_token_bob_1234567890".into(),
             platform: RegisterKeyPlatform::Fcm,
-            extra_data: None,
         }),
     )
     .await
@@ -540,7 +539,6 @@ async fn wrong_caller_ds_did_and_unknown_keys_return_uniform_202_with_zero_apns_
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "0123456789abcdef0123456789abcdef".into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -655,7 +653,6 @@ async fn replayed_jti_and_tampered_body_fail_with_401() {
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "0123456789abcdef0123456789abcdef".into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -760,7 +757,6 @@ async fn oversized_ciphertext_2201_bytes_and_injected_display_fields_return_400(
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "0123456789abcdef0123456789abcdef".into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -857,7 +853,6 @@ async fn unregistered_token_returns_410_only_to_authorized_ds_and_202_to_unautho
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "dead_apns_token_0123456789abcdef".into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -980,7 +975,6 @@ async fn rate_bucket_enforces_burst_10_and_blocks_cross_ds_bucket_exhaustion() {
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "0123456789abcdef0123456789abcdef".into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -1128,7 +1122,6 @@ async fn register(
             device_id: device_id.to_string().into(),
             native_token: token.to_string().into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
@@ -1481,7 +1474,6 @@ async fn try_register(env: &TestGatewayEnv, account: &str) -> Result<String, (St
             device_id: Uuid::new_v4().to_string().into(),
             native_token: "0123456789abcdef0123456789abcdef".into(),
             platform: RegisterKeyPlatform::Apns,
-            extra_data: None,
         }),
     )
     .await
