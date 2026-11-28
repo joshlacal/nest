@@ -3,41 +3,54 @@
 //! Validates that generated types match Lexicon definitions and serialize/deserialize
 //! with exact camelCase fields and typed descriptors, preventing field drift.
 
-use catbird_atproto::generated::blue_catbird::circle::activate_circle::{
-    ActivateCircle, ActivateCircleOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::get_capabilities::GetCapabilitiesOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_feed::{GetFeed, GetFeedOutput};
-use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThread;
-use catbird_atproto::generated::blue_catbird::circle::list_circles::{
-    ListCircles, ListCirclesOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::list_notifications::{
-    ListNotifications, ListNotificationsOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::report_record::{
-    ReportRecord, ReportRecordReason,
-};
-use catbird_atproto::generated::blue_catbird::circle::update_preferences::{
-    UpdatePreferences, UpdatePreferencesOutput,
-};
-use catbird_atproto::generated::blue_catbird::circle::{CircleSummary, NotificationReason};
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
-use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Did, Tid};
+use petrel_catbird::generated::blue::catbird::circle::activate_circle::Input as ActivateCircle;
+use petrel_catbird::generated::blue::catbird::circle::activate_circle::Output as ActivateCircleOutput;
+use petrel_catbird::generated::blue::catbird::circle::defs::CircleSummary;
+use petrel_catbird::generated::blue::catbird::circle::defs::NotificationReason;
+use petrel_catbird::generated::blue::catbird::circle::get_capabilities::Output as GetCapabilitiesOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Parameters as GetFeed;
+use petrel_catbird::generated::blue::catbird::circle::get_media::Parameters as GetMedia;
+use petrel_catbird::generated::blue::catbird::circle::get_post_thread::Parameters as GetPostThread;
+use petrel_catbird::generated::blue::catbird::circle::list_circles::Output as ListCirclesOutput;
+use petrel_catbird::generated::blue::catbird::circle::list_circles::Parameters as ListCircles;
+use petrel_catbird::generated::blue::catbird::circle::list_notifications::Output as ListNotificationsOutput;
+use petrel_catbird::generated::blue::catbird::circle::list_notifications::Parameters as ListNotifications;
+use petrel_catbird::generated::blue::catbird::circle::report_record::Input as ReportRecord;
+use petrel_catbird::generated::blue::catbird::circle::report_record::InputReason as ReportRecordReason;
+use petrel_catbird::generated::blue::catbird::circle::update_preferences::Input as UpdatePreferences;
+use petrel_catbird::generated::blue::catbird::circle::update_preferences::Output as UpdatePreferencesOutput;
+use petrel_core::AtUri;
+use petrel_core::CidString as Cid;
+use petrel_core::Did;
+use petrel_core::SpaceRef;
+use petrel_core::Tid;
 use serde_json::json;
+
+/// A raw-codec CID (the form a blob reference carries).
+const BLOB_CID: &str = "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
+
+/// Query parameters as the client sends them, keyed by wire name.
+fn query_map<P: petrel_core::ToQueryParams>(
+    params: &P,
+) -> std::collections::BTreeMap<&'static str, String> {
+    let mut out = Vec::new();
+    params.to_query_params(&mut out);
+    out.into_iter().collect()
+}
+
+/// Encode then decode query parameters the way a client and this server do.
+fn round_trip<P: petrel_core::ToQueryParams + petrel_core::FromQueryParams>(params: &P) -> P {
+    let mut out = Vec::new();
+    params.to_query_params(&mut out);
+    let pairs: Vec<(&str, &str)> = out.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    P::from_query_params(&pairs).unwrap()
+}
 
 #[test]
 fn test_activate_circle_contract_serialization() {
-    let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
-    ))
-    .unwrap();
-    let input = ActivateCircle {
-        space: space_uri,
-        extra_data: None,
-    };
+    let space_uri = SpaceRef::parse("at:space/did:plc:alice/blue.catbird.circle/3l7skey").unwrap();
+    let input = ActivateCircle { space: space_uri };
 
     let serialized = serde_json::to_value(&input).unwrap();
     assert_eq!(
@@ -55,13 +68,10 @@ fn test_activate_circle_contract_serialization() {
 #[test]
 fn test_activate_circle_output_contract() {
     let circle_summary = CircleSummary {
-        circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
-        uri: AtSpaceUri::new(SmolStr::new(
-            "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
-        ))
-        .unwrap(),
-        name: SmolStr::new("Test Circle"),
-        owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
+        circle_id: Tid::parse("3l7aaaaaaaaaa").unwrap(),
+        uri: SpaceRef::parse("at:space/did:plc:alice/blue.catbird.circle/3l7skey").unwrap(),
+        name: String::from("Test Circle"),
+        owner: Did::parse("did:plc:alice").unwrap(),
         member_count: Some(5),
         latest_key_version: None,
         muted: Some(false),
@@ -70,7 +80,6 @@ fn test_activate_circle_output_contract() {
 
     let output = ActivateCircleOutput {
         circle: circle_summary,
-        extra_data: None,
     };
 
     let serialized = serde_json::to_value(&output).unwrap();
@@ -87,13 +96,10 @@ fn test_activate_circle_output_contract() {
 #[test]
 fn test_circle_summary_contract() {
     let summary = CircleSummary {
-        circle_id: Tid::new(SmolStr::new("3l7aaaaaaaaaa")).unwrap(),
-        uri: AtSpaceUri::new(SmolStr::new(
-            "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
-        ))
-        .unwrap(),
-        name: SmolStr::new("Alice's Inner Circle"),
-        owner: Did::new(SmolStr::new("did:plc:alice")).unwrap(),
+        circle_id: Tid::parse("3l7aaaaaaaaaa").unwrap(),
+        uri: SpaceRef::parse("at:space/did:plc:alice/blue.catbird.circle/3l7skey").unwrap(),
+        name: String::from("Alice's Inner Circle"),
+        owner: Did::parse("did:plc:alice").unwrap(),
         member_count: Some(42),
         latest_key_version: None,
         muted: Some(true),
@@ -132,8 +138,8 @@ fn test_report_record_reason_open_union() {
     // Open union: unknown value deserializes into UnknownValue
     let reason_unknown: ReportRecordReason = serde_json::from_value(json!("harassment")).unwrap();
     match reason_unknown {
-        ReportRecordReason::UnknownValue(val) => assert_eq!(val.as_str(), "harassment"),
-        _ => panic!("Expected UnknownValue"),
+        ReportRecordReason::Unknown(val) => assert_eq!(val.as_str(), "harassment"),
+        _ => panic!("Expected Unknown"),
     }
 }
 
@@ -151,7 +157,7 @@ fn test_notification_reason_open_union() {
     // Open union: unknown value deserializes into Other
     let reason_custom: NotificationReason = serde_json::from_value(json!("mention")).unwrap();
     match reason_custom {
-        NotificationReason::Other(val) => assert_eq!(val.as_str(), "mention"),
+        NotificationReason::Unknown(val) => assert_eq!(val.as_str(), "mention"),
         _ => panic!("Expected Other"),
     }
 }
@@ -160,10 +166,9 @@ fn test_notification_reason_open_union() {
 fn test_get_capabilities_output_contract() {
     let output = GetCapabilitiesOutput {
         enabled: true,
-        protocol_revision: SmolStr::new("1f510f8e36a973f6fd055da349b586918805ae66"),
+        protocol_revision: String::from("1f510f8e36a973f6fd055da349b586918805ae66"),
         supports_images: false,
         supports_encrypted_posts: None,
-        extra_data: None,
     };
 
     let serialized = serde_json::to_value(&output).unwrap();
@@ -177,28 +182,25 @@ fn test_get_capabilities_output_contract() {
 
 #[test]
 fn test_get_feed_query_and_output_contract() {
-    let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
-    ))
-    .unwrap();
+    let space_uri = SpaceRef::parse("at:space/did:plc:alice/blue.catbird.circle/3l7skey").unwrap();
     let query = GetFeed {
-        cursor: Some(SmolStr::new("cursor123")),
+        cursor: Some(String::from("cursor123")),
         include_encrypted: None,
-        limit: Some(25),
+        limit: 25,
         space: Some(space_uri),
     };
-    let serialized = serde_json::to_value(&query).unwrap();
+    let serialized = query_map(&query);
     assert_eq!(
         serialized["space"],
         "at:space/did:plc:alice/blue.catbird.circle/3l7skey"
     );
-    assert_eq!(serialized["limit"], 25);
+    assert_eq!(serialized["limit"], "25");
     assert_eq!(serialized["cursor"], "cursor123");
+    assert_eq!(round_trip(&query), query);
 
     let output = GetFeedOutput {
-        cursor: Some(SmolStr::new("next_cursor")),
+        cursor: Some(String::from("next_cursor")),
         feed: Vec::new(),
-        extra_data: None,
     };
     let out_ser = serde_json::to_value(&output).unwrap();
     assert_eq!(out_ser["cursor"], "next_cursor");
@@ -208,17 +210,17 @@ fn test_get_feed_query_and_output_contract() {
 #[test]
 fn test_list_circles_query_and_output_contract() {
     let query = ListCircles {
-        cursor: Some(SmolStr::new("cursor_c")),
-        limit: Some(10),
+        cursor: Some(String::from("cursor_c")),
+        limit: 10,
     };
-    let serialized = serde_json::to_value(&query).unwrap();
-    assert_eq!(serialized["limit"], 10);
+    let serialized = query_map(&query);
+    assert_eq!(serialized["limit"], "10");
     assert_eq!(serialized["cursor"], "cursor_c");
+    assert_eq!(round_trip(&query), query);
 
     let output = ListCirclesOutput {
         circles: Vec::new(),
-        cursor: Some(SmolStr::new("next_cursor_c")),
-        extra_data: None,
+        cursor: Some(String::from("next_cursor_c")),
     };
     let out_ser = serde_json::to_value(&output).unwrap();
     assert_eq!(out_ser["cursor"], "next_cursor_c");
@@ -228,17 +230,17 @@ fn test_list_circles_query_and_output_contract() {
 #[test]
 fn test_list_notifications_query_and_output_contract() {
     let query = ListNotifications {
-        cursor: Some(SmolStr::new("cursor_n")),
-        limit: Some(20),
+        cursor: Some(String::from("cursor_n")),
+        limit: 20,
     };
-    let serialized = serde_json::to_value(&query).unwrap();
-    assert_eq!(serialized["limit"], 20);
+    let serialized = query_map(&query);
+    assert_eq!(serialized["limit"], "20");
     assert_eq!(serialized["cursor"], "cursor_n");
+    assert_eq!(round_trip(&query), query);
 
     let output = ListNotificationsOutput {
-        cursor: Some(SmolStr::new("next_cursor_n")),
+        cursor: Some(String::from("next_cursor_n")),
         notifications: Vec::new(),
-        extra_data: None,
     };
     let out_ser = serde_json::to_value(&output).unwrap();
     assert_eq!(out_ser["cursor"], "next_cursor_n");
@@ -247,55 +249,44 @@ fn test_list_notifications_query_and_output_contract() {
 
 #[test]
 fn test_get_media_and_post_thread_contract() {
-    let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
-    ))
-    .unwrap();
-    let aturi = AtUri::new(SmolStr::new(
-        "at://did:plc:alice/app.bsky.feed.post/3l7rkey",
-    ))
-    .unwrap();
-    let did = Did::new(SmolStr::new("did:plc:alice")).unwrap();
+    let space_uri = SpaceRef::parse("at:space/did:plc:alice/blue.catbird.circle/3l7skey").unwrap();
+    let aturi = AtUri::parse("at://did:plc:alice/app.bsky.feed.post/3l7rkey").unwrap();
+    let did = Did::parse("did:plc:alice").unwrap();
     let media = GetMedia {
-        cid: Cid::new(b"bafkreibblob").unwrap(),
+        cid: Cid::parse(BLOB_CID).unwrap(),
         did,
         space: space_uri.clone(),
     };
-    let media_ser = serde_json::to_value(&media).unwrap();
-    assert_eq!(media_ser["cid"], "bafkreibblob");
+    let media_ser = query_map(&media);
+    assert_eq!(media_ser["cid"], BLOB_CID);
     assert_eq!(media_ser["did"], "did:plc:alice");
+    assert_eq!(round_trip(&media), media);
 
     let thread_query = GetPostThread {
-        depth: Some(10),
+        depth: 10,
         include_encrypted: None,
-        parent_height: Some(80),
+        parent_height: 80,
         space: space_uri,
         uri: aturi,
     };
-    let thread_ser = serde_json::to_value(&thread_query).unwrap();
-    assert_eq!(thread_ser["depth"], 10);
-    assert_eq!(thread_ser["parentHeight"], 80);
+    let thread_ser = query_map(&thread_query);
+    assert_eq!(thread_ser["depth"], "10");
+    assert_eq!(thread_ser["parentHeight"], "80");
+    assert_eq!(round_trip(&thread_query), thread_query);
 }
 
 #[test]
 fn test_moderation_and_preferences_contract() {
-    let space_uri = AtSpaceUri::new(SmolStr::new(
-        "at:space/did:plc:alice/blue.catbird.circle/3l7skey",
-    ))
-    .unwrap();
-    let aturi = AtUri::new(SmolStr::new(
-        "at://did:plc:alice/app.bsky.feed.post/3l7rkey",
-    ))
-    .unwrap();
+    let space_uri = SpaceRef::parse("at:space/did:plc:alice/blue.catbird.circle/3l7skey").unwrap();
+    let aturi = AtUri::parse("at://did:plc:alice/app.bsky.feed.post/3l7rkey").unwrap();
 
     let report = ReportRecord {
-        details: Some(SmolStr::new("Inappropriate content")),
+        details: Some(String::from("Inappropriate content")),
         reason: ReportRecordReason::Abuse,
         space: space_uri.clone(),
         uri: aturi,
         disclosed_media: None,
         disclosed_post_key: None,
-        extra_data: None,
     };
     let report_ser = serde_json::to_value(&report).unwrap();
     assert_eq!(report_ser["reason"], "abuse");
@@ -304,15 +295,11 @@ fn test_moderation_and_preferences_contract() {
     let pref = UpdatePreferences {
         muted: true,
         space: space_uri,
-        extra_data: None,
     };
     let pref_ser = serde_json::to_value(&pref).unwrap();
     assert_eq!(pref_ser["muted"], true);
 
-    let pref_out = UpdatePreferencesOutput::<SmolStr> {
-        muted: true,
-        extra_data: None,
-    };
+    let pref_out = UpdatePreferencesOutput { muted: true };
     let pref_out_ser = serde_json::to_value(&pref_out).unwrap();
     assert_eq!(pref_out_ser["muted"], true);
 }

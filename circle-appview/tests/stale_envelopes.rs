@@ -7,11 +7,11 @@ use std::sync::Arc;
 use support::encrypted::{self as enc, cid_of, envelope, envelope_reply, pds};
 use support::encrypted::{CIRCLE_ID, ENCRYPTED_TYPE, KEY, POST};
 
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{Did, Handle};
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::rand_core::OsRng;
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_core::Did;
+use petrel_core::Handle;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -31,8 +31,8 @@ struct Setup {
 
 fn profile(did: &str, handle: &str) -> ProfileViewBasic {
     ProfileViewBasic {
-        did: Did::new(SmolStr::new(did)).unwrap(),
-        handle: Handle::new(SmolStr::new(handle)).unwrap(),
+        did: Did::parse(did).unwrap(),
+        handle: Handle::parse(handle).unwrap(),
         display_name: None,
         avatar: None,
         associated: None,

@@ -5,9 +5,8 @@ use crate::config::AppState;
 use crate::error::{AppError, AuthReason};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::blue_catbird::circle::CircleSummary;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
 use chrono::{DateTime, Utc};
+use petrel_catbird::generated::blue::catbird::circle::defs::CircleSummary;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -381,8 +380,8 @@ pub async fn purge_deleted_space(db: &PgPool, credential_store: &CredentialStore
 }
 
 pub fn extract_authority_did(space_uri: &str) -> Result<String, AppError> {
-    atproto_spaces::SpaceUri::parse_hedged(space_uri)
-        .map(|parsed| parsed.authority)
+    crate::space_uri::parse_lenient(space_uri)
+        .map(|parsed| parsed.space_did().as_str().to_owned())
         .map_err(|e| AppError::InvalidRequest(format!("Invalid Space URI: {e}")))
 }
 
@@ -1195,21 +1194,21 @@ pub async fn activate_circle(
     }
 
     let circle_tid =
-        catbird_atproto::jacquard_common::types::string::Tid::new(SmolStr::new(&circle_id))
+        petrel_core::Tid::parse(&circle_id)
             .map_err(|e| AppError::Internal(format!("Invalid circle TID: {e}")))?;
 
     let space_ref =
-        catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new(SmolStr::new(space_uri))
+        petrel_core::SpaceRef::parse(space_uri)
             .map_err(|e| AppError::Internal(format!("Invalid space URI: {e}")))?;
 
     let owner_did =
-        catbird_atproto::jacquard_common::types::string::Did::new(SmolStr::new(&authority_did))
+        petrel_core::Did::parse(&authority_did)
             .map_err(|e| AppError::Internal(format!("Invalid owner DID: {e}")))?;
 
         Ok(CircleSummary {
             circle_id: circle_tid,
             uri: space_ref,
-            name: SmolStr::new(&display_name),
+            name: String::from(&display_name),
             owner: owner_did,
             member_count: Some(members.len() as i64),
             muted: Some(false),
@@ -2668,16 +2667,16 @@ mod tests {
         };
 
         let mut lthash = LtHash::default();
-        lthash.add(&format!(
-            "{}/{}/{}",
-            rec_meta.collection, rec_meta.rkey, rec_meta.cid
-        ));
+        lthash.add_entry(
+            &format!("{}/{}", rec_meta.collection, rec_meta.rkey),
+            &rec_meta.cid,
+        );
         let mut records = vec![rec_meta];
         if with_post {
-            lthash.add(&format!(
-                "{}/{}/{}",
-                rec_post.collection, rec_post.rkey, rec_post.cid
-            ));
+            lthash.add_entry(
+                &format!("{}/{}", rec_post.collection, rec_post.rkey),
+                &rec_post.cid,
+            );
             records.push(rec_post);
         }
 
@@ -2685,7 +2684,7 @@ mod tests {
             space_uri,
             TEST_AUTHORITY_DID,
             "3l7rev234567a",
-            &lthash.state(),
+            lthash.state(),
         );
 
         let car_bytes = fixture_star(&commit, &records).unwrap();
@@ -2941,16 +2940,16 @@ mod tests {
         };
 
         let mut lthash = LtHash::default();
-        lthash.add(&format!(
-            "{}/{}/{}",
-            rec_post.collection, rec_post.rkey, rec_post.cid
-        ));
+        lthash.add_entry(
+            &format!("{}/{}", rec_post.collection, rec_post.rkey),
+            &rec_post.cid,
+        );
 
         let commit = fixture_commit(
             TEST_SPACE_URI,
             TEST_AUTHORITY_DID,
             "3l7rev234567a",
-            &lthash.state(),
+            lthash.state(),
         );
 
         let car_bytes = fixture_star(&commit, &[rec_post]).unwrap();

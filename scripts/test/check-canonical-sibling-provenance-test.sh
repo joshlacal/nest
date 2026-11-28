@@ -71,9 +71,9 @@ manifest_case wrong-circle-lock "s/^CIRCLE_APPVIEW_LOCK_SHA256=.*/CIRCLE_APPVIEW
 copy_checkout "$fixture/ws/redirected"
 ln -s "$sibling" "$fixture/ws/catbird-atproto-alt"
 sed 's#"\.\./\.\./catbird-atproto#"../../catbird-atproto-alt#g' \
-  "$fixture/ws/redirected/circle-appview/Cargo.toml" >"$fixture/ws/redirected/circle-appview/Cargo.toml.tmp"
-mv "$fixture/ws/redirected/circle-appview/Cargo.toml.tmp" "$fixture/ws/redirected/circle-appview/Cargo.toml"
-if cmp -s "$fixture/ws/redirected/circle-appview/Cargo.toml" "$repo_root/circle-appview/Cargo.toml"; then
+  "$fixture/ws/redirected/catbird/Cargo.toml" >"$fixture/ws/redirected/catbird/Cargo.toml.tmp"
+mv "$fixture/ws/redirected/catbird/Cargo.toml.tmp" "$fixture/ws/redirected/catbird/Cargo.toml"
+if cmp -s "$fixture/ws/redirected/catbird/Cargo.toml" "$repo_root/catbird/Cargo.toml"; then
   printf 'redirect case did not change the manifest\n' >&2
   exit 1
 fi

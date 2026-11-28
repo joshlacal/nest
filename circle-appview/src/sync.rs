@@ -471,7 +471,7 @@ impl SyncEngine {
         let (last_rev, mut lthash) = match &existing_sync {
             Some((rev, hash_bytes)) if hash_bytes.len() == LTHASH_SIZE => (
                 Some(rev.clone()),
-                LtHash::from_state(hash_bytes).unwrap_or_default(),
+                crate::commit::lthash_from_state(hash_bytes).unwrap_or_default(),
             ),
             _ => (None, LtHash::default()),
         };
@@ -592,7 +592,7 @@ impl SyncEngine {
                 ops_applied += 1;
 
                 let collection_str = op.collection.as_str();
-                let rkey_str = op.rkey.0.as_str();
+                let rkey_str = op.rkey.as_str();
                 let uri = format!("{space_uri}/{author_did}/{collection_str}/{rkey_str}");
 
                 if let Some(cid) = &op.cid {
@@ -618,7 +618,7 @@ impl SyncEngine {
                         fetch_failed = true;
                         break;
                     }
-                    let val_bytes = match serde_ipld_dagcbor::to_vec(data_val) {
+                    let val_bytes = match crate::commit::encode_dagcbor(data_val) {
                         Ok(b) => b,
                         Err(_) => {
                             fetch_failed = true;
@@ -629,9 +629,15 @@ impl SyncEngine {
                     self.record_bytes_processed(val_bytes.len());
 
                     if let Some(prev) = &op.prev {
-                        lthash.remove(&format!("{collection_str}/{rkey_str}/{}", prev.as_str()));
+                        lthash.remove_entry(
+                            &crate::commit::record_path(collection_str, rkey_str),
+                            prev.as_str(),
+                        );
                     }
-                    lthash.add(&format!("{collection_str}/{rkey_str}/{cid_str}"));
+                    lthash.add_entry(
+                        &crate::commit::record_path(collection_str, rkey_str),
+                        cid_str,
+                    );
 
                     let candidate_val =
                         serde_json::to_value(data_val).unwrap_or(serde_json::Value::Null);
@@ -665,7 +671,10 @@ impl SyncEngine {
                     }
                 } else {
                     if let Some(prev) = &op.prev {
-                        lthash.remove(&format!("{collection_str}/{rkey_str}/{}", prev.as_str()));
+                        lthash.remove_entry(
+                            &crate::commit::record_path(collection_str, rkey_str),
+                            prev.as_str(),
+                        );
                     }
                     current_policy.remove_post(&uri);
                     staged_mutations.push(StagedMutation::DeleteRecord { uri });
@@ -726,10 +735,11 @@ impl SyncEngine {
         };
 
         let latest_rev = commit_to_verify.rev.to_string();
-        let commit_verified = commit_to_verify.data.as_ref() == lthash.digest().as_slice()
+        let commit_verified = commit_to_verify.data.0.as_slice() == lthash.digest().as_slice()
             && commit_to_verify.space.as_str() == space_uri
             && commit_to_verify.repo.as_str() == author_did
-            && expected_authority_hash.is_none_or(|data| commit_to_verify.data.as_ref() == data)
+            && expected_authority_hash
+                .is_none_or(|data| commit_to_verify.data.0.as_slice() == data)
             && expected_authority_rev.is_none_or(|rev| commit_to_verify.rev.as_str() == rev);
 
         if !commit_verified {
@@ -1246,7 +1256,7 @@ impl SyncEngine {
         }
         // Verify against expected authority hash and rev if provided
         if let Some(expected_hash) = expected_authority_hash {
-            if commit.data.as_ref() != expected_hash {
+            if commit.data.0.as_slice() != expected_hash {
                 return Err(AppError::InvalidRequest(
                     "STAR commit hash does not match expected authority hash".into(),
                 ));

@@ -1,4 +1,16 @@
 **
+!Petrel/rust/
+!Petrel/rust/**
+Petrel/rust/target/
+Petrel/rust/target/**
+Petrel/rust/**/target/
+Petrel/rust/**/target/**
+!PetrelCatbird/rust/petrel-catbird/
+!PetrelCatbird/rust/petrel-catbird/**
+PetrelCatbird/rust/petrel-catbird/target/
+PetrelCatbird/rust/petrel-catbird/target/**
+!PetrelCatbird/lexicons/
+!PetrelCatbird/lexicons/**
 !nest/circle-appview/
 !nest/circle-appview/**
 nest/circle-appview/target/

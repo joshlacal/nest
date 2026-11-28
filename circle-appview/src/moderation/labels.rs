@@ -195,7 +195,7 @@ pub fn account_label_event(
 
 /// Whether a stored (latest) label state restricts the account at `now`.
 pub fn restricts(neg: bool, exp: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    !neg && exp.map_or(true, |exp| exp > now)
+    !neg && exp.is_none_or(|exp| exp > now)
 }
 
 #[cfg(test)]

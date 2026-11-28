@@ -8,20 +8,9 @@ use axum::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::app_bsky::actor::get_profile::GetProfileOutput;
-use catbird_atproto::generated::app_bsky::actor::{
-    ProfileAssociated, ProfileViewBasic, ProfileViewDetailed,
-};
-use catbird_atproto::generated::app_bsky::feed::{ThreadViewPostParent, ThreadViewPostRepliesItem};
-use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
-use catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{Datetime, Did, Handle, UriValue};
 use chrono::{Duration, Utc};
 use circle_appview::{
     auth::{DidDocument, PublicKeyJwk, VerificationMethod},
-    commit::create_cid_bytes_from_data,
     config::{AppState, Config},
     db,
     hydration::ProfileHydrator,
@@ -31,6 +20,17 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::Signature;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::EncodedPoint;
+use petrel_api::generated::app::bsky::actor::defs::ProfileAssociated;
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewDetailed;
+use petrel_api::generated::app::bsky::feed::defs::ThreadViewPostParent;
+use petrel_api::generated::app::bsky::feed::defs::ThreadViewPostReplies;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+use petrel_catbird::generated::blue::catbird::circle::get_post_thread::Output as GetPostThreadOutput;
+use petrel_catbird::generated::blue::catbird::circle::list_circles::Output as ListCirclesOutput;
+use petrel_core::Did;
+use petrel_core::Handle;
+use petrel_core::Uri;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,9 +57,7 @@ struct ViewTestSetup {
     charlie_key: p256::ecdsa::SigningKey,
 }
 fn compute_record_cid(val: &serde_json::Value) -> String {
-    let bytes = serde_ipld_dagcbor::to_vec(val).unwrap();
-    let (_, cid_str) = create_cid_bytes_from_data(&bytes);
-    cid_str
+    circle_appview::commit::compute_dagcbor_cid(val).unwrap()
 }
 fn compute_blob_cid(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -168,9 +166,9 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         .set_cached_profile(
             ALICE_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(ALICE_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("alice.test")).unwrap(),
-                display_name: Some(SmolStr::new("Alice Owner")),
+                did: Did::parse(ALICE_DID).unwrap(),
+                handle: Handle::parse("alice.test").unwrap(),
+                display_name: Some(String::from("Alice Owner")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -190,9 +188,9 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         .set_cached_profile(
             BOB_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(BOB_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("bob.test")).unwrap(),
-                display_name: Some(SmolStr::new("Bob Member")),
+                did: Did::parse(BOB_DID).unwrap(),
+                handle: Handle::parse("bob.test").unwrap(),
+                display_name: Some(String::from("Bob Member")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -212,9 +210,9 @@ async fn setup_views_test(pool: PgPool) -> ViewTestSetup {
         .set_cached_profile(
             CHARLIE_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(CHARLIE_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("charlie.test")).unwrap(),
-                display_name: Some(SmolStr::new("Charlie Nonmember")),
+                did: Did::parse(CHARLIE_DID).unwrap(),
+                handle: Handle::parse("charlie.test").unwrap(),
+                display_name: Some(String::from("Charlie Nonmember")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -1445,7 +1443,7 @@ async fn thread_never_traverses_public_or_other_space_records(pool: PgPool) {
     let replies = thread.thread.replies.expect("Replies must exist");
     assert_eq!(replies.len(), 1, "Only same-space reply must be returned");
     match &replies[0] {
-        ThreadViewPostRepliesItem::ThreadViewPost(tvp) => {
+        ThreadViewPostReplies::ThreadViewPost(tvp) => {
             assert_eq!(
                 tvp.post.uri.as_str(),
                 format!("at://{BOB_DID}/app.bsky.feed.post/3l7same")
@@ -1767,7 +1765,7 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
     let replies = thread.thread.replies.expect("Replies must exist");
     assert_eq!(replies.len(), 1);
     let rep1_node = match &replies[0] {
-        ThreadViewPostRepliesItem::ThreadViewPost(tvp) => tvp,
+        ThreadViewPostReplies::ThreadViewPost(tvp) => tvp,
         _ => panic!("Expected ThreadViewPost"),
     };
     assert_eq!(
@@ -1794,7 +1792,7 @@ async fn thread_child_aggregates_isolate_parent_and_sibling_counts_and_viewer_li
     let rep1_replies = rep1_node.replies.as_ref().expect("Reply 2 must exist");
     assert_eq!(rep1_replies.len(), 1);
     let rep2_node = match &rep1_replies[0] {
-        ThreadViewPostRepliesItem::ThreadViewPost(tvp) => tvp,
+        ThreadViewPostReplies::ThreadViewPost(tvp) => tvp,
         _ => panic!("Expected ThreadViewPost"),
     };
     assert_eq!(rep2_node.post.like_count, Some(0));
@@ -1880,74 +1878,65 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
                 let actor = query.strip_prefix("actor=").unwrap_or("");
 
                 if actor == "did:plc:alice-mock" {
-                    let output = GetProfileOutput {
-                        value: ProfileViewDetailed {
-                            did: Did::new(SmolStr::new("did:plc:alice-mock")).unwrap(),
-                            handle: Handle::new(SmolStr::new("alice.mock")).unwrap(),
-                            display_name: Some(SmolStr::new("Alice Mock")),
-                            avatar: Some(
-                                UriValue::new(SmolStr::new("https://cdn.bsky.app/avatar.jpg"))
-                                    .unwrap(),
-                            ),
-                            associated: Some(ProfileAssociated {
-                                chat: None,
-                                feedgens: None,
-                                labeler: None,
-                                lists: None,
-                                starter_packs: None,
-                                activity_subscription: None,
-                                germ: None,
-                                extra_data: None,
-                            }),
-                            banner: None,
-                            created_at: Some(Datetime::new(Utc::now().into())),
-                            debug: None,
-                            description: None,
-                            followers_count: None,
-                            follows_count: None,
-                            indexed_at: None,
-                            joined_via_starter_pack: None,
-                            labels: None,
-                            links: None,
-                            pinned_post: None,
-                            posts_count: None,
-                            pronouns: Some(SmolStr::new("she/her")),
-                            status: None,
-                            verification: None,
-                            viewer: None,
-                            website: None,
+                    let output = ProfileViewDetailed {
+                        did: Did::parse("did:plc:alice-mock").unwrap(),
+                        handle: Handle::parse("alice.mock").unwrap(),
+                        display_name: Some(String::from("Alice Mock")),
+                        avatar: Some(Uri::parse("https://cdn.bsky.app/avatar.jpg").unwrap()),
+                        associated: Some(ProfileAssociated {
+                            chat: None,
+                            feedgens: None,
+                            labeler: None,
+                            lists: None,
+                            starter_packs: None,
+                            activity_subscription: None,
+                            germ: None,
                             extra_data: None,
-                        },
+                        }),
+                        banner: None,
+                        created_at: circle_appview::datetime::from_utc(Utc::now()),
+                        debug: None,
+                        description: None,
+                        followers_count: None,
+                        follows_count: None,
+                        indexed_at: None,
+                        joined_via_starter_pack: None,
+                        labels: None,
+                        links: None,
+                        pinned_post: None,
+                        posts_count: None,
+                        pronouns: Some(String::from("she/her")),
+                        status: None,
+                        verification: None,
+                        viewer: None,
+                        website: None,
                         extra_data: None,
                     };
                     Json(output).into_response()
                 } else if actor == "did:plc:mismatched" {
-                    let output = GetProfileOutput {
-                        value: ProfileViewDetailed {
-                            did: Did::new(SmolStr::new("did:plc:some-other-did")).unwrap(),
-                            handle: Handle::new(SmolStr::new("other.mock")).unwrap(),
-                            display_name: None,
-                            avatar: None,
-                            associated: None,
-                            banner: None,
-                            created_at: None,
-                            debug: None,
-                            description: None,
-                            followers_count: None,
-                            follows_count: None,
-                            indexed_at: None,
-                            joined_via_starter_pack: None,
-                            labels: None,
-                            links: None,
-                            pinned_post: None,
-                            posts_count: None,
-                            pronouns: None,
-                            status: None,
-                            verification: None,
-                            viewer: None,
-                            website: None,
-                            extra_data: None,
-                        },
+                    let output = ProfileViewDetailed {
+                        did: Did::parse("did:plc:some-other-did").unwrap(),
+                        handle: Handle::parse("other.mock").unwrap(),
+                        display_name: None,
+                        avatar: None,
+                        associated: None,
+                        banner: None,
+                        created_at: None,
+                        debug: None,
+                        description: None,
+                        followers_count: None,
+                        follows_count: None,
+                        indexed_at: None,
+                        joined_via_starter_pack: None,
+                        labels: None,
+                        links: None,
+                        pinned_post: None,
+                        posts_count: None,
+                        pronouns: None,
+                        status: None,
+                        verification: None,
+                        viewer: None,
+                        website: None,
                         extra_data: None,
                     };
                     Json(output).into_response()
@@ -2030,8 +2019,8 @@ async fn profile_hydration_cached_for_five_minutes_and_fallback_unavailable_on_f
         .set_cached_profile_with_time(
             "did:plc:alice-mock",
             ProfileViewBasic {
-                did: Did::new(SmolStr::new("did:plc:alice-mock")).unwrap(),
-                handle: Handle::new(SmolStr::new("alice.mock")).unwrap(),
+                did: Did::parse("did:plc:alice-mock").unwrap(),
+                handle: Handle::parse("alice.mock").unwrap(),
                 display_name: None,
                 avatar: None,
                 associated: None,
@@ -2096,32 +2085,29 @@ async fn profile_hydration_global_concurrency_ceiling_enforces_maximum_eight_par
 
                 let query = req.uri().query().unwrap_or("");
                 let actor = query.strip_prefix("actor=").unwrap_or("");
-                let output = GetProfileOutput {
-                    value: ProfileViewDetailed {
-                        did: Did::new(SmolStr::new(actor)).unwrap(),
-                        handle: Handle::new(SmolStr::new("user.test")).unwrap(),
-                        display_name: None,
-                        avatar: None,
-                        associated: None,
-                        banner: None,
-                        created_at: None,
-                        debug: None,
-                        description: None,
-                        followers_count: None,
-                        follows_count: None,
-                        indexed_at: None,
-                        joined_via_starter_pack: None,
-                        links: None,
-                        labels: None,
-                        pinned_post: None,
-                        posts_count: None,
-                        pronouns: None,
-                        status: None,
-                        verification: None,
-                        viewer: None,
-                        website: None,
-                        extra_data: None,
-                    },
+                let output = ProfileViewDetailed {
+                    did: Did::parse(actor).unwrap(),
+                    handle: Handle::parse("user.test").unwrap(),
+                    display_name: None,
+                    avatar: None,
+                    associated: None,
+                    banner: None,
+                    created_at: None,
+                    debug: None,
+                    description: None,
+                    followers_count: None,
+                    follows_count: None,
+                    indexed_at: None,
+                    joined_via_starter_pack: None,
+                    links: None,
+                    labels: None,
+                    pinned_post: None,
+                    posts_count: None,
+                    pronouns: None,
+                    status: None,
+                    verification: None,
+                    viewer: None,
+                    website: None,
                     extra_data: None,
                 };
                 Json(output).into_response()
@@ -2281,10 +2267,10 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let thread_output: GetPostThreadOutput = serde_json::from_slice(&body).unwrap();
 
-    fn count_nodes(replies: &[ThreadViewPostRepliesItem]) -> usize {
+    fn count_nodes(replies: &[ThreadViewPostReplies]) -> usize {
         let mut count = 0;
         for item in replies {
-            if let ThreadViewPostRepliesItem::ThreadViewPost(tvp) = item {
+            if let ThreadViewPostReplies::ThreadViewPost(tvp) = item {
                 count += 1;
                 if let Some(child_replies) = &tvp.replies {
                     count += count_nodes(child_replies);
@@ -2317,7 +2303,7 @@ async fn thread_adversarial_depth_and_breadth_budget_bounded_and_preserves_direc
         "All 50 direct level 1 siblings must be retained and not starved by child recursion"
     );
     // 3. First sibling gets exactly 449 children consuming the remaining budget (499 - 50 = 449)
-    if let ThreadViewPostRepliesItem::ThreadViewPost(first_sibling) = &reply_items[0] {
+    if let ThreadViewPostReplies::ThreadViewPost(first_sibling) = &reply_items[0] {
         let first_sibling_replies = first_sibling
             .replies
             .as_ref()
@@ -2729,14 +2715,14 @@ async fn thread_view_unions_replies_under_both_parent_uri_spellings(pool: PgPool
     let r1_node = root_replies
         .iter()
         .find(|r| match r {
-            ThreadViewPostRepliesItem::ThreadViewPost(tvp) => {
+            ThreadViewPostReplies::ThreadViewPost(tvp) => {
                 tvp.post.uri.as_str() == r1_std_uri || tvp.post.uri.as_str() == r1_uri
             }
             _ => false,
         })
         .expect("Reply 1 must be present in root replies");
 
-    if let ThreadViewPostRepliesItem::ThreadViewPost(tvp) = r1_node {
+    if let ThreadViewPostReplies::ThreadViewPost(tvp) = r1_node {
         assert_eq!(
             tvp.post.reply_count,
             Some(2),

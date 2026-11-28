@@ -4,21 +4,27 @@ use crate::error::AppError;
 use crate::hydration::ProfileHydrator;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::app_bsky::embed::images::{View as ImagesView, ViewImage};
-use catbird_atproto::generated::app_bsky::feed::{
-    FeedViewPost, PostView, PostViewEmbed, ViewerState,
-};
-use catbird_atproto::generated::blue_catbird::circle::get_feed::GetFeedOutput;
-use catbird_atproto::generated::blue_catbird::circle::post::Post as EncryptedPostRecord;
-use catbird_atproto::generated::blue_catbird::circle::{
-    CircleSummary, EncryptedPostView, FeedItem, FeedItemPost,
-};
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
-use catbird_atproto::jacquard_common::types::string::{AtUri, Cid, Datetime, Did, Tid, UriValue};
-use catbird_atproto::jacquard_common::types::value::Data;
 use chrono::{DateTime, Utc};
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_api::generated::app::bsky::embed::images::View as ImagesView;
+use petrel_api::generated::app::bsky::embed::images::ViewImage;
+use petrel_api::generated::app::bsky::feed::defs::FeedViewPost;
+use petrel_api::generated::app::bsky::feed::defs::PostView;
+use petrel_api::generated::app::bsky::feed::defs::PostViewEmbed;
+use petrel_api::generated::app::bsky::feed::defs::ViewerState;
+use petrel_catbird::generated::blue::catbird::circle::defs::CircleSummary;
+use petrel_catbird::generated::blue::catbird::circle::defs::EncryptedPostView;
+use petrel_catbird::generated::blue::catbird::circle::defs::FeedItem;
+use petrel_catbird::generated::blue::catbird::circle::defs::FeedItemPost;
+use petrel_catbird::generated::blue::catbird::circle::get_feed::Output as GetFeedOutput;
+use petrel_catbird::generated::blue::catbird::circle::post::Post as EncryptedPostRecord;
+use petrel_core::AtUri;
+use petrel_core::CidString as Cid;
+use petrel_core::Datetime;
+use petrel_core::Did;
+use petrel_core::SpaceRef;
+use petrel_core::Tid;
+use petrel_core::Uri;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +97,7 @@ pub fn build_post_view(
     reply_count: i64,
     viewer_like_uri: Option<&str>,
     space_uri: &str,
-    author_profile: catbird_atproto::generated::app_bsky::actor::ProfileViewBasic,
+    author_profile: petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic,
     media_base_url: &url::Url,
 ) -> Result<PostView, AppError> {
     let embed = if let Some(e) = record_json.get("embed") {
@@ -137,14 +143,14 @@ pub fn build_post_view(
                     .append_pair("did", author_did)
                     .append_pair("cid", blob_cid);
                 let media_url = media_url_parsed.to_string();
-                let uri_val = UriValue::new(SmolStr::new(&media_url))
+                let uri_val = Uri::parse(&media_url)
                     .map_err(|e| AppError::Internal(format!("Invalid media URI: {e}")))?;
 
                 let aspect_ratio = img.get("aspectRatio").and_then(|ar| {
                     let width = ar.get("width")?.as_i64()?;
                     let height = ar.get("height")?.as_i64()?;
                     if width >= 1 && height >= 1 {
-                        Some(catbird_atproto::generated::app_bsky::embed::AspectRatio {
+                        Some(petrel_api::generated::app::bsky::embed::defs::AspectRatio {
                             width,
                             height,
                             extra_data: None,
@@ -155,7 +161,7 @@ pub fn build_post_view(
                 });
 
                 view_images.push(ViewImage {
-                    alt: SmolStr::new(&alt),
+                    alt: String::from(&alt),
                     aspect_ratio,
                     fullsize: uri_val.clone(),
                     thumb: uri_val,
@@ -175,7 +181,7 @@ pub fn build_post_view(
 
     let viewer = viewer_state(viewer_like_uri);
 
-    let record_data: Data = serde_json::from_value(record_json.clone())
+    let record_data = crate::commit::json_to_ipld(record_json)
         .map_err(|e| AppError::Internal(format!("Invalid record data: {e}")))?;
 
     let (aturi, cid_val) = post_identity(uri, cid)?;
@@ -185,7 +191,7 @@ pub fn build_post_view(
         cid: cid_val,
         author: author_profile,
         record: record_data,
-        indexed_at: Datetime::new(indexed_at.into()),
+        indexed_at: indexed_datetime(indexed_at)?,
         like_count: Some(like_count),
         reply_count: Some(reply_count),
         repost_count: None,
@@ -205,7 +211,7 @@ fn viewer_state(viewer_like_uri: Option<&str>) -> Option<ViewerState> {
     viewer_like_uri.map(|like_uri| {
         let std_like_uri = normalize_uri_to_standard_aturi(like_uri);
         ViewerState {
-            like: AtUri::new(SmolStr::new(std_like_uri)).ok(),
+            like: AtUri::parse(std_like_uri).ok(),
             repost: None,
             bookmarked: None,
             embedding_disabled: None,
@@ -221,10 +227,10 @@ fn viewer_state(viewer_like_uri: Option<&str>) -> Option<ViewerState> {
 /// The served URI (standard `at://did/collection/rkey` form) and CID of a post row.
 fn post_identity(uri: &str, cid: &str) -> Result<(AtUri, Cid), AppError> {
     let std_uri = normalize_uri_to_standard_aturi(uri);
-    let aturi = AtUri::new(SmolStr::new(std_uri))
-        .map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
-    let cid_val = Cid::new(cid.as_bytes())
-        .map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
+    let aturi =
+        AtUri::parse(std_uri).map_err(|e| AppError::Internal(format!("Invalid post URI: {e}")))?;
+    let cid_val =
+        Cid::parse(cid).map_err(|e| AppError::Internal(format!("Invalid post CID: {e}")))?;
     Ok((aturi, cid_val))
 }
 
@@ -243,8 +249,12 @@ pub fn build_encrypted_post_view(
     viewer_like_uri: Option<&str>,
     author_profile: ProfileViewBasic,
 ) -> Result<EncryptedPostView, AppError> {
-    let record: EncryptedPostRecord =
-        crate::validator::from_value_borrowed(record_json).map_err(|e| {
+    // Stored records passed the strict ingest validator; the view decode tolerates fields
+    // the generated type does not hold (such as a stale `embed`), which it drops.
+    let record: EncryptedPostRecord = serde_json::to_vec(record_json)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| petrel_core::from_json(&bytes).map_err(|e| e.to_string()))
+        .map_err(|e| {
             AppError::Internal(format!(
                 "Invalid encrypted post record from {author_did}: {e}"
             ))
@@ -255,7 +265,7 @@ pub fn build_encrypted_post_view(
         cid: cid_val,
         author: author_profile,
         record,
-        indexed_at: Datetime::new(indexed_at.into()),
+        indexed_at: indexed_datetime(indexed_at)?,
         like_count: Some(like_count),
         reply_count: Some(reply_count),
         viewer: viewer_state(viewer_like_uri),
@@ -503,11 +513,11 @@ pub async fn get_feed(
             }))
         };
 
-        let circle_tid = Tid::new(SmolStr::new(circle_id))
+        let circle_tid = Tid::parse(circle_id)
             .map_err(|e| AppError::Internal(format!("Invalid circle TID '{circle_id}': {e}")))?;
-        let circle_space_ref = AtSpaceUri::new(SmolStr::new(space_uri))
+        let circle_space_ref = SpaceRef::parse(space_uri)
             .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
-        let circle_owner_did = Did::new(SmolStr::new(circle_owner)).map_err(|e| {
+        let circle_owner_did = Did::parse(circle_owner).map_err(|e| {
             AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}"))
         })?;
         let latest_key_version = match key_versions.get(space_uri.as_str()) {
@@ -522,7 +532,7 @@ pub async fn get_feed(
         let circle_summary = CircleSummary {
             circle_id: circle_tid,
             uri: circle_space_ref,
-            name: SmolStr::new(circle_name),
+            name: String::from(circle_name),
             owner: circle_owner_did,
             member_count: None,
             muted: Some(circle_muted),
@@ -539,10 +549,10 @@ pub async fn get_feed(
 
     let next_cursor = if has_more {
         page_rows.last().map(|last_item| {
-            SmolStr::new(encode_cursor(&FeedCursor {
+            encode_cursor(&FeedCursor {
                 indexed_at: last_item.6,
                 uri: last_item.0.clone(),
-            }))
+            })
         })
     } else {
         None
@@ -568,8 +578,13 @@ pub async fn get_feed(
     Ok(GetFeedOutput {
         feed: feed_items,
         cursor: next_cursor,
-        extra_data: None,
     })
+}
+
+/// The lexicon datetime of a row's `indexed_at`.
+fn indexed_datetime(indexed_at: DateTime<Utc>) -> Result<Datetime, AppError> {
+    crate::datetime::from_utc(indexed_at)
+        .ok_or_else(|| AppError::Internal(format!("indexed_at out of range: {indexed_at}")))
 }
 
 #[cfg(test)]

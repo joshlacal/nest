@@ -2,6 +2,7 @@ pub mod access;
 pub mod auth;
 pub mod commit;
 pub mod config;
+pub mod datetime;
 pub mod db;
 pub mod error;
 pub mod feed;
@@ -22,9 +23,11 @@ pub mod space_client;
 pub mod space_mac;
 pub mod space_signature;
 pub mod space_star;
+pub mod space_uri;
 pub mod sync;
 pub mod thread;
 pub mod validator;
+pub mod xrpc_query;
 
 use std::future::Future;
 

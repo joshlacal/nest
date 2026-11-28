@@ -2,11 +2,9 @@
 //! keys with padded recipient lists) and `blue.catbird.circle.post` (ciphertext envelopes).
 //! Dispatched from [`super::validate_record`].
 use super::{
-    from_value_borrowed, resolve_reply, InvalidRecord, RecordCandidate, ValidatedRecord,
-    ValidationPolicy,
+    created_at_utc, decode_strict, lexicons, resolve_reply, InvalidRecord, RecordCandidate,
+    ValidatedRecord, ValidationPolicy,
 };
-use catbird_atproto::jacquard_lexicon::schema::LexiconSchema;
-use chrono::Utc;
 
 /// Recipient-list sizes a `blue.catbird.circle.key` record may carry (padding buckets).
 const KEY_RECIPIENT_BUCKETS: [usize; 7] = [8, 16, 32, 64, 128, 256, 512];
@@ -41,20 +39,16 @@ const ENVELOPE_FIELDS: [&str; 9] = [
 ];
 const SENDER_TYPE: &str = "blue.catbird.labyrinth.mek#labyrinthSender";
 
-/// The generated `Key.recipients` is `Vec<Bytes>` without the atproto `$bytes` serde helper,
-/// so it only deserializes from integer arrays. Rewrite each `{"$bytes": <base64>}` entry
-/// into that form (the wire form per the lexicon) before deserializing.
-fn recipients_bytes_to_arrays(
-    mut value: serde_json::Value,
-) -> Result<serde_json::Value, InvalidRecord> {
+/// Bound the work before decoding anything: `recipients` must be a bucket-sized list of
+/// `{"$bytes": <base64>}` entries, each the length of one Hawk wrap.
+pub(super) fn precheck_recipients(value: &serde_json::Value) -> Result<(), InvalidRecord> {
     use base64::Engine;
     let malformed = |m: &str| InvalidRecord::MalformedRecord(format!("circle.key recipients: {m}"));
-    if let Some(items) = value.get_mut("recipients").and_then(|r| r.as_array_mut()) {
-        // Bound the work before decoding anything: a bucket-sized list of wrap-sized strings.
+    if let Some(items) = value.get("recipients").and_then(|r| r.as_array()) {
         if !KEY_RECIPIENT_BUCKETS.contains(&items.len()) {
             return Err(InvalidRecord::RecipientCountNotBucket(items.len()));
         }
-        for item in items.iter_mut() {
+        for item in items {
             let encoded = item
                 .get("$bytes")
                 .and_then(|b| b.as_str())
@@ -66,13 +60,12 @@ fn recipients_bytes_to_arrays(
                     got: unpadded * 3 / 4,
                 });
             }
-            let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+            base64::engine::general_purpose::STANDARD_NO_PAD
                 .decode(encoded.trim_end_matches('='))
                 .map_err(|_| malformed("invalid base64"))?;
-            *item = serde_json::Value::Array(raw.into_iter().map(Into::into).collect());
         }
     }
-    Ok(value)
+    Ok(())
 }
 
 fn malformed(m: impl Into<String>) -> InvalidRecord {
@@ -147,7 +140,7 @@ pub(super) fn validate_key_record(
     policy: &ValidationPolicy,
     norm_value: serde_json::Value,
 ) -> Result<ValidatedRecord, InvalidRecord> {
-    use catbird_atproto::generated::blue_catbird::circle::key::Key;
+    use petrel_catbird::generated::blue::catbird::circle::key::Key;
 
     if !policy.is_encrypted_space() {
         return Err(InvalidRecord::EncryptedInPlaintextSpace);
@@ -175,8 +168,8 @@ pub(super) fn validate_key_record(
         return Err(InvalidRecord::SenderNotAuthor);
     }
     check_circle_id(candidate, policy)?;
-    let norm_value = recipients_bytes_to_arrays(norm_value)?;
-    let key: Key = from_value_borrowed(&norm_value).map_err(|e| {
+    precheck_recipients(&norm_value)?;
+    let key: Key = decode_strict(&norm_value).map_err(|e| {
         InvalidRecord::MalformedRecord(format!("Invalid blue.catbird.circle.key schema: {e}"))
     })?;
 
@@ -184,13 +177,15 @@ pub(super) fn validate_key_record(
     if !KEY_RECIPIENT_BUCKETS.contains(&count) {
         return Err(InvalidRecord::RecipientCountNotBucket(count));
     }
-    key.validate().map_err(|e| {
-        InvalidRecord::MalformedRecord(format!("Lexicon validation failed for key: {e}"))
-    })?;
-    if let Some(bad) = key.recipients.iter().find(|r| r.len() != HAWK_WRAP_32_LEN) {
+    lexicons::validate_record(&candidate.collection, &norm_value)?;
+    if let Some(bad) = key
+        .recipients
+        .iter()
+        .find(|r| r.0.len() != HAWK_WRAP_32_LEN)
+    {
         return Err(InvalidRecord::BadByteLength {
             field: "recipients",
-            got: bad.len(),
+            got: bad.0.len(),
         });
     }
 
@@ -209,7 +204,7 @@ pub(super) fn validate_key_record(
         collection: candidate.collection.clone(),
         rkey: candidate.rkey.clone(),
         record_json: candidate.value.clone(),
-        created_at: key.created_at.as_ref().with_timezone(&Utc),
+        created_at: created_at_utc(&key.created_at)?,
         parent_uri: None,
         root_uri: None,
         post_uri: None,
@@ -222,12 +217,12 @@ pub(super) fn validate_envelope_post(
     policy: &ValidationPolicy,
     norm_value: serde_json::Value,
 ) -> Result<ValidatedRecord, InvalidRecord> {
-    use catbird_atproto::generated::blue_catbird::circle::post::Post as EnvelopePost;
+    use petrel_catbird::generated::blue::catbird::circle::post::Post as EnvelopePost;
 
     if !policy.is_encrypted_space() {
         return Err(InvalidRecord::EncryptedInPlaintextSpace);
     }
-    let post: EnvelopePost = from_value_borrowed(&norm_value).map_err(|e| {
+    let post: EnvelopePost = decode_strict(&norm_value).map_err(|e| {
         InvalidRecord::MalformedRecord(format!("Invalid blue.catbird.circle.post schema: {e}"))
     })?;
     if let Some(extra) = candidate
@@ -239,28 +234,24 @@ pub(super) fn validate_envelope_post(
     }
     check_envelope_nested(&candidate.value)?;
     check_circle_id(candidate, policy)?;
-    post.validate().map_err(|e| {
-        InvalidRecord::MalformedRecord(format!("Lexicon validation failed for circle post: {e}"))
-    })?;
-
-    // The generated validate() does not enforce byte lengths; do it here.
-    let ct_len = post.ciphertext.len();
+    // Exact byte lengths first, so an over-long field is reported as such.
+    let ct_len = post.ciphertext.0.len();
     if ct_len == 0 || ct_len > POST_CIPHERTEXT_MAX {
         return Err(InvalidRecord::BadByteLength {
             field: "ciphertext",
             got: ct_len,
         });
     }
-    if post.sig.len() != POST_SIG_LEN {
+    if post.sig.0.len() != POST_SIG_LEN {
         return Err(InvalidRecord::BadByteLength {
             field: "sig",
-            got: post.sig.len(),
+            got: post.sig.0.len(),
         });
     }
-    if post.author_epoch_head.len() != POST_EPOCH_HEAD_LEN {
+    if post.author_epoch_head.0.len() != POST_EPOCH_HEAD_LEN {
         return Err(InvalidRecord::BadByteLength {
             field: "authorEpochHead",
-            got: post.author_epoch_head.len(),
+            got: post.author_epoch_head.0.len(),
         });
     }
     if let Some(att) = &post.attachments {
@@ -271,6 +262,7 @@ pub(super) fn validate_envelope_post(
             });
         }
     }
+    lexicons::validate_record(&candidate.collection, &norm_value)?;
 
     if !policy.has_membership(&candidate.author_did) {
         return Err(InvalidRecord::NotMember);
@@ -305,7 +297,7 @@ pub(super) fn validate_envelope_post(
         collection: candidate.collection.clone(),
         rkey: candidate.rkey.clone(),
         record_json: candidate.value.clone(),
-        created_at: post.created_at.as_ref().with_timezone(&Utc),
+        created_at: created_at_utc(&post.created_at)?,
         parent_uri,
         root_uri,
         post_uri: None,
@@ -415,6 +407,8 @@ mod tests {
     }
 
     const CID: &str = "bafyreibwlkyyazofc4z5vkwlz7vxx3n6pwmv3sbq4yqm4nbf6x7kk3ef4a";
+    /// Blob refs are raw-codec CIDs (the only form a PDS issues; Petrel rejects others).
+    const BLOB_CID: &str = "bafkreihuhrvkw25tq7bote4itvajpmwnz6zeswnrntz6gb4fa4x4mtntvm";
 
     #[test]
     fn encrypted_space_rejects_plaintext_post() {
@@ -592,7 +586,7 @@ mod tests {
     fn attachment(mime: &str) -> Value {
         json!({
             "$type": "blob",
-            "ref": {"$link": CID},
+            "ref": {"$link": BLOB_CID},
             "mimeType": mime,
             "size": 10,
         })
@@ -603,7 +597,7 @@ mod tests {
         let p = enc_policy(Some(1));
         let mut v = post_json(1);
         v["attachments"] = json!([attachment("application/octet-stream")]);
-        assert!(validate_record(&candidate(OWNER, POST, v.clone()), &p).is_ok());
+        validate_record(&candidate(OWNER, POST, v.clone()), &p).unwrap();
         v["attachments"] = json!([attachment("image/png")]);
         let e = validate_record(&candidate(OWNER, POST, v), &p).unwrap_err();
         assert!(matches!(e, InvalidRecord::MalformedRecord(_)), "{e:?}");

@@ -253,6 +253,15 @@ fn test_dockerignore_rules_exclude_sensitive_files() {
         "nest/circle-appview/Cargo.toml",
         "nest/circle-appview/Cargo.lock",
         "nest/circle-appview/.env.example",
+        // Sibling path dependencies and the lexicons the validator compiles in.
+        "Petrel/rust/Cargo.toml",
+        "Petrel/rust/Cargo.lock",
+        "Petrel/rust/petrel-core/src/lib.rs",
+        "Petrel/rust/petrel-spaces/src/lib.rs",
+        "Petrel/rust/petrel-e2e/Cargo.toml",
+        "PetrelCatbird/rust/petrel-catbird/Cargo.toml",
+        "PetrelCatbird/rust/petrel-catbird/src/lib.rs",
+        "PetrelCatbird/lexicons/blue/catbird/circle/blue.catbird.circle.post.json",
     ];
     for path in parent_inclusions {
         assert!(
@@ -262,7 +271,13 @@ fn test_dockerignore_rules_exclude_sensitive_files() {
     }
 
     let parent_exclusions = [
-        "catbird-atproto/src/lib.rs",
+        "catbird-mls/src/lib.rs",
+        "nest/catbird/src/main.rs",
+        "Petrel/Sources/Petrel/Core/Utils/ATProtoTypes.swift",
+        "Petrel/rust/target/release/libpetrel_core.rlib",
+        "Petrel/rust/petrel-core/target/debug/build.log",
+        "PetrelCatbird/rust/parity/src/main.rs",
+        "PetrelCatbird/rust/petrel-catbird/target/debug/x.rlib",
         "nest/circle-appview/.env",
         "nest/circle-appview/.env.production",
         "nest/circle-appview/server.key",
@@ -375,8 +390,8 @@ fn test_dockerignore_matcher_descendant_negation_and_glob_semantics() {
     // 4. Sequential negation ordering
     let seq_rules = r#"
 **
-!catbird-atproto/
-!catbird-atproto/**
+!Petrel/rust/
+!Petrel/rust/**
 !nest/circle-appview/
 !nest/circle-appview/**
 **/.env*
@@ -386,7 +401,7 @@ fn test_dockerignore_matcher_descendant_negation_and_glob_semantics() {
 "#;
     assert!(!evaluate_dockerignore(
         seq_rules,
-        "catbird-atproto/src/lib.rs"
+        "Petrel/rust/petrel-core/src/lib.rs"
     ));
     assert!(!evaluate_dockerignore(
         seq_rules,

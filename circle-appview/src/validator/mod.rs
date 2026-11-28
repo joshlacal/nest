@@ -1,7 +1,8 @@
-use catbird_atproto::generated::app_bsky::feed::like::Like;
-use catbird_atproto::generated::app_bsky::feed::post::{Post, PostEmbed};
-use catbird_atproto::jacquard_lexicon::schema::LexiconSchema;
 use chrono::{DateTime, Utc};
+use petrel_api::generated::app::bsky::feed::like::Like;
+use petrel_api::generated::app::bsky::feed::post::Post;
+use petrel_api::generated::app::bsky::feed::post::{PostEmbed, PostLabels};
+use petrel_api::generated::app::bsky::richtext::facet::FacetFeatures;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -10,6 +11,7 @@ pub const PLAINTEXT_SPACE_TYPE: &str = "blue.catbird.circle";
 pub const ENCRYPTED_SPACE_TYPE: &str = "blue.catbird.circle.encrypted";
 
 mod encrypted;
+mod lexicons;
 use encrypted::{validate_envelope_post, validate_key_record};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -207,7 +209,11 @@ pub struct ValidatedRecord {
 
 fn normalize_uri_to_standard_aturi(uri: &str) -> String {
     // `at:space/{spaceDid}/{type}/{skey}/{author}/{collection}/{rkey}` -> standard form, so
-    // schema deserialization never depends on the `at:space/` scheme being accepted.
+    // schema deserialization never depends on the `at:space/` scheme being accepted. An
+    // alpha-era `at://{spaceDid}/space/...` ref is first rewritten to `at:space/...`.
+    if let Some(current) = from_legacy_space_uri(uri) {
+        return normalize_uri_to_standard_aturi(&current);
+    }
     if let Some(rest) = uri.strip_prefix("at:space/") {
         let parts: Vec<&str> = rest.split('/').collect();
         if parts.len() == 6 && parts.iter().all(|p| !p.is_empty()) {
@@ -285,10 +291,10 @@ pub fn to_space_form(uri: &str, space_uri: &str) -> String {
     if let Some(normalized) = from_legacy_space_uri(uri) {
         return to_space_form(&normalized, space_uri);
     }
-    let parsed_space = atproto_spaces::SpaceUri::parse_hedged(space_uri).ok();
+    let parsed_space = crate::space_uri::parse_lenient(space_uri).ok();
     let canonical_space = parsed_space
         .as_ref()
-        .map(atproto_spaces::SpaceUri::as_str)
+        .map(petrel_core::SpaceRef::as_str)
         .unwrap_or(space_uri);
 
     if let Some(rest) = uri
@@ -311,7 +317,8 @@ pub fn to_space_form(uri: &str, space_uri: &str) -> String {
         return uri.to_string();
     }
     if let Some(space) = &parsed_space {
-        if let Ok(record_uri) = space.record_uri(parts[0], parts[1], parts[2]) {
+        if let Some(record_uri) = crate::space_uri::record_uri(space, parts[0], parts[1], parts[2])
+        {
             return record_uri;
         }
     }
@@ -332,7 +339,7 @@ fn known_cid<'a>(policy: &'a ValidationPolicy, space_form: &str, raw: &str) -> O
 fn resolve_reply(
     candidate: &RecordCandidate,
     policy: &ValidationPolicy,
-    reply: &catbird_atproto::generated::app_bsky::feed::post::ReplyRef,
+    reply: &petrel_api::generated::app::bsky::feed::post::ReplyRef,
 ) -> Result<(String, String), InvalidRecord> {
     let raw_uri = |which: &str, fallback: &str| {
         candidate
@@ -363,13 +370,27 @@ fn resolve_reply(
     }
 }
 
-/// `Tid` (and other borrowed-string lexicon types) refuse `serde_json::from_value`, so
-/// round-trip through text for the encrypted-record types.
-pub(crate) fn from_value_borrowed<T: for<'de> Deserialize<'de>>(
+/// Decode a record into its generated type, refusing any field the type cannot hold
+/// (Petrel's lenient decode would move a malformed optional field to `extra_data`).
+pub(crate) fn decode_strict<T: petrel_core::FromValue>(
     value: &serde_json::Value,
-) -> Result<T, serde_json::Error> {
-    let text = serde_json::to_string(value)?;
-    serde_json::from_str(&text)
+) -> Result<T, String> {
+    let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    petrel_core::from_json_strict(&bytes).map_err(|e| e.to_string())
+}
+
+/// The instant a record's `createdAt` names.
+pub(crate) fn created_at_utc(
+    value: &petrel_core::Datetime,
+) -> Result<DateTime<Utc>, InvalidRecord> {
+    crate::datetime::to_utc(value).ok_or_else(|| {
+        InvalidRecord::MalformedRecord(format!("createdAt out of range: {}", value.as_str()))
+    })
+}
+
+fn tag_is_valid(tag: &str) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    !tag.is_empty() && tag.len() <= 640 && tag.graphemes(true).count() <= 64
 }
 
 pub fn validate_record(
@@ -377,15 +398,16 @@ pub fn validate_record(
     policy: &ValidationPolicy,
 ) -> Result<ValidatedRecord, InvalidRecord> {
     // Canonical RecordKey validation (Finding 28)
-    if candidate
-        .rkey
-        .parse::<catbird_atproto::jacquard_common::types::string::Rkey>()
-        .is_err()
-    {
+    if candidate.rkey.parse::<petrel_core::RecordKey>().is_err() {
         return Err(InvalidRecord::MalformedRecord(format!(
             "Invalid RecordKey format '{}'",
             candidate.rkey
         )));
+    }
+
+    // 0. Bound the work on a key record's recipient list before decoding any of it.
+    if candidate.collection == "blue.catbird.circle.key" {
+        encrypted::precheck_recipients(&candidate.value)?;
     }
 
     // 1. Reject any floats or malformed JSON via IPLD converter
@@ -414,27 +436,31 @@ pub fn validate_record(
             if policy.is_encrypted_space() {
                 return Err(InvalidRecord::PlaintextInEncryptedSpace);
             }
-            // Deserialize into generated Post type (strictly validates schema, tags, and field types)
-            let post: Post = serde_json::from_value(norm_value).map_err(|e| {
+            // Only image embeds are served. Refuse any other declared embed type before
+            // schema validation, so it is reported as unsupported rather than malformed.
+            if let Some(embed_type) = norm_value
+                .get("embed")
+                .and_then(|e| e.get("$type"))
+                .and_then(|t| t.as_str())
+            {
+                if embed_type != "app.bsky.embed.images" {
+                    return Err(InvalidRecord::UnsupportedEmbed);
+                }
+            }
+            // Lexicon constraint validation of the whole record (lengths, graphemes,
+            // formats, ranges), then a strict decode into the generated type.
+            lexicons::validate_record(&candidate.collection, &norm_value)?;
+            let post: Post = decode_strict(&norm_value).map_err(|e| {
                 InvalidRecord::MalformedRecord(format!("Invalid app.bsky.feed.post schema: {e}"))
             })?;
 
-            // Run generated Lexicon constraint validation
-            post.validate().map_err(|e| {
-                InvalidRecord::MalformedRecord(format!("Lexicon validation failed for post: {e}"))
-            })?;
             if let Some(labels) = &post.labels {
-                labels.validate().map_err(|e| {
-                    InvalidRecord::MalformedRecord(format!(
-                        "Lexicon validation failed for labels: {e}"
-                    ))
-                })?;
+                let PostLabels::SelfLabels(labels) = labels else {
+                    return Err(InvalidRecord::MalformedRecord(
+                        "Unrecognized labels type".into(),
+                    ));
+                };
                 for label in &labels.values {
-                    label.validate().map_err(|e| {
-                        InvalidRecord::MalformedRecord(format!(
-                            "Lexicon validation failed for label: {e}"
-                        ))
-                    })?;
                     if label.val.is_empty() || label.val.len() > 128 {
                         return Err(InvalidRecord::MalformedRecord(
                             "SelfLabel val must be 1..128 characters".into(),
@@ -445,16 +471,6 @@ pub fn validate_record(
 
             if let Some(entities) = &post.entities {
                 for entity in entities {
-                    entity.validate().map_err(|e| {
-                        InvalidRecord::MalformedRecord(format!(
-                            "Lexicon validation failed for entity: {e}"
-                        ))
-                    })?;
-                    entity.index.validate().map_err(|e| {
-                        InvalidRecord::MalformedRecord(format!(
-                            "Lexicon validation failed for entity index: {e}"
-                        ))
-                    })?;
                     if entity.index.start < 0 || entity.index.end < entity.index.start {
                         return Err(InvalidRecord::MalformedRecord(
                             "Invalid entity text slice index range".into(),
@@ -465,16 +481,6 @@ pub fn validate_record(
 
             if let Some(facets) = &post.facets {
                 for facet in facets {
-                    facet.validate().map_err(|e| {
-                        InvalidRecord::MalformedRecord(format!(
-                            "Lexicon validation failed for facet: {e}"
-                        ))
-                    })?;
-                    facet.index.validate().map_err(|e| {
-                        InvalidRecord::MalformedRecord(format!(
-                            "Lexicon validation failed for facet index: {e}"
-                        ))
-                    })?;
                     if facet.index.byte_start < 0 || facet.index.byte_end < facet.index.byte_start {
                         return Err(InvalidRecord::MalformedRecord(
                             "Invalid facet byte slice index range".into(),
@@ -482,27 +488,33 @@ pub fn validate_record(
                     }
                     for feature in &facet.features {
                         match feature {
-                            catbird_atproto::generated::app_bsky::richtext::facet::FacetFeaturesItem::Mention(m) => {
-                                m.validate().map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for mention: {e}")))?;
-                                if let Err(e) = catbird_atproto::jacquard_common::types::did::validate_did(m.did.as_ref()) {
-                                    return Err(InvalidRecord::MalformedRecord(format!("Invalid mention DID: {e}")));
+                            FacetFeatures::Mention(m) => {
+                                if let Err(e) = petrel_core::Did::parse(m.did.as_str()) {
+                                    return Err(InvalidRecord::MalformedRecord(format!(
+                                        "Invalid mention DID: {e}"
+                                    )));
                                 }
                             }
-                            catbird_atproto::generated::app_bsky::richtext::facet::FacetFeaturesItem::Link(l) => {
-                                l.validate().map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for link: {e}")))?;
-                                if url::Url::parse(l.uri.as_ref()).is_err() {
-                                    return Err(InvalidRecord::MalformedRecord(format!("Invalid link URI: {}", l.uri.as_ref())));
+                            FacetFeatures::Link(l) => {
+                                if url::Url::parse(l.uri.as_str()).is_err() {
+                                    return Err(InvalidRecord::MalformedRecord(format!(
+                                        "Invalid link URI: {}",
+                                        l.uri.as_str()
+                                    )));
                                 }
                             }
-                            catbird_atproto::generated::app_bsky::richtext::facet::FacetFeaturesItem::Tag(t) => {
-                                t.validate().map_err(|e| InvalidRecord::MalformedRecord(format!("Lexicon validation failed for tag: {e}")))?;
-                                let tag_str = t.tag.as_str();
-                                if tag_str.is_empty() || tag_str.len() > 640 || catbird_atproto::jacquard_common::deps::codegen::unicode_segmentation::UnicodeSegmentation::graphemes(tag_str, true).count() > 64 {
-                                    return Err(InvalidRecord::MalformedRecord(format!("Invalid tag length/graphemes: {tag_str}")));
+                            FacetFeatures::Tag(t) => {
+                                if !tag_is_valid(&t.tag) {
+                                    return Err(InvalidRecord::MalformedRecord(format!(
+                                        "Invalid tag length/graphemes: {}",
+                                        t.tag
+                                    )));
                                 }
                             }
                             _ => {
-                                return Err(InvalidRecord::MalformedRecord("Unrecognized or malformed facet feature".into()));
+                                return Err(InvalidRecord::MalformedRecord(
+                                    "Unrecognized or malformed facet feature".into(),
+                                ));
                             }
                         }
                     }
@@ -511,9 +523,10 @@ pub fn validate_record(
 
             if let Some(tags) = &post.tags {
                 for tag in tags {
-                    let tag_str = tag.as_str();
-                    if tag_str.is_empty() || tag_str.len() > 640 || catbird_atproto::jacquard_common::deps::codegen::unicode_segmentation::UnicodeSegmentation::graphemes(tag_str, true).count() > 64 {
-                        return Err(InvalidRecord::MalformedRecord(format!("Invalid tag item length/graphemes: {tag_str}")));
+                    if !tag_is_valid(tag) {
+                        return Err(InvalidRecord::MalformedRecord(format!(
+                            "Invalid tag item length/graphemes: {tag}"
+                        )));
                     }
                 }
             }
@@ -521,31 +534,11 @@ pub fn validate_record(
             // Reject quote embeds and only accept image embeds
             if let Some(embed) = &post.embed {
                 match embed {
-                    PostEmbed::Images(images) => {
-                        images.validate().map_err(|e| {
-                            InvalidRecord::MalformedRecord(format!(
-                                "Lexicon validation failed for embed images: {e}"
-                            ))
-                        })?;
-                        for img in &images.images {
-                            img.validate().map_err(|e| {
-                                InvalidRecord::MalformedRecord(format!(
-                                    "Lexicon validation failed for embed image: {e}"
-                                ))
-                            })?;
-                            if let Some(ar) = &img.aspect_ratio {
-                                ar.validate().map_err(|e| {
-                                    InvalidRecord::MalformedRecord(format!(
-                                        "Lexicon validation failed for aspect ratio: {e}"
-                                    ))
-                                })?;
-                            }
-                        }
-                    }
+                    PostEmbed::Images(_) => {}
                     _ => return Err(InvalidRecord::UnsupportedEmbed),
                 }
             }
-            let created_at = post.created_at.as_ref().with_timezone(&Utc);
+            let created_at = created_at_utc(&post.created_at)?;
 
             if let Some(reply) = &post.reply {
                 // Reply: author must be on the member list at index time
@@ -592,20 +585,15 @@ pub fn validate_record(
             }
         }
         "app.bsky.feed.like" => {
-            // Deserialize into generated Like type
-            let like: Like = serde_json::from_value(norm_value).map_err(|e| {
+            lexicons::validate_record(&candidate.collection, &norm_value)?;
+            let like: Like = decode_strict(&norm_value).map_err(|e| {
                 InvalidRecord::MalformedRecord(format!("Invalid app.bsky.feed.like schema: {e}"))
-            })?;
-
-            // Run generated Lexicon constraint validation
-            like.validate().map_err(|e| {
-                InvalidRecord::MalformedRecord(format!("Lexicon validation failed for like: {e}"))
             })?;
 
             if !policy.has_membership(&candidate.author_did) {
                 return Err(InvalidRecord::NotMember);
             }
-            let created_at = like.created_at.as_ref().with_timezone(&Utc);
+            let created_at = created_at_utc(&like.created_at)?;
 
             let raw_subject_uri = candidate
                 .value
@@ -757,7 +745,7 @@ mod space_form_tests {
     }
 
     #[test]
-    fn hedged_and_legacy_space_uris_normalize_via_atproto_spaces_space_uri() {
+    fn canonical_and_alpha_space_uris_normalize_to_at_space() {
         assert_eq!(
             to_space_form(
                 "at://did:plc:bob/blue.catbird.circle.post/3k2",

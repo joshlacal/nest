@@ -51,11 +51,12 @@ impl TestLtHash {
         Self::default()
     }
     fn add(&mut self, collection: &str, rkey: &str, cid: &str) {
-        self.inner.add(&format!("{collection}/{rkey}/{cid}"));
+        self.inner.add_entry(&format!("{collection}/{rkey}"), cid);
         self.state_buf = self.inner.state().to_vec();
     }
     fn remove(&mut self, collection: &str, rkey: &str, cid: &str) {
-        self.inner.remove(&format!("{collection}/{rkey}/{cid}"));
+        self.inner
+            .remove_entry(&format!("{collection}/{rkey}"), cid);
         self.state_buf = self.inner.state().to_vec();
     }
     fn as_bytes(&self) -> &[u8; 2048] {
@@ -284,25 +285,20 @@ async fn test_cas_rejects_rollback_and_equal_rev_different_hash(pool: PgPool) {
         .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car_init);
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(post_cid.clone().into()),
-                    collection: "app.bsky.feed.post".to_string().into(),
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+                    cid: Some(petrel_core::CidString::parse(post_cid.as_str()).unwrap()),
+                    collection: petrel_core::Nsid::parse("app.bsky.feed.post").unwrap(),
                     prev: None,
-                    rev: "3l7234567a234".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new(
-                        "3l7post11111",
-                    )
-                    .unwrap()
-                    .into(),
+                    rev: petrel_core::Tid::parse("3l7234567a234").unwrap(),
+                    rkey: petrel_core::RecordKey::parse("3l7post11111").unwrap(),
                     value: Some(post_ipld),
                     extra_data: None,
                 },
             ],
             commit: init_commit,
-            extra_data: None,
         },
     );
 
@@ -319,11 +315,10 @@ async fn test_cas_rejects_rollback_and_equal_rev_different_hash(pool: PgPool) {
     // Fail ops fetch to route to full recovery
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             cursor: None,
             ops: vec![],
             commit: rollback_commit,
-            extra_data: None,
         },
     );
 
@@ -459,23 +454,20 @@ async fn test_missing_operation_value_fails_atomically_without_advancing_sync_st
         .set_get_repo_response(&format!("{SPACE_URI}:{OWNER_DID}"), car1);
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
-                    cid: Some(cid1.clone().into()),
-                    collection: "app.bsky.feed.post".to_string().into(),
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
+                    cid: Some(petrel_core::CidString::parse(cid1.as_str()).unwrap()),
+                    collection: petrel_core::Nsid::parse("app.bsky.feed.post").unwrap(),
                     prev: None,
-                    rev: "3l7234567a234".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new("rkey1")
-                        .unwrap()
-                        .into(),
+                    rev: petrel_core::Tid::parse("3l7234567a234").unwrap(),
+                    rkey: petrel_core::RecordKey::parse("rkey1").unwrap(),
                     value: Some(post_ipld),
                     extra_data: None,
                 },
             ],
             commit: init_commit.clone(),
-            extra_data: None,
         },
     );
 
@@ -485,27 +477,25 @@ async fn test_missing_operation_value_fails_atomically_without_advancing_sync_st
     // Incremental op has cid2 present, but value is None
     setup.mock_transport.set_list_repo_ops_response(
         &format!("{SPACE_URI}:{OWNER_DID}"),
-        catbird_atproto::generated::com_atproto::space::list_repo_ops::ListRepoOpsOutput {
+        petrel_api::generated::com::atproto::space::list_repo_ops::Output {
             cursor: None,
             ops: vec![
-                catbird_atproto::generated::com_atproto::space::list_repo_ops::OpEntry {
+                petrel_api::generated::com::atproto::space::list_repo_ops::OpEntry {
                     cid: Some(
-                        "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"
-                            .to_string()
-                            .into(),
+                        petrel_core::CidString::parse(
+                            "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454",
+                        )
+                        .unwrap(),
                     ),
-                    collection: "app.bsky.feed.post".to_string().into(),
+                    collection: petrel_core::Nsid::parse("app.bsky.feed.post").unwrap(),
                     prev: None,
-                    rev: "3l7234567a235".to_string().into(),
-                    rkey: catbird_atproto::jacquard_common::types::string::Rkey::new("rkey2")
-                        .unwrap()
-                        .into(),
+                    rev: petrel_core::Tid::parse("3l7234567a235").unwrap(),
+                    rkey: petrel_core::RecordKey::parse("rkey2").unwrap(),
                     value: None, // Missing value!
                     extra_data: None,
                 },
             ],
             commit: init_commit,
-            extra_data: None,
         },
     );
 

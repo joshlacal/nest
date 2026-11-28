@@ -1,14 +1,22 @@
 //! November 12 Spaces request authentication and RFC 9421 MAC verification,
-//! delegated to `atproto-spaces` (`kem` + `mac`).
+//! delegated to `petrel_spaces` (`kem` + `mac_header`).
 use crate::{
     auth::{parse_verification_key, DidDocument, ParsedVerifyingKey},
     error::{AppError, AuthReason},
 };
-pub use atproto_spaces::mac::{
-    MacProfile, ACCEPT_SIGNATURE_HEADER, COMMIT_MAC_PROFILE, RECORD_MAC_PROFILE,
-};
-pub use catbird_atproto::generated::com_atproto::space::Commit;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
+pub use petrel_api::generated::com::atproto::space::defs::Commit;
+pub use petrel_spaces::MacProfile;
+
+/// Request header that asks a Space host for a MAC-authenticated response.
+pub const ACCEPT_SIGNATURE_HEADER: &str = "accept-signature";
+/// Response header (and RFC 9421 component) carrying a commit MAC's covered fields.
+pub const COMMIT_MAC_PROFILE: &str = "atproto-space-commit";
+/// Response header (and RFC 9421 component) carrying a record MAC's covered fields.
+pub const RECORD_MAC_PROFILE: &str = "atproto-space-record";
+const SIGNATURE_INPUT_HEADER: &str = "signature-input";
+const SIGNATURE_HEADER: &str = "signature";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MacRequest {
@@ -28,6 +36,12 @@ impl std::fmt::Debug for MacRequest {
 
 fn invalid_mac() -> AppError {
     AppError::Unauthorized(AuthReason::InvalidSpaceMac)
+}
+
+/// The `did:key` of a P-256 public key (compressed SEC1, multicodec `p256-pub`).
+pub fn p256_did_key(key: &PublicKey) -> Result<String, AppError> {
+    petrel_spaces::encode_p256_did_key(key.to_encoded_point(true).as_bytes())
+        .map_err(|_| invalid_mac())
 }
 
 pub fn kem_key(doc: &DidDocument, did: &str) -> Result<PublicKey, AppError> {
@@ -62,19 +76,18 @@ pub fn kem_key(doc: &DidDocument, did: &str) -> Result<PublicKey, AppError> {
 }
 
 pub fn encapsulate(author: &PublicKey, profile: MacProfile) -> Result<MacRequest, AppError> {
-    let author_did_key = atproto_spaces::kem::encode_p256_did_key(author);
-    let encap =
-        atproto_spaces::kem::encapsulate_p256(&author_did_key).map_err(|_| invalid_mac())?;
+    let author_did_key = p256_did_key(author)?;
+    let encap = petrel_spaces::encapsulate_p256(&author_did_key).map_err(|_| invalid_mac())?;
     Ok(MacRequest {
-        key_share: encap.key_share_did_key,
-        shared_secret: encap.shared_secret,
+        key_share: encap.key_share.clone(),
+        shared_secret: *encap.shared_secret,
         profile,
     })
 }
 
 /// HPKE base-mode secret export using DHKEM(P-256, HKDF-SHA256), HKDF-SHA256,
 /// Export-only AEAD, `info = "atproto-mac"`, and an empty exporter context,
-/// delegated to `atproto_spaces::kem`.
+/// delegated to `petrel_spaces::kem`.
 pub fn derive_secret(
     secret: &SecretKey,
     other: &PublicKey,
@@ -82,13 +95,17 @@ pub fn derive_secret(
     author: &PublicKey,
 ) -> Result<[u8; 32], AppError> {
     let own_pub = secret.public_key();
+    let own_secret: zeroize::Zeroizing<[u8; 32]> =
+        zeroize::Zeroizing::new(secret.to_bytes().into());
     if &own_pub == author && other == syncer {
-        let syncer_did_key = atproto_spaces::kem::encode_p256_did_key(syncer);
-        atproto_spaces::kem::decapsulate_p256(secret, &syncer_did_key).map_err(|_| invalid_mac())
+        let syncer_did_key = p256_did_key(syncer)?;
+        petrel_spaces::decapsulate_p256(&own_secret, &syncer_did_key)
+            .map(|secret| *secret)
+            .map_err(|_| invalid_mac())
     } else if &own_pub == syncer && other == author {
-        let author_did_key = atproto_spaces::kem::encode_p256_did_key(author);
-        atproto_spaces::kem::encapsulate_p256_deterministic(&author_did_key, secret)
-            .map(|e| e.shared_secret)
+        let author_did_key = p256_did_key(author)?;
+        petrel_spaces::encapsulate_p256_with_ephemeral(&author_did_key, &own_secret)
+            .map(|e| *e.shared_secret)
             .map_err(|_| invalid_mac())
     } else {
         Err(invalid_mac())
@@ -97,16 +114,40 @@ pub fn derive_secret(
 
 impl MacRequest {
     pub fn header(&self) -> String {
-        atproto_spaces::mac::format_accept_signature(self.profile, &self.key_share).unwrap_or_else(
-            |_| {
-                let profile = self.profile.as_str();
-                format!(
-                    "mac=(\"{profile}\";sf);keyid=\"{}\";tag=\"{profile}\"",
-                    self.key_share
-                )
-            },
-        )
+        petrel_spaces::format_accept_signature(self.profile, &self.key_share).unwrap_or_else(|_| {
+            let profile = self.profile.as_str();
+            format!(
+                "mac=(\"{profile}\";sf);keyid=\"{}\";tag=\"{profile}\"",
+                self.key_share
+            )
+        })
     }
+}
+
+/// The single value of a MAC response header. A repeated header is refused: a
+/// host never sends two, and joining them would let an extra member slip in.
+fn single_header<'h>(
+    headers: &'h reqwest::header::HeaderMap,
+    name: &str,
+) -> Result<&'h str, AppError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or_else(invalid_mac)?;
+    if values.next().is_some() {
+        return Err(invalid_mac());
+    }
+    value.to_str().map_err(|_| invalid_mac())
+}
+
+/// The covered-fields, `Signature-Input` and `Signature` values of a MAC response.
+fn mac_headers(
+    headers: &reqwest::header::HeaderMap,
+    profile: MacProfile,
+) -> Result<(&str, &str, &str), AppError> {
+    Ok((
+        single_header(headers, profile.response_header())?,
+        single_header(headers, SIGNATURE_INPUT_HEADER)?,
+        single_header(headers, SIGNATURE_HEADER)?,
+    ))
 }
 
 pub fn verify_commit(
@@ -123,42 +164,55 @@ pub fn verify_commit(
     {
         return Err(invalid_mac());
     }
-    let data_32: &[u8; 32] = commit.data.as_ref().try_into().map_err(|_| invalid_mac())?;
-    atproto_spaces::mac::verify_commit_mac(
+    let data_32: [u8; 32] = commit
+        .data
+        .0
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_mac())?;
+    let (covered, signature_input, signature) = mac_headers(headers, MacProfile::Commit)?;
+    let verified = petrel_spaces::verify_commit_mac(
         &request.shared_secret,
-        &request.key_share,
-        headers,
-        commit.space.as_str(),
-        commit.repo.as_str(),
-        commit.rev.as_str(),
-        data_32,
+        covered,
+        signature_input,
+        signature,
     )
-    .map_err(|_| invalid_mac())
+    .map_err(|_| invalid_mac())?;
+    if verified.keyid != request.key_share
+        || verified.ver != 1
+        || verified.space.as_str() != commit.space.as_str()
+        || verified.repo.as_str() != commit.repo.as_str()
+        || verified.rev.as_str() != commit.rev.as_str()
+        || verified.data != data_32
+    {
+        return Err(invalid_mac());
+    }
+    Ok(())
 }
 
 pub fn verify_record(
     uri: &str,
     expected_uri: &str,
-    cid: &cid::Cid,
+    cid: &petrel_core::Cid,
     bytes: &[u8],
     request: &MacRequest,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<(), AppError> {
-    if request.profile != MacProfile::Record
-        || uri != expected_uri
-        || crate::commit::create_cid_bytes_from_data(bytes).0 != cid.to_bytes()
-    {
+    if request.profile != MacProfile::Record || uri != expected_uri || !cid.matches_content(bytes) {
         return Err(invalid_mac());
     }
-    let cid_str = cid.to_string();
-    atproto_spaces::mac::verify_record_mac(
+    let (covered, signature_input, signature) = mac_headers(headers, MacProfile::Record)?;
+    let verified = petrel_spaces::verify_record_mac(
         &request.shared_secret,
-        &request.key_share,
-        headers,
-        uri,
-        &cid_str,
+        covered,
+        signature_input,
+        signature,
     )
-    .map_err(|_| invalid_mac())
+    .map_err(|_| invalid_mac())?;
+    if verified.keyid != request.key_share || verified.uri.as_str() != uri || &verified.cid != cid {
+        return Err(invalid_mac());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -178,15 +232,18 @@ mod tests {
             .collect()
     }
 
+    /// A real P-256 `did:key`: petrel-spaces checks the MAC keyid parses as one.
+    fn test_did_key() -> String {
+        p256_did_key(&SecretKey::random(&mut OsRng).public_key()).unwrap()
+    }
+
     fn commit() -> Commit {
         Commit {
-            space: catbird_atproto::jacquard_common::types::aturi::AtSpaceUri::new_owned(
-                "at:space/did:example:space/app.bsky.group/test",
-            )
-            .unwrap(),
-            repo: "did:example:alice".to_owned().into(),
-            rev: "3kbcq3p7ad4aa".to_owned().into(),
-            data: bytes::Bytes::from_static(&[1; 32]),
+            space: petrel_core::SpaceRef::parse("at:space/did:example:space/app.bsky.group/test")
+                .unwrap(),
+            repo: petrel_core::Did::parse("did:example:alice").unwrap(),
+            rev: petrel_core::Tid::parse("3kbcq3p7ad4aa").unwrap(),
+            data: petrel_core::Bytes(vec![1; 32]),
             ver: 1,
             extra_data: None,
         }
@@ -263,7 +320,7 @@ mod tests {
     fn commit_profile_verifies_rfc9421_and_structured_field_canonicalization() {
         let commit = commit();
         let request = MacRequest {
-            key_share: "did:key:zDnaExample".into(),
+            key_share: test_did_key(),
             shared_secret: std::array::from_fn(|i| i as u8),
             profile: MacProfile::Commit,
         };
@@ -272,7 +329,7 @@ mod tests {
             commit.repo,
             commit.space,
             commit.rev,
-            STANDARD.encode(&commit.data)
+            STANDARD.encode(&commit.data.0)
         );
         let mut headers = signed_headers(&request, &covered, "other", None);
         headers.insert(
@@ -288,6 +345,23 @@ mod tests {
         )
         .is_ok());
 
+        // Parameters may come in any order, and `alg` names the one algorithm.
+        let params = format!(
+            "(\"atproto-space-commit\";sf);tag=\"atproto-space-commit\";keyid=\"{}\";alg=\"hmac-sha256\"",
+            request.key_share
+        );
+        let headers = signed_headers(&request, &covered, "mac", Some(&params));
+        assert!(verify_commit(
+            &commit,
+            commit.space.as_str(),
+            commit.repo.as_str(),
+            &request,
+            &headers
+        )
+        .is_ok());
+
+        // Wire pin: petrel-spaces refuses any parameter beyond keyid, tag and alg
+        // (the previous verifier accepted `created`). Swan echoes only keyid and tag.
         let params = format!(
             "(\"atproto-space-commit\";sf);tag=\"atproto-space-commit\";created=1700000000;keyid=\"{}\";alg=\"hmac-sha256\"",
             request.key_share
@@ -300,14 +374,26 @@ mod tests {
             &request,
             &headers
         )
-        .is_ok());
+        .is_err());
+
+        // A MAC with no keyid, or a keyid other than the request's key share, is refused.
+        let params = "(\"atproto-space-commit\";sf);tag=\"atproto-space-commit\"";
+        let headers = signed_headers(&request, &covered, "mac", Some(params));
+        assert!(verify_commit(
+            &commit,
+            commit.space.as_str(),
+            commit.repo.as_str(),
+            &request,
+            &headers
+        )
+        .is_err());
     }
 
     #[test]
     fn commit_profile_rejects_wrong_key_profile_body_and_duplicate_tag() {
         let commit = commit();
         let request = MacRequest {
-            key_share: "did:key:zDnaExample".into(),
+            key_share: test_did_key(),
             shared_secret: [7; 32],
             profile: MacProfile::Commit,
         };
@@ -316,10 +402,10 @@ mod tests {
             commit.repo,
             commit.space,
             commit.rev,
-            STANDARD.encode(&commit.data)
+            STANDARD.encode(&commit.data.0)
         );
         for params in [
-            "(\"atproto-space-commit\";sf);keyid=\"did:key:other\";tag=\"atproto-space-commit\"",
+            "(\"atproto-space-commit\";sf);keyid=\"did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2169\";tag=\"atproto-space-commit\"",
             "(\"atproto-space-commit\";sf);tag=\"atproto-space-commit\";alg=\"hmac-sha512\"",
             "(\"atproto-space-commit\");tag=\"atproto-space-commit\"",
         ] {
@@ -334,7 +420,7 @@ mod tests {
         }
 
         let mut changed = commit.clone();
-        changed.rev = "3kbcq3p7ad4ab".to_owned().into();
+        changed.rev = petrel_core::Tid::parse("3kbcq3p7ad4ab").unwrap();
         let headers = signed_headers(&request, &covered, "mac", None);
         assert!(verify_commit(
             &changed,
@@ -376,14 +462,15 @@ mod tests {
 
     #[test]
     fn record_profile_binds_uri_cid_and_body() {
-        let bytes = serde_ipld_dagcbor::to_vec(&serde_json::json!({"text":"private"})).unwrap();
-        let cid: cid::Cid = crate::commit::create_cid_bytes_from_data(&bytes)
-            .1
-            .parse()
-            .unwrap();
+        let bytes = crate::commit::encode_dagcbor(
+            &crate::commit::json_to_ipld(&serde_json::json!({"text":"private"})).unwrap(),
+        )
+        .unwrap();
+        let cid =
+            petrel_core::Cid::parse(&crate::commit::create_cid_bytes_from_data(&bytes).1).unwrap();
         let uri = "at:space/did:example:space/app.bsky.group/test/did:example:alice/app.bsky.feed.post/self";
         let request = MacRequest {
-            key_share: "did:key:zDnaRecord".into(),
+            key_share: test_did_key(),
             shared_secret: [9; 32],
             profile: MacProfile::Record,
         };

@@ -5,12 +5,6 @@ use axum::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput;
-use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordOutput;
-use catbird_atproto::generated::blue_catbird::circle::NotificationReason;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{Did, Handle};
 use chrono::{Duration, Utc};
 use circle_appview::{
     access::ActiveSpaceCredential,
@@ -24,6 +18,12 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::Signature;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::EncodedPoint;
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_catbird::generated::blue::catbird::circle::defs::NotificationReason;
+use petrel_catbird::generated::blue::catbird::circle::list_notifications::Output as ListNotificationsOutput;
+use petrel_catbird::generated::blue::catbird::circle::report_record::Output as ReportRecordOutput;
+use petrel_core::Did;
+use petrel_core::Handle;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -43,14 +43,13 @@ const SPACE_2: &str = "at:space/did:plc:dave-privacy-unauthorized/blue.catbird.c
 /// production route or claiming private-blob host qualification.
 fn media_core_fixture_router(state: AppState) -> axum::Router {
     use axum::{
-        extract::{Extension, Query, State},
+        extract::{Extension, State},
         middleware,
         routing::get,
     };
-    use catbird_atproto::generated::blue_catbird::circle::get_media::GetMedia;
     async fn core(
         Extension(user): Extension<circle_appview::auth::AuthenticatedUser>,
-        Query(query): Query<GetMedia>,
+        query: circle_appview::handlers::media::MediaQuery,
         State(state): State<AppState>,
     ) -> Result<axum::response::Response, circle_appview::error::AppError> {
         circle_appview::media::get_media(
@@ -58,7 +57,7 @@ fn media_core_fixture_router(state: AppState) -> axum::Router {
             user,
             query.space.as_str(),
             query.did.as_str(),
-            query.cid.as_str(),
+            &query.cid,
         )
         .await
     }
@@ -330,9 +329,9 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         .set_cached_profile(
             ALICE_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(ALICE_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("alice.test")).unwrap(),
-                display_name: Some(SmolStr::new("Alice Owner")),
+                did: Did::parse(ALICE_DID).unwrap(),
+                handle: Handle::parse("alice.test").unwrap(),
+                display_name: Some(String::from("Alice Owner")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -351,9 +350,9 @@ async fn setup_privacy_test(pool: PgPool) -> PrivacyTestSetup {
         .set_cached_profile(
             BOB_DID,
             ProfileViewBasic {
-                did: Did::new(SmolStr::new(BOB_DID)).unwrap(),
-                handle: Handle::new(SmolStr::new("bob.test")).unwrap(),
-                display_name: Some(SmolStr::new("Bob Member")),
+                did: Did::parse(BOB_DID).unwrap(),
+                handle: Handle::parse("bob.test").unwrap(),
+                display_name: Some(String::from("Bob Member")),
                 avatar: None,
                 associated: None,
                 viewer: None,
@@ -636,7 +635,7 @@ async fn report_requires_same_space_subject_and_stays_private(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::OK);
     let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let report_output: ReportRecordOutput = serde_json::from_slice(&body_bytes).unwrap();
-    assert!(!report_output.id.as_str().is_empty());
+    assert!(!report_output.id.is_empty());
 
     // 4. Verify report is stored in database
     let report_count: (i64,) =
@@ -1808,13 +1807,12 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
     };
 
     let mut lthash = circle_appview::commit::LtHash::default();
-    lthash.add(&circle_appview::commit::format_lthash_element(
-        &rec_reply.collection,
-        &rec_reply.rkey,
+    lthash.add_entry(
+        &circle_appview::commit::record_path(&rec_reply.collection, &rec_reply.rkey),
         &rec_reply.cid,
-    ));
+    );
 
-    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", lthash.state());
     let car_bob = fixture_star(&commit_bob, &[rec_reply]).unwrap();
     let bob_key = format!("{SPACE_1}:{BOB_DID}");
     setup
@@ -1823,7 +1821,7 @@ async fn sync_mutation_dispatches_generic_push_after_commit(pool: PgPool) {
 
     let sync_engine = SyncEngine::new(&setup.state);
     let sync_res = sync_engine
-        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.0.as_slice()))
         .await
         .unwrap();
     assert_eq!(sync_res.records_accepted, 1);
@@ -2115,13 +2113,12 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
     };
 
     let mut lthash = circle_appview::commit::LtHash::default();
-    lthash.add(&circle_appview::commit::format_lthash_element(
-        &rec_like.collection,
-        &rec_like.rkey,
+    lthash.add_entry(
+        &circle_appview::commit::record_path(&rec_like.collection, &rec_like.rkey),
         &rec_like.cid,
-    ));
+    );
 
-    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash.state());
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", lthash.state());
     let car_bob = fixture_star(&commit_bob, &[rec_like]).unwrap();
     let bob_key = format!("{SPACE_1}:{BOB_DID}");
     setup
@@ -2130,7 +2127,7 @@ async fn activity_push_targets_suppressed_when_author_loses_membership(pool: PgP
 
     let sync_engine = SyncEngine::new(&setup.state);
     let _ = sync_engine
-        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.as_ref()))
+        .sync_repo_with_expected_hash(SPACE_1, BOB_DID, Some(commit_bob.data.0.as_slice()))
         .await;
 
     // Verify NO push notification was dispatched because Bob is not a member of the space
@@ -2185,7 +2182,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
         "text": "Post for appAccess test",
         "embed": {
             "$type": "app.bsky.embed.images",
-            "images": [{ "image": { "ref": { "$link": "bafkreiblob1" } } }]
+            "images": [{ "image": { "ref": { "$link": "bafkreieludigxrnirftld5ub3hflfbyjpannprcqqawq4r3rglmjdhqmx4" } } }]
         },
         "createdAt": "2026-08-24T12:00:00Z"
     });
@@ -2264,7 +2261,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
     let bob_media_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
     let req = Request::builder()
         .uri(format!(
-            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid=bafkreiblob1",
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid=bafkreieludigxrnirftld5ub3hflfbyjpannprcqqawq4r3rglmjdhqmx4",
             url_encode(SPACE_1),
             url_encode(ALICE_DID)
         ))
@@ -2284,7 +2281,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let circles_out: catbird_atproto::generated::blue_catbird::circle::list_circles::ListCirclesOutput =
+    let circles_out: petrel_catbird::generated::blue::catbird::circle::list_circles::Output =
         serde_json::from_slice(&body).unwrap();
     assert!(circles_out
         .circles
@@ -2305,7 +2302,7 @@ async fn app_access_revocation_invalidates_all_private_surfaces_immediately(pool
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let notifs_out: catbird_atproto::generated::blue_catbird::circle::list_notifications::ListNotificationsOutput =
+    let notifs_out: petrel_catbird::generated::blue::catbird::circle::list_notifications::Output =
         serde_json::from_slice(&body).unwrap();
     assert!(notifs_out
         .notifications
@@ -2342,7 +2339,7 @@ async fn member_removal_revokes_private_reads_immediately(pool: PgPool) {
         "text": "Post for member removal test",
         "embed": {
             "$type": "app.bsky.embed.images",
-            "images": [{ "image": { "ref": { "$link": "bafkreiblobmem" } } }]
+            "images": [{ "image": { "ref": { "$link": "bafkreid2ubfjli7ia3lxhfrvwwmhgaescgoyrzzurfo5vtync5qiikld5q" } } }]
         },
         "createdAt": "2026-08-24T12:00:00Z"
     });
@@ -2402,7 +2399,7 @@ async fn member_removal_revokes_private_reads_immediately(pool: PgPool) {
     let bob_media_jwt = mint_jwt(BOB_DID, "blue.catbird.circle.getMedia", &setup.bob_key);
     let req = Request::builder()
         .uri(format!(
-            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid=bafkreiblobmem",
+            "/xrpc/blue.catbird.circle.getMedia?space={}&did={}&cid=bafkreid2ubfjli7ia3lxhfrvwwmhgaescgoyrzzurfo5vtync5qiikld5q",
             url_encode(SPACE_1),
             url_encode(ALICE_DID)
         ))
@@ -2547,12 +2544,11 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
         value: meta_val,
     };
     let mut lthash = circle_appview::commit::LtHash::default();
-    lthash.add(&circle_appview::commit::format_lthash_element(
-        &rec_meta.collection,
-        &rec_meta.rkey,
+    lthash.add_entry(
+        &circle_appview::commit::record_path(&rec_meta.collection, &rec_meta.rkey),
         &rec_meta.cid,
-    ));
-    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", &lthash.state());
+    );
+    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", lthash.state());
     let car_bytes = fixture_star(&commit, &[rec_meta]).unwrap();
     setup
         .mock_transport
@@ -2606,12 +2602,11 @@ async fn app_access_revocation_via_refresh_and_reactivation_lifecycle(pool: PgPo
         value: meta_val,
     };
     let mut lthash = circle_appview::commit::LtHash::default();
-    lthash.add(&circle_appview::commit::format_lthash_element(
-        &rec_meta.collection,
-        &rec_meta.rkey,
+    lthash.add_entry(
+        &circle_appview::commit::record_path(&rec_meta.collection, &rec_meta.rkey),
         &rec_meta.cid,
-    ));
-    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaab", &lthash.state());
+    );
+    let commit = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaab", lthash.state());
     let car_bytes = fixture_star(&commit, &[rec_meta]).unwrap();
     setup
         .mock_transport
@@ -2742,18 +2737,16 @@ async fn circle_activation_generates_notifications_for_members(pool: PgPool) {
     let alice_post_uri = format!("{SPACE_1}/{ALICE_DID}/app.bsky.feed.post/3l7alicepost");
 
     let mut lthash_alice = circle_appview::commit::LtHash::default();
-    lthash_alice.add(&circle_appview::commit::format_lthash_element(
-        &rec_meta.collection,
-        &rec_meta.rkey,
+    lthash_alice.add_entry(
+        &circle_appview::commit::record_path(&rec_meta.collection, &rec_meta.rkey),
         &rec_meta.cid,
-    ));
-    lthash_alice.add(&circle_appview::commit::format_lthash_element(
-        &rec_post.collection,
-        &rec_post.rkey,
+    );
+    lthash_alice.add_entry(
+        &circle_appview::commit::record_path(&rec_post.collection, &rec_post.rkey),
         &rec_post.cid,
-    ));
+    );
 
-    let commit_alice = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", &lthash_alice.state());
+    let commit_alice = fixture_commit(SPACE_1, ALICE_DID, "3l7aaaaaaaaaa", lthash_alice.state());
     let car_alice = fixture_star(&commit_alice, &[rec_meta, rec_post]).unwrap();
     setup
         .mock_transport
@@ -2779,13 +2772,12 @@ async fn circle_activation_generates_notifications_for_members(pool: PgPool) {
     };
 
     let mut lthash_bob = circle_appview::commit::LtHash::default();
-    lthash_bob.add(&circle_appview::commit::format_lthash_element(
-        &rec_like.collection,
-        &rec_like.rkey,
+    lthash_bob.add_entry(
+        &circle_appview::commit::record_path(&rec_like.collection, &rec_like.rkey),
         &rec_like.cid,
-    ));
+    );
 
-    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", &lthash_bob.state());
+    let commit_bob = fixture_commit(SPACE_1, BOB_DID, "3l7aaaaaaaaaa", lthash_bob.state());
     let car_bob = fixture_star(&commit_bob, &[rec_like]).unwrap();
     setup
         .mock_transport

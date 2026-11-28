@@ -1,7 +1,7 @@
 use crate::access;
 use crate::config::AppState;
 use crate::error::AppError;
-use catbird_atproto::generated::blue_catbird::circle::report_record::ReportRecordReason;
+use petrel_catbird::generated::blue::catbird::circle::report_record::InputReason as ReportRecordReason;
 use uuid::Uuid;
 
 /// Store a member's report of a Circle record.
@@ -82,7 +82,7 @@ pub async fn report_record(
         ReportRecordReason::Spam => "spam",
         ReportRecordReason::Abuse => "abuse",
         ReportRecordReason::Other => "other",
-        ReportRecordReason::UnknownValue(val) => {
+        ReportRecordReason::Unknown(val) => {
             return Err(AppError::InvalidRequest(format!(
                 "Unknown report reason: {val}"
             )));

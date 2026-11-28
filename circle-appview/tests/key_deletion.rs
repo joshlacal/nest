@@ -8,18 +8,18 @@ use support::encrypted::{self as enc, pds};
 use support::encrypted::{CIRCLE_ID, ENCRYPTED_TYPE, KEY};
 
 use axum::body::to_bytes;
-use axum::extract::{Extension, Query, State};
+use axum::extract::{Extension, State};
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::rand_core::OsRng;
 use serde_json::Value;
 use sqlx::PgPool;
 
-use catbird_atproto::generated::blue_catbird::circle::get_keys::GetKeys;
-use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
 use circle_appview::auth::AuthenticatedUser;
 use circle_appview::config::AppState;
 use circle_appview::space_client::MockSpaceHostTransport;
 use circle_appview::sync::{latest_key_version, SyncMode};
+use petrel_catbird::generated::blue::catbird::circle::get_keys::Parameters as GetKeys;
+use petrel_core::SpaceRef;
 
 const OWNER_DID: &str = "did:plc:alice-key-delete";
 const BOB_DID: &str = "did:plc:bob-key-delete";
@@ -88,9 +88,9 @@ async fn key_rows(pool: &PgPool) -> Vec<i64> {
 
 async fn get_keys(s: &Setup) -> Value {
     let query = GetKeys {
-        limit: None,
+        limit: 64,
         since_version: None,
-        space: AtSpaceUri::new_owned(SPACE).unwrap(),
+        space: SpaceRef::parse(SPACE).unwrap(),
     };
     let user = AuthenticatedUser {
         did: BOB_DID.to_string(),
@@ -98,7 +98,7 @@ async fn get_keys(s: &Setup) -> Value {
     };
     let resp = circle_appview::handlers::keys::get_keys_handler(
         Extension(user),
-        Query(query),
+        circle_appview::xrpc_query::XrpcQuery(query),
         State(s.state.clone()),
     )
     .await

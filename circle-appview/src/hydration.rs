@@ -1,6 +1,6 @@
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::string::{Did, Handle};
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_core::Did;
+use petrel_core::Handle;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,12 +43,12 @@ impl ProfileHydrator {
     }
 
     pub fn unavailable_profile(did: &str) -> ProfileViewBasic {
-        let did_val = Did::new(SmolStr::new(did)).unwrap_or_else(|_| {
+        let did_val = Did::parse(did).unwrap_or_else(|_| {
             panic!("Invalid DID format: {did}");
         });
         ProfileViewBasic {
             did: did_val,
-            handle: Handle::new(SmolStr::new("handle.invalid")).unwrap(),
+            handle: Handle::parse("handle.invalid").unwrap(),
             display_name: None,
             avatar: None,
             associated: None,
@@ -74,9 +74,12 @@ impl ProfileHydrator {
         );
         match self.http_client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                match resp.json::<catbird_atproto::generated::app_bsky::actor::get_profile::GetProfileOutput>().await {
+                match resp
+                    .json::<petrel_api::generated::app::bsky::actor::get_profile::Output>()
+                    .await
+                {
                     Ok(output) => {
-                        let detailed = output.value;
+                        let detailed = output;
                         // Verify requested DID matches returned DID exactly
                         if detailed.did.as_str() != did {
                             return Self::unavailable_profile(did);

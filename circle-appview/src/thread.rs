@@ -3,16 +3,19 @@ use crate::config::AppState;
 use crate::error::AppError;
 use crate::feed::{build_post_view, normalize_uri_to_standard_aturi, SPACE_URI_PREFIX};
 use crate::hydration::ProfileHydrator;
-use catbird_atproto::generated::app_bsky::actor::ProfileViewBasic;
-use catbird_atproto::generated::app_bsky::feed::{
-    NotFoundPost, PostView, ThreadViewPost, ThreadViewPostParent, ThreadViewPostRepliesItem,
-};
-use catbird_atproto::generated::blue_catbird::circle::get_post_thread::GetPostThreadOutput;
-use catbird_atproto::generated::blue_catbird::circle::CircleSummary;
-use catbird_atproto::jacquard_common::deps::smol_str::SmolStr;
-use catbird_atproto::jacquard_common::types::aturi::AtSpaceUri;
-use catbird_atproto::jacquard_common::types::string::{AtUri, Did, Tid};
 use chrono::{DateTime, Utc};
+use petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic;
+use petrel_api::generated::app::bsky::feed::defs::NotFoundPost;
+use petrel_api::generated::app::bsky::feed::defs::PostView;
+use petrel_api::generated::app::bsky::feed::defs::ThreadViewPost;
+use petrel_api::generated::app::bsky::feed::defs::ThreadViewPostParent;
+use petrel_api::generated::app::bsky::feed::defs::ThreadViewPostReplies;
+use petrel_catbird::generated::blue::catbird::circle::defs::CircleSummary;
+use petrel_catbird::generated::blue::catbird::circle::get_post_thread::Output as GetPostThreadOutput;
+use petrel_core::AtUri;
+use petrel_core::Did;
+use petrel_core::SpaceRef;
+use petrel_core::Tid;
 use sqlx::PgPool;
 
 const MAX_THREAD_NODES: usize = 500;
@@ -46,7 +49,7 @@ fn build_thread_post_view(
     reply_count: i64,
     viewer_like_uri: Option<&str>,
     space_uri: &str,
-    author_profile: catbird_atproto::generated::app_bsky::actor::ProfileViewBasic,
+    author_profile: petrel_api::generated::app::bsky::actor::defs::ProfileViewBasic,
     media_base_url: &url::Url,
 ) -> Result<PostView, AppError> {
     let mut view = build_post_view(
@@ -106,18 +109,18 @@ pub async fn get_post_thread(
         Some((c_id, name, owner, muted)) => (c_id, name, owner, muted.unwrap_or(false)),
     };
 
-    let circle_tid = Tid::new(SmolStr::new(&circle_id))
+    let circle_tid = Tid::parse(&circle_id)
         .map_err(|e| AppError::Internal(format!("Invalid circle TID '{circle_id}': {e}")))?;
-    let circle_space_ref = AtSpaceUri::new(SmolStr::new(space_uri))
+    let circle_space_ref = SpaceRef::parse(space_uri)
         .map_err(|e| AppError::Internal(format!("Invalid Space URI '{space_uri}': {e}")))?;
-    let circle_owner_did = Did::new(SmolStr::new(&circle_owner)).map_err(|e| {
+    let circle_owner_did = Did::parse(&circle_owner).map_err(|e| {
         AppError::Internal(format!("Invalid circle owner DID '{circle_owner}': {e}"))
     })?;
 
     let circle_summary = CircleSummary {
         circle_id: circle_tid,
         uri: circle_space_ref,
-        name: SmolStr::new(&circle_name),
+        name: String::from(&circle_name),
         owner: circle_owner_did,
         member_count: None,
         muted: Some(circle_muted),
@@ -474,7 +477,7 @@ pub async fn get_post_thread(
             let std_p = normalize_uri_to_standard_aturi(&p_uri);
             Some(ThreadViewPostParent::NotFoundPost(Box::new(NotFoundPost {
                 not_found: true,
-                uri: AtUri::new(SmolStr::new(std_p))
+                uri: AtUri::parse(std_p)
                     .map_err(|e| AppError::Internal(format!("Invalid parent post URI: {e}")))?,
                 extra_data: None,
             })))
@@ -519,7 +522,7 @@ pub async fn get_post_thread(
         profiles: &std::collections::HashMap<String, ProfileViewBasic>,
         space_uri: &str,
         media_base_url: &url::Url,
-    ) -> Result<Vec<ThreadViewPostRepliesItem>, AppError> {
+    ) -> Result<Vec<ThreadViewPostReplies>, AppError> {
         let mut out = Vec::with_capacity(nodes.len());
         for node in nodes {
             let profile = profiles
@@ -561,7 +564,7 @@ pub async fn get_post_thread(
                 extra_data: None,
             };
 
-            out.push(ThreadViewPostRepliesItem::ThreadViewPost(Box::new(tvp)));
+            out.push(ThreadViewPostReplies::ThreadViewPost(Box::new(tvp)));
         }
         Ok(out)
     }
@@ -592,7 +595,6 @@ pub async fn get_post_thread(
     Ok(GetPostThreadOutput {
         thread: main_thread_view,
         circle: circle_summary,
-        extra_data: None,
     })
 }
 
